@@ -3454,17 +3454,35 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                     continue;
                 }
                 match build_seat_image(&rt, cli) {
-                    Ok(tag) => println!("{cli}: built {tag}"),
+                    Ok(tag) => {
+                        println!("{cli}: built {tag}");
+                        // Held at once: the next seat's build must not leave this one to the
+                        // image cleanup.
+                        if crate::image_keep::supported(&rt) {
+                            if let Err(e) = crate::image_keep::hold_now(&rt, &[&tag]) {
+                                eprintln!("{cli}: built, but not held against image cleanup: {e}");
+                                rc = 1;
+                            }
+                        }
+                    }
                     Err(e) => {
                         eprintln!("{cli}: {e}");
                         rc = 1;
                     }
                 }
             }
-            // Then every image the seats use that is there now is held (built or not).
-            if let Err(e) = hold_present(&rt, &wanted) {
-                eprintln!("not held against image cleanup: {e}");
-                rc = 1;
+            // Then every image the seats use that is there now is held (built or not). A runtime
+            // that cannot hold images keeps its builds' exit code: holding is said, not failed.
+            if crate::image_keep::supported(&rt) {
+                if let Err(e) = hold_present(&rt, &wanted) {
+                    eprintln!("not held against image cleanup: {e}");
+                    rc = 1;
+                }
+            } else {
+                println!(
+                    "not held against image cleanup: holders protect images only on the docker CLI (moby); {} is not",
+                    rt.cli.display()
+                );
             }
             rc
         }
@@ -3835,6 +3853,8 @@ mod tests {
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
                  case \"$1 $2\" in\n\
                  'image inspect') last=; for a in \"$@\"; do last=$a; done\n\
+                   case \"$*\" in *Volumes*) echo null; exit 0 ;; esac\n\
+                   [ \"$last\" = sha256:{id} ] && {{ echo sha256:{id}; exit 0; }}\n\
                    grep -qx \"$last\" '{have}' || exit 1\n\
                    echo sha256:{id}; exit 0 ;;\n\
                  esac\n\
@@ -3889,10 +3909,16 @@ mod tests {
         build_seat_image_on(&rt, "codex", pkg, &base).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         assert!(!calls.contains("-t seat-base:rust"), "{calls}");
-        // The operator base is held before the seat image builds on it.
-        let held = calls.find("ps -a").expect("the base was held");
+        // The operator base is held (its holder made) before the seat image builds on it.
+        let held = calls
+            .find("create --name wicked-keep-seat-base-rust-")
+            .expect("the base's holder was made");
         let built = calls.find("build ").expect("the seat image was built");
         assert!(held < built, "{calls}");
+        assert!(
+            calls.contains("--label wicked.keep.image=seat-base:rust"),
+            "{calls}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
