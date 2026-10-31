@@ -381,6 +381,37 @@ pub fn coverage_report_for_repo(
     wicked_governance::recompute_front_half_coverage(&repo_store)
 }
 
+/// ONE registered repo's requirements graph, read from that repo's OWN estate store — the source of
+/// truth `wicked-core domain-graph` persists into (`wicked_governance::persist_domain_model`), never
+/// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
+/// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
+/// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
+/// "coverage": { mapped_pct, min_pct, behavior_bearing, mapped, resolved, unmapped } }`; the
+/// coverage is recomputed from the store's own counts at read time against the configured minimum
+/// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
+/// rebuild. `graph` is null until a build has reached the minimum; a repo registered but not
+/// indexed yet answers `{ graph: null, coverage: null }`. An unknown `repo_ref` errors.
+pub fn requirements_graph_for_repo(
+    daemon: &dyn GraphRead,
+    daemon_db: &str,
+    repo_ref: &str,
+) -> anyhow::Result<serde_json::Value> {
+    let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
+    let repo = get_repo(daemon, repo_ref)?
+        .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?;
+    // Registered but never indexed: no store yet, so no graph and nothing counted — the unbuilt
+    // state, not an error. (A store that exists but cannot be read still errors below.)
+    if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
+        return Ok(serde_json::json!({ "graph": null, "coverage": null }));
+    }
+    let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
+    let min_pct = wicked_governance::min_coverage_pct_from_env().map_err(|e| anyhow::anyhow!(e))?;
+    let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
+    let coverage = wicked_governance::model_coverage(&report, min_pct);
+    let graph = wicked_governance::load_domain_graph(&repo_store, Some(&coverage))?;
+    Ok(serde_json::json!({ "graph": graph, "coverage": coverage }))
+}
+
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
 /// graph store (its engine-resolved `code_graph_db`), never the daemon store (same discipline as
 /// [`coverage_report_for_repo`]; FINDING-009/067/122). This is the read half of #122's web surface:
@@ -1956,6 +1987,67 @@ mod tests {
             graph_kinds_for_repo(&daemon, daemon_path.to_str().unwrap(), "no-such-repo").is_err(),
             "an unknown repo_ref must error, not return an empty summary"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state_home);
+    }
+
+    /// Operator ruling 2026-10-31: the requirements graph is read from the repo's own estate store.
+    /// A repo registered but never indexed is the unbuilt state (graph and coverage null), not an
+    /// error (codex on core#1223); a built graph reads back with its live label; an unknown repo
+    /// errors.
+    #[test]
+    fn requirements_graph_for_repo_reads_the_repo_store_and_tolerates_an_unindexed_repo() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("reqgraph1223");
+        let state_home = scratch_state_home("reqgraph1223");
+        let daemon_path = state_home.join("daemon-store.db");
+        let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Req graph".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let db = daemon_path.to_str().unwrap();
+        assert!(
+            !Path::new(&entry.code_graph_db).exists(),
+            "precondition: not indexed"
+        );
+        let unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(
+            unbuilt,
+            serde_json::json!({ "graph": null, "coverage": null })
+        );
+
+        std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            let model = wicked_governance::DomainModel {
+                metadata: wicked_governance::DomainMetadata {
+                    schema_version: "1.1.0".into(),
+                    migration_mode: "functional".into(),
+                    source: Some("estate-graph".into()),
+                    coverage: None,
+                },
+                domains: Default::default(),
+            };
+            wicked_governance::persist_domain_model(&mut repo_store, &model).unwrap();
+        }
+        let built = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(
+            built["graph"]["domains"],
+            serde_json::json!({}),
+            "an empty build reads as built"
+        );
+        assert_eq!(built["coverage"]["min_pct"], 80);
+        assert!(requirements_graph_for_repo(&daemon, db, "no-such-repo").is_err());
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&state_home);

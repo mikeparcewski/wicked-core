@@ -2740,6 +2740,23 @@ impl Core {
         })
     }
 
+    /// ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
+    /// of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
+    /// recomputed from the store's own counts against the configured minimum. Resolves to a JSON
+    /// string `{ "graph": <domain-model document | null>, "coverage": {...} }`; `graph` is null until
+    /// a build reached the minimum. An unknown `repo_ref` REJECTS.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn get_requirements_graph_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
+        let db_path = self.db_path.clone();
+        task(move || {
+            use wicked_apps_core::open_store_ro;
+            let daemon = open_store_ro(Some(db_path.as_str())).map_err(err)?;
+            let doc = wicked_core::requirements_graph_for_repo(&daemon, &db_path, &repo_ref)
+                .map_err(err)?;
+            serde_json::to_string(&doc).map_err(err)
+        })
+    }
+
     /// Node-count-by-kind summary of ONE registered repo's code graph, over that repo's OWN store
     /// (#122). Resolves to a JSON string: an array of `{ "kind": string, "count": number }`,
     /// kind-sorted. An unknown `repo_ref` REJECTS — never a silent empty summary.
