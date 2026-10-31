@@ -10729,11 +10729,17 @@ fn dispatch_unit(
     // thread compares against to know whether the unit CHANGED the tree — the trigger for the
     // default repo-checks floor and the default judge. A Tool unit is the engine's own command
     // and takes none.
+    //
+    // …and for a bound agent unit that is NEITHER guarded NOR floored too (a creator whose
+    // deliverable is not code, followed by a verifying phase: domain-extraction's `extract`). The
+    // baseline carries the git dir pinned from the registered repository, and the seat container
+    // refuses a worktree with no pinned git dir (`verify_linked_worktree`, fail closed): without
+    // one, every such unit failed `root_unresolvable` on every seat and the run could not go on
+    // (rig run a4c6a389). What the baseline TRIGGERS stays keyed on the unit's own flags (the
+    // guard on `worktree_guarded`, the tree-changed floor on `default_floor`), so taking it here
+    // adds the pin and the secret scan, nothing else.
     let mut baseline_fresh = false;
-    if unit.tool_cmd.is_none()
-        && (crate::worktree_guard::applies_to(&unit) || unit.default_floor)
-        && unit.worktree_baseline.is_none()
-    {
+    if unit.tool_cmd.is_none() && unit.worktree_baseline.is_none() {
         if let Some(wd) = session.workdir.as_deref() {
             // (F-RC2-009) The run base rides the unit beside the baseline: the repo-checks floor's
             // baseline diff compares a failing check against IT, never against a HEAD a creator

@@ -279,6 +279,9 @@ fn db_in(name: &str) -> String {
 /// validator greps `coverage-report.json` in the worktree); `domain-graph` shells the REAL
 /// `wicked-core domain-graph` → writes `requirements_graph.json`. `out_override` lets a test inject a
 /// policy-tripping output for one phase.
+/// 0 = `extract` never dispatched, 1 = it carried a pinned git dir, 2 = it did not.
+static EXTRACT_PINNED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 struct DomainExtractionRunner {
     db: String,
     out_override: Option<(&'static str, String)>,
@@ -302,6 +305,23 @@ impl StepRunner for DomainExtractionRunner {
             };
         }
         let phase = i.unit.id.rsplit(':').next().unwrap_or_default();
+        // The seat container needs the worktree's git dir pinned from the registered repository
+        // (`verify_linked_worktree`); the actor hands it on the unit's baseline. `extract` is a
+        // creator with no code deliverable and a verifying phase after it, i.e. neither guarded
+        // nor floored — it used to dispatch with NO pin and fail `root_unresolvable` on every
+        // seat (rig run a4c6a389).
+        if phase == "extract" {
+            let pinned = i
+                .unit
+                .worktree_baseline
+                .as_ref()
+                .and_then(|b| b.git_dir.as_deref())
+                .is_some();
+            EXTRACT_PINNED.store(
+                if pinned { 1 } else { 2 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
         let workdir = i.workdir.clone();
         let mut output = format!("{phase} done");
         if phase == "pa-scope" {
@@ -614,6 +634,12 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
             }),
         "the run's skills were admitted against the fixture generation 000001 at {}: {handed:?}",
         snapshot.display()
+    );
+    assert_eq!(
+        EXTRACT_PINNED.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the `extract` unit reached its seat with the worktree's git dir pinned (a container \
+         seat refuses it otherwise)"
     );
     let wt = worktree(&repo, "run-happy");
     assert!(
