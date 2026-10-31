@@ -1608,6 +1608,19 @@ pub fn stabilize_requirement_ids(
     }
     for (dname, domain) in model.domains.iter_mut() {
         let old = std::mem::take(&mut domain.requirements);
+        // A `file#name` two requirements of THIS build share proves nothing either: the old id
+        // could be either one's. Only a reference unique on both sides carries an id over.
+        let mut refs_now: HashMap<&str, usize> = HashMap::new();
+        for req in old.values() {
+            if let Some(c) = req.legacy_components.first() {
+                *refs_now.entry(c.as_str()).or_insert(0) += 1;
+            }
+        }
+        let shared_now: HashSet<String> = refs_now
+            .into_iter()
+            .filter(|(_, n)| *n > 1)
+            .map(|(c, _)| c.to_string())
+            .collect();
         let mut next = high.get(dname.as_str()).copied().unwrap_or(0);
         let mut taken: HashSet<String> = HashSet::new();
         let mut renamed: BTreeMap<String, Requirement> = BTreeMap::new();
@@ -1621,6 +1634,7 @@ pub fn stabilize_requirement_ids(
             let by_ref = req
                 .legacy_components
                 .first()
+                .filter(|c| !shared_now.contains(*c))
                 .and_then(|c| previous.get(&(dname.clone(), format!("ref:{c}"))));
             let kept = by_symbol
                 .or(by_ref)
@@ -2892,6 +2906,53 @@ mod tests {
                 ids,
                 ["REQ-003", "REQ-004"],
                 "both fresh, neither inherits: {ids:?}"
+            );
+        }
+
+        /// xreview round 4 (codex P2): an old graph mapped only `B::new`; the first upgraded build
+        /// also maps `A::new` in the same file. The shared `file#name` cannot say which is the old
+        /// one, so neither inherits B's old id (B's override shows as orphaned, never on A).
+        #[test]
+        fn a_reference_shared_in_the_new_build_carries_no_legacy_id() {
+            let mut s = store();
+            let mk = |s: &mut SqliteStore, owner: &str| {
+                let n = Node::new(
+                    Symbol::synthetic("src", format!("pkg/m.rs::{owner}::new")).id(),
+                    NodeKind::Function,
+                    "new".to_string(),
+                    Language::new("rust"),
+                    Location::new("pkg/m.rs".to_string(), Span::ZERO),
+                );
+                s.begin_batch().unwrap();
+                s.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+                s.commit_batch().unwrap();
+                n
+            };
+            let b = mk(&mut s, "B");
+            map(&mut s, &b, "seat-1", "extract-loop");
+            let first = build_at(&s, 1);
+            let b_old = first.domains["pkg"]
+                .requirements
+                .keys()
+                .next()
+                .unwrap()
+                .clone();
+            persist_domain_model(&mut s, &first).unwrap();
+            let mut old: Vec<Node> = previous_graph_nodes(&s).unwrap();
+            for n in old.iter_mut() {
+                n.metadata.remove("code_symbol"); // the previous engine's format
+            }
+            s.begin_batch().unwrap();
+            s.upsert_nodes(&old).unwrap();
+            s.commit_batch().unwrap();
+            let a = mk(&mut s, "A"); // sorts before B
+            map(&mut s, &a, "seat-1", "extract-loop");
+            let mut m = build_at(&s, 1);
+            stabilize_requirement_ids(&s, &mut m).unwrap();
+            assert!(
+                !m.domains["pkg"].requirements.contains_key(&b_old),
+                "neither A nor B inherits {b_old}: {:?}",
+                m.domains["pkg"].requirements.keys().collect::<Vec<_>>()
             );
         }
 
