@@ -418,15 +418,34 @@ pub(crate) fn snapshot_through(
     let result = (|| -> anyhow::Result<String> {
         // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
         // unborn branch there is nothing to seed: `add -A` builds the index from scratch.
+        // No hook runs for the snapshot: a repository's `core.hooksPath` (a `post-index-change`)
+        // must not run engine-side code on a scratch index (DES-FLOOR-CONTAINER review).
         if !head.is_empty() {
-            git(worktree, &["read-tree", "HEAD"], &env)?;
+            git(
+                worktree,
+                &["-c", "core.hooksPath=/dev/null", "read-tree", "HEAD"],
+                &env,
+            )?;
         }
         git(
             worktree,
-            &["-c", &excludes_arg, "add", "-A", "--", "."],
+            &[
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                &excludes_arg,
+                "add",
+                "-A",
+                "--",
+                ".",
+            ],
             &env,
         )?;
-        git_string(worktree, &["write-tree"], &env)
+        git_string(
+            worktree,
+            &["-c", "core.hooksPath=/dev/null", "write-tree"],
+            &env,
+        )
     })();
     // Scratch hygiene on every exit — including `add`'s `<index>.lock` if it was left behind.
     let _ = std::fs::remove_file(&tmp_index);
@@ -924,6 +943,41 @@ mod tests {
             .expect("git runs");
         assert!(out.status.success(), "git {args:?}: {out:?}");
         String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    /// (DES-FLOOR-CONTAINER review) Taking a snapshot runs no repository hook: a
+    /// `post-index-change` the repository's `core.hooksPath` names never runs for `read-tree`,
+    /// `add` or `write-tree` on the scratch index.
+    #[cfg(unix)]
+    #[test]
+    fn a_snapshot_runs_no_repository_hook() {
+        use std::os::unix::fs::PermissionsExt;
+        let wt = creator_worktree("nohook");
+        let base = wt.parent().unwrap().to_path_buf();
+        let hooks = base.join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let marker = base.join("hook-ran");
+        for name in ["post-index-change", "post-checkout", "pre-commit"] {
+            let h = hooks.join(name);
+            std::fs::write(
+                &h,
+                format!("#!/bin/sh\necho {name} >> '{}'\n", marker.display()),
+            )
+            .unwrap();
+            std::fs::set_permissions(&h, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let repo = base.join("repo");
+        run_git(
+            &repo,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let snap = snapshot(&wt, &repo).expect("snapshot");
+        assert!(!snap.tree.is_empty());
+        assert!(
+            !marker.exists(),
+            "a repository hook ran during the snapshot: {:?}",
+            std::fs::read_to_string(&marker)
+        );
     }
 
     /// A repo with one commit and a linked worktree on `wicked/<tag>` — the engine's real layout —

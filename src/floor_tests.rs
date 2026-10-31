@@ -214,6 +214,7 @@ fn wire_decision(c: &CheckRun) -> serde_json::Value {
         changed: Vec::new(),
         changed_truncated: false,
         reused_from: None,
+        floor_runner: None,
     }
     .to_json()["checks"][0]["decision"]
         .clone()
@@ -3882,6 +3883,7 @@ fn interrupted_journal(
         floor_policy: FLOOR_POLICY_VERSION,
         key: FloorKey::of(tree, ctx, &report.detected),
         exclude: exclusion_enabled(),
+        posture: String::new(),
         attempt,
         checks,
     };
@@ -4381,6 +4383,7 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
         floor_policy: FLOOR_POLICY_VERSION,
         key: key.clone(),
         exclude: true,
+        posture: String::new(),
         attempt: 4,
         checks,
     };
@@ -4391,7 +4394,7 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
         tree: tree.to_string(),
         phase: None,
     };
-    let open = OpenJournal::open(&logs, &j, key, true);
+    let open = OpenJournal::open(&logs, &j, key, true, String::new());
     assert!(open.resume.as_ref().is_some_and(|r| r.restarted.is_none()));
     open
 }
@@ -4795,6 +4798,7 @@ fn core_1152_a_verify_only_check_ordered_last_runs_fresh_and_the_rest_is_reused(
             changed: Vec::new(),
             changed_truncated: false,
             reused_from,
+            floor_runner: None,
         }
         .to_json()
     };
@@ -4982,6 +4986,7 @@ fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
         floor_policy: FLOOR_POLICY_VERSION,
         key: FloorKey::of(&r.tree, &ctx, &first.detected),
         exclude: exclusion_enabled(),
+        posture: String::new(),
         attempt: 1,
         checks: vec![JournalEntry {
             dir: check.dir.clone(),
@@ -5070,6 +5075,7 @@ fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
         floor_policy: FLOOR_POLICY_VERSION,
         key: FloorKey::of(&r.tree, &ctx, &detected),
         exclude: exclusion_enabled(),
+        posture: String::new(),
         attempt: 1,
         checks: vec![JournalEntry {
             dir: check.dir.clone(),
@@ -5321,6 +5327,7 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
         floor_policy: FLOOR_POLICY_VERSION,
         key: FloorKey::of(&r.tree, &ctx, &first.detected),
         exclude: exclusion_enabled(),
+        posture: String::new(),
         attempt: 1,
         checks: vec![JournalEntry {
             dir: check.dir.clone(),
@@ -5499,6 +5506,7 @@ fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
         changed: Vec::new(),
         changed_truncated: false,
         reused_from: None,
+        floor_runner: None,
     }
     .to_json();
     let wire = frame["checks"]

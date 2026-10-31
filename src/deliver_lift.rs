@@ -1847,6 +1847,7 @@ pub(crate) fn lift_and_reverify(
             changed: Vec::new(),
             changed_truncated: false,
             reused_from: checks.reused_from.clone(),
+            floor_runner: checks.runner.clone().map(Box::new),
         });
         if let Some(r) = &checks.resumed {
             emit(CoreEvent::FloorResumed {
@@ -3607,6 +3608,11 @@ mod tests {
     /// running no checks, instead of re-running them into the same refusal.
     #[test]
     fn a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks() {
+        if crate::validator::skip_in_container_floor(
+            "a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested(
             "a_verify_override_on_the_unchanged_tree_delivers_without_rerunning_the_checks",
         ) {
@@ -3694,6 +3700,11 @@ mod tests {
     /// tree runs the checks again (and refuses again).
     #[test]
     fn an_override_is_stood_on_only_for_the_same_tree_base_and_checks() {
+        if crate::validator::skip_in_container_floor(
+            "an_override_is_stood_on_only_for_the_same_tree_base_and_checks",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested(
             "an_override_is_stood_on_only_for_the_same_tree_base_and_checks",
         ) {

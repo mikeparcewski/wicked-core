@@ -14,6 +14,34 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The repo-checks floor can run in a fresh Linux container (DES-FLOOR-CONTAINER).** On a macOS host every
+  process a check spawns paid for endpoint scanning and the sandbox profile: one crew full-suite floor took 79-123
+  min under load. With `WICKED_FLOOR_RUNNER=auto` (the default) a macOS host whose container runtime answers runs
+  each floor side in its own fresh container from `containers/checks/node22-rust.Dockerfile`
+  (`wicked-checks-floor:<hash>`, built on first use); the base gets a fresh container per base export, prepared only
+  when a base check needs it. The tree is streamed in as a tar the engine writes from git's objects (no bind mount,
+  no smudge filter) and is compared after every check: a check that rewrites a tracked file stands for nothing.
+  `--network none`, a read-only root, every capability dropped, uid 1000, and a memory cap (`WICKED_FLOOR_MEMORY`,
+  default `6g`; cargo jobs sized to it, debuginfo and incremental off). `node_modules` comes from a read-only volume
+  a networked install container filled with a fixed `npm ci --ignore-scripts` (keyed by the lockfile, every
+  manifest and `.npmrc`), the cargo registry from a shared read-only volume `cargo fetch --locked` filled with the
+  repository's `.cargo` configuration left out and compiler wrappers overridden, and the cargo target is a volume
+  per check-scratch leaf and side, removed with the leaf. `node_modules` and target volumes are held to the check
+  cache's caps against the runtime VM's disk, never while a floor leases them; the shared registry is outside the
+  caps. An OOM kill during a check, or a container that stops answering, is `could_not_run` (floor infrastructure),
+  never a failure of the change, whatever the check's exit code. `container` refuses the floor when the container
+  cannot run; `sandbox` keeps the host floor; `auto` falls back to it with the reason, but only for what the
+  container cannot do (a dependency install that fails on the repository's own inputs stays the floor's evidence).
+  Linux hosts and test harnesses keep the host floor unless the switch is set. Results a later floor may stand on
+  (creator records, journals, base records) carry the runner, so a container result never stands in for a host one.
+  Every report and `repoChecksEvaluated` say which ran (`floorRunner: {runner: container | macos-sandbox |
+  linux-bwrap | none, fallbackReason, image, memoryCap, caches, …}`). Checks see `WICKED_CHECKS_FLOOR=container`;
+  the 8 tests that need an OS write boundary armed inside the floor skip under it with a disclosed line (CI runs
+  them on ubuntu, macOS and Windows). The worktree snapshot now runs no repository hook. `wicked-core floor run
+  --repo <dir> --base <commit> [--full]` runs one floor and prints the report. Measured on this host: crew's full
+  suite floor 108 s (test 79 s) against 79-123 min on the macOS floor; core's floor 531 s against a 29.9 min test
+  check.
+
 - **domain-extraction maps on the seat container floor: the host prepares the seat's work and applies what it
   states (wicked-garden#1362).** A container seat has no `wicked-core`, no `wicked-estate` and a read-only store, so
   `extract` mapped nothing ("Generate it" produced 0 items). The preset gains two host Tool steps around it:

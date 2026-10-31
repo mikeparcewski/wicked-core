@@ -899,6 +899,11 @@ pub struct RepoChecksReport {
     /// them again. `None` when it reused nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reused_from: Option<FloorReuse>,
+    /// (DES-FLOOR-CONTAINER) Which floor ran the checks — a fresh Linux container or the host's OS
+    /// sandbox — and, when the container floor was wanted and did not run, why
+    /// ([`crate::checks_container::FloorRunner`]). `None` on a report from before it existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::checks_container::FloorRunner>,
 }
 
 /// (J4) A floor's journal identity: the unit whose floor it is, the attempt running it and the tree
@@ -1211,6 +1216,9 @@ struct JournalRecord {
     floor_policy: u32,
     key: FloorKey,
     exclude: bool,
+    /// (DES-FLOOR-CONTAINER) The runner the floor ran under ([`CheckScratch::posture`]).
+    #[serde(default)]
+    posture: String,
     attempt: u32,
     #[serde(default)]
     checks: Vec<JournalEntry>,
@@ -1240,7 +1248,7 @@ impl OpenJournal {
     /// Open `ord`'s journal for a floor on `key`: a record left behind by an interrupted floor of
     /// the same key (and policy, and exclusion switch) offers its finished checks; any other record
     /// is discarded and disclosed. The fresh record is written at once.
-    fn open(logs: &Path, j: &FloorJournal, key: FloorKey, exclude: bool) -> Self {
+    fn open(logs: &Path, j: &FloorJournal, key: FloorKey, exclude: bool, posture: String) -> Self {
         let path = journal_path(logs, j.ord);
         let left: Option<JournalRecord> = std::fs::read_to_string(&path)
             .ok()
@@ -1260,6 +1268,8 @@ impl OpenJournal {
                     Some("it was measured against another base".to_string())
                 } else if rec.key.checks != key.checks || rec.exclude != exclude {
                     Some("it ran another check set".to_string())
+                } else if rec.posture != posture {
+                    Some("it ran under another floor runner".to_string())
                 } else {
                     None
                 };
@@ -1282,6 +1292,7 @@ impl OpenJournal {
                 floor_policy: FLOOR_POLICY_VERSION,
                 key,
                 exclude,
+                posture,
                 attempt: j.attempt,
                 checks: Vec::new(),
             },
@@ -3323,6 +3334,9 @@ pub(crate) struct CheckScratch {
     pub(crate) logs: PathBuf,
     /// The per-stream byte cap ([`crate::floor_log::MAX_STREAM_BYTES`]).
     pub(crate) log_cap: u64,
+    /// (DES-FLOOR-CONTAINER) Set when this floor's checks run in a fresh Linux container: every
+    /// check is spawned there ([`run_one_with`]) instead of under the host's OS sandbox.
+    pub(crate) container: Option<std::sync::Arc<crate::checks_container::ChecksFloor>>,
 }
 
 impl Drop for CheckScratch {
@@ -3330,6 +3344,9 @@ impl Drop for CheckScratch {
     /// marked it orphaned instead of deleting it): the last floor out deletes it, so it is never
     /// left behind. The cap pass removes any orphan this could not take.
     fn drop(&mut self) {
+        // (DES-FLOOR-CONTAINER) The container floor first: its containers and volume leases go
+        // before the leaf can be retired, so the leaf's target volumes go with it.
+        drop(self.container.take());
         if orphan_path(&self.root).exists() {
             drop(self.lease.take());
             retire_leaf(&self.root);
@@ -3676,6 +3693,7 @@ impl CheckScratch {
             lease: Some(lease),
             logs,
             log_cap: log_cap(),
+            container: None,
         })
     }
 
@@ -3687,6 +3705,25 @@ impl CheckScratch {
 
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// (DES-FLOOR-CONTAINER) The runner this floor's results are taken under, for every record a
+    /// later floor may stand on (journals, base records): empty for the host floor (so the
+    /// records an earlier engine wrote still match it), the container floor's image otherwise.
+    pub(crate) fn posture(&self) -> String {
+        self.container
+            .as_ref()
+            .map(|f| f.posture())
+            .unwrap_or_default()
+    }
+
+    /// The boundary posture a creator record carries: the sandbox level, qualified by the
+    /// container floor's [`Self::posture`] when one ran (the host value is the level as before).
+    pub(crate) fn posture_level(&self, sandbox_level: &str) -> String {
+        match self.container.as_ref() {
+            Some(f) => format!("{sandbox_level}+{}", f.posture()),
+            None => sandbox_level.to_string(),
+        }
     }
 
     fn home(&self) -> PathBuf {
@@ -3787,6 +3824,17 @@ impl CheckScratch {
     /// variables the allow-list let through — so a `floor_env_mismatch` can be read against the
     /// environment CI runs the same check in.
     fn env_record(&self, sandbox_level: &str) -> FloorEnv {
+        if self.container.is_some() {
+            return FloorEnv {
+                home: "/home/floor".to_string(),
+                tmpdir: "/tmp".to_string(),
+                locale: vec!["LANG=C.UTF-8".to_string()],
+                network: "none".to_string(),
+                sandbox_level: sandbox_level.to_string(),
+                path: crate::checks_container::PATH_IN.to_string(),
+                passthrough: Vec::new(),
+            };
+        }
         let mut locale: Vec<String> = std::env::vars_os()
             .filter_map(|(k, v)| {
                 let k = k.to_string_lossy().into_owned();
@@ -3999,6 +4047,9 @@ fn tree_bytes(dir: &Path) -> u64 {
 
 /// Remove a leaf directory (a link at its path is removed, never followed).
 fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
+    // (DES-FLOOR-CONTAINER) The leaf's cargo target volumes go with it, whichever path removes it
+    // (a run's end, a guarded checkout dropped, the cap pass, an orphan retired).
+    crate::checks_container::remove_leaf_volumes(leaf);
     match std::fs::symlink_metadata(leaf) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -4741,16 +4792,136 @@ fn run_floor_inner(
             crate::floor_log::log_cap_bytes(),
         );
     }
+    // (DES-FLOOR-CONTAINER) The container floor first, when the operator's switch and the host
+    // call for it ([`crate::checks_container::RUNNER_ENV`]).
+    let mut scratch = scratch;
+    let mut fallback: Option<String> = None;
+    let wants = match crate::checks_container::mode() {
+        Ok(crate::checks_container::Mode::Sandbox) => None,
+        Ok(crate::checks_container::Mode::Auto)
+            if !crate::checks_container::auto_tries_container() =>
+        {
+            None
+        }
+        Ok(m) => Some(m),
+        Err(e) => return runner_refused(worktree, ctx, e),
+    };
+    // A floor whose detection fails, or that detects nothing, runs nothing: the host path reports
+    // that as it always has, with no container prepared.
+    let detected = match wants {
+        Some(_) => detect_with(worktree, ctx).ok().filter(|d| !d.is_empty()),
+        None => None,
+    };
+    if let (Some(m), Some(detected)) = (wants, detected) {
+        // The tree the floor judges, when a guarded checkout pinned it; else the copy snapshots
+        // the worktree.
+        let tree = journal.map(|j| j.tree.as_str()).filter(|t| !t.is_empty());
+        let prepared = check_cache_root()
+            .map_err(|e| format!("the check cache: {e}"))
+            .and_then(|cache| {
+                crate::checks_container::ChecksFloor::prepare(
+                    worktree,
+                    ctx,
+                    tree,
+                    scratch.root(),
+                    &cache,
+                    &detected,
+                )
+                .map_err(|e| e.0)
+            });
+        match prepared {
+            Ok(floor) => {
+                eprintln!(
+                    "wicked-core: repo checks floor — the checks run in a fresh Linux container \
+                     ({})",
+                    floor.record().image.unwrap_or_default()
+                );
+                // The scratch owns the floor alone: it drops the floor (containers, leases)
+                // before it can retire its leaf. The record is read through its own handle.
+                let record = floor.record_handle();
+                let sandbox = WorkerSandbox {
+                    wrapper: vec![floor.cli()],
+                    level: crate::validator::SandboxLevel::Sandboxed,
+                    downgrade_reason: None,
+                };
+                scratch.container = Some(std::sync::Arc::new(floor));
+                let mut report = run_with_sandbox_ctx(
+                    worktree, sandbox, ctx, scratch, rerun, journal, untouched,
+                );
+                report.rerun = rerun.map(|r| r.mode);
+                report.runner = record.lock().ok().map(|r| r.clone());
+                return report;
+            }
+            Err(e) if m == crate::checks_container::Mode::Container => {
+                return runner_refused(
+                    worktree,
+                    ctx,
+                    format!(
+                        "{}=container and the container floor could not start: {e}",
+                        crate::checks_container::RUNNER_ENV
+                    ),
+                )
+            }
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: repo checks floor — the container floor did not start ({e}); \
+                     the host floor runs instead"
+                );
+                fallback = Some(e);
+            }
+        }
+    }
     let sandbox = crate::validator::detect_floor_sandbox(&[
         worktree.to_path_buf(),
         scratch.tmp.path().to_path_buf(),
         scratch.root().to_path_buf(),
     ]);
     let sandbox = arm_probed(sandbox, floor_probe());
+    let wrapper = sandbox.wrapper.clone();
     let mut report =
         run_with_sandbox_ctx(worktree, sandbox, ctx, scratch, rerun, journal, untouched);
     report.rerun = rerun.map(|r| r.mode);
+    report.runner = Some(crate::checks_container::FloorRunner::host(
+        &report.sandbox_level,
+        &wrapper,
+        fallback,
+    ));
     report
+}
+
+/// The fail-closed report when the floor runner itself cannot be chosen or started
+/// ([`crate::checks_container::RUNNER_ENV`] unreadable, or `container` asked for and unavailable):
+/// nothing ran, and the reason is the report's `sandbox_error`.
+fn runner_refused(worktree: &Path, ctx: &FloorContext, why: String) -> RepoChecksReport {
+    let (detected, detect_error) = match detect_with(worktree, ctx) {
+        Ok(d) => (d, None),
+        Err(e) => (Vec::new(), Some(e)),
+    };
+    RepoChecksReport {
+        detected,
+        checks: Vec::new(),
+        skipped: Vec::new(),
+        passed: false,
+        detect_error,
+        sandbox_level: crate::validator::SandboxLevel::BestEffort
+            .as_wire()
+            .to_string(),
+        sandbox_note: None,
+        sandbox_error: Some(why.clone()),
+        engine_writes_removed: Vec::new(),
+        claim: None,
+        env: None,
+        tree: None,
+        rerun: None,
+        waived: Vec::new(),
+        requested_rerun: None,
+        recheck: None,
+        coverage_note: None,
+        key: None,
+        resumed: None,
+        reused_from: None,
+        runner: Some(crate::checks_container::FloorRunner::refused(why)),
+    }
 }
 
 /// (core#678, codex r1) The floor arms only what the host's cached EXECUTION probe says arms: a
@@ -4877,6 +5048,7 @@ fn scratch_refused(
         key: None,
         resumed: None,
         reused_from: None,
+        runner: None,
     }
 }
 
@@ -4981,6 +5153,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     key: None,
                     resumed: None,
                     reused_from: None,
+                    runner: None,
                 };
             }
         }
@@ -5105,6 +5278,7 @@ fn run_detected(
                             key: None,
                             resumed: None,
                             reused_from: None,
+                            runner: None,
                         },
                         None,
                     )
@@ -5136,6 +5310,7 @@ fn run_detected(
                                 key: None,
                                 resumed: None,
                                 reused_from: None,
+                                runner: None,
                             },
                             None,
                         )
@@ -5255,6 +5430,7 @@ fn run_detected(
                 j,
                 FloorKey::of(&j.tree, ctx, &detected),
                 exclude,
+                scratch.posture(),
             )
         });
     // (core#1144) The tree an ORDINARY guarded floor runs on (the checkout's probe is present only
@@ -5266,9 +5442,13 @@ fn run_detected(
         .filter(|_| untouched.is_some())
         .map(|j| j.record.key.tree.clone());
     let mut seed = match (ctx.stage, guarded_tree.as_deref(), ctx.base_head.as_deref()) {
-        (FloorStage::Verify, Some(tree), Some(base)) if allow_reuse => {
-            CreatorSeed::load(&scratch.logs, tree, base, &sandbox_level, exclude)
-        }
+        (FloorStage::Verify, Some(tree), Some(base)) if allow_reuse => CreatorSeed::load(
+            &scratch.logs,
+            tree,
+            base,
+            &scratch.posture_level(&sandbox_level),
+            exclude,
+        ),
         _ => None,
     };
     // (core#1152) Reuse is in ANY order: every check the record stands for is reused, wherever it
@@ -5695,7 +5875,7 @@ fn run_detected(
                     ord: j.ord,
                     attempt: j.attempt,
                     phase: j.phase.clone(),
-                    sandbox_level: sandbox_level.clone(),
+                    sandbox_level: scratch.posture_level(&sandbox_level),
                     exclude,
                     checks: ran_here,
                 },
@@ -5746,6 +5926,7 @@ fn run_detected(
             key: None,
             resumed,
             reused_from,
+            runner: None,
         },
         again.zip(rerun_inputs),
     )
@@ -6831,6 +7012,7 @@ pub(crate) fn guarded_checkout_refused(
         key: None,
         resumed: None,
         reused_from: None,
+        runner: None,
     }
 }
 
@@ -6991,7 +7173,10 @@ impl BaseTree {
         // The base runs the head's argv, and it can change within a run (a targeted command with
         // the files a rework touches — `{files}`, the derived `-p <crate>` — or a reworked
         // `.wicked/checks.json`): a cached run of ANOTHER argv is not this comparison.
-        if rec.floor_policy != FLOOR_POLICY_VERSION || rec.head_argv != check.argv {
+        if rec.floor_policy != FLOOR_POLICY_VERSION
+            || rec.head_argv != check.argv
+            || rec.posture != scratch.posture()
+        {
             return None;
         }
         // (codex r12) Reused evidence must still be there, whole — and its age restarts, so the
@@ -7371,6 +7556,7 @@ impl BaseTree {
             guide: guide_id(guide),
             run,
             toc,
+            posture: scratch.posture(),
         };
         if rec.run.timed_out
             || rec.run.spawn_error.is_some()
@@ -7406,6 +7592,10 @@ struct BaseRecord {
     run: CheckRun,
     #[serde(default)]
     toc: Option<Toc>,
+    /// (DES-FLOOR-CONTAINER) The runner the base ran under ([`CheckScratch::posture`]): empty for
+    /// the host floor, the image for a container floor. A record of another runner is a miss.
+    #[serde(default)]
+    posture: String,
 }
 
 // ─── DES-FLOOR-V2: the suite's TOC plus exit codes ─────────────────────────────────────────────
@@ -9677,91 +9867,139 @@ pub(crate) fn run_one_with(
     // enters it with `fchdir` — a detached descendant of an earlier check that swaps the path for a
     // link between the check above and the child's chdir cannot send this command elsewhere.
     #[cfg(unix)]
-    let start_dir = match held.map(|h| h.dir_fd(&check.dir)).transpose() {
+    let start_dir = match held
+        .filter(|_| scratch.container.is_none())
+        .map(|h| h.dir_fd(&check.dir))
+        .transpose()
+    {
         Ok(fd) => fd,
         Err(e) => {
             result.spawn_error = Some(e);
             return result;
         }
     };
-    // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
-    // rather than a bare OS code.
-    let Some(exe) = crate::validator::find_on_path(bin) else {
-        result.spawn_error = Some(format!("`{bin}` is not on PATH"));
-        result.duration_ms = started.elapsed().as_millis() as u64;
-        return result;
-    };
-    // `[<sandbox wrapper…>] [env K=V…] <exe> <args…>` — an empty wrapper is the disclosed
-    // best-effort floor. (DES-BUILD-GUIDE) A guide's env is applied INSIDE the boundary only,
-    // through `env` after the launcher: never on the launcher's own environment, which stays the
-    // floor's sanitized allow-list (a launcher that is not setuid — bwrap — honours `LD_PRELOAD`
-    // before it arms anything). With no launcher (no wrapper) the spawned process IS the command,
-    // and the env is set on it directly.
-    // (The names were checked when the guide loaded: `floor_guide::env_name_ok`.)
-    let mut full: Vec<String> = sandbox.wrapper.clone();
-    let env_inside = !exec.env.is_empty() && !sandbox.wrapper.is_empty();
-    if env_inside {
-        let exe_s = exe.to_string_lossy();
-        let Some(env_bin) = crate::validator::find_on_path("env") else {
-            result.spawn_error = Some(
-                "`env` is not on PATH (it applies the guide's env inside the boundary)".into(),
-            );
-            return result;
-        };
-        // `env` reads a leading `NAME=VALUE` as an assignment: an exe path holding `=` would be.
-        if exe_s.contains('=') {
-            result.spawn_error = Some(format!(
-                "`{exe_s}` holds `=` (it would read as an env assignment)"
-            ));
-            return result;
-        }
-        full.push(env_bin.to_string_lossy().into_owned());
-        full.extend(exec.env.iter().map(|(k, v)| format!("{k}={v}")));
-    }
-    full.push(exe.to_string_lossy().into_owned());
-    full.extend(check.argv[1..].iter().cloned());
-    // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
-    let mut cmd = Command::new(&full[0]);
-    cmd.hardened()
-        .args(&full[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    #[cfg(unix)]
-    match &start_dir {
-        Some(fd) => {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::process::CommandExt;
-            // Close-on-exec is fine: the hook runs in the child after fork, before exec.
-            let raw = fd.as_raw_fd();
-            // SAFETY: the hook calls only `fchdir` (async-signal-safe) and reads `errno`; `raw`
-            // stays open in the parent until `spawn` returns (`start_dir` outlives it), so the
-            // forked child's copy is the held directory.
-            unsafe {
-                cmd.pre_exec(move || {
-                    if libc::fchdir(raw) == 0 {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
+    let mut merged_in: Option<std::io::PipeReader> = None;
+    // (DES-FLOOR-CONTAINER) In a container floor the check is a `docker exec` into its side's
+    // fresh container: the tree there is a copy, the environment the container's own, and the
+    // host's sandbox, PATH and working directory play no part.
+    let container = scratch.container.clone();
+    let mut cmd = if let Some(floor) = container.as_deref() {
+        let _ = bin;
+        match floor.command(
+            tree,
+            worktree,
+            &check.name,
+            &check.dir,
+            &check.argv,
+            &exec.env,
+        ) {
+            Ok(mut c) => {
+                c.stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped());
+                if exec.merge {
+                    match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
+                        Ok((r, w1, w2)) => {
+                            c.stdout(w1).stderr(w2);
+                            merged_in = Some(r);
+                        }
+                        Err(e) => {
+                            result.spawn_error = Some(format!("the merged output pipe: {e}"));
+                            return result;
+                        }
                     }
-                });
+                }
+                c
+            }
+            Err(e) => {
+                result.spawn_error = Some(e);
+                result.duration_ms = started.elapsed().as_millis() as u64;
+                return result;
             }
         }
-        None => {
-            cmd.current_dir(worktree.join(&check.dir));
+    } else {
+        // Resolve on PATH the way `Command::new` will, so "not installed" is a legible spawn error
+        // rather than a bare OS code.
+        let Some(exe) = crate::validator::find_on_path(bin) else {
+            result.spawn_error = Some(format!("`{bin}` is not on PATH"));
+            result.duration_ms = started.elapsed().as_millis() as u64;
+            return result;
+        };
+        // `[<sandbox wrapper…>] [env K=V…] <exe> <args…>` — an empty wrapper is the disclosed
+        // best-effort floor. (DES-BUILD-GUIDE) A guide's env is applied INSIDE the boundary only,
+        // through `env` after the launcher: never on the launcher's own environment, which stays the
+        // floor's sanitized allow-list (a launcher that is not setuid — bwrap — honours `LD_PRELOAD`
+        // before it arms anything). With no launcher (no wrapper) the spawned process IS the command,
+        // and the env is set on it directly.
+        // (The names were checked when the guide loaded: `floor_guide::env_name_ok`.)
+        let mut full: Vec<String> = sandbox.wrapper.clone();
+        let env_inside = !exec.env.is_empty() && !sandbox.wrapper.is_empty();
+        if env_inside {
+            let exe_s = exe.to_string_lossy();
+            let Some(env_bin) = crate::validator::find_on_path("env") else {
+                result.spawn_error = Some(
+                    "`env` is not on PATH (it applies the guide's env inside the boundary)".into(),
+                );
+                return result;
+            };
+            // `env` reads a leading `NAME=VALUE` as an assignment: an exe path holding `=` would be.
+            if exe_s.contains('=') {
+                result.spawn_error = Some(format!(
+                    "`{exe_s}` holds `=` (it would read as an env assignment)"
+                ));
+                return result;
+            }
+            full.push(env_bin.to_string_lossy().into_owned());
+            full.extend(exec.env.iter().map(|(k, v)| format!("{k}={v}")));
         }
-    }
-    #[cfg(not(unix))]
-    cmd.current_dir(worktree.join(&check.dir));
-    // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
-    scratch.apply_env(&mut cmd, tree, worktree);
-    if !env_inside {
-        // No launcher: this process is the command itself.
-        for (k, v) in &exec.env {
-            cmd.env(k, v);
+        full.push(exe.to_string_lossy().into_owned());
+        full.extend(check.argv[1..].iter().cloned());
+        // spawn-audit: hardened — the repository's own check command, run in the run's worktree.
+        let mut cmd = Command::new(&full[0]);
+        cmd.hardened()
+            .args(&full[1..])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        #[cfg(unix)]
+        match &start_dir {
+            Some(fd) => {
+                use std::os::fd::AsRawFd;
+                use std::os::unix::process::CommandExt;
+                // Close-on-exec is fine: the hook runs in the child after fork, before exec.
+                let raw = fd.as_raw_fd();
+                // SAFETY: the hook calls only `fchdir` (async-signal-safe) and reads `errno`; `raw`
+                // stays open in the parent until `spawn` returns (`start_dir` outlives it), so the
+                // forked child's copy is the held directory.
+                unsafe {
+                    cmd.pre_exec(move || {
+                        if libc::fchdir(raw) == 0 {
+                            Ok(())
+                        } else {
+                            Err(std::io::Error::last_os_error())
+                        }
+                    });
+                }
+            }
+            None => {
+                cmd.current_dir(worktree.join(&check.dir));
+            }
         }
-    }
-    let merged = if exec.merge {
+        #[cfg(not(unix))]
+        cmd.current_dir(worktree.join(&check.dir));
+        // The launcher's environment: the floor's sanitized allow-list only (the guide's is in `full`).
+        scratch.apply_env(&mut cmd, tree, worktree);
+        if !env_inside {
+            // No launcher: this process is the command itself.
+            for (k, v) in &exec.env {
+                cmd.env(k, v);
+            }
+        }
+        cmd
+    };
+    let merged = if container.is_some() {
+        merged_in.take()
+    } else if exec.merge {
         match std::io::pipe().and_then(|(r, w)| Ok((r, w.try_clone()?, w))) {
             Ok((r, w1, w2)) => {
                 cmd.stdout(w1).stderr(w2);
@@ -9853,6 +10091,13 @@ pub(crate) fn run_one_with(
     if let Some(st) = status.filter(|st| st.code().is_none()) {
         result.spawn_error = Some(format!("the process was ended by a signal ({st})"));
     }
+    // (DES-FLOOR-CONTAINER) Everything the check left running in its container is ended, and a
+    // check during which the container ran out of memory or stopped answering did not run to a
+    // verdict (floor infrastructure, never a failure of the change), nor did one after which the
+    // copied tree no longer holds what was copied in — whatever its exit code.
+    if let Some(why) = container.as_deref().and_then(|f| f.after(tree)) {
+        result.spawn_error = Some(why);
+    }
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what
     // was read (marked truncated) and move on rather than wait for an EOF that may never come.
     let out = out_h.map(|c| c.finish(DRAIN_CAP)).unwrap_or_default();
@@ -9899,10 +10144,13 @@ pub(crate) fn run_one_with(
     // Never applied to a passing exit or a timeout.
     if !result.timed_out && result.exit_code != Some(0) {
         let first_err = if exec.merge { &stdout } else { &stderr };
-        if let Some(msg) = crate::validator::launcher_failure(
-            &sandbox.wrapper,
-            first_err.lines().next().unwrap_or(""),
-        ) {
+        let first = first_err.lines().next().unwrap_or("");
+        let launcher = if container.is_some() {
+            crate::checks_container::launcher_failure(first, result.exit_code)
+        } else {
+            crate::validator::launcher_failure(&sandbox.wrapper, first)
+        };
+        if let Some(msg) = launcher {
             result.spawn_error = Some(msg);
         }
     }
@@ -10269,6 +10517,7 @@ pub(crate) mod tests {
             key: None,
             resumed: None,
             reused_from: None,
+            runner: None,
         };
         let reason = report.denial_reason();
         assert!(
@@ -10337,6 +10586,11 @@ pub(crate) mod tests {
     #[cfg(unix)]
     #[test]
     fn a_malformed_or_symlinked_manifest_fails_the_floor_by_name() {
+        if crate::validator::skip_in_container_floor(
+            "a_malformed_or_symlinked_manifest_fails_the_floor_by_name",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested(
             "a_malformed_or_symlinked_manifest_fails_the_floor_by_name",
         ) {
@@ -12046,6 +12300,11 @@ exit 1
     #[cfg(unix)]
     #[test]
     fn an_uninspectable_base_export_refuses_the_floor() {
+        if crate::validator::skip_in_container_floor(
+            "an_uninspectable_base_export_refuses_the_floor",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested("an_uninspectable_base_export_refuses_the_floor") {
             return;
         }
@@ -12439,6 +12698,7 @@ exit 1
             key: None,
             resumed: None,
             reused_from: None,
+            runner: None,
         };
         let denial = report.denial_reason();
         assert!(
@@ -12713,6 +12973,7 @@ exit 1
             key: None,
             resumed: None,
             reused_from: None,
+            runner: None,
         };
         assert!(report.timed_out());
         assert_eq!(report.outcome(), "timed_out");
@@ -13651,6 +13912,7 @@ exit 1
             key: None,
             resumed: None,
             reused_from: None,
+            runner: None,
         }
     }
 
@@ -14232,6 +14494,7 @@ exit 1
             guide: None,
             run: ran,
             toc: None,
+            posture: String::new(),
         };
         std::fs::write(&path, serde_json::to_string(&rec).unwrap()).unwrap();
         // (review round 15, item 17) A record taken without a guide is no answer under one.

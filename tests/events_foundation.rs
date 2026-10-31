@@ -619,7 +619,11 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
         Arc::new(OkRunner),
     );
 
-    // Phase with a Tool executor — bypasses the council.
+    // Phase with a Tool executor — bypasses the council. The tool is a no-op: the test reads
+    // only the planned executor type, and a real `cargo test` here ran the whole workspace's suite
+    // again in the test's working directory (the repository itself), into the same target dir,
+    // relinking test binaries while the outer `cargo test` was executing them (a floor saw
+    // "could not execute process … Permission denied" on a random test binary).
     let def_json = r#"{
         "id": "test-toolexec",
         "phases": [
@@ -627,7 +631,7 @@ fn unit_planned_executor_type_is_tool_for_tool_phases() {
                 "id": "run-tests",
                 "kind": "test",
                 "gate": "auto",
-                "executor": {"type": "tool", "cmd": ["cargo", "test"]}
+                "executor": {"type": "tool", "cmd": ["true"]}
             }
         ]
     }"#;

@@ -220,6 +220,11 @@ fn a_phased_launch_carries_no_power_record_and_keeps_its_preset_steps() {
 #[cfg(not(windows))]
 #[test]
 fn a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own() {
+    if crate::validator::skip_in_container_floor(
+        "a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own",
+    ) {
+        return;
+    }
     if crate::validator::skip_when_nested(
         "a_hand_off_not_pass_goes_back_to_the_orchestrator_on_its_own",
     ) {
@@ -475,6 +480,11 @@ fn power_engine(name: &str, w: Arc<Worker>, run: &str) -> Engine {
 #[cfg(not(windows))]
 #[test]
 fn a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator() {
+    if crate::validator::skip_in_container_floor(
+        "a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator",
+    ) {
+        return;
+    }
     if crate::validator::skip_when_nested(
         "a_hand_off_that_keeps_failing_goes_back_three_rounds_then_waits_for_the_operator",
     ) {
@@ -580,6 +590,11 @@ fn an_operator_raise_is_a_floor_held_for_the_plan_and_rigor_is_never_lowered_on_
 #[cfg(not(windows))]
 #[test]
 fn a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches() {
+    if crate::validator::skip_in_container_floor(
+        "a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches",
+    ) {
+        return;
+    }
     if crate::validator::skip_when_nested(
         "a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches",
     ) {

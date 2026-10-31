@@ -1139,6 +1139,12 @@ pub enum CoreEvent {
         /// why the reuse was set aside when it was (`RepoChecksReport::reused_from`). `None`
         /// (absent on the wire) when it reused nothing.
         reused_from: Option<crate::repo_checks::FloorReuse>,
+        /// (DES-FLOOR-CONTAINER, additive) Which floor ran the checks: a fresh Linux container
+        /// (`runner: "container"`, with its image, memory cap, caches and platform scope) or the
+        /// host's OS sandbox (`macos-sandbox` | `linux-bwrap` | `none`), with `fallbackReason`
+        /// when the container floor was wanted and did not run. Wire `floorRunner` (`floor` is
+        /// already the stage). `None` (absent on the wire) on a report from before it existed.
+        floor_runner: Option<Box<crate::checks_container::FloorRunner>>,
     },
     /// An operator retry re-ran a unit's floor on the SAME tree its last floor judged — the one
     /// exception to core#544's carry-forward (`RepoChecksReport::recheck`). Emitted right after
@@ -3004,6 +3010,7 @@ impl CoreEvent {
                 changed,
                 changed_truncated,
                 reused_from,
+                floor_runner,
             } => {
                 let mut v = json!({
                 "type": "repoChecksEvaluated",
@@ -3032,6 +3039,10 @@ impl CoreEvent {
                 // before the field.
                 if let Some(r) = reused_from {
                     v["reusedFrom"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
+                }
+                // (DES-FLOOR-CONTAINER) Absent on a frame from before the field.
+                if let Some(r) = floor_runner {
+                    v["floorRunner"] = serde_json::to_value(r).unwrap_or(serde_json::Value::Null);
                 }
                 v
             }
@@ -3332,6 +3343,7 @@ mod tests {
                 changed,
                 changed_truncated: cut,
                 reused_from: None,
+                floor_runner: None,
             }
             .to_json()
         };
