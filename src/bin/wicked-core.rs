@@ -987,7 +987,17 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                         session, prompt, ..
                     } if is_mine(session) => {
                         if let Some((core, run_id)) = gate {
-                            let decision = prompt_decision(prompt);
+                            // The answer tokens the gate offers (codex r1 on #1226: the loop's
+                            // ask could only be approved at its default from here).
+                            let choices: Vec<String> = ev.to_json()["choices"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|c| c.as_str())
+                                .filter(|c| c.starts_with("consent:"))
+                                .map(str::to_string)
+                                .collect();
+                            let decision = prompt_decision(prompt, &choices);
                             match core.confirm_gate(run_id, decision) {
                                 Ok(s) => println!("  → gate resolved: {s:?}"),
                                 Err(e) => {
@@ -1021,11 +1031,23 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
 }
 
 /// Prompt the operator on stdin for a gate decision (a = approve, r = reject; default approve).
-fn prompt_decision(prompt: &str) -> HumanDecision {
-    println!("  ❓ {prompt}\n  [a]pprove / [r]eject ? ");
+fn prompt_decision(prompt: &str, choices: &[String]) -> HumanDecision {
+    if choices.is_empty() {
+        println!("  ❓ {prompt}\n  [a]pprove / [r]eject ? ");
+    } else {
+        // A gate that offers choices (a consent plan, a loop's ask): type one of its tokens.
+        println!(
+            "  ❓ {prompt}\n  {} / [a]pprove (its default) / [r]eject ? ",
+            choices.join(" / ")
+        );
+    }
     let mut line = String::new();
     let _ = std::io::stdin().lock().read_line(&mut line);
-    match line.trim().chars().next() {
+    let answer = line.trim();
+    if let Some(c) = choices.iter().find(|c| c.as_str() == answer) {
+        return HumanDecision::ConsentChoice { choice: c.clone() };
+    }
+    match answer.chars().next() {
         Some('r') | Some('R') => HumanDecision::Reject,
         _ => HumanDecision::Approve {
             amend: None,
@@ -1331,38 +1353,57 @@ fn min_coverage_pct_arg(
 /// (or raises) the bar this repository's requirements graph is held to, `--clear` returns it to the
 /// daemon-wide minimum. Prints the target in force and where it comes from.
 fn requirements_target_cmd(args: &[String]) {
-    let set = flag(args, "--set");
+    // Flag PRESENCE is read on its own (codex/agy r1 on #1226): `--set` with no value, or beside
+    // `--clear`, is refused before the store is opened — never a read, never a silent clear.
+    let has_set = args.iter().any(|a| a == "--set");
     let clear = args.iter().any(|a| a == "--clear");
-    if set.is_some() && clear {
+    if has_set && clear {
         fail("requirements-target: --set and --clear are exclusive");
         return;
     }
-    let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    let change = if has_set {
+        match flag(args, "--set").filter(|v| !v.starts_with("--")) {
+            Some(v) => match wicked_governance::parse_min_coverage_pct(&v) {
+                Some(pct) => Some(Some(pct)),
+                None => {
+                    fail(&format!(
+                        "requirements-target: --set {v:?} is not a whole percentage 1..100"
+                    ));
+                    return;
+                }
+            },
+            None => {
+                fail("requirements-target: --set needs a whole percentage 1..100");
+                return;
+            }
+        }
+    } else if clear {
+        Some(None)
+    } else {
+        None
+    };
+    let path = store_path(args);
+    if let Some(pct) = change {
+        let mut store = match wicked_apps_core::open_store(Some(&path)) {
+            Ok(s) => s,
+            Err(e) => {
+                fail(&format!("requirements-target: open store failed: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = wicked_governance::set_repo_min_coverage_pct(&mut store, pct) {
+            fail(&format!("requirements-target: {e}"));
+            return;
+        }
+    }
+    // A read opens the store read-only: it never creates or changes one.
+    let store = match wicked_apps_core::open_store_ro(Some(&path)) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("requirements-target: open store failed: {e}"));
             return;
         }
     };
-    let change = match (set, clear) {
-        (Some(v), _) => match wicked_governance::parse_min_coverage_pct(&v) {
-            Some(pct) => Some(Some(pct)),
-            None => {
-                fail(&format!(
-                    "requirements-target: --set {v:?} is not a whole percentage 1..100"
-                ));
-                return;
-            }
-        },
-        (None, true) => Some(None),
-        (None, false) => None,
-    };
-    if let Some(pct) = change {
-        if let Err(e) = wicked_governance::set_repo_min_coverage_pct(&mut store, pct) {
-            fail(&format!("requirements-target: {e}"));
-            return;
-        }
-    }
     let own = match wicked_governance::repo_min_coverage_pct(&store) {
         Ok(v) => v,
         Err(e) => {

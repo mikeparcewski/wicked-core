@@ -5135,6 +5135,11 @@ pub(crate) fn resume_run_inner(
     ) {
         return Ok(session.status);
     }
+    // (domain-graph-3) A loop's open ask is answered through its gate, never resumed past: the
+    // asking step would run again with no answer (codex r1 on #1226).
+    if session.status == SessionStatus::AwaitingHuman && repeat_gate::ask_open(&*store, run_id)? {
+        return Ok(SessionStatus::AwaitingHuman);
+    }
     // (J4) An orphan: persisted `executing` with no worker in this process (the in-flight check
     // above), its cursor unit dispatched (`last_attempt`) and never folded (still `distributed`).
     // Its advance below re-dispatches that unit; it is not a step boundary.

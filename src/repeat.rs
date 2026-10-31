@@ -190,12 +190,18 @@ pub fn ask_prompt(signal: &Signal, ord: u32) -> String {
             s.push_str(&format!(" \u{2022} {}{rec}.", c.label));
         }
     }
+    if signal.choices.is_empty() {
+        // (agy r1 on #1226) An ask with no choice of its own is answered approve (the step runs
+        // again) or stop — say both.
+        s.push_str(" \u{2022} Approve: the step runs again.");
+    }
     s.push_str(" \u{2022} Stop here: the run ends and what it did so far is kept.");
     s
 }
 
 /// The fields an ask adds to `awaitingHuman`: `choices` (the answer tokens, `reject` last),
-/// `recommended` (the default's index), `choiceLabels` (per token) and `repeatLine`.
+/// `recommended` (the default's index; absent when the step offered no choice), `choiceLabels`
+/// (per token) and `repeatLine`.
 pub fn event_fields(signal: &Signal) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::json;
     let mut m = serde_json::Map::new();
@@ -207,12 +213,14 @@ pub fn event_fields(signal: &Signal) -> serde_json::Map<String, serde_json::Valu
         tokens.push(t);
     }
     labels.insert("reject".into(), json!("Stop here"));
-    let recommended = default_choice(signal)
-        .and_then(|d| signal.choices.iter().position(|c| c.id == d.id))
-        .unwrap_or(0);
     tokens.push("reject".into());
     m.insert("choices".into(), json!(tokens));
-    m.insert("recommended".into(), json!(recommended));
+    // The step's recommendation, when it offered choices; never `reject` by default (agy r1).
+    if let Some(i) =
+        default_choice(signal).and_then(|d| signal.choices.iter().position(|c| c.id == d.id))
+    {
+        m.insert("recommended".into(), json!(i));
+    }
     m.insert("choiceLabels".into(), serde_json::Value::Object(labels));
     m.insert("repeatLine".into(), json!(signal.line));
     m
@@ -281,6 +289,18 @@ mod tests {
         let p = ask_prompt(&s, 7);
         assert!(p.starts_with("budget reached Choose one:"), "{p}");
         assert!(p.contains("Map 12 more (recommended)") && p.ends_with("is kept."));
+    }
+
+    #[test]
+    fn an_ask_with_no_choice_recommends_nothing_and_says_approve_runs_it_again() {
+        let s = parse_signal(r#"wicked-repeat {"next":"ask","line":"pause"}"#).unwrap();
+        let f = event_fields(&s);
+        assert_eq!(f["choices"], serde_json::json!(["reject"]));
+        assert!(
+            f.get("recommended").is_none(),
+            "stop is never the recommendation"
+        );
+        assert!(ask_prompt(&s, 3).contains("Approve: the step runs again."));
     }
 
     #[test]

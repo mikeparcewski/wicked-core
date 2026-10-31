@@ -1375,6 +1375,14 @@ impl WorkflowDef {
                     "only a Tool phase decides a loop (an agent's output never does)".into(),
                 );
             }
+            // Its own gate would fire after it, which a `continue` skips (codex/agy r1 on #1226):
+            // the deciding step asks through its decision, never through a human gate.
+            if p.gate != GateSpec::Auto {
+                return bad(
+                    "the deciding step asks through its own decision; it takes no human gate"
+                        .into(),
+                );
+            }
             let start = match pos.get(from) {
                 Some(&s) if s < i => s,
                 Some(_) => return bad(format!("{from} is not declared before it")),
@@ -1392,6 +1400,10 @@ impl WorkflowDef {
                 }
                 if q.id != p.id && q.repeat_from.is_some() {
                     return bad(format!("the range holds another loop ({})", q.id));
+                }
+                // A team member's step owes the PA's acceptance of THAT work, once (codex r1).
+                if q.owner == StepOwner::Team {
+                    return bad(format!("the range holds {}, a team member's step", q.id));
                 }
             }
         }

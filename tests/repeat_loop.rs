@@ -270,6 +270,14 @@ fn a_loop_runs_its_range_again_asks_at_its_budget_and_goes_on_with_the_choice() 
     );
     let refused = core.confirm_gate(sid, HumanDecision::RequestChanges { note: None });
     assert!(refused.is_err(), "a send-back does not answer an ask");
+    // A resume never runs past the ask (codex r1 on #1226): the step does not run again.
+    let before = log_lines(&dir).len();
+    assert_eq!(
+        core.resume_run(sid).expect("resume"),
+        wicked_core::SessionStatus::AwaitingHuman
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(log_lines(&dir).len(), before, "nothing ran on resume");
 
     // The choice re-runs the deciding step with it; its `continue` makes one more pass, then done.
     core.confirm_gate(
@@ -364,6 +372,17 @@ fn a_loop_only_a_tool_can_decide_and_only_backward_is_refused_at_registration() 
                                 "gate": "consent_before"},
                                {"id": "c", "kind": "recon", "executor": tool, "repeat_from": "a"}]),
             "the range holds b, which asks consent first",
+        ),
+        (
+            serde_json::json!([{"id": "a", "kind": "recon", "executor": tool},
+                               {"id": "b", "kind": "recon", "executor": tool, "repeat_from": "a",
+                                "gate": {"human_confirm": {"unconditional": true}}}]),
+            "it takes no human gate",
+        ),
+        (
+            serde_json::json!([{"id": "a", "kind": "recon", "executor": tool, "owner": "team"},
+                               {"id": "b", "kind": "recon", "executor": tool, "repeat_from": "a"}]),
+            "the range holds a, a team member's step",
         ),
     ];
     for (i, (phases, why)) in cases.into_iter().enumerate() {

@@ -287,6 +287,79 @@ fn domain_graph_refuses_below_the_configured_minimum_and_says_how_far_it_got() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// domain-graph-3: a repository's own target (`requirements-target`) lives in its store and holds
+/// the graph before the daemon-wide minimum: lowered to 80 there, the bare `--min-coverage-pct`
+/// check passes at 80% even with the daemon at 90; `--set` with no value, or beside `--clear`, is
+/// refused and changes nothing (codex/agy r1 on #1226); a read never creates a store.
+#[test]
+fn a_repositorys_own_target_holds_the_check_before_the_daemon_minimum() {
+    let dir = scratch("target");
+    let db = dir.join("estate.db");
+    seed_many(db.to_str().unwrap(), 5, 4); // 80% mapped
+    let dbs = db.to_str().unwrap();
+    let cli = |args: &[&str]| {
+        Command::new(BIN)
+            .env("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT", "90")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let check = || {
+        cli(&[
+            "coverage",
+            "--db",
+            dbs,
+            "--out",
+            dir.join("c.json").to_str().unwrap(),
+            "--min-coverage-pct",
+        ])
+    };
+    assert_eq!(
+        check().status.code(),
+        Some(3),
+        "the daemon's 90 holds first"
+    );
+    let read = cli(&["requirements-target", "--db", dbs, "--json"]);
+    assert!(read.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&read.stdout).unwrap(),
+        serde_json::json!({"min_coverage_pct": 90, "source": "daemon"})
+    );
+    for bad in [
+        vec!["requirements-target", "--db", dbs, "--set"],
+        vec!["requirements-target", "--db", dbs, "--clear", "--set", "70"],
+        vec!["requirements-target", "--db", dbs, "--set", "--json"],
+        vec!["requirements-target", "--db", dbs, "--set", "0"],
+    ] {
+        assert_eq!(cli(&bad).status.code(), Some(1), "{bad:?} is refused");
+    }
+    let set = cli(&["requirements-target", "--db", dbs, "--set", "80", "--json"]);
+    assert!(set.status.success());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&set.stdout).unwrap()["source"],
+        "repository"
+    );
+    assert!(
+        check().status.success(),
+        "the repository's own 80 holds now"
+    );
+    assert!(cli(&["requirements-target", "--db", dbs, "--clear"])
+        .status
+        .success());
+    assert_eq!(
+        check().status.code(),
+        Some(3),
+        "cleared: the daemon's 90 again"
+    );
+    let missing = dir.join("never.db");
+    assert!(
+        !cli(&["requirements-target", "--db", missing.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(!missing.exists(), "a read creates no store");
+}
+
 #[test]
 fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
     let dir = scratch("check");

@@ -42,20 +42,34 @@ pub(super) fn after_pass(
 ) -> anyhow::Result<Option<StepApplied>> {
     use crate::repeat::Next;
     let run_id = session.id.clone();
+    let mut units = crate::domain::session_units(store, &run_id)?;
+    let Some(unit) = units.get_mut(unit_ix) else {
+        return Ok(None);
+    };
+    if unit.repeat_from.is_none() {
+        return Ok(None);
+    }
+    // A choice answers ONE ask: the run that received it consumed it, whatever it decided
+    // (agy r1 on #1226, P1) — a later pass, or a rewind across this step, never sees it again.
+    if unit.repeat_choice.take().is_some() {
+        put_node(store, unit.to_node())?;
+    }
+    let unit = &units[unit_ix];
     let Some(signal) = crate::repeat::parse_signal(output) else {
         return Ok(None);
     };
     if signal.next == Next::Done {
         return Ok(None);
     }
-    let units = crate::domain::session_units(store, &run_id)?;
-    let Some(unit) = units.get(unit_ix) else {
-        return Ok(None);
-    };
-    let Some(from) = unit.repeat_from.as_deref() else {
-        return Ok(None);
-    };
+    let from = unit.repeat_from.as_deref().unwrap_or_default();
     let ord = unit.ord;
+    let refuse = |subscribers: &mut crate::event_log::EventSink, why: String| {
+        emit_run_error(
+            subscribers,
+            &run_id,
+            anyhow::anyhow!("step {ord} asked for another pass, but {why}; the run goes on"),
+        );
+    };
     let Some(from_ix) = units
         .iter()
         .position(|u| u.phase_id() == Some(from))
@@ -63,24 +77,37 @@ pub(super) fn after_pass(
     else {
         // The def's validation refuses this; a revision that moved the target is said, and the
         // run moves on rather than looping somewhere nobody declared.
-        emit_run_error(
+        refuse(
             subscribers,
-            &run_id,
-            anyhow::anyhow!(
-                "step {ord} asked for another pass from {from}, which is not a step before it in \
-                 this run; the run goes on"
-            ),
+            format!("{from} is not a step before it in this run"),
         );
         return Ok(None);
     };
-    if unit.repeat_passes >= crate::repeat::MAX_PASSES {
-        emit_run_error(
+    // The def's rule, re-judged on the run as it stands (a mid-run revision may have inserted
+    // units into the range): nothing that ships, asks consent, belongs to a team member or loops
+    // on its own is run again unattended (agy r1 on #1226).
+    if let Some(u) = units[from_ix..=unit_ix].iter().find(|u| {
+        crate::deliver_lift::is_deliver_unit(u)
+            || matches!(u.gate, crate::workflow::GateSpec::ConsentBefore)
+            || u.owner == crate::workflow::StepOwner::Team
+            || (u.ord != ord && u.repeat_from.is_some())
+    }) {
+        refuse(
             subscribers,
-            &run_id,
-            anyhow::anyhow!(
-                "step {ord} asked for pass {} of its loop; the engine stops a loop at {} passes, \
-                 so the run goes on",
-                unit.repeat_passes.saturating_add(2),
+            format!(
+                "its range now holds unit {}, which cannot run again unattended",
+                u.ord
+            ),
+        );
+        return Ok(None);
+    }
+    // `repeat_passes` counts the passes already sent back; this one is pass `repeat_passes + 1`,
+    // the last the engine runs is MAX_PASSES (codex/agy r1 on #1226: pass 201 got through).
+    if unit.repeat_passes.saturating_add(1) >= crate::repeat::MAX_PASSES {
+        refuse(
+            subscribers,
+            format!(
+                "the engine stops a loop at {} passes",
                 crate::repeat::MAX_PASSES
             ),
         );
@@ -93,14 +120,15 @@ pub(super) fn after_pass(
             // the gate's approve dispatches it again at a fresh attempt, so its command decides
             // again with the operator's choice in hand. Reject cancels the run; what it did is kept.
             // Re-armed like a rewind target (a Done unit's late result is stale by rule): the
-            // approve dispatches it at its own next attempt, a fresh dispatch key.
+            // approve dispatches it at its own next attempt, a fresh dispatch key. Every answer is
+            // a person's, so an ask that keeps asking is bounded by the person answering it.
             let mut u = unit.clone();
             u.status = crate::domain::UnitStatus::Distributed;
             u.worktree_baseline = None;
             u.worktree_mutation = None;
-            put_node(store, u.to_node())?;
             session.unit_ix = unit_ix;
             session.attempt = next_attempt(unit);
+            put_node(store, u.to_node())?;
             pause_for_human(
                 store,
                 subscribers,
@@ -116,9 +144,13 @@ pub(super) fn after_pass(
         Next::Continue => {
             let from_ord = units[from_ix].ord;
             let pass = unit.repeat_passes.saturating_add(1);
-            // ONE pass of writes over the range, as a rewind re-arms its range: every unit from the
-            // target through the loop unit runs again at its own next attempt (a fresh dispatch
-            // key), with nothing of the previous pass's tree baseline or denial left on it.
+            // ONE write over the range, the counter and the cursor (codex r1 on #1226: a crash
+            // between per-unit writes left re-armed units behind a cursor still on the loop step).
+            // Every unit from the target through the loop unit runs again at its own next attempt
+            // (a fresh dispatch key), as a NEW pass: nothing of the previous pass's tree baseline,
+            // denial, failed seats, review rounds or rulings is carried onto different work (codex
+            // r1: page two's first FAIL reached the capped review's adjudication).
+            let mut nodes = Vec::new();
             for (ix, u) in units.iter().enumerate().take(unit_ix + 1).skip(from_ix) {
                 let mut u = u.clone();
                 u.status = if ix == from_ix {
@@ -133,18 +165,21 @@ pub(super) fn after_pass(
                 u.requested_rejudge = None;
                 u.rework_of = None;
                 u.rework_amendment = None;
+                u.worker_failed_clis.clear();
+                u.review_rounds.clear();
+                u.operator_rulings.clear();
+                u.floor_auto_retries = 0;
                 if ix == unit_ix {
                     u.repeat_passes = pass;
-                    // A choice answers ONE ask: the next pass decides without it.
-                    u.repeat_choice = None;
                 }
-                put_node(store, u.to_node())?;
+                nodes.push(u.to_node());
             }
             session.unit_ix = from_ix;
             session.attempt = next_attempt(&units[from_ix]);
             session.verified_tree = None;
             session.status = SessionStatus::Executing;
-            put_node(store, session.to_node())?;
+            nodes.push(session.to_node());
+            crate::domain::put_nodes(store, &nodes)?;
             emit(
                 subscribers,
                 CoreEvent::StepRepeated {
@@ -178,6 +213,18 @@ pub(super) fn after_pass(
     }
 }
 
+/// Whether `run_id` has an open `repeat` ask: a resume must not run past it (codex r1 on #1226 —
+/// `resume_run` re-dispatched the asking step with no answer).
+pub(super) fn ask_open(store: &dyn GraphStore, run_id: &str) -> anyhow::Result<bool> {
+    Ok(crate::interaction::list_interactions(
+        store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .iter()
+    .any(|r| r.gate_kind.as_deref() == Some(crate::repeat::GATE_KIND)))
+}
+
 /// An answer at an open `repeat` ask on unit `ord`, turned into the ordinary approve / reject: a
 /// `consent:<id>` the ask offers (or a plain approve = its recommended choice) is recorded on the
 /// unit, whose command re-runs with it; reject stops the run. Every other answer is refused here,
@@ -199,6 +246,9 @@ pub(super) fn resolve_answer(
                     .collect()
             })
             .unwrap_or_default();
+        if v.is_empty() {
+            v.push("approve".into());
+        }
         v.push("reject".into());
         v.join(", ")
     };
@@ -246,4 +296,226 @@ pub(super) fn resolve_answer(
             amend_scope: crate::workflow::AmendScope::Cursor,
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{HumanConfirm, UnitStatus, WorkUnit};
+    use crate::scope::EntityMode;
+    use std::sync::mpsc::channel;
+    use wicked_apps_core::open_store;
+
+    fn session(run_id: &str, unit_ix: usize) -> AgentSession {
+        AgentSession {
+            intent_amendments: Vec::new(),
+            id: run_id.into(),
+            workflow_id: format!("wf-{run_id}"),
+            problem: "p".into(),
+            entity_mode: EntityMode::Shared,
+            collection_scope: None,
+            clis: vec!["claude".into()],
+            status: SessionStatus::Executing,
+            human_confirm: HumanConfirm::None,
+            auto_deliver: false,
+            unit_ix,
+            attempt: 0,
+            workdir: None,
+            repo_ref: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_graph: None,
+            project_id: None,
+            archived_at: None,
+            archive_note: None,
+            verified_tree: None,
+            run_branch: None,
+            base_commit: None,
+            finished_at: None,
+            seat_failures: Vec::new(),
+            benched_seats: Vec::new(),
+            team: None,
+            team_plan: None,
+            exclude_seats: Vec::new(),
+            evidence_root: None,
+            assurance: Default::default(),
+            power: None,
+        }
+    }
+
+    /// `page` (ord 1, done) → `next` (ord 2, the loop step, just passed); `extra` units go between.
+    fn seed(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        extra: Vec<WorkUnit>,
+        next: impl FnOnce(&mut WorkUnit),
+    ) -> usize {
+        let mut page = WorkUnit::pending(format!("{run_id}:page"), run_id, 1, "page");
+        page.status = UnitStatus::Done;
+        page.last_attempt = Some(0);
+        page.assigned_cli = Some("claude".into());
+        page.review_rounds.push(crate::domain::ReviewRound {
+            attempt: 0,
+            findings: "f".into(),
+            outcome: Some(crate::domain::REVIEW_SENT_BACK.to_string()),
+        });
+        page.worker_failed_clis.push("codex".into());
+        put_node(store, page.to_node()).unwrap();
+        let mut ord = 2;
+        for mut u in extra {
+            u.ord = ord;
+            ord += 1;
+            put_node(store, u.to_node()).unwrap();
+        }
+        let mut n = WorkUnit::pending(format!("{run_id}:next"), run_id, ord, "next");
+        n.status = UnitStatus::Done;
+        n.last_attempt = Some(0);
+        n.tool_cmd = Some(vec!["true".into()]);
+        n.repeat_from = Some("page".into());
+        next(&mut n);
+        put_node(store, n.to_node()).unwrap();
+        let ix = (ord - 1) as usize;
+        put_node(store, session(run_id, ix).to_node()).unwrap();
+        ix
+    }
+
+    fn run(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        ix: usize,
+        out: &str,
+    ) -> (Option<StepApplied>, Vec<CoreEvent>) {
+        let mut s = crate::domain::get_session(&*store, run_id)
+            .unwrap()
+            .unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let mut subs = crate::event_log::EventSink::default();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        subs.push(ev_tx);
+        let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
+        let r = after_pass(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut s,
+            ix,
+            out,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        (r, ev_rx.try_iter().collect())
+    }
+
+    fn unit(store: &dyn GraphStore, run_id: &str, ord: u32) -> WorkUnit {
+        crate::domain::session_units(store, run_id)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.ord == ord)
+            .unwrap()
+    }
+
+    const CONTINUE: &str = r#"wicked-repeat {"next":"continue","line":"page 2"}"#;
+
+    fn errors(evs: &[CoreEvent]) -> Vec<String> {
+        evs.iter()
+            .filter_map(|e| match e {
+                CoreEvent::Error { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// codex/agy r1 on #1226: pass 200 is the last the engine runs (pass 201 got through).
+    #[test]
+    fn the_engine_runs_no_pass_past_its_cap() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ix = seed(&mut store, "cap", Vec::new(), |n| {
+            n.repeat_passes = crate::repeat::MAX_PASSES - 1
+        });
+        let (r, evs) = run(&mut store, "cap", ix, CONTINUE);
+        assert!(r.is_none(), "the run goes on past the loop");
+        assert!(
+            errors(&evs)
+                .iter()
+                .any(|m| m.contains("stops a loop at 200 passes")),
+            "{evs:?}"
+        );
+        assert!(!evs
+            .iter()
+            .any(|e| matches!(e, CoreEvent::StepRepeated { .. })));
+        assert_eq!(
+            unit(&store, "cap", 2).repeat_passes,
+            crate::repeat::MAX_PASSES - 1
+        );
+    }
+
+    /// agy r1 on #1226 (P1): a choice is consumed by the run that received it, whatever it decided.
+    #[test]
+    fn a_choice_answers_one_ask_and_is_gone_after_its_run() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ix = seed(&mut store, "choice", Vec::new(), |n| {
+            n.repeat_choice = Some("lower".into())
+        });
+        let (r, _) = run(
+            &mut store,
+            "choice",
+            ix,
+            r#"wicked-repeat {"next":"done","line":"lowered"}"#,
+        );
+        assert!(r.is_none());
+        assert_eq!(unit(&store, "choice", 2).repeat_choice, None);
+    }
+
+    /// agy r1 on #1226: a range that now holds a deliver step is never run again unattended.
+    #[test]
+    fn a_range_that_now_holds_a_deliver_step_is_not_looped() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut deliver = WorkUnit::pending("dl:deliver", "dl", 0, "deliver");
+        deliver.catalog = Some("deliver".into());
+        deliver.tool_cmd = Some(vec!["true".into()]);
+        let ix = seed(&mut store, "dl", vec![deliver], |_| {});
+        let (r, evs) = run(&mut store, "dl", ix, CONTINUE);
+        assert!(r.is_none());
+        assert!(
+            errors(&evs)
+                .iter()
+                .any(|m| m.contains("cannot run again unattended")),
+            "{evs:?}"
+        );
+        assert_eq!(
+            unit(&store, "dl", 1).status,
+            UnitStatus::Done,
+            "nothing was re-armed"
+        );
+    }
+
+    /// codex r1 on #1226: a new pass carries nothing of the last pass's reviews or failed seats,
+    /// and the range, counter and cursor move together.
+    #[test]
+    fn continue_starts_a_fresh_pass_of_the_range() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ix = seed(&mut store, "fresh", Vec::new(), |_| {});
+        let (r, evs) = run(&mut store, "fresh", ix, CONTINUE);
+        assert!(r.is_some());
+        assert!(evs.iter().any(|e| matches!(e, CoreEvent::StepRepeated { ord: 2, from_ord: 1, pass: 1, line, .. } if line == "page 2")), "{evs:?}");
+        let page = unit(&store, "fresh", 1);
+        assert!(
+            page.review_rounds.is_empty() && page.worker_failed_clis.is_empty(),
+            "{page:?}"
+        );
+        let next = unit(&store, "fresh", 2);
+        assert_eq!((next.status, next.repeat_passes), (UnitStatus::Pending, 1));
+        let s = crate::domain::get_session(&store, "fresh")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (s.unit_ix, s.attempt),
+            (0, 1),
+            "the cursor is on the range's first step, at a fresh attempt"
+        );
+    }
 }
