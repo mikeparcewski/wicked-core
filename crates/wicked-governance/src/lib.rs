@@ -105,10 +105,10 @@ pub use domain_model::{
     assert_front_half_coverage, assert_front_half_coverage_min, build_domain_model,
     build_domain_model_with, coverage_verdict, load_domain_graph, mapped_pct, meets_minimum,
     min_coverage_pct_from_env, model_coverage, parse_min_coverage_pct, persist_domain_model,
-    recompute_front_half_coverage, recompute_front_half_coverage_with, CoverageConfig,
-    CoverageReport, Domain, DomainBuildOptions, DomainModel, Entity, EntityField, ErrorPath,
-    Metadata as DomainMetadata, ModelCoverage, PerApp, Provenance as DomainProvenance, Requirement,
-    Rule as DomainRule, UnaccountedNode, Validation, DEFAULT_MIN_COVERAGE_PCT,
+    recompute_front_half_coverage, recompute_front_half_coverage_with, stabilize_requirement_ids,
+    CoverageConfig, CoverageReport, Domain, DomainBuildOptions, DomainModel, Entity, EntityField,
+    ErrorPath, Metadata as DomainMetadata, ModelCoverage, PerApp, Provenance as DomainProvenance,
+    Requirement, Rule as DomainRule, UnaccountedNode, Validation, DEFAULT_MIN_COVERAGE_PCT,
     DEFAULT_RESOLVE_THRESHOLD, MIN_COVERAGE_ENV,
 };
 // Corroboration of each requirement (operator ruling 2026-10-31, "validation by duplication").

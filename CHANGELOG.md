@@ -17,9 +17,12 @@ Two release tracks share this file, newest entry first regardless of track:
 - **The requirements graph lives in estate and is read from there (operator ruling 2026-10-31).** `wicked-core
   domain-graph` already saved the graph into the repo's estate store (domain, requirement and business-rule nodes,
   `SatisfiedBy` edges to code, corroboration on each requirement). Now it is the only copy:
-  - `persist_domain_model` removes the domain, requirement and rule nodes an earlier build wrote that this build no
-    longer has, so the store holds the latest build. Ids stay stable as coverage grows.
-  - The new `wicked_governance::load_domain_graph` reads the graph back from the store in the domain-model shape,
+  - `persist_domain_model` replaces the previous build whole (old nodes with all their edges) in one batch, so the
+    store holds exactly the latest build, and stores the requirement and domain documents and rule provenance on
+    their nodes. `stabilize_requirement_ids` gives each requirement the id the previous build gave the same code, so
+    ids (and crew's overrides keyed on them) follow the code when behaviours are added or deleted.
+  - The new `wicked_governance::load_domain_graph` reads back the build's exact document (it validates against the
+    domain-model schema),
     and `repo::requirements_graph_for_repo` wraps it as `{ graph, coverage }`. core-ts exposes the same read as
     `getRequirementsGraphForRepo`. The coverage label comes from the store's own counts at read time, checked
     against the configured minimum.

@@ -69,8 +69,9 @@
 //!   wicked-core coverage [--out F]                # recompute front-half coverage FROM THE STORE →
 //!       # coverage-report.json (schema-exact; two-predicate: bare/description-only behavior nodes are holes)
 //!   wicked-core domain-graph [--repo-root D] [--min-coverage-pct N] [--coverage F] [--out F]
-//!       # translate the annotated estate graph into requirements_graph.json at
-//!       # <D>/.wicked-estate/requirements/ (front-half coverage RECOMPUTED from the store, FAIL-CLOSED
+//!       # build the requirements graph from the annotated estate graph and save it INTO the store
+//!       # (--out F also writes it as a JSON export; D = the checkout whose tracked files the
+//!       # corroboration reads; front-half coverage RECOMPUTED from the store, FAIL-CLOSED
 //!       # below the configured minimum, default 80%;
 //!       # a supplied --coverage file is an optional cross-check that must agree; modern package-dir grouping)
 //!   [--db <path>]                                 # else $WICKED_ESTATE_DB, else ./wicked-estate.db
@@ -1046,10 +1047,11 @@ fn print_status(core: &Core) {
     }
 }
 
-/// `wicked-core domain-graph` — translate the annotated estate graph into a `requirements_graph.json`
-/// domain model (DES-OUTGOV-001 PR-D). Reads the front-half coverage report, gates on coverage == 1.0
-/// (FAIL-CLOSED — refuses to translate an unannotated graph), builds the model (functional / package-
-/// dir grouping, M5), and writes the artifact. Like the other pre-`Core::spawn` subcommands it opens
+/// `wicked-core domain-graph` — build the requirements graph (the domain model, DES-OUTGOV-001 PR-D)
+/// from the annotated estate graph and save it into the store (operator ruling 2026-10-31: estate is
+/// where it lives; `--out` writes a JSON export). Gates on the configured minimum coverage
+/// (FAIL-CLOSED), builds the model (functional / package-dir grouping, M5), keeps each requirement's
+/// id from the previous build, and persists it. Like the other pre-`Core::spawn` subcommands it opens
 /// the store directly for a brief read and never spawns the actor.
 ///
 /// STORE-BOUND coverage (core#25): front-half coverage is now RECOMPUTED directly from the store as the
@@ -1162,7 +1164,7 @@ fn domain_graph_cmd(args: &[String]) {
         min_coverage_pct: min_pct,
         repo_root: repo_root.as_deref(),
     };
-    let model =
+    let mut model =
         match wicked_governance::build_domain_model_with(&store, &coverage, &schema_version, &opts)
         {
             Ok(m) => m,
@@ -1171,6 +1173,14 @@ fn domain_graph_cmd(args: &[String]) {
                 return;
             }
         };
+    // A requirement keeps the id the previous build gave the same code, so ids (and crew's
+    // overrides keyed on them) follow the code when behaviours are added or deleted.
+    if let Err(e) = wicked_governance::stabilize_requirement_ids(&store, &mut model) {
+        fail(&format!(
+            "domain-graph: reading the previous build failed: {e}"
+        ));
+        return;
+    }
 
     // The domain graph belongs IN the estate DB, not only as a JSON file (operator directive; the
     // locked "domain data lives in estate's graph" direction). Persist the assembled model as

@@ -1183,6 +1183,17 @@ pub fn persist_domain_model(
                 serde_json::Value::String(desc.clone()),
             );
         }
+        // The document fields the nodes and edges do not carry (entities, cluster id) and the
+        // model's metadata, so the store reads back the exact document the build produced.
+        let mut ddoc = serde_json::to_value(domain)?;
+        if let Some(o) = ddoc.as_object_mut() {
+            o.remove("requirements");
+        }
+        dnode.metadata.insert(DOMAIN_DOC_KEY.to_string(), ddoc);
+        dnode.metadata.insert(
+            MODEL_METADATA_KEY.to_string(),
+            serde_json::to_value(&model.metadata)?,
+        );
         nodes.push(dnode);
 
         for (rkey, req) in &domain.requirements {
@@ -1269,6 +1280,11 @@ pub fn persist_domain_model(
                     rnode.metadata.insert("corroboration".to_string(), v);
                 }
             }
+            // The whole requirement as the build wrote it (rule provenance, validations, error
+            // paths …): what `load_domain_graph` returns, so a read is the build's document.
+            rnode
+                .metadata
+                .insert(REQUIREMENT_DOC_KEY.to_string(), serde_json::to_value(req)?);
             nodes.push(rnode);
 
             // domain CONTAINS requirement
@@ -1305,6 +1321,10 @@ pub fn persist_domain_model(
                 bnode
                     .metadata
                     .insert("confidence".to_string(), serde_json::json!(rule.confidence));
+                bnode.metadata.insert(
+                    "provenance".to_string(),
+                    serde_json::to_value(&rule.provenance)?,
+                );
                 nodes.push(bnode);
                 edges.push(Edge::new(
                     rsym.clone(),
@@ -1317,18 +1337,14 @@ pub fn persist_domain_model(
         }
     }
 
-    // The store holds THIS build of the graph and nothing older: a domain, requirement or rule node
-    // an earlier build wrote and this one no longer has (a domain regrouped, a requirement whose
-    // code was deleted) is removed with its edges, so a read of the store is the latest build.
-    // Everything this build keeps keeps its id (stable slot ids above), so its edges and crew's
-    // overrides keyed on it survive a growing mapping.
-    let keep: std::collections::HashSet<&str> = nodes.iter().map(|n| n.symbol.as_str()).collect();
-    let mut stale: Vec<String> = Vec::new();
-    for node in previous_graph_nodes(&*store)? {
-        if !keep.contains(node.symbol.as_str()) {
-            stale.push(node.location.file.clone());
-        }
-    }
+    // The store holds THIS build of the graph and nothing older: every domain, requirement and rule
+    // node an earlier build wrote is removed with ALL its edges, then this build is written, in one
+    // batch. A kept requirement keeps its id ([`stabilize_requirement_ids`]) but never an edge the
+    // new build did not state (a `SatisfiedBy` to code it no longer covers, a dropped dependency).
+    let stale: Vec<String> = previous_graph_nodes(&*store)?
+        .into_iter()
+        .map(|n| n.location.file)
+        .collect();
 
     // Atomic: the nodes and their edges land together or not at all. Without the batch, an
     // `upsert_edges` failure after `upsert_nodes` succeeded would leave the store holding a partial
@@ -1377,19 +1393,152 @@ fn previous_graph_nodes(store: &dyn GraphRead) -> anyhow::Result<Vec<wicked_apps
         .collect())
 }
 
+/// Node-metadata keys [`persist_domain_model`] writes the document under.
+const DOMAIN_DOC_KEY: &str = "domain_document";
+const REQUIREMENT_DOC_KEY: &str = "requirement_document";
+const MODEL_METADATA_KEY: &str = "model_metadata";
+
+/// Keep each requirement's id across builds. The builder numbers requirements by their code's
+/// position in the domain (`REQ-nnn` by slot), so deleting or inserting a behaviour ahead of others
+/// would shift every later id onto different code — and crew's overrides, keyed by id, with it.
+/// This renames the requirements of `model` to the id the PREVIOUS build in `store` gave the same
+/// code (the first `legacy_components` entry, `file#name`, in the same domain); a requirement new
+/// to the domain takes a number above every id the domain ever used, so a retired id is never
+/// reused for different code. In-domain `dependencies` follow the renames. Deterministic.
+pub fn stabilize_requirement_ids(
+    store: &dyn GraphRead,
+    model: &mut DomainModel,
+) -> anyhow::Result<()> {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    // (domain, first component) -> previous id, and the highest number each domain used.
+    let mut previous: HashMap<(String, String), String> = HashMap::new();
+    let mut high: HashMap<String, u32> = HashMap::new();
+    let nodes = previous_graph_nodes(store)?;
+    let domains: HashSet<&str> = nodes
+        .iter()
+        .filter(|n| n.location.file.starts_with(DOMAIN_FILE_PREFIX))
+        .map(|n| n.name.as_str())
+        .collect();
+    for n in nodes
+        .iter()
+        .filter(|n| n.location.file.starts_with(REQUIREMENT_FILE_PREFIX))
+    {
+        let rest = &n.location.file[REQUIREMENT_FILE_PREFIX.len()..];
+        // The domain is the longest known domain name the id path starts with (names may hold '/').
+        let Some(dname) = domains
+            .iter()
+            .filter(|d| rest.starts_with(&format!("{d}/")))
+            .max_by_key(|d| d.len())
+        else {
+            continue;
+        };
+        let rkey = &rest[dname.len() + 1..];
+        if let Some(num) = req_number(rkey) {
+            let h = high.entry((*dname).to_string()).or_insert(0);
+            *h = (*h).max(num);
+        }
+        let first = n
+            .metadata
+            .get("legacy_components")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .and_then(|v| v.as_str());
+        if let Some(first) = first {
+            previous.insert(((*dname).to_string(), first.to_string()), rkey.to_string());
+        }
+    }
+    for (dname, domain) in model.domains.iter_mut() {
+        let old = std::mem::take(&mut domain.requirements);
+        let mut next = high.get(dname).copied().unwrap_or(0);
+        let mut taken: HashSet<String> = HashSet::new();
+        let mut renamed: BTreeMap<String, Requirement> = BTreeMap::new();
+        let mut map: HashMap<String, String> = HashMap::new();
+        let mut fresh: Vec<(String, Requirement)> = Vec::new();
+        for (key, req) in old {
+            let kept = req
+                .legacy_components
+                .first()
+                .and_then(|c| previous.get(&(dname.clone(), c.clone())))
+                .filter(|id| !taken.contains(*id))
+                .cloned();
+            match kept {
+                Some(id) => {
+                    taken.insert(id.clone());
+                    map.insert(key, id.clone());
+                    renamed.insert(id, req);
+                }
+                None => fresh.push((key, req)),
+            }
+        }
+        for (key, req) in fresh {
+            let id = loop {
+                next += 1;
+                let id = format!("REQ-{next:03}");
+                if !taken.contains(&id) {
+                    break id;
+                }
+            };
+            taken.insert(id.clone());
+            map.insert(key, id.clone());
+            renamed.insert(id, req);
+        }
+        for req in renamed.values_mut() {
+            for dep in req.dependencies.iter_mut() {
+                if let Some(id) = map.get(dep.as_str()) {
+                    *dep = id.clone();
+                }
+            }
+        }
+        domain.requirements = renamed;
+    }
+    Ok(())
+}
+
+/// The number of a `REQ-nnn` id.
+fn req_number(key: &str) -> Option<u32> {
+    key.strip_prefix("REQ-").and_then(|n| n.parse().ok())
+}
+
 /// The requirements graph as the estate store holds it — the source of truth
-/// [`persist_domain_model`] writes — read back into the domain-model document shape (`metadata` +
-/// `domains{ name: { description, requirements{ REQ-id: { title, description, status,
-/// legacy_components, dependencies, corroboration, business_rules[{id, statement, confidence}],
-/// satisfied_by[code SymbolId] } } } }`). `None` when no graph has been built into this store.
+/// [`persist_domain_model`] writes — read back as the domain-model document that build produced
+/// (`metadata` + `domains{ name: { …, requirements{ REQ-id: Requirement }, entities } }`), so it
+/// deserializes as [`DomainModel`] and validates against the domain-model schema. The
+/// requirement → code links are the store's `SatisfiedBy` edges (graph queries read them there);
+/// the document carries them as `legacy_components`, as the schema says. `None` when no graph has
+/// been built into this store.
 ///
-/// `coverage` is the label to carry, computed by the caller from the store's OWN counts at read
-/// time ([`model_coverage`]), so a later run that maps more of the repository is reflected without
-/// a rebuild. Read-only; deterministic order (domains, requirements and rules by id).
+/// `coverage`, when given, replaces the build's `metadata.coverage`: the label computed by the
+/// caller from the store's OWN counts at read time ([`model_coverage`]), so a later run that maps
+/// more of the repository shows without a rebuild. Read-only; deterministic order. A read that
+/// meets an edge to a node it did not list (a rebuild committed in between) starts over, twice at
+/// most.
 pub fn load_domain_graph(
     store: &dyn GraphRead,
     coverage: Option<&ModelCoverage>,
 ) -> anyhow::Result<Option<serde_json::Value>> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match load_domain_graph_once(store, coverage)? {
+            Loaded::Torn if attempt < 3 => continue,
+            Loaded::Torn => anyhow::bail!(
+                "the requirements graph changed while it was read (a build was writing it); read again"
+            ),
+            Loaded::Graph(g) => return Ok(g),
+        }
+    }
+}
+
+enum Loaded {
+    Graph(Option<serde_json::Value>),
+    /// An edge pointed at a node the read had not listed.
+    Torn,
+}
+
+fn load_domain_graph_once(
+    store: &dyn GraphRead,
+    coverage: Option<&ModelCoverage>,
+) -> anyhow::Result<Loaded> {
     use serde_json::{json, Map, Value};
     use wicked_apps_core::EdgeKind;
     use wicked_estate_core::Direction;
@@ -1400,15 +1549,19 @@ pub fn load_domain_graph(
         .filter(|n| n.location.file.starts_with(DOMAIN_FILE_PREFIX))
         .collect();
     if domains.is_empty() {
-        return Ok(None);
+        return Ok(Loaded::Graph(None));
     }
     domains.sort_by(|a, b| a.name.cmp(&b.name));
     let by_symbol: std::collections::HashMap<&str, &wicked_apps_core::Node> =
         nodes.iter().map(|n| (n.symbol.as_str(), n)).collect();
-    let meta_str = |n: &wicked_apps_core::Node, k: &str| -> Option<Value> {
-        n.metadata.get(k).filter(|v| !v.is_null()).cloned()
-    };
 
+    let mut metadata = domains
+        .iter()
+        .find_map(|d| d.metadata.get(MODEL_METADATA_KEY).cloned())
+        .unwrap_or_else(|| {
+            json!({ "schema_version": "1.1.0", "migration_mode": "functional",
+                    "source": "estate-graph" })
+        });
     let mut out_domains = Map::new();
     for d in domains {
         let dname = d.name.clone();
@@ -1418,77 +1571,98 @@ pub fn load_domain_graph(
             if e.kind != EdgeKind::Contains {
                 continue;
             }
-            if let Some(r) = by_symbol.get(e.target.as_str()) {
-                if let Some(key) = r.location.file.strip_prefix(req_prefix.as_str()) {
-                    reqs.push((key.to_string(), r));
-                }
+            let Some(r) = by_symbol.get(e.target.as_str()) else {
+                return Ok(Loaded::Torn);
+            };
+            if let Some(key) = r.location.file.strip_prefix(req_prefix.as_str()) {
+                reqs.push((key.to_string(), r));
             }
         }
         reqs.sort_by(|a, b| a.0.cmp(&b.0));
         reqs.dedup_by(|a, b| a.0 == b.0);
         let mut out_reqs = Map::new();
         for (key, r) in reqs {
-            let rule_prefix = format!("{RULE_FILE_PREFIX}{dname}/{key}/");
-            let mut rules: Vec<(String, Value)> = Vec::new();
-            let mut satisfied: Vec<String> = Vec::new();
-            for e in store.neighbors(&r.symbol, Direction::Dependencies)? {
-                match e.kind {
-                    EdgeKind::Contains => {
-                        if let Some(b) = by_symbol.get(e.target.as_str()) {
-                            if let Some(id) = b.location.file.strip_prefix(rule_prefix.as_str()) {
-                                rules.push((
-                                    id.to_string(),
-                                    json!({
-                                        "id": id,
-                                        "statement": b.name,
-                                        "confidence": b.metadata.get("confidence").cloned()
-                                            .unwrap_or(Value::Null),
-                                    }),
-                                ));
-                            }
-                        }
-                    }
-                    EdgeKind::SatisfiedBy => satisfied.push(e.target.as_str().to_string()),
-                    _ => {}
-                }
-            }
-            rules.sort_by(|a, b| a.0.cmp(&b.0));
-            satisfied.sort();
-            satisfied.dedup();
-            let mut req = Map::new();
-            req.insert("title".into(), Value::String(r.name.clone()));
-            for k in [
-                "description",
-                "status",
-                "legacy_components",
-                "dependencies",
-                "corroboration",
-            ] {
-                if let Some(v) = meta_str(r, k) {
-                    req.insert(k.into(), v);
-                }
-            }
-            req.insert(
-                "business_rules".into(),
-                Value::Array(rules.into_iter().map(|(_, v)| v).collect()),
-            );
-            req.insert("satisfied_by".into(), json!(satisfied));
-            out_reqs.insert(key, Value::Object(req));
+            let doc = match r.metadata.get(REQUIREMENT_DOC_KEY) {
+                Some(doc) => doc.clone(),
+                // A graph persisted before the document rode on the node: rebuild what the nodes
+                // and edges say.
+                None => legacy_requirement(store, r, &by_symbol, &dname, &key)?,
+            };
+            out_reqs.insert(key, doc);
         }
-        let mut dom = Map::new();
-        if let Some(v) = meta_str(d, "description") {
-            dom.insert("description".into(), v);
-        }
+        let mut dom = match d.metadata.get(DOMAIN_DOC_KEY) {
+            Some(Value::Object(o)) => o.clone(),
+            _ => {
+                let mut o = Map::new();
+                if let Some(v) = d.metadata.get("description").filter(|v| !v.is_null()) {
+                    o.insert("description".into(), v.clone());
+                }
+                o.insert("entities".into(), json!({}));
+                o
+            }
+        };
         dom.insert("requirements".into(), Value::Object(out_reqs));
         out_domains.insert(dname, Value::Object(dom));
     }
-    let mut metadata = json!({ "source": "estate-graph" });
-    if let Some(c) = coverage {
-        metadata["coverage"] = serde_json::to_value(c)?;
+    if let (Some(c), Some(o)) = (coverage, metadata.as_object_mut()) {
+        o.insert("coverage".into(), serde_json::to_value(c)?);
     }
-    Ok(Some(
+    Ok(Loaded::Graph(Some(
         json!({ "metadata": metadata, "domains": out_domains }),
-    ))
+    )))
+}
+
+/// A requirement of a graph persisted without its document, rebuilt from its node, its rule nodes
+/// and its metadata into the schema's shape (required arrays present, possibly empty).
+fn legacy_requirement(
+    store: &dyn GraphRead,
+    r: &wicked_apps_core::Node,
+    by_symbol: &std::collections::HashMap<&str, &wicked_apps_core::Node>,
+    dname: &str,
+    key: &str,
+) -> anyhow::Result<serde_json::Value> {
+    use serde_json::{json, Value};
+    use wicked_apps_core::EdgeKind;
+    use wicked_estate_core::Direction;
+    let rule_prefix = format!("{RULE_FILE_PREFIX}{dname}/{key}/");
+    let mut rules: Vec<(String, Value)> = Vec::new();
+    for e in store.neighbors(&r.symbol, Direction::Dependencies)? {
+        if e.kind != EdgeKind::Contains {
+            continue;
+        }
+        if let Some(b) = by_symbol.get(e.target.as_str()) {
+            if let Some(id) = b.location.file.strip_prefix(rule_prefix.as_str()) {
+                let mut rule = json!({
+                    "id": id,
+                    "statement": b.name,
+                    "confidence": b.metadata.get("confidence").cloned().unwrap_or(json!(0.0)),
+                });
+                if let Some(p) = b.metadata.get("provenance") {
+                    rule["provenance"] = p.clone();
+                }
+                rules.push((id.to_string(), rule));
+            }
+        }
+    }
+    rules.sort_by(|a, b| a.0.cmp(&b.0));
+    let meta = |k: &str, default: Value| r.metadata.get(k).cloned().unwrap_or(default);
+    let mut req = json!({
+        "title": r.name,
+        "description": meta("description", json!("")),
+        "legacy_components": meta("legacy_components", json!([])),
+        "data_access": [],
+        "dependencies": meta("dependencies", json!([])),
+        "business_rules": rules.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
+        "validations": [],
+        "error_paths": [],
+        "merged_programs": [],
+    });
+    for k in ["status", "corroboration"] {
+        if let Some(v) = r.metadata.get(k).filter(|v| !v.is_null()) {
+            req[k] = v.clone();
+        }
+    }
+    Ok(req)
 }
 
 /// The coverage label for `report` against `min_pct`, from the store's own counts — the same
@@ -2175,12 +2349,10 @@ mod tests {
         }
 
         /// Operator ruling 2026-10-31: the requirements graph lives in estate. What a build saves
-        /// reads back out of the store — requirements with their business rules, SatisfiedBy code
-        /// links and corroboration, and the coverage label from the store's own counts — and a
-        /// second, larger run keeps every id, adds the new requirement and leaves nothing stale
-        /// behind (a requirement whose code is gone is removed with its edges).
+        /// reads back out of the store as the SAME document (it deserializes as `DomainModel` and
+        /// equals the build's), with the coverage label from the store's own counts when asked.
         #[test]
-        fn the_graph_reads_back_from_estate_and_stays_stable_across_a_second_run() {
+        fn the_graph_reads_back_from_estate_as_the_builds_document() {
             let mut s = store();
             let nodes: Vec<Node> = ["a", "b", "c", "d", "e"]
                 .iter()
@@ -2193,81 +2365,85 @@ mod tests {
                 load_domain_graph(&s, None).unwrap().is_none(),
                 "nothing built yet"
             );
-            let model = build_at(&s, 80);
+            let mut model = build_at(&s, 80);
+            stabilize_requirement_ids(&s, &mut model).unwrap();
             persist_domain_model(&mut s, &model).unwrap();
+            let read = load_domain_graph(&s, None).unwrap().expect("a graph");
+            let back: DomainModel = serde_json::from_value(read).unwrap();
+            assert_eq!(back, model, "the store reads back the build's document");
+
             let label = model_coverage(&cov(&s), 80);
             assert_eq!((label.mapped_pct, label.min_pct, label.mapped), (80, 80, 4));
-            let first = load_domain_graph(&s, Some(&label))
-                .unwrap()
-                .expect("a graph");
-            assert_eq!(first["metadata"]["source"], "estate-graph");
-            assert_eq!(first["metadata"]["coverage"]["mapped_pct"], 80);
-            let reqs = |g: &serde_json::Value| -> Vec<(String, String, Vec<String>)> {
-                let mut v: Vec<_> = g["domains"]["pkg"]["requirements"]
-                    .as_object()
-                    .unwrap()
-                    .iter()
-                    .map(|(k, r)| {
-                        let code: Vec<String> = r["satisfied_by"]
-                            .as_array()
-                            .unwrap()
-                            .iter()
-                            .map(|c| c.as_str().unwrap().to_string())
-                            .collect();
-                        (k.clone(), r["title"].as_str().unwrap().to_string(), code)
-                    })
-                    .collect();
-                v.sort();
-                v
-            };
-            let r1 = reqs(&first);
-            assert_eq!(
-                r1.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
-                ["b", "c", "d", "e"]
-            );
-            for (_, title, code) in &r1 {
-                let want = nodes.iter().find(|n| &n.name == title).unwrap();
-                assert_eq!(
-                    code,
-                    &vec![want.symbol.as_str().to_string()],
-                    "{title} -> its code"
-                );
-            }
-            let b = &first["domains"]["pkg"]["requirements"]["REQ-002"];
-            assert_eq!(b["business_rules"][0]["statement"], "b holds");
-            assert_eq!(b["corroboration"]["status"], "unconfirmed");
+            let labelled = load_domain_graph(&s, Some(&label)).unwrap().unwrap();
+            assert_eq!(labelled["metadata"]["coverage"]["mapped_pct"], 80);
+            assert_eq!(labelled["metadata"]["schema_version"], "1.1.0");
+        }
 
-            // Second run: `a` is mapped now, and `e`'s code is deleted from the repository.
-            map(&mut s, &nodes[0], "seat-1", "extract-loop");
-            s.remove_file("pkg/ops.rs").unwrap();
-            for n in &nodes[..4] {
-                s.begin_batch().unwrap();
-                s.upsert_nodes(std::slice::from_ref(n)).unwrap();
-                s.commit_batch().unwrap();
+        /// xreview on core#1223 (codex + agy P2): ids follow the CODE, not its position. Deleting an
+        /// early behaviour (its file gone, the others untouched) must not shift later requirements
+        /// onto different code, and a kept requirement keeps no `SatisfiedBy` edge the new build did
+        /// not state. A new behaviour takes a fresh number; nothing stale is left behind.
+        #[test]
+        fn requirement_ids_follow_their_code_across_deletions_and_edges_are_replaced() {
+            use wicked_apps_core::{EdgeKind, GraphRead};
+            use wicked_estate_core::Direction;
+            let mut s = store();
+            // One behaviour per file, all in package `pkg`.
+            let mut nodes: Vec<Node> = ["a", "b", "c"]
+                .iter()
+                .map(|n| node(&mut s, n, NodeKind::Function, &format!("pkg/{n}.rs")))
+                .collect();
+            for n in &nodes {
                 map(&mut s, n, "seat-1", "extract-loop");
             }
-            let model = build_at(&s, 80);
-            persist_domain_model(&mut s, &model).unwrap();
-            let second = load_domain_graph(&s, None).unwrap().expect("a graph");
-            let r2 = reqs(&second);
-            for kept in r1.iter().filter(|r| r.1 != "e") {
-                assert!(
-                    r2.contains(kept),
-                    "{kept:?} kept its id and its code link: {r2:?}"
+            let mut first = build_at(&s, 80);
+            stabilize_requirement_ids(&s, &mut first).unwrap();
+            persist_domain_model(&mut s, &first).unwrap();
+            let id_of = |m: &DomainModel, name: &str| -> String {
+                m.domains["pkg"]
+                    .requirements
+                    .iter()
+                    .find(|(_, r)| r.title == name)
+                    .map(|(k, _)| k.clone())
+                    .unwrap()
+            };
+            let (b1, c1) = (id_of(&first, "b"), id_of(&first, "c"));
+
+            // `a` is deleted; `d` is new.
+            s.remove_file("pkg/a.rs").unwrap();
+            let d = node(&mut s, "d", NodeKind::Function, "pkg/d.rs");
+            map(&mut s, &d, "seat-1", "extract-loop");
+            nodes.push(d);
+            let mut second = build_at(&s, 80);
+            stabilize_requirement_ids(&s, &mut second).unwrap();
+            persist_domain_model(&mut s, &second).unwrap();
+            assert_eq!(id_of(&second, "b"), b1, "b kept its id");
+            assert_eq!(id_of(&second, "c"), c1, "c kept its id");
+            let d_id = id_of(&second, "d");
+            assert!(
+                ![id_of(&first, "a"), b1.clone(), c1.clone()].contains(&d_id),
+                "a new behaviour never takes a retired id: {d_id}"
+            );
+            // Every requirement is SatisfiedBy exactly its own code, nothing from the first build.
+            for name in ["b", "c", "d"] {
+                let id = id_of(&second, name);
+                let rsym = synthetic_symbol("requirement", &format!("pkg/{id}"));
+                let code: Vec<String> = s
+                    .neighbors(&rsym, Direction::Dependencies)
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == EdgeKind::SatisfiedBy)
+                    .map(|e| s.get_node(&e.target).unwrap().unwrap().name)
+                    .collect();
+                assert_eq!(
+                    code,
+                    vec![name.to_string()],
+                    "{id} is satisfied by {name} alone"
                 );
             }
-            assert!(
-                r2.iter().any(|r| r.1 == "a"),
-                "the newly mapped behaviour joined"
-            );
-            assert!(
-                !r2.iter().any(|r| r.1 == "e"),
-                "a requirement whose code is gone is not left behind: {r2:?}"
-            );
-            assert!(
-                second["metadata"].get("coverage").is_none(),
-                "the label is the caller's, from the store's counts at read time"
-            );
+            let back: DomainModel =
+                serde_json::from_value(load_domain_graph(&s, None).unwrap().unwrap()).unwrap();
+            assert_eq!(back, second, "the store holds the second build exactly");
         }
 
         /// xreview on core#1215 (codex P2): a DESCRIPTION-only behaviour is a coverage hole, so a

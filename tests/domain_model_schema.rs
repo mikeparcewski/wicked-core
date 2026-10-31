@@ -92,10 +92,25 @@ fn built_domain_model_validates_against_the_kept_schema() {
         .flat_map(|d| d.requirements.values())
         .all(|r| r.corroboration.is_some()));
 
+    // Operator ruling 2026-10-31: the graph lives in estate, so what is SAVED and READ BACK must
+    // validate too (codex on core#1223), not only what the builder returns.
+    wicked_governance::persist_domain_model(&mut store, &new).expect("persist");
+    let label = wicked_governance::model_coverage(
+        &wicked_governance::recompute_front_half_coverage(&store).unwrap(),
+        80,
+    );
+    let read_back = wicked_governance::load_domain_graph(&store, Some(&label))
+        .unwrap()
+        .expect("the graph reads back from estate");
+
     let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("schema parses");
     let compiled = jsonschema::JSONSchema::compile(&schema).expect("schema compiles");
-    for model in [old, new] {
-        let instance = serde_json::to_value(&model).unwrap();
+    let instances = [
+        serde_json::to_value(&old).unwrap(),
+        serde_json::to_value(&new).unwrap(),
+        read_back,
+    ];
+    for instance in instances {
         let pretty = serde_json::to_string_pretty(&instance).unwrap();
         let violations: Vec<String> = match compiled.validate(&instance) {
             Ok(()) => Vec::new(),
