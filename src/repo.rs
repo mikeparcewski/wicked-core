@@ -386,7 +386,8 @@ pub fn coverage_report_for_repo(
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
 /// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
-/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product } }`
+/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product },
+/// "build": { generation, coverage: <the label the listed build persisted, or null> } or null }`
 /// (real requirements only count toward the minimum, core#1233); the
 /// coverage is recomputed from the store's own counts at read time against the configured minimum
 /// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
@@ -403,17 +404,29 @@ pub fn requirements_graph_for_repo(
     // Registered but never indexed: no store yet, so no graph and nothing counted — the unbuilt
     // state, not an error. (A store that exists but cannot be read still errors below.)
     if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
-        return Ok(serde_json::json!({ "graph": null, "coverage": null }));
+        return Ok(serde_json::json!({ "graph": null, "coverage": null, "build": null }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
     // (domain-graph-3) The repository's own target first (lowered at a budget ask), else the
     // daemon-wide minimum.
     let min_pct = wicked_governance::effective_min_coverage_pct(&repo_store)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // The rows are the last BUILD; `coverage` is the store now. `build` says which build the rows are
+    // and the label it was built at, so a reader can tell when the header counts what the list does
+    // not hold (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is
+    // built. The rows are read FIRST and the store counted after (xreview on #1237): a build or a
+    // mapping that commits in between shows as a difference, never as a stale build matching.
+    let loaded = wicked_governance::load_domain_graph_with_build(&repo_store)?;
     let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
-    let graph = wicked_governance::load_domain_graph(&repo_store, Some(&coverage))?;
-    Ok(serde_json::json!({ "graph": graph, "coverage": coverage }))
+    let (graph, build) = match loaded {
+        Some((mut graph, build)) => {
+            wicked_governance::label_domain_graph(&mut graph, &coverage)?;
+            (Some(graph), Some(build))
+        }
+        None => (None, None),
+    };
+    Ok(serde_json::json!({ "graph": graph, "coverage": coverage, "build": build }))
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
@@ -2036,7 +2049,7 @@ mod tests {
         let unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
         assert_eq!(
             unbuilt,
-            serde_json::json!({ "graph": null, "coverage": null })
+            serde_json::json!({ "graph": null, "coverage": null, "build": null })
         );
 
         std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
@@ -2060,6 +2073,52 @@ mod tests {
             "an empty build reads as built"
         );
         assert_eq!(built["coverage"]["min_pct"], 80);
+        assert_eq!(
+            built["build"],
+            serde_json::json!({ "generation": 1, "coverage": null }),
+            "the read names the build it listed (this one persisted no label)"
+        );
+
+        // req-list-stale: a build that persisted its label, then the store moved on. The rows are that
+        // build; `coverage` is the store now; `build.coverage` keeps what the rows were built at, so
+        // the two can be told apart (the rig listed 1,383 real under a header counting 3,585).
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            let built_at = wicked_governance::ModelCoverage {
+                real_pct: 23,
+                min_pct: 80,
+                behavior_bearing: 5786,
+                real: 1362,
+                placeholders: 4397,
+                unmapped: 27,
+                not_product: 2380,
+            };
+            let model = wicked_governance::DomainModel {
+                metadata: wicked_governance::DomainMetadata {
+                    schema_version: "1.1.0".into(),
+                    migration_mode: "functional".into(),
+                    source: Some("estate-graph".into()),
+                    coverage: Some(built_at),
+                },
+                domains: Default::default(),
+            };
+            wicked_governance::persist_domain_model(&mut repo_store, &model).unwrap();
+        }
+        let moved = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(moved["build"]["generation"], 2);
+        assert_eq!(
+            moved["build"]["coverage"]["real"], 1362,
+            "the build's own label"
+        );
+        assert_eq!(moved["build"]["coverage"]["real_pct"], 23);
+        assert_eq!(
+            moved["coverage"]["real"], 0,
+            "the store now (nothing mapped in it)"
+        );
+        assert_eq!(
+            moved["graph"]["metadata"]["coverage"], moved["coverage"],
+            "the document still carries the live label, as before"
+        );
         assert!(requirements_graph_for_repo(&daemon, db, "no-such-repo").is_err());
 
         let _ = std::fs::remove_dir_all(&root);

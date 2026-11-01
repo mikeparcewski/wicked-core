@@ -14,6 +14,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The requirements read says which build it lists.** crew's requirements list is the last graph BUILD and its
+  header is the store NOW, and nothing said so: on the rig wicked-crew listed the 04:59 build (1,383 real, built under
+  the old placeholder-counting gate) under a header counting 3,585 real, after a run mapped 2,223 more and stopped at
+  the repeat ask before `domain-graph`. The read overwrote the build's label with the live one, so no reader could tell.
+  `requirements_graph_for_repo` (core-ts `getRequirementsGraphForRepo`) now also returns `build: { generation,
+  coverage }`: the build record's generation and the label that build persisted, verbatim (`null` coverage when it
+  persisted none; generation 0 for a graph persisted before the build record existed), read in the same consistent
+  pass as the rows (`load_domain_graph_with_build`). The rows are read before the store is counted, so a build or a
+  mapping committed in between shows as a difference. `build` is null when nothing is built. The comparison is of
+  counts, which is what the header shows: equal counts mean the header counts what the list holds, not that every
+  statement is unchanged. Additive: `graph` and `coverage` are unchanged (`label_domain_graph` puts the live label on
+  the read, as before).
+
 - **The requirements minimum counts real requirements only (#1233, operator decision 2026-11-01).** The 80% minimum
   counted every accounted behaviour, risk-flagged placeholders included: pi-governance read 100% with 3 real
   requirements of 120, and a wicked-crew page that stated 3 rules for 500 units still lifted the share 83% → 89%.
