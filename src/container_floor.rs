@@ -2786,14 +2786,9 @@ fn carry_prompt_in_file_at(
         let prev = out.last().map(String::as_str).unwrap_or("");
         let option_value = PI_VALUE_OPTIONS.contains(&prev);
         if cli == "pi" && a != prompt && a.contains(prompt) {
-            // Glued: `--system-prompt=<text>` loads a path; a decorated positional
-            // (`"<text> Be concise."`) gets the file as its own `@path` before it.
-            if let Some(opt) = ["--system-prompt=", "--append-system-prompt="]
-                .into_iter()
-                .find(|o| a.starts_with(o) && &a[o.len()..] == prompt)
-            {
-                out.push(format!("{opt}{}", file.display()));
-            } else if option_value || a.starts_with('-') {
+            // A decorated positional (`"<text> Be concise."`) gets the file as its own `@path`
+            // before it; anything glued to an option gets the read-the-file sentence.
+            if option_value || a.starts_with('-') {
                 out.push(a.replace(prompt, &prompt_pointer("", &file, prompt.len()).join(" ")));
             } else {
                 out.push(format!("@{}", file.display()));
@@ -7201,7 +7196,7 @@ mod long_prompt_tests {
     }
 
     #[test]
-    fn pi_after_a_boolean_flag_still_gets_its_file_and_a_glued_system_prompt_gets_the_path() {
+    fn pi_after_a_boolean_flag_still_gets_its_file() {
         let root = base();
         let prompt = big_prompt();
         let mut argv =
@@ -7211,17 +7206,6 @@ mod long_prompt_tests {
             .unwrap()
             .expect("carried");
         assert!(argv.contains(&format!("@{}", c.file.display())), "{argv:?}");
-        let mut glued = vec![
-            "pi".to_string(),
-            "-p".to_string(),
-            format!("--system-prompt={prompt}"),
-            "Go.".into(),
-        ];
-        let mut mounts = Vec::new();
-        let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut glued, &mut mounts)
-            .unwrap()
-            .expect("carried");
-        assert_eq!(glued[2], format!("--system-prompt={}", c.file.display()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
