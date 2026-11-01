@@ -981,6 +981,27 @@ fn index_at_base_with(
     Ok(BaseIndex::Indexed)
 }
 
+/// garden#1370: why a run whose steps read code out of the repo graph (`graph_required`: the
+/// `domain-extraction` preset) is refused when D8 could not bring that graph to the run's base:
+/// its pages would frame code the run does not have. `None` lets the run start (the graph is
+/// current or was just indexed, or the run only scores against it). The repo with no graph at all
+/// is left to the run's own steps, which say so.
+pub(crate) fn base_index_refusal(
+    graph_required: bool,
+    indexed: &Result<BaseIndex, String>,
+    base_commit: &str,
+) -> Option<String> {
+    match indexed {
+        Err(e) if graph_required => Some(format!(
+            "the repository's code graph could not be re-indexed at this run's base {} ({e}). \
+             Mapping it would read code the run does not have, so the run is not started. \
+             Launch it again; if this repeats, check that wicked-estate runs on this host",
+            base_commit.get(..12).unwrap_or(base_commit)
+        )),
+        _ => None,
+    }
+}
+
 /// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
 pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
     let graph = code_graph_path_for_write(repo)?;
@@ -1159,6 +1180,25 @@ mod tests {
     /// repo's graph, and then reads as current; a current graph and a never-indexed repo are left
     /// alone (the indexer is not run); a failing or hung indexer is an `Err`, bounded.
     #[cfg(unix)]
+    #[test]
+    fn a_domain_mapping_is_refused_when_its_graph_could_not_reach_the_run_base() {
+        let failed: Result<BaseIndex, String> =
+            Err("the indexer exceeded 120s and was killed".into());
+        let base = "c48ea0d7e2d4f6a33a7cbd21db961dc5d2367f89";
+        let why = base_index_refusal(true, &failed, base).expect("refused");
+        assert!(
+            why.contains("c48ea0d7e2d4")
+                && why.contains("exceeded 120s")
+                && why.contains("Launch it again"),
+            "{why}"
+        );
+        // Any other run only scores against the graph: it starts, as before.
+        assert_eq!(base_index_refusal(false, &failed, base), None);
+        for ok in [BaseIndex::Current, BaseIndex::Indexed, BaseIndex::NoGraph] {
+            assert_eq!(base_index_refusal(true, &Ok(ok), base), None);
+        }
+    }
+
     #[test]
     fn d8_a_stale_repo_graph_is_reindexed_at_the_run_base() {
         use std::os::unix::fs::PermissionsExt;

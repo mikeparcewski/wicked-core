@@ -1695,6 +1695,14 @@ pub(crate) fn run(
                         let rid = run_id.clone();
                         // D8: resolved here, where the thread's state home is bound.
                         let graph_root = crate::code_graph::repo_graph_root();
+                        // garden#1370: a domain mapping reads its units' code out of the graph,
+                        // so its graph MUST be at the run's base; any other run only scores
+                        // against it (a stale graph fails closed there).
+                        let graph_required = launch_plan
+                            .as_ref()
+                            .and_then(|(_, preset)| preset.as_deref())
+                            .or_else(|| selected_def.as_ref().map(|d| d.id.as_str()))
+                            == Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID);
                         std::thread::spawn(move || {
                             // (DES-L9 / crew#550) An explicit base — the open PR's head branch a
                             // revision run starts from — reaches the mint here; `None` keeps the
@@ -1714,18 +1722,30 @@ pub(crate) fn run(
                                         // D8: the run is scored against the repo graph AT this
                                         // base; re-index a stale graph from the fresh worktree
                                         // (the base tree) before the run starts.
-                                        if let Err(e) = crate::code_graph::index_at_base(
+                                        let indexed = crate::code_graph::index_at_base(
                                             std::path::Path::new(&root),
                                             &wt,
                                             &b.commit,
                                             graph_root.as_deref(),
-                                        ) {
+                                        );
+                                        if let Err(e) = &indexed {
                                             tracing::warn!(
                                                 run_id = %rid,
                                                 "repo graph not re-indexed at the run base {}: {e}; \
                                                  a behavioural scope fails closed",
                                                 b.commit
                                             );
+                                        }
+                                        if let Some(why) = crate::code_graph::base_index_refusal(
+                                            graph_required,
+                                            &indexed,
+                                            &b.commit,
+                                        ) {
+                                            let _ = tx.send(Command::WorktreeFailed {
+                                                run_id: rid,
+                                                error: why,
+                                            });
+                                            return;
                                         }
                                     }
                                     Command::WorktreeReady {

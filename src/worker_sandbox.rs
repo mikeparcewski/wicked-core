@@ -399,7 +399,7 @@ impl FloorUnarmed {
             }
             FloorUnarmed::ArgvTooLong => {
                 "argv_too_long: the seat's command line is larger than a container can pass to \
-                 it, and its prompt could not be handed over in a file"
+                 it"
             }
         }
     }

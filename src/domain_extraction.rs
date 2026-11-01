@@ -74,7 +74,11 @@ frontier until the target is reached; grouping by domain happens in the domain-g
 each stated rule: it names a unit of the worklist, it states what the business requires rather \
 than describing the code, it is grounded in that unit's source, and its confidence is not \
 inflated. An empty statement is right where the source supports no rule (the host records it as a \
-risk). You judge work another seat did; change no file. List each problem as `ITEM n: FAIL — \
+risk). Units in test, data, manifest or document files (JSON or YAML keys, package.json fields, \
+markdown headings, test helpers) are not product requirements: the host records whatever is stated \
+for them as unconfirmed, never as a validated requirement, so they are not a reason to fail the \
+page; judge the page on its product-code units, and PASS a page that has none. You judge work \
+another seat did; change no file. List each problem as `ITEM n: FAIL — \
 <symbol> — <why>`. Judge the PAGE: a weak or code-describing statement is a problem you list, and \
 the host records every statement under its confidence threshold as a risk, never as a validated \
 requirement. End with `VERDICT: PASS` when the page is sound as a whole (most stated rules are \

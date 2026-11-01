@@ -3381,7 +3381,7 @@ impl WrappedCliStepRunner {
         // outcome at spawn decides `governed`; `floor_governed` is that outcome.
         let mut floor_pending = false;
         let mut floor_governed = false;
-        let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
+        let mut gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
             (Some(gov), true) => {
                 // #653: an org `allowManagedHooksOnly` setting drops every `--settings` hook, so
                 // arming here would announce a gate that never fires. The unit is on this carrier
@@ -3563,7 +3563,7 @@ impl WrappedCliStepRunner {
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A long prompt's file (core#1228): kept until the seat has run.
-            let mut prompt_guard: Option<crate::container_floor::RemoveOnDrop> = None;
+            let mut prompt_guard: Option<crate::container_floor::CarriedPrompt> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
@@ -3768,6 +3768,26 @@ impl WrappedCliStepRunner {
                         seat_files = c.files;
                         gateway_lease = c.lease;
                         argv = c.argv;
+                        // core#1228: a carried prompt's file is the seat's to read — the governed
+                        // claude's gate hook admits exactly that file, and copilot (which reads
+                        // only its cwd and temp) is handed its directory.
+                        if let Some(carried) = &prompt_guard {
+                            if let Some(g) = gov_env.as_mut() {
+                                g.extra_read_roots
+                                    .push(carried.file.to_string_lossy().into_owned());
+                            }
+                            if seat_cli == wicked_apps_core::spawn::SeatCli::Copilot {
+                                if let Some(dir) = carried.file.parent() {
+                                    apply_seat_posture(
+                                        &mut argv,
+                                        &[
+                                            "--add-dir".to_string(),
+                                            dir.to_string_lossy().into_owned(),
+                                        ],
+                                    );
+                                }
+                            }
+                        }
                         // Each CLI's own sandbox off inside ours (codex's cannot run in a
                         // container: it needs user namespaces).
                         crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv);
@@ -3801,7 +3821,12 @@ impl WrappedCliStepRunner {
                                 format!(": {detail}")
                             }
                         );
-                        return floor_refused(input, &cli_key, why);
+                        let mut out = floor_refused(input, &cli_key, why);
+                        if why == crate::worker_sandbox::FloorUnarmed::ArgvTooLong {
+                            // The size (or the file handoff's failure) is the reason itself.
+                            out.output.push_str(&format!(" — {detail}"));
+                        }
+                        return out;
                     }
                 }
             } else if os_sandbox {

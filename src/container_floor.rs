@@ -2456,9 +2456,18 @@ pub(crate) struct ArmedContainer {
     /// What the seat container mounts, for narrowing a claude seat's fence to it
     /// (`execute_wrapped::narrow_container_fence`).
     pub(crate) view: MountView,
-    /// The private directory holding a long prompt the seat reads from a file
-    /// ([`carry_prompt_in_file`]); removed when the caller drops it at the end of the unit.
-    pub(crate) prompt_file: Option<RemoveOnDrop>,
+    /// A long prompt the seat reads from a file ([`carry_prompt_in_file`]): the file (the caller
+    /// admits it to the seat's own read permissions) and its private directory, removed when the
+    /// caller drops it at the end of the unit.
+    pub(crate) prompt_file: Option<CarriedPrompt>,
+}
+
+/// A long prompt carried in a file (core#1228): `file` is mounted read-only into the seat; the
+/// directory goes when this is dropped.
+#[derive(Debug)]
+pub(crate) struct CarriedPrompt {
+    pub(crate) file: PathBuf,
+    pub(crate) _dir: RemoveOnDrop,
 }
 
 impl std::fmt::Debug for ArmedContainer {
@@ -2652,7 +2661,8 @@ pub(crate) fn check_exec_args(argv: &[String]) -> Result<(), String> {
             EXEC_ARG_MAX
         ));
     }
-    let total: usize = argv.iter().map(|a| a.len() + 1).sum();
+    // Each argument also takes a pointer in the exec's argv table (8 bytes on 64-bit).
+    let total: usize = argv.iter().map(|a| a.len() + 1 + 8).sum::<usize>() + 8;
     if total > EXEC_ARGS_TOTAL_MAX {
         return Err(format!(
             "the seat's command is {total} bytes; a container takes at most {EXEC_ARGS_TOTAL_MAX}"
@@ -2688,7 +2698,7 @@ pub(crate) fn carry_prompt_in_file(
     prompt: &str,
     argv: &mut Vec<String>,
     mounts: &mut Vec<Mount>,
-) -> Result<RemoveOnDrop, String> {
+) -> Result<CarriedPrompt, String> {
     let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
     carry_prompt_in_file_at(&base, cli, prompt, argv, mounts)
 }
@@ -2699,11 +2709,21 @@ fn carry_prompt_in_file_at(
     prompt: &str,
     argv: &mut Vec<String>,
     mounts: &mut Vec<Mount>,
-) -> Result<RemoveOnDrop, String> {
+) -> Result<CarriedPrompt, String> {
     let base = crate::worker_sandbox::canon_lenient(base).unwrap_or_else(|| base.to_path_buf());
-    let dir = base
-        .join(".wicked-prompts")
-        .join(uuid::Uuid::new_v4().simple().to_string());
+    let store = base.join(".wicked-prompts");
+    // The store must lie outside everything this seat mounts: under a bind (a worker home
+    // configured inside the repository, say) the seat would see other units' prompts, and under
+    // a writable one it could move this unit's file away from its cleanup.
+    if let Some(m) = mounts.iter().find(|m| store.starts_with(m.dst())) {
+        return Err(format!(
+            "the long prompt's store {} lies under {}, which the seat mounts; set the worker \
+             home outside the repository and the seat's roots",
+            store.display(),
+            m.dst().display()
+        ));
+    }
+    let dir = store.join(uuid::Uuid::new_v4().simple().to_string());
     let guard = RemoveOnDrop(dir.clone());
     let file = dir.join("prompt.md");
     write_private_file(&file, prompt.as_bytes())
@@ -2736,11 +2756,11 @@ fn carry_prompt_in_file_at(
     if carried {
         mounts.retain(|m| m.dst() != file.as_path());
         mounts.push(Mount::Bind {
-            path: file,
+            path: file.clone(),
             rw: false,
         });
     }
-    Ok(guard)
+    Ok(CarriedPrompt { file, _dir: guard })
 }
 
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
@@ -7015,7 +7035,7 @@ mod long_prompt_tests {
         let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
         assert!(check_exec_args(&argv).unwrap_err().contains("argument"));
         let mut mounts = Vec::new();
-        let guard =
+        let carried =
             carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts).unwrap();
         check_exec_args(&argv).expect("the argv now fits one exec");
         assert!(argv.iter().all(|a| a.len() < PROMPT_ARGV_MAX), "{argv:?}");
@@ -7035,8 +7055,9 @@ mod long_prompt_tests {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode & 0o077, 0, "{mode:o}");
-        let dir = guard.0.clone();
-        drop(guard);
+        assert_eq!(&carried.file, path);
+        let dir = carried._dir.0.clone();
+        drop(carried);
         assert!(!dir.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7076,6 +7097,26 @@ mod long_prompt_tests {
     }
 
     #[test]
+    fn a_prompt_store_under_a_seat_mount_is_refused() {
+        // A worker home inside a mounted root would show every unit's prompts to the seat.
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        let canon = root.canonicalize().unwrap();
+        for rw in [false, true] {
+            let mut mounts = vec![Mount::Bind {
+                path: canon.clone(),
+                rw,
+            }];
+            let why = carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts)
+                .unwrap_err();
+            assert!(why.contains("which the seat mounts"), "{why}");
+            assert!(!canon.join(".wicked-prompts").exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn any_other_argument_too_large_for_an_exec_is_refused_with_the_reason() {
         // A skills list of 256 KiB, not the prompt: nothing can carry it, so arming refuses.
         let skills: Vec<String> = (0..16_000)
@@ -7092,6 +7133,9 @@ mod long_prompt_tests {
         // Many small arguments that add up past the budget are refused too.
         let many = vec!["x".repeat(100 * 1024); 12];
         assert!(check_exec_args(&many).unwrap_err().contains("at most"));
+        // Many tiny ones too: each also costs its pointer in the exec's argv table.
+        let tiny = vec!["x".to_string(); 120_000];
+        assert!(check_exec_args(&tiny).unwrap_err().contains("at most"));
         assert_eq!(
             crate::worker_sandbox::FloorUnarmed::ArgvTooLong.as_str(),
             "argv_too_long"
