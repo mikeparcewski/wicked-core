@@ -2748,7 +2748,20 @@ fn carry_prompt_in_file_at(
     let mut carried = false;
     let mut out = Vec::with_capacity(argv.len() + 1);
     for a in argv.drain(..) {
-        if a == prompt {
+        // What the argument before the prompt makes of it: pi's `@path` attaches a file only as
+        // a positional argument (after `-p`/`--print` or another positional); as the value of
+        // `--system-prompt`/`--append-system-prompt` pi loads a plain path's contents itself;
+        // as any other option's value, the read-the-file sentence stands in.
+        let prev = out.last().map(String::as_str).unwrap_or("");
+        let option_value = prev.starts_with('-') && !matches!(prev, "-p" | "--print" | "--");
+        if a == prompt && cli == "pi" && option_value {
+            if matches!(prev, "--system-prompt" | "--append-system-prompt") {
+                out.push(file.to_string_lossy().into_owned());
+            } else {
+                out.push(prompt_pointer("", &file, prompt.len()).join(" "));
+            }
+            carried = true;
+        } else if a == prompt {
             out.extend(pointer.iter().cloned());
             carried = true;
         } else if a.contains(prompt) {
@@ -7111,6 +7124,35 @@ mod long_prompt_tests {
             "{last}"
         );
         assert!(last.ends_with(" Be concise."), "{last}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_takes_a_prompt_given_as_an_option_value_as_that_option_expects() {
+        let root = base();
+        let prompt = big_prompt();
+        for (template, want_path) in [
+            ("pi -p --system-prompt \"{PROMPT}\" Begin.", true),
+            ("pi -p --append-system-prompt \"{PROMPT}\" Begin.", true),
+            ("pi -p --model \"{PROMPT}\" Begin.", false),
+        ] {
+            let mut argv = crate::execute_wrapped::build_argv(template, &prompt, &[]);
+            let mut mounts = Vec::new();
+            let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+                .unwrap()
+                .expect("carried");
+            let value = &argv[3];
+            assert!(!value.starts_with('@'), "{template}: {value}");
+            if want_path {
+                assert_eq!(value, &c.file.display().to_string(), "{template}");
+            } else {
+                assert!(
+                    value.contains("Read that whole file"),
+                    "{template}: {value}"
+                );
+            }
+            assert_eq!(argv.last().unwrap(), "Begin.", "{template}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
