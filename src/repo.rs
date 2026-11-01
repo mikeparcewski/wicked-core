@@ -3211,6 +3211,7 @@ mod discard_minted_tests {
 
     fn run(cwd: &Path, args: &[&str]) {
         let out = std::process::Command::new("git")
+            .hardened()
             .args(["-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false"])
             .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
             .args(args)
