@@ -1887,6 +1887,26 @@ pub fn load_domain_graph(
     store: &dyn GraphRead,
     coverage: Option<&ModelCoverage>,
 ) -> anyhow::Result<Option<serde_json::Value>> {
+    Ok(load_domain_graph_with_build(store, coverage)?.map(|(graph, _)| graph))
+}
+
+/// Which build a [`load_domain_graph`] read returned: the build record's generation and the coverage
+/// label that build persisted, verbatim (`None` when the build carried none, e.g. a 1.0.0 document).
+/// The read's `metadata.coverage` is the caller's live label when one is passed, so this is the only
+/// place a reader learns what the listed graph was built at, and so whether the store has moved on
+/// since (req-list-stale 2026-11-01: a list of the 04:59 build under a header counting today's store).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct DomainGraphBuild {
+    pub generation: u64,
+    pub coverage: Option<serde_json::Value>,
+}
+
+/// [`load_domain_graph`], with the build it read: taken from the same build record the read checked
+/// for a concurrent rebuild, so the label always belongs to the rows returned beside it.
+pub fn load_domain_graph_with_build(
+    store: &dyn GraphRead,
+    coverage: Option<&ModelCoverage>,
+) -> anyhow::Result<Option<(serde_json::Value, DomainGraphBuild)>> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -1901,7 +1921,7 @@ pub fn load_domain_graph(
 }
 
 enum Loaded {
-    Graph(Option<serde_json::Value>),
+    Graph(Option<(serde_json::Value, DomainGraphBuild)>),
     /// An edge pointed at a node the read had not listed.
     Torn,
 }
@@ -1987,13 +2007,18 @@ fn load_domain_graph_once(
     }
     // The fresh label replaces the build's — except on a 1.0.0 document, whose schema has no
     // `metadata.coverage` (the caller carries the label beside the graph either way).
+    let build = DomainGraphBuild {
+        generation: record.generation,
+        coverage: metadata.get("coverage").filter(|v| !v.is_null()).cloned(),
+    };
     let v1_0 = metadata.get("schema_version").and_then(|v| v.as_str()) == Some("1.0.0");
     if let (Some(c), Some(o), false) = (coverage, metadata.as_object_mut(), v1_0) {
         o.insert("coverage".into(), serde_json::to_value(c)?);
     }
-    Ok(Loaded::Graph(Some(
+    Ok(Loaded::Graph(Some((
         json!({ "metadata": metadata, "domains": out_domains }),
-    )))
+        build,
+    ))))
 }
 
 /// A requirement of a graph persisted without its document, rebuilt from its node, its rule nodes
@@ -2916,6 +2941,23 @@ mod tests {
             assert_eq!(labelled["metadata"]["coverage"]["real_pct"], 80);
             assert!(labelled["metadata"]["coverage"].get("mapped_pct").is_none());
             assert_eq!(labelled["metadata"]["schema_version"], "1.1.0");
+
+            // req-list-stale: the store moves on after the build (the first behaviour is mapped
+            // too). The live label replaces the document's, and the build's own label is still
+            // there to read, with the build's generation, so a reader can tell the rows are older.
+            map(&mut s, &nodes[0], "seat-1", "extract-loop");
+            let live = model_coverage(&cov(&s), 80);
+            assert_eq!(live.real, 5);
+            let (read, build) = load_domain_graph_with_build(&s, Some(&live))
+                .unwrap()
+                .expect("a graph");
+            assert_eq!(read["metadata"]["coverage"]["real"], 5, "the live label");
+            assert_eq!(build.generation, 1);
+            assert_eq!(
+                build.coverage,
+                Some(serde_json::to_value(model.metadata.coverage.as_ref().unwrap()).unwrap()),
+                "the label the rows were built at, not the live one"
+            );
         }
 
         /// xreview on core#1223 (codex + agy P2): ids follow the CODE, not its position. Deleting an

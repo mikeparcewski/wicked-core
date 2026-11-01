@@ -2743,8 +2743,9 @@ impl Core {
     /// ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
     /// of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
     /// recomputed from the store's own counts against the configured minimum. Resolves to a JSON
-    /// string `{ "graph": <domain-model document | null>, "coverage": {...} }`; `graph` is null until
-    /// a build reached the minimum. An unknown `repo_ref` REJECTS.
+    /// string `{ "graph": <domain-model document | null>, "coverage": {...}, "build": { generation,
+    /// coverage } | null }`: `graph` is the last build (null until a build reached the minimum),
+    /// `coverage` the store now, `build` the label that build persisted. An unknown `repo_ref` REJECTS.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn get_requirements_graph_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
