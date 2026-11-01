@@ -24,8 +24,9 @@ Two release tracks share this file, newest entry first regardless of track:
   nothing is built): `real` is `classify_node`'s resolve verdict, `uncounted` is null when the share counts the unit,
   else `"structural" | "not_product" | "unindexed"`. Both are decided in the same recompute pass that counts
   `coverage` (`recompute_front_half_coverage_for_rows`, over the units `load_domain_graph_with_units` read with the
-  rows), so the rows with `real` and no `uncounted` number exactly `coverage.real`. A row from a build before
-  `code_symbol` has no entry: no claim either way. Additive: `graph`, `coverage` and `build` are unchanged.
+  rows), so each counted row gets the verdict the count used; with the build not behind the store, the rows with
+  `real` and no `uncounted` number exactly `coverage.real` (behind it, units mapped since the build have no row yet).
+  A row from a build before `code_symbol` has no entry: no claim either way. Additive: `graph`, `coverage` and `build` are unchanged.
 - **A TypeScript shape is not a behaviour.** The requirements minimum counted every `Interface` as behaviour, while
   a `TypeAlias` was structural: on wicked-crew 915 of the 2,174 placeholders the seat could not state a rule for were
   TypeScript interfaces (459 of them wire types). A TS interface is erased at runtime, so it now counts only when the

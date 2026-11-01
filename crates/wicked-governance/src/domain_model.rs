@@ -2122,12 +2122,14 @@ pub type ListedRows =
 
 /// [`recompute_front_half_coverage`], plus the engine's verdict on each listed requirement (`units`, from
 /// [`load_domain_graph_with_units`]): whether it resolves and whether the share counts its unit — decided
-/// in the same pass that counts the header's numbers, so among the rows it covers, those with
-/// `real && uncounted == None` are exactly `resolved` (req-reconcile 2026-11-01: wicked-crew listed 1,458
-/// rows on TypeScript shapes under a header that, since core#1238, counts none of them, and crew could only
-/// guess real from the document, whose synthesized fallback rule hides a risk-only unit). A unit the store
-/// no longer holds is [`Uncounted::Unindexed`]. A requirement with no recorded unit (a build before
-/// `code_symbol`) has no verdict: no claim either way.
+/// in the same pass that counts the header's numbers, so each counted row gets the very verdict the count
+/// used. The rows with `real && uncounted == None` number exactly `resolved` when every resolved behaviour
+/// has one listed row with a recorded unit, i.e. the build is not behind the store: a unit mapped since
+/// the build has no row yet, and a row with no recorded unit gets no verdict. (req-reconcile 2026-11-01:
+/// wicked-crew listed 1,458 rows on TypeScript shapes under a header that, since core#1238, counts none of
+/// them, and crew could only guess real from the document, whose synthesized fallback rule hides a
+/// risk-only unit.) A unit the store no longer holds is [`Uncounted::Unindexed`]. A requirement with no
+/// recorded unit (a build before `code_symbol`) has no verdict: no claim either way.
 pub fn recompute_front_half_coverage_for_rows(
     store: &dyn GraphRead,
     units: &RequirementUnits,

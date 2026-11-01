@@ -390,9 +390,10 @@ pub fn coverage_report_for_repo(
 /// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
 /// "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" | "not_product" |
 /// "unindexed" } } } or null }` — `rows` is the engine's verdict on each listed requirement that
-/// recorded its code unit, decided in the same pass as `coverage` (req-reconcile 2026-11-01): the rows
-/// with `real` and no `uncounted` number exactly `coverage.real`. A requirement from a build before
-/// `code_symbol` has no entry (no claim either way);
+/// recorded its code unit, decided in the same pass as `coverage` (req-reconcile 2026-11-01), so each
+/// counted row gets the verdict the count used. With the build not behind the store, the rows with
+/// `real` and no `uncounted` number exactly `coverage.real`; behind it, units mapped since the build
+/// have no row yet. A requirement from a build before `code_symbol` has no entry (no claim either way);
 /// (real requirements only count toward the minimum, core#1233); the
 /// coverage is recomputed from the store's own counts at read time against the configured minimum
 /// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
