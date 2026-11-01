@@ -88,17 +88,19 @@ field a caller must supply), so an empty statement on a unit whose source shows 
 rule, and a problem you list. Units in test, data, manifest or document files are not product \
 requirements: the host records whatever is stated for them as unconfirmed, never as a validated \
 requirement, so they are not a reason to fail the page; judge the page on its product-code \
-units, and PASS a page that has none. You judge work another seat did; change no file. List each \
-problem as `ITEM n: FAIL — <symbol> — <why>` (for a missed rule, `missed: <the rule its source \
-shows>`). Judge the PAGE: a weak or code-describing statement is a problem you list, and the \
-host records every statement under its confidence threshold as a risk, never as a validated \
-requirement. End with `VERDICT: PASS` when the page is sound as a whole (most stated rules are \
-grounded in their unit's source and name worklist units, and the units whose source shows a rule \
-got one), or `VERDICT: FAIL` when it is not: rules are invented, name symbols outside the \
-worklist, were composed by a script from names rather than read from the source, most of them \
-describe code instead of requirements, or most sourced product-code units were left empty while \
-their source shows a rule (a page that states almost nothing is not sound, however correct its \
-few rules are).";
+units, and PASS a page that has none. An extracted rule (kind `Rule`: a Salesforce Flow, a cloud \
+policy) is product behaviour whatever its file's extension, outside test and fixture files: \
+judge it like code. You judge work another seat did; change no file. List each problem as `ITEM \
+n: FAIL — <symbol> — <why>` (for a missed rule, `missed: <the rule its source shows>`). Judge \
+the PAGE: a weak or code-describing statement is a problem you list, and the host records every \
+statement under its confidence threshold as a risk, never as a validated requirement. End with \
+`VERDICT: PASS` when the page is sound as a whole (most stated rules are grounded in their \
+unit's source and name worklist units, and the units whose source shows a rule got one), or \
+`VERDICT: FAIL` when it is not: rules are invented, name symbols outside the worklist, were \
+composed by a script from names rather than read from the source, most of them describe code \
+instead of requirements, or most sourced product-code units were left empty while their source \
+shows a rule (a page that states almost nothing is not sound, however correct its few rules \
+are).";
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
@@ -457,6 +459,22 @@ mod tests {
     /// That is FINDING-050's shape: a denial whose stated reason does not match its cause. Both
     /// strings are inputs to the content-address, so they cannot drift silently in the pin — but
     /// they can drift in MEANING, which is what this asserts.
+    /// The page review agrees with the denominator (core#1233, codex r3 on #1234): tests and
+    /// data files are not product requirements, an extracted rule in a data-extension file is,
+    /// and a page that leaves most sourced product units empty is not passed.
+    #[test]
+    fn the_page_review_matches_what_the_minimum_counts() {
+        let r = RULES_REVIEW_INSTRUCTIONS;
+        assert!(r.contains("not product requirements"), "{r}");
+        assert!(r.contains("An extracted rule (kind `Rule`"), "{r}");
+        assert!(r.contains("judge it like code"), "{r}");
+        assert!(r.contains("MISSED rule"), "{r}");
+        assert!(
+            r.contains("most sourced product-code units were left empty"),
+            "{r}"
+        );
+    }
+
     #[test]
     fn the_criterion_describes_the_requirement_the_script_enforces() {
         let script_checks_non_vacuity =

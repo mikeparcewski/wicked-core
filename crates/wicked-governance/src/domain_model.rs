@@ -442,7 +442,8 @@ const DATA_EXTS: &[&str] = &[
 /// make the share harder to reach, never easier). An EXTRACTED rule stays in whatever its file
 /// (`is_product_node`): a Salesforce Flow (`.flow-meta.xml`) or a cloud policy (`.json`) is
 /// executable behaviour, not data. Classified by file only: a test module inside a product file
-/// (Rust's `#[cfg(test)] mod tests`) still counts, which can only make the share harder to reach.
+/// (Rust's `#[cfg(test)] mod tests`) still counts, in the denominator and, once a page resolves it,
+/// in the real count, so it can bias the share either way (codex r3 on #1234; post-mvp).
 #[must_use]
 pub fn is_product_file(file: &str) -> bool {
     !is_test_file(file) && !is_data_file(file)
@@ -2503,6 +2504,8 @@ mod tests {
             "crates/x/src/lib.rs",
             "app/Contest.py",
             "src/latest/handler.go",
+            "src/Payment.php",
+            "src/payment.cpp",
             "",
         ] {
             assert!(is_product_file(file), "{file} is product code");
@@ -2524,7 +2527,7 @@ mod tests {
             "pkg/run_test.go",
             "src/payment_test.cpp",
             "src/payment_test.cc",
-            "tests/PaymentTest.php",
+            "src/PaymentTest.php",
             "spec/run_spec.rb",
             "Src/Tests/RunTests.cs",
             "src\\Tests\\Run.cs",
