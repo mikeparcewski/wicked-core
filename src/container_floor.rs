@@ -2698,7 +2698,7 @@ pub(crate) fn carry_prompt_in_file(
     prompt: &str,
     argv: &mut Vec<String>,
     mounts: &mut Vec<Mount>,
-) -> Result<CarriedPrompt, String> {
+) -> Result<Option<CarriedPrompt>, String> {
     let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
     carry_prompt_in_file_at(&base, cli, prompt, argv, mounts)
 }
@@ -2709,18 +2709,24 @@ fn carry_prompt_in_file_at(
     prompt: &str,
     argv: &mut Vec<String>,
     mounts: &mut Vec<Mount>,
-) -> Result<CarriedPrompt, String> {
+) -> Result<Option<CarriedPrompt>, String> {
     let base = crate::worker_sandbox::canon_lenient(base).unwrap_or_else(|| base.to_path_buf());
     let store = base.join(".wicked-prompts");
     // The store must lie outside everything this seat mounts: under a bind (a worker home
     // configured inside the repository, say) the seat would see other units' prompts, and under
     // a writable one it could move this unit's file away from its cleanup.
-    if let Some(m) = mounts.iter().find(|m| store.starts_with(m.dst())) {
+    let exposed = |p: &Path| {
+        mounts
+            .iter()
+            .find(|m| p.starts_with(m.dst()) || m.dst().starts_with(p))
+            .map(|m| m.dst().to_path_buf())
+    };
+    if let Some(m) = exposed(&store) {
         return Err(format!(
             "the long prompt's store {} lies under {}, which the seat mounts; set the worker \
              home outside the repository and the seat's roots",
             store.display(),
-            m.dst().display()
+            m.display()
         ));
     }
     let dir = store.join(uuid::Uuid::new_v4().simple().to_string());
@@ -2731,9 +2737,10 @@ fn carry_prompt_in_file_at(
     let file = file
         .canonicalize()
         .map_err(|e| format!("the long prompt's file {}: {e}", file.display()))?;
-    if !mountable(&file) {
+    // Written without following a link (`write_private_file`); checked again where it landed.
+    if !mountable(&file) || exposed(&file).is_some() {
         return Err(format!(
-            "the long prompt's file {} cannot be mounted into a seat container",
+            "the long prompt's file {} cannot be mounted into a seat container on its own",
             file.display()
         ));
     }
@@ -2753,14 +2760,14 @@ fn carry_prompt_in_file_at(
         }
     }
     *argv = out;
-    if carried {
-        mounts.retain(|m| m.dst() != file.as_path());
-        mounts.push(Mount::Bind {
-            path: file.clone(),
-            rw: false,
-        });
+    if !carried {
+        return Ok(None); // the argv does not carry the prompt: nothing to hand over (dir removed)
     }
-    Ok(CarriedPrompt { file, _dir: guard })
+    mounts.push(Mount::Bind {
+        path: file.clone(),
+        rw: false,
+    });
+    Ok(Some(CarriedPrompt { file, _dir: guard }))
 }
 
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
@@ -2873,22 +2880,20 @@ pub(crate) fn arm_noting(
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
     mount_argv_paths(&mut mounts, &mut argv, prompt);
-    // core#1228: a prompt too long for one exec argument rides a private read-only file; the
-    // argv carries a short pointer to it. Nothing larger than the kernel takes reaches the exec.
-    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
-        Some(p) => Some(
-            carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
-                .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
-        ),
-        None => None,
-    };
-    check_exec_args(&argv).map_err(|e| (FloorUnarmed::ArgvTooLong, e))?;
     // A member turn's repository view: read-only, or the seat does not start.
     if let Some(view) = read_view {
         add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     }
     cover_gateway_dir(&mut mounts, gateway_dir)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // core#1228: a prompt too long for one exec argument rides a private read-only file; the
+    // argv carries a short pointer to it. After every other mount is known (the store must lie
+    // outside all of them) and before the view the claude fence is narrowed to.
+    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
+        Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
+            .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
+        None => None,
+    };
     // What the seat sees, for the claude fence ([`narrow_fenced_dir`]): the final mounts, and
     // the unit's working set among them.
     let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
@@ -2898,6 +2903,7 @@ pub(crate) fn arm_noting(
         .chain(inp.write_roots.iter().cloned())
         .chain(read_roots.iter().cloned())
         .chain(read_view.map(Path::to_path_buf))
+        .chain(prompt_file.as_ref().map(|c| c.file.clone()))
         .collect();
     let view = mount_view(&mounts, &working_set);
     // The seat image cannot move a mount (a link where one lands, a declared volume).
@@ -3043,9 +3049,13 @@ pub(crate) fn arm_noting(
         own_ports: &own_ports,
     });
     grant_seat_devices(&mut wrapper, cli).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    let argv = with_seat_args(image_argv(&argv, cli), seat_args);
+    // Checked on what the container will exec (the seat's own args included); a refusal here
+    // drops the lease (revoking its key) and the container's cleanup with it.
+    check_exec_args(&argv).map_err(|e| (FloorUnarmed::ArgvTooLong, e))?;
     Ok(ArmedContainer {
         wrapper,
-        argv: with_seat_args(image_argv(&argv, cli), seat_args),
+        argv,
         prompt_file,
         tool: tool_name(&rt.cli),
         cleanup,
@@ -7035,8 +7045,9 @@ mod long_prompt_tests {
         let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
         assert!(check_exec_args(&argv).unwrap_err().contains("argument"));
         let mut mounts = Vec::new();
-        let carried =
-            carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts).unwrap();
+        let carried = carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
         check_exec_args(&argv).expect("the argv now fits one exec");
         assert!(argv.iter().all(|a| a.len() < PROMPT_ARGV_MAX), "{argv:?}");
         assert_eq!(argv[..2], ["codex".to_string(), "exec".to_string()]);
@@ -7068,7 +7079,9 @@ mod long_prompt_tests {
         let prompt = big_prompt();
         let mut argv = crate::execute_wrapped::build_argv("pi -p \"{PROMPT}\"", &prompt, &[]);
         let mut mounts = Vec::new();
-        let _guard = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts).unwrap();
+        let _guard = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
         let Mount::Bind { path, .. } = &mounts[0] else {
             panic!("{mounts:?}")
         };
@@ -7085,14 +7098,49 @@ mod long_prompt_tests {
         let prompt = big_prompt();
         let mut argv = vec!["tool".to_string(), format!("--prompt={prompt}")];
         let mut mounts = Vec::new();
-        let _guard =
-            carry_prompt_in_file_at(&root, "tool", &prompt, &mut argv, &mut mounts).unwrap();
+        let _guard = carry_prompt_in_file_at(&root, "tool", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
         assert!(
             argv[1].starts_with("--prompt=This turn's task"),
             "{}",
             &argv[1][..80]
         );
         check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prompt_the_argv_does_not_carry_is_not_handed_over() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = vec!["agy".to_string(), "-p".to_string(), "short".to_string()];
+        let mut mounts = Vec::new();
+        let none = carry_prompt_in_file_at(&root, "agy", &prompt, &mut argv, &mut mounts).unwrap();
+        assert!(none.is_none() && mounts.is_empty());
+        assert_eq!(argv[2], "short");
+        let store = root.canonicalize().unwrap().join(".wicked-prompts");
+        assert_eq!(std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_seat_mount_inside_the_prompt_store_is_refused_too() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        let inside = root
+            .canonicalize()
+            .unwrap()
+            .join(".wicked-prompts")
+            .join("x");
+        let mut mounts = vec![Mount::Bind {
+            path: inside,
+            rw: true,
+        }];
+        let why =
+            carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts).unwrap_err();
+        assert!(why.contains("which the seat mounts"), "{why}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

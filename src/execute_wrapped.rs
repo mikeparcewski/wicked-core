@@ -3823,8 +3823,12 @@ impl WrappedCliStepRunner {
                         );
                         let mut out = floor_refused(input, &cli_key, why);
                         if why == crate::worker_sandbox::FloorUnarmed::ArgvTooLong {
-                            // The size (or the file handoff's failure) is the reason itself.
-                            out.output.push_str(&format!(" — {detail}"));
+                            // The size (or the file handoff's failure) is the reason itself,
+                            // said inside the refusal's parentheses.
+                            if out.output.ends_with(')') {
+                                out.output.pop();
+                            }
+                            out.output.push_str(&format!(" — {detail})"));
                         }
                         return out;
                     }

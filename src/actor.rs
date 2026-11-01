@@ -1741,6 +1741,10 @@ pub(crate) fn run(
                                             &indexed,
                                             &b.commit,
                                         ) {
+                                            // The tree was minted for this launch: removed
+                                            // here, before the run is failed, so a relaunch of
+                                            // the same id never races its removal.
+                                            crate::repo::remove_worktree(&root, &rid);
                                             let _ = tx.send(Command::WorktreeFailed {
                                                 run_id: rid,
                                                 error: why,
