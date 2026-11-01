@@ -2175,8 +2175,10 @@ Two release tracks share this file, newest entry first regardless of track:
     graph build it lists, and gives the engine's verdict on each listed row (#1240): `rows` carries `real` and
     `uncounted` (`structural`, `not_product` or `unindexed` for a row the share does not count). Domain extraction
     brackets the seat's extract with host steps (#1221) and reviews the page it mapped (#1222).
-  - **Floor (#1184, #1190, #1192, #1197, #1199, #1200, #1203, #1204, #1220).** The repo-checks floor runs in a fresh
-    Linux container. A cargo workspace's affected test set is computed at the creator floor. Retries and the base
+  - **Floor (#1184, #1190, #1192, #1197, #1199, #1200, #1203, #1204, #1220).** The repo-checks floor can run in a fresh
+    Linux container: with `WICKED_FLOOR_RUNNER=auto` (the default) only a macOS host whose container runtime answers
+    uses it, falling back to the host sandbox with the reason; Linux hosts keep the host floor (`bwrap`) unless the
+    switch is set, and `sandbox` keeps the host floor. A cargo workspace's affected test set is computed at the creator floor. Retries and the base
     compare cover only a failed check's failing tests, an override carries to a later floor on the same tree, and the
     floor, QE reviewer, team and judge stop waiting on each other (#1224).
   - **Power mode and activity (#1195, #1207, #1211, #1212, #1218, #1231).** Live tool activity from codex and pi
