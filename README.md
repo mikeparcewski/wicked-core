@@ -61,8 +61,9 @@ the code). crew reads it from there; nothing is written into the checkout.
 
 The graph is held to a minimum share of **real** requirements: behaviours in product code with a
 validated requirement or a business rule at or above the confidence threshold (0.75 by default).
-A placeholder (a risk flag, a rule under the threshold, or an unvalidated requirement) stays in the
-graph as a `review` requirement and never counts. What is product code is decided by file path:
+A placeholder (a behaviour that meets neither: a risk flag, a rule under the threshold, or an
+unvalidated requirement alone) stays in the graph and never counts. A requirement's `review` status
+is not that test: an unvalidated requirement whose rule clears the threshold still counts. What is product code is decided by file path:
 test, spec and fixture files and data, manifest and document files are left out (`not_product`),
 though a test module inside a product file still counts, and an extracted rules-engine rule outside
 test and fixture paths counts whatever its file extension. A TypeScript interface counts only when the graph shows it does something.
