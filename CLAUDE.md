@@ -17,6 +17,11 @@ open to check a claim.
   `wicked-governance` (deterministic policy/conformance engine; owns the
   governance JSON Schemas in `crates/wicked-governance/schemas/`),
   `wicked-orchestration`, `wicked-council`.
+- **`containers/` holds the images the engine builds itself** (from the file alone, no
+  build context, tagged by a hash of its inputs): `checks/node22-rust.Dockerfile` (the
+  repo-checks floor, `src/checks_container.rs`), `seats/seat.Dockerfile` (one seat image
+  per CLI), `seats/netns.Dockerfile` (each seat's network sidecar) and `floor.Dockerfile`
+  (the trusted launcher mounted into every seat, `src/container_floor.rs`).
 - **`crates/wicked-core-ts` is workspace-EXCLUDED on purpose** (its own
   `[profile.release]` lto/strip shapes the shipped `.node` artifact; folding it in
   would silently drop LTO). `cargo test --workspace` never touches it — after ANY
