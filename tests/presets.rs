@@ -1553,19 +1553,40 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             Some(creator),
             "{name}: {all:?}"
         );
+        // The WHOLE plan, nothing filtered (codex r1): an unexpected step fails here. A creator plan
+        // also carries the engine's own additions (the PA scope first, the floor's planning steps,
+        // which this rig's silent PA floors at 100); those are enumerated, never skipped.
+        let engine_added =
+            |id: &str| creator && ["pa-scope", "test_plan", "design", "architecture"].contains(&id);
         let own: Vec<_> = all
             .iter()
-            .filter(|row| want.iter().any(|w| w.0 == row.0))
+            .filter(|row| !engine_added(&row.0))
             .cloned()
             .collect();
         assert_eq!(own, want, "{name}: {all:?}");
+        for u in &units {
+            assert!(u.tool_cmd.is_none(), "{name}: {} is an agent step", u.id);
+            assert!(!u.executes_code, "{name}: {} runs no code", u.id);
+        }
+        // The check depends on what it judges, exactly (the floor may plan steps before a creator).
+        for pair in want.windows(2).filter(|p| p[1].2 == "evaluator") {
+            let u = units
+                .iter()
+                .find(|u| u.id == format!("{run}:{}", pair[1].0))
+                .unwrap();
+            assert_eq!(
+                u.depends_on,
+                vec![pair[0].0.clone()],
+                "{name}:{}",
+                pair[1].0
+            );
+        }
         for (id, skill) in skills {
             let u = units
                 .iter()
                 .find(|u| u.id == format!("{run}:{id}"))
                 .unwrap_or_else(|| panic!("{name}:{id} in {all:?}"));
             assert_eq!(u.skill_ref.as_deref(), *skill, "{name}:{id}");
-            assert!(!u.executes_code, "{name}:{id} runs no code");
         }
         let steps = wicked_core::builtin_presets()
             .into_iter()
