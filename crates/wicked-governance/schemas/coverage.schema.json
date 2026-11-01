@@ -120,7 +120,7 @@
       "type": "number",
       "minimum": 0,
       "maximum": 1,
-      "description": "(resolved + risk_flagged) / behavior_bearing, 4 dp. The rule_coverage value crew's GATE_3 gates on == 1.0. Vacuously 1.0 when there are no behavior-bearing nodes."
+      "description": "(resolved + risk_flagged) / behavior_bearing, 4 dp: the ACCOUNTED ledger, not the gate. Since bundle 1.3.0 (wicked-core#1233) the minimum counts real requirements only: floor(resolved * 100 / behavior_bearing) against the configured minimum, so a fully accounted report of mostly placeholders fails it. Vacuously 1.0 when there are no behavior-bearing nodes."
     },
     "resolved_rate": {
       "type": "number",

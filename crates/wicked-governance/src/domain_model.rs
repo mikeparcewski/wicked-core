@@ -445,18 +445,30 @@ const DATA_EXTS: &[&str] = &[
 /// (Rust's `#[cfg(test)] mod tests`) still counts, which can only make the share harder to reach.
 #[must_use]
 pub fn is_product_file(file: &str) -> bool {
+    !is_test_file(file) && !is_data_file(file)
+}
+
+/// A test, spec or fixture file (garden's `is_test_path`).
+fn is_test_file(file: &str) -> bool {
     let norm = file.replace('\\', "/");
-    let lower = norm.to_ascii_lowercase();
-    !(TEST_DIR.is_match(&norm)
-        || TEST_FILE.is_match(&norm)
-        || DATA_EXTS.iter().any(|ext| lower.ends_with(ext)))
+    TEST_DIR.is_match(&norm) || TEST_FILE.is_match(&norm)
+}
+
+/// A data, manifest or document file, by extension (garden's `is_data_path`).
+fn is_data_file(file: &str) -> bool {
+    let lower = file.to_ascii_lowercase();
+    DATA_EXTS.iter().any(|ext| lower.ends_with(ext))
 }
 
 /// Whether a behaviour-kind node is product behaviour: in a product file ([`is_product_file`]), or an
 /// extracted rule (a rules-engine extractor's `Rule` node, executable whatever its file's
-/// extension). The one predicate the coverage recompute and the build share.
+/// extension) outside test and fixture files. The one predicate the coverage recompute and the build share.
 fn is_product_node(node: &wicked_apps_core::Node) -> bool {
-    matches!(node.kind, wicked_apps_core::NodeKind::Rule) || is_product_file(&node.location.file)
+    let file = &node.location.file;
+    // An extracted rule passes the data-extension test only; a rule in a test or fixture file is
+    // still a test (codex r2 on #1234).
+    !is_test_file(file)
+        && (matches!(node.kind, wicked_apps_core::NodeKind::Rule) || !is_data_file(file))
 }
 
 /// The bucket a behavior-bearing node falls into for the resolved/risk/unaccounted split.
@@ -894,7 +906,7 @@ pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> a
             shown.len(),
             shown,
             coverage_verdict(report, min_pct),
-            report.risk_flagged + report.unaccounted
+            u128::from(report.risk_flagged) + u128::from(report.unaccounted)
         );
     }
     // #131: content-free accounting. Gated on the AVERAGE (nodes / distinct), not any single string's
@@ -1081,6 +1093,12 @@ pub fn build_domain_model_with(
     let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 
     for node in &nodes {
+        // Not product behaviour (a test, data, manifest or document file): no requirement, even
+        // when an earlier page annotated it, so the graph matches the denominator (agy on #1234).
+        // First, before any annotation is read or validated (codex r2 on #1234).
+        if !is_product_node(node) {
+            continue;
+        }
         let semantics = store.node_semantics(&node.symbol)?;
         let requirement_text = semantics.as_ref().and_then(|s| s.requirement.clone());
         let description_text = semantics.as_ref().and_then(|s| s.description.clone());
@@ -1118,11 +1136,6 @@ pub fn build_domain_model_with(
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
         let resolved = has_requirement || !business_rules.is_empty();
-        // Not product behaviour (a test, data, manifest or document file): no requirement, even
-        // when an earlier page annotated it, so the graph matches the denominator (agy on #1234).
-        if !is_product_node(node) {
-            continue;
-        }
         let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other);
         let accounted = resolved || !risk_notes.is_empty();
         let slot = if behavior || accounted {
@@ -2443,6 +2456,20 @@ mod tests {
         };
         assert!(!meets_minimum(&huge, 100));
         assert!(real_pct(&huge) <= 100);
+        let err = assert_front_half_coverage_min(
+            &CoverageReport {
+                risk_flagged: u64::MAX,
+                unaccounted: 1,
+                ..Default::default()
+            },
+            80,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("18446744073709551616 behavior-bearing"),
+            "{err}"
+        );
         // The empty graph stays a vacuous pass.
         assert!(meets_minimum(&report(0, 0, 0), 80));
         assert_eq!(real_pct(&report(0, 0, 0)), 100);
@@ -3380,6 +3407,12 @@ mod tests {
                     .with_confidence(0.0),
             )
             .unwrap();
+            // An out-of-range confidence on an excluded node never blocks the build (codex r2).
+            s.annotate(
+                &test_fn.symbol,
+                Annotation::new("business_rule", "bad", "x").with_confidence(1.1),
+            )
+            .unwrap();
             let m = build_at(&s, 80);
             let titles: Vec<&str> = m
                 .domains
@@ -3651,10 +3684,17 @@ mod tests {
                 "policies/storage.json",
             );
             node(&mut s, "name", NodeKind::Struct, "package.json");
+            // …but a rule in a test fixture is a test (codex r2 on #1234).
+            node(
+                &mut s,
+                "fixture-policy",
+                NodeKind::Rule,
+                "tests/fixtures/policy.json",
+            );
             let r = cov(&s);
             assert_eq!(
                 (r.behavior_bearing, r.unaccounted, r.not_product),
-                (2, 2, 1),
+                (2, 2, 2),
                 "{r:?}"
             );
             assert_eq!(
