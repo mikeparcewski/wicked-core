@@ -2744,8 +2744,11 @@ impl Core {
     /// of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
     /// recomputed from the store's own counts against the configured minimum. Resolves to a JSON
     /// string `{ "graph": <domain-model document | null>, "coverage": {...}, "build": { generation,
-    /// coverage } | null }`: `graph` is the last build (null until a build reached the minimum),
-    /// `coverage` the store now, `build` the label that build persisted. An unknown `repo_ref` REJECTS.
+    /// coverage } | null, "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" |
+    /// "not_product" | "unindexed" } } } | null }`: `graph` is the last build (null until a build
+    /// reached the minimum), `coverage` the store now, `build` the label that build persisted, `rows`
+    /// the engine's verdict on each listed row that recorded its unit (same pass as `coverage`). An
+    /// unknown `repo_ref` REJECTS.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn get_requirements_graph_for_repo(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
