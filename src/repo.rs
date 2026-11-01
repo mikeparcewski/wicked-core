@@ -411,16 +411,21 @@ pub fn requirements_graph_for_repo(
     // daemon-wide minimum.
     let min_pct = wicked_governance::effective_min_coverage_pct(&repo_store)
         .map_err(|e| anyhow::anyhow!(e))?;
+    // The rows are the last BUILD; `coverage` is the store now. `build` says which build the rows are
+    // and the label it was built at, so a reader can tell when the header counts what the list does
+    // not hold (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is
+    // built. The rows are read FIRST and the store counted after (xreview on #1237): a build or a
+    // mapping that commits in between shows as a difference, never as a stale build matching.
+    let loaded = wicked_governance::load_domain_graph_with_build(&repo_store)?;
     let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
-    // The rows are the last BUILD; `coverage` is the store now. `build` says which build the rows are
-    // and the label it was built at, so a reader can tell when the store has moved on since
-    // (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is built.
-    let (graph, build) =
-        match wicked_governance::load_domain_graph_with_build(&repo_store, Some(&coverage))? {
-            Some((graph, build)) => (Some(graph), Some(build)),
-            None => (None, None),
-        };
+    let (graph, build) = match loaded {
+        Some((mut graph, build)) => {
+            wicked_governance::label_domain_graph(&mut graph, &coverage)?;
+            (Some(graph), Some(build))
+        }
+        None => (None, None),
+    };
     Ok(serde_json::json!({ "graph": graph, "coverage": coverage, "build": build }))
 }
 

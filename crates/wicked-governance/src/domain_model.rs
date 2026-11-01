@@ -1887,30 +1887,52 @@ pub fn load_domain_graph(
     store: &dyn GraphRead,
     coverage: Option<&ModelCoverage>,
 ) -> anyhow::Result<Option<serde_json::Value>> {
-    Ok(load_domain_graph_with_build(store, coverage)?.map(|(graph, _)| graph))
+    let Some((mut graph, _)) = load_domain_graph_with_build(store)? else {
+        return Ok(None);
+    };
+    if let Some(c) = coverage {
+        label_domain_graph(&mut graph, c)?;
+    }
+    Ok(Some(graph))
+}
+
+/// Put `coverage` on a read graph's `metadata.coverage`, replacing the build's — except on a 1.0.0
+/// document, whose schema has no such field (the caller carries the label beside the graph either way).
+pub fn label_domain_graph(
+    graph: &mut serde_json::Value,
+    coverage: &ModelCoverage,
+) -> anyhow::Result<()> {
+    let label = serde_json::to_value(coverage)?;
+    if let Some(metadata) = graph.get_mut("metadata").and_then(|m| m.as_object_mut()) {
+        if metadata.get("schema_version").and_then(|v| v.as_str()) != Some("1.0.0") {
+            metadata.insert("coverage".into(), label);
+        }
+    }
+    Ok(())
 }
 
 /// Which build a [`load_domain_graph`] read returned: the build record's generation and the coverage
 /// label that build persisted, verbatim (`None` when the build carried none, e.g. a 1.0.0 document).
-/// The read's `metadata.coverage` is the caller's live label when one is passed, so this is the only
-/// place a reader learns what the listed graph was built at, and so whether the store has moved on
-/// since (req-list-stale 2026-11-01: a list of the 04:59 build under a header counting today's store).
+/// Once a caller labels the read with the store's counts now ([`label_domain_graph`]), this is the only
+/// place a reader learns what the listed graph was built at, and so whether the header's counts are
+/// the rows' (req-list-stale 2026-11-01: a list of the 04:59 build under a header counting today's
+/// store). `generation` is 0 for a graph persisted before the build record existed.
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
 pub struct DomainGraphBuild {
     pub generation: u64,
     pub coverage: Option<serde_json::Value>,
 }
 
-/// [`load_domain_graph`], with the build it read: taken from the same build record the read checked
-/// for a concurrent rebuild, so the label always belongs to the rows returned beside it.
+/// [`load_domain_graph`] as the build wrote it (its own `metadata.coverage`), with the build it read:
+/// taken from the same build record the read checked for a concurrent rebuild, so the label always
+/// belongs to the rows returned beside it.
 pub fn load_domain_graph_with_build(
     store: &dyn GraphRead,
-    coverage: Option<&ModelCoverage>,
 ) -> anyhow::Result<Option<(serde_json::Value, DomainGraphBuild)>> {
     let mut attempt = 0;
     loop {
         attempt += 1;
-        match load_domain_graph_once(store, coverage)? {
+        match load_domain_graph_once(store)? {
             Loaded::Torn if attempt < 3 => continue,
             Loaded::Torn => anyhow::bail!(
                 "the requirements graph changed while it was read (a build was writing it); read again"
@@ -1926,10 +1948,7 @@ enum Loaded {
     Torn,
 }
 
-fn load_domain_graph_once(
-    store: &dyn GraphRead,
-    coverage: Option<&ModelCoverage>,
-) -> anyhow::Result<Loaded> {
+fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
     use serde_json::{json, Map, Value};
     use wicked_apps_core::EdgeKind;
     use wicked_estate_core::Direction;
@@ -1947,7 +1966,7 @@ fn load_domain_graph_once(
     let by_symbol: std::collections::HashMap<&str, &wicked_apps_core::Node> =
         nodes.iter().map(|n| (n.symbol.as_str(), n)).collect();
 
-    let mut metadata = record
+    let metadata = record
         .metadata
         .clone()
         .or_else(|| {
@@ -2011,10 +2030,6 @@ fn load_domain_graph_once(
         generation: record.generation,
         coverage: metadata.get("coverage").filter(|v| !v.is_null()).cloned(),
     };
-    let v1_0 = metadata.get("schema_version").and_then(|v| v.as_str()) == Some("1.0.0");
-    if let (Some(c), Some(o), false) = (coverage, metadata.as_object_mut(), v1_0) {
-        o.insert("coverage".into(), serde_json::to_value(c)?);
-    }
     Ok(Loaded::Graph(Some((
         json!({ "metadata": metadata, "domains": out_domains }),
         build,
@@ -2948,9 +2963,12 @@ mod tests {
             map(&mut s, &nodes[0], "seat-1", "extract-loop");
             let live = model_coverage(&cov(&s), 80);
             assert_eq!(live.real, 5);
-            let (read, build) = load_domain_graph_with_build(&s, Some(&live))
-                .unwrap()
-                .expect("a graph");
+            let (mut read, build) = load_domain_graph_with_build(&s).unwrap().expect("a graph");
+            assert_eq!(
+                read["metadata"]["coverage"]["real"], 4,
+                "as the build wrote it"
+            );
+            label_domain_graph(&mut read, &live).unwrap();
             assert_eq!(read["metadata"]["coverage"]["real"], 5, "the live label");
             assert_eq!(build.generation, 1);
             assert_eq!(

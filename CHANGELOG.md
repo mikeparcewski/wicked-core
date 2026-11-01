@@ -20,8 +20,12 @@ Two release tracks share this file, newest entry first regardless of track:
   the repeat ask before `domain-graph`. The read overwrote the build's label with the live one, so no reader could tell.
   `requirements_graph_for_repo` (core-ts `getRequirementsGraphForRepo`) now also returns `build: { generation,
   coverage }`: the build record's generation and the label that build persisted, verbatim (`null` coverage when it
-  persisted none), read in the same consistent pass as the rows (`load_domain_graph_with_build`). `build` is null
-  when nothing is built. Additive: `graph` and `coverage` are unchanged.
+  persisted none; generation 0 for a graph persisted before the build record existed), read in the same consistent
+  pass as the rows (`load_domain_graph_with_build`). The rows are read before the store is counted, so a build or a
+  mapping committed in between shows as a difference. `build` is null when nothing is built. The comparison is of
+  counts, which is what the header shows: equal counts mean the header counts what the list holds, not that every
+  statement is unchanged. Additive: `graph` and `coverage` are unchanged (`label_domain_graph` puts the live label on
+  the read, as before).
 
 - **The requirements minimum counts real requirements only (#1233, operator decision 2026-11-01).** The 80% minimum
   counted every accounted behaviour, risk-flagged placeholders included: pi-governance read 100% with 3 real
