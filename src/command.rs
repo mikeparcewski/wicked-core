@@ -77,7 +77,13 @@ pub(crate) enum Command {
     },
     /// Internal: worktree creation failed off-thread; actor marks the run Failed.
     /// Posted by the worktree-creation worker spawned by `LaunchRun` on error.
-    WorktreeFailed { run_id: String, error: String },
+    /// `cleaned`: the worker already removed what it minted (a refused domain launch), so the
+    /// actor schedules no second, asynchronous removal that could race a same-id relaunch.
+    WorktreeFailed {
+        run_id: String,
+        error: String,
+        cleaned: bool,
+    },
     /// Resume an interactive run from its persisted cursor (after a pause, crash, or fresh process).
     /// Re-dispatches the next not-yet-done unit. Busy error if the run is already in flight.
     ResumeRun {

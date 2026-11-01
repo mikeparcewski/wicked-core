@@ -2752,8 +2752,11 @@ fn carry_prompt_in_file_at(
             out.extend(pointer.iter().cloned());
             carried = true;
         } else if a.contains(prompt) {
-            // Glued to a flag (`--prompt=<text>`): the pointer's text takes the prompt's place.
-            out.push(a.replace(prompt, &pointer.join(" ")));
+            // Embedded in a larger argument (`--prompt=<text>`, `"{PROMPT} Be concise."`): the
+            // read-the-file sentence takes the prompt's place (pi's `@path` must be an argument
+            // of its own, so it is never glued).
+            let sentence = prompt_pointer("", &file, prompt.len()).join(" ");
+            out.push(a.replace(prompt, &sentence));
             carried = true;
         } else {
             out.push(a);
@@ -7089,6 +7092,25 @@ mod long_prompt_tests {
         assert_eq!(argv[2], format!("@{}", path.display()));
         assert!(argv[3].contains("whole task"), "{argv:?}");
         check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_with_a_decorated_template_gets_the_read_sentence_not_a_glued_at_path() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv =
+            crate::execute_wrapped::build_argv("pi -p \"{PROMPT} Be concise.\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let _c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        let last = argv.last().unwrap();
+        assert!(
+            !last.starts_with('@') && last.contains("Read that whole file"),
+            "{last}"
+        );
+        assert!(last.ends_with(" Be concise."), "{last}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

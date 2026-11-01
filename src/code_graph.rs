@@ -1179,7 +1179,7 @@ mod tests {
     /// every run. A stale graph is re-indexed from the run's worktree (the base tree) into the
     /// repo's graph, and then reads as current; a current graph and a never-indexed repo are left
     /// alone (the indexer is not run); a failing or hung indexer is an `Err`, bounded.
-    #[cfg(unix)]
+
     #[test]
     fn a_domain_mapping_is_refused_when_its_graph_could_not_reach_the_run_base() {
         let failed: Result<BaseIndex, String> =
@@ -1199,6 +1199,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn d8_a_stale_repo_graph_is_reindexed_at_the_run_base() {
         use std::os::unix::fs::PermissionsExt;

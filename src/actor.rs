@@ -1744,10 +1744,11 @@ pub(crate) fn run(
                                             // The tree was minted for this launch: removed
                                             // here, before the run is failed, so a relaunch of
                                             // the same id never races its removal.
-                                            crate::repo::remove_worktree(&root, &rid);
+                                            crate::repo::discard_minted_worktree(&root, &rid);
                                             let _ = tx.send(Command::WorktreeFailed {
                                                 run_id: rid,
                                                 error: why,
+                                                cleaned: true,
                                             });
                                             return;
                                         }
@@ -1762,6 +1763,7 @@ pub(crate) fn run(
                                 Err(e) => Command::WorktreeFailed {
                                     run_id: rid,
                                     error: e.to_string(),
+                                    cleaned: false,
                                 },
                             };
                             let _ = tx.send(cmd);
@@ -2106,13 +2108,21 @@ pub(crate) fn run(
                     }
                 }
             }
-            Command::WorktreeFailed { run_id, error } => {
+            Command::WorktreeFailed {
+                run_id,
+                error,
+                cleaned,
+            } => {
                 // The off-thread worktree creation failed. Mark the session Failed and surface
                 // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
                 // Guard: only update if the session is not already in a terminal state (e.g.
                 // it may have been cancelled while the worktree thread was running).
                 in_flight.remove(&run_id);
-                if let Ok(Some(s)) = crate::domain::get_session(&store, &run_id) {
+                if let Some(s) = crate::domain::get_session(&store, &run_id)
+                    .ok()
+                    .flatten()
+                    .filter(|_| !cleaned)
+                {
                     // Best-effort: prune any stale git worktree metadata left by a partial
                     // `git worktree add`. Spawned off the actor thread — git can be slow.
                     if let Some(ref ref_id) = s.repo_ref {
