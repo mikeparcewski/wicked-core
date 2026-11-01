@@ -14,16 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
-- **The requirements read says which listed rows the share does not count.** A build emits a requirement for every
+- **The requirements read gives the engine's verdict on each listed row.** A build emits a requirement for every
   product unit an extraction page annotated, behaviour or not, and a later classification change leaves those rows in
   the list while the share stops counting them: on the rig wicked-crew listed 5,770 rows under a header of 3,476 real
   and 836 placeholders, and the other 1,458 were TypeScript shapes (#1238), 441 of them with a stated rule, so the list
-  showed more "real" rows than the header. `requirements_graph_for_repo` (core-ts `getRequirementsGraphForRepo`) now
-  also returns `uncounted: { <domain>: { <REQ-NNN>: "structural" | "not_product" | "unindexed" } }` (null when nothing
-  is built), decided in the same recompute pass that counts `coverage` (`recompute_front_half_coverage_labelling`,
-  over the units `load_domain_graph_with_units` read with the rows), so the rows it leaves out are exactly the
-  counted ones. A row from a build before `code_symbol` gets no label. Additive: `graph`, `coverage` and `build` are
-  unchanged.
+  showed more "real" rows than the header. A reader of the document alone can only guess "real" too: a risk-only
+  unit's synthesized fallback rule carries the risk note's own confidence. `requirements_graph_for_repo` (core-ts
+  `getRequirementsGraphForRepo`) now also returns `rows: { <domain>: { <REQ-NNN>: { real, uncounted } } }` (null when
+  nothing is built): `real` is `classify_node`'s resolve verdict, `uncounted` is null when the share counts the unit,
+  else `"structural" | "not_product" | "unindexed"`. Both are decided in the same recompute pass that counts
+  `coverage` (`recompute_front_half_coverage_for_rows`, over the units `load_domain_graph_with_units` read with the
+  rows), so the rows with `real` and no `uncounted` number exactly `coverage.real`. A row from a build before
+  `code_symbol` has no entry: no claim either way. Additive: `graph`, `coverage` and `build` are unchanged.
 - **A TypeScript shape is not a behaviour.** The requirements minimum counted every `Interface` as behaviour, while
   a `TypeAlias` was structural: on wicked-crew 915 of the 2,174 placeholders the seat could not state a rule for were
   TypeScript interfaces (459 of them wire types). A TS interface is erased at runtime, so it now counts only when the

@@ -662,15 +662,16 @@ pub fn recompute_front_half_coverage_with(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
 ) -> anyhow::Result<CoverageReport> {
-    recompute_observing(store, cfg, &mut |_, _| {})
+    recompute_observing(store, cfg, &mut |_, _| Ok(()))
 }
 
-/// Where the coverage share puts one node: counted in its denominator, or left out and why. The
-/// recompute decides it for every node it visits ([`recompute_observing`]), so a reader that asks it
-/// for a listed requirement's unit gets the very decision behind the header's numbers.
+/// Where the coverage share puts one node: counted in its denominator (and whether it resolves, i.e. is
+/// one of the header's real requirements), or left out and why. The recompute decides it for every node
+/// it visits ([`recompute_observing`]), so a reader that asks it for a listed requirement's unit gets the
+/// very decision behind the header's numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnitClass {
-    Counted,
+    Counted { real: bool },
     Uncounted(Uncounted),
 }
 
@@ -690,11 +691,11 @@ pub enum Uncounted {
     Unindexed,
 }
 
-/// The recompute, telling `observe` where each visited node falls (by symbol).
+/// The recompute, telling `observe` where each visited node falls.
 fn recompute_observing(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
-    observe: &mut dyn FnMut(&str, UnitClass),
+    observe: &mut dyn FnMut(&wicked_apps_core::Node, UnitClass) -> anyhow::Result<()>,
 ) -> anyhow::Result<CoverageReport> {
     // Fail-closed on an out-of-schema threshold (the schema constrains resolve_threshold to [0,1]) — the
     // public `..._with` entry point could otherwise emit a schema-invalid report. Mirrors the annotation
@@ -737,21 +738,14 @@ fn recompute_observing(
 
     for node in &nodes {
         if !is_behavior_bearing(node, &idx, cfg, &mut unknown_other) {
-            observe(
-                node.symbol.as_str(),
-                UnitClass::Uncounted(Uncounted::Structural),
-            );
+            observe(node, UnitClass::Uncounted(Uncounted::Structural))?;
             continue;
         }
         if !is_product_node(node) {
-            observe(
-                node.symbol.as_str(),
-                UnitClass::Uncounted(Uncounted::NotProduct),
-            );
+            observe(node, UnitClass::Uncounted(Uncounted::NotProduct))?;
             not_product += 1;
             continue;
         }
-        observe(node.symbol.as_str(), UnitClass::Counted);
         behavior_bearing += 1;
         // ONE read, used twice: the reuse tally and the bucket classification below.
         let semantics = store.node_semantics(&node.symbol)?;
@@ -768,7 +762,14 @@ fn recompute_observing(
         let app = package_dir(&node.location.file);
         let acc = apps.entry(app.clone()).or_default();
         acc.behavior_bearing += 1;
-        match classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())? {
+        let bucket = classify_node(store, node, cfg.resolve_threshold, semantics.as_ref())?;
+        observe(
+            node,
+            UnitClass::Counted {
+                real: matches!(bucket, Bucket::Resolved(_)),
+            },
+        )?;
+        match bucket {
             Bucket::Resolved(conf) => {
                 resolved += 1;
                 acc.resolved += 1;
@@ -2084,8 +2085,8 @@ pub type RequirementUnits =
     std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
 
 /// [`load_domain_graph_with_build`], with the code unit behind each requirement read
-/// ([`RequirementUnits`]), from the same read: what [`recompute_front_half_coverage_labelling`] needs to
-/// say which listed rows the share does not count.
+/// ([`RequirementUnits`]), from the same read: what [`recompute_front_half_coverage_for_rows`] needs to
+/// give the engine's verdict on each listed row.
 pub fn load_domain_graph_with_units(
     store: &dyn GraphRead,
 ) -> anyhow::Result<Option<(serde_json::Value, DomainGraphBuild, RequirementUnits)>> {
@@ -2102,41 +2103,74 @@ pub fn load_domain_graph_with_units(
     }
 }
 
-/// Listed requirements the coverage share leaves out, by domain then requirement id, with why.
-pub type UncountedRequirements =
-    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Uncounted>>;
+/// The engine's verdict on one listed requirement, from the pass that counts the header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ListedRow {
+    /// The unit resolves (a validated requirement, or a business rule at or above the resolve
+    /// threshold), as `classify_node` decides it. On a counted row this is exactly whether it is one of
+    /// the header's real requirements; on an uncounted row it says only whether a rule was stated there.
+    /// `false` on an unindexed row (nothing to resolve).
+    pub real: bool,
+    /// Why the share leaves the row out, or `None` when it counts it.
+    pub uncounted: Option<Uncounted>,
+}
 
-/// [`recompute_front_half_coverage`], plus which of the listed requirements (`units`, from
-/// [`load_domain_graph_with_units`]) sit on a unit the share does not count — decided in the same pass
-/// that counts the header's numbers, so the rows NOT returned are exactly the requirements on
-/// behaviour-bearing product units (req-reconcile 2026-11-01: wicked-crew listed 1,458 rows on
-/// TypeScript shapes under a header that, since core#1238, counts none of them). A unit the store no
-/// longer holds is [`Uncounted::Unindexed`].
-pub fn recompute_front_half_coverage_labelling(
+/// The engine's verdict on each listed requirement that recorded its code unit, by domain then
+/// requirement id ([`recompute_front_half_coverage_for_rows`]).
+pub type ListedRows =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, ListedRow>>;
+
+/// [`recompute_front_half_coverage`], plus the engine's verdict on each listed requirement (`units`, from
+/// [`load_domain_graph_with_units`]): whether it resolves and whether the share counts its unit — decided
+/// in the same pass that counts the header's numbers, so among the rows it covers, those with
+/// `real && uncounted == None` are exactly `resolved` (req-reconcile 2026-11-01: wicked-crew listed 1,458
+/// rows on TypeScript shapes under a header that, since core#1238, counts none of them, and crew could only
+/// guess real from the document, whose synthesized fallback rule hides a risk-only unit). A unit the store
+/// no longer holds is [`Uncounted::Unindexed`]. A requirement with no recorded unit (a build before
+/// `code_symbol`) has no verdict: no claim either way.
+pub fn recompute_front_half_coverage_for_rows(
     store: &dyn GraphRead,
     units: &RequirementUnits,
-) -> anyhow::Result<(CoverageReport, UncountedRequirements)> {
+) -> anyhow::Result<(CoverageReport, ListedRows)> {
     let wanted: std::collections::HashSet<&str> = units
         .values()
         .flat_map(|reqs| reqs.values().map(String::as_str))
         .collect();
-    let mut seen: std::collections::HashMap<String, UnitClass> = std::collections::HashMap::new();
-    let report = recompute_observing(store, &CoverageConfig::default(), &mut |sym, class| {
-        if wanted.contains(sym) {
-            seen.insert(sym.to_string(), class);
+    let threshold = CoverageConfig::default().resolve_threshold;
+    let mut seen: std::collections::HashMap<String, ListedRow> = std::collections::HashMap::new();
+    let report = recompute_observing(store, &CoverageConfig::default(), &mut |node, class| {
+        let sym = node.symbol.as_str();
+        if !wanted.contains(sym) {
+            return Ok(());
         }
+        let row = match class {
+            UnitClass::Counted { real } => ListedRow {
+                real,
+                uncounted: None,
+            },
+            // Not counted: still say whether a rule was stated there, by the same classifier.
+            UnitClass::Uncounted(why) => {
+                let semantics = store.node_semantics(&node.symbol)?;
+                let bucket = classify_node(store, node, threshold, semantics.as_ref())?;
+                ListedRow {
+                    real: matches!(bucket, Bucket::Resolved(_)),
+                    uncounted: Some(why),
+                }
+            }
+        };
+        seen.insert(sym.to_string(), row);
+        Ok(())
     })?;
-    let mut out = UncountedRequirements::new();
+    let mut out = ListedRows::new();
     for (domain, reqs) in units {
         for (req, sym) in reqs {
-            let why = match seen.get(sym.as_str()) {
-                Some(UnitClass::Counted) => continue,
-                Some(UnitClass::Uncounted(why)) => *why,
-                None => Uncounted::Unindexed,
-            };
+            let row = seen.get(sym.as_str()).copied().unwrap_or(ListedRow {
+                real: false,
+                uncounted: Some(Uncounted::Unindexed),
+            });
             out.entry(domain.clone())
                 .or_default()
-                .insert(req.clone(), why);
+                .insert(req.clone(), row);
         }
     }
     Ok((report, out))
@@ -4053,12 +4087,13 @@ mod tests {
 
         /// req-reconcile (2026-11-01): wicked-crew's list held 1,458 rows on TypeScript shapes (an
         /// extraction page had annotated them before core#1238 stopped counting them) under a header
-        /// that counts none, so the list showed 441 more "real" rows than the header. The read now says,
-        /// from the same pass that counts the header, which listed rows the share leaves out and why;
-        /// the rest are exactly the counted ones. Falsifier: observe every node as `Counted` in
-        /// `recompute_observing` and the shape's row loses its label (the map has 3 entries, not 4).
+        /// that counts none, so the list showed 441 more "real" rows than the header; and a reader can
+        /// only guess "real" from the document, whose synthesized fallback rule makes a risk-only unit
+        /// look stated (codex on crew#1257). The read now gives the engine's verdict on each listed row
+        /// from the same pass that counts the header: the counted real rows are exactly `resolved`.
+        /// Falsifiers: observe a structural unit as counted, or a risk unit as real, and the map differs.
         #[test]
-        fn the_read_labels_listed_rows_the_share_does_not_count() {
+        fn the_read_gives_the_engines_verdict_on_each_listed_row() {
             use wicked_apps_core::GraphRead;
             let mut s = store();
             let f = "src/wire.ts";
@@ -4082,6 +4117,16 @@ mod tests {
                 (5, 9),
                 "export function run(w: Wire): void {",
             );
+            let risky = shaped(
+                &mut s,
+                &format!("{TS}src/wire/refund()."),
+                NodeKind::Function,
+                f,
+                "typescript",
+                (220, 300),
+                (11, 14),
+                "export function refund(): void {",
+            );
             let in_test = shaped(
                 &mut s,
                 &format!("{TS}src/wire.test/helper()."),
@@ -4094,11 +4139,37 @@ mod tests {
             );
             map(&mut s, &shape, "seat", "RULE-1");
             map(&mut s, &run, "seat", "RULE-2");
-            let mut model = build_at(&s, 100);
+            map(&mut s, &in_test, "seat", "RULE-3");
+            // A risk note only, confident and without the "[RISK]" prefix: the builder's fallback rule
+            // carries it at 0.9, which a reader of the document alone would take for a stated rule.
+            s.annotate(
+                &risky.symbol,
+                Annotation::new("risk", "r", "approval threshold unverified").with_confidence(0.9),
+            )
+            .unwrap();
+            let mut model = build_at(&s, 50);
+            let titled = |m: &DomainModel, t: &str| {
+                m.domains["src"]
+                    .requirements
+                    .iter()
+                    .find(|(_, r)| r.title == t)
+                    .map(|(k, _)| k.clone())
+                    .unwrap()
+            };
+            let (shape_req, run_req, risky_req) = (
+                titled(&model, "Wire"),
+                titled(&model, "run"),
+                titled(&model, "refund"),
+            );
             assert_eq!(
                 model.domains["src"].requirements.len(),
-                2,
+                3,
                 "an annotated shape still emits a row; the test-file helper does not"
+            );
+            let fallback = &model.domains["src"].requirements[&risky_req].business_rules[0];
+            assert_eq!(
+                (fallback.statement.as_str(), fallback.confidence),
+                ("approval threshold unverified", 0.9)
             );
             // Rows a build no longer makes but an older graph may hold: a unit outside product code,
             // a unit since removed from the index, and one from before `code_symbol` (no claim).
@@ -4128,40 +4199,58 @@ mod tests {
             let (graph, _, units) = load_domain_graph_with_units(&s).unwrap().unwrap();
             assert_eq!(
                 units["src"].len(),
-                4,
+                5,
                 "every row with a code_symbol: {units:?}"
             );
-            let (report, uncounted) = recompute_front_half_coverage_labelling(&s, &units).unwrap();
+            let (report, rows) = recompute_front_half_coverage_for_rows(&s, &units).unwrap();
             assert_eq!(report, cov(&s), "the same report as the plain recompute");
-            assert_eq!((report.behavior_bearing, report.resolved), (1, 1));
-            let shape_req = model.domains["src"]
-                .requirements
-                .iter()
-                .find(|(_, r)| r.title == "Wire")
-                .map(|(k, _)| k.clone())
-                .unwrap();
-            let want: UncountedRequirements = [(
+            assert_eq!(
+                (
+                    report.behavior_bearing,
+                    report.resolved,
+                    report.risk_flagged
+                ),
+                (2, 1, 1)
+            );
+            let v = |real, uncounted| ListedRow { real, uncounted };
+            let want: ListedRows = [(
                 "src".to_string(),
                 [
-                    (shape_req, Uncounted::Structural),
-                    ("REQ-900".to_string(), Uncounted::NotProduct),
-                    ("REQ-901".to_string(), Uncounted::Unindexed),
+                    (shape_req, v(true, Some(Uncounted::Structural))),
+                    (run_req, v(true, None)),
+                    (risky_req, v(false, None)),
+                    ("REQ-900".to_string(), v(true, Some(Uncounted::NotProduct))),
+                    ("REQ-901".to_string(), v(false, Some(Uncounted::Unindexed))),
                 ]
                 .into_iter()
                 .collect(),
             )]
             .into_iter()
             .collect();
-            assert_eq!(uncounted, want);
-            // Listed rows minus the labelled ones and the one with no claim = what the share counts.
-            let listed = graph["domains"]["src"]["requirements"]
-                .as_object()
-                .unwrap()
-                .len();
-            assert_eq!(listed - want["src"].len() - 1, report.resolved as usize);
+            assert_eq!(rows, want);
+            let counted = |real: bool| {
+                rows["src"]
+                    .values()
+                    .filter(|r| r.uncounted.is_none() && r.real == real)
+                    .count() as u64
+            };
             assert_eq!(
-                serde_json::to_value(&uncounted).unwrap()["src"]["REQ-900"],
-                "not_product"
+                counted(true),
+                report.resolved,
+                "counted real rows = the header's real"
+            );
+            assert_eq!(counted(false), report.risk_flagged);
+            assert_eq!(
+                graph["domains"]["src"]["requirements"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                6,
+                "every row is still listed"
+            );
+            assert_eq!(
+                serde_json::to_value(&rows).unwrap()["src"]["REQ-900"],
+                serde_json::json!({ "real": true, "uncounted": "not_product" })
             );
             assert!(s.get_node(&run.symbol).unwrap().is_some());
         }

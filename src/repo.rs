@@ -388,10 +388,11 @@ pub fn coverage_report_for_repo(
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
 /// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product },
 /// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
-/// "uncounted": { <domain>: { <REQ-NNN>: "structural" | "not_product" | "unindexed" } } or null }`
-/// — `uncounted` names the listed requirements whose code unit the coverage share does not count,
-/// decided in the same pass as `coverage` (req-reconcile 2026-11-01), so the rows it leaves out are
-/// exactly the ones `coverage` counts (when the build is not behind the store);
+/// "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" | "not_product" |
+/// "unindexed" } } } or null }` — `rows` is the engine's verdict on each listed requirement that
+/// recorded its code unit, decided in the same pass as `coverage` (req-reconcile 2026-11-01): the rows
+/// with `real` and no `uncounted` number exactly `coverage.real`. A requirement from a build before
+/// `code_symbol` has no entry (no claim either way);
 /// (real requirements only count toward the minimum, core#1233); the
 /// coverage is recomputed from the store's own counts at read time against the configured minimum
 /// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
@@ -409,7 +410,7 @@ pub fn requirements_graph_for_repo(
     // state, not an error. (A store that exists but cannot be read still errors below.)
     if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
         return Ok(serde_json::json!({
-            "graph": null, "coverage": null, "build": null, "uncounted": null,
+            "graph": null, "coverage": null, "build": null, "rows": null,
         }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
@@ -427,18 +428,18 @@ pub fn requirements_graph_for_repo(
         .as_ref()
         .map(|(_, _, u)| u.clone())
         .unwrap_or_default();
-    let (report, uncounted) =
-        wicked_governance::recompute_front_half_coverage_labelling(&repo_store, &units)?;
+    let (report, rows) =
+        wicked_governance::recompute_front_half_coverage_for_rows(&repo_store, &units)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
-    let (graph, build, uncounted) = match loaded {
+    let (graph, build, rows) = match loaded {
         Some((mut graph, build, _)) => {
             wicked_governance::label_domain_graph(&mut graph, &coverage)?;
-            (Some(graph), Some(build), Some(uncounted))
+            (Some(graph), Some(build), Some(rows))
         }
         None => (None, None, None),
     };
     Ok(serde_json::json!({
-        "graph": graph, "coverage": coverage, "build": build, "uncounted": uncounted,
+        "graph": graph, "coverage": coverage, "build": build, "rows": rows,
     }))
 }
 
@@ -2062,7 +2063,7 @@ mod tests {
         let unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
         assert_eq!(
             unbuilt,
-            serde_json::json!({ "graph": null, "coverage": null, "build": null, "uncounted": null })
+            serde_json::json!({ "graph": null, "coverage": null, "build": null, "rows": null })
         );
 
         std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
@@ -2087,9 +2088,9 @@ mod tests {
         );
         assert_eq!(built["coverage"]["min_pct"], 80);
         assert_eq!(
-            built["uncounted"],
+            built["rows"],
             serde_json::json!({}),
-            "a built graph says which rows the share leaves out: none here"
+            "a built graph gives a verdict on each listed row: none here"
         );
         assert_eq!(
             built["build"],
