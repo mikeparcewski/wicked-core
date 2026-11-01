@@ -2582,8 +2582,8 @@ fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let n = |k: &str| v.get(k).and_then(serde_json::Value::as_u64);
     let f = |k: &str| v.get(k).and_then(serde_json::Value::as_f64);
-    // Only the fields the criterion actually turns on, led by the operator's sentence ("42%
-    // mapped, minimum 80% (…)"). A dump of the whole report would bury the one number they need.
+    // Only the fields the criterion actually turns on, led by the operator's sentence ("42% real
+    // requirements, minimum 80% (…)"). A dump of the whole report would bury the one number they need.
     let report = wicked_governance::CoverageReport {
         behavior_bearing: n("behavior_bearing")?,
         resolved: n("resolved")?,
@@ -2592,17 +2592,11 @@ fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
         ..Default::default()
     };
     // The sentence names what actually failed: a minimum the operator mistyped, a store with
-    // nothing to map, the share itself, or (share met) no requirement genuinely resolved.
+    // nothing to map, or the real share itself.
     let lead = match wicked_governance::min_coverage_pct_from_env() {
         Err(e) => format!("the configured minimum is invalid ({e})"),
         Ok(_) if report.behavior_bearing == 0 => {
             "no behaviour-bearing code in the store to map (index the repository first)".to_string()
-        }
-        Ok(min) if wicked_governance::meets_minimum(&report, min) && report.resolved == 0 => {
-            format!(
-                "{}, but no requirement is genuinely resolved (every mapped node is a RISK flag)",
-                wicked_governance::coverage_verdict(&report, min)
-            )
         }
         Ok(min) => format!(
             "{}; the mapping so far is kept for the next run",

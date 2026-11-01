@@ -1124,7 +1124,7 @@ mod tests {
                 j("agent"),
                 Some("wicked-garden-qe-security-test-engineer"),
             ),
-            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("313df7270f380e53"), false, j("agent"), None),
+            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("9fddcc159580ed33"), false, j("agent"), None),
             ("run", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
         ];

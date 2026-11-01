@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://wickedagile.com/schemas/coverage/1.0.0",
   "title": "wicked coverage report (v1.0.0)",
-  "description": "The resolved-or-flagged coverage ledger \u2014 part of the @wicked/domain-model-schema bundle. Formalizes anti-legacy's coverage-report.json (the coverage.py output). Every behavior-bearing estate SymbolId is either RESOLVED (a rule annotation at/above the confidence threshold) or RISK-flagged (on the HITL research queue) \u2014 never bare/unaccounted. `coverage` = (resolved + risk_flagged) / behavior_bearing, in [0,1], rounded to 4 dp; this is the rule_coverage value crew's GATE_3 requires to equal 1.0. The report doubles as a gate predicate: the engine exits non-zero and lists the unaccounted SymbolIds when coverage < 1.0. Deterministic: unaccounted_nodes and per_app are sorted by SymbolId / app name.",
+  "description": "The resolved-or-flagged coverage ledger \u2014 part of the @wicked/domain-model-schema bundle. Formalizes anti-legacy's coverage-report.json (the coverage.py output). Every behavior-bearing estate SymbolId is either RESOLVED (a rule annotation at/above the confidence threshold) or RISK-flagged (on the HITL research queue) \u2014 never bare/unaccounted. `coverage` = (resolved + risk_flagged) / behavior_bearing, in [0,1], rounded to 4 dp, is the ACCOUNTED ledger. The minimum (bundle 1.3.0, wicked-core#1233) counts REAL requirements only: floor(resolved * 100 / behavior_bearing) against the configured minimum; risk-flagged placeholders never count, and behavior_bearing is product code only (not_product counts what is left out). The report doubles as a gate predicate: `wicked-core coverage --min-coverage-pct` exits non-zero below the minimum. Deterministic: unaccounted_nodes and per_app are sorted by SymbolId / app name.",
   "type": "object",
   "required": [
     "total",
@@ -120,7 +120,7 @@
       "type": "number",
       "minimum": 0,
       "maximum": 1,
-      "description": "(resolved + risk_flagged) / behavior_bearing, 4 dp. The rule_coverage value crew's GATE_3 gates on == 1.0. Vacuously 1.0 when there are no behavior-bearing nodes."
+      "description": "(resolved + risk_flagged) / behavior_bearing, 4 dp: the ACCOUNTED ledger, not the gate. Since bundle 1.3.0 (wicked-core#1233) the minimum counts real requirements only: floor(resolved * 100 / behavior_bearing) against the configured minimum, so a fully accounted report of mostly placeholders fails it. Vacuously 1.0 when there are no behavior-bearing nodes."
     },
     "resolved_rate": {
       "type": "number",
@@ -150,6 +150,18 @@
     "unaccounted_nodes": {
       "type": "array",
       "description": "The bare behavior-bearing nodes, sorted by SymbolId. Empty iff coverage == 1.0.",
+      "items": {
+        "$ref": "#/$defs/unaccountedNode"
+      }
+    },
+    "not_product": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Behaviour-kind nodes left OUT of behavior_bearing because their file is not product code (a test, data, manifest or document file). Optional: absent on reports written before bundle 1.3.0."
+    },
+    "placeholder_nodes": {
+      "type": "array",
+      "description": "The risk-flagged placeholders (accounted, not real requirements), sorted by SymbolId: what the next extraction page may revisit. Absent when there are none.",
       "items": {
         "$ref": "#/$defs/unaccountedNode"
       }

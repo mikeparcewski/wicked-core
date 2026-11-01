@@ -386,7 +386,8 @@ pub fn coverage_report_for_repo(
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
 /// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
-/// "coverage": { mapped_pct, min_pct, behavior_bearing, mapped, resolved, unmapped } }`; the
+/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product } }`
+/// (real requirements only count toward the minimum, core#1233); the
 /// coverage is recomputed from the store's own counts at read time against the configured minimum
 /// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
 /// rebuild. `graph` is null until a build has reached the minimum; a repo registered but not

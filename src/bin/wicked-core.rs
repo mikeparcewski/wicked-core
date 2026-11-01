@@ -160,7 +160,8 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          Recompute front-half coverage from the store and print the report. Reads only. With \
          --min-coverage-pct (a bare flag reads the repository's own target, else \
          $WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, else 80), \
-         exits 3 after writing the report when less than N% of behaviours are mapped.",
+         exits 3 after writing the report when real requirements (resolved behaviours; placeholders \
+         never count) are less than N% of the behaviours in product code.",
     ),
     (
         "requirements-target",
@@ -1350,8 +1351,14 @@ fn coverage_cmd(args: &[String]) {
     }
     match std::fs::write(&out_path, json) {
         Ok(()) => println!(
-            "coverage: {:.4} ({} behavior-bearing, {} unaccounted) → {out_path}",
-            report.coverage, report.behavior_bearing, report.unaccounted
+            "coverage: {}% real requirements ({} of {} behaviours; {} placeholders, {} unmapped; \
+             {} not product code) → {out_path}",
+            wicked_governance::real_pct(&report),
+            report.resolved,
+            report.behavior_bearing,
+            report.risk_flagged,
+            report.unaccounted,
+            report.not_product
         ),
         Err(e) => {
             fail(&format!("coverage: cannot write {out_path}: {e}"));

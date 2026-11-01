@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The requirements minimum counts real requirements only (#1233, operator decision 2026-11-01).** The 80% minimum
+  counted every accounted behaviour, risk-flagged placeholders included: pi-governance read 100% with 3 real
+  requirements of 120, and a wicked-crew page that stated 3 rules for 500 units still lifted the share 83% → 89%.
+  - *The gate.* `meets_minimum`, `coverage_verdict` and `assert_front_half_coverage_min` count resolved behaviours
+    only (`real_pct`, which replaces `mapped_pct`): "23% real requirements, minimum 80% (1362 of 5786 behaviours;
+    4397 placeholders, 27 unmapped)". Placeholders still become `review` requirements in the graph.
+  - *The denominator.* A behaviour-kind node in a test, spec or fixture file, or in a data, manifest or document
+    file (`is_product_file`, the same patterns garden's extraction uses) is not behaviour-bearing; the report counts
+    them as `not_product`. pi-governance's 120 were 109 JSON keys, 8 test functions and 3 product functions.
+  - *The label.* `metadata.coverage` and `requirements_graph_for_repo`'s coverage are `{real_pct, min_pct,
+    behavior_bearing, real, placeholders, unmapped, not_product}` (schema bundle 1.3.0). The coverage report also
+    lists `placeholder_nodes`, so garden's next page can revisit them.
+  - *The coverage step.* Its criterion says real requirements (new validator pin `9fddcc159580ed33`; the script is
+    unchanged, the binary decides). The page review lists an empty statement whose source shows a rule as a missed
+    rule and fails a page that leaves most sourced product units empty.
+
 - **A power-mode orchestrator proposes a memory for what it witnessed.** The orchestrator loads the floor skill, but
   it works to the power brief's turn protocol, and the brief never named the floor's memory rule (garden A7). On the
   rig, a claude orchestrator fixed a test script that fails on Node 22, gave the reason in a `DECISION:` line, and

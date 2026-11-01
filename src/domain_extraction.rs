@@ -32,9 +32,15 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 /// The bar is the CONFIGURED MINIMUM (operator ruling 2026-10-31: 80% by default, crew's
 /// `requirementsGraph.minCoveragePct`), not 1.0: a large repository is mapped hub-first over several
 /// runs, and the graph is built and shown, labelled with its share, once the minimum is reached.
-/// Without a store to recompute from, the file-only fallback still demands full coverage.
+/// Without a store to recompute from, the file-only fallback demands full coverage of REAL
+/// requirements: zero unaccounted and zero placeholders (codex on #1234).
+///
+/// REAL requirements only (operator decision 2026-11-01, core#1233): the minimum counts resolved
+/// behaviours in product code; risk-flagged placeholders are shown in the graph as unconfirmed but
+/// never count, and tests, data, manifests and documents are not in the denominator. The script is
+/// unchanged: `wicked-core coverage --min-coverage-pct` decides.
 pub const COVERAGE_CRITERION: &str =
-    "at least one behavior-bearing node, resolved-or-flagged coverage at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or == 1.0 with zero unaccounted when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
+    "at least one behavior-bearing node in product code, real requirements (resolved behaviours; risk-flagged placeholders never count) at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or every behaviour a real requirement (coverage == 1.0, zero unaccounted, zero placeholders) when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
 
 /// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
 /// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
@@ -66,25 +72,35 @@ pub const RULES_REL: &str = ".wicked/domain/rules.json";
 /// incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
 /// wicked-crew, 8,109 behaviours). Completeness is the coverage step's question, against the
 /// configured minimum; this review judges the rules that were stated.
-pub const RULES_REVIEW_INSTRUCTIONS: &str = "Review the rules the extract step stated in \
-`.wicked/domain/rules.json` against the units of `.wicked/domain/worklist.json`. This run maps the \
-repository one page at a time: the worklist is the current page, hub-first. Completeness is not \
-your question. The host measures the mapped share after each page and maps the next page from the \
-frontier until the target is reached; grouping by domain happens in the domain-graph step. Judge \
-each stated rule: it names a unit of the worklist, it states what the business requires rather \
-than describing the code, it is grounded in that unit's source, and its confidence is not \
-inflated. An empty statement is right where the source supports no rule (the host records it as a \
-risk). Units in test, data, manifest or document files (JSON or YAML keys, package.json fields, \
-markdown headings, test helpers) are not product requirements: the host records whatever is stated \
-for them as unconfirmed, never as a validated requirement, so they are not a reason to fail the \
-page; judge the page on its product-code units, and PASS a page that has none. You judge work \
-another seat did; change no file. List each problem as `ITEM n: FAIL — \
-<symbol> — <why>`. Judge the PAGE: a weak or code-describing statement is a problem you list, and \
-the host records every statement under its confidence threshold as a risk, never as a validated \
-requirement. End with `VERDICT: PASS` when the page is sound as a whole (most stated rules are \
-grounded in their unit's source and name worklist units), or `VERDICT: FAIL` when it is not: \
-rules are invented, name symbols outside the worklist, were composed by a script from names \
-rather than read from the source, or most of them describe code instead of requirements.";
+pub const RULES_REVIEW_INSTRUCTIONS: &str =
+    "Review the rules the extract step stated in `.wicked/domain/rules.json` against the units of \
+`.wicked/domain/worklist.json`. This run maps the repository one page at a time: the worklist is \
+the current page, hub-first, of product-code units not yet resolved to a requirement (unmapped \
+first, then placeholders an earlier page left empty or under the confidence threshold). \
+Completeness is not your question. The host measures the share of real requirements after each \
+page and maps the next page until the target is reached; grouping by domain happens in the \
+domain-graph step. Judge each stated rule: it names a unit of the worklist, it states what the \
+business requires rather than describing the code, it is grounded in that unit's source, and its \
+confidence is not inflated. An empty statement is right where the source supports no rule: pure \
+plumbing such as a re-export, a getter or a pass-through wrapper. Most product code does encode \
+a rule (a check, a refusal, a limit, a default, an ordering, a permission, a state change, a \
+field a caller must supply), so an empty statement on a unit whose source shows one is a MISSED \
+rule, and a problem you list. Units in test, data, manifest or document files are not product \
+requirements: the host records whatever is stated for them as unconfirmed, never as a validated \
+requirement, so they are not a reason to fail the page; judge the page on its product-code \
+units, and PASS a page that has none. An extracted rule (kind `Rule`: a Salesforce Flow, a cloud \
+policy) is product behaviour whatever its file's extension, outside test and fixture files: \
+judge it like code. You judge work another seat did; change no file. List each problem as `ITEM \
+n: FAIL — <symbol> — <why>` (for a missed rule, `missed: <the rule its source shows>`). Judge \
+the PAGE: a weak or code-describing statement is a problem you list, and the host records every \
+statement under its confidence threshold as a risk, never as a validated requirement. End with \
+`VERDICT: PASS` when the page is sound as a whole (most stated rules are grounded in their \
+unit's source and name worklist units, and the units whose source shows a rule got one), or \
+`VERDICT: FAIL` when it is not: rules are invented, name symbols outside the worklist, were \
+composed by a script from names rather than read from the source, most of them describe code \
+instead of requirements, or most sourced product-code units were left empty while their source \
+shows a rule (a page that states almost nothing is not sound, however correct its few rules \
+are).";
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
@@ -145,7 +161,7 @@ pub fn garden_domain_step_cmd(step: &str, script: &str, rest: &str) -> Vec<Strin
 /// setting; the bare flag falls back to 80) — exact integer arithmetic in the binary, because grep
 /// cannot compare a ratio to a number. The full-coverage greps moved INTO the no-store fallback
 /// branch: without a store there is nothing to recompute, so a file alone still has to show 1.0.
-pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage --min-coverage-pct ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json ) && test -f coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage --min-coverage-pct ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && ! grep -Eq '"risk_flagged":[[:space:]]*[1-9]' coverage-report.json ) && test -f coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -177,7 +193,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "313df7270f380e53";
+pub const COVERAGE_VALIDATOR_PIN: &str = "9fddcc159580ed33";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -443,6 +459,22 @@ mod tests {
     /// That is FINDING-050's shape: a denial whose stated reason does not match its cause. Both
     /// strings are inputs to the content-address, so they cannot drift silently in the pin — but
     /// they can drift in MEANING, which is what this asserts.
+    /// The page review agrees with the denominator (core#1233, codex r3 on #1234): tests and
+    /// data files are not product requirements, an extracted rule in a data-extension file is,
+    /// and a page that leaves most sourced product units empty is not passed.
+    #[test]
+    fn the_page_review_matches_what_the_minimum_counts() {
+        let r = RULES_REVIEW_INSTRUCTIONS;
+        assert!(r.contains("not product requirements"), "{r}");
+        assert!(r.contains("An extracted rule (kind `Rule`"), "{r}");
+        assert!(r.contains("judge it like code"), "{r}");
+        assert!(r.contains("MISSED rule"), "{r}");
+        assert!(
+            r.contains("most sourced product-code units were left empty"),
+            "{r}"
+        );
+    }
+
     #[test]
     fn the_criterion_describes_the_requirement_the_script_enforces() {
         let script_checks_non_vacuity =
@@ -723,6 +755,29 @@ mod tests {
             r#"{
   "total": 42,
   "behavior_bearing": 30,
+  "resolved": 30,
+  "risk_flagged": 0,
+  "unaccounted": 0,
+  "coverage": 1.0,
+  "resolve_threshold": 0.75,
+  "unaccounted_nodes": []
+}"#,
+        )
+        .unwrap();
+        assert!(
+            run_validator(&approved, &pass_wt).unwrap(),
+            "every behaviour a real requirement ⇒ gate PASSES"
+        );
+
+        // core#1233 (codex on #1234): without a store, placeholders never count either. 28 real +
+        // 2 placeholders is fully ACCOUNTED (coverage 1.0, unaccounted 0) and used to pass.
+        let placeholder_wt = base.join("placeholders");
+        std::fs::create_dir_all(&placeholder_wt).unwrap();
+        std::fs::write(
+            placeholder_wt.join("coverage-report.json"),
+            r#"{
+  "total": 42,
+  "behavior_bearing": 30,
   "resolved": 28,
   "risk_flagged": 2,
   "unaccounted": 0,
@@ -733,8 +788,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            run_validator(&approved, &pass_wt).unwrap(),
-            "coverage == 1.0 with zero unaccounted ⇒ gate PASSES"
+            !run_validator(&approved, &placeholder_wt).unwrap(),
+            "placeholders do not count toward the no-store fallback ⇒ gate FAILS"
         );
 
         // FAIL worktree: a coverage hole (coverage < 1.0, unaccounted > 0).

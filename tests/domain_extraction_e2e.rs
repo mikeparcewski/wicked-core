@@ -778,9 +778,9 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         graph.is_object(),
         "the graph reads back from estate: {read}"
     );
-    assert_eq!(read["coverage"]["mapped_pct"], 100, "{read}");
+    assert_eq!(read["coverage"]["real_pct"], 100, "{read}");
     assert_eq!(
-        graph["metadata"]["coverage"]["mapped_pct"], 100,
+        graph["metadata"]["coverage"]["real_pct"], 100,
         "the graph carries its coverage label: {graph}"
     );
     assert_eq!(graph["metadata"]["coverage"]["min_pct"], 80);
