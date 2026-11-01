@@ -2639,12 +2639,43 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
 /// ([`carry_prompt_in_file`]), with room to spare for the pointer and the rest of the argv.
 pub(crate) const PROMPT_ARGV_MAX: usize = 64 * 1024;
 
+/// Pi's options that take a value (pi 1.1 `--help`): a prompt right after one of these is that
+/// option's value, not a positional message; every other flag before it is a boolean.
+const PI_VALUE_OPTIONS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--api-key",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--mode",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--name",
+    "-n",
+    "--models",
+    "--tools",
+    "-t",
+    "--exclude-tools",
+    "-xt",
+    "--thinking",
+    "--extension",
+    "-e",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--export",
+    "--tui-mode",
+];
+
 /// Linux's limit on one exec argument (`MAX_ARG_STRLEN`, 32 pages of 4 KiB).
 const EXEC_ARG_MAX: usize = 128 * 1024;
 
-/// What all arguments together may take, well under the 2 MiB a default 8 MiB stack gives exec
-/// (the environment shares that budget).
-const EXEC_ARGS_TOTAL_MAX: usize = 1024 * 1024;
+/// What all the seat's arguments together may take: half of macOS's 1 MiB `ARG_MAX` (the host's
+/// runtime client receives these arguments too, with its wrapper and environment), and well under
+/// the 2 MiB a Linux exec takes.
+const EXEC_ARGS_TOTAL_MAX: usize = 512 * 1024;
 
 /// `Err` when an argument, or all of them together, is too large for a Linux exec, so the unit
 /// is refused with the reason instead of failing inside the container (core#1228).
@@ -2753,8 +2784,23 @@ fn carry_prompt_in_file_at(
         // `--system-prompt`/`--append-system-prompt` pi loads a plain path's contents itself;
         // as any other option's value, the read-the-file sentence stands in.
         let prev = out.last().map(String::as_str).unwrap_or("");
-        let option_value = prev.starts_with('-') && !matches!(prev, "-p" | "--print" | "--");
-        if a == prompt && cli == "pi" && option_value {
+        let option_value = PI_VALUE_OPTIONS.contains(&prev);
+        if cli == "pi" && a != prompt && a.contains(prompt) {
+            // Glued: `--system-prompt=<text>` loads a path; a decorated positional
+            // (`"<text> Be concise."`) gets the file as its own `@path` before it.
+            if let Some(opt) = ["--system-prompt=", "--append-system-prompt="]
+                .into_iter()
+                .find(|o| a.starts_with(o) && &a[o.len()..] == prompt)
+            {
+                out.push(format!("{opt}{}", file.display()));
+            } else if option_value || a.starts_with('-') {
+                out.push(a.replace(prompt, &prompt_pointer("", &file, prompt.len()).join(" ")));
+            } else {
+                out.push(format!("@{}", file.display()));
+                out.push(a.replace(prompt, "the task in the attached file"));
+            }
+            carried = true;
+        } else if a == prompt && cli == "pi" && option_value {
             if matches!(prev, "--system-prompt" | "--append-system-prompt") {
                 out.push(file.to_string_lossy().into_owned());
             } else {
@@ -7109,7 +7155,7 @@ mod long_prompt_tests {
     }
 
     #[test]
-    fn pi_with_a_decorated_template_gets_the_read_sentence_not_a_glued_at_path() {
+    fn pi_with_a_decorated_template_gets_its_at_path_as_an_argument_of_its_own() {
         let root = base();
         let prompt = big_prompt();
         let mut argv =
@@ -7118,12 +7164,10 @@ mod long_prompt_tests {
         let _c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
             .unwrap()
             .expect("carried");
-        let last = argv.last().unwrap();
-        assert!(
-            !last.starts_with('@') && last.contains("Read that whole file"),
-            "{last}"
-        );
-        assert!(last.ends_with(" Be concise."), "{last}");
+        // The file rides pi's own carrier as an argument of its own; the decoration stays.
+        let n = argv.len();
+        assert_eq!(argv[n - 2], format!("@{}", _c.file.display()), "{argv:?}");
+        assert_eq!(argv[n - 1], "the task in the attached file Be concise.");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7153,6 +7197,31 @@ mod long_prompt_tests {
             }
             assert_eq!(argv.last().unwrap(), "Begin.", "{template}");
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_after_a_boolean_flag_still_gets_its_file_and_a_glued_system_prompt_gets_the_path() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv =
+            crate::execute_wrapped::build_argv("pi -p --no-tools \"{PROMPT}\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        assert!(argv.contains(&format!("@{}", c.file.display())), "{argv:?}");
+        let mut glued = vec![
+            "pi".to_string(),
+            "-p".to_string(),
+            format!("--system-prompt={prompt}"),
+            "Go.".into(),
+        ];
+        let mut mounts = Vec::new();
+        let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut glued, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        assert_eq!(glued[2], format!("--system-prompt={}", c.file.display()));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -7243,10 +7312,10 @@ mod long_prompt_tests {
         let why = check_exec_args(&argv).unwrap_err();
         assert!(why.contains("cannot pass an argument"), "{why}");
         // Many small arguments that add up past the budget are refused too.
-        let many = vec!["x".repeat(100 * 1024); 12];
+        let many = vec!["x".repeat(100 * 1024); 6];
         assert!(check_exec_args(&many).unwrap_err().contains("at most"));
         // Many tiny ones too: each also costs its pointer in the exec's argv table.
-        let tiny = vec!["x".to_string(); 120_000];
+        let tiny = vec!["x".to_string(); 60_000];
         assert!(check_exec_args(&tiny).unwrap_err().contains("at most"));
         assert_eq!(
             crate::worker_sandbox::FloorUnarmed::ArgvTooLong.as_str(),
