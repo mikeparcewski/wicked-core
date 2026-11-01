@@ -2024,8 +2024,8 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
     if read_build_record(store)?.generation != record.generation {
         return Ok(Loaded::Torn);
     }
-    // The fresh label replaces the build's — except on a 1.0.0 document, whose schema has no
-    // `metadata.coverage` (the caller carries the label beside the graph either way).
+    // The graph as the build wrote it, its own label included; a caller that wants the store's counts
+    // now puts them on with `label_domain_graph`.
     let build = DomainGraphBuild {
         generation: record.generation,
         coverage: metadata.get("coverage").filter(|v| !v.is_null()).cloned(),
