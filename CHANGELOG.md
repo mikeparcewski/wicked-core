@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A power-mode orchestrator proposes a memory for what it witnessed.** The orchestrator loads the floor skill, but
+  it works to the power brief's turn protocol, and the brief never named the floor's memory rule (garden A7). On the
+  rig, a claude orchestrator fixed a test script that fails on Node 22, gave the reason in a `DECISION:` line, and
+  proposed nothing. Both runs showed this. The brief (`power::orchestrator_brief`) and every later turn's prompt
+  (`power::continuation_prompt`, since a restarted session never read the brief) now carry `power::MEMORY_DIRECTIVE`.
+  Before each `CHECKPOINT:` or `HANDOFF:` line, the orchestrator proposes what bit for a reason the code doesn't show
+  (a command that failed because of the toolchain, the environment or the setup, and what made it pass; a tool trap;
+  an operator ruling). It uses the floor's one-line shim (`estate_memory.py --readonly propose`), which files the
+  proposal under the run, the unit and the seat. Each learning is proposed once, at most three a session.
+
 - **A domain-extraction run keeps mapping until the target, or until the operator says stop.** One run mapped one
   page (300 behaviours) and ended, so wicked-crew (8,109 behaviours) needed about 27 runs to reach the 80% minimum.
   - *A bounded loop over a run's own steps.* A Tool phase may declare `repeat_from: <earlier phase>` (a `run` plan
