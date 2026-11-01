@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A TypeScript shape is not a behaviour.** The requirements minimum counted every `Interface` as behaviour, while
+  a `TypeAlias` was structural: on wicked-crew 915 of the 2,174 placeholders the seat could not state a rule for were
+  TypeScript interfaces (459 of them wire types). A TS interface is erased at runtime, so it now counts only when the
+  graph shows behaviour: its own outgoing behaviour edge (the `Module` rule's set), a member with one, or a member
+  outside its declaration (a class merged into the same symbol). Its method signatures (members inside
+  the declaration, no behaviour edge) are structural too. Interfaces and traits in other languages keep counting:
+  Java interface constants, C# property bodies and Scala trait initializers can execute and are not always
+  extracted, and estate gives overloads one symbol, so a `…;` signature does not prove the symbol has no body.
+  Constructors are unchanged. Rules already stated on a shape stay in the graph; they leave the share's numerator
+  and denominator together. wicked-crew: 62.0% (3585 of 5786) → 72.7% (3144 of 4322), placeholders 2174 → 1157.
 - **The requirements read says which build it lists.** crew's requirements list is the last graph BUILD and its
   header is the store NOW, and nothing said so: on the rig wicked-crew listed the 04:59 build (1,383 real, built under
   the old placeholder-counting gate) under a header counting 3,585 real, after a run mapped 2,223 more and stopped at

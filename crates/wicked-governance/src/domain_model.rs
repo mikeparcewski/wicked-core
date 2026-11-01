@@ -344,23 +344,135 @@ fn is_behavior_out_edge(kind: &wicked_apps_core::EdgeKind) -> bool {
     }
 }
 
+/// TypeScript-family languages. A TS interface is erased at runtime: its own declaration holds only
+/// types, and an extracted interface method (`interface_body (method_signature)`) never has a body.
+const TS_FAMILY: &[&str] = &["typescript", "tsx", "vue", "svelte"];
+
+/// The type a member's symbol names as its owner: the symbol minus the member's own name and
+/// descriptor (`…/TokenVerifier#verify().` → `…/TokenVerifier#`, `Pay#NoOp#run().` → `Pay#NoOp#`,
+/// `T#N#` → `T#`). Split on the node's NAME, never on the last `#`: estate renders a name raw, so it
+/// may itself hold `#` (a private `#data`, `Live##data.`) or `.`; a backtick-escaped rendering is
+/// tried too. `None` when the symbol does not end in the name (nothing is attributed) or the rest is
+/// not a type.
+fn owner_symbol<'a>(sym: &'a str, name: &str) -> Option<&'a str> {
+    if name.is_empty() {
+        return None;
+    }
+    let escaped = format!("`{name}`");
+    let prefix = [name, escaped.as_str()].iter().find_map(|n| {
+        ["().", ".", "#"]
+            .iter()
+            .find_map(|d| sym.strip_suffix(*d)?.strip_suffix(*n))
+    })?;
+    // A raw private name (`#data`) whose node name drops the `#` leaves `Live##`: a type
+    // descriptor never has an empty name, so the second `#` belongs to the member.
+    let prefix = prefix
+        .strip_suffix("##")
+        .map_or(prefix, |p| &prefix[..p.len() + 1]);
+    prefix.ends_with('#').then_some(prefix)
+}
+
+/// What the per-node behaviour test needs from the rest of the graph, computed once per pass
+/// ([`BehaviorIndex::build`]) and shared by the coverage recompute and the domain-graph build.
+struct BehaviorIndex {
+    /// Every symbol with ≥1 outgoing behaviour edge: the Module dead-shell test, and a TS interface
+    /// that does something.
+    has_behavior_out: std::collections::HashSet<String>,
+    /// TS interface method signatures (proven bodiless): structural.
+    bodiless: std::collections::HashSet<String>,
+    /// TS interfaces with evidence of runtime content: a member outside the declaration (a class or
+    /// namespace merged into the same symbol), or a member with a behaviour-out edge.
+    carries_body: std::collections::HashSet<String>,
+}
+
+impl BehaviorIndex {
+    fn build(store: &dyn GraphRead, nodes: &[wicked_apps_core::Node]) -> anyhow::Result<Self> {
+        use std::collections::{HashMap, HashSet};
+        use wicked_apps_core::NodeKind;
+        let mut has_behavior_out: HashSet<String> = HashSet::new();
+        for e in store.all_edges()? {
+            if is_behavior_out_edge(&e.kind) {
+                has_behavior_out.insert(e.source.as_str().to_string());
+            }
+        }
+        let ts_interfaces: HashMap<&str, &wicked_apps_core::Node> = nodes
+            .iter()
+            .filter(|n| is_ts_interface(n))
+            .map(|n| (n.symbol.as_str(), n))
+            .collect();
+        let mut bodiless: HashSet<String> = HashSet::new();
+        let mut carries_body: HashSet<String> = HashSet::new();
+        for n in nodes {
+            let sym = n.symbol.as_str();
+            let Some(owner) =
+                owner_symbol(sym, &n.name).and_then(|o| ts_interfaces.get(o).copied())
+            else {
+                continue;
+            };
+            // A member is part of the interface's own declaration only when both have a span, they
+            // share a file, the member lies inside it, and the member does nothing (no behaviour edge).
+            let (sp, osp) = (&n.location.span, &owner.location.span);
+            let in_declaration = n.location.file == owner.location.file
+                && sp.end_byte > sp.start_byte
+                && osp.end_byte > osp.start_byte
+                && osp.start_byte <= sp.start_byte
+                && sp.end_byte <= osp.end_byte
+                && !has_behavior_out.contains(sym);
+            if !in_declaration {
+                carries_body.insert(owner.symbol.as_str().to_string());
+            } else if matches!(n.kind, NodeKind::Method) {
+                bodiless.insert(sym.to_string());
+            }
+        }
+        Ok(BehaviorIndex {
+            has_behavior_out,
+            bodiless,
+            carries_body,
+        })
+    }
+}
+
+/// A TypeScript-family `interface` node.
+fn is_ts_interface(node: &wicked_apps_core::Node) -> bool {
+    matches!(node.kind, wicked_apps_core::NodeKind::Interface)
+        && TS_FAMILY.contains(&node.language.as_str())
+}
+
 /// Whether a node counts in the coverage DENOMINATOR (ports `coverage.py::is_behavior_bearing`). The
 /// native `NodeKind` match is EXHAUSTIVE with NO wildcard arm — adding a variant to the enum breaks this
 /// build until it is explicitly classified (a dropped behavior kind is fail-OPEN, so silence is the
 /// hazard). `Module` is behavior-bearing only when it is NOT a dead shell (has ≥1 behavior-out edge).
+/// A TypeScript `interface` likewise counts only when the graph shows it carries behaviour (its own
+/// behaviour-out edge, a member with one, or a member outside its declaration: a merged class or
+/// namespace): a pure shape is the same thing as a `TypeAlias` and can never carry a rule. Its
+/// method signatures are structural for the same reason. Interfaces and traits in other languages
+/// keep counting: Java interface constants, C# property bodies, Rust trait items and Scala trait
+/// initializers can execute, and extraction does not prove their absence. Known residuals, both
+/// estate extraction gaps: a TS class merged with an interface whose every member the interface
+/// redeclares collapses (estate gives both one symbol, last declaration wins) and leaves no evidence
+/// of the class; and a namespace merged with an interface has no namespace node (its members are
+/// module-level), so only its members' own classification counts it (a `Constant` initializer is
+/// structural before and after this rule).
 /// `unknown_other` collects any unrecognized `Other` tag so the caller can WARN (release-safe surfacing
 /// of a new behavior extractor's tag that currently defaults structural).
 fn is_behavior_bearing(
     node: &wicked_apps_core::Node,
-    has_behavior_out: &std::collections::HashSet<String>,
+    idx: &BehaviorIndex,
     cfg: &CoverageConfig,
     unknown_other: &mut std::collections::BTreeSet<String>,
 ) -> bool {
     use wicked_apps_core::NodeKind::*;
     match &node.kind {
-        // Behavior-bearing: the atomic units of logic. Namespace≈Module, Trait≈Interface,
-        // Constructor≈Method.
-        Namespace | Function | Method | Constructor | Class | Struct | Interface | Trait => true,
+        // Behavior-bearing: the atomic units of logic. Namespace≈Module.
+        Namespace | Class | Struct => true,
+        // A callable counts unless it is a TS interface's method signature.
+        Function | Method | Constructor => !idx.bodiless.contains(node.symbol.as_str()),
+        // A TS interface counts only when the graph shows behaviour; other interfaces and traits count.
+        Interface | Trait => {
+            !is_ts_interface(node)
+                || idx.has_behavior_out.contains(node.symbol.as_str())
+                || idx.carries_body.contains(node.symbol.as_str())
+        }
         // Rule is behavior-bearing when EXTRACTED — a rules-engine extractor's output, bare until
         // annotated (extractors mint per-language schemes: `odm`, `dmn`, `drl`, …). But a Rule
         // persisted by `persist_domain_model` is a `wicked-apps` SYNTHETIC node — the domain graph's
@@ -370,7 +482,7 @@ fn is_behavior_bearing(
         // excluded; an extracted Rule still counts.
         Rule => !wicked_apps_core::is_apps_synthetic_symbol(&node.symbol),
         // Module counts unless it is a dead shell (a pure container with no outgoing behavior edge).
-        Module => has_behavior_out.contains(node.symbol.as_str()),
+        Module => idx.has_behavior_out.contains(node.symbol.as_str()),
         // Structural leaves + rule-engine containers/sub-clauses (annotation target is the Rule node).
         File | Import | Field | Constant | Variable | Parameter | TypeAlias | Enum | Macro
         | RuleSet | Condition | Action | Fact | Synthetic => false,
@@ -563,13 +675,9 @@ pub fn recompute_front_half_coverage_with(
     nodes.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     let total = nodes.len() as u64;
 
-    // Precompute the Module dead-shell input ONCE: every symbol with ≥1 outgoing behavior edge.
-    let mut has_behavior_out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for e in store.all_edges()? {
-        if is_behavior_out_edge(&e.kind) {
-            has_behavior_out.insert(e.source.as_str().to_string());
-        }
-    }
+    // Precompute ONCE: behaviour-out edges (Module dead shells, interfaces that act), bodiless
+    // callables and the interfaces/traits that carry a body.
+    let idx = BehaviorIndex::build(store, &nodes)?;
 
     // Per-app accumulators (grouped by package_dir — root sentinel "(root)").
     #[derive(Default)]
@@ -594,7 +702,7 @@ pub fn recompute_front_half_coverage_with(
         std::collections::BTreeMap::new();
 
     for node in &nodes {
-        if !is_behavior_bearing(node, &has_behavior_out, cfg, &mut unknown_other) {
+        if !is_behavior_bearing(node, &idx, cfg, &mut unknown_other) {
             continue;
         }
         if !is_product_node(node) {
@@ -1084,12 +1192,7 @@ pub fn build_domain_model_with(
     // persisted `SatisfiedBy` edge would point at the old one, and crew's overrides (keyed
     // `domain::REQ-NNN`) would land on the wrong item. Gaps in the numbering are unmapped nodes.
     let cfg = CoverageConfig::default();
-    let mut has_behavior_out: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for e in store.all_edges()? {
-        if is_behavior_out_edge(&e.kind) {
-            has_behavior_out.insert(e.source.as_str().to_string());
-        }
-    }
+    let idx = BehaviorIndex::build(store, &nodes)?;
     let mut unknown_other = std::collections::BTreeSet::new();
     let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 
@@ -1137,7 +1240,7 @@ pub fn build_domain_model_with(
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
         let resolved = has_requirement || !business_rules.is_empty();
-        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other);
+        let behavior = is_behavior_bearing(node, &idx, &cfg, &mut unknown_other);
         let accounted = resolved || !risk_notes.is_empty();
         let slot = if behavior || accounted {
             let n = slots.entry(package_dir(&node.location.file)).or_insert(0);
@@ -3655,6 +3758,429 @@ mod tests {
                 r.coverage < 1.0,
                 "bare mainframe behavior nodes DENY: {r:?}"
             );
+        }
+
+        /// A source node with an extractor-style symbol, a language, a span (bytes, lines) and the
+        /// extractor's one-line signature.
+        #[allow(clippy::too_many_arguments)]
+        fn shaped(
+            store: &mut SqliteStore,
+            sym: &str,
+            kind: NodeKind,
+            file: &str,
+            lang: &str,
+            bytes: (u32, u32),
+            lines: (u32, u32),
+            sig: &str,
+        ) -> Node {
+            let name = sym
+                .trim_end_matches(['#', '.', '(', ')'])
+                .rsplit(['#', '/'])
+                .next()
+                .unwrap()
+                .to_string();
+            let mut n = Node::new(
+                wicked_apps_core::SymbolId::from(sym),
+                kind,
+                name,
+                Language::new(lang),
+                Location::new(
+                    file.to_string(),
+                    Span {
+                        start_byte: bytes.0,
+                        end_byte: bytes.1,
+                        start_line: lines.0,
+                        start_col: 0,
+                        end_line: lines.1,
+                        end_col: 1,
+                    },
+                ),
+            );
+            n.signature = Some(sig.to_string());
+            store.begin_batch().unwrap();
+            store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+            store.commit_batch().unwrap();
+            n
+        }
+        fn calls(store: &mut SqliteStore, from: &Node, to: &Node) {
+            use wicked_apps_core::{Edge, EdgeKind, ResolutionTier};
+            store.begin_batch().unwrap();
+            store
+                .upsert_edges(&[Edge::new(
+                    from.symbol.clone(),
+                    to.symbol.clone(),
+                    EdgeKind::Calls,
+                    ResolutionTier::Heuristic,
+                    "test",
+                )])
+                .unwrap();
+            store.commit_batch().unwrap();
+        }
+        fn listed(r: &CoverageReport) -> Vec<String> {
+            let mut v: Vec<String> = r
+                .unaccounted_nodes
+                .iter()
+                .chain(&r.placeholder_nodes)
+                .map(|n| n.symbol_id.rsplit(' ').next().unwrap().to_string())
+                .collect();
+            v.sort();
+            v
+        }
+        const TS: &str = "ts-typescript . . . ";
+
+        #[test]
+        fn owner_symbol_names_the_enclosing_type() {
+            assert_eq!(
+                owner_symbol("t . . . a/T#run().", "run"),
+                Some("t . . . a/T#")
+            );
+            assert_eq!(owner_symbol("t . . . a/T#x.", "x"), Some("t . . . a/T#"));
+            assert_eq!(
+                owner_symbol("t . . . a/T#N#run().", "run"),
+                Some("t . . . a/T#N#")
+            );
+            assert_eq!(owner_symbol("t . . . a/T#N#", "N"), Some("t . . . a/T#"));
+            assert_eq!(owner_symbol("t . . . a/T#", "T"), None);
+            assert_eq!(owner_symbol("t . . . a/run().", "run"), None);
+            assert_eq!(owner_symbol("t . . . a/T#run().", "other"), None);
+            // xreview r2+r3 on core#1238 (codex): estate renders names raw, so a name may hold `#`
+            // (a private field `#data`), or be backtick-escaped.
+            assert_eq!(
+                owner_symbol("t . . . a/Live##data.", "#data"),
+                Some("t . . . a/Live#")
+            );
+            assert_eq!(
+                owner_symbol("t . . . a/Live##data.", "data"),
+                Some("t . . . a/Live#")
+            );
+            assert_eq!(
+                owner_symbol("t . . . a/Live##run().", "#run"),
+                Some("t . . . a/Live#")
+            );
+            assert_eq!(
+                owner_symbol("s . . . a/H#`foo#bar`().", "foo#bar"),
+                Some("s . . . a/H#")
+            );
+            assert_eq!(
+                owner_symbol("s . . . a/H#foo#bar().", "foo#bar"),
+                Some("s . . . a/H#")
+            );
+        }
+
+        /// cov-interfaces (2026-11-01): wicked-crew stopped at 61% with 915 of its 2,174
+        /// placeholders on TypeScript interfaces (459 of them wire types). A TS interface that only
+        /// describes a data shape is the same thing as a type alias, and its extracted method
+        /// signatures have no body: neither can carry a business rule. The class method and the
+        /// function beside them still count. Falsifier: put `Interface` back in the unconditional
+        /// arm of `is_behavior_bearing` (and drop the bodiless test) and `behavior_bearing` reads 5.
+        #[test]
+        fn ts_shape_interface_and_its_signatures_are_structural() {
+            let mut s = store();
+            let f = "src/auth.ts";
+            shaped(
+                &mut s,
+                &format!("{TS}src/auth/TokenVerifier#"),
+                NodeKind::Interface,
+                f,
+                "typescript",
+                (0, 120),
+                (1, 5),
+                "export interface TokenVerifier {",
+            );
+            shaped(
+                &mut s,
+                &format!("{TS}src/auth/TokenVerifier#verify()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (60, 110),
+                (4, 4),
+                "verify(token: string): Promise<Actor | null>",
+            );
+            shaped(
+                &mut s,
+                &format!("{TS}src/auth/Wire#"),
+                NodeKind::Interface,
+                f,
+                "typescript",
+                (130, 200),
+                (7, 9),
+                "interface Wire {",
+            );
+            let m = shaped(
+                &mut s,
+                &format!("{TS}src/auth/StaticVerifier#verify()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (260, 400),
+                (12, 20),
+                "async verify(token: string): Promise<Actor | null> {",
+            );
+            let g = shaped(
+                &mut s,
+                &format!("{TS}src/auth/defaultTokensPath()."),
+                NodeKind::Function,
+                f,
+                "typescript",
+                (420, 520),
+                (22, 24),
+                "export function defaultTokensPath(env = process.env): string {",
+            );
+            let r = cov(&s);
+            assert_eq!(r.behavior_bearing, 2, "{r:?}");
+            assert_eq!(
+                listed(&r),
+                vec![
+                    "src/auth/StaticVerifier#verify().",
+                    "src/auth/defaultTokensPath()."
+                ]
+            );
+            // Mapping the two behaviours is 100%: the unmapped shapes never block a full build, and
+            // the build emits exactly the two requirements.
+            map(&mut s, &m, "seat", "RULE-1");
+            map(&mut s, &g, "seat", "RULE-2");
+            assert_eq!(cov(&s).resolved, 2);
+            let model = build_at(&s, 100);
+            let reqs: usize = model.domains.values().map(|d| d.requirements.len()).sum();
+            assert_eq!(reqs, 2);
+        }
+
+        /// What keeps a TS interface or its member counted (xreview r1 + r2 on core#1238): the
+        /// interface's own behaviour edge; a class merged into the same symbol (its method or field
+        /// lies outside the interface's declaration); a member with no span (membership unproven);
+        /// an in-declaration member with its own behaviour edge.
+        #[test]
+        fn ts_interface_counts_when_anything_proves_behaviour() {
+            let mut s = store();
+            let f = "src/a.ts";
+            let ts = |t: &str| format!("{TS}src/a/{t}");
+            let i = |s: &mut SqliteStore, t: &str, b: (u32, u32)| {
+                shaped(
+                    s,
+                    &ts(t),
+                    NodeKind::Interface,
+                    f,
+                    "typescript",
+                    b,
+                    (b.0, b.0 + 1),
+                    "interface X {",
+                )
+            };
+            let policy = i(&mut s, "Policy#", (0, 100));
+            let decide = shaped(
+                &mut s,
+                &ts("decide()."),
+                NodeKind::Function,
+                f,
+                "typescript",
+                (120, 200),
+                (6, 9),
+                "function decide() {",
+            );
+            calls(&mut s, &policy, &decide);
+            // Declaration merging: `class Merged { fee() {…} }` + `interface Merged { sig(): void }`.
+            i(&mut s, "Merged#", (300, 360));
+            shaped(
+                &mut s,
+                &ts("Merged#sig()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (320, 340),
+                (21, 21),
+                "sig(): void",
+            );
+            shaped(
+                &mut s,
+                &ts("Merged#fee()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (220, 280),
+                (12, 14),
+                "fee() {",
+            );
+            // A merged class field with an initializer that calls: `class Live { data = { a: charge() } }`.
+            i(&mut s, "Live#", (400, 460));
+            let data = shaped(
+                &mut s,
+                &ts("Live#data."),
+                NodeKind::Field,
+                f,
+                "typescript",
+                (380, 398),
+                (30, 30),
+                "data = { a: charge() };",
+            );
+            calls(&mut s, &data, &decide);
+            // A merged class's PRIVATE field (`#data = charge()`): estate renders `Live2##data.`.
+            i(&mut s, "Live2#", (600, 640));
+            let pdata = shaped(
+                &mut s,
+                &ts("Live2##data."),
+                NodeKind::Field,
+                f,
+                "typescript",
+                (580, 598),
+                (50, 50),
+                "#data = { a: charge() };",
+            );
+            calls(&mut s, &pdata, &decide);
+            // An in-declaration member with its own behaviour edge.
+            i(&mut s, "Edged#", (500, 560));
+            let run = shaped(
+                &mut s,
+                &ts("Edged#run()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (520, 540),
+                (41, 41),
+                "run(): void",
+            );
+            calls(&mut s, &run, &decide);
+            // An interface at byte 0 and a zero-span method of it: no span, no proof.
+            shaped(
+                &mut s,
+                &format!("{TS}src/b/Zero#"),
+                NodeKind::Interface,
+                "src/b.ts",
+                "typescript",
+                (0, 90),
+                (1, 3),
+                "interface Zero {",
+            );
+            shaped(
+                &mut s,
+                &format!("{TS}src/b/Zero#run()."),
+                NodeKind::Method,
+                "src/b.ts",
+                "typescript",
+                (0, 0),
+                (0, 0),
+                "run() { return 7; }",
+            );
+            let r = cov(&s);
+            assert_eq!(
+                listed(&r),
+                vec![
+                    "src/a/Edged#",
+                    "src/a/Edged#run().",
+                    "src/a/Live#",
+                    "src/a/Live2#",
+                    "src/a/Merged#",
+                    "src/a/Merged#fee().",
+                    "src/a/Policy#",
+                    "src/a/decide().",
+                    "src/b/Zero#",
+                    "src/b/Zero#run().",
+                ],
+                "{r:?}"
+            );
+        }
+
+        /// Interfaces and traits outside TypeScript keep counting, members or not: a Java interface
+        /// constant (`Object LOCK = new Object();`) or a Scala trait initializer can execute and is
+        /// not always extracted, a C# property body is a Field, and estate gives overloads one symbol,
+        /// so a `…;` signature does not prove the symbol has no body. A Rust trait's default method
+        /// counts as before.
+        #[test]
+        fn interfaces_and_traits_outside_typescript_keep_counting() {
+            let mut s = store();
+            let f = "src/main/java/a/Pay.java";
+            shaped(
+                &mut s,
+                "java . . . a/Pay#",
+                NodeKind::Interface,
+                f,
+                "java",
+                (0, 300),
+                (1, 10),
+                "public interface Pay {",
+            );
+            shaped(
+                &mut s,
+                "java . . . a/Pay#fee().",
+                NodeKind::Method,
+                f,
+                "java",
+                (30, 70),
+                (2, 2),
+                "long fee(Order order);",
+            );
+            shaped(
+                &mut s,
+                "java . . . a/Locks#",
+                NodeKind::Interface,
+                f,
+                "java",
+                (310, 400),
+                (12, 14),
+                "interface Locks { Object LOCK = new Object(); }",
+            );
+            shaped(
+                &mut s,
+                "csharp . . . a/Fees#",
+                NodeKind::Interface,
+                "Fees.cs",
+                "csharp",
+                (0, 90),
+                (1, 3),
+                "interface Fees {",
+            );
+            let r = "rust . . . src/team/vault/";
+            shaped(
+                &mut s,
+                &format!("{r}EvidenceVault#"),
+                NodeKind::Trait,
+                "src/team/vault.rs",
+                "rust",
+                (0, 200),
+                (1, 8),
+                "pub trait EvidenceVault: Send + Sync {",
+            );
+            shaped(
+                &mut s,
+                &format!("{r}Hooks#on_shutdown()."),
+                NodeKind::Function,
+                "src/team/vault.rs",
+                "rust",
+                (240, 280),
+                (11, 11),
+                "fn on_shutdown(&self) {}",
+            );
+            let rep = cov(&s);
+            assert_eq!(rep.behavior_bearing, 6, "{rep:?}");
+        }
+
+        /// Constructors are unchanged: an empty `{}` body can still run parameter defaults,
+        /// destructuring and decorators, so a one-line TS constructor keeps counting.
+        #[test]
+        fn constructors_keep_counting() {
+            let mut s = store();
+            let f = "src/cache.ts";
+            shaped(
+                &mut s,
+                &format!("{TS}src/cache/C#constructor()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (0, 60),
+                (3, 3),
+                "constructor(private readonly deps: CacheDeps) {}",
+            );
+            shaped(
+                &mut s,
+                &format!("{TS}src/cache/D#constructor()."),
+                NodeKind::Method,
+                f,
+                "typescript",
+                (100, 160),
+                (9, 9),
+                "constructor([first]: Iterable<number>) {}",
+            );
+            assert_eq!(cov(&s).behavior_bearing, 2);
         }
 
         #[test]
