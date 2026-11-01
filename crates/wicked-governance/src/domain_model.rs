@@ -42,21 +42,29 @@ pub struct Metadata {
     pub coverage: Option<ModelCoverage>,
 }
 
-/// The coverage a domain model was built at (`metadata.coverage`, domain-model 1.1.0).
+/// The coverage a domain model was built at (`metadata.coverage`, domain-model 1.1.0, schema
+/// bundle 1.3.0). The minimum counts REAL requirements only (operator decision 2026-11-01,
+/// core#1233): a behaviour resolved to a stated, sourced business rule. A risk-flagged placeholder
+/// (an empty statement, a rule under the confidence threshold, or one written unconfirmed) still
+/// shows in the graph as unconfirmed, but never counts toward the minimum.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ModelCoverage {
-    /// `floor(mapped * 100 / behavior_bearing)`; 100 on an empty denominator.
-    pub mapped_pct: u8,
+    /// `floor(real * 100 / behavior_bearing)`; 100 on an empty denominator. The one number the
+    /// minimum is checked against.
+    pub real_pct: u8,
     /// The minimum the build was held to.
     pub min_pct: u8,
-    /// Behavior-bearing nodes (the denominator).
+    /// Behavior-bearing nodes in product code (the denominator; tests, data, manifests and
+    /// documents are not in it, see [`is_product_file`]).
     pub behavior_bearing: u64,
-    /// Behavior-bearing nodes mapped (resolved + risk-flagged).
-    pub mapped: u64,
-    /// Of those, resolved to a stated business rule.
-    pub resolved: u64,
-    /// Behavior-bearing nodes not mapped yet (left for the next extraction run).
+    /// Behavior-bearing nodes resolved to a stated, sourced business rule.
+    pub real: u64,
+    /// Behavior-bearing nodes carrying only a risk-flagged placeholder: shown, never counted.
+    pub placeholders: u64,
+    /// Behavior-bearing nodes with nothing recorded yet.
     pub unmapped: u64,
+    /// Behaviour-kind nodes left out of the denominator because their file is not product code.
+    pub not_product: u64,
 }
 
 /// A capability domain: its requirements + the entities they operate on.
@@ -217,6 +225,15 @@ pub struct CoverageReport {
     /// does not require known ones).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requirement_reuse: Option<RequirementReuse>,
+    /// Behaviour-kind nodes left OUT of the denominator because their file is not product code (a
+    /// test, a data file, a manifest or a document: [`is_product_file`]). Optional on the wire for
+    /// reports written before the field.
+    #[serde(default)]
+    pub not_product: u64,
+    /// The risk-flagged placeholders (accounted, not real requirements), sorted by SymbolId: what
+    /// the next extraction page may revisit. Absent when there are none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placeholder_nodes: Vec<UnaccountedNode>,
 }
 
 /// How concentrated the `requirement` strings are across the nodes claiming them.
@@ -379,6 +396,58 @@ fn is_behavior_bearing(
     }
 }
 
+/// Test, spec and fixture files, by directory (any case: `Tests/` in .NET, `Specs/`) or by file
+/// name (case kept: `*Tests.cs` is a test, `Contest.py` is not). The same patterns as
+/// wicked-garden's `extract_loop.is_test_path`, which frames pages and writes their rules.
+static TEST_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(^|/)(tests?|__tests__|specs?|e2e|fixtures?|testdata)/")
+        .expect("test-dir pattern compiles")
+});
+static TEST_FILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(
+        r"\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|(^|/)tests?\.py$|(^|/)conftest\.py$|_test\.(py|go|rs)$|_spec\.rb$|Tests?\.(cs|java|kt|swift|scala)$",
+    )
+    .expect("test-file pattern compiles")
+});
+/// Data, manifest and document files (by extension, any case): the indexer counts their keys and
+/// headings as nodes (a JSON object is a `Struct`), but what they hold is not behaviour the
+/// product's code implements. wicked-garden's `extract_loop._DATA_EXTS`.
+const DATA_EXTS: &[&str] = &[
+    ".json",
+    ".jsonc",
+    ".json5",
+    ".jsonl",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".lock",
+    ".ini",
+    ".cfg",
+    ".conf",
+    ".properties",
+    ".csv",
+    ".tsv",
+    ".txt",
+    ".md",
+    ".mdx",
+    ".rst",
+    ".xml",
+];
+
+/// Whether `file` (repo-relative, either slash) holds product code: not a test, spec or fixture
+/// file and not a data, manifest or document file. A behaviour-kind node outside product code is
+/// not behaviour-bearing (operator decision 2026-11-01): on pi-governance 109 of 120 "behaviours"
+/// were JSON evidence keys and package.json fields. A node with no file stays in (it can only
+/// make the share harder to reach, never easier).
+#[must_use]
+pub fn is_product_file(file: &str) -> bool {
+    let norm = file.replace('\\', "/");
+    let lower = norm.to_ascii_lowercase();
+    !(TEST_DIR.is_match(&norm)
+        || TEST_FILE.is_match(&norm)
+        || DATA_EXTS.iter().any(|ext| lower.ends_with(ext)))
+}
+
 /// The bucket a behavior-bearing node falls into for the resolved/risk/unaccounted split.
 enum Bucket {
     /// Validated requirement OR business_rule ≥ threshold. Carries the mean_confidence contribution.
@@ -494,12 +563,18 @@ pub fn recompute_front_half_coverage_with(
     let mut unaccounted: u64 = 0;
     let mut confidences: Vec<f64> = Vec::new();
     let mut unaccounted_nodes: Vec<UnaccountedNode> = Vec::new();
+    let mut placeholder_nodes: Vec<UnaccountedNode> = Vec::new();
+    let mut not_product: u64 = 0;
     // requirement string → how many behavior-bearing nodes claim it (the #131 bulk-mapping signal).
     let mut requirement_counts: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
 
     for node in &nodes {
         if !is_behavior_bearing(node, &has_behavior_out, cfg, &mut unknown_other) {
+            continue;
+        }
+        if !is_product_file(&node.location.file) {
+            not_product += 1;
             continue;
         }
         behavior_bearing += 1;
@@ -529,17 +604,12 @@ pub fn recompute_front_half_coverage_with(
             Bucket::Risk => {
                 risk_flagged += 1;
                 acc.risk_flagged += 1;
+                placeholder_nodes.push(listed_node(node, app));
             }
             Bucket::Unaccounted => {
                 unaccounted += 1;
                 acc.unaccounted += 1;
-                unaccounted_nodes.push(UnaccountedNode {
-                    symbol_id: node.symbol.as_str().to_string(),
-                    name: (!node.name.is_empty()).then(|| node.name.clone()),
-                    kind: Some(kind_label(&node.kind)),
-                    file: (!node.location.file.is_empty()).then(|| node.location.file.clone()),
-                    app: Some(app),
-                });
+                unaccounted_nodes.push(listed_node(node, app));
             }
         }
     }
@@ -580,6 +650,7 @@ pub fn recompute_front_half_coverage_with(
     };
 
     unaccounted_nodes.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
+    placeholder_nodes.sort_by(|a, b| a.symbol_id.cmp(&b.symbol_id));
     let per_app: Vec<PerApp> = apps
         .into_iter()
         .map(|(app, a)| PerApp {
@@ -628,7 +699,20 @@ pub fn recompute_front_half_coverage_with(
         per_app,
         unaccounted_nodes,
         requirement_reuse,
+        not_product,
+        placeholder_nodes,
     })
+}
+
+/// A behaviour-bearing node as the report lists it (`unaccounted_nodes`, `placeholder_nodes`).
+fn listed_node(node: &wicked_apps_core::Node, app: String) -> UnaccountedNode {
+    UnaccountedNode {
+        symbol_id: node.symbol.as_str().to_string(),
+        name: (!node.name.is_empty()).then(|| node.name.clone()),
+        kind: Some(kind_label(&node.kind)),
+        file: (!node.location.file.is_empty()).then(|| node.location.file.clone()),
+        app: Some(app),
+    }
 }
 
 /// A stable human label for a `NodeKind` (for `unaccounted_nodes[].kind`).
@@ -718,20 +802,17 @@ pub fn min_coverage_pct_from_env() -> Result<u8, String> {
     }
 }
 
-/// Mapped behavior-bearing nodes (resolved + risk-flagged).
-fn mapped_count(report: &CoverageReport) -> u64 {
-    report.resolved + report.risk_flagged
-}
-
-/// `floor(mapped * 100 / behavior_bearing)`, 100 on an empty denominator. Floored so the number
-/// shown never rounds up past the minimum it is compared to.
+/// `floor(real * 100 / behavior_bearing)`, 100 on an empty denominator, where `real` is the
+/// behaviours RESOLVED to a stated, sourced business rule. Risk-flagged placeholders never count
+/// (operator decision 2026-11-01, core#1233). Floored so the number shown never rounds up past the
+/// minimum it is compared to.
 #[must_use]
-pub fn mapped_pct(report: &CoverageReport) -> u8 {
+pub fn real_pct(report: &CoverageReport) -> u8 {
     let den = denominator(report);
     if den == 0 {
         return 100;
     }
-    let pct = u128::from(mapped_count(report)) * 100 / u128::from(den);
+    let pct = u128::from(report.resolved) * 100 / u128::from(den);
     pct.min(100) as u8
 }
 
@@ -741,29 +822,34 @@ pub fn mapped_pct(report: &CoverageReport) -> u8 {
 fn denominator(report: &CoverageReport) -> u64 {
     report
         .behavior_bearing
-        .max(mapped_count(report) + report.unaccounted)
+        .max(report.resolved + report.risk_flagged + report.unaccounted)
 }
 
-/// Whether the report maps at least `min_pct` percent of the behavior-bearing nodes. Exact
-/// integer arithmetic, never the rounded `coverage` float: on a large graph a single hole rounds
-/// up to 1.0, so a float test would fail open. `min_pct == 100` is exactly `unaccounted == 0`.
+/// Whether REAL requirements (resolved behaviours) reach `min_pct` percent of the behaviour-bearing
+/// nodes. Placeholders do not count. Exact integer arithmetic, never the rounded `coverage` float:
+/// on a large graph a single hole rounds up to 1.0, so a float test would fail open. `min_pct ==
+/// 100` is exactly "every behaviour is a real requirement".
 #[must_use]
 pub fn meets_minimum(report: &CoverageReport, min_pct: u8) -> bool {
-    if min_pct >= 100 && report.unaccounted != 0 {
-        return false;
+    let den = denominator(report);
+    if min_pct >= 100 {
+        return report.resolved >= den;
     }
-    u128::from(mapped_count(report)) * 100 >= u128::from(min_pct) * u128::from(denominator(report))
+    u128::from(report.resolved) * 100 >= u128::from(min_pct) * u128::from(den)
 }
 
-/// The one-line verdict, e.g. `"42% mapped, minimum 80% (336 of 800 behaviours)"`.
+/// The one-line verdict, e.g. `"23% real requirements, minimum 80% (1362 of 5786 behaviours;
+/// 4397 placeholders, 27 unmapped)"`.
 #[must_use]
 pub fn coverage_verdict(report: &CoverageReport, min_pct: u8) -> String {
     format!(
-        "{}% mapped, minimum {}% ({} of {} behaviours)",
-        mapped_pct(report),
+        "{}% real requirements, minimum {}% ({} of {} behaviours; {} placeholders, {} unmapped)",
+        real_pct(report),
         min_pct,
-        mapped_count(report),
-        denominator(report)
+        report.resolved,
+        denominator(report),
+        report.risk_flagged,
+        report.unaccounted
     )
 }
 
@@ -776,6 +862,7 @@ pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> a
         let shown: Vec<&str> = report
             .unaccounted_nodes
             .iter()
+            .chain(&report.placeholder_nodes)
             .take(20)
             .map(|n| n.symbol_id.as_str())
             .collect();
@@ -783,13 +870,14 @@ pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> a
         // consumers (unit denial_reason, logs) keep the TAIL of long output — the line a human
         // must read has to be the last one, not buried above a 20-item symbol list.
         anyhow::bail!(
-            "first unaccounted (sample of {}): {:?}\n{} — {} behavior-bearing node(s) still \
-             unmapped. The mapping so far is kept in the estate store; the next domain-extraction \
-             run continues from it (refusing to build a requirements graph below the minimum).",
+            "first not yet real (sample of {}): {:?}\n{} — {} behavior-bearing node(s) are not \
+             real requirements yet. The mapping so far is kept in the estate store; the next \
+             domain-extraction run continues from it (refusing to build a requirements graph \
+             below the minimum).",
             shown.len(),
             shown,
             coverage_verdict(report, min_pct),
-            report.unaccounted
+            report.risk_flagged + report.unaccounted
         );
     }
     // #131: content-free accounting. Gated on the AVERAGE (nodes / distinct), not any single string's
@@ -1013,7 +1101,8 @@ pub fn build_domain_model_with(
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
         let resolved = has_requirement || !business_rules.is_empty();
-        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other);
+        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other)
+            && is_product_file(&node.location.file);
         let accounted = resolved || !risk_notes.is_empty();
         let slot = if behavior || accounted {
             let n = slots.entry(package_dir(&node.location.file)).or_insert(0);
@@ -1940,12 +2029,13 @@ fn legacy_requirement(
 #[must_use]
 pub fn model_coverage(report: &CoverageReport, min_pct: u8) -> ModelCoverage {
     ModelCoverage {
-        mapped_pct: mapped_pct(report),
+        real_pct: real_pct(report),
         min_pct,
         behavior_bearing: report.behavior_bearing,
-        mapped: mapped_count(report),
-        resolved: report.resolved,
+        real: report.resolved,
+        placeholders: report.risk_flagged,
         unmapped: report.unaccounted,
+        not_product: report.not_product,
     }
 }
 
@@ -2266,9 +2356,10 @@ mod tests {
     }
 
     /// Operator ruling 2026-10-31: the gate is the CONFIGURED MINIMUM (default 80%), compared in
-    /// exact integers, and the refusal says how far the mapping got.
+    /// exact integers, and the refusal says how far the mapping got. Operator decision 2026-11-01
+    /// (core#1233): it counts REAL requirements only — risk-flagged placeholders never count.
     #[test]
-    fn the_coverage_gate_holds_at_the_configured_minimum() {
+    fn the_coverage_gate_counts_real_requirements_only() {
         let report = |bb: u64, resolved: u64, risk: u64| CoverageReport {
             behavior_bearing: bb,
             resolved,
@@ -2276,26 +2367,36 @@ mod tests {
             unaccounted: bb - resolved - risk,
             ..Default::default()
         };
-        // 80 of 100 mapped (60 resolved + 20 risk): meets 80, misses 81.
+        // pi-governance before this change: 3 real + 117 placeholders read "100% mapped". Now it
+        // is 2%, and the placeholders do not lift it.
+        let r = report(120, 3, 117);
+        assert_eq!(real_pct(&r), 2);
+        assert!(!meets_minimum(&r, 80));
+        // 80 real of 100 meets 80; 60 real + 20 placeholders does not (it did before).
+        assert!(meets_minimum(&report(100, 80, 0), 80));
         let r = report(100, 60, 20);
-        assert_eq!(mapped_pct(&r), 80);
-        assert!(meets_minimum(&r, 80));
-        assert!(assert_front_half_coverage_min(&r, 80).is_ok());
-        let err = assert_front_half_coverage_min(&r, 81)
+        assert_eq!(real_pct(&r), 60);
+        assert!(!meets_minimum(&r, 80));
+        assert!(assert_front_half_coverage_min(&r, 60).is_ok());
+        let err = assert_front_half_coverage_min(&r, 80)
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("80% mapped, minimum 81% (80 of 100 behaviours)")
-                && err.contains("kept in the estate store"),
+            err.contains(
+                "60% real requirements, minimum 80% (60 of 100 behaviours; 20 placeholders, 20 unmapped)"
+            ) && err.contains("kept in the estate store"),
             "{err}"
         );
         // Floored, never rounded up past the bar: 7999/10000 is 79%, below 80.
         let r = report(10_000, 7_999, 0);
-        assert_eq!(mapped_pct(&r), 79);
+        assert_eq!(real_pct(&r), 79);
         assert!(!meets_minimum(&r, 80));
-        // 100 is exactly the historical `unaccounted == 0`, including the one-hole-in-20k case.
+        // 100 is exactly "every behaviour is a real requirement": one hole or one placeholder in
+        // 20k denies it.
         assert!(!meets_minimum(&report(20_000, 19_999, 0), 100));
+        assert!(!meets_minimum(&report(20_000, 19_999, 1), 100));
         assert!(assert_front_half_coverage(&report(3, 3, 0)).is_ok());
+        assert!(assert_front_half_coverage(&report(3, 2, 1)).is_err());
         // An inconsistent report can only read worse (xreview on core#1215, agy P3): holes beyond
         // a too-small `behavior_bearing` still count, and 100 still means zero holes.
         let lying = CoverageReport {
@@ -2304,14 +2405,72 @@ mod tests {
             ..Default::default()
         };
         assert!(!meets_minimum(&lying, 100) && !meets_minimum(&lying, 80));
+        let lying = CoverageReport {
+            behavior_bearing: 1,
+            resolved: 1,
+            risk_flagged: 3,
+            ..Default::default()
+        };
+        assert_eq!(real_pct(&lying), 25);
         // The empty graph stays a vacuous pass.
         assert!(meets_minimum(&report(0, 0, 0), 80));
-        assert_eq!(mapped_pct(&report(0, 0, 0)), 100);
+        assert_eq!(real_pct(&report(0, 0, 0)), 100);
+        // The label carries the one gated number and the placeholders as their own count.
+        let label = model_coverage(&report(100, 60, 20), 80);
+        assert_eq!(
+            (
+                label.real_pct,
+                label.real,
+                label.placeholders,
+                label.unmapped
+            ),
+            (60, 60, 20, 20)
+        );
         // The setting's parse: whole percentages 1..=100 only.
         assert_eq!(parse_min_coverage_pct(" 80 "), Some(80));
         assert_eq!(parse_min_coverage_pct("75%"), Some(75));
         for bad in ["0", "101", "eighty", "80.5", ""] {
             assert_eq!(parse_min_coverage_pct(bad), None, "{bad}");
+        }
+    }
+
+    /// Operator decision 2026-11-01: tests, data, manifests and documents are not behaviour-bearing.
+    /// pi-governance's 120 "behaviours" were 109 JSON keys (indexed as `Struct`), 8 test functions
+    /// and 3 product functions.
+    #[test]
+    fn only_product_files_are_behaviour_bearing() {
+        for file in [
+            "extensions/pi-governance.js",
+            "src/core/run.ts",
+            "crates/x/src/lib.rs",
+            "app/Contest.py",
+            "src/latest/handler.go",
+            "",
+        ] {
+            assert!(is_product_file(file), "{file} is product code");
+        }
+        for file in [
+            "evidence/pi-0.84.2/four-gate-allow/summary.json",
+            "package.json",
+            "README.md",
+            "config/app.YAML",
+            "Cargo.lock",
+            "test/live/capture.mjs",
+            "tests/coverage_cli.rs",
+            "packages/crew/tests/requirements.test.ts",
+            "src/__tests__/a.tsx",
+            "src/api/run.test.ts",
+            "src/api/run.spec.js",
+            "pkg/test_run.py",
+            "pkg/conftest.py",
+            "pkg/run_test.go",
+            "spec/run_spec.rb",
+            "Src/Tests/RunTests.cs",
+            "src\\Tests\\Run.cs",
+            "e2e/journey.ts",
+            "fixtures/repo/main.ts",
+        ] {
+            assert!(!is_product_file(file), "{file} is not product code");
         }
     }
 
@@ -2333,7 +2492,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("unaccounted") && err.contains("refund"),
+            err.contains("2 unmapped") && err.contains("refund"),
             "got: {err}"
         );
 
@@ -2361,7 +2520,7 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(
-            err.contains("unaccounted") && err.contains("hole"),
+            err.contains("1 unmapped") && err.contains("hole"),
             "a hole that rounds coverage to 1.0 must STILL fail closed: {err}"
         );
     }
@@ -2448,7 +2607,13 @@ mod tests {
             coverage: 1.0,
             ..Default::default()
         };
-        let model = build_domain_model(&store, &coverage, "1.0.0").unwrap();
+        // One real requirement of three behaviours (two placeholders): built at a 33% minimum,
+        // because placeholders never count toward it (core#1233) — and the build still KEEPS them.
+        let opts = DomainBuildOptions {
+            min_coverage_pct: 33,
+            repo_root: None,
+        };
+        let model = build_domain_model_with(&store, &coverage, "1.0.0", &opts).unwrap();
 
         assert_eq!(model.metadata.migration_mode, "functional");
         // Two package-dir domains (auth, billing); scaffold contributed nothing.
@@ -2682,9 +2847,10 @@ mod tests {
             assert_eq!(back.domains.len(), model.domains.len());
 
             let label = model_coverage(&cov(&s), 80);
-            assert_eq!((label.mapped_pct, label.min_pct, label.mapped), (80, 80, 4));
+            assert_eq!((label.real_pct, label.min_pct, label.real), (80, 80, 4));
             let labelled = load_domain_graph(&s, Some(&label)).unwrap().unwrap();
-            assert_eq!(labelled["metadata"]["coverage"]["mapped_pct"], 80);
+            assert_eq!(labelled["metadata"]["coverage"]["real_pct"], 80);
+            assert!(labelled["metadata"]["coverage"].get("mapped_pct").is_none());
             assert_eq!(labelled["metadata"]["schema_version"], "1.1.0");
         }
 
@@ -3156,7 +3322,7 @@ mod tests {
                 .requirements
                 .values()
                 .all(|r| r.title != "a"));
-            assert_eq!(m.metadata.coverage.as_ref().unwrap().mapped, 4);
+            assert_eq!(m.metadata.coverage.as_ref().unwrap().real, 4);
         }
 
         /// xreview on core#1215 (codex P2): extractor SEATS are counted by author, not provenance.
@@ -3333,6 +3499,67 @@ mod tests {
             let r = cov(&s);
             assert_eq!(r.behavior_bearing, 0);
             assert_eq!(r.coverage, 1.0, "vacuous 1.0 on no behavior nodes");
+        }
+
+        /// Operator decision 2026-11-01, on pi-governance's shape: JSON keys (indexed as `Struct`),
+        /// package.json fields and test functions are not behaviour-bearing; the product's own
+        /// function is, and a placeholder on it is listed for the next page to revisit but is not
+        /// a real requirement. Falsifier: drop the `is_product_file` check in the recompute and
+        /// `behavior_bearing` reads 5.
+        #[test]
+        fn only_product_code_is_counted_and_placeholders_are_listed() {
+            let mut s = store();
+            let decide = node(&mut s, "decide", NodeKind::Function, "extensions/gov.js");
+            let envelope = node(&mut s, "envelope", NodeKind::Function, "extensions/gov.js");
+            node(
+                &mut s,
+                "capture",
+                NodeKind::Function,
+                "test/live/capture.mjs",
+            );
+            node(
+                &mut s,
+                "summary",
+                NodeKind::Struct,
+                "evidence/a/summary.json",
+            );
+            node(&mut s, "scripts", NodeKind::Struct, "package.json");
+            s.annotate(
+                &decide.symbol,
+                Annotation::new("business_rule", "RULE-1", "a call proceeds only on true")
+                    .with_confidence(0.9),
+            )
+            .unwrap();
+            s.annotate(
+                &envelope.symbol,
+                Annotation::new("risk", "RULE-2", "[RISK] envelope: empty statement")
+                    .with_confidence(0.0),
+            )
+            .unwrap();
+            let r = cov(&s);
+            assert_eq!(
+                (
+                    r.behavior_bearing,
+                    r.resolved,
+                    r.risk_flagged,
+                    r.unaccounted,
+                    r.not_product
+                ),
+                (2, 1, 1, 0, 3),
+                "{r:?}"
+            );
+            assert_eq!(
+                r.coverage, 1.0,
+                "the accounted ratio is unchanged in meaning"
+            );
+            assert_eq!(real_pct(&r), 50, "the placeholder does not count");
+            let listed: Vec<&str> = r
+                .placeholder_nodes
+                .iter()
+                .map(|n| n.symbol_id.as_str())
+                .collect();
+            assert_eq!(listed, vec![envelope.symbol.as_str()]);
+            assert!(r.unaccounted_nodes.is_empty());
         }
 
         /// #131, in miniature: coverage 1.0 with the accounting carrying no content.

@@ -154,6 +154,18 @@
         "$ref": "#/$defs/unaccountedNode"
       }
     },
+    "not_product": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Behaviour-kind nodes left OUT of behavior_bearing because their file is not product code (a test, data, manifest or document file). Optional: absent on reports written before bundle 1.3.0."
+    },
+    "placeholder_nodes": {
+      "type": "array",
+      "description": "The risk-flagged placeholders (accounted, not real requirements), sorted by SymbolId: what the next extraction page may revisit. Absent when there are none.",
+      "items": {
+        "$ref": "#/$defs/unaccountedNode"
+      }
+    },
     "requirement_reuse": {
       "type": "object",
       "additionalProperties": false,

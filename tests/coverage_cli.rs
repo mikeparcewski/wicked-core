@@ -191,6 +191,84 @@ fn seed_many(db: &str, n: usize, accounted: usize) {
     }
 }
 
+/// Operator decision 2026-11-01 (core#1233): the minimum counts REAL requirements only. One stated
+/// rule and four risk-flagged placeholders used to read "100% mapped" and pass an 80% minimum; now
+/// the check reads 20% and exits 3. Two JSON keys (indexed as `Struct`) and a test function are not
+/// behaviour-bearing at all, and the placeholders are listed for the next page.
+#[test]
+fn placeholders_never_reach_the_minimum_and_non_product_files_are_not_counted() {
+    let dir = scratch("real");
+    let db = dir.join("estate.db");
+    let dbs = db.to_str().unwrap();
+    let mut store = open_store(Some(dbs)).unwrap();
+    let mk = |name: &str, kind: NodeKind, file: &str| {
+        Node::new(
+            synthetic_symbol("code", name),
+            kind,
+            name.to_string(),
+            Language::new(SYMBOL_SCHEME),
+            Location::new(file.to_string(), Span::ZERO),
+        )
+    };
+    let product: Vec<Node> = (0..5)
+        .map(|i| mk(&format!("op{i}"), NodeKind::Function, "extensions/gov.js"))
+        .collect();
+    let other = vec![
+        mk("summary", NodeKind::Struct, "evidence/a/summary.json"),
+        mk("scripts", NodeKind::Struct, "package.json"),
+        mk("capture", NodeKind::Function, "test/live/capture.mjs"),
+    ];
+    store.begin_batch().unwrap();
+    store.upsert_nodes(&product).unwrap();
+    store.upsert_nodes(&other).unwrap();
+    store.commit_batch().unwrap();
+    store
+        .annotate(
+            &product[0].symbol,
+            Annotation::new("business_rule", "r", "a call proceeds only on true")
+                .with_confidence(0.9),
+        )
+        .unwrap();
+    for n in product.iter().skip(1).chain(&other) {
+        store
+            .annotate(
+                &n.symbol,
+                Annotation::new("risk", "r", format!("[RISK] {}: empty statement", n.name)),
+            )
+            .unwrap();
+    }
+    drop(store);
+    let out_file = dir.join("coverage-report.json");
+    let out = Command::new(BIN)
+        .env_remove("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT")
+        .args(["coverage", "--db", dbs, "--out", out_file.to_str().unwrap()])
+        .args(["--min-coverage-pct", "80"])
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "placeholders do not count: {err}"
+    );
+    assert!(
+        err.contains(
+            "20% real requirements, minimum 80% (1 of 5 behaviours; 4 placeholders, 0 unmapped)"
+        ),
+        "{err}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out_file).unwrap()).unwrap();
+    assert_eq!(report["behavior_bearing"], 5, "{report}");
+    assert_eq!(report["not_product"], 3, "{report}");
+    assert_eq!(
+        report["placeholder_nodes"].as_array().unwrap().len(),
+        4,
+        "{report}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Operator ruling 2026-10-31: the graph is built once coverage reaches the configured minimum
 /// (default 80%), labelled with its share, and saved INTO the estate store — no JSON file in the
 /// checkout (operator ruling 2026-10-31); `--out` is the explicit export.
@@ -229,11 +307,17 @@ fn domain_graph_builds_at_the_minimum_into_estate_and_writes_no_file() {
         .unwrap()
         .expect("the graph is in estate");
     let cov = &graph["metadata"]["coverage"];
-    assert_eq!(cov["mapped_pct"], 80, "{cov}");
+    assert_eq!(cov["real_pct"], 80, "{cov}");
     assert_eq!(cov["min_pct"], 80);
     assert_eq!(cov["behavior_bearing"], 5);
-    assert_eq!(cov["mapped"], 4);
+    assert_eq!(cov["real"], 4);
+    assert_eq!(cov["placeholders"], 0);
     assert_eq!(cov["unmapped"], 1);
+    assert_eq!(cov["not_product"], 0);
+    assert!(
+        cov.get("mapped_pct").is_none(),
+        "no field keeps an old name: {cov}"
+    );
     let reqs = graph["domains"]["billing"]["requirements"]
         .as_object()
         .unwrap();
@@ -248,7 +332,7 @@ fn domain_graph_builds_at_the_minimum_into_estate_and_writes_no_file() {
                 && r["corroboration"]["why"]["code"] == "dead_code"),
         "nothing calls these: unconfirmed, and why: {reqs:?}"
     );
-    assert!(String::from_utf8_lossy(&out.stdout).contains("80% mapped, minimum 80%"));
+    assert!(String::from_utf8_lossy(&out.stdout).contains("80% real requirements, minimum 80%"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -278,7 +362,9 @@ fn domain_graph_refuses_below_the_configured_minimum_and_says_how_far_it_got() {
         assert!(!out.status.success(), "80% is below a 90% minimum");
         let err = String::from_utf8_lossy(&out.stderr);
         assert!(
-            err.contains("80% mapped, minimum 90% (4 of 5 behaviours)"),
+            err.contains(
+                "80% real requirements, minimum 90% (4 of 5 behaviours; 0 placeholders, 1 unmapped)"
+            ),
             "names how far it got: {err}"
         );
         assert!(err.contains("kept in the estate store"), "{err}");
@@ -383,7 +469,7 @@ fn coverage_min_check_exits_3_below_the_minimum_after_writing_the_report() {
     };
     let below = run("85");
     assert_eq!(below.status.code(), Some(3));
-    assert!(String::from_utf8_lossy(&below.stderr).contains("80% mapped, minimum 85%"));
+    assert!(String::from_utf8_lossy(&below.stderr).contains("80% real requirements, minimum 85%"));
     assert!(out_file.is_file(), "the report is written either way");
     assert!(run("80").status.success());
     let junk = run("eighty");
