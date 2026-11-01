@@ -14,7 +14,7 @@ use wicked_apps_core::{
 };
 use wicked_estate_core::Annotation;
 use wicked_estate_core::ValidationClaim;
-use wicked_governance::{build_domain_model, CoverageReport};
+use wicked_governance::CoverageReport;
 
 const SCHEMA: &str = include_str!("../crates/wicked-governance/schemas/domain-model.schema.json");
 
@@ -77,12 +77,15 @@ fn built_domain_model_validates_against_the_kept_schema() {
         ..Default::default()
     };
     // Both contract versions the builder emits: 1.0.0 (no coverage/corroboration) and 1.1.0
-    // (`metadata.coverage` + every requirement's `corroboration`).
-    let old = build_domain_model(&store, &coverage, "1.0.0").expect("build 1.0.0");
+    // (`metadata.coverage` + every requirement's `corroboration`). One real requirement of three
+    // (core#1233: placeholders never count), so both are built at a minimum that one meets; the
+    // placeholders are still kept as review requirements and must validate too.
     let opts = wicked_governance::DomainBuildOptions {
-        min_coverage_pct: 80,
+        min_coverage_pct: 33,
         repo_root: None,
     };
+    let old = wicked_governance::build_domain_model_with(&store, &coverage, "1.0.0", &opts)
+        .expect("build 1.0.0");
     let new = wicked_governance::build_domain_model_with(&store, &coverage, "1.1.0", &opts)
         .expect("build 1.1.0");
     assert!(new.metadata.coverage.is_some());
@@ -97,7 +100,7 @@ fn built_domain_model_validates_against_the_kept_schema() {
     wicked_governance::persist_domain_model(&mut store, &new).expect("persist");
     let label = wicked_governance::model_coverage(
         &wicked_governance::recompute_front_half_coverage(&store).unwrap(),
-        80,
+        33,
     );
     let read_back = wicked_governance::load_domain_graph(&store, Some(&label))
         .unwrap()

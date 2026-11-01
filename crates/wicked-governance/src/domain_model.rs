@@ -189,8 +189,9 @@ pub struct Provenance {
 
 /// The front-half coverage report — the schema-exact wire shape (`coverage.schema.json`, all 11 fields
 /// required, `additionalProperties:false`). `coverage = (resolved + risk_flagged) / behavior_bearing`
-/// (vacuously 1.0 when `behavior_bearing == 0`); the builder gates on the exact integer `unaccounted == 0`
-/// (NOT the rounded `coverage` float — see [`assert_front_half_coverage`]). `deny_unknown_fields` makes
+/// (vacuously 1.0 when `behavior_bearing == 0`) is the ACCOUNTED ledger only: the builder's minimum
+/// counts RESOLVED behaviours (real requirements; placeholders never count, core#1233) in exact
+/// integers, never the rounded `coverage` float — see [`meets_minimum`]. `deny_unknown_fields` makes
 /// DESERIALIZE fail-closed on an extra key, mirroring the schema's `additionalProperties:false` — a
 /// hand-written/older report with a stray field is rejected, not silently accepted.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -405,7 +406,7 @@ static TEST_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(||
 });
 static TEST_FILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
     regex::Regex::new(
-        r"\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|(^|/)tests?\.py$|(^|/)conftest\.py$|_test\.(py|go|rs)$|_spec\.rb$|Tests?\.(cs|java|kt|swift|scala)$",
+        r"\.(test|spec)\.[^/]+$|(^|/)test_[^/]+\.py$|(^|/)tests?\.py$|(^|/)conftest\.py$|_test\.(py|go|rs|c|cc|cpp|cxx|h|hpp)$|_spec\.rb$|Tests?\.(cs|java|kt|swift|scala|php)$",
     )
     .expect("test-file pattern compiles")
 });
@@ -438,7 +439,10 @@ const DATA_EXTS: &[&str] = &[
 /// file and not a data, manifest or document file. A behaviour-kind node outside product code is
 /// not behaviour-bearing (operator decision 2026-11-01): on pi-governance 109 of 120 "behaviours"
 /// were JSON evidence keys and package.json fields. A node with no file stays in (it can only
-/// make the share harder to reach, never easier).
+/// make the share harder to reach, never easier). An EXTRACTED rule stays in whatever its file
+/// (`is_product_node`): a Salesforce Flow (`.flow-meta.xml`) or a cloud policy (`.json`) is
+/// executable behaviour, not data. Classified by file only: a test module inside a product file
+/// (Rust's `#[cfg(test)] mod tests`) still counts, which can only make the share harder to reach.
 #[must_use]
 pub fn is_product_file(file: &str) -> bool {
     let norm = file.replace('\\', "/");
@@ -446,6 +450,13 @@ pub fn is_product_file(file: &str) -> bool {
     !(TEST_DIR.is_match(&norm)
         || TEST_FILE.is_match(&norm)
         || DATA_EXTS.iter().any(|ext| lower.ends_with(ext)))
+}
+
+/// Whether a behaviour-kind node is product behaviour: in a product file ([`is_product_file`]), or an
+/// extracted rule (a rules-engine extractor's `Rule` node, executable whatever its file's
+/// extension). The one predicate the coverage recompute and the build share.
+fn is_product_node(node: &wicked_apps_core::Node) -> bool {
+    matches!(node.kind, wicked_apps_core::NodeKind::Rule) || is_product_file(&node.location.file)
 }
 
 /// The bucket a behavior-bearing node falls into for the resolved/risk/unaccounted split.
@@ -573,7 +584,7 @@ pub fn recompute_front_half_coverage_with(
         if !is_behavior_bearing(node, &has_behavior_out, cfg, &mut unknown_other) {
             continue;
         }
-        if !is_product_file(&node.location.file) {
+        if !is_product_node(node) {
             not_product += 1;
             continue;
         }
@@ -756,9 +767,10 @@ fn env_f64(key: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
-/// Fail-closed front-half precondition (port of `domain_graph.py::assert_front_half_coverage`, §I5):
-/// the builder REFUSES to translate an unannotated graph. Every behavior-bearing node must be resolved
-/// or risk-flagged; otherwise bail, surfacing the unaccounted SymbolIds. Never translates a partial graph.
+/// Fail-closed front-half precondition (port of `domain_graph.py::assert_front_half_coverage`, §I5) at
+/// 100%: every behavior-bearing node must be a REAL requirement (resolved; a risk-flagged placeholder
+/// is not one, core#1233); otherwise bail, surfacing the nodes that are not. The configured minimum
+/// is [`assert_front_half_coverage_min`].
 ///
 /// It ALSO refuses a graph whose accounting is content-free (#131): `coverage == 1.0` says every node
 /// is ACCOUNTED, not that the accounting means anything. A handful of `requirement` strings smeared
@@ -812,17 +824,20 @@ pub fn real_pct(report: &CoverageReport) -> u8 {
     if den == 0 {
         return 100;
     }
-    let pct = u128::from(report.resolved) * 100 / u128::from(den);
+    let pct = u128::from(report.resolved) * 100 / den;
     pct.min(100) as u8
 }
 
 /// The denominator a report is judged on: `behavior_bearing`, or the bucket sum when a hand-built
 /// or inconsistent report claims fewer behaviours than its buckets hold — never a smaller number
 /// than the holes it lists, so an inconsistent report can only read WORSE, not better.
-fn denominator(report: &CoverageReport) -> u64 {
-    report
-        .behavior_bearing
-        .max(report.resolved + report.risk_flagged + report.unaccounted)
+fn denominator(report: &CoverageReport) -> u128 {
+    // u128: a hand-built report's buckets cannot overflow their sum (codex on #1234).
+    u128::from(report.behavior_bearing).max(
+        u128::from(report.resolved)
+            + u128::from(report.risk_flagged)
+            + u128::from(report.unaccounted),
+    )
 }
 
 /// Whether REAL requirements (resolved behaviours) reach `min_pct` percent of the behaviour-bearing
@@ -833,9 +848,11 @@ fn denominator(report: &CoverageReport) -> u64 {
 pub fn meets_minimum(report: &CoverageReport, min_pct: u8) -> bool {
     let den = denominator(report);
     if min_pct >= 100 {
-        return report.resolved >= den;
+        return report.risk_flagged == 0
+            && report.unaccounted == 0
+            && u128::from(report.resolved) >= den;
     }
-    u128::from(report.resolved) * 100 >= u128::from(min_pct) * u128::from(den)
+    u128::from(report.resolved) * 100 >= u128::from(min_pct) * den
 }
 
 /// The one-line verdict, e.g. `"23% real requirements, minimum 80% (1362 of 5786 behaviours;
@@ -923,8 +940,8 @@ pub fn assert_front_half_coverage_min(report: &CoverageReport, min_pct: u8) -> a
 /// The `business_rule` annotation type — the estate annotations the builder lifts into
 /// [`Requirement::business_rules`].
 const BUSINESS_RULE_ANN: &str = "business_rule";
-/// A custom `risk` annotation type — a risk-flagged node the coverage gate COUNTS as accounted
-/// (numerator = resolved + risk_flagged) but that carries no resolved requirement.
+/// A custom `risk` annotation type — a risk-flagged placeholder: accounted in the `coverage` ledger
+/// and kept in the graph as a `review` requirement, but never counted toward the minimum.
 const RISK_ANN: &str = "risk";
 /// Confidence stamped on a synthesized fallback rule for a behavior-bearing node that produced no
 /// real business rule (the schema's `business_rules` `minItems:1` invariant + `domain_graph.py`'s
@@ -1101,8 +1118,12 @@ pub fn build_domain_model_with(
             .as_deref()
             .is_some_and(|r| !r.trim().is_empty());
         let resolved = has_requirement || !business_rules.is_empty();
-        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other)
-            && is_product_file(&node.location.file);
+        // Not product behaviour (a test, data, manifest or document file): no requirement, even
+        // when an earlier page annotated it, so the graph matches the denominator (agy on #1234).
+        if !is_product_node(node) {
+            continue;
+        }
+        let behavior = is_behavior_bearing(node, &has_behavior_out, &cfg, &mut unknown_other);
         let accounted = resolved || !risk_notes.is_empty();
         let slot = if behavior || accounted {
             let n = slots.entry(package_dir(&node.location.file)).or_insert(0);
@@ -2412,6 +2433,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(real_pct(&lying), 25);
+        // Buckets that overflow u64 when summed still read worse, never wrap past the bar (codex
+        // on #1234): a hole at 100% denies.
+        let huge = CoverageReport {
+            behavior_bearing: u64::MAX,
+            resolved: u64::MAX,
+            unaccounted: 1,
+            ..Default::default()
+        };
+        assert!(!meets_minimum(&huge, 100));
+        assert!(real_pct(&huge) <= 100);
         // The empty graph stays a vacuous pass.
         assert!(meets_minimum(&report(0, 0, 0), 80));
         assert_eq!(real_pct(&report(0, 0, 0)), 100);
@@ -2464,6 +2495,9 @@ mod tests {
             "pkg/test_run.py",
             "pkg/conftest.py",
             "pkg/run_test.go",
+            "src/payment_test.cpp",
+            "src/payment_test.cc",
+            "tests/PaymentTest.php",
             "spec/run_spec.rb",
             "Src/Tests/RunTests.cs",
             "src\\Tests\\Run.cs",
@@ -3325,6 +3359,42 @@ mod tests {
             assert_eq!(m.metadata.coverage.as_ref().unwrap().real, 4);
         }
 
+        /// agy on #1234: a test function or a JSON key an earlier page annotated (a placeholder,
+        /// or a rule) is not a requirement in the graph, so the graph matches the denominator.
+        #[test]
+        fn annotated_non_product_nodes_are_not_requirements() {
+            let mut s = store();
+            let real = node(&mut s, "charge", NodeKind::Function, "pkg/ops.rs");
+            map(&mut s, &real, "seat-1", "extract-loop");
+            let test_fn = node(
+                &mut s,
+                "capture",
+                NodeKind::Function,
+                "test/live/capture.mjs",
+            );
+            let json_key = node(&mut s, "scripts", NodeKind::Struct, "package.json");
+            map(&mut s, &test_fn, "seat-1", "extract-loop");
+            s.annotate(
+                &json_key.symbol,
+                Annotation::new("risk", "r", "[RISK] scripts: not product code")
+                    .with_confidence(0.0),
+            )
+            .unwrap();
+            let m = build_at(&s, 80);
+            let titles: Vec<&str> = m
+                .domains
+                .values()
+                .flat_map(|d| d.requirements.values())
+                .map(|r| r.title.as_str())
+                .collect();
+            assert_eq!(titles, vec!["charge"], "{m:?}");
+            let label = m.metadata.coverage.as_ref().unwrap();
+            assert_eq!(
+                (label.behavior_bearing, label.real, label.not_product),
+                (1, 1, 2)
+            );
+        }
+
         /// xreview on core#1215 (codex P2): extractor SEATS are counted by author, not provenance.
         #[test]
         fn one_seat_citing_two_provenances_is_one_extractor() {
@@ -3560,6 +3630,38 @@ mod tests {
                 .collect();
             assert_eq!(listed, vec![envelope.symbol.as_str()]);
             assert!(r.unaccounted_nodes.is_empty());
+        }
+
+        /// An extracted rule is executable behaviour whatever its file (codex on #1234): a
+        /// Salesforce Flow (`.flow-meta.xml`) or a cloud policy (`.json`) Rule stays in the
+        /// denominator, while a JSON key beside it does not.
+        #[test]
+        fn an_extracted_rule_in_a_data_extension_file_still_counts() {
+            let mut s = store();
+            node(
+                &mut s,
+                "Approve_Discount",
+                NodeKind::Rule,
+                "flows/Approve.flow-meta.xml",
+            );
+            node(
+                &mut s,
+                "deny-public-buckets",
+                NodeKind::Rule,
+                "policies/storage.json",
+            );
+            node(&mut s, "name", NodeKind::Struct, "package.json");
+            let r = cov(&s);
+            assert_eq!(
+                (r.behavior_bearing, r.unaccounted, r.not_product),
+                (2, 2, 1),
+                "{r:?}"
+            );
+            assert_eq!(
+                real_pct(&r),
+                0,
+                "two unmapped executable rules are not 100%"
+            );
         }
 
         /// #131, in miniature: coverage 1.0 with the accounting carrying no content.

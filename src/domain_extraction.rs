@@ -32,14 +32,15 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 /// The bar is the CONFIGURED MINIMUM (operator ruling 2026-10-31: 80% by default, crew's
 /// `requirementsGraph.minCoveragePct`), not 1.0: a large repository is mapped hub-first over several
 /// runs, and the graph is built and shown, labelled with its share, once the minimum is reached.
-/// Without a store to recompute from, the file-only fallback still demands full coverage.
+/// Without a store to recompute from, the file-only fallback demands full coverage of REAL
+/// requirements: zero unaccounted and zero placeholders (codex on #1234).
 ///
 /// REAL requirements only (operator decision 2026-11-01, core#1233): the minimum counts resolved
 /// behaviours in product code; risk-flagged placeholders are shown in the graph as unconfirmed but
 /// never count, and tests, data, manifests and documents are not in the denominator. The script is
 /// unchanged: `wicked-core coverage --min-coverage-pct` decides.
 pub const COVERAGE_CRITERION: &str =
-    "at least one behavior-bearing node in product code, real requirements (resolved behaviours; risk-flagged placeholders never count) at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or == 1.0 with zero unaccounted when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
+    "at least one behavior-bearing node in product code, real requirements (resolved behaviours; risk-flagged placeholders never count) at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or every behaviour a real requirement (coverage == 1.0, zero unaccounted, zero placeholders) when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
 
 /// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
 /// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
@@ -158,7 +159,7 @@ pub fn garden_domain_step_cmd(step: &str, script: &str, rest: &str) -> Vec<Strin
 /// setting; the bare flag falls back to 80) — exact integer arithmetic in the binary, because grep
 /// cannot compare a ratio to a number. The full-coverage greps moved INTO the no-store fallback
 /// branch: without a store there is nothing to recompute, so a file alone still has to show 1.0.
-pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage --min-coverage-pct ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json ) && test -f coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
+pub const COVERAGE_SCRIPT: &str = r#"( test -n "${WICKED_COVERAGE_DB}" && "${WICKED_CORE_EXE:-wicked-core}" coverage --min-coverage-pct ) || ( test -z "${WICKED_COVERAGE_DB}" && test -f coverage-report.json && grep -Eq '"coverage":[[:space:]]*(1|1\.0+)([,}[:space:]]|$)' coverage-report.json && ! grep -Eq '"coverage":[[:space:]]*0' coverage-report.json && ! grep -Eq '"unaccounted":[[:space:]]*[1-9]' coverage-report.json && ! grep -Eq '"risk_flagged":[[:space:]]*[1-9]' coverage-report.json ) && test -f coverage-report.json && grep -Eq '"behavior_bearing":[[:space:]]*[1-9]' coverage-report.json && grep -Eq '"resolved":[[:space:]]*[1-9]' coverage-report.json"#;
 
 /// The coverage report's filename, relative to the run's worktree.
 ///
@@ -190,7 +191,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "a607b67a07d026cd";
+pub const COVERAGE_VALIDATOR_PIN: &str = "9fddcc159580ed33";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -736,6 +737,29 @@ mod tests {
             r#"{
   "total": 42,
   "behavior_bearing": 30,
+  "resolved": 30,
+  "risk_flagged": 0,
+  "unaccounted": 0,
+  "coverage": 1.0,
+  "resolve_threshold": 0.75,
+  "unaccounted_nodes": []
+}"#,
+        )
+        .unwrap();
+        assert!(
+            run_validator(&approved, &pass_wt).unwrap(),
+            "every behaviour a real requirement ⇒ gate PASSES"
+        );
+
+        // core#1233 (codex on #1234): without a store, placeholders never count either. 28 real +
+        // 2 placeholders is fully ACCOUNTED (coverage 1.0, unaccounted 0) and used to pass.
+        let placeholder_wt = base.join("placeholders");
+        std::fs::create_dir_all(&placeholder_wt).unwrap();
+        std::fs::write(
+            placeholder_wt.join("coverage-report.json"),
+            r#"{
+  "total": 42,
+  "behavior_bearing": 30,
   "resolved": 28,
   "risk_flagged": 2,
   "unaccounted": 0,
@@ -746,8 +770,8 @@ mod tests {
         )
         .unwrap();
         assert!(
-            run_validator(&approved, &pass_wt).unwrap(),
-            "coverage == 1.0 with zero unaccounted ⇒ gate PASSES"
+            !run_validator(&approved, &placeholder_wt).unwrap(),
+            "placeholders do not count toward the no-store fallback ⇒ gate FAILS"
         );
 
         // FAIL worktree: a coverage hole (coverage < 1.0, unaccounted > 0).

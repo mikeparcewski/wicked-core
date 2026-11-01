@@ -26,7 +26,7 @@ Two release tracks share this file, newest entry first regardless of track:
   - *The label.* `metadata.coverage` and `requirements_graph_for_repo`'s coverage are `{real_pct, min_pct,
     behavior_bearing, real, placeholders, unmapped, not_product}` (schema bundle 1.3.0). The coverage report also
     lists `placeholder_nodes`, so garden's next page can revisit them.
-  - *The coverage step.* Its criterion says real requirements (new validator pin `a607b67a07d026cd`; the script is
+  - *The coverage step.* Its criterion says real requirements (new validator pin `9fddcc159580ed33`; the script is
     unchanged, the binary decides). The page review lists an empty statement whose source shows a rule as a missed
     rule and fails a page that leaves most sourced product units empty.
 
