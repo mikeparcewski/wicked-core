@@ -387,7 +387,11 @@ pub fn coverage_report_for_repo(
 /// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
 /// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product },
-/// "build": { generation, coverage: <the label the listed build persisted, or null> } or null }`
+/// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
+/// "uncounted": { <domain>: { <REQ-NNN>: "structural" | "not_product" | "unindexed" } } or null }`
+/// — `uncounted` names the listed requirements whose code unit the coverage share does not count,
+/// decided in the same pass as `coverage` (req-reconcile 2026-11-01), so the rows it leaves out are
+/// exactly the ones `coverage` counts (when the build is not behind the store);
 /// (real requirements only count toward the minimum, core#1233); the
 /// coverage is recomputed from the store's own counts at read time against the configured minimum
 /// (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else 80), so a run that maps more shows up without a
@@ -404,7 +408,9 @@ pub fn requirements_graph_for_repo(
     // Registered but never indexed: no store yet, so no graph and nothing counted — the unbuilt
     // state, not an error. (A store that exists but cannot be read still errors below.)
     if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
-        return Ok(serde_json::json!({ "graph": null, "coverage": null, "build": null }));
+        return Ok(serde_json::json!({
+            "graph": null, "coverage": null, "build": null, "uncounted": null,
+        }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
     // (domain-graph-3) The repository's own target first (lowered at a budget ask), else the
@@ -416,17 +422,24 @@ pub fn requirements_graph_for_repo(
     // not hold (req-list-stale: 1,383 real listed under a header counting 3,585). Null when nothing is
     // built. The rows are read FIRST and the store counted after (xreview on #1237): a build or a
     // mapping that commits in between shows as a difference, never as a stale build matching.
-    let loaded = wicked_governance::load_domain_graph_with_build(&repo_store)?;
-    let report = wicked_governance::recompute_front_half_coverage(&repo_store)?;
+    let loaded = wicked_governance::load_domain_graph_with_units(&repo_store)?;
+    let units = loaded
+        .as_ref()
+        .map(|(_, _, u)| u.clone())
+        .unwrap_or_default();
+    let (report, uncounted) =
+        wicked_governance::recompute_front_half_coverage_labelling(&repo_store, &units)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
-    let (graph, build) = match loaded {
-        Some((mut graph, build)) => {
+    let (graph, build, uncounted) = match loaded {
+        Some((mut graph, build, _)) => {
             wicked_governance::label_domain_graph(&mut graph, &coverage)?;
-            (Some(graph), Some(build))
+            (Some(graph), Some(build), Some(uncounted))
         }
-        None => (None, None),
+        None => (None, None, None),
     };
-    Ok(serde_json::json!({ "graph": graph, "coverage": coverage, "build": build }))
+    Ok(serde_json::json!({
+        "graph": graph, "coverage": coverage, "build": build, "uncounted": uncounted,
+    }))
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
@@ -2049,7 +2062,7 @@ mod tests {
         let unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
         assert_eq!(
             unbuilt,
-            serde_json::json!({ "graph": null, "coverage": null, "build": null })
+            serde_json::json!({ "graph": null, "coverage": null, "build": null, "uncounted": null })
         );
 
         std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
@@ -2073,6 +2086,11 @@ mod tests {
             "an empty build reads as built"
         );
         assert_eq!(built["coverage"]["min_pct"], 80);
+        assert_eq!(
+            built["uncounted"],
+            serde_json::json!({}),
+            "a built graph says which rows the share leaves out: none here"
+        );
         assert_eq!(
             built["build"],
             serde_json::json!({ "generation": 1, "coverage": null }),

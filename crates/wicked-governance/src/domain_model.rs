@@ -662,6 +662,40 @@ pub fn recompute_front_half_coverage_with(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
 ) -> anyhow::Result<CoverageReport> {
+    recompute_observing(store, cfg, &mut |_, _| {})
+}
+
+/// Where the coverage share puts one node: counted in its denominator, or left out and why. The
+/// recompute decides it for every node it visits ([`recompute_observing`]), so a reader that asks it
+/// for a listed requirement's unit gets the very decision behind the header's numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnitClass {
+    Counted,
+    Uncounted(Uncounted),
+}
+
+/// Why the coverage share leaves a listed requirement out (`uncounted` on the requirements read).
+/// The graph keeps every requirement a build emitted, and a build emits one for every product unit an
+/// extraction page annotated, whether or not the unit counts as behaviour; a later classification
+/// change (core#1238: a TypeScript shape is not a behaviour) leaves such rows in the list while the
+/// share stops counting them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Uncounted {
+    /// Not behaviour-bearing: a type shape, a signature, a constant or another structural unit.
+    Structural,
+    /// A behaviour-kind unit outside product code (a test, data, manifest or document file).
+    NotProduct,
+    /// The unit is no longer in the index (its code was removed or renamed since the build).
+    Unindexed,
+}
+
+/// The recompute, telling `observe` where each visited node falls (by symbol).
+fn recompute_observing(
+    store: &dyn GraphRead,
+    cfg: &CoverageConfig,
+    observe: &mut dyn FnMut(&str, UnitClass),
+) -> anyhow::Result<CoverageReport> {
     // Fail-closed on an out-of-schema threshold (the schema constrains resolve_threshold to [0,1]) — the
     // public `..._with` entry point could otherwise emit a schema-invalid report. Mirrors the annotation
     // confidence guard below.
@@ -703,12 +737,21 @@ pub fn recompute_front_half_coverage_with(
 
     for node in &nodes {
         if !is_behavior_bearing(node, &idx, cfg, &mut unknown_other) {
+            observe(
+                node.symbol.as_str(),
+                UnitClass::Uncounted(Uncounted::Structural),
+            );
             continue;
         }
         if !is_product_node(node) {
+            observe(
+                node.symbol.as_str(),
+                UnitClass::Uncounted(Uncounted::NotProduct),
+            );
             not_product += 1;
             continue;
         }
+        observe(node.symbol.as_str(), UnitClass::Counted);
         behavior_bearing += 1;
         // ONE read, used twice: the reuse tally and the bucket classification below.
         let semantics = store.node_semantics(&node.symbol)?;
@@ -2032,6 +2075,20 @@ pub struct DomainGraphBuild {
 pub fn load_domain_graph_with_build(
     store: &dyn GraphRead,
 ) -> anyhow::Result<Option<(serde_json::Value, DomainGraphBuild)>> {
+    Ok(load_domain_graph_with_units(store)?.map(|(graph, build, _)| (graph, build)))
+}
+
+/// Each listed requirement's code unit, by domain then requirement id: the `code_symbol` its build
+/// recorded. A requirement persisted without one (a build from before the field) is absent.
+pub type RequirementUnits =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>;
+
+/// [`load_domain_graph_with_build`], with the code unit behind each requirement read
+/// ([`RequirementUnits`]), from the same read: what [`recompute_front_half_coverage_labelling`] needs to
+/// say which listed rows the share does not count.
+pub fn load_domain_graph_with_units(
+    store: &dyn GraphRead,
+) -> anyhow::Result<Option<(serde_json::Value, DomainGraphBuild, RequirementUnits)>> {
     let mut attempt = 0;
     loop {
         attempt += 1;
@@ -2045,8 +2102,48 @@ pub fn load_domain_graph_with_build(
     }
 }
 
+/// Listed requirements the coverage share leaves out, by domain then requirement id, with why.
+pub type UncountedRequirements =
+    std::collections::BTreeMap<String, std::collections::BTreeMap<String, Uncounted>>;
+
+/// [`recompute_front_half_coverage`], plus which of the listed requirements (`units`, from
+/// [`load_domain_graph_with_units`]) sit on a unit the share does not count — decided in the same pass
+/// that counts the header's numbers, so the rows NOT returned are exactly the requirements on
+/// behaviour-bearing product units (req-reconcile 2026-11-01: wicked-crew listed 1,458 rows on
+/// TypeScript shapes under a header that, since core#1238, counts none of them). A unit the store no
+/// longer holds is [`Uncounted::Unindexed`].
+pub fn recompute_front_half_coverage_labelling(
+    store: &dyn GraphRead,
+    units: &RequirementUnits,
+) -> anyhow::Result<(CoverageReport, UncountedRequirements)> {
+    let wanted: std::collections::HashSet<&str> = units
+        .values()
+        .flat_map(|reqs| reqs.values().map(String::as_str))
+        .collect();
+    let mut seen: std::collections::HashMap<String, UnitClass> = std::collections::HashMap::new();
+    let report = recompute_observing(store, &CoverageConfig::default(), &mut |sym, class| {
+        if wanted.contains(sym) {
+            seen.insert(sym.to_string(), class);
+        }
+    })?;
+    let mut out = UncountedRequirements::new();
+    for (domain, reqs) in units {
+        for (req, sym) in reqs {
+            let why = match seen.get(sym.as_str()) {
+                Some(UnitClass::Counted) => continue,
+                Some(UnitClass::Uncounted(why)) => *why,
+                None => Uncounted::Unindexed,
+            };
+            out.entry(domain.clone())
+                .or_default()
+                .insert(req.clone(), why);
+        }
+    }
+    Ok((report, out))
+}
+
 enum Loaded {
-    Graph(Option<(serde_json::Value, DomainGraphBuild)>),
+    Graph(Option<(serde_json::Value, DomainGraphBuild, RequirementUnits)>),
     /// An edge pointed at a node the read had not listed.
     Torn,
 }
@@ -2082,6 +2179,7 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
                     "source": "estate-graph" })
         });
     let mut out_domains = Map::new();
+    let mut units = RequirementUnits::new();
     for d in domains {
         let dname = d.name.clone();
         let req_prefix = format!("{REQUIREMENT_FILE_PREFIX}{dname}/");
@@ -2101,6 +2199,12 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
         reqs.dedup_by(|a, b| a.0 == b.0);
         let mut out_reqs = Map::new();
         for (key, r) in reqs {
+            if let Some(sym) = r.metadata.get("code_symbol").and_then(Value::as_str) {
+                units
+                    .entry(dname.clone())
+                    .or_default()
+                    .insert(key.clone(), sym.to_string());
+            }
             let doc = match r.metadata.get(REQUIREMENT_DOC_KEY) {
                 Some(doc) => doc.clone(),
                 // A graph persisted before the document rode on the node: rebuild what the nodes
@@ -2136,6 +2240,7 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
     Ok(Loaded::Graph(Some((
         json!({ "metadata": metadata, "domains": out_domains }),
         build,
+        units,
     ))))
 }
 
@@ -3944,6 +4049,121 @@ mod tests {
             let model = build_at(&s, 100);
             let reqs: usize = model.domains.values().map(|d| d.requirements.len()).sum();
             assert_eq!(reqs, 2);
+        }
+
+        /// req-reconcile (2026-11-01): wicked-crew's list held 1,458 rows on TypeScript shapes (an
+        /// extraction page had annotated them before core#1238 stopped counting them) under a header
+        /// that counts none, so the list showed 441 more "real" rows than the header. The read now says,
+        /// from the same pass that counts the header, which listed rows the share leaves out and why;
+        /// the rest are exactly the counted ones. Falsifier: observe every node as `Counted` in
+        /// `recompute_observing` and the shape's row loses its label (the map has 3 entries, not 4).
+        #[test]
+        fn the_read_labels_listed_rows_the_share_does_not_count() {
+            use wicked_apps_core::GraphRead;
+            let mut s = store();
+            let f = "src/wire.ts";
+            let shape = shaped(
+                &mut s,
+                &format!("{TS}src/wire/Wire#"),
+                NodeKind::Interface,
+                f,
+                "typescript",
+                (0, 60),
+                (1, 3),
+                "export interface Wire {",
+            );
+            let run = shaped(
+                &mut s,
+                &format!("{TS}src/wire/run()."),
+                NodeKind::Function,
+                f,
+                "typescript",
+                (80, 200),
+                (5, 9),
+                "export function run(w: Wire): void {",
+            );
+            let in_test = shaped(
+                &mut s,
+                &format!("{TS}src/wire.test/helper()."),
+                NodeKind::Function,
+                "src/wire.test.ts",
+                "typescript",
+                (0, 50),
+                (1, 3),
+                "function helper() {",
+            );
+            map(&mut s, &shape, "seat", "RULE-1");
+            map(&mut s, &run, "seat", "RULE-2");
+            let mut model = build_at(&s, 100);
+            assert_eq!(
+                model.domains["src"].requirements.len(),
+                2,
+                "an annotated shape still emits a row; the test-file helper does not"
+            );
+            // Rows a build no longer makes but an older graph may hold: a unit outside product code,
+            // a unit since removed from the index, and one from before `code_symbol` (no claim).
+            let reqs = &mut model.domains.get_mut("src").unwrap().requirements;
+            let row = |code: Option<&str>| Requirement {
+                title: "older".into(),
+                description: "older".into(),
+                business_rules: vec![Rule {
+                    id: "RULE-001".into(),
+                    statement: "older holds".into(),
+                    confidence: 0.9,
+                    provenance: Provenance {
+                        source: "code-graph".into(),
+                        reference: "src/x.ts#older".into(),
+                        source_kinds: vec!["code-body".into()],
+                    },
+                    source_ref: None,
+                }],
+                code_symbol: code.map(str::to_string),
+                ..Default::default()
+            };
+            reqs.insert("REQ-900".into(), row(Some(in_test.symbol.as_str())));
+            reqs.insert("REQ-901".into(), row(Some(&format!("{TS}src/gone/old()."))));
+            reqs.insert("REQ-902".into(), row(None));
+            persist_domain_model(&mut s, &model).unwrap();
+
+            let (graph, _, units) = load_domain_graph_with_units(&s).unwrap().unwrap();
+            assert_eq!(
+                units["src"].len(),
+                4,
+                "every row with a code_symbol: {units:?}"
+            );
+            let (report, uncounted) = recompute_front_half_coverage_labelling(&s, &units).unwrap();
+            assert_eq!(report, cov(&s), "the same report as the plain recompute");
+            assert_eq!((report.behavior_bearing, report.resolved), (1, 1));
+            let shape_req = model.domains["src"]
+                .requirements
+                .iter()
+                .find(|(_, r)| r.title == "Wire")
+                .map(|(k, _)| k.clone())
+                .unwrap();
+            let want: UncountedRequirements = [(
+                "src".to_string(),
+                [
+                    (shape_req, Uncounted::Structural),
+                    ("REQ-900".to_string(), Uncounted::NotProduct),
+                    ("REQ-901".to_string(), Uncounted::Unindexed),
+                ]
+                .into_iter()
+                .collect(),
+            )]
+            .into_iter()
+            .collect();
+            assert_eq!(uncounted, want);
+            // Listed rows minus the labelled ones and the one with no claim = what the share counts.
+            let listed = graph["domains"]["src"]["requirements"]
+                .as_object()
+                .unwrap()
+                .len();
+            assert_eq!(listed - want["src"].len() - 1, report.resolved as usize);
+            assert_eq!(
+                serde_json::to_value(&uncounted).unwrap()["src"]["REQ-900"],
+                "not_product"
+            );
+            assert!(s.get_node(&run.symbol).unwrap().is_some());
         }
 
         /// What keeps a TS interface or its member counted (xreview r1 + r2 on core#1238): the
