@@ -31,7 +31,7 @@ scripts only inside a write boundary, so the host decides whether it can run at 
 
 | Host | Boundary | The verify floor |
 |---|---|---|
-| **macOS** (primary) | a fresh Linux container when a container runtime answers (`WICKED_FLOOR_RUNNER=auto`, the default); else `sandbox-exec`, in the base system | runs the checks (`floorRunner.runner`: `container` or `macos-sandbox`) |
+| **macOS** (primary) | a fresh Linux container when a container runtime answers and the floor can be prepared there (`WICKED_FLOOR_RUNNER=auto`, the default); else `sandbox-exec`, in the base system | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container` or `macos-sandbox`) |
 | **Linux** (supported) | `bwrap` (`bubblewrap`) — install it | runs the checks; without `bwrap`, **denies** |
 | **Windows** (not supported) | none the engine can arm | **denies every floor phase, by construction** |
 

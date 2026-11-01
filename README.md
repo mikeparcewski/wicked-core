@@ -59,18 +59,25 @@ extraction stated on the code, grouped into domains by package directory and sav
 repository's estate store (domain, requirement and business-rule nodes, `SatisfiedBy` edges to
 the code). crew reads it from there; nothing is written into the checkout.
 
-The graph is held to a minimum share of **real** requirements: behaviours in product code that
-resolved to a stated, sourced rule. A placeholder (an empty statement, or a rule under the
-confidence threshold) shows in the graph as unconfirmed and never counts. Tests, fixtures, data,
-manifests and documents are not behaviours (`not_product`), and a TypeScript interface counts only
-when the graph shows it does something. Below the minimum the build fails closed and says why:
-"23% real requirements, minimum 80% (1362 of 5786 behaviours; 4397 placeholders, 27 unmapped)".
-The mapping done so far stays in the store.
+The graph is held to a minimum share of **real** requirements: behaviours in product code with a
+validated requirement or a business rule at or above the confidence threshold (0.75 by default).
+A placeholder (a risk flag, a rule under the threshold, or an unvalidated requirement) stays in the
+graph as a `review` requirement and never counts. What is product code is decided by file path:
+test, spec and fixture files and data, manifest and document files are left out (`not_product`),
+though a test module inside a product file still counts and an extracted rules-engine rule counts
+whatever its file. A TypeScript interface counts only when the graph shows it does something.
+Below the minimum the build fails closed and says why: "23% real requirements, minimum 80% (1362
+of 5786 behaviours; 4397 placeholders, 27 unmapped)". The mapping done so far stays in the store.
 
-- `wicked-core coverage [--min-coverage-pct]` reports the share, and exits 3 below the minimum.
-- `wicked-core domain-graph` builds and saves the graph (`--out` also writes a JSON export).
-- `wicked-core requirements-target --set N | --clear` keeps a repository's own minimum in its
-  store, ahead of the daemon-wide one (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, default 80).
+Each command reads the store `--db` names, else `WICKED_COVERAGE_DB`, else `WICKED_ESTATE_DB`, else
+`./wicked-estate.db`, so point it at the repository's estate store:
+
+- `wicked-core coverage --db <store> [--min-coverage-pct [N]]` reports the share. With
+  `--min-coverage-pct` it exits 3 below the minimum (N, or with no value the minimum in force).
+- `wicked-core domain-graph --db <store>` builds and saves the graph (`--out` also writes a JSON
+  export).
+- `wicked-core requirements-target --db <store> --set N | --clear` keeps a repository's own minimum
+  in its store, ahead of the daemon-wide one (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, default 80).
 
 crew's `domain-extraction` run maps a repository page by page (a bounded loop over its own steps,
 `repeat_from`) until the minimum is reached or the operator stops it. `requirements_graph_for_repo`
@@ -88,7 +95,7 @@ the floor fails closed and the gate denies (core#416).
 
 | Host | Where the repository's checks run | The verify floor | Governed runs |
 |---|---|---|---|
-| **macOS** | a fresh Linux container per floor side when a container runtime answers (`docker`, `podman` or `nerdctl`); else `sandbox-exec` (base system) | runs the checks (`floorRunner.runner`: `container`, or `macos-sandbox` with the fallback reason) | primary |
+| **macOS** | a fresh Linux container per floor side when a container runtime answers (`docker`, `podman` or `nerdctl`) and the floor can be prepared there; else `sandbox-exec` (base system), with the reason | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container`, or `macos-sandbox` with its `fallbackReason`) | primary |
 | **Linux** | `bwrap` — `apt install bubblewrap` / `dnf install bubblewrap` | runs the checks with `bwrap`; **without it, denies** | supported |
 | **Windows** (incl. Git Bash / WSL host side) | none | **denies every floor phase, by construction** | not supported |
 
@@ -99,7 +106,9 @@ cap (`WICKED_FLOOR_MEMORY`, default `6g`); the tree is copied in, and a check th
 tracked file stands for nothing. A check killed for memory, or a container that stops answering,
 is "could not run", never a failure of the change. The image is `containers/checks/node22-rust.Dockerfile`,
 built on first use. `wicked-core floor run --repo <dir> --base <commit> [--full]` runs one floor and
-prints its report.
+prints its report (which floor ran is its `runner` field). The container cannot run everything: an
+install other than `npm ci`, a check that names the base commit (the copy has no history), a build
+guide that reads results from a file, or a tool the image lacks sends `auto` back to the host floor.
 
 The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the
 repository's own checks with **no OS write boundary**. The results are real; the pass is not
@@ -113,8 +122,8 @@ from `containers/seats/seat.Dockerfile`, the engine's own launcher mounted from
 `containers/floor.Dockerfile`, a read-only root, and a network whose only way out is the model
 gateway. A unit whose container cannot start is refused, never run on the host;
 `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. `wicked-core seat-image
-build|hold|status` builds the images, holds them against a runtime's image cleanup, and reports
-them.
+build|hold|status` builds the images, holds them against a runtime's image cleanup (the `docker`
+CLI only), and reports them.
 
 Two smaller consequences of the same rule, worth knowing before you debug them:
 
