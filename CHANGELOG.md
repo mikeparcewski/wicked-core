@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Four new built-in workflows fill the catalog's gaps (lane wf-catalog).** Each is data over existing catalog
+  entries and garden skills (`src/presets/<name>.json`), described for the picker (C2) and pinned by a launch test:
+  `docs` (scope → write Markdown docs as the `produce` creator → an independent `critique` check of every claim,
+  held for a person when it does not pass; delivers a PR), `test-plan` (recon → one risk-ranked plan file under
+  `docs/test-plans/` → check), and two read-only reports with no creator, no PA scope and nothing that executes
+  code: `validate-docs` (list the docs' checkable claims → verify each against the code) and `test-analysis`
+  (coverage gaps, test smells and flake signals → verify). None requires QE acceptance (they do not change the
+  application). Crew's workflow catalog files them under Create › Documentation, Analyze › Validate
+  documentation, Test › Planning and Test › Analysis.
 - **The requirements read gives the engine's verdict on each listed row.** A build emits a requirement for every
   product unit an extraction page annotated, behaviour or not, and a later classification change leaves those rows in
   the list while the share stops counting them: on the rig wicked-crew listed 5,770 rows under a header of 3,476 real

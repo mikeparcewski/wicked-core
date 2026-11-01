@@ -12836,6 +12836,7 @@ mod tests {
             vec![
                 "bug/verify",
                 "demo/review",
+                "docs/check",
                 "domain-extraction/coverage",
                 "domain-extraction/critique",
                 "editor-plugin/security-review",
@@ -12849,6 +12850,9 @@ mod tests {
                 "mcp-server/test",
                 "migration/verify",
                 "qe-author-tests/review",
+                "test-analysis/verify",
+                "test-plan/check",
+                "validate-docs/verify",
             ],
             "the shipped Evaluator agent units the verdict contract reaches — pinned by name"
         );

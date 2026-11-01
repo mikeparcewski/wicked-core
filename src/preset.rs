@@ -520,6 +520,7 @@ mod tests {
                 "capture-learnings",
                 "chat",
                 "demo",
+                "docs",
                 "domain-extraction",
                 "editor-plugin",
                 "feature",
@@ -531,7 +532,10 @@ mod tests {
                 "migration",
                 "onboarding",
                 "qe-author-tests",
-                "steering-author"
+                "steering-author",
+                "test-analysis",
+                "test-plan",
+                "validate-docs"
             ]
         );
         assert!(seed_builtins(&mut store, 20).unwrap().is_empty());
@@ -563,6 +567,7 @@ mod tests {
                 "capture-learnings",
                 "chat",
                 "demo",
+                "docs",
                 "domain-extraction",
                 "editor-plugin",
                 "feature",
@@ -574,7 +579,10 @@ mod tests {
                 "migration",
                 "onboarding",
                 "qe-author-tests",
-                "steering-author"
+                "steering-author",
+                "test-analysis",
+                "test-plan",
+                "validate-docs"
             ]
         );
         let f = resolve(&store, None, "feature").unwrap().unwrap();
@@ -606,6 +614,7 @@ mod tests {
                 "bug",
                 "capture-learnings",
                 "demo",
+                "docs",
                 "domain-extraction",
                 "editor-plugin",
                 "feature",
@@ -617,7 +626,10 @@ mod tests {
                 "migration",
                 "onboarding",
                 "qe-author-tests",
-                "steering-author"
+                "steering-author",
+                "test-analysis",
+                "test-plan",
+                "validate-docs"
             ]
         );
         assert_eq!(resolve(&store, None, "chat").unwrap(), Some(saved.clone()));
@@ -871,6 +883,7 @@ mod tests {
                 ("capture-learnings".to_string(), GLOBAL_SCOPE.to_string()),
                 ("chat".to_string(), GLOBAL_SCOPE.to_string()),
                 ("demo".to_string(), GLOBAL_SCOPE.to_string()),
+                ("docs".to_string(), GLOBAL_SCOPE.to_string()),
                 ("domain-extraction".to_string(), GLOBAL_SCOPE.to_string()),
                 ("editor-plugin".to_string(), GLOBAL_SCOPE.to_string()),
                 ("feature".to_string(), format!("project:{pid}")),
@@ -883,6 +896,9 @@ mod tests {
                 ("onboarding".to_string(), GLOBAL_SCOPE.to_string()),
                 ("qe-author-tests".to_string(), GLOBAL_SCOPE.to_string()),
                 ("steering-author".to_string(), GLOBAL_SCOPE.to_string()),
+                ("test-analysis".to_string(), GLOBAL_SCOPE.to_string()),
+                ("test-plan".to_string(), GLOBAL_SCOPE.to_string()),
+                ("validate-docs".to_string(), GLOBAL_SCOPE.to_string()),
             ]
         );
     }

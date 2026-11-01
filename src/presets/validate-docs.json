@@ -1,0 +1,18 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "claims",
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 1/2 CLAIMS: read the documentation in scope (the paths or pages the operator names; otherwise the repository's README files and docs/ tree) and list every checkable claim: a behaviour, a command or flag, an endpoint, a config key and its default, a file path, a version or a number. For each claim give the doc file and line and the code it should rest on. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. "
+  },
+  {
+   "catalog": "critique",
+   "id": "verify",
+   "depends_on": [
+    "claims"
+   ],
+   "instructions": "Phase 2/2 VERIFY (independent evaluator): check each listed claim yourself against the code — do not trust the claims phase's mapping. Classify each claim: holds, wrong (the code says otherwise), stale (it was true once; name the change when git log shows it), or unverifiable. Then report, most harmful first: for every wrong or stale claim, the doc file:line, what it says, what the code does at file:line, and the smallest correct wording. Close with counts per class. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`); a claim you could not ground is named as such, never asserted. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. PASS only when no claim is wrong or stale. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. "
+  }
+ ]
+}
