@@ -80,10 +80,12 @@ Each command reads the store `--db` names, else `WICKED_COVERAGE_DB`, else `WICK
   in its store, ahead of the daemon-wide one (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, default 80).
 
 crew's `domain-extraction` run maps a repository page by page (a bounded loop over its own steps,
-`repeat_from`) until the minimum is reached or the operator stops it. `requirements_graph_for_repo`
+`repeat_from`) until the minimum is reached, the operator stops it, or nothing is left to map; a
+run that ends its pages below the minimum still meets the fail-closed build. `requirements_graph_for_repo`
 (core-ts `getRequirementsGraphForRepo`) returns the graph, the live coverage label, the `build`
-record the listed graph came from, and the engine's verdict on each listed row (`rows`: `real`, and
-`uncounted` with the reason a row is not in the share).
+record the listed graph came from, and the engine's verdict on each listed row that records its code unit (`rows`: `real`, and
+`uncounted` with the reason a row is not in the share; a row from an older build has no entry,
+which means unknown until a rebuild).
 
 ## Platform support
 
