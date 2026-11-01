@@ -1084,6 +1084,15 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
     }
 }
 
+/// A worktree this launch minted a moment ago and will not use (a refused domain launch,
+/// garden#1370): the tree AND its fresh branch go, so a relaunch of the same id mints both anew
+/// from the base and passes the base checks again, rather than adopting a retained branch whose
+/// base is not re-resolved. Nothing was written on that branch yet.
+pub(crate) fn discard_minted_worktree(repo_root: &str, run_id: &str) {
+    remove_worktree(repo_root, run_id);
+    let _ = git(repo_root, &["branch", "-D", &worktree_branch(run_id)]);
+}
+
 /// (F-7R2-013, review RN-1) `git clean -fdX` in a RETAINED worktree: removes IGNORED files only
 /// (`node_modules`, `target/`, build output) — never tracked files, never untracked files that
 /// are not ignored (a seat's leftover edit stays for the operator to see). Best-effort; the
@@ -3191,5 +3200,52 @@ mod tests {
             "web-refresh-lint-a0"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// garden#1370 (review r3): a refused domain launch discards the tree AND the branch it just
+/// minted, so a same-id relaunch mints both from the base again instead of adopting the branch.
+#[cfg(test)]
+mod discard_minted_tests {
+    use super::*;
+
+    fn run(cwd: &Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(["-c", "core.fsmonitor=false", "-c", "commit.gpgsign=false"])
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid"])
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    #[test]
+    fn a_discarded_launch_leaves_neither_its_tree_nor_its_branch() {
+        let repo = std::env::temp_dir().join(format!(
+            "wicked-core-discard-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&repo).unwrap();
+        run(&repo, &["init", "-q", "-b", "main", "."]);
+        std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+        run(&repo, &["add", "-A"]);
+        run(&repo, &["commit", "-qm", "base"]);
+        let root = repo.to_string_lossy().to_string();
+        let id = "run-discard-1";
+        let wt = worktree_path(&root, id);
+        let branch = worktree_branch(id);
+        run(
+            &repo,
+            &["worktree", "add", "-q", "-b", &branch, wt.to_str().unwrap()],
+        );
+        stamp_worktree_owner(&wt, id);
+        assert!(wt.is_dir());
+        discard_minted_worktree(&root, id);
+        assert!(!wt.exists(), "the tree is gone");
+        let (ok, _, _) = git(&root, &["rev-parse", "--verify", "--quiet", &branch]).unwrap();
+        assert!(!ok, "the branch is gone");
+        let _ = std::fs::remove_dir_all(&repo);
     }
 }

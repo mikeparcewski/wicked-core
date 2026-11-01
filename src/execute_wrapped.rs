@@ -3381,7 +3381,7 @@ impl WrappedCliStepRunner {
         // outcome at spawn decides `governed`; `floor_governed` is that outcome.
         let mut floor_pending = false;
         let mut floor_governed = false;
-        let gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
+        let mut gov_env: Option<GovLaunch> = match (&input.governance, is_claude) {
             (Some(gov), true) => {
                 // #653: an org `allowManagedHooksOnly` setting drops every `--settings` hook, so
                 // arming here would announce a gate that never fires. The unit is on this carrier
@@ -3562,6 +3562,8 @@ impl WrappedCliStepRunner {
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
+            // A long prompt's file (core#1228): kept until the seat has run.
+            let mut prompt_guard: Option<crate::container_floor::CarriedPrompt> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
@@ -3760,11 +3762,33 @@ impl WrappedCliStepRunner {
                             }
                         }
                         seat_cleanup = Some(c.cleanup);
+                        prompt_guard = c.prompt_file;
                         seat_gateway_env = c.env;
                         copilot_account = c.copilot_account;
                         seat_files = c.files;
                         gateway_lease = c.lease;
                         argv = c.argv;
+                        // core#1228: a carried prompt's file is the seat's to read — the governed
+                        // claude's gate hook admits exactly that file, and copilot (which reads
+                        // only its cwd and temp) is handed its directory.
+                        if let Some(carried) = &prompt_guard {
+                            if let Some(g) = gov_env.as_mut() {
+                                g.extra_read_roots
+                                    .push(carried.file.to_string_lossy().into_owned());
+                            }
+                            if let Some(dir) = carried.file.parent() {
+                                let dir = dir.to_string_lossy().into_owned();
+                                if seat_cli == wicked_apps_core::spawn::SeatCli::Copilot {
+                                    apply_seat_posture(&mut argv, &["--add-dir".to_string(), dir]);
+                                } else if seat_cli == wicked_apps_core::spawn::SeatCli::Claude {
+                                    // Every claude seat (an ungoverned judge too) may read outside
+                                    // its tree only in an added directory: placed right before
+                                    // `--setting-sources`, an option, so the variadic `--add-dir`
+                                    // never takes the pointer as a second directory.
+                                    add_dir_before_setting_sources(&mut argv, dir);
+                                }
+                            }
+                        }
                         // Each CLI's own sandbox off inside ours (codex's cannot run in a
                         // container: it needs user namespaces).
                         crate::worker_sandbox::codex_sandbox_off_under_floor(&mut argv);
@@ -3798,7 +3822,16 @@ impl WrappedCliStepRunner {
                                 format!(": {detail}")
                             }
                         );
-                        return floor_refused(input, &cli_key, why);
+                        let mut out = floor_refused(input, &cli_key, why);
+                        if why == crate::worker_sandbox::FloorUnarmed::ArgvTooLong {
+                            // The size (or the file handoff's failure) is the reason itself,
+                            // said inside the refusal's parentheses.
+                            if out.output.ends_with(')') {
+                                out.output.pop();
+                            }
+                            out.output.push_str(&format!(" — {detail})"));
+                        }
+                        return out;
                     }
                 }
             } else if os_sandbox {
@@ -4348,6 +4381,7 @@ impl WrappedCliStepRunner {
             // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
             drop(scratch_guard.take());
+            drop(prompt_guard.take());
             // Revoke the seat's gateway key and keep what the gateway recorded for it (each
             // model request's status, model, tool calls, text and usage) as the unit's evidence.
             if let Some(lease) = gateway_lease.take() {
@@ -6725,6 +6759,15 @@ fn compose_seat_opencode_config(
         &[]
     };
     crate::mcp_isolation::opencode_config_admitting(base.as_deref(), admitted).map(Some)
+}
+
+/// core#1228: `--add-dir <dir>` directly before claude's `--setting-sources` (an option, so the
+/// variadic `--add-dir` ends there). No `--setting-sources` (not one of the engine's claude
+/// launches): the argv is left as it is.
+pub(crate) fn add_dir_before_setting_sources(argv: &mut Vec<String>, dir: String) {
+    if let Some(i) = argv.iter().position(|a| a == "--setting-sources") {
+        argv.splice(i..i, ["--add-dir".to_string(), dir]);
+    }
 }
 
 /// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
@@ -18693,5 +18736,33 @@ mod ask_config_tests {
                 )]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carried_prompt_dir_tests {
+    #[test]
+    fn claude_reads_the_carried_prompt_from_an_added_dir_placed_before_an_option() {
+        let mut argv: Vec<String> = ["claude", "--setting-sources", "", "-p", "Read the file"]
+            .map(String::from)
+            .to_vec();
+        super::add_dir_before_setting_sources(&mut argv, "/w/.wicked-prompts/u".into());
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--add-dir",
+                "/w/.wicked-prompts/u",
+                "--setting-sources",
+                "",
+                "-p",
+                "Read the file"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let mut other: Vec<String> = ["x", "-p", "y"].map(String::from).to_vec();
+        super::add_dir_before_setting_sources(&mut other, "/d".into());
+        assert_eq!(other, ["x", "-p", "y"].map(String::from).to_vec());
     }
 }

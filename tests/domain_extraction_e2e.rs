@@ -474,6 +474,16 @@ fn setup(
         }
         std::env::set_var("WICKED_SKILLS_SNAPSHOT", &snapshot);
         std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
+        // garden#1370: a domain-extraction launch re-indexes the repo graph at its base (D8) and
+        // is refused when that fails. A hermetic runner has no wicked-estate; the seeded graph is
+        // already what these runs map, so the indexer is a stub that succeeds.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let indexer = skills_base.join("wicked-estate-stub");
+            std::fs::write(&indexer, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&indexer, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::env::set_var("WICKED_ESTATE_BIN", &indexer);
+        }
     });
     let repo = make_git_repo(name);
     let core = Core::spawn_with_engine(db.clone(), Arc::new(StubDispatcher), Arc::new(runner));

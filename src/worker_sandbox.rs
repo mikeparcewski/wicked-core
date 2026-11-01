@@ -323,6 +323,9 @@ pub(crate) enum FloorUnarmed {
     AgentSignedOut,
     /// (C5) A governed unit on the interim host floor whose seat was governed only over ACP.
     NeedsContainerFloor,
+    /// Container floor: the seat's command line is larger than a Linux exec takes, and no file
+    /// could carry it (core#1228).
+    ArgvTooLong,
 }
 
 impl FloorUnarmed {
@@ -394,6 +397,10 @@ impl FloorUnarmed {
                  removed; on the interim host floor (WICKED_SEAT_FLOOR=host) nothing would check \
                  them — run with the container floor (the default), or use a claude or codex seat"
             }
+            FloorUnarmed::ArgvTooLong => {
+                "argv_too_long: the seat's command line is larger than a container can pass to \
+                 it"
+            }
         }
     }
 
@@ -415,6 +422,7 @@ impl FloorUnarmed {
             FloorUnarmed::UnverifiedHookImage => "unverified_hook_image",
             FloorUnarmed::AgentSignedOut => "agent_signed_out",
             FloorUnarmed::NeedsContainerFloor => "needs_container_floor",
+            FloorUnarmed::ArgvTooLong => "argv_too_long",
         }
     }
 }
@@ -594,6 +602,16 @@ pub(crate) fn default_worker_sandbox(
 /// The text of a governed unit refused because its seat container did not arm. Says `could not
 /// run`, which the runner reads as a seat failure, so the actor fails the unit over.
 pub(crate) fn floor_refusal_text(cli: &str, why: FloorUnarmed) -> String {
+    // core#1228: a signed-out agent is said plainly first, so the escalation that lists every
+    // judge seat that could not rule reads "agy is signed out: sign it in", not a floor code.
+    if why == FloorUnarmed::AgentSignedOut {
+        let agent = cli.split('#').next().unwrap_or(cli); // `agy#2` is a second agy seat
+        return format!(
+            "({agent} is signed out: sign it in (Agents → Sign in), then retry — its seat \
+             '{cli}' could not run this unit: {})",
+            why.describe()
+        );
+    }
     format!(
         "(seat '{cli}' could not run this governed unit: its seat container did not arm — {}; \
          the unit is refused rather than run outside the floor (fail closed) — fix it, or let \
@@ -1575,6 +1593,27 @@ esac
             "{text}"
         );
         assert!(text.contains("agent_signed_out") && text.contains("Agents"));
+    }
+
+    /// core#1228: the escalation names a signed-out agent plainly, first, by its own name (a
+    /// second seat of the same agent too), so the operator reads what to do.
+    #[test]
+    fn a_signed_out_agent_is_said_plainly_first() {
+        for (seat, agent) in [("agy", "agy"), ("agy#2", "agy"), ("pi", "pi")] {
+            let text = floor_refusal_text(seat, FloorUnarmed::AgentSignedOut);
+            assert!(
+                text.starts_with(&format!("({agent} is signed out: sign it in")),
+                "{text}"
+            );
+            assert_eq!(
+                wicked_council::types::SeatFailureReason::classify_refusal(&text, false),
+                Some(wicked_council::types::SeatFailureReason::NotLoggedIn),
+                "{text}"
+            );
+        }
+        // Every other refusal keeps its floor wording.
+        let other = floor_refusal_text("agy", FloorUnarmed::NoSeatImage);
+        assert!(other.starts_with("(seat 'agy' could not run"), "{other}");
     }
 
     fn git(dir: &Path, args: &[&str]) {

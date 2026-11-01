@@ -2456,6 +2456,18 @@ pub(crate) struct ArmedContainer {
     /// What the seat container mounts, for narrowing a claude seat's fence to it
     /// (`execute_wrapped::narrow_container_fence`).
     pub(crate) view: MountView,
+    /// A long prompt the seat reads from a file ([`carry_prompt_in_file`]): the file (the caller
+    /// admits it to the seat's own read permissions) and its private directory, removed when the
+    /// caller drops it at the end of the unit.
+    pub(crate) prompt_file: Option<CarriedPrompt>,
+}
+
+/// A long prompt carried in a file (core#1228): `file` is mounted read-only into the seat; the
+/// directory goes when this is dropped.
+#[derive(Debug)]
+pub(crate) struct CarriedPrompt {
+    pub(crate) file: PathBuf,
+    pub(crate) _dir: RemoveOnDrop,
 }
 
 impl std::fmt::Debug for ArmedContainer {
@@ -2474,6 +2486,7 @@ impl std::fmt::Debug for ArmedContainer {
             .field("lease", &self.lease)
             .field("copilot_account", &self.copilot_account)
             .field("view", &self.view)
+            .field("prompt_file", &self.prompt_file)
             .finish()
     }
 }
@@ -2620,6 +2633,200 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
     )
 }
 
+/// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
+/// exec any single argument over `MAX_ARG_STRLEN` (32 pages, 128 KiB): docker-init then fails
+/// with "argument list too long" before the CLI starts. A longer prompt rides a file instead
+/// ([`carry_prompt_in_file`]), with room to spare for the pointer and the rest of the argv.
+pub(crate) const PROMPT_ARGV_MAX: usize = 64 * 1024;
+
+/// Pi's options that take a value (pi 1.1 `--help`): a prompt right after one of these is that
+/// option's value, not a positional message; every other flag before it is a boolean.
+const PI_VALUE_OPTIONS: &[&str] = &[
+    "--provider",
+    "--model",
+    "--api-key",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--mode",
+    "--session",
+    "--session-id",
+    "--fork",
+    "--session-dir",
+    "--name",
+    "-n",
+    "--models",
+    "--tools",
+    "-t",
+    "--exclude-tools",
+    "-xt",
+    "--thinking",
+    "--extension",
+    "-e",
+    "--skill",
+    "--prompt-template",
+    "--theme",
+    "--export",
+    "--tui-mode",
+];
+
+/// Linux's limit on one exec argument (`MAX_ARG_STRLEN`, 32 pages of 4 KiB).
+const EXEC_ARG_MAX: usize = 128 * 1024;
+
+/// What all the seat's arguments together may take: half of macOS's 1 MiB `ARG_MAX` (the host's
+/// runtime client receives these arguments too, with its wrapper and environment), and well under
+/// the 2 MiB a Linux exec takes.
+const EXEC_ARGS_TOTAL_MAX: usize = 512 * 1024;
+
+/// `Err` when an argument, or all of them together, is too large for a Linux exec, so the unit
+/// is refused with the reason instead of failing inside the container (core#1228).
+pub(crate) fn check_exec_args(argv: &[String]) -> Result<(), String> {
+    if let Some((i, a)) = argv
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.len() >= EXEC_ARG_MAX)
+    {
+        return Err(format!(
+            "argument {i} of the seat's command is {} bytes; a container cannot pass an argument \
+             of {} bytes or more",
+            a.len(),
+            EXEC_ARG_MAX
+        ));
+    }
+    // Each argument also takes a pointer in the exec's argv table (8 bytes on 64-bit).
+    let total: usize = argv.iter().map(|a| a.len() + 1 + 8).sum::<usize>() + 8;
+    if total > EXEC_ARGS_TOTAL_MAX {
+        return Err(format!(
+            "the seat's command is {total} bytes; a container takes at most {EXEC_ARGS_TOTAL_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+/// The argument that stands for a long prompt carried in `file` (`bytes` long). Pi reads a file
+/// named `@<path>` into its first message itself; every other CLI is told to read the file.
+fn prompt_pointer(cli: &str, file: &Path, bytes: usize) -> Vec<String> {
+    if cli == "pi" {
+        return vec![
+            format!("@{}", file.display()),
+            "The attached file is this turn's whole task. Follow it exactly.".to_string(),
+        ];
+    }
+    vec![format!(
+        "This turn's task is too long to pass on the command line ({bytes} bytes), so it is in \
+         the file {}. Read that whole file now, then do exactly what it says, as if it were \
+         this message. Do not answer before you have read all of it.",
+        file.display()
+    )]
+}
+
+/// Write `prompt` to a fresh private directory under the engine's worker home, mount it into
+/// the seat read-only, and put a pointer to it where the prompt stood in `argv` (an argument
+/// that IS the prompt, or one that carries it glued to a flag). Returns the directory's guard:
+/// the caller holds it until the unit ends. Under the worker home because seat config homes are
+/// there already, so the runtime's VM shares it; the path is canonical, as every mount is.
+pub(crate) fn carry_prompt_in_file(
+    cli: &str,
+    prompt: &str,
+    argv: &mut Vec<String>,
+    mounts: &mut Vec<Mount>,
+) -> Result<Option<CarriedPrompt>, String> {
+    let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
+    carry_prompt_in_file_at(&base, cli, prompt, argv, mounts)
+}
+
+fn carry_prompt_in_file_at(
+    base: &Path,
+    cli: &str,
+    prompt: &str,
+    argv: &mut Vec<String>,
+    mounts: &mut Vec<Mount>,
+) -> Result<Option<CarriedPrompt>, String> {
+    let base = crate::worker_sandbox::canon_lenient(base).unwrap_or_else(|| base.to_path_buf());
+    let store = base.join(".wicked-prompts");
+    // The store must lie outside everything this seat mounts: under a bind (a worker home
+    // configured inside the repository, say) the seat would see other units' prompts, and under
+    // a writable one it could move this unit's file away from its cleanup.
+    let exposed = |p: &Path| {
+        mounts
+            .iter()
+            .find(|m| p.starts_with(m.dst()) || m.dst().starts_with(p))
+            .map(|m| m.dst().to_path_buf())
+    };
+    if let Some(m) = exposed(&store) {
+        return Err(format!(
+            "the long prompt's store {} lies under {}, which the seat mounts; set the worker \
+             home outside the repository and the seat's roots",
+            store.display(),
+            m.display()
+        ));
+    }
+    let dir = store.join(uuid::Uuid::new_v4().simple().to_string());
+    let guard = RemoveOnDrop(dir.clone());
+    let file = dir.join("prompt.md");
+    write_private_file(&file, prompt.as_bytes())
+        .map_err(|e| format!("the long prompt could not be written to a file: {e}"))?;
+    let file = file
+        .canonicalize()
+        .map_err(|e| format!("the long prompt's file {}: {e}", file.display()))?;
+    // Written without following a link (`write_private_file`); checked again where it landed.
+    if !mountable(&file) || exposed(&file).is_some() {
+        return Err(format!(
+            "the long prompt's file {} cannot be mounted into a seat container on its own",
+            file.display()
+        ));
+    }
+    let pointer = prompt_pointer(cli, &file, prompt.len());
+    let mut carried = false;
+    let mut out = Vec::with_capacity(argv.len() + 1);
+    for a in argv.drain(..) {
+        // What the argument before the prompt makes of it: pi's `@path` attaches a file only as
+        // a positional argument (after `-p`/`--print` or another positional); as the value of
+        // `--system-prompt`/`--append-system-prompt` pi loads a plain path's contents itself;
+        // as any other option's value, the read-the-file sentence stands in.
+        let prev = out.last().map(String::as_str).unwrap_or("");
+        let option_value = PI_VALUE_OPTIONS.contains(&prev);
+        if cli == "pi" && a != prompt && a.contains(prompt) {
+            // A decorated positional (`"<text> Be concise."`) gets the file as its own `@path`
+            // before it; anything glued to an option gets the read-the-file sentence.
+            if option_value || a.starts_with('-') {
+                out.push(a.replace(prompt, &prompt_pointer("", &file, prompt.len()).join(" ")));
+            } else {
+                out.push(format!("@{}", file.display()));
+                out.push(a.replace(prompt, "the task in the attached file"));
+            }
+            carried = true;
+        } else if a == prompt && cli == "pi" && option_value {
+            if matches!(prev, "--system-prompt" | "--append-system-prompt") {
+                out.push(file.to_string_lossy().into_owned());
+            } else {
+                out.push(prompt_pointer("", &file, prompt.len()).join(" "));
+            }
+            carried = true;
+        } else if a == prompt {
+            out.extend(pointer.iter().cloned());
+            carried = true;
+        } else if a.contains(prompt) {
+            // Embedded in a larger argument (`--prompt=<text>`, `"{PROMPT} Be concise."`): the
+            // read-the-file sentence takes the prompt's place (pi's `@path` must be an argument
+            // of its own, so it is never glued).
+            let sentence = prompt_pointer("", &file, prompt.len()).join(" ");
+            out.push(a.replace(prompt, &sentence));
+            carried = true;
+        } else {
+            out.push(a);
+        }
+    }
+    *argv = out;
+    if !carried {
+        return Ok(None); // the argv does not carry the prompt: nothing to hand over (dir removed)
+    }
+    mounts.push(Mount::Bind {
+        path: file.clone(),
+        rw: false,
+    });
+    Ok(Some(CarriedPrompt { file, _dir: guard }))
+}
+
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
 /// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
 /// names why the unit cannot run in a container; the caller refuses it (fail closed).
@@ -2736,6 +2943,14 @@ pub(crate) fn arm_noting(
     }
     cover_gateway_dir(&mut mounts, gateway_dir)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // core#1228: a prompt too long for one exec argument rides a private read-only file; the
+    // argv carries a short pointer to it. After every other mount is known (the store must lie
+    // outside all of them) and before the view the claude fence is narrowed to.
+    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
+        Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
+            .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
+        None => None,
+    };
     // What the seat sees, for the claude fence ([`narrow_fenced_dir`]): the final mounts, and
     // the unit's working set among them.
     let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
@@ -2745,6 +2960,7 @@ pub(crate) fn arm_noting(
         .chain(inp.write_roots.iter().cloned())
         .chain(read_roots.iter().cloned())
         .chain(read_view.map(Path::to_path_buf))
+        .chain(prompt_file.as_ref().map(|c| c.file.clone()))
         .collect();
     let view = mount_view(&mounts, &working_set);
     // The seat image cannot move a mount (a link where one lands, a declared volume).
@@ -2890,9 +3106,14 @@ pub(crate) fn arm_noting(
         own_ports: &own_ports,
     });
     grant_seat_devices(&mut wrapper, cli).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    let argv = with_seat_args(image_argv(&argv, cli), seat_args);
+    // Checked on what the container will exec (the seat's own args included); a refusal here
+    // drops the lease (revoking its key) and the container's cleanup with it.
+    check_exec_args(&argv).map_err(|e| (FloorUnarmed::ArgvTooLong, e))?;
     Ok(ArmedContainer {
         wrapper,
-        argv: with_seat_args(image_argv(&argv, cli), seat_args),
+        argv,
+        prompt_file,
         tool: tool_name(&rt.cli),
         cleanup,
         env,
@@ -6848,5 +7069,241 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("wicked-seat-claude-runid1-3-"), "{a}");
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+}
+
+/// core#1228: a prompt or payload too large for one Linux exec argument never reaches the seat
+/// container's argv (docker-init failed with "argument list too long" on a coverage judge).
+#[cfg(all(test, unix))]
+mod long_prompt_tests {
+    use super::*;
+
+    fn base() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-long-prompt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn big_prompt() -> String {
+        // Over 256 KiB, past Linux's 128 KiB per-argument limit twice over.
+        let p = "Judge the coverage step. ".repeat(11_000);
+        assert!(p.len() > 256 * 1024);
+        p
+    }
+
+    #[test]
+    fn a_prompt_over_256_kib_rides_a_read_only_file_and_the_argv_fits_an_exec() {
+        let root = base();
+        let prompt = big_prompt();
+        // Before: the prompt itself is an argument, which no Linux exec takes.
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        assert!(check_exec_args(&argv).unwrap_err().contains("argument"));
+        let mut mounts = Vec::new();
+        let carried = carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        check_exec_args(&argv).expect("the argv now fits one exec");
+        assert!(argv.iter().all(|a| a.len() < PROMPT_ARGV_MAX), "{argv:?}");
+        assert_eq!(argv[..2], ["codex".to_string(), "exec".to_string()]);
+        let [Mount::Bind { path, rw: false }] = mounts.as_slice() else {
+            panic!("one read-only bind: {mounts:?}");
+        };
+        assert_eq!(std::fs::read_to_string(path).unwrap(), prompt);
+        assert!(path.starts_with(root.canonicalize().unwrap()));
+        let pointer = argv.last().unwrap();
+        assert!(
+            pointer.contains(&path.display().to_string())
+                && pointer.contains("Read that whole file"),
+            "{pointer}"
+        );
+        // Private to the operator; gone with the unit.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        assert_eq!(&carried.file, path);
+        let dir = carried._dir.0.clone();
+        drop(carried);
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_reads_the_long_prompt_file_itself() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("pi -p \"{PROMPT}\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let _guard = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        let Mount::Bind { path, .. } = &mounts[0] else {
+            panic!("{mounts:?}")
+        };
+        assert_eq!(argv[..2], ["pi".to_string(), "-p".to_string()]);
+        assert_eq!(argv[2], format!("@{}", path.display()));
+        assert!(argv[3].contains("whole task"), "{argv:?}");
+        check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_with_a_decorated_template_gets_its_at_path_as_an_argument_of_its_own() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv =
+            crate::execute_wrapped::build_argv("pi -p \"{PROMPT} Be concise.\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let _c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        // The file rides pi's own carrier as an argument of its own; the decoration stays.
+        let n = argv.len();
+        assert_eq!(argv[n - 2], format!("@{}", _c.file.display()), "{argv:?}");
+        assert_eq!(argv[n - 1], "the task in the attached file Be concise.");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_takes_a_prompt_given_as_an_option_value_as_that_option_expects() {
+        let root = base();
+        let prompt = big_prompt();
+        for (template, want_path) in [
+            ("pi -p --system-prompt \"{PROMPT}\" Begin.", true),
+            ("pi -p --append-system-prompt \"{PROMPT}\" Begin.", true),
+            ("pi -p --model \"{PROMPT}\" Begin.", false),
+        ] {
+            let mut argv = crate::execute_wrapped::build_argv(template, &prompt, &[]);
+            let mut mounts = Vec::new();
+            let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+                .unwrap()
+                .expect("carried");
+            let value = &argv[3];
+            assert!(!value.starts_with('@'), "{template}: {value}");
+            if want_path {
+                assert_eq!(value, &c.file.display().to_string(), "{template}");
+            } else {
+                assert!(
+                    value.contains("Read that whole file"),
+                    "{template}: {value}"
+                );
+            }
+            assert_eq!(argv.last().unwrap(), "Begin.", "{template}");
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_after_a_boolean_flag_still_gets_its_file() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv =
+            crate::execute_wrapped::build_argv("pi -p --no-tools \"{PROMPT}\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let c = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        assert!(argv.contains(&format!("@{}", c.file.display())), "{argv:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prompt_glued_to_a_flag_is_replaced_in_place() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = vec!["tool".to_string(), format!("--prompt={prompt}")];
+        let mut mounts = Vec::new();
+        let _guard = carry_prompt_in_file_at(&root, "tool", &prompt, &mut argv, &mut mounts)
+            .unwrap()
+            .expect("carried");
+        assert!(
+            argv[1].starts_with("--prompt=This turn's task"),
+            "{}",
+            &argv[1][..80]
+        );
+        check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prompt_the_argv_does_not_carry_is_not_handed_over() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = vec!["agy".to_string(), "-p".to_string(), "short".to_string()];
+        let mut mounts = Vec::new();
+        let none = carry_prompt_in_file_at(&root, "agy", &prompt, &mut argv, &mut mounts).unwrap();
+        assert!(none.is_none() && mounts.is_empty());
+        assert_eq!(argv[2], "short");
+        let store = root.canonicalize().unwrap().join(".wicked-prompts");
+        assert_eq!(std::fs::read_dir(&store).map(|d| d.count()).unwrap_or(0), 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_seat_mount_inside_the_prompt_store_is_refused_too() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        let inside = root
+            .canonicalize()
+            .unwrap()
+            .join(".wicked-prompts")
+            .join("x");
+        let mut mounts = vec![Mount::Bind {
+            path: inside,
+            rw: true,
+        }];
+        let why =
+            carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts).unwrap_err();
+        assert!(why.contains("which the seat mounts"), "{why}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prompt_store_under_a_seat_mount_is_refused() {
+        // A worker home inside a mounted root would show every unit's prompts to the seat.
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        let canon = root.canonicalize().unwrap();
+        for rw in [false, true] {
+            let mut mounts = vec![Mount::Bind {
+                path: canon.clone(),
+                rw,
+            }];
+            let why = carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts)
+                .unwrap_err();
+            assert!(why.contains("which the seat mounts"), "{why}");
+            assert!(!canon.join(".wicked-prompts").exists());
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn any_other_argument_too_large_for_an_exec_is_refused_with_the_reason() {
+        // A skills list of 256 KiB, not the prompt: nothing can carry it, so arming refuses.
+        let skills: Vec<String> = (0..16_000)
+            .map(|i| format!("skill-number-{i:06}"))
+            .collect();
+        let argv = crate::execute_wrapped::build_argv(
+            "claude -p {PROMPT} --skills={SKILLS}",
+            "hi",
+            &skills,
+        );
+        assert!(argv.iter().any(|a| a.len() > 256 * 1024));
+        let why = check_exec_args(&argv).unwrap_err();
+        assert!(why.contains("cannot pass an argument"), "{why}");
+        // Many small arguments that add up past the budget are refused too.
+        let many = vec!["x".repeat(100 * 1024); 6];
+        assert!(check_exec_args(&many).unwrap_err().contains("at most"));
+        // Many tiny ones too: each also costs its pointer in the exec's argv table.
+        let tiny = vec!["x".to_string(); 60_000];
+        assert!(check_exec_args(&tiny).unwrap_err().contains("at most"));
+        assert_eq!(
+            crate::worker_sandbox::FloorUnarmed::ArgvTooLong.as_str(),
+            "argv_too_long"
+        );
     }
 }
