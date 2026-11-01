@@ -3562,6 +3562,8 @@ impl WrappedCliStepRunner {
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
+            // A long prompt's file (core#1228): kept until the seat has run.
+            let mut prompt_guard: Option<crate::container_floor::RemoveOnDrop> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
             // failing the unit — `detect_worker_sandbox` returns a best-effort (empty-wrapper)
             // sandbox with a downgrade reason, and we emit a `SandboxUnenforced` disclosure (the
@@ -3760,6 +3762,7 @@ impl WrappedCliStepRunner {
                             }
                         }
                         seat_cleanup = Some(c.cleanup);
+                        prompt_guard = c.prompt_file;
                         seat_gateway_env = c.env;
                         copilot_account = c.copilot_account;
                         seat_files = c.files;
@@ -4348,6 +4351,7 @@ impl WrappedCliStepRunner {
             // The seat ran (and `run_bounded` reaped it); release the arm-time guards now.
             drop(seat_cleanup.take());
             drop(scratch_guard.take());
+            drop(prompt_guard.take());
             // Revoke the seat's gateway key and keep what the gateway recorded for it (each
             // model request's status, model, tool calls, text and usage) as the unit's evidence.
             if let Some(lease) = gateway_lease.take() {

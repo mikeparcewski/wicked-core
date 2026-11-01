@@ -2456,6 +2456,9 @@ pub(crate) struct ArmedContainer {
     /// What the seat container mounts, for narrowing a claude seat's fence to it
     /// (`execute_wrapped::narrow_container_fence`).
     pub(crate) view: MountView,
+    /// The private directory holding a long prompt the seat reads from a file
+    /// ([`carry_prompt_in_file`]); removed when the caller drops it at the end of the unit.
+    pub(crate) prompt_file: Option<RemoveOnDrop>,
 }
 
 impl std::fmt::Debug for ArmedContainer {
@@ -2474,6 +2477,7 @@ impl std::fmt::Debug for ArmedContainer {
             .field("lease", &self.lease)
             .field("copilot_account", &self.copilot_account)
             .field("view", &self.view)
+            .field("prompt_file", &self.prompt_file)
             .finish()
     }
 }
@@ -2620,6 +2624,125 @@ pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
     )
 }
 
+/// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
+/// exec any single argument over `MAX_ARG_STRLEN` (32 pages, 128 KiB): docker-init then fails
+/// with "argument list too long" before the CLI starts. A longer prompt rides a file instead
+/// ([`carry_prompt_in_file`]), with room to spare for the pointer and the rest of the argv.
+pub(crate) const PROMPT_ARGV_MAX: usize = 64 * 1024;
+
+/// Linux's limit on one exec argument (`MAX_ARG_STRLEN`, 32 pages of 4 KiB).
+const EXEC_ARG_MAX: usize = 128 * 1024;
+
+/// What all arguments together may take, well under the 2 MiB a default 8 MiB stack gives exec
+/// (the environment shares that budget).
+const EXEC_ARGS_TOTAL_MAX: usize = 1024 * 1024;
+
+/// `Err` when an argument, or all of them together, is too large for a Linux exec, so the unit
+/// is refused with the reason instead of failing inside the container (core#1228).
+pub(crate) fn check_exec_args(argv: &[String]) -> Result<(), String> {
+    if let Some((i, a)) = argv
+        .iter()
+        .enumerate()
+        .find(|(_, a)| a.len() >= EXEC_ARG_MAX)
+    {
+        return Err(format!(
+            "argument {i} of the seat's command is {} bytes; a container cannot pass an argument \
+             of {} bytes or more",
+            a.len(),
+            EXEC_ARG_MAX
+        ));
+    }
+    let total: usize = argv.iter().map(|a| a.len() + 1).sum();
+    if total > EXEC_ARGS_TOTAL_MAX {
+        return Err(format!(
+            "the seat's command is {total} bytes; a container takes at most {EXEC_ARGS_TOTAL_MAX}"
+        ));
+    }
+    Ok(())
+}
+
+/// The argument that stands for a long prompt carried in `file` (`bytes` long). Pi reads a file
+/// named `@<path>` into its first message itself; every other CLI is told to read the file.
+fn prompt_pointer(cli: &str, file: &Path, bytes: usize) -> Vec<String> {
+    if cli == "pi" {
+        return vec![
+            format!("@{}", file.display()),
+            "The attached file is this turn's whole task. Follow it exactly.".to_string(),
+        ];
+    }
+    vec![format!(
+        "This turn's task is too long to pass on the command line ({bytes} bytes), so it is in \
+         the file {}. Read that whole file now, then do exactly what it says, as if it were \
+         this message. Do not answer before you have read all of it.",
+        file.display()
+    )]
+}
+
+/// Write `prompt` to a fresh private directory under the engine's worker home, mount it into
+/// the seat read-only, and put a pointer to it where the prompt stood in `argv` (an argument
+/// that IS the prompt, or one that carries it glued to a flag). Returns the directory's guard:
+/// the caller holds it until the unit ends. Under the worker home because seat config homes are
+/// there already, so the runtime's VM shares it; the path is canonical, as every mount is.
+pub(crate) fn carry_prompt_in_file(
+    cli: &str,
+    prompt: &str,
+    argv: &mut Vec<String>,
+    mounts: &mut Vec<Mount>,
+) -> Result<RemoveOnDrop, String> {
+    let base = wicked_apps_core::spawn::worker_home_base().map_err(|e| e.to_string())?;
+    carry_prompt_in_file_at(&base, cli, prompt, argv, mounts)
+}
+
+fn carry_prompt_in_file_at(
+    base: &Path,
+    cli: &str,
+    prompt: &str,
+    argv: &mut Vec<String>,
+    mounts: &mut Vec<Mount>,
+) -> Result<RemoveOnDrop, String> {
+    let base = crate::worker_sandbox::canon_lenient(base).unwrap_or_else(|| base.to_path_buf());
+    let dir = base
+        .join(".wicked-prompts")
+        .join(uuid::Uuid::new_v4().simple().to_string());
+    let guard = RemoveOnDrop(dir.clone());
+    let file = dir.join("prompt.md");
+    write_private_file(&file, prompt.as_bytes())
+        .map_err(|e| format!("the long prompt could not be written to a file: {e}"))?;
+    let file = file
+        .canonicalize()
+        .map_err(|e| format!("the long prompt's file {}: {e}", file.display()))?;
+    if !mountable(&file) {
+        return Err(format!(
+            "the long prompt's file {} cannot be mounted into a seat container",
+            file.display()
+        ));
+    }
+    let pointer = prompt_pointer(cli, &file, prompt.len());
+    let mut carried = false;
+    let mut out = Vec::with_capacity(argv.len() + 1);
+    for a in argv.drain(..) {
+        if a == prompt {
+            out.extend(pointer.iter().cloned());
+            carried = true;
+        } else if a.contains(prompt) {
+            // Glued to a flag (`--prompt=<text>`): the pointer's text takes the prompt's place.
+            out.push(a.replace(prompt, &pointer.join(" ")));
+            carried = true;
+        } else {
+            out.push(a);
+        }
+    }
+    *argv = out;
+    if carried {
+        mounts.retain(|m| m.dst() != file.as_path());
+        mounts.push(Mount::Bind {
+            path: file,
+            rw: false,
+        });
+    }
+    Ok(guard)
+}
+
 /// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
 /// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
 /// names why the unit cannot run in a container; the caller refuses it (fail closed).
@@ -2730,6 +2853,16 @@ pub(crate) fn arm_noting(
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
     mount_argv_paths(&mut mounts, &mut argv, prompt);
+    // core#1228: a prompt too long for one exec argument rides a private read-only file; the
+    // argv carries a short pointer to it. Nothing larger than the kernel takes reaches the exec.
+    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
+        Some(p) => Some(
+            carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
+                .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
+        ),
+        None => None,
+    };
+    check_exec_args(&argv).map_err(|e| (FloorUnarmed::ArgvTooLong, e))?;
     // A member turn's repository view: read-only, or the seat does not start.
     if let Some(view) = read_view {
         add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
@@ -2893,6 +3026,7 @@ pub(crate) fn arm_noting(
     Ok(ArmedContainer {
         wrapper,
         argv: with_seat_args(image_argv(&argv, cli), seat_args),
+        prompt_file,
         tool: tool_name(&rt.cli),
         cleanup,
         env,
@@ -6848,5 +6982,119 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("wicked-seat-claude-runid1-3-"), "{a}");
         assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+    }
+}
+
+/// core#1228: a prompt or payload too large for one Linux exec argument never reaches the seat
+/// container's argv (docker-init failed with "argument list too long" on a coverage judge).
+#[cfg(all(test, unix))]
+mod long_prompt_tests {
+    use super::*;
+
+    fn base() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-long-prompt-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn big_prompt() -> String {
+        // Over 256 KiB, past Linux's 128 KiB per-argument limit twice over.
+        let p = "Judge the coverage step. ".repeat(11_000);
+        assert!(p.len() > 256 * 1024);
+        p
+    }
+
+    #[test]
+    fn a_prompt_over_256_kib_rides_a_read_only_file_and_the_argv_fits_an_exec() {
+        let root = base();
+        let prompt = big_prompt();
+        // Before: the prompt itself is an argument, which no Linux exec takes.
+        let mut argv = crate::execute_wrapped::build_argv("codex exec \"{PROMPT}\"", &prompt, &[]);
+        assert!(check_exec_args(&argv).unwrap_err().contains("argument"));
+        let mut mounts = Vec::new();
+        let guard =
+            carry_prompt_in_file_at(&root, "codex", &prompt, &mut argv, &mut mounts).unwrap();
+        check_exec_args(&argv).expect("the argv now fits one exec");
+        assert!(argv.iter().all(|a| a.len() < PROMPT_ARGV_MAX), "{argv:?}");
+        assert_eq!(argv[..2], ["codex".to_string(), "exec".to_string()]);
+        let [Mount::Bind { path, rw: false }] = mounts.as_slice() else {
+            panic!("one read-only bind: {mounts:?}");
+        };
+        assert_eq!(std::fs::read_to_string(path).unwrap(), prompt);
+        assert!(path.starts_with(root.canonicalize().unwrap()));
+        let pointer = argv.last().unwrap();
+        assert!(
+            pointer.contains(&path.display().to_string())
+                && pointer.contains("Read that whole file"),
+            "{pointer}"
+        );
+        // Private to the operator; gone with the unit.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode & 0o077, 0, "{mode:o}");
+        let dir = guard.0.clone();
+        drop(guard);
+        assert!(!dir.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pi_reads_the_long_prompt_file_itself() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = crate::execute_wrapped::build_argv("pi -p \"{PROMPT}\"", &prompt, &[]);
+        let mut mounts = Vec::new();
+        let _guard = carry_prompt_in_file_at(&root, "pi", &prompt, &mut argv, &mut mounts).unwrap();
+        let Mount::Bind { path, .. } = &mounts[0] else {
+            panic!("{mounts:?}")
+        };
+        assert_eq!(argv[..2], ["pi".to_string(), "-p".to_string()]);
+        assert_eq!(argv[2], format!("@{}", path.display()));
+        assert!(argv[3].contains("whole task"), "{argv:?}");
+        check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_prompt_glued_to_a_flag_is_replaced_in_place() {
+        let root = base();
+        let prompt = big_prompt();
+        let mut argv = vec!["tool".to_string(), format!("--prompt={prompt}")];
+        let mut mounts = Vec::new();
+        let _guard =
+            carry_prompt_in_file_at(&root, "tool", &prompt, &mut argv, &mut mounts).unwrap();
+        assert!(
+            argv[1].starts_with("--prompt=This turn's task"),
+            "{}",
+            &argv[1][..80]
+        );
+        check_exec_args(&argv).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn any_other_argument_too_large_for_an_exec_is_refused_with_the_reason() {
+        // A skills list of 256 KiB, not the prompt: nothing can carry it, so arming refuses.
+        let skills: Vec<String> = (0..16_000)
+            .map(|i| format!("skill-number-{i:06}"))
+            .collect();
+        let argv = crate::execute_wrapped::build_argv(
+            "claude -p {PROMPT} --skills={SKILLS}",
+            "hi",
+            &skills,
+        );
+        assert!(argv.iter().any(|a| a.len() > 256 * 1024));
+        let why = check_exec_args(&argv).unwrap_err();
+        assert!(why.contains("cannot pass an argument"), "{why}");
+        // Many small arguments that add up past the budget are refused too.
+        let many = vec!["x".repeat(100 * 1024); 12];
+        assert!(check_exec_args(&many).unwrap_err().contains("at most"));
+        assert_eq!(
+            crate::worker_sandbox::FloorUnarmed::ArgvTooLong.as_str(),
+            "argv_too_long"
+        );
     }
 }
