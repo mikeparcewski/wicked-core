@@ -2166,6 +2166,32 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.20** — 2026-11-01 — release on main 5637b20, carrying 36 PRs since 0.15.19: #1183, #1184, #1189, #1190,
+  #1192, #1193, #1195, #1196, #1197, #1199, #1200, #1201, #1202, #1203, #1204, #1205, #1207, #1211, #1212, #1214, #1215,
+  #1218, #1219, #1220, #1221, #1222, #1223, #1224, #1225, #1226, #1229, #1231, #1234, #1237, #1238 and #1240.
+  - **Requirements (#1215, #1223, #1226, #1234, #1237, #1238, #1240).** The requirements graph lives in estate and is read
+    from there. A run keeps mapping until the configurable minimum coverage (default 80%), and the minimum counts real
+    requirements only: placeholders, tests, data files and TypeScript shapes are not behaviours. The read says which
+    graph build it lists, and gives the engine's verdict on each listed row (#1240): `rows` carries `real` and
+    `uncounted` (`structural`, `not_product` or `unindexed` for a row the share does not count). Domain extraction
+    brackets the seat's extract with host steps (#1221) and reviews the page it mapped (#1222).
+  - **Floor (#1184, #1190, #1192, #1197, #1199, #1200, #1203, #1204, #1220).** The repo-checks floor can run in a fresh
+    Linux container: with `WICKED_FLOOR_RUNNER=auto` (the default) only a macOS host whose container runtime answers
+    uses it, falling back to the host sandbox with the reason; Linux hosts keep the host floor (`bwrap`) unless the
+    switch is set, and `sandbox` keeps the host floor. A cargo workspace's affected test set is computed at the creator floor. Retries and the base
+    compare cover only a failed check's failing tests, an override carries to a later floor on the same tree, and the
+    floor, QE reviewer, team and judge stop waiting on each other (#1224).
+  - **Power mode and activity (#1195, #1207, #1211, #1212, #1218, #1231).** Live tool activity from codex and pi
+    streams, with a heartbeat for quiet seats. The orchestrator hears the person's personality and proposes a memory
+    for what it witnessed. QE gets the floor's evidence. There is a live token meter for a working step.
+  - **Seats (#1219, #1225, #1229).** Every bound agent unit carries the pinned git dir its seat container needs. Seat
+    images are held against a runtime's image GC and a missing base is rebuilt. A long prompt reaches a seat container
+    in a file, never as one argv element.
+  - **Asks (#1214):** a seat's ask can let the operator pick several choices.
+  - **Fixes and tests:** #1183, #1189, #1193, #1196, #1201, #1202, #1205.
+  - A new checks image (`containers/checks/node22-rust.Dockerfile`, #1220). The seat and floor Dockerfiles, the seat
+    package pins, the base image and the gate-hook protocol are unchanged since 0.15.19, so the seat and floor image tags
+    and gate protocol 3 are unchanged.
 - **core-ts 0.15.19** — 2026-10-29 — patch release on main 0ce5c39, carrying #1179, #1180 (core#1113) and #1181.
   - **Power mode: time against the estimate is the orchestrator's own turns (#1179).** Floors, reviewers and waits on
     a person no longer count towards the struggle signal.
