@@ -52,20 +52,69 @@ wicked-studio's Steering section, CI comments with it on PRs. Start here:
 **[crates/wicked-governance/STEERING.md](./crates/wicked-governance/STEERING.md)** — the
 operator guide from "never heard of it" to seeded and recalling.
 
+## Requirements graph
+
+wicked-core also builds a repository's **requirements graph**: the business rules garden's
+extraction stated on the code, grouped into domains by package directory and saved into the
+repository's estate store (domain, requirement and business-rule nodes, `SatisfiedBy` edges to
+the code). crew reads it from there; nothing is written into the checkout.
+
+The graph is held to a minimum share of **real** requirements: behaviours in product code with a
+validated requirement or a business rule at or above the confidence threshold (0.75 by default).
+A placeholder (a behaviour that meets neither: a risk flag, a rule under the threshold, or an
+unvalidated requirement alone) stays in the graph and never counts. A requirement's `review` status
+is not that test: an unvalidated requirement whose rule clears the threshold still counts. What is product code is decided by file path:
+test, spec and fixture files and data, manifest and document files are left out (`not_product`),
+though a test module inside a product file still counts, and an extracted rules-engine rule outside
+test and fixture paths counts whatever its file extension. A TypeScript interface counts only when the graph shows it does something.
+Below the minimum the build fails closed and says why: "23% real requirements, minimum 80% (1362
+of 5786 behaviours; 4397 placeholders, 27 unmapped)". The mapping done so far stays in the store.
+
+Each command reads the store `--db` names, else `WICKED_COVERAGE_DB`, else `WICKED_ESTATE_DB`, else
+`./wicked-estate.db`, so point it at the repository's estate store:
+
+- `wicked-core coverage --db <store> [--min-coverage-pct [N]]` reports the share. With
+  `--min-coverage-pct` it exits 3 below the minimum (N, or with no value the minimum in force).
+- `wicked-core domain-graph --db <store>` builds and saves the graph (`--out` also writes a JSON
+  export).
+- `wicked-core requirements-target --db <store> --set N | --clear` keeps a repository's own minimum
+  in its store, ahead of the daemon-wide one (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, default 80).
+
+crew's `domain-extraction` run maps a repository page by page (a bounded loop over its own steps,
+`repeat_from`) until the minimum is reached, the operator stops it, or nothing is left to map; a
+run that ends its pages below the minimum still meets the fail-closed build. `requirements_graph_for_repo`
+(core-ts `getRequirementsGraphForRepo`) returns the graph, the live coverage label, the `build`
+record the listed graph came from, and the engine's verdict on each listed row that records its code unit (`rows`: `real`, and
+`uncounted` with the reason a row is not in the share; a row persisted before requirements recorded
+their code unit has no entry, which means unknown until a rebuild).
+
 ## Platform support
 
 macOS is the primary platform. Linux is supported. **Windows is not supported for governed runs**
 — it runs, and then it denies the verify gate on every one of them. The engine runs a repository's
 own check scripts (the `repo_checks` floor behind `bug/verify`, `feature/test`,
-`migration/verify` and crew's served mirrors) only inside an OS write boundary, because those
-scripts are code the repository chose; there is no boundary the engine can arm on Windows, so the
-floor fails closed and the gate denies (core#416).
+`migration/verify` and crew's served mirrors) only inside a write boundary, because those
+scripts are code the repository chose; there is no boundary the engine arms on a Windows host, so
+the floor fails closed and the gate denies (core#416).
 
-| Host | OS write boundary | The verify floor | Governed runs |
+| Host | Where the repository's checks run | The verify floor | Governed runs |
 |---|---|---|---|
-| **macOS** | `sandbox-exec` (base system) | runs the checks (`sandbox_level: sandboxed`) | primary |
+| **macOS** | a fresh Linux container per floor side when a container runtime answers (`docker`, `podman` or `nerdctl`) and the floor can be prepared there; else `sandbox-exec` (base system), with the reason | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container`, or `macos-sandbox` with its `fallbackReason`) | primary |
 | **Linux** | `bwrap` — `apt install bubblewrap` / `dnf install bubblewrap` | runs the checks with `bwrap`; **without it, denies** | supported |
 | **Windows** (incl. Git Bash / WSL host side) | none | **denies every floor phase, by construction** | not supported |
+
+`WICKED_FLOOR_RUNNER` picks the floor: `auto` (the default) tries the container on macOS only,
+`container` asks for it on any host and refuses the floor when it cannot start, `sandbox` keeps the
+host floor. The container has no network, a read-only root, every capability dropped and a memory
+cap (`WICKED_FLOOR_MEMORY`, default `6g`); the tree is copied in, and a check that rewrites a
+tracked file stands for nothing. A check killed for memory, or a container that stops answering,
+is "could not run", never a failure of the change. The image is `containers/checks/node22-rust.Dockerfile`,
+built on first use. `wicked-core floor run --repo <dir> --base <commit> [--full]` runs one floor and
+prints its report (which floor ran is its `runner` field). The container cannot run everything: an
+install other than `npm ci`, a check that names the base commit (the copy has no history), a build
+guide that reads results from a file, or a check whose command the image lacks sends `auto` back to
+the host floor. Only each check's own command is probed: a tool a script calls inside the container
+(`go test` from an npm script) fails there, so such a repository sets `WICKED_FLOOR_RUNNER=sandbox`.
 
 The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the
 repository's own checks with **no OS write boundary**. The results are real; the pass is not
@@ -73,12 +122,21 @@ containment evidence, and every report, gate note and `repoChecksEvaluated` even
 (`sandbox_level: "none"`). A real Windows boundary (AppContainer / a restricted-token job object,
 or the checks under WSL2 `bwrap`) is not designed and not shipped.
 
+**Seats run in containers too.** The `wicked-core` CLI (and crew's daemon) run governed seats in a
+hardened container per seat by default (`WICKED_SEAT_FLOOR=container`): one image per CLI built
+from `containers/seats/seat.Dockerfile`, the engine's own launcher mounted from
+`containers/floor.Dockerfile`, a read-only root, and a network whose only way out is the model
+gateway. A unit whose container cannot start is refused, never run on the host;
+`WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. `wicked-core seat-image
+build|hold|status` builds the images, holds them against a runtime's image cleanup (the `docker`
+CLI only), and reports them.
+
 Two smaller consequences of the same rule, worth knowing before you debug them:
 
 - A floor that passed says nothing about the platforms a repository's own CI gates — the checks ran
-  on the daemon's OS alone.
+  on one platform alone (the container's Linux, or the daemon's OS).
 - Everything else (planning, councils, chat, documents, the gate ladder) is cross-platform; it is
-  the *floor* that has a platform matrix.
+  the *floors* that have a platform matrix.
 
 ## Audience
 

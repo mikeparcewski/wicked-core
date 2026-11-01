@@ -27,11 +27,11 @@ and only rules that carry an `effect` participate in it. Seeding steering makes 
 
 **One part of that ladder has a platform matrix** (core#416). The gate that re-derives "done"
 from a repository's OWN checks — the `repo_checks` verify floor — runs repo-controlled
-scripts only inside an OS write boundary, so the host decides whether it can run at all:
+scripts only inside a write boundary, so the host decides whether it can run at all:
 
 | Host | Boundary | The verify floor |
 |---|---|---|
-| **macOS** (primary) | `sandbox-exec`, in the base system | runs the checks (`sandbox_level: sandboxed`) |
+| **macOS** (primary) | a fresh Linux container when a container runtime answers and the floor can be prepared there (`WICKED_FLOOR_RUNNER=auto`, the default); else `sandbox-exec`, in the base system | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container` or `macos-sandbox`) |
 | **Linux** (supported) | `bwrap` (`bubblewrap`) — install it | runs the checks; without `bwrap`, **denies** |
 | **Windows** (not supported) | none the engine can arm | **denies every floor phase, by construction** |
 
