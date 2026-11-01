@@ -3776,15 +3776,16 @@ impl WrappedCliStepRunner {
                                 g.extra_read_roots
                                     .push(carried.file.to_string_lossy().into_owned());
                             }
-                            if seat_cli == wicked_apps_core::spawn::SeatCli::Copilot {
-                                if let Some(dir) = carried.file.parent() {
-                                    apply_seat_posture(
-                                        &mut argv,
-                                        &[
-                                            "--add-dir".to_string(),
-                                            dir.to_string_lossy().into_owned(),
-                                        ],
-                                    );
+                            if let Some(dir) = carried.file.parent() {
+                                let dir = dir.to_string_lossy().into_owned();
+                                if seat_cli == wicked_apps_core::spawn::SeatCli::Copilot {
+                                    apply_seat_posture(&mut argv, &["--add-dir".to_string(), dir]);
+                                } else if seat_cli == wicked_apps_core::spawn::SeatCli::Claude {
+                                    // Every claude seat (an ungoverned judge too) may read outside
+                                    // its tree only in an added directory: placed right before
+                                    // `--setting-sources`, an option, so the variadic `--add-dir`
+                                    // never takes the pointer as a second directory.
+                                    add_dir_before_setting_sources(&mut argv, dir);
                                 }
                             }
                         }
@@ -6758,6 +6759,15 @@ fn compose_seat_opencode_config(
         &[]
     };
     crate::mcp_isolation::opencode_config_admitting(base.as_deref(), admitted).map(Some)
+}
+
+/// core#1228: `--add-dir <dir>` directly before claude's `--setting-sources` (an option, so the
+/// variadic `--add-dir` ends there). No `--setting-sources` (not one of the engine's claude
+/// launches): the argv is left as it is.
+pub(crate) fn add_dir_before_setting_sources(argv: &mut Vec<String>, dir: String) {
+    if let Some(i) = argv.iter().position(|a| a == "--setting-sources") {
+        argv.splice(i..i, ["--add-dir".to_string(), dir]);
+    }
 }
 
 /// The [`StepOutput`] for a governed unit whose seat container did not arm: nothing ran. The
@@ -18726,5 +18736,33 @@ mod ask_config_tests {
                 )]
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod carried_prompt_dir_tests {
+    #[test]
+    fn claude_reads_the_carried_prompt_from_an_added_dir_placed_before_an_option() {
+        let mut argv: Vec<String> = ["claude", "--setting-sources", "", "-p", "Read the file"]
+            .map(String::from)
+            .to_vec();
+        super::add_dir_before_setting_sources(&mut argv, "/w/.wicked-prompts/u".into());
+        assert_eq!(
+            argv,
+            [
+                "claude",
+                "--add-dir",
+                "/w/.wicked-prompts/u",
+                "--setting-sources",
+                "",
+                "-p",
+                "Read the file"
+            ]
+            .map(String::from)
+            .to_vec()
+        );
+        let mut other: Vec<String> = ["x", "-p", "y"].map(String::from).to_vec();
+        super::add_dir_before_setting_sources(&mut other, "/d".into());
+        assert_eq!(other, ["x", "-p", "y"].map(String::from).to_vec());
     }
 }
