@@ -64,8 +64,8 @@ validated requirement or a business rule at or above the confidence threshold (0
 A placeholder (a risk flag, a rule under the threshold, or an unvalidated requirement) stays in the
 graph as a `review` requirement and never counts. What is product code is decided by file path:
 test, spec and fixture files and data, manifest and document files are left out (`not_product`),
-though a test module inside a product file still counts and an extracted rules-engine rule counts
-whatever its file. A TypeScript interface counts only when the graph shows it does something.
+though a test module inside a product file still counts, and an extracted rules-engine rule outside
+test and fixture paths counts whatever its file extension. A TypeScript interface counts only when the graph shows it does something.
 Below the minimum the build fails closed and says why: "23% real requirements, minimum 80% (1362
 of 5786 behaviours; 4397 placeholders, 27 unmapped)". The mapping done so far stays in the store.
 
@@ -81,8 +81,9 @@ Each command reads the store `--db` names, else `WICKED_COVERAGE_DB`, else `WICK
 
 crew's `domain-extraction` run maps a repository page by page (a bounded loop over its own steps,
 `repeat_from`) until the minimum is reached or the operator stops it. `requirements_graph_for_repo`
-(core-ts `getRequirementsGraphForRepo`) returns the graph, the live coverage label, and the `build`
-record the listed graph came from.
+(core-ts `getRequirementsGraphForRepo`) returns the graph, the live coverage label, the `build`
+record the listed graph came from, and the engine's verdict on each listed row (`rows`: `real`, and
+`uncounted` with the reason a row is not in the share).
 
 ## Platform support
 
@@ -108,7 +109,9 @@ is "could not run", never a failure of the change. The image is `containers/chec
 built on first use. `wicked-core floor run --repo <dir> --base <commit> [--full]` runs one floor and
 prints its report (which floor ran is its `runner` field). The container cannot run everything: an
 install other than `npm ci`, a check that names the base commit (the copy has no history), a build
-guide that reads results from a file, or a tool the image lacks sends `auto` back to the host floor.
+guide that reads results from a file, or a check whose command the image lacks sends `auto` back to
+the host floor. Only each check's own command is probed: a tool a script calls inside the container
+(`go test` from an npm script) fails there, so such a repository sets `WICKED_FLOOR_RUNNER=sandbox`.
 
 The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the
 repository's own checks with **no OS write boundary**. The results are real; the pass is not
