@@ -1031,6 +1031,22 @@ pub fn turn_end(output: &str) -> TurnEnd {
     end
 }
 
+/// What the orchestrator proposes as a memory, and when (rule A7 of the floor skill,
+/// `wicked-garden-governed-worker`). The floor is loaded in power mode too, but the orchestrator
+/// works to this brief's turn protocol, and a floor rule the brief never names was skipped: on the
+/// rig (runs e0ba4073, 56691495) a claude orchestrator fixed a test script that fails on Node 22,
+/// gave the reason in a DECISION line, and proposed nothing. The proposal goes through the same
+/// shim every seat uses; its provenance (run, unit, seat) is stamped from the unit, never passed.
+pub const MEMORY_DIRECTIVE: &str = "Before each `CHECKPOINT:` or `HANDOFF:` line, follow rule A7 \
+     of your floor skill (wicked-garden-governed-worker): when something since your last check \
+     bit for a reason the code does not show (a command that failed because of the toolchain, \
+     the environment or the repository's setup, and what made it pass; a trap in a tool; a ruling \
+     the operator gave), propose it as a memory with `\"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" \
+     run scripts/mem/estate_memory.py --readonly propose '<the rule, why it holds, when it \
+     applies>'`. It goes to the operator's review queue under your seat. Propose each learning \
+     once, at most three in this whole session; what the code does and what you changed are not \
+     memories.";
+
 /// The orchestrator brief appended to the build unit's task at dispatch.
 ///
 /// `voice` (core#1216) is the person's voice block, appended LAST under [`voice_section`]'s
@@ -1090,7 +1106,8 @@ pub fn orchestrator_brief(
          your plan as one line `{APPROACH_PREFIX} <how you will make this change>`, and write it \
          again whenever the plan changes. For each choice a reviewer would ask about, write one \
          line `{DECISION_PREFIX} <what you chose> {WHY_MARK} <why>`. These lines are recorded as \
-         yours, labelled with your seat; they never steer the run. {rigor_line}{rework}{voice}",
+         yours, labelled with your seat; they never steer the run. {MEMORY_DIRECTIVE} \
+         {rigor_line}{rework}{voice}",
         voice = voice_section(voice)
     )
 }
@@ -1296,6 +1313,8 @@ pub fn continuation_prompt(
              `{HANDOFF_PREFIX} …` when the change is complete."
         ));
     }
+    // A restarted session never read the first brief, so the memory rule rides every later turn.
+    out.push_str(&format!("\n\n{MEMORY_DIRECTIVE}"));
     out.push_str(&format!(
         "\n\nThe change, for reference:\n{}",
         clip(task, 4000)
@@ -2196,6 +2215,61 @@ mod tests {
             "{b}"
         );
         assert!(b.contains("the tests that cover it pass"), "{b}");
+    }
+
+    /// (memory-seats) The orchestrator is told to propose what bit as a memory, through the floor's
+    /// A7 path, before each turn-end line: rig runs e0ba4073 and 56691495 loaded the floor in power
+    /// mode, fixed a test script that fails on Node 22, and proposed nothing because the brief never
+    /// named the rule. Every later turn restates it (a restarted session never read the brief), and
+    /// the turn-end line stays the last thing the orchestrator is asked to write.
+    #[test]
+    fn the_brief_and_every_later_turn_ask_for_witnessed_memories_before_the_turn_end_line() {
+        let shim =
+            "\"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/mem/estate_memory.py \
+                    --readonly propose '";
+        for word in [
+            "Before each `CHECKPOINT:` or `HANDOFF:` line, follow rule A7",
+            "wicked-garden-governed-worker",
+            "a command that failed because of the toolchain",
+            "and what made it pass",
+            "a ruling the operator gave",
+            shim,
+            "under your seat",
+            "Propose each learning once, at most three in this whole session",
+            "what the code does and what you changed are not memories",
+        ] {
+            assert!(
+                MEMORY_DIRECTIVE.contains(word),
+                "{word}: {MEMORY_DIRECTIVE}"
+            );
+        }
+        assert!(
+            !MEMORY_DIRECTIVE.contains("provenance"),
+            "never asks the seat to pass provenance"
+        );
+        let b = orchestrator_brief(Some(Rigor::Standard), None, 1, Some(VOICE));
+        let directive = b
+            .find(MEMORY_DIRECTIVE)
+            .expect("the brief carries the memory rule");
+        assert!(
+            b.find(DECISION_PREFIX).unwrap() < directive
+                && directive < b.find(VOICE_GOVERNANCE).unwrap(),
+            "after the working-note lines, before the voice: {b}"
+        );
+        let a = CheckpointAnswer::default();
+        for restarted in [false, true] {
+            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, None);
+            assert!(p.contains(MEMORY_DIRECTIVE), "{p}");
+            assert!(
+                p.find(CHECKPOINT_PREFIX).unwrap() < p.find(MEMORY_DIRECTIVE).unwrap(),
+                "{p}"
+            );
+        }
+        let last = continuation_prompt("fix it", 5, 5, &a, "did x", false, None);
+        assert!(
+            last.contains("LAST turn") && last.contains(MEMORY_DIRECTIVE),
+            "{last}"
+        );
     }
 
     const VOICE: &str = "## Voice\n\n- Your name with the person is \"Rook\".\n- Keep it short.\n";
