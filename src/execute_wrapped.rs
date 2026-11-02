@@ -2231,7 +2231,11 @@ fn open_state_home_around_declared(
                     let mut forms: Vec<String> = Vec::new();
                     for base in bases {
                         let a = under(base, sub);
-                        let p = rule_path(&a).ok_or_else(|| unspellable(&a))?;
+                        // A spelling the rule syntax cannot express (a Windows verbatim path) names no
+                        // rule the fence emitted, so there is nothing under it to open.
+                        let Some(p) = rule_path(&a) else {
+                            continue;
+                        };
                         for f in [format!("{tool}({p})"), format!("{tool}({p}/**)")] {
                             if !forms.contains(&f) {
                                 forms.push(f);
@@ -2270,15 +2274,23 @@ fn open_state_home_around_declared(
                         // Spelled under both the state home as the fence named it and its canonical form,
                         // like the rules it replaces (review r1).
                         let rel_e = e.strip_prefix(&sh_canon).map_err(|x| x.to_string())?;
+                        let mut spelled = false;
                         for base in bases {
                             let at_base = base.join(rel_e);
-                            let ep = rule_path(&at_base).ok_or_else(|| unspellable(&at_base))?;
+                            let Some(ep) = rule_path(&at_base) else {
+                                continue;
+                            };
+                            spelled = true;
                             for f in [format!("{tool}({ep}/**)"), format!("{tool}({ep})")] {
                                 let leaf = f.ends_with(&format!("{ep})"));
                                 if (!leaf || view.mounted.contains(e)) && !instead.contains(&f) {
                                     instead.push(f);
                                 }
                             }
+                        }
+                        // An entry no spelling can name could not stay denied: refuse the launch.
+                        if !spelled {
+                            return Err(unspellable(e));
                         }
                     }
                     instead.retain(|r| !out.contains(r));
@@ -6284,6 +6296,19 @@ pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
     )
 }
 
+/// A path as a seat container mounts it: resolved, when it exists (unix hosts; a Windows host keeps
+/// the spelling, whose resolved form is a verbatim `\\?\` path).
+fn as_seat_mounts(p: &Path) -> PathBuf {
+    #[cfg(unix)]
+    {
+        p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+    }
+    #[cfg(not(unix))]
+    {
+        p.to_path_buf()
+    }
+}
+
 /// (core#503) The instruction a READ-ONLY unit on a codex seat carries in the check-scratch shape:
 /// the tree is denied by codex's own sandbox, its workspace is the scratch, so every command must
 /// run with its working directory set to the tree; temp, cargo's target and the npm cache already
@@ -6301,9 +6326,8 @@ pub(crate) fn codex_checks_instruction(
     scratch: &Path,
     notes_root: Option<&str>,
 ) -> String {
-    let tree = crate::worker_sandbox::canon_lenient(tree).unwrap_or_else(|| tree.to_path_buf());
-    let scratch =
-        crate::worker_sandbox::canon_lenient(scratch).unwrap_or_else(|| scratch.to_path_buf());
+    let tree = as_seat_mounts(tree);
+    let scratch = as_seat_mounts(scratch);
     let mut out = format!(
         "READ-ONLY PHASE, CHECKS RUN IN A SCRATCH: this phase declares executes_code: false. The \
          repository is at {tree} and your sandbox DENIES every write to it; your workspace is the \
@@ -6317,8 +6341,7 @@ pub(crate) fn codex_checks_instruction(
         scratch = scratch.display()
     );
     if let Some(root) = notes_root {
-        let root = crate::worker_sandbox::canon_lenient(Path::new(root))
-            .map_or_else(|| root.to_string(), |p| p.display().to_string());
+        let root = as_seat_mounts(Path::new(root)).display().to_string();
         out.push(' ');
         out.push_str(&notes_root_sentence(&root));
     }
@@ -12330,12 +12353,14 @@ mod tests {
             "the worktree is never a writable root; got: {}",
             out.output
         );
-        // The prompt names the tree to run commands in.
+        // The prompt names the tree to run commands in, as the seat mounts it (resolved:
+        // artifact-runs-fix, a `/var/folders` temp dir is `/private/var/folders` in the seat).
         assert!(
             out.output.contains("CHECKS RUN IN A SCRATCH")
-                && out
-                    .output
-                    .contains(&format!("working directory set to {}", dir.display())),
+                && out.output.contains(&format!(
+                    "working directory set to {}",
+                    dir.canonicalize().unwrap().display()
+                )),
             "the shape rides the prompt; got: {}",
             out.output
         );
@@ -19096,7 +19121,9 @@ mod carried_prompt_dir_tests {
 /// write them, to write — on every carrier: the state-home fence of a claude seat in a container,
 /// the read roots every unit is handed, and the tree a codex review is told to run its commands in.
 /// Each test fails on the engine before this change (rig runs 2e6059da, 968e8c7c, d5374efa).
-#[cfg(test)]
+// Paths in these tests are POSIX (the seat container floor runs Linux seats; a Windows canonical path is a
+// verbatim `\\?\` path the claude rule syntax does not spell).
+#[cfg(all(test, unix))]
 mod artifact_run_roots_tests {
     use super::*;
     use crate::container_floor::{mount_view, Mount};
