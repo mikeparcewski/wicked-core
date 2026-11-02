@@ -7,7 +7,7 @@
    "instructions": "Phase 1/3 SCOPE (engineering skill, docs action): read the operator's ask, the code it concerns and the repository's existing documentation. Name the audience, each Markdown file you will write or update (its path: READMEs at the component root, guides under docs/guides/, API reference under docs/api/ unless the repository already keeps docs elsewhere), and for each file the claims it will make with the file:line each rests on. Note any existing doc that has drifted from the code. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files. End with the exact list of files to write or update, one path per line, under a line FILES:."
   },
   {
-   "catalog": "produce",
+   "catalog": "build",
    "id": "write",
    "skill_ref": "wicked-garden-engineering",
    "depends_on": [

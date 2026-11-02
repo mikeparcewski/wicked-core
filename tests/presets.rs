@@ -1501,7 +1501,13 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             true,
             vec![
                 r("scope", "recon", "neutral", "auto", None),
-                r("write", "build", "creator", "auto", None),
+                r(
+                    "write",
+                    "build",
+                    "creator",
+                    "auto",
+                    Some(EVIDENCE_FLOOR_PIN),
+                ),
                 r("check", "review", "evaluator", hif, None),
             ],
             &[
@@ -1515,7 +1521,7 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             true,
             vec![
                 r("recon", "recon", "neutral", "auto", None),
-                r("plan", "build", "creator", "auto", None),
+                r("plan", "build", "creator", "auto", Some(EVIDENCE_FLOOR_PIN)),
                 r("check", "review", "evaluator", hif, None),
             ],
             &[
@@ -1558,7 +1564,7 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
         );
         // The WHOLE plan, literally (codex r1/r2): the engine's own rows of a creator plan (the PA
         // scope first, the floor's planning rungs this rig's silent PA floors at 100) are pinned
-        // with their kind, role and gate, never filtered.
+        // with their kind, role, gate and pin, never filtered.
         let mut whole = Vec::new();
         if creator {
             whole.push(r("pa-scope", "recon", "neutral", "auto", None));
@@ -1566,14 +1572,22 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             whole.push(r("test_plan", "test", "neutral", "auto", None));
             whole.push(r("design", "recon", "neutral", "auto", None));
             whole.push(r("architecture", "recon", "neutral", "auto", None));
-            whole.extend(want[1..].iter().cloned());
+            whole.push(want[1].clone());
+            // The writer is a code-work `build` step, so the floor adds its diff-floored review and
+            // security review at this band.
+            let f = Some(EVIDENCE_FLOOR_PIN);
+            whole.push(r("review", "review", "evaluator", "auto", f));
+            whole.push(want[2].clone());
+            whole.push(r("security_review", "review", "evaluator", "auto", f));
         } else {
             whole.extend(want.iter().cloned());
         }
         assert_eq!(all, whole, "{name}");
+        // Only the creator (`build`, so the run delivers its PR by default) executes code.
         for u in &units {
             assert!(u.tool_cmd.is_none(), "{name}: {} is an agent step", u.id);
-            assert!(!u.executes_code, "{name}: {} runs no code", u.id);
+            let writer = u.id.ends_with(":write") || u.id.ends_with(":plan");
+            assert_eq!(u.executes_code, writer, "{name}: {}", u.id);
         }
         // The check depends on what it judges, exactly; the docs check also reads the scope's FILES:
         // list and the test-plan check the recon's risk ranking, so each depends on that step too
