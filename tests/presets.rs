@@ -1484,15 +1484,18 @@ fn analyze_launches_one_read_only_answer_unit_on_one_seat() {
 /// creator is `produce` (never `executes_code`), so the PA rates them first (`pa-scope`) and their
 /// check is an independent evaluator held for a person when it does not pass. `validate-docs` and
 /// `test-analysis` have no creator: read-only, no PA scope, nothing executes code.
+/// One gap preset's expectation: name, is a creator plan, its authored rows, each step's skill.
+type GapCase = (
+    &'static str,
+    bool,
+    Vec<(String, String, String, String, Option<String>)>,
+    &'static [(&'static str, Option<&'static str>)],
+);
+
 #[test]
 fn catalog_gap_presets_launch_and_plan_their_steps() {
     let hif = r#"{"human_confirm_if":"verdict_not_pass"}"#;
-    let cases: [(
-        &str,
-        bool,
-        Vec<(String, String, String, String, Option<String>)>,
-        &[(&str, Option<&str>)],
-    ); 4] = [
+    let cases: [GapCase; 4] = [
         (
             "docs",
             true,
