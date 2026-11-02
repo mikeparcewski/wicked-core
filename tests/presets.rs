@@ -1576,17 +1576,18 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             assert!(!u.executes_code, "{name}: {} runs no code", u.id);
         }
         // The check depends on what it judges, exactly; the docs check also reads the scope's FILES:
-        // list, so it depends on the scope too (codex r2: only direct dependencies are injected).
+        // list and the test-plan check the recon's risk ranking, so each depends on that step too
+        // (only direct dependencies are injected).
         let check = want.last().unwrap();
         let u = units
             .iter()
             .find(|u| u.id == format!("{run}:{}", check.0))
             .unwrap();
         let prev = want[want.len() - 2].0.clone();
-        let deps = if name == "docs" {
-            vec!["scope".to_string(), prev]
-        } else {
-            vec![prev]
+        let deps = match name {
+            "docs" => vec!["scope".to_string(), prev],
+            "test-plan" => vec!["recon".to_string(), prev],
+            _ => vec![prev],
         };
         assert_eq!(u.depends_on, deps, "{name}:{}", check.0);
         for (id, skill) in skills {

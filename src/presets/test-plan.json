@@ -21,12 +21,13 @@
    "id": "check",
    "skill_ref": "wicked-garden-qe-risk-assessor",
    "depends_on": [
+    "recon",
     "plan"
    ],
    "gate": {
     "human_confirm_if": "verdict_not_pass"
    },
-   "instructions": "Phase 3/3 CHECK (independent evaluator): List EVERY change the run made, not only the committed diff: committed (git diff --name-status against the run's base), staged and unstaged (git diff --name-status HEAD; git diff --cached --name-status) and untracked (git ls-files --others --exclude-standard), including deletions and renames. The only allowed output is ONE new or updated Markdown file docs/test-plans/<kebab-case-slug>.md; FAIL on any other change (source, tests, config, other docs, deletions, renames). Then read the plan file and judge it: every claim of existing coverage verified at file:line, the high-risk behaviours not missed, every scenario has its negative case, priorities follow the risk, and each scenario names a harness the repository really has. List the gaps, most important first. PASS only when only that file changed and every claim of existing coverage holds at file:line, every scenario has its negative case and names a harness the repository has, and no high-risk behaviour is missing; anything else is a FAIL. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. Read-only: change nothing."
+   "instructions": "Phase 3/3 CHECK (independent evaluator): List EVERY change the run made, not only the committed diff: committed (git diff --name-status against the run's base), staged and unstaged (git diff --name-status HEAD; git diff --cached --name-status) and untracked (git ls-files --others --exclude-standard --exclude=/tmp/; the engine's scratch tmp/ is never an output), including deletions and renames. The only allowed output is ONE new or updated Markdown file docs/test-plans/<kebab-case-slug>.md; FAIL on any other change (source, tests, config, other docs, deletions, renames). Then read the plan file and judge it: every claim of existing coverage verified at file:line, the high-risk behaviours not missed, every scenario has its negative case, priorities follow the risk, and each scenario names a harness the repository really has. List the gaps, most important first. PASS only when only that file changed and every claim of existing coverage holds at file:line, every scenario has its negative case and names a harness the repository has, and no high-risk behaviour is missing; anything else is a FAIL. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. Read-only: change nothing."
   }
  ]
 }
