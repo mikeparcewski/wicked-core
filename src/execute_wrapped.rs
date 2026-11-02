@@ -6299,9 +6299,11 @@ pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
 /// A path as a seat container mounts it: resolved, when it exists (unix hosts; a Windows host keeps
 /// the spelling, whose resolved form is a verbatim `\\?\` path).
 fn as_seat_mounts(p: &Path) -> PathBuf {
+    // The nearest existing ancestor resolved (review r4: an unbound run's sandbox is created after
+    // the prompt is built, under a linked temp dir).
     #[cfg(unix)]
     {
-        p.canonicalize().unwrap_or_else(|_| p.to_path_buf())
+        crate::worker_sandbox::canon_lenient(p).unwrap_or_else(|| p.to_path_buf())
     }
     #[cfg(not(unix))]
     {
@@ -19504,6 +19506,15 @@ mod artifact_run_roots_tests {
         std::os::unix::fs::symlink(base.join("real"), &link).unwrap();
         let notes = link.join("tree").join("notes");
         std::fs::create_dir_all(&notes).unwrap();
+        // A tree not created yet, under the link (review r4): still named as the seat mounts it.
+        let later = codex_checks_instruction(&link.join("tree").join("later"), &notes, None);
+        assert!(
+            later.contains(&format!(
+                "working directory set to {}",
+                real.canonicalize().unwrap().join("later").display()
+            )),
+            "{later}"
+        );
         let said = codex_checks_instruction(
             &link.join("tree"),
             &link.join("tree"),
