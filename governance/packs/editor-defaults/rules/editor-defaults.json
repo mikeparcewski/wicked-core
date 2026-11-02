@@ -34,7 +34,7 @@
     {
       "id": "EDITOR-BUILTIN-PAGE-MEDIA",
       "rule_type": "policy",
-      "statement": "The first-party page editor (wicked-page) may load images and fonts from the internet, because agent-authored pages use web images today. No other editor gets network.media by default.",
+      "statement": "The first-party page editor (wicked-page) may load images and fonts from the internet, because agent-authored pages use web images today. The first-party Document has its own rule (EDITOR-BUILTIN-DOC-MEDIA); no pack editor gets network.media by default.",
       "severity": "info",
       "confidence": 1.0,
       "steering_type": "security",

@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 
 /// Dual-purpose 2KB bound: the pending-size threshold that forces an immediate flush, AND the
-/// hard cap on any single flushed `text` (enforced by [`elide`]).
+/// most any single emitted delta carries (a larger flush is split by [`pieces`]).
 pub(crate) const FLUSH_BYTES: usize = 2048;
 
 /// The most one flush may carry across its split deltas (eight of [`FLUSH_BYTES`]): a burst past
@@ -100,7 +100,7 @@ impl UnitOutputThrottle {
     }
 
     /// Final drain for `run_id`: return every non-empty pending buffer as
-    /// `(ord, attempt, elided text)` — sorted `(ord, attempt)`-ascending, each labeled with the
+    /// `(ord, attempt, text)` — each pending buffer as its [`pieces`], sorted `(ord, attempt)`-ascending, each labeled with the
     /// attempt its chunks arrived under — and drop ALL of the run's throttle state. Called by
     /// the actor when the worker's stream is over (the step result arrived) — so the live
     /// stream never loses its tail — and on cancel, where the caller discards the result.

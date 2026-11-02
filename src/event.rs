@@ -299,8 +299,10 @@ pub enum CoreEvent {
     /// A COALESCED span of a unit's live output — the throttled sibling of [`CliOutputDelta`],
     /// which never leaves the process (excluded from the durable log, too chatty to relay).
     /// Coalesced per unit at the actor's emit point (at most one flush per 500ms, or immediately
-    /// at 2KB pending; `text` capped at 2KB head+tail — see [`crate::output_throttle`]), so this
-    /// stream is cheap enough to log durably and relay off-process. `attempt` mirrors
+    /// at 2KB pending; each `text` at most 2KB: a larger flush arrives as consecutive deltas of the
+    /// same attempt, in order, and only a single flush past 16KB is head+tail elided first — see
+    /// [`crate::output_throttle`]), so this stream is cheap enough to log durably and relay
+    /// off-process. `attempt` mirrors
     /// [`UnitDispatched`]: a consumer can drop output belonging to a superseded attempt after a
     /// re-dispatch.
     UnitOutputDelta {
