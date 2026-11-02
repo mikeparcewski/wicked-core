@@ -2155,15 +2155,36 @@ fn open_state_home_around_declared(
     view: &crate::container_floor::MountView,
 ) -> Result<(), String> {
     use crate::worker_sandbox::canon_lenient;
+    // One pass per CANONICAL state home, with every spelling the fence may have used for it (review
+    // r2: two candidates naming one home must not split its rules between passes).
+    let mut groups: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
     for sh in state_homes {
-        let sh_canon = canon_lenient(sh).unwrap_or_else(|| sh.clone());
+        let c = canon_lenient(sh).unwrap_or_else(|| sh.clone());
+        match groups.iter_mut().find(|(gc, _)| *gc == c) {
+            Some((_, bases)) => {
+                if !bases.contains(sh) {
+                    bases.push(sh.clone());
+                }
+            }
+            None => {
+                let mut bases = vec![c.clone()];
+                if *sh != c {
+                    bases.push(sh.clone());
+                }
+                groups.push((c, bases));
+            }
+        }
+    }
+    for (sh_canon, bases) in &groups {
+        let sh_canon = sh_canon.clone();
+        let sh = &bases[bases.len() - 1];
         // The roots opened under this state home, as the view exposes them (canonical), with
         // whether the seat may write each.
         let mut opened: Vec<(PathBuf, bool)> = Vec::new();
         for r in declared {
             // Only a root that resolves to itself is opened (`pinned_declared_root`): a retargeted one
             // (a planted link, a renamed ancestor) keeps every rule.
-            let Some(rc) = pinned_declared_root(r) else {
+            let Some(rc) = pinned_declared_root_in(r, state_homes) else {
                 continue;
             };
             if !rc.starts_with(&sh_canon) || rc == sh_canon {
@@ -2208,7 +2229,7 @@ fn open_state_home_around_declared(
                 for sub in &chain {
                     let canon_a = under(&sh_canon, sub);
                     let mut forms: Vec<String> = Vec::new();
-                    for base in [sh.as_path(), sh_canon.as_path()] {
+                    for base in bases {
                         let a = under(base, sub);
                         let p = rule_path(&a).ok_or_else(|| unspellable(&a))?;
                         for f in [format!("{tool}({p})"), format!("{tool}({p}/**)")] {
@@ -2249,7 +2270,7 @@ fn open_state_home_around_declared(
                         // Spelled under both the state home as the fence named it and its canonical form,
                         // like the rules it replaces (review r1).
                         let rel_e = e.strip_prefix(&sh_canon).map_err(|x| x.to_string())?;
-                        for base in [sh_canon.as_path(), sh.as_path()] {
+                        for base in bases {
                             let at_base = base.join(rel_e);
                             let ep = rule_path(&at_base).ok_or_else(|| unspellable(&at_base))?;
                             for f in [format!("{tool}({ep}/**)"), format!("{tool}({ep})")] {
@@ -3826,6 +3847,13 @@ impl WrappedCliStepRunner {
                 // A governed claude unit's gate-hook read roots ride too (`GovLaunch::read_roots`,
                 // the `WICKED_READ_ROOTS` it is handed): mounted here, not late in `finalize`, so the
                 // mount view its fence is narrowed to is the container's whole mount set.
+                // (artifact-runs-fix, review r2) The run's declared WRITE roots are read roots of EVERY
+                // seat, not only a claude one (whose gate-hook env carries them): a codex or pi review
+                // must find the draft it judges mounted read-only too.
+                let homes = declared_root_state_homes(
+                    self.operational_home.as_deref(),
+                    handed.map(|s| s.root.as_path()),
+                );
                 let read_roots: Vec<PathBuf> = input
                     .governance
                     .iter()
@@ -3835,6 +3863,12 @@ impl WrappedCliStepRunner {
                         gov_env
                             .iter()
                             .flat_map(|g| g.read_roots(self.operational_home.as_deref())),
+                    )
+                    .chain(
+                        input
+                            .governance
+                            .iter()
+                            .flat_map(|g| promoted_write_roots(&g.extra_write_roots, &homes)),
                     )
                     .collect();
                 // A claude unit's gate hook runs on the host, reached through the gateway's hook
@@ -5630,15 +5664,67 @@ impl GovLaunch {
             &self.extra_read_roots,
             self.skills_root.as_deref(),
         );
-        for r in self.extra_write_roots.iter().map(PathBuf::from) {
-            if let Some(r) = pinned_declared_root(&r) {
-                if !roots.contains(&r) {
-                    roots.push(r);
-                }
+        let homes = declared_root_state_homes(operational_home, self.skills_root.as_deref());
+        for r in promoted_write_roots(&self.extra_write_roots, &homes) {
+            if !roots.contains(&r) {
+                roots.push(r);
             }
         }
         roots
     }
+}
+
+/// The run's declared write roots as READ roots of every unit, each pinned
+/// ([`pinned_declared_root_in`]): ONE list for a claude unit's gate hook (`GovLaunch::read_roots`)
+/// and for every seat container's read mounts, so no seat is left without the draft it reviews.
+pub(crate) fn promoted_write_roots(
+    extra_write_roots: &[String],
+    homes: &[PathBuf],
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for r in extra_write_roots {
+        if let Some(p) = pinned_declared_root_in(Path::new(r), homes) {
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// The state homes a declared root may be spelled under: the fence's candidates (the default
+/// `~/.wicked-crew`, the engine's operational home) and the handed snapshot's derived state home.
+pub(crate) fn declared_root_state_homes(
+    operational_home: Option<&Path>,
+    skills_root: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut homes = state_home_candidates(operational_home);
+    homes.extend(skills_root.and_then(crate::state_home::of_snapshot));
+    homes
+}
+
+/// [`pinned_declared_root`] for a root spelled under one of `state_homes` (review r2): the state
+/// home itself may be reached through a link the operator configured (`/var` → `/private/var`, a
+/// symlinked home), so only the part AT AND BELOW it must resolve to itself — that part is where a
+/// worker could plant a link. Returns the canonical root. A root under no state home must resolve to
+/// itself whole.
+pub(crate) fn pinned_declared_root_in(r: &Path, state_homes: &[PathBuf]) -> Option<PathBuf> {
+    for sh in state_homes {
+        let canon = crate::worker_sandbox::canon_lenient(sh).unwrap_or_else(|| sh.clone());
+        for base in [sh.as_path(), canon.as_path()] {
+            let Ok(rel) = r.strip_prefix(base) else {
+                continue;
+            };
+            if rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            {
+                return None;
+            }
+            return pinned_declared_root(&canon.join(rel));
+        }
+    }
+    pinned_declared_root(r)
 }
 
 /// A launch-declared root as it may be READ or opened in the fence (artifact-runs-fix, review r1): an absolute,
@@ -19225,11 +19311,17 @@ mod artifact_run_roots_tests {
             format!("Read({pa}/chats/**)"),
             format!("Edit({pa}/**)"),
         ];
+        // The root declared as the launcher spelled it: through the state home's link (review r2).
+        let declared = alias.join("interactive-drafts").join("my-doc");
+        assert_eq!(
+            pinned_declared_root_in(&declared, std::slice::from_ref(&alias)),
+            Some(run_dir.clone())
+        );
         let out = container_fence_rules(
             &rules,
             None,
             Some(&alias),
-            std::slice::from_ref(&run_dir),
+            std::slice::from_ref(&declared),
             &view,
         )
         .unwrap();
@@ -19289,6 +19381,28 @@ mod artifact_run_roots_tests {
         for kept in &rules {
             assert!(out.contains(kept), "{kept}: {out:?}");
         }
+    }
+
+    /// Review r2: every seat's container mounts the promoted roots, not only a claude seat's (whose
+    /// gate-hook env carries them) — the codex review of d5374efa is the case. One list for both.
+    #[test]
+    fn every_seat_container_mounts_the_promoted_write_roots() {
+        let (sh, _snap, run_dir, _gateway, _tmp) = state_home("seats");
+        let promoted = promoted_write_roots(
+            &[
+                run_dir.to_string_lossy().into_owned(),
+                "/no/such/root".to_string(),
+            ],
+            std::slice::from_ref(&sh),
+        );
+        assert_eq!(promoted, vec![run_dir]);
+        let src: String = include_str!("execute_wrapped.rs")
+            .split_whitespace()
+            .collect();
+        assert!(
+            src.contains(".flat_map(|g|promoted_write_roots(&g.extra_write_roots,&homes))"),
+            "the seat container's read mounts no longer take the promoted write roots"
+        );
     }
 
     /// A review unit is handed the run's declared write roots as READ roots (mounted read-only in
