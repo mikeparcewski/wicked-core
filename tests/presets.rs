@@ -1553,34 +1553,39 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             Some(creator),
             "{name}: {all:?}"
         );
-        // The WHOLE plan, nothing filtered (codex r1): an unexpected step fails here. A creator plan
-        // also carries the engine's own additions (the PA scope first, the floor's planning steps,
-        // which this rig's silent PA floors at 100); those are enumerated, never skipped.
-        let engine_added =
-            |id: &str| creator && ["pa-scope", "test_plan", "design", "architecture"].contains(&id);
-        let own: Vec<_> = all
-            .iter()
-            .filter(|row| !engine_added(&row.0))
-            .cloned()
-            .collect();
-        assert_eq!(own, want, "{name}: {all:?}");
+        // The WHOLE plan, literally (codex r1/r2): the engine's own rows of a creator plan (the PA
+        // scope first, the floor's planning rungs this rig's silent PA floors at 100) are pinned
+        // with their kind, role and gate, never filtered.
+        let mut whole = Vec::new();
+        if creator {
+            whole.push(r("pa-scope", "recon", "neutral", "auto", None));
+            whole.push(want[0].clone());
+            whole.push(r("test_plan", "test", "neutral", "auto", None));
+            whole.push(r("design", "recon", "neutral", "auto", None));
+            whole.push(r("architecture", "recon", "neutral", "auto", None));
+            whole.extend(want[1..].iter().cloned());
+        } else {
+            whole.extend(want.iter().cloned());
+        }
+        assert_eq!(all, whole, "{name}");
         for u in &units {
             assert!(u.tool_cmd.is_none(), "{name}: {} is an agent step", u.id);
             assert!(!u.executes_code, "{name}: {} runs no code", u.id);
         }
-        // The check depends on what it judges, exactly (the floor may plan steps before a creator).
-        for pair in want.windows(2).filter(|p| p[1].2 == "evaluator") {
-            let u = units
-                .iter()
-                .find(|u| u.id == format!("{run}:{}", pair[1].0))
-                .unwrap();
-            assert_eq!(
-                u.depends_on,
-                vec![pair[0].0.clone()],
-                "{name}:{}",
-                pair[1].0
-            );
-        }
+        // The check depends on what it judges, exactly; the docs check also reads the scope's FILES:
+        // list, so it depends on the scope too (codex r2: only direct dependencies are injected).
+        let check = want.last().unwrap();
+        let u = units
+            .iter()
+            .find(|u| u.id == format!("{run}:{}", check.0))
+            .unwrap();
+        let prev = want[want.len() - 2].0.clone();
+        let deps = if name == "docs" {
+            vec!["scope".to_string(), prev]
+        } else {
+            vec![prev]
+        };
+        assert_eq!(u.depends_on, deps, "{name}:{}", check.0);
         for (id, skill) in skills {
             let u = units
                 .iter()

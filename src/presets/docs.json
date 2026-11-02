@@ -19,6 +19,7 @@
    "catalog": "critique",
    "id": "check",
    "depends_on": [
+    "scope",
     "write"
    ],
    "gate": {
