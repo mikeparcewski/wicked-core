@@ -49,6 +49,23 @@
       }
     },
     {
+      "id": "EDITOR-BUILTIN-DOC-MEDIA",
+      "rule_type": "policy",
+      "statement": "The first-party document editor (wicked-doc) may load images and fonts from the internet, as the page editor may: agent-authored documents use web images too, and the shipped editor declares network.media. Its own rule, not a widening of EDITOR-BUILTIN-PAGE-MEDIA, because the boot seed is insert-only: a store seeded before this rule existed keeps the page rule and gains this one at the next boot. No pack editor gets network.media by default.",
+      "severity": "info",
+      "confidence": 1.0,
+      "steering_type": "security",
+      "applies_to": ["editor-origin:first-party"],
+      "effect": "allow",
+      "trigger": { "contains": "\"id\":\"wicked-doc\",\"permission\":\"network\\.media\"" },
+      "criteria": "the first-party document editor loads web images and fonts",
+      "provenance": {
+        "source": "filesystem",
+        "ref": "governance/packs/editor-defaults/rules/editor-defaults.json#EDITOR-BUILTIN-DOC-MEDIA",
+        "source_kinds": ["doc"]
+      }
+    },
+    {
       "id": "EDITOR-BUILTIN-THEME",
       "rule_type": "policy",
       "statement": "A first-party editor (a wicked-* id whose entry hash is the one shipped in studio's bundle) may change the theme of the artifact it opens (protocol 2 theme.set), as a new version the user can undo. A pack editor asks. This is its own rule, not a widening of EDITOR-BUILTIN, because the boot seed is insert-only: a store seeded before artifact.theme existed keeps its EDITOR-BUILTIN and gains this rule at the next boot.",

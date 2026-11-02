@@ -2600,11 +2600,12 @@ pub(crate) fn run(
                         chunk,
                     },
                 );
-                if let Some(text) = flushed {
+                // A flush larger than one delta is emitted as consecutive deltas, in order.
+                for text in flushed {
                     emit(
                         &mut subscribers,
                         CoreEvent::UnitOutputDelta {
-                            session: run_id,
+                            session: run_id.clone(),
                             ord,
                             attempt,
                             text,
@@ -27175,7 +27176,7 @@ mod live_output_stream_tests {
         // 1. A unit's FIRST chunk streams immediately (no startup delay), verbatim.
         send(0, "first chunk".into());
         // 2. An over-cap chunk flushes on the SIZE boundary (2KB pending forces a flush NOW,
-        //    even inside the 500ms window) and the emitted text is capped by the head+tail elide.
+        //    even inside the 500ms window), emitted WHOLE as consecutive ≤2KB deltas.
         send(0, "z".repeat(5000));
         // 3. A RE-DISPATCHED attempt's first chunk: a fresh `(run, ord, attempt)` buffer — flushes
         //    immediately, labeled with ITS in-band attempt, never merged with attempt 0's buffer.
@@ -27237,27 +27238,32 @@ mod live_output_stream_tests {
             .collect();
         assert_eq!(
             unit_outputs.len(),
-            4,
-            "four flushes: first-chunk, size-boundary, rework first-chunk, the tail — got {unit_outputs:?}"
+            6,
+            "first-chunk, the size-boundary flush as three ≤2KB deltas, rework first-chunk, the \
+             tail — got {unit_outputs:?}"
         );
         // (1) first chunk, verbatim, immediately, labeled with its in-band attempt.
         assert_eq!(unit_outputs[0], ("live-run", 3, 0, "first chunk"));
-        // (2) size-boundary flush, capped by the head+tail elide, still attempt 0.
-        let (_, _, attempt, text) = unit_outputs[1];
-        assert_eq!(attempt, 0, "the size flush carries the chunk's attempt");
-        assert!(
-            text.len() <= crate::output_throttle::FLUSH_BYTES,
-            "flushed text is capped at 2KB, got {} bytes",
-            text.len()
-        );
-        assert!(
-            text.contains("bytes elided"),
-            "over-cap text is head+tail elided"
+        // (2) size-boundary flush, every delta capped at 2KB, still attempt 0, and nothing of the
+        //     5000 bytes elided (artifact-runs-fix: the live view carries the whole text).
+        let size_flush: Vec<&str> = unit_outputs[1..4].iter().map(|(_, _, _, t)| *t).collect();
+        for (_, _, attempt, text) in &unit_outputs[1..4] {
+            assert_eq!(*attempt, 0, "the size flush carries the chunk's attempt");
+            assert!(
+                text.len() <= crate::output_throttle::FLUSH_BYTES,
+                "each delta is capped at 2KB, got {} bytes",
+                text.len()
+            );
+        }
+        assert_eq!(
+            size_flush.concat(),
+            "z".repeat(5000),
+            "the whole flush streams"
         );
         // (3) the re-dispatched attempt's first chunk: its own buffer, its own label — attempt 0's
         //     pending text did not leak into it.
         assert_eq!(
-            unit_outputs[2],
+            unit_outputs[4],
             ("live-run", 3, 1, "rework output"),
             "a bumped attempt streams under its own in-band label, unmerged"
         );
@@ -27265,7 +27271,7 @@ mod live_output_stream_tests {
         //     attempt (7) — whether the window or the ApplyStepResult drain flushed it. This is the
         //     mislabeling fix: a superseded attempt's late output keeps its own attempt.
         assert_eq!(
-            unit_outputs[3],
+            unit_outputs[5],
             ("live-run", 3, 0, "the tail"),
             "the pending tail keeps its chunk's attempt, never the result's"
         );
@@ -27284,7 +27290,7 @@ mod live_output_stream_tests {
         );
         assert!(
             raw.iter().any(|c| c.len() == 5000),
-            "the raw stream is NOT capped — only the throttled stream elides"
+            "the raw stream is NOT split — only the throttled stream is"
         );
     }
 }

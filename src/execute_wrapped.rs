@@ -2076,6 +2076,7 @@ pub(crate) fn container_fence_rules(
     rules: &[String],
     skills_root: Option<&Path>,
     operational_home: Option<&Path>,
+    declared: &[PathBuf],
     view: &crate::container_floor::MountView,
 ) -> Result<Vec<String>, String> {
     let mut state_homes = state_home_candidates(operational_home);
@@ -2123,7 +2124,140 @@ pub(crate) fn container_fence_rules(
         );
         out.splice(at..at, instead);
     }
+    open_state_home_around_declared(&mut out, &state_homes, declared, view)?;
     Ok(out)
+}
+
+/// (artifact-runs-fix, rig runs 2e6059da / 968e8c7c) The state-home rules opened around the RUN'S
+/// OWN declared roots inside a seat container. crew drafts a document into
+/// `<state home>/interactive-drafts/<doc>`, declared as the run's extra write root; the state-home
+/// registry denies `interactive-drafts` for Read and the whole home for Edit, and Claude's deny
+/// beats any allow, so the claude creator could not write its deliverable and the claude reviewer
+/// could not read it.
+///
+/// For every launch-declared root `R` (`declared`: the run's `extra_write_roots` and
+/// `extra_read_roots`, validated at launch) strictly under a state home and exposed by a mount in
+/// `view`: each `Read(A)` / `Read(A/**)` rule over an ancestor `A` of `R` (from the state home down
+/// to `R`) is replaced by denies of the OTHER mounted entries under `A`
+/// ([`crate::container_floor::entries_around`]), and each `Edit` rule likewise, only when `R` is
+/// seat-writable in the view (a read-only reviewer gets no Edit). A rule the walk cannot narrow
+/// (a mount at or above `A`, or one on the way to `R` outside every opened root) stays. A root
+/// that is the state home itself, or above it, opens nothing. Inside the container nothing of the
+/// state home exists but what is mounted, so every other entry keeps a rule by name. The host floor
+/// is never narrowed here.
+fn open_state_home_around_declared(
+    out: &mut Vec<String>,
+    state_homes: &[PathBuf],
+    declared: &[PathBuf],
+    view: &crate::container_floor::MountView,
+) -> Result<(), String> {
+    use crate::worker_sandbox::canon_lenient;
+    for sh in state_homes {
+        let sh_canon = canon_lenient(sh).unwrap_or_else(|| sh.clone());
+        // The roots opened under this state home, as the view exposes them (canonical), with
+        // whether the seat may write each.
+        let mut opened: Vec<(PathBuf, bool)> = Vec::new();
+        for r in declared {
+            let rc = canon_lenient(r).unwrap_or_else(|| r.clone());
+            if !rc.starts_with(&sh_canon) || rc == sh_canon {
+                continue;
+            }
+            if let Some((_, rw)) = view.roots.iter().find(|(p, _)| *p == rc) {
+                if !opened.iter().any(|(p, _)| *p == rc) {
+                    opened.push((rc, *rw));
+                }
+            }
+        }
+        for (root, rw) in opened.clone() {
+            let rel = root
+                .strip_prefix(&sh_canon)
+                .map_err(|e| e.to_string())?
+                .to_path_buf();
+            // Every ancestor from the state home down to the root itself, spelled under both the
+            // state home as the fence named it and its canonical form (a rule is a string).
+            let mut chain: Vec<PathBuf> = vec![PathBuf::new()];
+            let mut acc = PathBuf::new();
+            for c in rel.components() {
+                acc.push(c);
+                chain.push(acc.clone());
+            }
+            for tool in ["Read", "Edit"] {
+                if tool == "Edit" && !rw {
+                    continue;
+                }
+                let open_for_tool: Vec<PathBuf> = opened
+                    .iter()
+                    .filter(|(_, w)| tool == "Read" || *w)
+                    .map(|(p, _)| p.clone())
+                    .collect();
+                // `Path::join("")` would add a trailing separator, so the state home itself is the base.
+                let under = |base: &Path, sub: &Path| -> PathBuf {
+                    if sub.as_os_str().is_empty() {
+                        base.to_path_buf()
+                    } else {
+                        base.join(sub)
+                    }
+                };
+                for sub in &chain {
+                    let canon_a = under(&sh_canon, sub);
+                    let mut forms: Vec<String> = Vec::new();
+                    for base in [sh.as_path(), sh_canon.as_path()] {
+                        let a = under(base, sub);
+                        let p = rule_path(&a).ok_or_else(|| unspellable(&a))?;
+                        for f in [format!("{tool}({p})"), format!("{tool}({p}/**)")] {
+                            if !forms.contains(&f) {
+                                forms.push(f);
+                            }
+                        }
+                    }
+                    if !out.iter().any(|r| forms.contains(r)) {
+                        continue;
+                    }
+                    let entries = if canon_a == root {
+                        // The root itself: everything under it is the run's.
+                        Some(Vec::new())
+                    } else {
+                        crate::container_floor::entries_around(
+                            &canon_a,
+                            &open_for_tool,
+                            view,
+                            &canon_a,
+                        )
+                    };
+                    let Some(entries) = entries else {
+                        continue;
+                    };
+                    let at = out
+                        .iter()
+                        .position(|r| forms.contains(r))
+                        .unwrap_or(out.len());
+                    out.retain(|r| !forms.contains(r));
+                    let mut instead: Vec<String> = Vec::new();
+                    for e in &entries {
+                        let ep = rule_path(e).ok_or_else(|| unspellable(e))?;
+                        instead.push(format!("{tool}({ep}/**)"));
+                        if view.mounted.contains(e) {
+                            instead.push(format!("{tool}({ep})"));
+                        }
+                    }
+                    instead.retain(|r| !out.contains(r));
+                    let at = at.min(out.len());
+                    eprintln!(
+                        "[wicked-core] fence.notice the seat container mounts the run's declared \
+                         root {} under the state home {}: its {tool} rule over {} is narrowed to \
+                         {} other mounted entr{}; the host floor keeps it",
+                        root.display(),
+                        sh.display(),
+                        canon_a.display(),
+                        entries.len(),
+                        if entries.len() == 1 { "y" } else { "ies" },
+                    );
+                    out.splice(at..at, instead);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Narrow BOTH fence carriers of a claude unit armed in a seat container to the container's
@@ -2139,10 +2273,12 @@ pub(crate) fn narrow_container_fence(
     settings: Option<&Path>,
     skills_root: Option<&Path>,
     operational_home: Option<&Path>,
+    declared: &[PathBuf],
     view: &crate::container_floor::MountView,
 ) -> Result<(), String> {
-    let narrow =
-        |rules: Vec<String>| container_fence_rules(&rules, skills_root, operational_home, view);
+    let narrow = |rules: Vec<String>| {
+        container_fence_rules(&rules, skills_root, operational_home, declared, view)
+    };
     if let Some(i) = argv
         .iter()
         .position(|a| a == "--disallowedTools" && Some(a.as_str()) != prompt)
@@ -3747,12 +3883,23 @@ impl WrappedCliStepRunner {
                         // `~/.wicked/repos`) is narrowed to the other mounted entries there.
                         if is_claude {
                             let settings = plan.inputs.pinned.first().filter(|_| governed);
+                            // The run's own declared roots (its deliverable inbox), which the
+                            // state-home fence must not deny the seat (artifact-runs-fix).
+                            let declared: Vec<PathBuf> = input
+                                .governance
+                                .iter()
+                                .flat_map(|g| {
+                                    g.extra_write_roots.iter().chain(g.extra_read_roots.iter())
+                                })
+                                .map(PathBuf::from)
+                                .collect();
                             if let Err(why) = narrow_container_fence(
                                 &mut c.argv,
                                 Some(prompt.as_str()),
                                 settings.map(PathBuf::as_path),
                                 handed.map(|s| s.root.as_path()),
                                 operational_home,
+                                &declared,
                                 &c.view,
                             ) {
                                 if let Some(lease) = c.lease {
@@ -5450,13 +5597,25 @@ impl GovLaunch {
     /// env and for the seat container's read mounts (`container_floor::arm`), so the container
     /// never mounts a read root late (in `container_floor::finalize`) that its narrowed fence
     /// ([`narrow_container_fence`]) did not see.
+    ///
+    /// (artifact-runs-fix, rig runs 2e6059da / d5374efa) The run's launch-declared WRITE roots are
+    /// read roots of every unit too: they hold the run's deliverables (an interactive draft in
+    /// `<state home>/interactive-drafts/<doc>`), and the review unit that judges a deliverable must
+    /// be able to read it. A read-only unit gets them mounted read-only and its gate hook admits the
+    /// reads; what it may WRITE is unchanged (`write_posture::unit_admitted_roots`).
     fn read_roots(&self, operational_home: Option<&Path>) -> Vec<PathBuf> {
-        assemble_read_roots(
+        let mut roots = assemble_read_roots(
             self.code_graph_db.as_deref(),
             operational_home,
             &self.extra_read_roots,
             self.skills_root.as_deref(),
-        )
+        );
+        for r in self.extra_write_roots.iter().map(PathBuf::from) {
+            if !roots.contains(&r) {
+                roots.push(r);
+            }
+        }
+        roots
     }
 }
 
@@ -5989,11 +6148,21 @@ pub(crate) fn notes_root_sentence(notes_root: &str) -> String {
 /// run with its working directory set to the tree; temp, cargo's target and the npm cache already
 /// point into the scratch, and the network is on. The one write that still fails is a temp file a
 /// tool writes BESIDE the tree's own config (vite/vitest's `vite.config.*.timestamp-*.mjs`).
+///
+/// Both paths are named CANONICAL (artifact-runs-fix): a seat container mounts every host path at
+/// its resolved path, and an unbound run's tree is the per-run sandbox under the system temp dir —
+/// `/var/folders/…` on macOS, which resolves to `/private/var/folders/…`. Told the unresolved
+/// spelling, codex ran every command in a directory that does not exist in the Linux seat, and
+/// every spawn failed `No such file or directory`, `/bin/sh` included (rig runs d5374efa,
+/// b4f0f93f: 0 of 4 commands ran on each codex review).
 pub(crate) fn codex_checks_instruction(
     tree: &Path,
     scratch: &Path,
     notes_root: Option<&str>,
 ) -> String {
+    let tree = crate::worker_sandbox::canon_lenient(tree).unwrap_or_else(|| tree.to_path_buf());
+    let scratch =
+        crate::worker_sandbox::canon_lenient(scratch).unwrap_or_else(|| scratch.to_path_buf());
     let mut out = format!(
         "READ-ONLY PHASE, CHECKS RUN IN A SCRATCH: this phase declares executes_code: false. The \
          repository is at {tree} and your sandbox DENIES every write to it; your workspace is the \
@@ -6007,8 +6176,10 @@ pub(crate) fn codex_checks_instruction(
         scratch = scratch.display()
     );
     if let Some(root) = notes_root {
+        let root = crate::worker_sandbox::canon_lenient(Path::new(root))
+            .map_or_else(|| root.to_string(), |p| p.display().to_string());
         out.push(' ');
-        out.push_str(&notes_root_sentence(root));
+        out.push_str(&notes_root_sentence(&root));
     }
     out
 }
@@ -16013,8 +16184,16 @@ tail -c 1500 /work/claude.out
             &mounts,
             &[tree.clone(), clone.clone(), git.clone()],
         );
-        super::narrow_container_fence(&mut argv, Some(prompt), Some(&settings), None, None, &view)
-            .expect("narrowed");
+        super::narrow_container_fence(
+            &mut argv,
+            Some(prompt),
+            Some(&settings),
+            None,
+            None,
+            &[],
+            &view,
+        )
+        .expect("narrowed");
 
         let after = deny_of(&settings);
         let mut on_argv: Vec<String> = flag_value(&argv, "--disallowedTools")
@@ -16140,6 +16319,7 @@ tail -c 1500 /work/claude.out
             &super::deny_rules(None, None).unwrap(),
             None,
             None,
+            &[],
             &view,
         )
         .unwrap();
@@ -16300,7 +16480,7 @@ tail -c 1500 /work/claude.out
                 &mounts,
                 &[PathBuf::from(TREE), PathBuf::from("/fence/.wicked/repos/x")],
             );
-            super::narrow_container_fence(&mut argv, Some(prompt), None, None, None, &view)
+            super::narrow_container_fence(&mut argv, Some(prompt), None, None, None, &[], &view)
                 .expect("narrowed");
         }
         let rules = flag_value(&argv, "--disallowedTools").unwrap_or_default();
@@ -18768,5 +18948,211 @@ mod carried_prompt_dir_tests {
         let mut other: Vec<String> = ["x", "-p", "y"].map(String::from).to_vec();
         super::add_dir_before_setting_sources(&mut other, "/d".into());
         assert_eq!(other, ["x", "-p", "y"].map(String::from).to_vec());
+    }
+}
+
+/// (artifact-runs-fix) The run's declared roots are the run's to read — and, where the seat may
+/// write them, to write — on every carrier: the state-home fence of a claude seat in a container,
+/// the read roots every unit is handed, and the tree a codex review is told to run its commands in.
+/// Each test fails on the engine before this change (rig runs 2e6059da, 968e8c7c, d5374efa).
+#[cfg(test)]
+mod artifact_run_roots_tests {
+    use super::*;
+    use crate::container_floor::{mount_view, Mount};
+
+    /// A registry-shaped state home: the snapshot generation, a run's draft inbox and the gateway.
+    fn state_home(tag: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-arf-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let sh = base.join("state");
+        let snap = sh.join("skills").join("snapshots").join("000016");
+        let run_dir = sh.join("interactive-drafts").join("my-doc");
+        let gateway = sh.join("gateway");
+        for d in [&snap, &run_dir, &gateway] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let canon = |p: &Path| p.canonicalize().unwrap();
+        (canon(&sh), canon(&snap), canon(&run_dir), canon(&gateway))
+    }
+
+    fn registry_rules(sh: &Path) -> Vec<String> {
+        let p = rule_path(sh).unwrap();
+        vec![
+            format!("Read({p}/core.db)"),
+            format!("Read({p}/interactive-drafts)"),
+            format!("Read({p}/interactive-drafts/**)"),
+            format!("Read({p}/chats/**)"),
+            format!("Edit({p}/**)"),
+        ]
+    }
+
+    fn view_with(
+        snap: &Path,
+        run_dir: &Path,
+        gateway: &Path,
+        run_rw: bool,
+    ) -> crate::container_floor::MountView {
+        let mounts = vec![
+            Mount::Bind {
+                path: snap.to_path_buf(),
+                rw: false,
+            },
+            Mount::Bind {
+                path: run_dir.to_path_buf(),
+                rw: run_rw,
+            },
+            Mount::Bind {
+                path: gateway.to_path_buf(),
+                rw: false,
+            },
+        ];
+        mount_view(&mounts, &[run_dir.to_path_buf(), snap.to_path_buf()])
+    }
+
+    /// The claude creator (rig run 968e8c7c, unit 2) was denied the Write of its own deliverable and
+    /// the claude reviewer (2e6059da, unit 3) the Read of it: the registry denies
+    /// `interactive-drafts` and `Edit(<state home>/**)`, and Claude's deny beats any allow.
+    #[test]
+    fn a_writable_declared_root_under_the_state_home_is_opened_for_read_and_edit() {
+        let (sh, snap, run_dir, gateway) = state_home("rw");
+        let view = view_with(&snap, &run_dir, &gateway, true);
+        let rules = registry_rules(&sh);
+        let p = rule_path(&sh).unwrap();
+        let out = container_fence_rules(
+            &rules,
+            None,
+            Some(&sh),
+            std::slice::from_ref(&run_dir),
+            &view,
+        )
+        .expect("narrowed");
+        for gone in [
+            format!("Read({p}/interactive-drafts)"),
+            format!("Read({p}/interactive-drafts/**)"),
+            format!("Edit({p}/**)"),
+        ] {
+            assert!(
+                !out.contains(&gone),
+                "{gone} still denies the run its own root: {out:?}"
+            );
+        }
+        // Every other entry the container mounts there stays denied by name, and the rest of the
+        // registry is untouched.
+        for kept in [
+            format!("Read({p}/core.db)"),
+            format!("Read({p}/chats/**)"),
+            format!("Edit({p}/skills/**)"),
+            format!("Edit({p}/gateway/**)"),
+            format!("Edit({p}/gateway)"),
+        ] {
+            assert!(out.contains(&kept), "{kept} missing: {out:?}");
+        }
+        // The same rules with no declared root: nothing opens (the fence before this change).
+        let closed = container_fence_rules(&rules, None, Some(&sh), &[], &view).unwrap();
+        for still in [
+            format!("Read({p}/interactive-drafts/**)"),
+            format!("Edit({p}/**)"),
+        ] {
+            assert!(closed.contains(&still), "{still}: {closed:?}");
+        }
+    }
+
+    /// A read-only review unit reads the deliverable, and still may not edit it.
+    #[test]
+    fn a_read_only_declared_root_opens_for_read_only() {
+        let (sh, snap, run_dir, gateway) = state_home("ro");
+        let view = view_with(&snap, &run_dir, &gateway, false);
+        let p = rule_path(&sh).unwrap();
+        let out = container_fence_rules(
+            &registry_rules(&sh),
+            None,
+            Some(&sh),
+            std::slice::from_ref(&run_dir),
+            &view,
+        )
+        .unwrap();
+        assert!(
+            !out.contains(&format!("Read({p}/interactive-drafts/**)")),
+            "{out:?}"
+        );
+        assert!(
+            out.contains(&format!("Edit({p}/**)")),
+            "a reviewer gets no Edit: {out:?}"
+        );
+    }
+
+    /// A root that is the state home itself (or above it) opens nothing: fail closed.
+    #[test]
+    fn the_state_home_itself_is_never_opened() {
+        let (sh, snap, run_dir, gateway) = state_home("sh");
+        let view = view_with(&snap, &run_dir, &gateway, true);
+        let rules = registry_rules(&sh);
+        let out = container_fence_rules(
+            &rules,
+            None,
+            Some(&sh),
+            &[sh.clone(), sh.parent().unwrap().to_path_buf()],
+            &view,
+        )
+        .unwrap();
+        assert_eq!(
+            out.iter().filter(|r| rules.contains(r)).count(),
+            rules.len(),
+            "{out:?}"
+        );
+    }
+
+    /// A review unit is handed the run's declared write roots as READ roots (mounted read-only in
+    /// its container, admitted by its gate hook): the codex and claude reviewers of d5374efa and
+    /// 2e6059da could not see the draft they judged.
+    #[test]
+    fn every_unit_reads_the_runs_declared_write_roots() {
+        let gov = GovLaunch {
+            hook_token: None,
+            decisions_path: PathBuf::from("/w/gov/decisions.ndjson"),
+            db_path: "/w/state/core.db".to_string(),
+            scope: "s".to_string(),
+            phase: "unit-3".to_string(),
+            phase_id: String::new(),
+            catalog: String::new(),
+            code_graph_db: None,
+            extra_write_roots: vec!["/w/state/interactive-drafts/doc".to_string()],
+            extra_read_roots: vec!["/w/ground".to_string()],
+            skills_root: None,
+        };
+        let roots = gov.read_roots(None);
+        assert!(
+            roots.contains(&PathBuf::from("/w/state/interactive-drafts/doc")),
+            "{roots:?}"
+        );
+        assert!(roots.contains(&PathBuf::from("/w/ground")), "{roots:?}");
+    }
+
+    /// The codex review of an unbound run is told to run its commands in its tree, the per-run
+    /// sandbox under the temp dir. Named unresolved (`/var/folders/…` on macOS), that directory does
+    /// not exist in the Linux seat, where every host path is mounted at its resolved path.
+    #[cfg(unix)]
+    #[test]
+    fn the_codex_review_is_told_the_tree_as_the_seat_mounts_it() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-arf-link-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let real = base.join("real").join("tree");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(base.join("real"), &link).unwrap();
+        let said = codex_checks_instruction(&link.join("tree"), &link.join("tree"), None);
+        let canon = real.canonicalize().unwrap();
+        assert!(
+            said.contains(&format!("working directory set to {}", canon.display())),
+            "{said}"
+        );
+        assert!(!said.contains(&link.display().to_string()), "{said}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

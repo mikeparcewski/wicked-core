@@ -3579,17 +3579,31 @@ pub(crate) fn narrow_fenced_dir(
             r.display()
         ));
     }
+    let opened: Vec<PathBuf> = view.roots.iter().map(|(r, _)| r.clone()).collect();
+    Ok(entries_around(&d, &opened, view, dir))
+}
+
+/// The walk behind [`narrow_fenced_dir`], for a canonical `d` and an explicit set of `opened`
+/// roots (those strictly under `d` count): `None` keeps the rule over `d` (no opened root under it,
+/// a mount at or above it, or a mount on the way to an opened root that is not inside one);
+/// `Some(entries)` are the other mounted entries under `d` to deny by name instead. `shown` is how
+/// the fence notice names the directory.
+pub(crate) fn entries_around(
+    d: &Path,
+    opened: &[PathBuf],
+    view: &MountView,
+    shown: &Path,
+) -> Option<Vec<PathBuf>> {
+    let d = d.to_path_buf();
     if view.mounted.iter().any(|m| d.starts_with(m)) {
-        return Ok(None);
+        return None;
     }
-    let opened: Vec<&PathBuf> = view
-        .roots
+    let opened: Vec<&PathBuf> = opened
         .iter()
-        .map(|(r, _)| r)
         .filter(|r| r.starts_with(&d) && **r != d)
         .collect();
     if opened.is_empty() {
-        return Ok(None);
+        return None;
     }
     let on_the_way = |p: &Path| opened.iter().any(|r| r.starts_with(p));
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -3607,9 +3621,9 @@ pub(crate) fn narrow_fenced_dir(
                  above the unit's working roots: it exposes entries the mount plan does not name, \
                  so the blanket rule stays (the seat cannot read its tree there)",
                 m.display(),
-                dir.display()
+                shown.display()
             );
-            return Ok(None);
+            return None;
         }
         let mut p = d.clone();
         for c in m.strip_prefix(&d).into_iter().flat_map(Path::components) {
@@ -3622,7 +3636,7 @@ pub(crate) fn narrow_fenced_dir(
             }
         }
     }
-    Ok(Some(entries))
+    Some(entries)
 }
 
 /// `wicked-core seat-image build [<cli>…|all]` / `seat-image status`: build the seat images

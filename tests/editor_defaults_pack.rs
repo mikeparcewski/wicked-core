@@ -81,6 +81,16 @@ fn the_editor_defaults_pack_ingests_and_recalls_its_rules() {
             serde_json::json!(["EDITOR-BUILTIN-PAGE-MEDIA"])
         )
     );
+    // (artifact-runs-fix) The first-party Document declares network.media like the Page; its grant
+    // read `ask` and the editor said "asks for network.media" on every open.
+    assert_eq!(
+        ask("wicked-doc", "network.media", true),
+        (
+            "allow".into(),
+            serde_json::json!(["EDITOR-BUILTIN-DOC-MEDIA"])
+        )
+    );
+    assert_eq!(ask("acme-notes", "network.media", false).0, "ask");
     assert_eq!(
         ask("acme-notes", "artifact.read", false),
         ("allow".into(), serde_json::json!(["EDITOR-OPEN-DEFAULTS"]))

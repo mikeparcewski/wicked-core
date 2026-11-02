@@ -13,9 +13,12 @@
 //! - **flush at most every [`FLUSH_INTERVAL`]** — OR immediately once **[`FLUSH_BYTES`]** of text
 //!   is pending, whichever comes first (a unit's FIRST chunk also flushes immediately, so live
 //!   output starts streaming without a startup delay);
-//! - **each flushed text is capped at [`FLUSH_BYTES`]** via a head+tail elision ([`elide`]) — the
-//!   tail is kept because fatal lines come last by convention (same argument as the
-//!   `apply_step_result` denial snippet).
+//! - **each emitted text is at most [`FLUSH_BYTES`]**: a flush larger than that is SPLIT into
+//!   consecutive deltas ([`pieces`]), so the live view carries the whole text (artifact-runs-fix:
+//!   a CLI hands a whole assistant block as one chunk, and a 3 KB chat answer used to stream with
+//!   `[… N bytes elided …]` in its middle). Only a single flush over [`FLUSH_MAX_BYTES`] is
+//!   head+tail elided ([`elide_to`]) first — the tail is kept because fatal lines come last by
+//!   convention (same argument as the `apply_step_result` denial snippet).
 //!
 //! State lives on the single-writer actor thread (the actor loop owns the instance); workers only
 //! ever send raw chunks. A buffer that stops receiving chunks mid-window is drained by the actor
@@ -33,6 +36,10 @@ pub(crate) const FLUSH_INTERVAL: Duration = Duration::from_millis(500);
 /// Dual-purpose 2KB bound: the pending-size threshold that forces an immediate flush, AND the
 /// hard cap on any single flushed `text` (enforced by [`elide`]).
 pub(crate) const FLUSH_BYTES: usize = 2048;
+
+/// The most one flush may carry across its split deltas (eight of [`FLUSH_BYTES`]): a burst past
+/// it (a CLI dumping a whole file) is head+tail elided to it, so one flush stays bounded.
+pub(crate) const FLUSH_MAX_BYTES: usize = 8 * FLUSH_BYTES;
 
 /// One unit's coalescing state.
 struct Accum {
@@ -54,10 +61,11 @@ impl UnitOutputThrottle {
         Self::default()
     }
 
-    /// Append `chunk` to the `(run_id, ord, attempt)` buffer. Returns `Some(text)` — the
-    /// coalesced, elided text to emit as one `UnitOutputDelta` labeled with THIS `attempt` —
-    /// when a flush is due at `now`; `None` while the buffer is still accumulating inside the
-    /// window. Empty chunks are a no-op: they never allocate an entry (PR #279 review).
+    /// Append `chunk` to the `(run_id, ord, attempt)` buffer. Returns the coalesced text to emit
+    /// as consecutive `UnitOutputDelta`s labeled with THIS `attempt` ([`pieces`]: each at most
+    /// [`FLUSH_BYTES`], in order) when a flush is due at `now`; empty while the buffer is still
+    /// accumulating inside the window. Empty chunks are a no-op: they never allocate an entry
+    /// (PR #279 review).
     ///
     /// `now` is a parameter (not read internally) so the boundary behavior is testable with
     /// fabricated instants.
@@ -68,9 +76,9 @@ impl UnitOutputThrottle {
         attempt: u32,
         chunk: &str,
         now: Instant,
-    ) -> Option<String> {
+    ) -> Vec<String> {
         if chunk.is_empty() {
-            return None;
+            return Vec::new();
         }
         let acc = self
             .units
@@ -85,10 +93,10 @@ impl UnitOutputThrottle {
             Some(t) => now.duration_since(t) >= FLUSH_INTERVAL || acc.pending.len() >= FLUSH_BYTES,
         };
         if !due {
-            return None;
+            return Vec::new();
         }
         acc.last_flush = Some(now);
-        Some(elide(std::mem::take(&mut acc.pending)))
+        pieces(std::mem::take(&mut acc.pending))
     }
 
     /// Final drain for `run_id`: return every non-empty pending buffer as
@@ -103,7 +111,9 @@ impl UnitOutputThrottle {
                 return true;
             }
             if !acc.pending.is_empty() {
-                out.push((*ord, *attempt, elide(std::mem::take(&mut acc.pending))));
+                for piece in pieces(std::mem::take(&mut acc.pending)) {
+                    out.push((*ord, *attempt, piece));
+                }
             }
             false
         });
@@ -112,17 +122,42 @@ impl UnitOutputThrottle {
     }
 }
 
-/// Cap `text` at [`FLUSH_BYTES`] bytes. Short text passes through untouched; anything longer keeps
-/// its head and its TAIL around an elision marker (fatal lines come last by convention), always
-/// cutting on char boundaries so multi-byte text can never split into invalid UTF-8.
-pub(crate) fn elide(text: String) -> String {
+/// One flush as the deltas it is emitted in: [`elide_to`] [`FLUSH_MAX_BYTES`], then cut into
+/// consecutive pieces of at most [`FLUSH_BYTES`] on char boundaries. Their concatenation is the
+/// flush itself whenever it fits the bound — the normal case — so the live view loses nothing.
+pub(crate) fn pieces(text: String) -> Vec<String> {
+    let text = elide_to(text, FLUSH_MAX_BYTES);
     if text.len() <= FLUSH_BYTES {
+        return vec![text];
+    }
+    let mut out = Vec::new();
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let cut = if rest.len() <= FLUSH_BYTES {
+            rest.len()
+        } else {
+            match floor_char_boundary(rest, FLUSH_BYTES) {
+                0 => ceil_char_boundary(rest, 1),
+                n => n,
+            }
+        };
+        out.push(rest[..cut].to_string());
+        rest = &rest[cut..];
+    }
+    out
+}
+
+/// Cap `text` at `cap` bytes. Short text passes through untouched; anything longer keeps its head
+/// and its TAIL around an elision marker (fatal lines come last by convention), always cutting on
+/// char boundaries so multi-byte text can never split into invalid UTF-8.
+pub(crate) fn elide_to(text: String, cap: usize) -> String {
+    if text.len() <= cap {
         return text;
     }
-    // Head + tail + marker must stay under FLUSH_BYTES: 1000 + 1000 + a ~40-byte marker.
-    const KEEP: usize = 1000;
-    let head_end = floor_char_boundary(&text, KEEP);
-    let tail_start = ceil_char_boundary(&text, text.len() - KEEP);
+    // Head + tail + marker must stay under the cap: a ~40-byte marker between two halves.
+    let keep = cap.saturating_sub(64) / 2;
+    let head_end = floor_char_boundary(&text, keep);
+    let tail_start = ceil_char_boundary(&text, text.len() - keep);
     format!(
         "{}\n[… {} bytes elided …]\n{}",
         &text[..head_end],
@@ -151,13 +186,25 @@ fn ceil_char_boundary(s: &str, mut i: usize) -> usize {
 mod tests {
     use super::*;
 
+    /// One flush as the text it carries (its deltas joined); `None` = nothing due.
+    fn one(v: Vec<String>) -> Option<String> {
+        if v.is_empty() {
+            None
+        } else {
+            Some(v.concat())
+        }
+    }
+
     /// A unit's first chunk must stream immediately — a fresh buffer has never flushed, so there
     /// is no window to wait out. Otherwise every unit's live view starts half a second late.
     #[test]
     fn first_chunk_flushes_immediately() {
         let mut t = UnitOutputThrottle::new();
         let now = Instant::now();
-        assert_eq!(t.push("r", 1, 0, "hello", now).as_deref(), Some("hello"));
+        assert_eq!(
+            one(t.push("r", 1, 0, "hello", now)).as_deref(),
+            Some("hello")
+        );
     }
 
     /// Inside the window and under the size threshold, chunks accumulate silently; the flush at
@@ -166,26 +213,28 @@ mod tests {
     fn coalesces_across_the_500ms_boundary() {
         let mut t = UnitOutputThrottle::new();
         let t0 = Instant::now();
-        assert!(t.push("r", 1, 0, "a", t0).is_some(), "first chunk flushes");
+        assert!(
+            one(t.push("r", 1, 0, "a", t0)).is_some(),
+            "first chunk flushes"
+        );
         // Strictly inside the window: accumulate, no emission.
         assert_eq!(
-            t.push("r", 1, 0, "b", t0 + Duration::from_millis(100)),
+            one(t.push("r", 1, 0, "b", t0 + Duration::from_millis(100))),
             None
         );
         assert_eq!(
-            t.push("r", 1, 0, "c", t0 + Duration::from_millis(499)),
+            one(t.push("r", 1, 0, "c", t0 + Duration::from_millis(499))),
             None
         );
         // AT the boundary: the flush carries everything pending, coalesced in order.
         assert_eq!(
-            t.push("r", 1, 0, "d", t0 + Duration::from_millis(500))
-                .as_deref(),
+            one(t.push("r", 1, 0, "d", t0 + Duration::from_millis(500))).as_deref(),
             Some("bcd"),
             "the 500ms flush must carry the coalesced window, not just the last chunk"
         );
         // The window restarts from the flush: the next chunk accumulates again.
         assert_eq!(
-            t.push("r", 1, 0, "e", t0 + Duration::from_millis(600)),
+            one(t.push("r", 1, 0, "e", t0 + Duration::from_millis(600))),
             None
         );
     }
@@ -196,13 +245,51 @@ mod tests {
     fn size_threshold_flushes_inside_the_window() {
         let mut t = UnitOutputThrottle::new();
         let t0 = Instant::now();
-        assert!(t.push("r", 1, 0, "x", t0).is_some());
+        assert!(one(t.push("r", 1, 0, "x", t0)).is_some());
         let big = "y".repeat(FLUSH_BYTES + 100); // pending crosses the threshold on this push
-        let flushed = t
-            .push("r", 1, 0, &big, t0 + Duration::from_millis(1))
-            .expect("size threshold must flush even 1ms after the last flush");
-        assert!(flushed.len() <= FLUSH_BYTES, "flushed text is capped");
-        assert!(flushed.contains("bytes elided"), "over-cap text is elided");
+        let flushed = t.push("r", 1, 0, &big, t0 + Duration::from_millis(1));
+        assert!(
+            !flushed.is_empty(),
+            "size threshold must flush even 1ms after the last flush"
+        );
+        assert!(
+            flushed.iter().all(|p| p.len() <= FLUSH_BYTES),
+            "each delta is capped"
+        );
+        assert_eq!(
+            flushed.concat(),
+            big,
+            "the whole flush streams, nothing elided"
+        );
+    }
+
+    /// (artifact-runs-fix) A CLI hands a whole assistant block as ONE chunk: a 5 KB answer
+    /// streamed with `[… N bytes elided …]` in its middle, and the chat's live view showed it.
+    /// The flush is split into ≤2 KB deltas whose concatenation is the answer, multi-byte safe.
+    #[test]
+    fn a_big_chunk_streams_whole_in_bounded_deltas() {
+        let mut t = UnitOutputThrottle::new();
+        let answer = format!("START{}END", "é".repeat(2600)); // 5 KB+, two-byte chars
+        let flushed = t.push("r", 1, 0, &answer, Instant::now());
+        assert!(flushed.len() >= 3, "{} deltas", flushed.len());
+        assert!(flushed
+            .iter()
+            .all(|p| p.len() <= FLUSH_BYTES && !p.is_empty()));
+        assert_eq!(flushed.concat(), answer);
+        assert!(!flushed.concat().contains("bytes elided"));
+    }
+
+    /// Past [`FLUSH_MAX_BYTES`] one flush is bounded: head+tail elided first, then split.
+    #[test]
+    fn a_burst_past_the_bound_is_elided_then_split() {
+        let mut t = UnitOutputThrottle::new();
+        let burst = format!("HEAD{}TAIL", "z".repeat(40 * 1024));
+        let flushed = t.push("r", 1, 0, &burst, Instant::now());
+        let joined = flushed.concat();
+        assert!(joined.len() <= FLUSH_MAX_BYTES, "{}", joined.len());
+        assert!(flushed.len() <= FLUSH_MAX_BYTES / FLUSH_BYTES + 1);
+        assert!(joined.starts_with("HEAD") && joined.ends_with("TAIL"));
+        assert_eq!(joined.matches("bytes elided").count(), 1);
     }
 
     /// A re-dispatched unit (bumped attempt) gets its OWN buffer: text buffered under the
@@ -213,22 +300,24 @@ mod tests {
     fn attempts_never_share_a_buffer_and_drain_labels_each() {
         let mut t = UnitOutputThrottle::new();
         let t0 = Instant::now();
-        assert!(t.push("r", 1, 0, "old", t0).is_some());
+        assert!(one(t.push("r", 1, 0, "old", t0)).is_some());
         assert_eq!(
-            t.push("r", 1, 0, "old-tail", t0 + Duration::from_millis(1)),
+            one(t.push("r", 1, 0, "old-tail", t0 + Duration::from_millis(1))),
             None,
             "attempt 0 leaves text pending"
         );
         // The re-dispatched attempt's FIRST chunk: a fresh buffer — flushes immediately and
         // carries ONLY the new attempt's text.
         assert_eq!(
-            t.push("r", 1, 1, "new", t0 + Duration::from_millis(2))
-                .as_deref(),
+            one(t.push("r", 1, 1, "new", t0 + Duration::from_millis(2))).as_deref(),
             Some("new"),
             "a bumped attempt starts a fresh buffer — no cross-attempt merge"
         );
         // A late straggler from the superseded attempt keeps accumulating under ITS key.
-        assert_eq!(t.push("r", 1, 0, "!", t0 + Duration::from_millis(3)), None);
+        assert_eq!(
+            one(t.push("r", 1, 0, "!", t0 + Duration::from_millis(3))),
+            None
+        );
         assert_eq!(
             t.drain_run("r"),
             vec![(1, 0, "old-tail!".to_string())],
@@ -241,7 +330,7 @@ mod tests {
     #[test]
     fn empty_chunks_never_allocate_an_entry() {
         let mut t = UnitOutputThrottle::new();
-        assert_eq!(t.push("r", 1, 0, "", Instant::now()), None);
+        assert_eq!(one(t.push("r", 1, 0, "", Instant::now())), None);
         assert!(t.units.is_empty(), "an empty chunk must not allocate");
         assert!(t.drain_run("r").is_empty());
     }
@@ -251,7 +340,7 @@ mod tests {
     #[test]
     fn elide_keeps_head_and_tail_on_char_boundaries() {
         let text = format!("HEAD{}TAIL", "é".repeat(3000)); // multi-byte middle
-        let out = elide(text);
+        let out = elide_to(text, FLUSH_BYTES);
         assert!(out.len() <= FLUSH_BYTES, "capped at 2KB, got {}", out.len());
         assert!(out.starts_with("HEAD"), "head survives");
         assert!(
@@ -260,7 +349,7 @@ mod tests {
         );
         assert!(out.contains("bytes elided"));
         // Under the cap: untouched.
-        assert_eq!(elide("short".to_string()), "short");
+        assert_eq!(elide_to("short".to_string(), FLUSH_BYTES), "short");
     }
 
     /// The final drain returns the pending tail (elided, (ord, attempt)-ascending) and drops the
@@ -269,19 +358,19 @@ mod tests {
     fn drain_run_returns_the_tail_and_clears_only_that_run() {
         let mut t = UnitOutputThrottle::new();
         let t0 = Instant::now();
-        assert!(t.push("r", 1, 0, "first", t0).is_some());
+        assert!(one(t.push("r", 1, 0, "first", t0)).is_some());
         assert_eq!(
-            t.push("r", 1, 0, "tail-1", t0 + Duration::from_millis(1)),
+            one(t.push("r", 1, 0, "tail-1", t0 + Duration::from_millis(1))),
             None
         );
-        assert!(t.push("r", 2, 0, "tail-2", t0).is_some()); // unit 2: flushed, nothing pending
+        assert!(one(t.push("r", 2, 0, "tail-2", t0)).is_some()); // unit 2: flushed, nothing pending
         assert_eq!(
-            t.push("r", 2, 0, "tail-3", t0 + Duration::from_millis(1)),
+            one(t.push("r", 2, 0, "tail-3", t0 + Duration::from_millis(1))),
             None
         );
-        assert!(t.push("other", 1, 0, "keep", t0).is_some());
+        assert!(one(t.push("other", 1, 0, "keep", t0)).is_some());
         assert_eq!(
-            t.push("other", 1, 0, "kept-pending", t0 + Duration::from_millis(1)),
+            one(t.push("other", 1, 0, "kept-pending", t0 + Duration::from_millis(1))),
             None
         );
 

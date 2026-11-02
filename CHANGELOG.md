@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A review unit can read the work it reviews (rig runs 2e6059da, 968e8c7c, d5374efa, b4f0f93f).** Every interactive
+  draft, edit and chat run declares its deliverable inbox under the state home (`<state home>/interactive-drafts/<doc>`)
+  as its extra write root. Three things kept the review from it. (1) A read-only unit's container mounted only its
+  notes root, so the draft did not exist in the seat: the run's declared write roots are now READ roots of every unit
+  (mounted read-only, admitted by the gate hook; what a read-only unit may write is unchanged). (2) Claude's deny
+  fence over the state home (the registry's `Read(<sh>/interactive-drafts/**)` and the blanket `Edit(<sh>/**)`) beat
+  every allow, so the claude creator could not write its draft and the claude reviewer could not read it. In a seat
+  container the fence now opens around the run's declared roots the container mounts: Read for every such root,
+  Edit only where the seat may write it, and every other mounted entry there stays denied by name. The host floor
+  keeps its rules. (3) A codex review of an unbound run was told to run its commands in its tree spelled
+  `/var/folders/…`, which the Linux seat mounts at `/private/var/folders/…`, so every command, `/bin/sh` included,
+  failed `No such file or directory`. The instruction now names the paths as the seat mounts them.
+- **The live output stream carries the whole text.** A flush over 2 KB was head+tail elided, and a CLI hands a whole
+  assistant block as one chunk, so a 3 KB chat answer streamed with `[… N bytes elided …]` in its middle. An oversized
+  flush is now split into consecutive deltas of at most 2 KB; only a single flush past 16 KB is elided first.
+- **The first-party Document editor may load web images and fonts.** Only `wicked-page` had a rule for
+  `network.media`, so the Document's grant read `ask` and it asked on every open. New insert-only rule
+  `EDITOR-BUILTIN-DOC-MEDIA` (a store seeded before it gains it at the next boot); a pack editor still asks.
+
 - **Four new built-in workflows fill the catalog's gaps (lane wf-catalog).** Each is data over existing catalog
   entries and garden skills (`src/presets/<name>.json`), described for the picker (C2) and pinned by a launch test.
   `docs`: scope → write the Markdown docs (a `build` step, so the run delivers its pull request by default and the
