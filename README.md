@@ -9,13 +9,19 @@ __      _(_) ___| | _____  __| |       ___ ___  _ __ ___
 
 # wicked-core
 
-**The execution engine behind wicked-crew — and the concurrency-safe runtime for wicked-estate.**
+**The engine behind [wicked-crew](https://github.com/mikeparcewski/wicked-crew).** It runs jobs
+defined as data: it plans the steps, decides which agent builds and, by default, which different
+agent reviews, runs each agent in its sandbox, runs the repository's detected or configured checks,
+and records every verdict.
 
-wicked-core is the in-process composition runtime that powers [wicked-crew](https://github.com/mikeparcewski/wicked-crew):
-workflows-as-data, data-driven planning, skills-driven CLI invocation, and the governed gate ladder.
-A single-writer store actor owns the SQLite file on one thread while the agent, UI, and MCP servers
-compose through a shared command API and a live event stream — no consumer ever re-opens or races on
-the shared DB.
+In power mode the code-writing build step runs as one agent's checkpointed turns while the engine
+re-scores the diff (other required steps can run separately); a failed review or qualifying check
+failure goes back to that agent, up to three hand-off attempts in all, and problems that need the
+operator's judgment pause for them. It also builds a repository's requirements graph and measures
+real coverage against a minimum. Underneath, a single-writer store actor owns the SQLite file, so
+the daemon, the UI and the MCP servers compose through one command API and a live event stream
+without racing on the database. Not end-user-facing: wicked-crew drives it through the
+`wicked-core-ts` bindings.
 
 > **Status:** active. **v0.4.0, not published to crates.io** — four internal workspace crates are
 > marked `publish = false` (`wicked-apps-core`, `wicked-governance`, `wicked-orchestration`,
