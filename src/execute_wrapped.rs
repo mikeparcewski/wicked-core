@@ -5709,22 +5709,37 @@ pub(crate) fn declared_root_state_homes(
 /// worker could plant a link. Returns the canonical root. A root under no state home must resolve to
 /// itself whole.
 pub(crate) fn pinned_declared_root_in(r: &Path, state_homes: &[PathBuf]) -> Option<PathBuf> {
-    for sh in state_homes {
-        let canon = crate::worker_sandbox::canon_lenient(sh).unwrap_or_else(|| sh.clone());
-        for base in [sh.as_path(), canon.as_path()] {
-            let Ok(rel) = r.strip_prefix(base) else {
-                continue;
-            };
-            if rel
-                .components()
-                .any(|c| !matches!(c, std::path::Component::Normal(_)))
-            {
-                return None;
+    // Only state homes that exist anchor a spelling (review r3: a missing candidate could be a link a
+    // worker planted where it would be).
+    let homes: Vec<(&PathBuf, PathBuf)> = state_homes
+        .iter()
+        .filter_map(|sh| sh.canonicalize().ok().map(|c| (sh, c)))
+        .collect();
+    let pinned = 'found: {
+        for (sh, canon) in &homes {
+            for base in [sh.as_path(), canon.as_path()] {
+                let Ok(rel) = r.strip_prefix(base) else {
+                    continue;
+                };
+                // Strictly BELOW the state home, one plain name at a time (review r3: never the
+                // state home itself).
+                if rel.as_os_str().is_empty()
+                    || rel
+                        .components()
+                        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+                {
+                    return None;
+                }
+                break 'found pinned_declared_root(&canon.join(rel));
             }
-            return pinned_declared_root(&canon.join(rel));
         }
+        pinned_declared_root(r)
+    }?;
+    // A root that CONTAINS a state home would hand every unit the whole home (review r3).
+    if homes.iter().any(|(_, canon)| canon.starts_with(&pinned)) {
+        return None;
     }
-    pinned_declared_root(r)
+    Some(pinned)
 }
 
 /// A launch-declared root as it may be READ or opened in the fence (artifact-runs-fix, review r1): an absolute,
@@ -19396,12 +19411,28 @@ mod artifact_run_roots_tests {
             std::slice::from_ref(&sh),
         );
         assert_eq!(promoted, vec![run_dir]);
+        // The production half of the file only (review r3: the needle must not match this test).
         let src: String = include_str!("execute_wrapped.rs")
+            .split(concat!("mod artifact_run_", "roots_tests"))
+            .next()
+            .unwrap()
             .split_whitespace()
             .collect();
         assert!(
-            src.contains(".flat_map(|g|promoted_write_roots(&g.extra_write_roots,&homes))"),
+            src.contains(concat!(
+                ".flat_map(|g|promoted_write_roots(",
+                "&g.extra_write_roots,&homes))"
+            )),
             "the seat container's read mounts no longer take the promoted write roots"
+        );
+        // Never the state home itself, nor a root that contains it (review r3).
+        assert_eq!(
+            pinned_declared_root_in(&sh, std::slice::from_ref(&sh)),
+            None
+        );
+        assert_eq!(
+            pinned_declared_root_in(sh.parent().unwrap(), std::slice::from_ref(&sh)),
+            None
         );
     }
 
