@@ -1479,11 +1479,6 @@ fn analyze_launches_one_read_only_answer_unit_on_one_seat() {
     assert_eq!(u.skill_ref.as_deref(), Some("wicked-garden-search"));
 }
 
-/// Workflow-catalog gap fills: each new built-in launches and plans its own steps, in order, on
-/// existing catalog entries and garden skills. `docs` and `test-plan` are creator plans whose one
-/// creator is `produce` (never `executes_code`), so the PA rates them first (`pa-scope`) and their
-/// check is an independent evaluator held for a person when it does not pass. `validate-docs` and
-/// `test-analysis` have no creator: read-only, no PA scope, nothing executes code.
 /// One gap preset's expectation: name, is a creator plan, its authored rows, each step's skill.
 type GapCase = (
     &'static str,
@@ -1492,6 +1487,12 @@ type GapCase = (
     &'static [(&'static str, Option<&'static str>)],
 );
 
+/// Workflow-catalog gap fills: each new built-in launches and plans its own steps, in order, on
+/// existing catalog entries and garden skills. `docs` and `test-plan` write with a `build` step (it
+/// executes code, so the evidence floor applies and crew's launch defaults to delivering the PR), so
+/// the PA rates them first (`pa-scope`), the floor adds its planning rungs, review and security
+/// review, and their check is an independent evaluator held for a person when it does not pass.
+/// `validate-docs` and `test-analysis` have no creator: read-only, no PA scope, nothing executes code.
 #[test]
 fn catalog_gap_presets_launch_and_plan_their_steps() {
     let hif = r#"{"human_confirm_if":"verdict_not_pass"}"#;
