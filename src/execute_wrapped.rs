@@ -2226,7 +2226,11 @@ fn open_state_home_around_declared(
                         base.join(sub)
                     }
                 };
-                for sub in &chain {
+                // Only the rules the ENGINE spells over a state home are narrowed (Copilot on #1247):
+                // the home itself (`Edit(<sh>/**)`, a blanket `Read`) and its top-level registry
+                // entries (`Read(<sh>/<entry>/**)`). A deeper rule over the root or its ancestors is a
+                // template's own deny, and a template may add denies, never lose one.
+                for sub in chain.iter().filter(|c| c.components().count() <= 1) {
                     let canon_a = under(&sh_canon, sub);
                     let mut forms: Vec<String> = Vec::new();
                     for base in bases {
@@ -3500,6 +3504,22 @@ impl WrappedCliStepRunner {
                 &mut argv,
                 &member_view_flags(seat_cli, member_view.as_deref()),
             );
+            // (artifact-runs-fix, Copilot on #1247) …and so is the run's promoted deliverable root,
+            // which a copilot review reads outside its cwd (the mount, or the host floor's own
+            // boundary, keeps it read-only for a read-only unit).
+            if seat_cli == wicked_apps_core::spawn::SeatCli::Copilot {
+                let homes = declared_root_state_homes(
+                    self.operational_home.as_deref(),
+                    handed.map(|s| s.root.as_path()),
+                );
+                for r in input
+                    .governance
+                    .iter()
+                    .flat_map(|g| promoted_write_roots(&g.extra_write_roots, &homes))
+                {
+                    apply_seat_posture(&mut argv, &member_view_flags(seat_cli, Some(&r)));
+                }
+            }
             // core#660: the seat's own MCP off-switches, so nothing ambient loads on the carriers
             // claude's `--strict-mcp-config` does not cover — copilot's `--disable-builtin-mcps`
             // (its built-in `github-mcp-server` is a GitHub write path the remote-write fence
@@ -19463,6 +19483,42 @@ mod artifact_run_roots_tests {
             pinned_declared_root_in(sh.parent().unwrap(), std::slice::from_ref(&sh)),
             None
         );
+    }
+
+    /// Copilot on #1247: a template's own deny over the declared root (deeper than the state home's
+    /// top-level entries, so never one the engine spells) is kept; only engine-shaped rules open.
+    #[test]
+    fn a_templates_own_deny_over_the_root_is_kept() {
+        let (sh, snap, run_dir, gateway, _tmp) = state_home("tmpl");
+        let view = view_with(&snap, &run_dir, &gateway, true);
+        let p = rule_path(&sh).unwrap();
+        let mut rules = registry_rules(&sh);
+        let own = format!("Read({p}/interactive-drafts/my-doc/**)");
+        rules.push(own.clone());
+        let out = container_fence_rules(
+            &rules,
+            None,
+            Some(&sh),
+            std::slice::from_ref(&run_dir),
+            &view,
+        )
+        .unwrap();
+        assert!(out.contains(&own), "{out:?}");
+        assert!(
+            !out.contains(&format!("Read({p}/interactive-drafts/**)")),
+            "{out:?}"
+        );
+        // A copilot seat is handed the promoted root as an added directory (production wiring).
+        let src: String = include_str!("execute_wrapped.rs")
+            .split(concat!("mod artifact_run_", "roots_tests"))
+            .next()
+            .unwrap()
+            .split_whitespace()
+            .collect();
+        assert!(src.contains(concat!(
+            "apply_seat_posture(&mutargv,&member_view_flags(",
+            "seat_cli,Some(&r)));"
+        )));
     }
 
     /// A review unit is handed the run's declared write roots as READ roots (mounted read-only in
