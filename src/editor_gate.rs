@@ -402,7 +402,7 @@ mod tests {
 
     fn seeded() -> wicked_apps_core::SqliteStore {
         let mut store = open_store(Some(":memory:")).unwrap();
-        assert_eq!(seed_editor_defaults(&mut store).unwrap(), 5);
+        assert_eq!(seed_editor_defaults(&mut store).unwrap(), 6);
         store
     }
 
@@ -741,7 +741,7 @@ mod tests {
 
     #[test]
     fn a_store_seeded_before_artifact_theme_gains_its_rule_at_the_next_boot() {
-        // A store an older engine seeded holds the other four pack rules only.
+        // A store an older engine seeded holds the other pack rules only.
         let mut store = open_store(Some(":memory:")).unwrap();
         let older: Vec<_> = editor_default_rules()
             .unwrap()
@@ -749,7 +749,7 @@ mod tests {
             .filter(|r| r.id != "EDITOR-BUILTIN-THEME")
             .map(|r| r.to_node())
             .collect();
-        assert_eq!(older.len(), 4);
+        assert_eq!(older.len(), 5);
         let dynstore: &mut dyn GraphStore = &mut store;
         dynstore.upsert_nodes(&older).unwrap();
         assert!(matches!(
@@ -764,6 +764,43 @@ mod tests {
         let got = evaluate_editor_grants(&store, &req("wicked-deck", &["artifact.theme"], true), 1)
             .unwrap();
         assert_eq!(decisions(&got), vec![("artifact.theme", "allow")]);
+    }
+
+    /// (artifact-runs-fix) The first-party Document declares `network.media` (agent-authored
+    /// documents use web images), but only the Page had a rule for it, so the Document's grant read
+    /// `ask` and studio said "This editor asks for network.media" on every open. A store seeded
+    /// before the rule gains it at the next boot (insert-only); a pack editor still asks.
+    #[test]
+    fn the_first_party_document_gets_network_media_and_an_older_store_gains_the_rule() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let older: Vec<_> = editor_default_rules()
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.id != "EDITOR-BUILTIN-DOC-MEDIA")
+            .map(|r| r.to_node())
+            .collect();
+        let dynstore: &mut dyn GraphStore = &mut store;
+        dynstore.upsert_nodes(&older).unwrap();
+        assert_eq!(
+            seed_editor_defaults(&mut store).unwrap(),
+            1,
+            "only the new rule"
+        );
+        let doc = evaluate_editor_grants(&store, &req("wicked-doc", &["network.media"], true), 1)
+            .unwrap();
+        assert_eq!(decisions(&doc), vec![("network.media", "allow")]);
+        assert_eq!(
+            doc.grants[0].rule_ids,
+            vec!["EDITOR-BUILTIN-DOC-MEDIA".to_string()]
+        );
+        for (id, fp) in [
+            ("acme-notes", false),
+            ("wicked-doc", false),
+            ("wicked-deck", true),
+        ] {
+            let got = evaluate_editor_grants(&store, &req(id, &["network.media"], fp), 1).unwrap();
+            assert_eq!(decisions(&got), vec![("network.media", "ask")], "{id} {fp}");
+        }
     }
 
     #[test]

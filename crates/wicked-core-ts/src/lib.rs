@@ -5293,6 +5293,7 @@ mod tests {
             ids,
             [
                 "EDITOR-BUILTIN",
+                "EDITOR-BUILTIN-DOC-MEDIA",
                 "EDITOR-BUILTIN-PAGE-MEDIA",
                 "EDITOR-BUILTIN-THEME",
                 "EDITOR-GRANTS",

@@ -44,7 +44,8 @@ operator retired.
 |---|---|
 | `EDITOR-GRANTS` | The approvals ledger, not a decide-lane rule. Allowing a permission adds `editor:<id>@<version>#<sha256>/<permission>` to its `excludes`, using the full 64-hex sha256 of the entry file and the version. A new version or a changed hash is a different token and asks again. The engine reads it whether the rule is active or retired. |
 | `EDITOR-BUILTIN` | Allows a first-party editor its default set (every permission but `network.media`, `mcp.session` and `artifact.theme`). |
-| `EDITOR-BUILTIN-PAGE-MEDIA` | Allows `network.media` for the first-party page editor only. |
+| `EDITOR-BUILTIN-PAGE-MEDIA` | Allows `network.media` for the first-party page editor. |
+| `EDITOR-BUILTIN-DOC-MEDIA` | Allows `network.media` for the first-party document editor (its own rule: the boot seed is insert-only). No pack editor gets it by default. |
 | `EDITOR-BUILTIN-THEME` | Allows a first-party editor `artifact.theme`. A pack editor asks. |
 | `EDITOR-OPEN-DEFAULTS` | Allows every editor `artifact.read`, `selection.chip`, `checks.contribute` and `ui.fullscreen`. |
 
