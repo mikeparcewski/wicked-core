@@ -1,0 +1,18 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "analyze",
+   "skill_ref": "wicked-garden-qe",
+   "instructions": "Phase 1/2 ANALYZE (qe skill, insight action, read-only): detect the repository's test harnesses and map its tests to the code they exercise. Find (1) coverage gaps: load-bearing or often-changed code with no test (rank by risk with git churn and the code graph's hotspots and blast radius), (2) test-code smells: assertion-free or tautological tests, swallowed errors, sleeps, shared state, dead tests, (3) flake signals the ledger or CI history shows. Read with git and your file and search tools directly; do not run `python -c` or other inline-interpreter probes, and do not run the test suite (the read-only boundary refuses what writes). GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. "
+  },
+  {
+   "catalog": "critique",
+   "id": "verify",
+   "depends_on": [
+    "analyze"
+   ],
+   "instructions": "Phase 2/2 VERIFY (independent evaluator): re-check each finding yourself at file:line and drop any that does not hold. Report the confirmed findings ranked by risk, each with its evidence and the one test (or test change) that would close it, then counts per class. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`); a claim you could not ground is named as such, never asserted. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. PASS when the report holds no finding you could not confirm. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. "
+  }
+ ]
+}

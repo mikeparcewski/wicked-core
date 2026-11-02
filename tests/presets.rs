@@ -615,6 +615,18 @@ fn f_presets_survive_a_restart() {
     assert_eq!(rows("rf", &units_of(&rig.core, "rf")), my_flow_units());
 }
 
+/// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
+const NO_MAPPING_ROW: [&str; 8] = [
+    "analyze",
+    "demo",
+    "docs",
+    "editor-plugin",
+    "learn",
+    "test-analysis",
+    "test-plan",
+    "validate-docs",
+];
+
 /// The built-in `feature` preset's steps ARE C1's §11.2 mapping fixture — the preset cannot drift
 /// from the composition C1(a) pinned against today's def.
 #[test]
@@ -635,6 +647,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "capture-learnings",
             "chat",
             "demo",
+            "docs",
             "domain-extraction",
             "editor-plugin",
             "feature",
@@ -646,7 +659,10 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "migration",
             "onboarding",
             "qe-author-tests",
-            "steering-author"
+            "steering-author",
+            "test-analysis",
+            "test-plan",
+            "validate-docs"
         ]
     );
     // `demo` (M9b) replaces interactive-demo with the garden demo skill's flow instead of mapping
@@ -654,9 +670,11 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     // `editor-plugin` (X3) is a new workflow, not a migrated consumer: it has no §11.2 row either;
     // `x3_editor_plugin_*` pins its steps. `learn` (DES-learn-workflow) is new too; `learn_*` pins it.
     // `analyze` (crew#1157) is new as well; `analyze_*` pins it.
+    // The workflow-catalog gap fills (`docs`, `validate-docs`, `test-plan`, `test-analysis`) are new too;
+    // `catalog_gap_*` pins them.
     for (name, steps) in builtins
         .into_iter()
-        .filter(|(n, _)| *n != "analyze" && *n != "demo" && *n != "editor-plugin" && *n != "learn")
+        .filter(|(n, _)| !NO_MAPPING_ROW.contains(n))
     {
         let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -1459,4 +1477,154 @@ fn analyze_launches_one_read_only_answer_unit_on_one_seat() {
     assert!(!u.executes_code, "analyze is read-only");
     assert!(u.worktree_guarded);
     assert_eq!(u.skill_ref.as_deref(), Some("wicked-garden-search"));
+}
+
+/// Workflow-catalog gap fills: each new built-in launches and plans its own steps, in order, on
+/// existing catalog entries and garden skills. `docs` and `test-plan` are creator plans whose one
+/// creator is `produce` (never `executes_code`), so the PA rates them first (`pa-scope`) and their
+/// check is an independent evaluator held for a person when it does not pass. `validate-docs` and
+/// `test-analysis` have no creator: read-only, no PA scope, nothing executes code.
+/// One gap preset's expectation: name, is a creator plan, its authored rows, each step's skill.
+type GapCase = (
+    &'static str,
+    bool,
+    Vec<(String, String, String, String, Option<String>)>,
+    &'static [(&'static str, Option<&'static str>)],
+);
+
+#[test]
+fn catalog_gap_presets_launch_and_plan_their_steps() {
+    let hif = r#"{"human_confirm_if":"verdict_not_pass"}"#;
+    let cases: [GapCase; 4] = [
+        (
+            "docs",
+            true,
+            vec![
+                r("scope", "recon", "neutral", "auto", None),
+                r(
+                    "write",
+                    "build",
+                    "creator",
+                    "auto",
+                    Some(EVIDENCE_FLOOR_PIN),
+                ),
+                r("check", "review", "evaluator", hif, None),
+            ],
+            &[
+                ("scope", Some("wicked-garden-engineering")),
+                ("write", Some("wicked-garden-engineering")),
+                ("check", None),
+            ],
+        ),
+        (
+            "test-plan",
+            true,
+            vec![
+                r("recon", "recon", "neutral", "auto", None),
+                r("plan", "build", "creator", "auto", Some(EVIDENCE_FLOOR_PIN)),
+                r("check", "review", "evaluator", hif, None),
+            ],
+            &[
+                ("recon", Some("wicked-garden-qe-test-strategist")),
+                ("plan", Some("wicked-garden-qe-test-strategist")),
+                ("check", Some("wicked-garden-qe-risk-assessor")),
+            ],
+        ),
+        (
+            "validate-docs",
+            false,
+            vec![
+                r("claims", "recon", "neutral", "auto", None),
+                r("verify", "review", "evaluator", "auto", None),
+            ],
+            &[("claims", Some("wicked-garden-search")), ("verify", None)],
+        ),
+        (
+            "test-analysis",
+            false,
+            vec![
+                r("analyze", "recon", "neutral", "auto", None),
+                r("verify", "review", "evaluator", "auto", None),
+            ],
+            &[("analyze", Some("wicked-garden-qe")), ("verify", None)],
+        ),
+    ];
+    for (name, creator, want, skills) in cases {
+        let dir = tmp_dir(name);
+        let db = dir.join("estate.db").to_str().unwrap().to_string();
+        let rig = spawn(&db);
+        let run = format!("r{}", name.replace('-', ""));
+        rig.core.launch_run(spec(&run, name, None)).unwrap();
+        let units = units_of(&rig.core, &run);
+        let all = rows(&run, &units);
+        assert_eq!(
+            all.first().map(|r| r.0 == "pa-scope"),
+            Some(creator),
+            "{name}: {all:?}"
+        );
+        // The WHOLE plan, literally (codex r1/r2): the engine's own rows of a creator plan (the PA
+        // scope first, the floor's planning rungs this rig's silent PA floors at 100) are pinned
+        // with their kind, role, gate and pin, never filtered.
+        let mut whole = Vec::new();
+        if creator {
+            whole.push(r("pa-scope", "recon", "neutral", "auto", None));
+            whole.push(want[0].clone());
+            whole.push(r("test_plan", "test", "neutral", "auto", None));
+            whole.push(r("design", "recon", "neutral", "auto", None));
+            whole.push(r("architecture", "recon", "neutral", "auto", None));
+            whole.push(want[1].clone());
+            // The writer is a code-work `build` step, so the floor adds its diff-floored review and
+            // security review at this band.
+            let f = Some(EVIDENCE_FLOOR_PIN);
+            whole.push(r("review", "review", "evaluator", "auto", f));
+            whole.push(want[2].clone());
+            whole.push(r("security_review", "review", "evaluator", "auto", f));
+        } else {
+            whole.extend(want.iter().cloned());
+        }
+        assert_eq!(all, whole, "{name}");
+        // Only the creator (`build`, so the run delivers its PR by default) executes code.
+        for u in &units {
+            assert!(u.tool_cmd.is_none(), "{name}: {} is an agent step", u.id);
+            let writer = u.id.ends_with(":write") || u.id.ends_with(":plan");
+            assert_eq!(u.executes_code, writer, "{name}: {}", u.id);
+        }
+        // The check depends on what it judges, exactly; the docs check also reads the scope's FILES:
+        // list and the test-plan check the recon's risk ranking, so each depends on that step too
+        // (only direct dependencies are injected).
+        let check = want.last().unwrap();
+        let u = units
+            .iter()
+            .find(|u| u.id == format!("{run}:{}", check.0))
+            .unwrap();
+        let prev = want[want.len() - 2].0.clone();
+        let deps = match name {
+            "docs" => vec!["scope".to_string(), prev],
+            "test-plan" => vec!["recon".to_string(), prev],
+            _ => vec![prev],
+        };
+        assert_eq!(u.depends_on, deps, "{name}:{}", check.0);
+        for (id, skill) in skills {
+            let u = units
+                .iter()
+                .find(|u| u.id == format!("{run}:{id}"))
+                .unwrap_or_else(|| panic!("{name}:{id} in {all:?}"));
+            assert_eq!(u.skill_ref.as_deref(), *skill, "{name}:{id}");
+        }
+        let steps = wicked_core::builtin_presets()
+            .into_iter()
+            .find(|(n, _)| *n == name)
+            .unwrap()
+            .1;
+        let plan = wicked_core::PlanSteps {
+            steps,
+            ..Default::default()
+        };
+        assert_eq!(plan.has_creator(), creator, "{name}");
+        assert_eq!(
+            wicked_core::builtin_preset_descriptor(name).map(|d| d.use_when.len() >= 2),
+            Some(true),
+            "{name} is described for the picker"
+        );
+    }
 }

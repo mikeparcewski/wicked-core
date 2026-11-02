@@ -158,7 +158,9 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// Seeded here: `analyze` (crew#1157), `feature` (C2's acceptance), `bug` (M1), `chat` (M3), `onboarding` (M4), `migration` (M2),
 /// `capture-learnings` (M7), `steering-author` (M8), `domain-extraction` (M6), `interactive-chat`,
 /// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `learn` (DES-learn-workflow), `qe-author-tests` (M10) and `demo` (M9b,
-/// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them). Every other consumer's preset is added by its migration seam (§14 M1–M10),
+/// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them), and the
+/// workflow-catalog gap fills `docs`, `validate-docs`, `test-plan` and `test-analysis` (new workflows as
+/// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
@@ -167,6 +169,10 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
         ("demo", demo_preset()),
+        (
+            "docs",
+            interactive_preset(include_str!("presets/docs.json"), "docs"),
+        ),
         ("domain-extraction", domain_extraction_preset()),
         ("editor-plugin", editor_plugin_preset()),
         ("feature", feature_preset()),
@@ -197,6 +203,18 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("onboarding", onboarding_preset()),
         ("qe-author-tests", qe_author_tests_preset()),
         ("steering-author", steering_author_preset()),
+        (
+            "test-analysis",
+            interactive_preset(include_str!("presets/test-analysis.json"), "test-analysis"),
+        ),
+        (
+            "test-plan",
+            interactive_preset(include_str!("presets/test-plan.json"), "test-plan"),
+        ),
+        (
+            "validate-docs",
+            interactive_preset(include_str!("presets/validate-docs.json"), "validate-docs"),
+        ),
     ]
 }
 
@@ -277,6 +295,14 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             "Demo video",
             "Plan, record and review a narrated demo video of an app.",
             &["record a product demo", "show a feature working on video"],
+        ),
+        "docs" => (
+            "Write documentation",
+            "Write or update Markdown documentation in the repository from the code, with every claim checked against it.",
+            &[
+                "write a README, guide or API reference",
+                "bring docs back in line with the code",
+            ],
         ),
         "domain-extraction" => (
             "Map the domain",
@@ -372,6 +398,31 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             &[
                 "turn team practices into rules",
                 "propose rules from docs or code",
+            ],
+        ),
+        "test-analysis" => (
+            "Analyze tests",
+            "Find the risky code with no tests, weak or flaky tests and what would close each gap, changing nothing.",
+            &[
+                "where are we under-tested",
+                "audit the quality of a test suite",
+                "find flaky or empty tests",
+            ],
+        ),
+        "test-plan" => (
+            "Plan tests",
+            "Write a risk-ranked test plan for a change or an area of the code, ready to automate.",
+            &[
+                "decide what to test before building",
+                "a test strategy for a feature or release",
+            ],
+        ),
+        "validate-docs" => (
+            "Check documentation",
+            "Check every claim in your documentation against the code and report what is wrong or stale, changing nothing.",
+            &[
+                "are the docs still true",
+                "find stale commands, flags or examples",
             ],
         ),
         _ => return None,

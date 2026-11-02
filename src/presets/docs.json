@@ -1,0 +1,31 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 1/3 SCOPE (engineering skill, docs action): read the operator's ask, the code it concerns and the repository's existing documentation. Name the audience, each Markdown file you will write or update (its path: READMEs at the component root, guides under docs/guides/, API reference under docs/api/ unless the repository already keeps docs elsewhere), and for each file the claims it will make with the file:line each rests on. Note any existing doc that has drifted from the code. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files. End with the exact list of files to write or update, one path per line, under a line FILES:."
+  },
+  {
+   "catalog": "build",
+   "id": "write",
+   "skill_ref": "wicked-garden-engineering",
+   "depends_on": [
+    "scope"
+   ],
+   "instructions": "Phase 2/3 WRITE (engineering skill, docs action): write or update exactly the Markdown files the scope named, in the repository's own voice and layout. Every statement about behaviour, a command, a flag, an endpoint, a config key or a number must match the code you read; prefer a short accurate page over a long guessed one. Change documentation files only (Markdown, and images the docs reference): never edit source, tests or config. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "depends_on": [
+    "scope",
+    "write"
+   ],
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "instructions": "Phase 3/3 CHECK (independent evaluator): List EVERY change the run made, not only the committed diff: committed (git diff --name-status against the run's base), staged and unstaged (git diff --name-status HEAD; git diff --cached --name-status) and untracked (git ls-files --others --exclude-standard --exclude=/tmp/; the engine's scratch tmp/ is never an output), including deletions and renames. The allowed outputs are exactly the Markdown files the scope phase named (its output is above) and images those files reference. FAIL on any other change: a source, test or config edit, a doc outside the scope, a deletion or a rename the scope did not name, or a scoped file that was not written. Then open every allowed output and check every checkable claim in it against the code at file:line: it holds, it is wrong, it is stale, or it cannot be verified. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`). List each wrong or stale claim with the doc line and the code line that contradicts it, and each unverifiable claim with the doc line and what you looked for and where. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. PASS only when every checkable claim holds and only allowed outputs changed; an unverifiable claim is a FAIL (the docs must not assert what the code does not show). Read-only: change nothing."
+  }
+ ]
+}
