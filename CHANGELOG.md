@@ -2195,6 +2195,20 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.22** — 2026-11-03 — patch release on main 01e91b1, carrying 2 PRs since 0.15.21: #1251 and #1254.
+  - **Apps presets (#1251, DES-APPS-001 K0).** Two built-in presets with fixed plans that skip the plan gate:
+    `apps-turn` (build, then crew's `wicked-crew apps-check`, then a review on a distinct seat) and `apps-publish`
+    (`wicked-crew apps-check --publish`, then the run's QE unit, then `wicked-crew apps-produce` behind a consent
+    gate). An Apps run's contract carries `assurance.apps: {preset}`. Launch admission requires the governed container
+    floor, a broker URL, the app's registered repository and two usable seats, and refuses reduced assurance, power
+    mode, a deliver step and a user plan. A publish's QE is forced with the new `basis: 'preset'` (clients that switch
+    on `basis` see a new value): it is never re-scored or skipped, the launch's `exclude_seats` keep the turns'
+    builders off it, and produce waits for a bound QE PASS from a distinct reviewer on the tree the run holds. Every
+    unit of an Apps run is denied every registry tool (`engine:apps-no-source-tool`), and the repo-checks floor runs
+    nothing from an app repository. No binding method or `LaunchSpec` field is added.
+  - **Lockfile:** #1254 re-stamped the 0.15.21 platform lock entries.
+  - The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol are unchanged
+    since 0.15.21, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.21** — 2026-11-03 — patch release on main ca90345, carrying 5 PRs since 0.15.20: #1243, #1245, #1246,
   #1247 and #1248.
   - **Built-in workflows (#1243, #1248).** Four new presets fill the catalog's gaps: `docs` and `test-plan` (each
