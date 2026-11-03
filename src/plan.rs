@@ -312,11 +312,16 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // exit codes into the gate (`repo_checks`). Same selection rule as the evidence floor's
             // "a diff is the evidence" test, so the two floors always agree on which phase
             // verifies code.
-            unit.repo_checks_floor = phase.verified_evidence
+            unit.repo_checks_floor = (phase.verified_evidence
                 && !is_tool
                 && def.phases[..i]
                     .iter()
-                    .any(|p| p.executes_code && p.role == crate::workflow::PhaseRole::Creator);
+                    .any(|p| p.executes_code && p.role == crate::workflow::PhaseRole::Creator))
+                // (DES-APPS-001 §9.3) An Apps publish builds nothing, so no creator precedes its
+                // `qe` step; it is still the run's QE unit (the ledger root, the isolated reviewer,
+                // the attributed verdict crew's acceptance reads). It judges the publish check's
+                // evidence, not a diff, so it carries no diff floor pin.
+                || (!is_tool && crate::apps::is_publish_qe_phase(&def.id, &phase.id));
             unit
         })
         .collect()

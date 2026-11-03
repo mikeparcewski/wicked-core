@@ -616,8 +616,10 @@ fn f_presets_survive_a_restart() {
 }
 
 /// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
-const NO_MAPPING_ROW: [&str; 8] = [
+const NO_MAPPING_ROW: [&str; 10] = [
     "analyze",
+    "apps-publish",
+    "apps-turn",
     "demo",
     "docs",
     "editor-plugin",
@@ -643,6 +645,8 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
         names,
         [
             "analyze",
+            "apps-publish",
+            "apps-turn",
             "bug",
             "capture-learnings",
             "chat",
@@ -672,6 +676,8 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     // `analyze` (crew#1157) is new as well; `analyze_*` pins it.
     // The workflow-catalog gap fills (`docs`, `validate-docs`, `test-plan`, `test-analysis`) are new too;
     // `catalog_gap_*` pins them.
+    // The Apps presets (DES-APPS-001 K0) are new too; `apps::tests` and `tests/apps_presets.rs`
+    // pin them.
     for (name, steps) in builtins
         .into_iter()
         .filter(|(n, _)| !NO_MAPPING_ROW.contains(n))

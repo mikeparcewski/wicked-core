@@ -5193,6 +5193,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,

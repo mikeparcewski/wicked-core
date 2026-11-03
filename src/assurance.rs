@@ -203,6 +203,9 @@ pub const QE_SKIPPED: &str = "skipped";
 pub const QE_BASIS_PLAN: &str = "plan";
 pub const QE_BASIS_OPERATOR: &str = "operator";
 pub const QE_BASIS_DIFF: &str = "diff";
+/// (DES-APPS-001 §9.3) The decision is the PRESET's: an Apps publish forces QE acceptance, and no
+/// score, launch word or gate skip changes it ([`crate::apps::contract`]).
+pub const QE_BASIS_PRESET: &str = "preset";
 
 /// The operator's explicit word on QE acceptance at launch ([`crate::LaunchSpec::qe_acceptance`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -327,7 +330,7 @@ impl HostQeAcceptance {
 pub struct QeAcceptance {
     /// [`QE_REQUIRED`] | [`QE_WAIVED`] | [`QE_SKIPPED`].
     pub status: String,
-    /// [`QE_BASIS_PLAN`] | [`QE_BASIS_OPERATOR`] | [`QE_BASIS_DIFF`].
+    /// [`QE_BASIS_PLAN`] | [`QE_BASIS_OPERATOR`] | [`QE_BASIS_DIFF`] | [`QE_BASIS_PRESET`].
     pub basis: String,
     /// The impact score the decision read (`None` before the diff is scored, or for an operator
     /// decision).
@@ -354,6 +357,11 @@ impl QeAcceptance {
     /// The operator decided (skip or force): no score changes it.
     pub fn by_operator(&self) -> bool {
         self.basis == QE_BASIS_OPERATOR
+    }
+    /// The decision is final at launch — the operator's, or the preset's (an Apps publish): no
+    /// diff score re-decides it.
+    pub fn fixed(&self) -> bool {
+        self.by_operator() || self.basis == QE_BASIS_PRESET
     }
 }
 
@@ -385,6 +393,12 @@ pub struct RunAssurance {
         skip_serializing_if = "Vec::is_empty"
     )]
     pub floor_overrides: Vec<OperatorJudgment>,
+    /// (DES-APPS-001 §9.2-§9.3) Set when the run is an Apps turn or publish: the launch named the
+    /// built-in Apps preset. Every Apps rule keys on THIS (the container floor at dispatch, the
+    /// registry-tool ban, the refused QE skips, the publish QE backstop), never on a def id.
+    /// Absent on every other run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps: Option<crate::apps::AppsContract>,
 }
 
 impl Default for RunAssurance {
@@ -425,6 +439,7 @@ impl RunAssurance {
             required,
             qe,
             floor_overrides: Vec::new(),
+            apps: None,
         }
     }
 

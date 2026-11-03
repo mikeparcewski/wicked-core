@@ -195,14 +195,21 @@ pub(crate) fn resolve_workflow_def(
     if let Some(preset) = crate::preset::resolve(store, project_id, id)? {
         // A preset saved under an older catalog may no longer compose: refuse the launch naming
         // the preset and the step rule, never a silent fall-through to a same-named def.
-        return crate::preset::compose_preset(&preset)
-            .map(Some)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "preset `{id}` ({}) does not compose over the phase catalog: {e}",
-                    preset.scope
-                )
-            });
+        let mut def = crate::preset::compose_preset(&preset).map_err(|e| {
+            anyhow::anyhow!(
+                "preset `{id}` ({}) does not compose over the phase catalog: {e}",
+                preset.scope
+            )
+        })?;
+        // The instruments a launch of it requires, as `preset::required_instruments` reads them
+        // (a built-in's from the catalog, a saved one's as saved): the fixed Apps plans
+        // (DES-APPS-001 K0) plan from here, and their contract is built from this def.
+        def.required_instruments = if preset.created_by == crate::preset::BUILTIN_CREATED_BY {
+            crate::catalog::builtin_preset_instruments(&preset.name)
+        } else {
+            preset.required_instruments.clone()
+        };
+        return Ok(Some(def));
     }
     // The actor-owned registry (the LaunchRun path) holds the runtime-registered and per-run
     // defs; a miss is a real typo or an unregistered id, refused naming what a launch can name.
@@ -437,10 +444,17 @@ pub(crate) fn pre_distribute(
 
     // The launch bench (C5 host floor; F-EDIT-5 / F-LEARN-3 worktree), on every launch route
     // (campaign, synchronous).
-    let worktree_bench = crate::distribute::launch_benched(
-        clis,
-        repo_ref.is_some(),
-        crate::actor::in_process_governance().is_some(),
+    // (DES-APPS-001 K0) The run's Apps contract, from the preset the launch names (admission ran
+    // on every launch route before this); on a publish its builder exclusion leads the bench.
+    let apps = crate::apps::contract_for(&*store, project_id.as_deref(), workflow)?;
+    let worktree_bench = crate::apps::with_exclusion_benches(
+        apps.as_ref(),
+        &exclude_seats,
+        crate::distribute::launch_benched(
+            clis,
+            repo_ref.is_some(),
+            crate::actor::in_process_governance().is_some(),
+        ),
     );
     let mut session = AgentSession {
         intent_amendments: Vec::new(),
@@ -485,10 +499,7 @@ pub(crate) fn pre_distribute(
     // launch stub already exists carries the stub's contract forward below (the word was applied
     // there, against the def the launch named), so it is never re-judged against a later rev's def.
     if !session_already_started {
-        session.assurance = session
-            .assurance
-            .clone()
-            .with_qe_override(qe_acceptance)
+        session.assurance = crate::apps::contract(session.assurance.clone(), apps, qe_acceptance)
             .map_err(|e| anyhow::anyhow!("the launch is refused: {e}"))?;
     }
     if session_already_started {
@@ -3304,6 +3315,17 @@ fn gate_receipt(
     use crate::assurance as a;
     let mut r = a::AssuranceReceipt::for_run(run, attempt);
     r.tree = f.tree;
+    // (DES-APPS-001 §9.2, K0) An Apps review names the tree it judged: crew issues `reviewed` for
+    // exactly that tree. A review floor runs no repository checks, so no verified tree reaches it;
+    // the tree it judged is the guarded baseline it was dispatched on (an evaluator that changed
+    // it is denied by the guard and lands nothing).
+    if r.tree.is_none()
+        && run.apps.is_some()
+        && unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.worktree_guarded
+    {
+        r.tree = unit.worktree_baseline.as_ref().map(|b| b.tree.clone());
+    }
     // Who decided this attempt's disputes: the councils its team ledger recorded on findings.
     // (A member-step review's council lands on the step's review record after its gate; the
     // delivery receipt carries those — one source each, so nothing is counted twice.)

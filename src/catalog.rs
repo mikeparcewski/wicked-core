@@ -160,11 +160,20 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `learn` (DES-learn-workflow), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them), and the
 /// workflow-catalog gap fills `docs`, `validate-docs`, `test-plan` and `test-analysis` (new workflows as
-/// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row). Every other consumer's preset is added by its migration seam (§14 M1–M10),
+/// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row), and the
+/// Apps presets `apps-turn` and `apps-publish` (DES-APPS-001 K0; fixed plans, [`crate::apps`]). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("analyze", analyze_preset()),
+        (
+            crate::apps::APPS_PUBLISH,
+            apps_preset(include_str!("presets/apps-publish.json"), "apps-publish"),
+        ),
+        (
+            crate::apps::APPS_TURN,
+            apps_preset(include_str!("presets/apps-turn.json"), "apps-turn"),
+        ),
         ("bug", bug_preset()),
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
@@ -220,12 +229,22 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 
 /// (QE acceptance, operator ruling 2026-10-10) The instruments a run of a BUILT-IN preset
 /// requires, as a workflow's `required_instruments` declares them: the presets that make
-/// application changes (`feature`, `bug`, `editor-plugin`, `mcp-server`, `migration`) require `qe_acceptance` on top of the
-/// defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
+/// application changes (`feature`, `bug`, `editor-plugin`, `mcp-server`, `migration`) and the Apps
+/// publish (`apps-publish`, DES-APPS-001 §9.3) require `qe_acceptance` on top of the defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
 pub fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
+    // (DES-APPS-001 §9.2) An Apps turn has no QE unit: its instrument is the review on a seat
+    // distinct from the builder ("apps-turn requires the distinct evaluator"). A semantic judge on
+    // the review's pinned floor would need a THIRD seat (distinct from the builder and from the
+    // reviewer, the validator's author), and a turn runs on two ("with one seat, the person edits
+    // directly or adds a seat"): the judge runs when a third seat exists and is skipped, disclosed,
+    // when none does — it is not required.
+    if name == crate::apps::APPS_TURN {
+        return Some(vec![crate::assurance::DISTINCT_EVALUATOR.to_string()]);
+    }
+    // (§9.3) An Apps publish requires QE acceptance, which its launch forces.
     matches!(
         name,
-        "feature" | "bug" | "editor-plugin" | "mcp-server" | "migration"
+        "feature" | "bug" | "editor-plugin" | "mcp-server" | "migration" | "apps-publish"
     )
     .then(|| {
         [
@@ -263,6 +282,22 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
                 "how does this part of the code work",
                 "who calls this, what breaks if it changes",
                 "a cited answer without changing code",
+            ],
+        ),
+        "apps-publish" => (
+            "Publish an app",
+            "Check an app against its publish manifest, run QE on a seat that built none of it, then produce it after you consent.",
+            &[
+                "publish an app from the Apps section",
+                "produce the app's site image or embed",
+            ],
+        ),
+        "apps-turn" => (
+            "Change an app",
+            "Make one change to an app's spec and queries, check it without touching any data, and have a second seat review it.",
+            &[
+                "a chat message in the Apps builder",
+                "change an app's pages, charts or queries",
             ],
         ),
         "bug" => (
@@ -780,6 +815,20 @@ fn migration_preset() -> Vec<PlanStep> {
 /// the PA rates their RISK first (§11.3): a routine internal draft proceeds in auto mode, a
 /// high-stakes one pauses.
 fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
+    plan.steps
+}
+
+/// The Apps presets (DES-APPS-001 §9.2-§9.3, K0) as data (`src/presets/apps-turn.json`,
+/// `src/presets/apps-publish.json`). turn: build → `build` (the creator, skill `wicked-garden-apps`,
+/// `apps.json` and `queries/` only); check → `run`, crew's fixed `wicked-crew apps-check` (a Tool:
+/// no agent code runs); review → `review` (a distinct evaluator, the evidence floor and the judge).
+/// publish: check → `run` (`wicked-crew apps-check --publish`); qe → `critique` (the run's QE unit,
+/// [`crate::plan::plan_from_def`]; no diff floor, since a publish changes no tree); produce → `run`
+/// (`wicked-crew apps-produce`) behind `consent_before`. They launch as FIXED plans
+/// ([`crate::apps`]): never scoped, floor-filled or re-planned by the plan gate.
+fn apps_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)
         .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
     plan.steps

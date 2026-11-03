@@ -235,6 +235,13 @@ pub struct GovernanceContext {
     /// older peer's `DispatchedTask` still deserializes.
     #[serde(default)]
     pub human_confirm: crate::domain::HumanConfirm,
+    /// (DES-APPS-001 §5.2, K0) The Apps preset the run is (`apps-turn` | `apps-publish`), from the
+    /// session's contract (`RunAssurance::apps`), filled per unit like the fields above. `Some` ⇒
+    /// every brokered MCP call and tool listing of the unit is denied
+    /// (`mcp_gate::RULE_APPS_NO_SOURCE_TOOL`): no agent unit of an Apps run gets any registry tool.
+    /// `#[serde(default)]` so an older peer's `DispatchedTask` still deserializes (as `None`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apps: Option<String>,
 }
 
 /// How a worker step finished. P2 wires `Ok`/`Failed`; `Cancelled` lands with real subprocess kill

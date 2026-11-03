@@ -1224,6 +1224,10 @@ fn resolve_launch_plan(
             anyhow::bail!("a launch carries a plan or names a preset (`{w}`), not both — drop one")
         }
         (Some(p), None) => Ok(Some((p.clone(), None))),
+        // (DES-APPS-001 K0) An Apps preset is a FIXED plan: it never enters the plan gate (no PA
+        // scope, no floor fill, no re-plan), so a launch naming one plans from its composed def
+        // (`pipeline::resolve_workflow_def`), like a registered workflow.
+        (None, Some(w)) if crate::apps::is_apps_preset(w) => Ok(None),
         (None, Some(w)) => Ok(crate::preset::resolve(store, project_id, w)?.map(|p| {
             (
                 PlanSteps {

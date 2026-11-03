@@ -174,7 +174,8 @@ pub(crate) fn on_dispatch(
     let Some(current) = session.assurance.qe.as_ref() else {
         return Dispatched::Unchanged;
     };
-    if current.by_operator() {
+    // An operator's decision, or an Apps publish's forced one, is never re-scored.
+    if current.fixed() {
         return Dispatched::Unchanged;
     }
     if may_change_the_tree(unit) && current.status == a::QE_WAIVED {

@@ -189,6 +189,7 @@ mod tests {
             decisions_path: PathBuf::from("/nonexistent"),
             db_path: String::new(),
             estate: crate::mcp_gate::EstateScope::default(),
+            apps: None,
         }
     }
 

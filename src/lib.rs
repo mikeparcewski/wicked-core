@@ -33,6 +33,7 @@ mod actor;
 pub(crate) mod ask;
 pub use ask::{AskError, AskMulti, AskRequest, AskTicket, AskUnit};
 mod applications;
+pub mod apps;
 pub mod assumptions;
 pub mod assurance;
 mod builtin_floors;
