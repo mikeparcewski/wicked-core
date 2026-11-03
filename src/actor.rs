@@ -3387,6 +3387,11 @@ pub(crate) fn run(
                         let _ = reply.send(Err(e));
                         continue;
                     }
+                    // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units.
+                    if let Some(why) = crate::apps::reassign_refusal(&session, cli) {
+                        let _ = reply.send(Err(anyhow::anyhow!("run {run_id}: {why}")));
+                        continue;
+                    }
                 }
                 let previous_cli = cursor_unit
                     .assigned_cli
@@ -3573,7 +3578,9 @@ pub(crate) fn run(
                         // the re-route runs over a CLEARED bench (DES-L3 §4; the `:3775`
                         // precedent). Without this the lever was a no-op after a sign-in
                         // (F-RC2-007).
-                        let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
+                        // (DES-APPS-001 K0) …except a publish's builder exclusion, which no
+                        // operator lever lifts.
+                        let benched_c = crate::apps::binding_benches(&session.benched_seats);
                         let units_for_routing = units.clone();
                         let clis_keys = session.clis.clone();
                         let assurance_c = session.assurance.clone();
@@ -14229,6 +14236,16 @@ pub(crate) fn confirm_gate_as(
     }
 
     if adjudication_open {
+        // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
+        // the capped review's "land with carried items" would land it over the reviewer's FAIL.
+        if let (Some(preset), crate::workflow::HumanDecision::Approve { .. }) =
+            (crate::apps::run_preset(&session), &decision)
+        {
+            anyhow::bail!(
+                "run {run_id} is an `{preset}` run, which lands only on a passing review — \
+                 request changes (one more round) or reject"
+            );
+        }
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return land_with_carried_items(
                 store,

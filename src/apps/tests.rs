@@ -950,3 +950,128 @@ fn the_produce_consent_gate_refuses_an_approve_without_a_qe_pass() {
     )
     .expect("a bound QE PASS opens the consent gate");
 }
+
+/// The builder exclusion survives the operator's levers: an explicit reassign to an excluded seat
+/// is refused, and the `{cli: null}` re-route (which clears every other bench) keeps it.
+#[test]
+fn no_operator_reassign_seats_a_publish_on_an_excluded_builder() {
+    let apps = AppsContract {
+        preset: APPS_PUBLISH.into(),
+    };
+    let mut s = session("r-pub", apps_contract(APPS_PUBLISH));
+    let signed_out = BenchedSeat {
+        cli: "codex".into(),
+        reason: "signed out".into(),
+        source: "launcher".into(),
+        governed_only: false,
+        benched_until: None,
+        strikes: 0,
+        replaced: None,
+    };
+    s.benched_seats =
+        with_exclusion_benches(Some(&apps), &["claude".to_string()], vec![signed_out]);
+    let why = reassign_refusal(&s, "claude").expect("refused");
+    assert!(why.contains("built an Apps turn"), "{why}");
+    assert_eq!(
+        reassign_refusal(&s, "codex"),
+        None,
+        "an ordinary bench is the operator's"
+    );
+    let kept = binding_benches(&s.benched_seats);
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].cli, "claude");
+    // The re-route over that bench never seats the excluded builder.
+    let units = crate::plan::plan_from_def(&def_of(&seeded(), APPS_PUBLISH), "p", "r-pub");
+    let clis = [cli("claude"), cli("codex")];
+    let dists =
+        crate::distribute::distribute_units_on_benched(&units, &clis, "r-pub", &kept, &s.assurance)
+            .unwrap();
+    for (u, d) in units.iter().zip(dists) {
+        if u.tool_cmd.is_none() {
+            assert_ne!(d.assigned_cli, "claude", "{:?}", u.phase_id());
+        }
+    }
+}
+
+/// A turn lands only on a passing review: at the capped review's adjudication gate, the approve
+/// that would land it over the reviewer's FAIL ("land with carried items") is refused.
+#[test]
+fn an_apps_turn_never_lands_over_a_failed_review() {
+    use std::sync::mpsc::channel;
+    let mut store = open_store(Some(":memory:")).unwrap();
+    let run_id = "r-adjudicate";
+    let mut s = session(run_id, apps_contract(APPS_TURN));
+    s.unit_ix = 2;
+    let mut build = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build");
+    build.role = PhaseRole::Creator;
+    build.status = UnitStatus::Done;
+    build.assigned_cli = Some("claude".into());
+    let mut check = WorkUnit::pending(format!("{run_id}:check"), run_id, 2, "check");
+    check.tool_cmd = Some(vec!["true".into()]);
+    check.status = UnitStatus::Done;
+    let mut review = WorkUnit::pending(format!("{run_id}:review"), run_id, 3, "review");
+    review.role = PhaseRole::Evaluator;
+    review.status = UnitStatus::Rejected;
+    review.assigned_cli = Some("codex".into());
+    review.denial = Some(UnitDenial::new("evaluator", "VERDICT: FAIL"));
+    for u in [&build, &check, &review] {
+        crate::domain::put_node(&mut store, u.to_node()).unwrap();
+    }
+    let mut subs = crate::event_log::EventSink::default();
+    let (tx, _rx) = channel::<crate::command::Command>();
+    crate::actor::pause_for_human(
+        &mut store,
+        &mut subs,
+        &tx,
+        &mut s,
+        3,
+        None,
+        crate::review_context::REVIEW_ADJUDICATION_GATE,
+        "land with carried items?".into(),
+    )
+    .unwrap();
+    struct Noop;
+    impl crate::workflow::StepRunner for Noop {
+        fn run_unit(&self, i: &StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: String::new(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let runner: std::sync::Arc<dyn crate::workflow::StepRunner> = std::sync::Arc::new(Noop);
+    let mut in_flight = std::collections::HashSet::new();
+    let err = crate::actor::confirm_gate(
+        &mut store,
+        &mut subs,
+        &runner,
+        &tx,
+        &mut in_flight,
+        run_id,
+        crate::workflow::HumanDecision::Approve {
+            amend: None,
+            amend_scope: crate::workflow::AmendScope::Cursor,
+        },
+        &None,
+        &None,
+        uuid::Uuid::nil(),
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("lands only on a passing review"), "{err}");
+    assert_eq!(
+        crate::domain::get_session(&store, run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::AwaitingHuman
+    );
+}

@@ -335,6 +335,31 @@ pub(crate) fn with_exclusion_benches(
     out
 }
 
+/// The benches no operator lever lifts: a publish's builder exclusion. An operator's re-route
+/// (`{cli: null}`) runs over a cleared bench so a seat signed in since is seated again; these
+/// stay, or the re-route would seat the publish's QE on a seat that built a turn.
+pub(crate) fn binding_benches(bench: &[BenchedSeat]) -> Vec<BenchedSeat> {
+    bench
+        .iter()
+        .filter(|b| b.source == EXCLUSION_BENCH_SOURCE)
+        .cloned()
+        .collect()
+}
+
+/// Why an operator's reassign of a unit of `session` to `cli` is refused, or `None`: a publish's
+/// excluded builder seat takes no unit of it, however it is asked.
+pub(crate) fn reassign_refusal(session: &AgentSession, cli: &str) -> Option<String> {
+    // By seat key, as distribution compares benches (`distribute::eligible_seats`).
+    binding_benches(&session.benched_seats)
+        .iter()
+        .any(|b| b.cli == cli)
+        .then(|| {
+            format!(
+                "cannot reassign to '{cli}': it {EXCLUSION_BENCH_REASON} — reassign to a seat that                  built none of this app's turns, or stop the run"
+            )
+        })
+}
+
 /// The Apps preset a session's contract names, when it is an Apps run.
 pub(crate) fn run_preset(session: &AgentSession) -> Option<&str> {
     session.assurance.apps.as_ref().map(|a| a.preset.as_str())
