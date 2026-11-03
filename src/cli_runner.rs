@@ -2404,6 +2404,16 @@ enum FloorRun {
 
 /// The unit's floor plan ([`FloorPlan`]), or `None` when no floor runs for it.
 #[allow(clippy::too_many_arguments)]
+/// (core#1155) Whether this unit's attempt installs the worktree's dependencies for its seats:
+/// an agent unit of a bound run, not the pre-build scope unit — and (DES-APPS-001 K0) never a unit
+/// of an Apps run, whose repository is data: a manifest a builder planted there is never resolved
+/// or installed before crew's `apps-check` refuses it.
+fn provisions_seat_deps(input: &StepInput) -> bool {
+    !input.unit.pre_build_scope
+        && input.unit.tool_cmd.is_none()
+        && !input.governance.as_ref().is_some_and(|g| g.apps.is_some())
+}
+
 fn floor_plan(
     input: &StepInput,
     output: &StepOutput,
@@ -2679,7 +2689,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // never reads a slow install as a wedged seat. The seats are told (one context block, on the
     // input every seat below is built from).
     let with_deps: Option<StepInput> = match input.workdir.as_deref() {
-        Some(wd) if !input.unit.pre_build_scope && input.unit.tool_cmd.is_none() => {
+        Some(wd) if provisions_seat_deps(input) => {
             let git_dir = input
                 .unit
                 .worktree_baseline
@@ -6347,6 +6357,44 @@ mod tests {
             "it ran on the clean checkout of the creator's tree: {report:#?}"
         );
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (DES-APPS-001 K0, codex r2) A unit of an Apps run installs no dependencies from the app
+    /// repository; every other bound agent unit does, and the pre-build scope unit never.
+    #[test]
+    fn an_apps_unit_installs_no_dependencies() {
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "build");
+        unit.assigned_cli = Some("claude".into());
+        let mut input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(std::env::temp_dir()),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: "/abs/estate.db".into(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+                repo_id: None,
+                human_confirm: crate::domain::HumanConfirm::None,
+                apps: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        assert!(provisions_seat_deps(&input));
+        input.governance.as_mut().unwrap().apps = Some("apps-turn".into());
+        assert!(!provisions_seat_deps(&input));
+        input.governance = None;
+        input.unit.pre_build_scope = true;
+        assert!(!provisions_seat_deps(&input));
     }
 
     /// (DES-APPS-001 K0, codex r1) A unit of an Apps run runs no repository-authored check: a

@@ -162,6 +162,8 @@ struct ScriptedSeat {
     ran: Ran,
     /// Every governed input the seat was handed (what the engine put in its context).
     inputs: Inputs,
+    /// The publish QE reviewer's verdict.
+    qe_passes: bool,
 }
 impl StepRunner for ScriptedSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
@@ -191,7 +193,7 @@ impl StepRunner for ScriptedSeat {
                 output = "Changed apps.json (kpi-open) and queries/open.sql (open)".to_string();
             }
             if let (Some(root), "qe") = (input.unit.qe_ledger_root.as_deref(), phase.as_str()) {
-                output.push_str(&qe_turn(input, Path::new(root)));
+                output.push_str(&qe_turn(input, Path::new(root), self.qe_passes));
             }
             if input.unit.role == wicked_core::PhaseRole::Evaluator && input.unit.tool_cmd.is_none()
             {
@@ -220,7 +222,7 @@ impl StepRunner for ScriptedSeat {
 /// (DES-QE-EVERY-SEAT): the executor turn records its evidence under the run's ledger root and names
 /// it on a `QE-EVIDENCE:` line; the engine's isolated reviewer turn (its nonce set) records a PASS
 /// stamped with that nonce.
-fn qe_turn(input: &StepInput, root: &Path) -> String {
+fn qe_turn(input: &StepInput, root: &Path, pass: bool) -> String {
     let id = "5d1e7c2a-9b3f-4e8d-a1c6-0f2e4b6d8a9c";
     match input.unit.qe_review_session.as_deref() {
         None => {
@@ -250,7 +252,8 @@ fn qe_turn(input: &StepInput, root: &Path) -> String {
                 serde_json::json!({
                     "id": "v-review", "created_at": iso_now(),
                     "run_id": id,
-                    "verdict": "PASS", "crew_run_id": input.run_id,
+                    "verdict": if pass { "PASS" } else { "FAIL" },
+                    "crew_run_id": input.run_id,
                     "review_session": nonce,
                 })
                 .to_string(),
@@ -352,6 +355,15 @@ fn core_with(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Strin
 }
 
 fn core_full(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Inputs, String) {
+    core_rig(name, build, review_passes, true)
+}
+
+fn core_rig(
+    name: &str,
+    build: Build,
+    review_passes: bool,
+    qe_passes: bool,
+) -> (Core, Ran, Inputs, String) {
     install_crew_stub();
     let dir = std::env::temp_dir().join(format!(
         "wicked-core-apps-db-{name}-{}-{:?}",
@@ -370,6 +382,7 @@ fn core_full(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Input
             review_passes,
             ran: ran.clone(),
             inputs: inputs.clone(),
+            qe_passes,
         }),
     );
     let repo = app_repo(name);
@@ -757,5 +770,72 @@ fn a_publish_produces_once_after_a_bound_qe_pass_and_takes_no_skip() {
         .filter(|l| l.contains("argv=apps-produce"))
         .count();
     assert_eq!(produced, 1, "{}", crew_log("r-publish"));
+    let _ = std::fs::remove_dir_all(&evidence);
+}
+
+/// codex r2: no operator lever moves a publish's QE onto a seat that built a turn. The QE reviewer
+/// fails the publish, which parks at the QE unit's gate; a reassign there to an excluded builder
+/// seat (benched, in the roster) or to an excluded seat outside the roster is refused, the QE skip
+/// is refused, and produce never runs.
+#[test]
+fn a_parked_publish_takes_no_reassign_to_a_builder_seat() {
+    let (core, ran, _inputs, repo) = core_rig("parked", Build::SafeQuery, true, false);
+    let evidence = std::env::temp_dir().join(format!(
+        "wicked-core-apps-parked-evidence-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&evidence);
+    std::fs::create_dir_all(&evidence).unwrap();
+    let mut s = spec(
+        "r-parked",
+        "apps-publish",
+        &repo,
+        &["claude", "codex", "pi"],
+    );
+    s.exclude_seats = vec!["claude".into(), "opencode".into()];
+    s.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    core.launch_run(s).expect("launch");
+    assert!(wait_status(&core, "r-parked", SessionStatus::AwaitingHuman));
+    let v = view(&core, "r-parked");
+    let qe = v
+        .units
+        .iter()
+        .find(|u| u.phase_id() == Some("qe"))
+        .expect("the QE unit");
+    assert_eq!(
+        v.session.unit_ix, 1,
+        "parked at the QE unit: {:?}",
+        v.session
+    );
+    for seat in ["claude", "opencode"] {
+        let err = core
+            .reassign_unit("r-parked", qe.ord, Some(seat.into()))
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("built an Apps turn"),
+            "{seat}: {err:#}"
+        );
+    }
+    let still = view(&core, "r-parked");
+    let qe_now = still
+        .units
+        .iter()
+        .find(|u| u.phase_id() == Some("qe"))
+        .unwrap();
+    assert_eq!(qe_now.assigned_cli, qe.assigned_cli, "nothing moved");
+    let err = core
+        .confirm_gate(
+            "r-parked",
+            HumanDecision::SkipQe {
+                reason: "demo".into(),
+            },
+        )
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("cannot be skipped"), "{err:#}");
+    for (phase, seat) in ran.lock().unwrap().iter() {
+        assert_ne!(seat, "claude", "{phase} ran on a builder seat");
+    }
+    assert!(!crew_log("r-parked").contains("apps-produce"));
     let _ = std::fs::remove_dir_all(&evidence);
 }

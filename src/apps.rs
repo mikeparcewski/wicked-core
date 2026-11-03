@@ -436,16 +436,24 @@ pub(crate) fn binding_benches(bench: &[BenchedSeat]) -> Vec<BenchedSeat> {
 /// Why an operator's reassign of a unit of `session` to `cli` is refused, or `None`: a publish's
 /// excluded builder seat takes no unit of it, however it is asked.
 pub(crate) fn reassign_refusal(session: &AgentSession, cli: &str) -> Option<String> {
-    // By seat key, as distribution compares benches (`distribute::eligible_seats`).
-    binding_benches(&session.benched_seats)
-        .iter()
-        .any(|b| b.cli == cli)
-        .then(|| {
-            format!(
-                "seat '{cli}' {EXCLUSION_BENCH_REASON}, so no unit of this publish runs there — \
+    // The benches (by seat key, as distribution compares them) and the launch's own exclusion list
+    // (a seat outside the launch roster, or an instance of an excluded CLI added since, has no
+    // bench): the QE reviewer's matching rule, an exact seat or every instance of a CLI.
+    let launch_excluded = is_publish(session)
+        && session
+            .exclude_seats
+            .iter()
+            .any(|e| e == cli || e == crate::team::runner::seat_key(cli));
+    (launch_excluded
+        || binding_benches(&session.benched_seats)
+            .iter()
+            .any(|b| b.cli == cli))
+    .then(|| {
+        format!(
+            "seat '{cli}' {EXCLUSION_BENCH_REASON}, so no unit of this publish runs there — \
                  reassign to a seat that built none of this app's turns, or stop the run"
-            )
-        })
+        )
+    })
 }
 
 /// The Apps preset a session's contract names, when it is an Apps run.

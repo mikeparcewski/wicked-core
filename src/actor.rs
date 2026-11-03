@@ -9436,6 +9436,10 @@ fn reseat_parked_unit(
         );
     }
     refuse_author_reassign(session, &units, session.unit_ix, cli)?;
+    // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units, parked or not.
+    if let Some(why) = crate::apps::reassign_refusal(session, cli) {
+        anyhow::bail!("run {run_id}: {why}");
+    }
     let previous_cli = unit
         .assigned_cli
         .clone()
@@ -11350,10 +11354,21 @@ fn dispatch_unit(
         in_process_governance().is_some(),
         || current_worktree_tree(&*store, &session),
     ) {
-        anyhow::bail!(
+        // Failed explicitly, whichever path dispatched (an approve already resolved its gate): a
+        // refused Apps unit never leaves its run executing with no worker.
+        let why = format!(
             "unit {} of run {run_id} is refused: {why}",
             dispatched_unit.ord
         );
+        fail_run_by_id(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            run_id,
+            anyhow::anyhow!("{why}"),
+        );
+        anyhow::bail!(why);
     }
     let input = StepInput {
         run_id: run_id.to_string(),
@@ -13843,6 +13858,19 @@ pub(crate) fn confirm_gate_as(
         let units = crate::domain::session_units(store, run_id)?;
         let cursor = units.get(session.unit_ix);
         let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+        // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
+        // the capped review's "land with carried items" would land it over the reviewer's FAIL.
+        // Refused here, so the adjudication gate stays open for request changes or reject.
+        if let (true, Some(preset), crate::workflow::HumanDecision::Approve { .. }) = (
+            adjudication_open,
+            crate::apps::run_preset(&session),
+            &decision,
+        ) {
+            anyhow::bail!(
+                "run {run_id} is an `{preset}` run, which lands only on a passing review — \
+                 request changes (one more round) or reject"
+            );
+        }
         // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
         // refused here, before the row resolves and before its `gate.decided` is published, when
         // there is no creator to rerun (a member-step dispute reworks the member instead).
@@ -14259,16 +14287,6 @@ pub(crate) fn confirm_gate_as(
     }
 
     if adjudication_open {
-        // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
-        // the capped review's "land with carried items" would land it over the reviewer's FAIL.
-        if let (Some(preset), crate::workflow::HumanDecision::Approve { .. }) =
-            (crate::apps::run_preset(&session), &decision)
-        {
-            anyhow::bail!(
-                "run {run_id} is an `{preset}` run, which lands only on a passing review — \
-                 request changes (one more round) or reject"
-            );
-        }
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
             return land_with_carried_items(
                 store,
@@ -14844,7 +14862,7 @@ fn floor_fix_request(
 }
 
 /// The gate kind `escalate_denied_unit` opens for a denied unit.
-const ESCALATION_GATE_KIND: &str = "escalation";
+pub(crate) const ESCALATION_GATE_KIND: &str = "escalation";
 
 /// Arm ONE re-run of the cursor unit's floor for its next attempt (`RepoChecksReport::recheck`):
 /// the operator retried an escalated unit whose last floor FAILED on a known tree. Without it the
@@ -15205,6 +15223,8 @@ pub(crate) fn approve_is_operator_judgment(
     u: &crate::domain::WorkUnit,
 ) -> bool {
     let publish = crate::apps::is_publish(session);
+    // (A semantic judge that could not rule stays the operator's to judge on a publish too: the
+    // QE unit then counts, and produce still waits on the bound QE PASS, `apps::dispatch_refusal`.)
     u.status == crate::domain::UnitStatus::Rejected
         && u.denial.as_ref().is_some_and(|d| {
             d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE

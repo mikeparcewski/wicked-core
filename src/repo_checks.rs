@@ -7011,8 +7011,6 @@ impl FloorCheckout {
     }
 }
 
-/// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
-/// ran, and the floor does not pass.
 /// (DES-APPS-001 K0) The floor's report for a unit of an Apps run: nothing ran, by design. An app
 /// repository holds data (`apps.json`, `queries/`), checked by crew's fixed `apps-check`; a manifest
 /// a builder planted there would otherwise be run by this floor before that check refuses it.
@@ -7049,6 +7047,8 @@ pub(crate) fn apps_repository_report(worktree: &Path) -> RepoChecksReport {
     }
 }
 
+/// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
+/// ran, and the floor does not pass.
 pub(crate) fn guarded_checkout_refused(
     worktree: &Path,
     ctx: &FloorContext,

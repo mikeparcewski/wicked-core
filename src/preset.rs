@@ -131,6 +131,11 @@ impl std::fmt::Display for PresetError {
                 f,
                 "{r}: preset name `{n}` must be 1-64 characters of letters, digits, `.`, `_` or `-`"
             ),
+            PresetError::BuiltinReadonly(n) if crate::apps::is_apps_preset(n) => write!(
+                f,
+                "{r}: `{n}` is a built-in Apps preset — it cannot be deleted, overwritten or \
+                 shadowed in any scope"
+            ),
             PresetError::BuiltinReadonly(n) => write!(
                 f,
                 "{r}: `{n}` is a built-in preset — it cannot be deleted or overwritten globally; \
@@ -285,6 +290,16 @@ pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<
             .as_ref()
             .filter(|p| p.created_by != BUILTIN_CREATED_BY)
         {
+            // (DES-APPS-001 K0) An Apps name is reserved: such a row never launches as saved.
+            if crate::apps::is_apps_preset(name) {
+                eprintln!(
+                    "wicked-core: the saved global preset `{name}` (created_by `{}`) holds a \
+                     reserved Apps preset name; every launch of `{name}` is refused until it is \
+                     deleted (the built-in is seeded at the next boot after that).",
+                    saved.created_by
+                );
+                continue;
+            }
             eprintln!(
                 "wicked-core: the saved global preset `{name}` (created_by `{}`) holds a built-in \
                  preset's name; it is kept and launches as saved. Delete it to get the built-in \

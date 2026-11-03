@@ -739,9 +739,12 @@ fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
 }
 
 /// Acceptance (S5): marker strings seeded in a fixture source's rows appear in no unit's context
-/// pack. The broker hands rows only on `allow`; each unit's output becomes the next unit's prior
-/// output, exactly as the actor threads it. Under an Apps run no unit ever receives a row, so no
-/// later context holds one; the control run shows the harness would catch it.
+/// pack. The engine's only path for source rows into an Apps seat is a brokered tool call: the
+/// broker hands rows only on `allow`, and each unit's output becomes the next unit's prior output,
+/// as the actor threads it. Under an Apps run no unit ever receives a row, so no later context
+/// holds one; the control run shows the harness would catch it. (That the real actor stamps the ban
+/// on every dispatched input, QE reviewer turn included, is `tests/apps_presets.rs`; the check
+/// Tool's own output is crew's contract: codes and identifiers only, DES §5.2.)
 #[test]
 fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
     const MARKERS: [&str; 3] = [
@@ -1132,6 +1135,12 @@ fn no_operator_reassign_seats_a_publish_on_an_excluded_builder() {
         None,
         "an ordinary bench is the operator's"
     );
+    // codex r2: the launch's own list binds too — a seat outside the roster (no bench) and an
+    // instance of an excluded CLI added since.
+    s.exclude_seats = vec!["claude".into(), "opencode".into()];
+    assert!(reassign_refusal(&s, "opencode").is_some(), "off-roster");
+    assert!(reassign_refusal(&s, "claude#3").is_some(), "a new instance");
+    assert_eq!(reassign_refusal(&s, "pi"), None);
     let kept = binding_benches(&s.benched_seats);
     assert_eq!(kept.len(), 1);
     assert_eq!(kept[0].cli, "claude");
@@ -1227,6 +1236,103 @@ fn an_apps_turn_never_lands_over_a_failed_review() {
             .unwrap()
             .status,
         SessionStatus::AwaitingHuman
+    );
+    // codex r2: refused before the gate resolves — the adjudication row is still open, for request
+    // changes or reject.
+    let open = crate::interaction::list_interactions(
+        &store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )
+    .unwrap();
+    assert!(
+        open.iter().any(
+            |r| r.gate_kind.as_deref() == Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        ),
+        "{open:?}"
+    );
+}
+
+/// codex r2: the dispatch guard's wiring. An approve at a publish's QE escalation gate re-dispatches
+/// the QE unit through `dispatch_unit`; on an engine that cannot run it contained and governed (this
+/// test thread arms no input governance), the dispatch is refused and the run FAILS with the reason
+/// — never left executing with no worker.
+#[test]
+fn a_refused_apps_dispatch_fails_the_run() {
+    use std::sync::mpsc::channel;
+    let _env = crate::test_env::ENV_LOCK.read();
+    let mut store = open_store(Some(":memory:")).unwrap();
+    let run_id = "r-refused";
+    let mut s = session(run_id, apps_contract(APPS_PUBLISH));
+    s.unit_ix = 1;
+    let mut check = WorkUnit::pending(format!("{run_id}:check"), run_id, 1, "check");
+    check.tool_cmd = Some(vec!["true".into()]);
+    check.status = UnitStatus::Done;
+    let mut qe = qe_denied_unit(run_id, s.assurance.qe.clone());
+    qe.assigned_cli = Some("codex".into());
+    qe.last_attempt = Some(0);
+    let mut produce = WorkUnit::pending(format!("{run_id}:produce"), run_id, 3, "produce");
+    produce.gate = GateSpec::ConsentBefore;
+    produce.tool_cmd = Some(vec!["true".into()]);
+    for u in [&check, &qe, &produce] {
+        crate::domain::put_node(&mut store, u.to_node()).unwrap();
+    }
+    let mut subs = crate::event_log::EventSink::default();
+    let (tx, _rx) = channel::<crate::command::Command>();
+    crate::actor::pause_for_human(
+        &mut store,
+        &mut subs,
+        &tx,
+        &mut s,
+        2,
+        None,
+        crate::actor::ESCALATION_GATE_KIND,
+        "the QE reviewer failed it".into(),
+    )
+    .unwrap();
+    struct Noop;
+    impl crate::workflow::StepRunner for Noop {
+        fn run_unit(&self, i: &StepInput) -> crate::workflow::StepOutput {
+            crate::workflow::StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: String::new(),
+                status: crate::workflow::StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let runner: std::sync::Arc<dyn crate::workflow::StepRunner> = std::sync::Arc::new(Noop);
+    let mut in_flight = std::collections::HashSet::new();
+    let err = crate::actor::confirm_gate(
+        &mut store,
+        &mut subs,
+        &runner,
+        &tx,
+        &mut in_flight,
+        run_id,
+        crate::workflow::HumanDecision::Approve {
+            amend: None,
+            amend_scope: crate::workflow::AmendScope::Cursor,
+        },
+        &None,
+        &None,
+        uuid::Uuid::nil(),
+        false,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("is refused"), "{err}");
+    assert_eq!(
+        crate::domain::get_session(&store, run_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        SessionStatus::Failed
     );
 }
 
