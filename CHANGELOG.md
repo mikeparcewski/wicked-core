@@ -2195,6 +2195,19 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.21** — 2026-11-03 — patch release on main ca90345, carrying 5 PRs since 0.15.20: #1243, #1245, #1246,
+  #1247 and #1248.
+  - **Built-in workflows (#1243, #1248).** Four new presets fill the catalog's gaps: `docs` and `test-plan` (each
+    writes in a `build` step, so the run delivers its pull request and the evidence floor applies, then an
+    independent check), and the read-only reports `validate-docs` and `test-analysis`. None requires QE acceptance.
+  - **Seats (#1247).** A review unit can read the work it reviews: a run's declared write roots are read roots of
+    every unit, a seat container's Claude fence opens around the run's declared roots it mounts, and a codex review
+    is given its paths as the seat mounts them. The live output stream no longer elides a flush over 2 KB: it is
+    split into deltas of at most 2 KB, and only a single flush past 16 KB is still head+tail elided first. The
+    first-party Document editor may load web images and fonts (new insert-only rule `EDITOR-BUILTIN-DOC-MEDIA`).
+  - **Lockfile and docs:** #1245 re-stamped the 0.15.20 platform lock entries; #1246 rewrote the README's opening.
+  - The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol are unchanged
+    since 0.15.20, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.20** — 2026-11-01 — release on main 5637b20, carrying 36 PRs since 0.15.19: #1183, #1184, #1189, #1190,
   #1192, #1193, #1195, #1196, #1197, #1199, #1200, #1201, #1202, #1203, #1204, #1205, #1207, #1211, #1212, #1214, #1215,
   #1218, #1219, #1220, #1221, #1222, #1223, #1224, #1225, #1226, #1229, #1231, #1234, #1237, #1238 and #1240.
