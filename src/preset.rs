@@ -99,6 +99,9 @@ pub enum PresetError {
     InvalidName(String),
     /// A global write or a delete aimed at a built-in.
     BuiltinReadonly(String),
+    /// (DES-APPS-001 K0) A write, in any scope, of a name only a built-in may hold: the Apps
+    /// presets run as fixed plans with their own governance, so no saved preset may shadow them.
+    ReservedName(String),
     /// `created_by: "builtin"` from a caller.
     ReservedCreatedBy,
     /// The project scope names no project.
@@ -112,6 +115,7 @@ impl PresetError {
         match self {
             PresetError::InvalidName(_) => "preset_invalid_name",
             PresetError::BuiltinReadonly(_) => "preset_builtin_readonly",
+            PresetError::ReservedName(_) => "preset_reserved_name",
             PresetError::ReservedCreatedBy => "preset_reserved_created_by",
             PresetError::UnknownProject(_) => "preset_unknown_project",
             PresetError::InvalidSteps(_) => "preset_invalid_steps",
@@ -127,10 +131,20 @@ impl std::fmt::Display for PresetError {
                 f,
                 "{r}: preset name `{n}` must be 1-64 characters of letters, digits, `.`, `_` or `-`"
             ),
+            PresetError::BuiltinReadonly(n) if crate::apps::is_apps_preset(n) => write!(
+                f,
+                "{r}: `{n}` is a built-in Apps preset — it cannot be deleted, overwritten or \
+                 shadowed in any scope"
+            ),
             PresetError::BuiltinReadonly(n) => write!(
                 f,
                 "{r}: `{n}` is a built-in preset — it cannot be deleted or overwritten globally; \
                  save a project-scoped preset of that name to shadow it for one project"
+            ),
+            PresetError::ReservedName(n) => write!(
+                f,
+                "{r}: `{n}` is reserved for the built-in Apps preset in every scope — a saved \
+                 preset cannot shadow it"
             ),
             PresetError::ReservedCreatedBy => {
                 write!(
@@ -276,6 +290,16 @@ pub fn seed_builtins(store: &mut dyn GraphStore, now_ms: i64) -> anyhow::Result<
             .as_ref()
             .filter(|p| p.created_by != BUILTIN_CREATED_BY)
         {
+            // (DES-APPS-001 K0) An Apps name is reserved: such a row never launches as saved.
+            if crate::apps::is_apps_preset(name) {
+                eprintln!(
+                    "wicked-core: the saved global preset `{name}` (created_by `{}`) holds a \
+                     reserved Apps preset name; every launch of `{name}` is refused until it is \
+                     deleted (the built-in is seeded at the next boot after that).",
+                    saved.created_by
+                );
+                continue;
+            }
             eprintln!(
                 "wicked-core: the saved global preset `{name}` (created_by `{}`) holds a built-in \
                  preset's name; it is kept and launches as saved. Delete it to get the built-in \
@@ -334,6 +358,9 @@ pub fn put_preset_requiring(
     }
     if spec.created_by == BUILTIN_CREATED_BY {
         return Err(PresetError::ReservedCreatedBy.into());
+    }
+    if crate::apps::is_apps_preset(&spec.name) {
+        return Err(PresetError::ReservedName(spec.name).into());
     }
     match spec.project_id.as_deref() {
         None if is_builtin_name(&spec.name) => {
@@ -516,6 +543,8 @@ mod tests {
             seed_builtins(&mut store, 10).unwrap(),
             [
                 "analyze",
+                "apps-publish",
+                "apps-turn",
                 "bug",
                 "capture-learnings",
                 "chat",
@@ -563,6 +592,8 @@ mod tests {
             seed_builtins(&mut store, 5).unwrap(),
             [
                 "analyze",
+                "apps-publish",
+                "apps-turn",
                 "bug",
                 "capture-learnings",
                 "chat",
@@ -611,6 +642,8 @@ mod tests {
             seed_builtins(&mut store, 5).unwrap(),
             [
                 "analyze",
+                "apps-publish",
+                "apps-turn",
                 "bug",
                 "capture-learnings",
                 "demo",
@@ -879,6 +912,8 @@ mod tests {
             listed,
             [
                 ("analyze".to_string(), GLOBAL_SCOPE.to_string()),
+                ("apps-publish".to_string(), GLOBAL_SCOPE.to_string()),
+                ("apps-turn".to_string(), GLOBAL_SCOPE.to_string()),
                 ("bug".to_string(), GLOBAL_SCOPE.to_string()),
                 ("capture-learnings".to_string(), GLOBAL_SCOPE.to_string()),
                 ("chat".to_string(), GLOBAL_SCOPE.to_string()),

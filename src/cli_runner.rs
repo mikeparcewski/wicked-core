@@ -2330,6 +2330,9 @@ struct FloorPlan {
     /// running the same checks again.
     creator_tree: Option<String>,
     git_dir: Option<String>,
+    /// (DES-APPS-001 K0) The unit belongs to an Apps run: an app repository is data, checked by
+    /// crew's fixed `apps-check`; nothing in it runs, so the floor runs no repository-authored check.
+    apps: bool,
     /// (core#544) The tree id as it stood after the seat's turn.
     current_tree: Option<String>,
 }
@@ -2401,6 +2404,16 @@ enum FloorRun {
 
 /// The unit's floor plan ([`FloorPlan`]), or `None` when no floor runs for it.
 #[allow(clippy::too_many_arguments)]
+/// (core#1155) Whether this unit's attempt installs the worktree's dependencies for its seats:
+/// an agent unit of a bound run, not the pre-build scope unit — and (DES-APPS-001 K0) never a unit
+/// of an Apps run, whose repository is data: a manifest a builder planted there is never resolved
+/// or installed before crew's `apps-check` refuses it.
+fn provisions_seat_deps(input: &StepInput) -> bool {
+    !input.unit.pre_build_scope
+        && input.unit.tool_cmd.is_none()
+        && !input.governance.as_ref().is_some_and(|g| g.apps.is_some())
+}
+
 fn floor_plan(
     input: &StepInput,
     output: &StepOutput,
@@ -2496,6 +2509,7 @@ fn floor_plan(
             .flatten(),
         git_dir: baseline.and_then(|b| b.git_dir.clone()),
         current_tree: current_tree.map(str::to_string),
+        apps: input.governance.as_ref().is_some_and(|g| g.apps.is_some()),
     })
 }
 
@@ -2509,6 +2523,11 @@ fn floor_plan(
 /// reads a long floor as a wedged worker; the per-check durations stay on
 /// `repoChecksEvaluated.checks[].durationMs`.
 fn run_floor_plan(plan: &FloorPlan, emit_delta: &DeltaSink, live_ok: bool) -> FloorRun {
+    if plan.apps {
+        return FloorRun::Done(Box::new(
+            plan.finish(crate::repo_checks::apps_repository_report(&plan.wd), None),
+        ));
+    }
     let Some((tree, git_dir)) = plan.clean_target() else {
         return if live_ok {
             FloorRun::Done(Box::new(floor_live(plan, emit_delta)))
@@ -2670,7 +2689,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // never reads a slow install as a wedged seat. The seats are told (one context block, on the
     // input every seat below is built from).
     let with_deps: Option<StepInput> = match input.workdir.as_deref() {
-        Some(wd) if !input.unit.pre_build_scope && input.unit.tool_cmd.is_none() => {
+        Some(wd) if provisions_seat_deps(input) => {
             let git_dir = input
                 .unit
                 .worktree_baseline
@@ -5193,6 +5212,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -6339,6 +6359,90 @@ mod tests {
         let _ = std::fs::remove_dir_all(&repo);
     }
 
+    /// (DES-APPS-001 K0, codex r2) A unit of an Apps run installs no dependencies from the app
+    /// repository; every other bound agent unit does, and the pre-build scope unit never.
+    #[test]
+    fn an_apps_unit_installs_no_dependencies() {
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "build");
+        unit.assigned_cli = Some("claude".into());
+        let mut input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(std::env::temp_dir()),
+            governance: Some(crate::workflow::GovernanceContext {
+                db_path: "/abs/estate.db".into(),
+                code_graph_db: None,
+                extra_write_roots: Vec::new(),
+                extra_read_roots: Vec::new(),
+                project_id: None,
+                repo_id: None,
+                human_confirm: crate::domain::HumanConfirm::None,
+                apps: None,
+            }),
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        assert!(provisions_seat_deps(&input));
+        input.governance.as_mut().unwrap().apps = Some("apps-turn".into());
+        assert!(!provisions_seat_deps(&input));
+        input.governance = None;
+        input.unit.pre_build_scope = true;
+        assert!(!provisions_seat_deps(&input));
+    }
+
+    /// (DES-APPS-001 K0, codex r1) A unit of an Apps run runs no repository-authored check: a
+    /// manifest a builder planted in the app repository is never run by the floor (crew's
+    /// `apps-check` refuses it); the floor reports a pass with nothing run, and why.
+    #[test]
+    fn an_apps_floor_runs_nothing_from_the_app_repository() {
+        let dir =
+            std::env::temp_dir().join(format!("wicked-core-apps-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let marker = dir.join("RAN");
+        std::fs::write(
+            dir.join("package.json"),
+            format!(
+                "{{\"scripts\":{{\"test\":\"touch {}\"}}}}",
+                marker.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let plan = FloorPlan {
+            wd: dir.clone(),
+            ord: 1,
+            attempt: 0,
+            run_id: "r-apps".into(),
+            phase: Some("build".into()),
+            stage: crate::repo_checks::FloorStage::Creator,
+            ctx: crate::repo_checks::FloorContext::default(),
+            rerun: None,
+            guarded: false,
+            guard_tree: None,
+            creator_tree: None,
+            git_dir: None,
+            current_tree: None,
+            apps: true,
+        };
+        match run_floor_plan(&plan, &|_: &str| {}, true) {
+            FloorRun::Done(report) => {
+                assert!(report.passed && report.checks.is_empty(), "{report:#?}");
+                assert!(report.detected.is_empty());
+                assert!(report.skipped.iter().any(|s| s.contains("Apps repository")));
+            }
+            FloorRun::LiveWorktree => panic!("an Apps floor is decided, never handed back"),
+        }
+        assert!(!marker.exists(), "nothing from the app repository ran");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (power-speed-2, xreview on #1224) The early floor's heartbeat covers making the clean
     /// checkout too (a slow export must not read as a wedged worker), and a CREATOR checkout that
     /// cannot be made is handed back un-run — the live-worktree floor only ever runs after the
@@ -6365,6 +6469,7 @@ mod tests {
             creator_tree: Some("0000000000000000000000000000000000000000".into()),
             git_dir: Some(dir.join("no-such-git-dir").to_string_lossy().into_owned()),
             current_tree: None,
+            apps: false,
         };
         let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let d2 = deltas.clone();

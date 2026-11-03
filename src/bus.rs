@@ -1606,9 +1606,12 @@ fn launch_from_event(
             {
                 emit_run_launched(db, &session_id, req.workflow.as_deref(), &req.problem);
                 Ok(())
-            } else if e.downcast_ref::<QeOverrideRefused>().is_some() {
-                // A QE word that cannot apply (a blank reason, or nothing to skip or force) is
-                // refused the same way on every retry: drop it rather than wedge the bridge.
+            } else if e.downcast_ref::<QeOverrideRefused>().is_some()
+                || e.downcast_ref::<crate::apps::AppsLaunchRefused>().is_some()
+            {
+                // A QE word that cannot apply (a blank reason, or nothing to skip or force), or an
+                // Apps launch its admission refuses (DES-APPS-001 K0), is refused the same way on
+                // every retry: drop it rather than wedge the bridge.
                 Err(BridgeError::Permanent(e))
             } else {
                 Err(BridgeError::Retriable(e))

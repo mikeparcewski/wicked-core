@@ -239,7 +239,13 @@ pub(crate) fn candidates(
         .filter(|k| !is_author(k) && Some(k.as_str()) != executor)
         .map(|k| seat(k, BASIS_DISTINCT))
         .collect();
-    if let Some(e) = executor.filter(|e| !is_author(e) && pool.iter().any(|k| k == e)) {
+    // (DES-APPS-001 K0) Never on an Apps publish: its produce step needs a PASS a seat distinct from
+    // the QE executor recorded (`apps::publish_consent_refusal`), so an executor-seat PASS would
+    // count the QE unit and strand the run at a consent gate that can only refuse. With no distinct
+    // reviewer the unit is denied `qe_reviewer_unavailable`, where an approve retries.
+    if let Some(e) = executor.filter(|e| {
+        !is_author(e) && pool.iter().any(|k| k == e) && !crate::apps::is_publish(session)
+    }) {
         out.push(seat(e, BASIS_EXECUTOR));
     }
     if session.assurance.reduced() {

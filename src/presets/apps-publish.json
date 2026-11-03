@@ -1,0 +1,45 @@
+{
+ "steps": [
+  {
+   "catalog": "run",
+   "id": "check",
+   "gate_type": "execution",
+   "instructions": "crew's Apps publish check, bound to the head tree and the publish manifest: all of the turn check, plus every action's grant bound to its current hashes, every row write's table safety check now, a public app with no action and only public queries, each target's blocked sources gone, the audience rule and issuer set, embed origins named; in the jail, on fixture rows, every filter changed and every action prepared, the before and after renders and the generated cards recorded as evidence. Unwaivable. No agent code runs here.",
+   "executor": {
+    "type": "tool",
+    "cmd": [
+     "wicked-crew",
+     "apps-check",
+     "--publish"
+    ]
+   }
+  },
+  {
+   "catalog": "critique",
+   "id": "qe",
+   "skill_ref": "wicked-garden-apps",
+   "depends_on": [
+    "check"
+   ],
+   "instructions": "Follow the wicked-garden-apps skill's qe action: QE acceptance of this publish from the publish check's evidence alone (its report, the before and after renders, the generated cards). You built none of this app's turns since the last publish; change no file in the app repository: your QE evidence and verdict go only where the QE acceptance flow writes them, under the run's QE ledger root. You need no browser and no source of your own, and you have no source tool."
+  },
+  {
+   "catalog": "run",
+   "id": "produce",
+   "kind": "build",
+   "gate_type": "execution",
+   "gate": "consent_before",
+   "depends_on": [
+    "check"
+   ],
+   "instructions": "Produce the publish with crew's pinned tooling: pack the checked apps.json, queries/ and lock from the tree's git objects and the snapshots by digest, build the targets the manifest names, and record their digests in the published receipt. Nothing in the app repository runs. Nothing has been produced yet: this asks first. The card is the one crew's publish check printed (advisory: produce acts on the manifest crew bound to this run), and it lists the manifest: targets, audience and issuer, every source, query and action with its grant, environment names, embed origins and the snapshots shipped.",
+   "executor": {
+    "type": "tool",
+    "cmd": [
+     "wicked-crew",
+     "apps-produce"
+    ]
+   }
+  }
+ ]
+}

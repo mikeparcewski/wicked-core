@@ -1280,12 +1280,15 @@ export declare class Subscription {
  * `denial.source === 'evaluator_error'`.
  * QE acceptance (additive, operator ruling 2026-10-10): a run whose contract requires
  * `qe_acceptance` carries its decision as `assurance.qe: {status: 'required' | 'waived' |
- * 'skipped', basis: 'plan' | 'operator' | 'diff', score: number | null, threshold, reason,
+ * 'skipped', basis: 'plan' | 'operator' | 'diff' | 'preset', score: number | null, threshold, reason,
  * reasons: string[], ord: number | null, tree: string | null}` on sessionStarted and on every
  * gateEvaluated / deliverLiftEvaluated receipt; a waived or skipped one is also a `skipped[]`
  * entry (reason `qe_waived_by_score` | `qe_skipped_by_operator`, detail = the words). New event
  * `qeAcceptanceDecided` {session, ord, qe}: the run's QE unit scored its diff (waived only when
  * every dimension is in its lowest band, score <= threshold), or a creator after a waiver revoked it.
+ * Apps (additive, DES-APPS-001 K0): an Apps run's contract carries `assurance.apps: {preset:
+ * 'apps-turn' | 'apps-publish'}` (absent on every other run); an apps-publish's QE decision has
+ * `basis: 'preset'` (forced by the preset: never re-scored, never skipped).
  * Operator recheck (additive, new event): `floorRecheck` {session, ord, attempt, reason, tree,
  * previousOutcome, outcome, passed} — an operator retry (a plain approve at an escalated unit's
  * gate) re-ran the unit's failed floor once on the SAME tree its last floor judged; it follows the

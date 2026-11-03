@@ -485,6 +485,7 @@ mod tests {
             decisions_path: "/unused".into(),
             db_path: String::new(),
             estate: Default::default(),
+            apps: None,
         }
     }
     struct Fixture {

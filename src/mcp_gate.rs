@@ -77,6 +77,12 @@ pub(crate) const RULE_UNREGISTERED: &str = "engine:mcp-unregistered";
 /// First use of a server (or of a tool whose schema changed) waits for the operator, in every mode.
 pub(crate) const RULE_FIRST_USE: &str = "engine:mcp-first-use";
 
+/// D-7 (DES-APPS-001 §5.2, K0): a unit of an Apps run (`apps-turn`, `apps-publish`) — builder,
+/// reviewer, QE executor, QE reviewer, or the check Tool's token — calls and lists NO registry
+/// tool, of any class, registered or not, in any mode. An Apps seat holds no row data and no
+/// credential; a source tool would hand it both.
+pub(crate) const RULE_APPS_NO_SOURCE_TOOL: &str = crate::apps::RULE_NO_SOURCE_TOOL;
+
 /// The pack rule that is the first-use APPROVALS LEDGER: its `excludes` lists the approved
 /// `mcp:<server>` (or `mcp:<server>/<tool>`) tokens, edited through crew's audited rule upsert. The
 /// engine reads the list whether the rule is active or retired, so retiring it never lifts the ask,
@@ -263,6 +269,9 @@ pub(crate) struct McpUnit {
     pub db_path: String,
     /// What crew's estate relay scopes this unit's estate calls to (core#1018).
     pub estate: EstateScope,
+    /// (DES-APPS-001 K0) The Apps preset the unit's run is, from its governance context: `Some`
+    /// ⇒ D-7, every call and every listing is denied ([`RULE_APPS_NO_SOURCE_TOOL`]).
+    pub apps: Option<String>,
 }
 
 /// The run facts crew's estate relay scopes a unit's estate calls by (core#1018), copied from the
@@ -310,6 +319,7 @@ impl McpUnit {
                     code_graph_db: nonblank(g.code_graph_db.as_deref()),
                 })
                 .unwrap_or_default(),
+            apps: input.governance.as_ref().and_then(|g| g.apps.clone()),
         }
     }
 }
@@ -470,8 +480,19 @@ pub(crate) fn evaluate(
     let subject = subject_of(&call.server, &call.tool);
     let ctx = context(unit, call, class);
 
-    // The two engine gates hold in every mode and no rule can lift them.
-    let engine_deny = if !call.registered {
+    // The engine gates hold in every mode and no rule can lift them. D-7 first: an Apps unit is
+    // refused every tool, whatever the registry or its class says.
+    let engine_deny = if let Some(preset) = unit.apps.as_deref() {
+        Some((
+            RULE_APPS_NO_SOURCE_TOOL,
+            format!(
+                "mcp: `{subject}` is refused: this unit belongs to an `{preset}` run, and no unit \
+                 of an Apps run gets any registry tool (D-7)"
+            ),
+            "work from the catalog and the files the task names; an Apps step never calls a \
+             source",
+        ))
+    } else if !call.registered {
         Some((
             RULE_UNREGISTERED,
             format!("mcp: `{subject}` is not a registered, enabled tool (D-5)"),
@@ -845,6 +866,42 @@ fn arm_worker_mcp_channel_at(
     Some((token, binding))
 }
 
+/// A Tool unit's armed channel: the token, its binding (both live until the command exits) and
+/// the env to hand the command.
+pub(crate) type ToolChannel = (McpToken, McpBinding, Vec<(String, String)>);
+
+/// (DES-APPS-001 §9.2, K0) The capability token a TOOL unit of an Apps run carries to crew: crew's
+/// fixed `wicked-crew apps-check` (and `apps-produce`) calls its route with the unit's token, as a
+/// seat calls `/mcp/call`, so crew knows which run, unit and attempt is asking. Bound to the unit for
+/// as long as the guards live (the caller keeps them until the command exits); the unit's Apps
+/// marker rides the binding, so the token itself reaches no registry tool (D-7). `None` for an
+/// ungoverned unit or a daemon with no broker URL. Returns the env to hand the command.
+pub(crate) fn arm_tool_unit_channel(input: &crate::workflow::StepInput) -> Option<ToolChannel> {
+    arm_tool_unit_channel_at(input, daemon_crew_url())
+}
+
+pub(crate) fn arm_tool_unit_channel_at(
+    input: &crate::workflow::StepInput,
+    crew_url: Option<String>,
+) -> Option<ToolChannel> {
+    let gov = input.governance.as_ref()?;
+    let token = McpToken::mint();
+    let env: Vec<(String, String)> = token
+        .worker_env(crew_url.as_deref())
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+    if env.is_empty() {
+        return None;
+    }
+    let binding = token.bind(McpUnit::of(
+        input,
+        &gov.db_path,
+        McpMode::of(&gov.human_confirm),
+    ));
+    Some((token, binding, env))
+}
+
 pub(crate) fn resolve(token: &str) -> Option<McpUnit> {
     lock_registry()
         .get(token)
@@ -1150,6 +1207,7 @@ pub(crate) fn preview_unit(cell: &McpPreviewCell, db_path: &str) -> Result<McpUn
         decisions_path: PathBuf::new(),
         db_path: db_path.to_string(),
         estate: EstateScope::default(),
+        apps: None,
     })
 }
 
@@ -1352,6 +1410,7 @@ mod tests {
             decisions_path: PathBuf::from("/nonexistent"),
             db_path: String::new(),
             estate: EstateScope::default(),
+            apps: None,
         }
     }
 
@@ -2084,6 +2143,7 @@ mod tests {
                 project_id: None,
                 repo_id: None,
                 human_confirm: HumanConfirm::All,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -2151,6 +2211,7 @@ mod tests {
                 project_id: project.map(str::to_string),
                 repo_id: repo.map(str::to_string),
                 human_confirm: HumanConfirm::None,
+                apps: None,
             })
         };
         let mut input = crate::workflow::StepInput {

@@ -187,6 +187,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
         extra_read_roots: Vec::new(),
         project_id: None,
         repo_id: None,
+        apps: None,
     })
 }
 
@@ -1454,6 +1455,19 @@ pub(crate) fn run(
                     // is a synchronous Err (`plan.proposed` + `plan.refused` published) with no
                     // session persisted. Scoring, floor fill and the approval matrix run once the
                     // worktree's base commit is known (`team_plan_at_launch`).
+                    // (DES-APPS-001 K0) An Apps preset's launch admission: the container floor,
+                    // full assurance, a seat for the review or the QE, and the publish's forced QE
+                    // — a synchronous Err with NO session persisted. `Some` = the run's Apps
+                    // contract, which the stub below records.
+                    let floor = crate::apps::floor_env();
+                    let apps = crate::apps::admit(
+                        &store,
+                        &crate::apps::LaunchFacts::of(
+                            &spec,
+                            floor.as_deref(),
+                            in_process_governance().is_some(),
+                        ),
+                    )?;
                     let launch_plan = crate::plan_gate::launch_plan(
                         &store,
                         spec.plan.as_ref(),
@@ -1633,10 +1647,17 @@ pub(crate) fn run(
                         // per-call check on the host floor (C5), and codex on a worktree-bound run
                         // (F-EDIT-5 / F-LEARN-3).
                         seat_failures: Vec::new(),
-                        benched_seats: crate::distribute::launch_benched(
+                        // (DES-APPS-001 K0) …and, on an Apps publish, the QE builder exclusion,
+                        // first: a bench that never lifts.
+                        benched_seats: crate::apps::with_exclusion_benches(
+                            apps.as_ref(),
+                            &spec.exclude_seats,
                             &spec.clis,
-                            repo_ref.is_some(),
-                            in_process_governance().is_some(),
+                            crate::distribute::launch_benched(
+                                &spec.clis,
+                                repo_ref.is_some(),
+                                in_process_governance().is_some(),
+                            ),
                         ),
                         team: None,
                         team_plan: None,
@@ -1646,15 +1667,19 @@ pub(crate) fn run(
                         evidence_root: spec.evidence_root.clone(),
                         // (core#850) The run's assurance contract: the workflow's declared
                         // instruments (or the default) and the launch's explicit opt-in.
-                        assurance: crate::assurance::RunAssurance::new(
-                            selected_def
-                                .as_ref()
-                                .and_then(|d| d.required_instruments.as_deref()),
-                            spec.reduced_assurance,
-                        )
                         // (QE acceptance) The operator's explicit skip or force, refused before
-                        // anything persists when it is malformed or has nothing to apply to.
-                        .with_qe_override(&spec.qe_acceptance)
+                        // anything persists when it is malformed or has nothing to apply to; an
+                        // Apps run's contract carries its preset, and a publish's QE is forced.
+                        assurance: crate::apps::contract(
+                            crate::assurance::RunAssurance::new(
+                                selected_def
+                                    .as_ref()
+                                    .and_then(|d| d.required_instruments.as_deref()),
+                                spec.reduced_assurance,
+                            ),
+                            apps.clone(),
+                            &spec.qe_acceptance,
+                        )
                         // Typed, so the bus bridge drops a request that will never launch
                         // instead of retrying it forever.
                         .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
@@ -3367,6 +3392,11 @@ pub(crate) fn run(
                         let _ = reply.send(Err(e));
                         continue;
                     }
+                    // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units.
+                    if let Some(why) = crate::apps::reassign_refusal(&session, cli) {
+                        let _ = reply.send(Err(anyhow::anyhow!("run {run_id}: {why}")));
+                        continue;
+                    }
                 }
                 let previous_cli = cursor_unit
                     .assigned_cli
@@ -3553,7 +3583,9 @@ pub(crate) fn run(
                         // the re-route runs over a CLEARED bench (DES-L3 §4; the `:3775`
                         // precedent). Without this the lever was a no-op after a sign-in
                         // (F-RC2-007).
-                        let benched_c: Vec<crate::domain::BenchedSeat> = Vec::new();
+                        // (DES-APPS-001 K0) …except a publish's builder exclusion, which no
+                        // operator lever lifts.
+                        let benched_c = crate::apps::binding_benches(&session.benched_seats);
                         let units_for_routing = units.clone();
                         let clis_keys = session.clis.clone();
                         let assurance_c = session.assurance.clone();
@@ -4831,6 +4863,19 @@ pub(crate) fn launch_run_inner(
             .map_err(|e| anyhow::anyhow!(e))?;
         // (core#1216) The orchestrator's voice block: same synchronous refusal.
         crate::power::validate_voice(spec.voice.as_deref())?;
+    }
+    // (DES-APPS-001 K0) The same Apps admission as the interactive path, before anything is
+    // created; `plan_and_distribute` records the contract on the session it writes.
+    {
+        let floor = crate::apps::floor_env();
+        crate::apps::admit(
+            &*store,
+            &crate::apps::LaunchFacts::of(
+                &spec,
+                floor.as_deref(),
+                in_process_governance().is_some(),
+            ),
+        )?;
     }
     // If the run targets a registered repo, create its isolated worktree first.
     let (repo_ref, workdir) = resolve_workdir(store, &spec.repo_ref, &run_id)?;
@@ -9210,7 +9255,7 @@ fn partition_sessions_for_reap(
 /// the CONDITIONAL verdict gate (seam finding #3), and the TERMINAL gate (seam finding #4) so all three
 /// pause identically. Does NOT move the resume cursor — the caller decides what the cursor points at.
 #[allow(clippy::too_many_arguments)]
-fn pause_for_human(
+pub(crate) fn pause_for_human(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
     self_tx: &Sender<Command>,
@@ -9391,6 +9436,10 @@ fn reseat_parked_unit(
         );
     }
     refuse_author_reassign(session, &units, session.unit_ix, cli)?;
+    // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units, parked or not.
+    if let Some(why) = crate::apps::reassign_refusal(session, cli) {
+        anyhow::bail!("run {run_id}: {why}");
+    }
     let previous_cli = unit
         .assigned_cli
         .clone()
@@ -10204,7 +10253,7 @@ pub(crate) const CONSENT_GATE_KIND: &str = "consent";
 /// (core#820) The dry-run plan a consent gate on unit `ord` offers: the approved output of the
 /// newest unit before it whose phase it `depends_on` and which printed a plan
 /// ([`crate::consent_plan::parse_plan`]), or why there is none.
-fn consent_offer(
+pub(crate) fn consent_offer(
     store: &dyn GraphStore,
     session_id: &str,
     ord: u32,
@@ -11293,6 +11342,34 @@ fn dispatch_unit(
     if session.power.is_some() && review_of.is_none() {
         power_gate::on_dispatch(store, subscribers, run_id, &dispatched_unit);
     }
+    // (DES-APPS-001 K0) THE Apps dispatch guard, on the unit's FINAL seat (after every reseat
+    // above), for every path that reaches a unit (launch, approve, retry, reassign, resume): an
+    // agent unit runs only contained and governed, never on a publish's excluded builder seat,
+    // and a publish's produce step only past its QE backstop. Nothing has run yet.
+    if let Some(why) = crate::apps::dispatch_refusal(
+        &session,
+        &units,
+        &dispatched_unit,
+        crate::apps::floor_env().as_deref(),
+        in_process_governance().is_some(),
+        || current_worktree_tree(&*store, &session),
+    ) {
+        // Failed explicitly, whichever path dispatched (an approve already resolved its gate): a
+        // refused Apps unit never leaves its run executing with no worker.
+        let why = format!(
+            "unit {} of run {run_id} is refused: {why}",
+            dispatched_unit.ord
+        );
+        fail_run_by_id(
+            store,
+            subscribers,
+            runner,
+            self_tx,
+            run_id,
+            anyhow::anyhow!("{why}"),
+        );
+        anyhow::bail!(why);
+    }
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -11349,6 +11426,9 @@ fn dispatch_unit(
             repo_id: session.repo_ref.clone(),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
+            // (DES-APPS-001 K0) An Apps run's units get no registry tool: from the SESSION's
+            // contract, so a resume re-arms the same ban.
+            apps: crate::apps::run_preset(&session).map(str::to_string),
             ..g
         }),
         prior_outputs,
@@ -11443,7 +11523,21 @@ fn dispatch_unit(
         let run_for_child = run_id.to_string();
         let run_for_reg = run_id.to_string();
         let my_seq = launch_seq;
+        // (DES-APPS-001 §9.2, K0) A Tool unit of an Apps run is crew's fixed command (`wicked-crew
+        // apps-check`, `apps-produce`): `wicked-crew` resolves through `WICKED_CREW_BIN` when crew
+        // set it, and the command carries the unit's capability token so crew's route knows which
+        // run, unit and attempt is asking. The guards live until the command exits.
+        let apps_tool = crate::apps::run_preset(&session).is_some();
+        let apps_channel = apps_tool
+            .then(|| crate::mcp_gate::arm_tool_unit_channel(&input))
+            .flatten();
+        // No token, no command: crew's route authenticates the unit by it.
+        let apps_unarmed = apps_tool && apps_channel.is_none();
         std::thread::spawn(move || {
+            let (_apps_token, _apps_binding, apps_env) = match apps_channel {
+                Some((t, b, env)) => (Some(t), Some(b), env),
+                None => (None, None, Vec::new()),
+            };
             let stop = move || -> Option<&'static str> {
                 let m = maps_for_child.as_ref()?;
                 let g = m.lock().unwrap_or_else(|p| p.into_inner());
@@ -11501,6 +11595,14 @@ fn dispatch_unit(
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
+                // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
+                _ if apps_unarmed => (
+                    "wicked-core: refused: an Apps run's Tool command runs only with its unit's \
+                     capability token, and none could be armed (no input governance or no broker \
+                     URL on this daemon)"
+                        .to_string(),
+                    crate::workflow::StepStatus::Failed,
+                ),
                 Ok(admitted) => {
                     // The generation the RUN was judged against, reported like a handoff
                     // (`path: "tool_cmd"`): the log line for the operator and the event crew's
@@ -11562,6 +11664,7 @@ fn dispatch_unit(
                         };
                         let mut run_vars =
                             run_env.as_ref().map(ToolRunEnv::vars).unwrap_or_default();
+                        run_vars.extend(apps_env.iter().cloned());
                         // (core#802) The garden root the run was admitted against rides every
                         // generic Tool unit as `WICKED_GARDEN_ROOT`, so a def runs
                         // `"$WICKED_GARDEN_ROOT/scripts/wicked-garden" run <script>` from the
@@ -12285,6 +12388,11 @@ fn run_tool_cmd_jailed(
     let resolved_bin;
     let bin: &str = if bin == "wicked-core" {
         resolved_bin = crate::execute_wrapped::resolve_wicked_core_exe();
+        &resolved_bin
+    } else if bin == crate::apps::CREW_BIN {
+        // (DES-APPS-001 K0) crew's CLI, where crew said it is (`WICKED_CREW_BIN`) — the resolver the
+        // launch preflight reads too.
+        resolved_bin = crate::apps::crew_bin();
         &resolved_bin
     } else {
         bin
@@ -13671,7 +13779,24 @@ pub(crate) fn confirm_gate_as(
         Some(ord) => repeat_gate::resolve_answer(store, run_id, ord, decision)?,
         None => decision,
     };
-    let decision = match consent_row.and_then(|r| r.ord) {
+    let consent_ord = consent_row.and_then(|r| r.ord);
+    // (DES-APPS-001 §9.3, K0) THE PUBLISH QE BACKSTOP: an Apps publish's produce step runs only
+    // behind its consent gate, and that gate takes no approve (and no choice) until the run's QE
+    // unit holds a bound QE PASS on a required decision. Whatever let the QE unit count without
+    // one — a skip, a judgment, an override — the produce step never runs on it.
+    if consent_ord.is_some()
+        && !matches!(decision, crate::workflow::HumanDecision::Reject)
+        && crate::apps::is_publish(&session)
+    {
+        let units = crate::domain::session_units(&*store, run_id)?;
+        let tree = current_worktree_tree(&*store, &session);
+        if let Some(why) = crate::apps::publish_consent_refusal(&session, &units, tree.as_deref()) {
+            anyhow::bail!(
+                "run {run_id}'s consent gate takes only reject until it can produce: {why}"
+            );
+        }
+    }
+    let decision = match consent_ord {
         Some(ord) => resolve_consent_answer(store, run_id, ord, decision)?,
         None if !repeat_open
             && matches!(
@@ -13733,6 +13858,19 @@ pub(crate) fn confirm_gate_as(
         let units = crate::domain::session_units(store, run_id)?;
         let cursor = units.get(session.unit_ix);
         let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+        // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
+        // the capped review's "land with carried items" would land it over the reviewer's FAIL.
+        // Refused here, so the adjudication gate stays open for request changes or reject.
+        if let (true, Some(preset), crate::workflow::HumanDecision::Approve { .. }) = (
+            adjudication_open,
+            crate::apps::run_preset(&session),
+            &decision,
+        ) {
+            anyhow::bail!(
+                "run {run_id} is an `{preset}` run, which lands only on a passing review — \
+                 request changes (one more round) or reject"
+            );
+        }
         // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
         // refused here, before the row resolves and before its `gate.decided` is published, when
         // there is no creator to rerun (a member-step dispute reworks the member instead).
@@ -14003,13 +14141,7 @@ pub(crate) fn confirm_gate_as(
     // only walked back into the same dead end (run b9ada134). Never automatic: only this answer.
     let judge_unavailable_gate = crate::domain::session_units(store, run_id)?
         .get(session.unit_ix)
-        .is_some_and(|u| {
-            u.status == crate::domain::UnitStatus::Rejected
-                && u.denial.as_ref().is_some_and(|d| {
-                    d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
-                        || crate::qe_acceptance::review::could_not_judge(d)
-                })
-        });
+        .is_some_and(|u| approve_is_operator_judgment(&session, u));
     // A team MEMBER's step owes its team accounting (the PA's review of it, the member's record):
     // it keeps today's answer here (codex r1 on #907).
     // (core#937) An ORDINARY step of a teamed run does not: its gate's `gate.decided` was published
@@ -14730,7 +14862,7 @@ fn floor_fix_request(
 }
 
 /// The gate kind `escalate_denied_unit` opens for a denied unit.
-const ESCALATION_GATE_KIND: &str = "escalation";
+pub(crate) const ESCALATION_GATE_KIND: &str = "escalation";
 
 /// Arm ONE re-run of the cursor unit's floor for its next attempt (`RepoChecksReport::recheck`):
 /// the operator retried an escalated unit whose last floor FAILED on a known tree. Without it the
@@ -15064,6 +15196,42 @@ fn apply_suggestion(
     ))
 }
 
+/// (DES-APPS-001 K0) The tree the run's worktree holds now (`None` for a repo-less run or one the
+/// snapshot cannot read): what an Apps publish's QE PASS must have been taken on.
+fn current_worktree_tree(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+) -> Option<String> {
+    let wd = session.workdir.as_deref()?;
+    let repo = crate::repo::get_repo(store, session.repo_ref.as_deref()?)
+        .ok()
+        .flatten()?;
+    crate::worktree_guard::snapshot(
+        std::path::Path::new(wd),
+        std::path::Path::new(&repo.root_path),
+    )
+    .ok()
+    .map(|s| s.tree)
+}
+
+/// (operator ruling 2026-10-11) Whether the operator's plain approve at `u`'s gate IS the judgment:
+/// the unit was denied because no judge could rule (`judge_unavailable`), or no QE reviewer could
+/// judge its evidence. (DES-APPS-001 §9.3, K0) Never the QE layer of an Apps publish: there the
+/// operator standing in for the QE reviewer would be a QE skip, so the approve is a retry.
+pub(crate) fn approve_is_operator_judgment(
+    session: &crate::domain::AgentSession,
+    u: &crate::domain::WorkUnit,
+) -> bool {
+    let publish = crate::apps::is_publish(session);
+    // (A semantic judge that could not rule stays the operator's to judge on a publish too: the
+    // QE unit then counts, and produce still waits on the bound QE PASS, `apps::dispatch_refusal`.)
+    u.status == crate::domain::UnitStatus::Rejected
+        && u.denial.as_ref().is_some_and(|d| {
+            d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
+                || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+        })
+}
+
 /// (j4-gates) The words every surface shows for an operator's QE skip at a gate — the launch
 /// skip's own prefix (`assurance::RunAssurance::with_qe_override`), so studio's
 /// "QE acceptance: skipped by operator (…)" reads both the same way.
@@ -15071,7 +15239,7 @@ const SKIP_QE_LABEL: &str = "QE acceptance skipped by operator";
 
 /// (j4-gates) What a [`crate::workflow::HumanDecision::SkipQe`] does at the open gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SkipQePlan {
+pub(crate) enum SkipQePlan {
     /// The gate before the deliver step: record the skip, then approve.
     Approve,
     /// A unit only the QE reviewer denied: record the skip, and the unit counts.
@@ -15111,15 +15279,18 @@ fn skip_qe_shape(u: &crate::domain::WorkUnit) -> Option<SkipQePlan> {
 
 /// (j4-gates) Whether a verdict gate's prompt offers `skip_qe` for this unit: a QE layer is all that
 /// denied it, on a run whose QE decision (as stamped on the unit) still requires QE acceptance.
-fn skip_qe_takes_unit(u: &crate::domain::WorkUnit) -> bool {
+pub(crate) fn skip_qe_takes_unit(u: &crate::domain::WorkUnit) -> bool {
     u.member_step.is_none()
-        && u.qe_acceptance.as_ref().is_some_and(|q| q.required())
+        // (DES-APPS-001 K0) A preset-forced decision (an Apps publish) is never offered a skip.
+        && u.qe_acceptance
+            .as_ref()
+            .is_some_and(|q| q.required() && q.basis != crate::assurance::QE_BASIS_PRESET)
         && skip_qe_shape(u) == Some(SkipQePlan::UnitCounts)
 }
 
 /// (j4-gates) What a QE skip does at `session`'s open gate — refused, naming why, unless it applies
 /// ([`crate::workflow::HumanDecision::SkipQe`]).
-fn skip_qe_plan(
+pub(crate) fn skip_qe_plan(
     session: &crate::domain::AgentSession,
     cursor: Option<&crate::domain::WorkUnit>,
     reason: &str,
@@ -15127,6 +15298,19 @@ fn skip_qe_plan(
     run_id: &str,
 ) -> anyhow::Result<SkipQePlan> {
     let action = crate::workflow::SKIP_QE_ACTION;
+    // (DES-APPS-001 §9.3, K0) An Apps publish's QE acceptance is forced by its preset: no gate
+    // skips it (and an Apps turn has none to skip).
+    if let Some(preset) = crate::apps::run_preset(session) {
+        anyhow::bail!(
+            "`{action}` is refused on run {run_id}: it is an `{preset}` run, whose QE acceptance \
+             {} — answer approve (retry), request changes or reject",
+            if crate::apps::is_publish(session) {
+                "is forced by its preset and cannot be skipped"
+            } else {
+                "does not exist (its review on a distinct seat is the check)"
+            }
+        );
+    }
     if reason.trim().is_empty() {
         anyhow::bail!(
             "action `{action}` needs a written reason in `amend` — why QE acceptance is skipped \
@@ -26212,6 +26396,7 @@ mod seat_failover_tests {
                 decisions_path: "/unused".into(),
                 db_path: String::new(),
                 estate: Default::default(),
+                apps: None,
             },
             crate::AskRequest {
                 question: "pick one".into(),

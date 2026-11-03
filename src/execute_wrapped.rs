@@ -9046,6 +9046,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -9178,6 +9179,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -9614,6 +9616,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -9808,6 +9811,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -10174,6 +10178,7 @@ mod tests {
             extra_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
+            apps: None,
         };
         let input = StepInput {
             run_id: format!("armtest-{}", std::process::id()),
@@ -10406,6 +10411,7 @@ mod tests {
             extra_read_roots: Vec::new(),
             project_id: project.map(str::to_string),
             repo_id: None,
+            apps: None,
         };
         let input = |governance: Option<crate::workflow::GovernanceContext>| {
             let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
@@ -11025,6 +11031,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -12730,6 +12737,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             },
             &format!("mcptest-repo-{}", std::process::id()),
         );
@@ -12765,6 +12773,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             },
             &format!("mcptest-norepo-{}", std::process::id()),
         );
@@ -13066,6 +13075,7 @@ mod tests {
                 extra_read_roots: Vec::new(),
                 project_id: None,
                 repo_id: None,
+                apps: None,
             }),
             prior_outputs: vec![],
             elicitation_epoch: 0,
@@ -13193,6 +13203,8 @@ mod tests {
         assert_eq!(
             evaluators,
             vec![
+                "apps-publish/qe",
+                "apps-turn/review",
                 "bug/verify",
                 "demo/review",
                 "docs/check",
@@ -15936,6 +15948,7 @@ mod tests {
             extra_read_roots: vec!["/srv/grounding".to_string()],
             project_id: None,
             repo_id: None,
+            apps: None,
         };
         let input = StepInput {
             run_id: format!("skillsroot-{}", std::process::id()),
@@ -16316,6 +16329,7 @@ tail -c 1500 /work/claude.out
             extra_read_roots: Vec::new(),
             project_id: None,
             repo_id: None,
+            apps: None,
         };
         let input = StepInput {
             run_id: format!("sf1019-{}", uuid::Uuid::new_v4().simple()),
@@ -18648,6 +18662,7 @@ mod ask_config_tests {
             extra_read_roots: vec![],
             project_id: None,
             repo_id: None,
+            apps: None,
         };
         let mut input = StepInput {
             run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),
