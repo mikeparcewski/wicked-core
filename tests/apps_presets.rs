@@ -8,8 +8,11 @@
 //! 2. A fixed creator candidate holding `SELECT query_to_xml($1, true, false, '')` fails the check
 //!    with zero source dispatches: the review never runs and the turn fails, landing nothing.
 //! 3. The launch refusals hold on the real launch path, with nothing persisted.
-//! 4. A publish seats no builder anywhere, takes no QE skip at the gate, and its produce step's
-//!    consent gate takes no approve without a bound QE PASS.
+//! 4. A publish seats no builder anywhere and takes no QE skip at the gate; with a bound QE PASS
+//!    from an isolated reviewer on the run's tree, its consent gate produces exactly once.
+
+// The `wicked-crew` stand-in and the scripted QE turns are POSIX shell and paths.
+#![cfg(unix)]
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -157,6 +160,8 @@ struct ScriptedSeat {
     build: Build,
     review_passes: bool,
     ran: Ran,
+    /// Every governed input the seat was handed (what the engine put in its context).
+    inputs: Inputs,
 }
 impl StepRunner for ScriptedSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
@@ -169,6 +174,7 @@ impl StepRunner for ScriptedSeat {
                 phase.clone(),
                 input.unit.assigned_cli.clone().unwrap_or_default(),
             ));
+            self.inputs.lock().unwrap().push(input.clone());
             if let (Some(wd), "build") = (&input.workdir, phase.as_str()) {
                 let sql = match self.build {
                     Build::SafeQuery => {
@@ -183,6 +189,9 @@ impl StepRunner for ScriptedSeat {
                 )
                 .unwrap();
                 output = "Changed apps.json (kpi-open) and queries/open.sql (open)".to_string();
+            }
+            if let (Some(root), "qe") = (input.unit.qe_ledger_root.as_deref(), phase.as_str()) {
+                output.push_str(&qe_turn(input, Path::new(root)));
             }
             if input.unit.role == wicked_core::PhaseRole::Evaluator && input.unit.tool_cmd.is_none()
             {
@@ -205,6 +214,76 @@ impl StepRunner for ScriptedSeat {
             governed: false,
         }
     }
+}
+
+/// The publish QE unit's two turns, as garden's QE pipeline plays them on a seat with no sub-agent
+/// (DES-QE-EVERY-SEAT): the executor turn records its evidence under the run's ledger root and names
+/// it on a `QE-EVIDENCE:` line; the engine's isolated reviewer turn (its nonce set) records a PASS
+/// stamped with that nonce.
+fn qe_turn(input: &StepInput, root: &Path) -> String {
+    let id = "5d1e7c2a-9b3f-4e8d-a1c6-0f2e4b6d8a9c";
+    match input.unit.qe_review_session.as_deref() {
+        None => {
+            let dir = root.join("evidence").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::create_dir_all(root.join("runs")).unwrap();
+            std::fs::write(dir.join("test-plan.md"), "# publish check evidence\n").unwrap();
+            std::fs::write(dir.join("scenario.md"), "# every page, filter and card\n").unwrap();
+            std::fs::write(dir.join("evidence.json"), "{}\n").unwrap();
+            std::fs::write(
+                root.join("runs").join(format!("{id}.json")),
+                serde_json::json!({
+                    "id": id, "created_at": iso_now(),
+                    "status": "running", "crew_run_id": input.run_id,
+                    "evidence_path": dir.to_string_lossy(),
+                })
+                .to_string(),
+            )
+            .unwrap();
+            format!("\nQE-EVIDENCE: {}", dir.display())
+        }
+        Some(nonce) => {
+            let verdicts = root.join("verdicts");
+            std::fs::create_dir_all(&verdicts).unwrap();
+            std::fs::write(
+                verdicts.join("v-review.json"),
+                serde_json::json!({
+                    "id": "v-review", "created_at": iso_now(),
+                    "run_id": id,
+                    "verdict": "PASS", "crew_run_id": input.run_id,
+                    "review_session": nonce,
+                })
+                .to_string(),
+            )
+            .unwrap();
+            String::new()
+        }
+    }
+}
+
+fn iso_now() -> String {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    let (days, rem) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000));
+    // Civil date from days (H. Hinnant's algorithm).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}.{:03}Z",
+        rem / 3_600_000,
+        rem / 60_000 % 60,
+        rem / 1000 % 60,
+        rem % 1000
+    )
 }
 
 fn cli(key: &str) -> AgenticCli {
@@ -265,8 +344,14 @@ fn app_repo(name: &str) -> PathBuf {
 
 /// `(phase, seat)` for every governed unit the scripted seat ran.
 type Ran = Arc<Mutex<Vec<(String, String)>>>;
+type Inputs = Arc<Mutex<Vec<StepInput>>>;
 
 fn core_with(name: &str, build: Build, review_passes: bool) -> (Core, Ran, String) {
+    let (core, ran, _inputs, repo) = core_full(name, build, review_passes);
+    (core, ran, repo)
+}
+
+fn core_full(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Inputs, String) {
     install_crew_stub();
     let dir = std::env::temp_dir().join(format!(
         "wicked-core-apps-db-{name}-{}-{:?}",
@@ -276,6 +361,7 @@ fn core_with(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Strin
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let ran = Arc::new(Mutex::new(Vec::new()));
+    let inputs = Arc::new(Mutex::new(Vec::new()));
     let core = Core::spawn_with_engine(
         dir.join("estate.db").to_str().unwrap().to_string(),
         Arc::new(StubDispatcher),
@@ -283,6 +369,7 @@ fn core_with(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Strin
             build,
             review_passes,
             ran: ran.clone(),
+            inputs: inputs.clone(),
         }),
     );
     let repo = app_repo(name);
@@ -293,7 +380,23 @@ fn core_with(name: &str, build: Build, review_passes: bool) -> (Core, Ran, Strin
             registered_at: 1,
         })
         .expect("register");
-    (core, ran, entry.id)
+    (core, ran, inputs, entry.id)
+}
+
+/// Every governed unit the engine dispatched carried the run's Apps marker (the registry-tool ban
+/// rides it), from the session's contract, on every agent turn — the QE reviewer turn included.
+fn assert_every_input_carries_the_ban(inputs: &Inputs, preset: &str) {
+    let inputs = inputs.lock().unwrap();
+    assert!(!inputs.is_empty());
+    for i in inputs.iter() {
+        assert_eq!(
+            i.governance.as_ref().and_then(|g| g.apps.as_deref()),
+            Some(preset),
+            "unit {:?} (reviewer turn: {})",
+            i.unit.phase_id(),
+            i.unit.qe_review_session.is_some()
+        );
+    }
 }
 
 fn spec(run_id: &str, workflow: &str, repo: &str, clis: &[&str]) -> LaunchSpec {
@@ -384,12 +487,13 @@ fn ran_phases(ran: &Ran) -> Vec<String> {
 /// review's gate receipt names the tree it judged — the tree the check offered.
 #[test]
 fn a_turn_lands_only_after_a_distinct_seat_review_naming_its_tree() {
-    let (core, ran, repo) = core_with("lands", Build::SafeQuery, true);
+    let (core, ran, inputs, repo) = core_full("lands", Build::SafeQuery, true);
     let events = core.subscribe();
     core.launch_run(spec("r-lands", "apps-turn", &repo, &["claude", "codex"]))
         .expect("launch");
     assert!(wait_status(&core, "r-lands", SessionStatus::Completed));
     let evs = drain(&events);
+    assert_every_input_carries_the_ban(&inputs, "apps-turn");
     let v = view(&core, "r-lands");
     assert_eq!(
         v.session.assurance.apps.as_ref().map(|a| a.preset.as_str()),
@@ -527,13 +631,21 @@ fn apps_launch_refusals_persist_nothing() {
     reduced.reduced_assurance = true;
     let mut skip = spec("r-skip", "apps-publish", &repo, &["claude", "codex"]);
     skip.qe_acceptance = QeOverride::Skip("ship it".into());
+    let evidence = std::env::temp_dir().join(format!(
+        "wicked-core-apps-refusal-evidence-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&evidence).unwrap();
     let mut builders = spec("r-builders", "apps-publish", &repo, &["claude", "codex"]);
     builders.exclude_seats = vec!["claude".into(), "codex".into()];
+    builders.evidence_root = Some(evidence.to_string_lossy().into_owned());
+    let no_evidence = spec("r-no-evidence", "apps-publish", &repo, &["claude", "codex"]);
     let lonely = spec("r-lonely", "apps-turn", &repo, &["claude"]);
     for (s, want) in [
         (reduced, "reduced-assurance"),
         (skip, "cannot be skipped"),
         (builders, "built a turn since the last publish"),
+        (no_evidence, "evidence root"),
         (lonely, "distinct from its builder"),
     ] {
         let id = s.session_id.clone();
@@ -550,13 +662,27 @@ fn apps_launch_refusals_persist_nothing() {
     }
 }
 
-/// A publish seats no builder anywhere; its QE is forced, a gate skip is refused, and the produce
-/// step's consent gate takes no approve without a bound QE PASS — so produce never runs.
+/// A publish seats no builder anywhere, its QE is forced, and a gate skip is refused. With a bound
+/// QE PASS (the QE executor's evidence reviewed by the engine's isolated reviewer on a third seat,
+/// on the tree the run holds), the approve produces exactly once and the publish completes.
 #[test]
-fn a_publish_refuses_qe_skips_and_produces_only_after_a_qe_pass() {
-    let (core, ran, repo) = core_with("publish", Build::SafeQuery, true);
-    let mut s = spec("r-publish", "apps-publish", &repo, &["claude", "codex"]);
+fn a_publish_produces_once_after_a_bound_qe_pass_and_takes_no_skip() {
+    let (core, ran, inputs, repo) = core_full("publish", Build::SafeQuery, true);
+    let evidence = std::env::temp_dir().join(format!(
+        "wicked-core-apps-evidence-{}-{:?}",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    let _ = std::fs::remove_dir_all(&evidence);
+    std::fs::create_dir_all(&evidence).unwrap();
+    let mut s = spec(
+        "r-publish",
+        "apps-publish",
+        &repo,
+        &["claude", "codex", "pi"],
+    );
     s.exclude_seats = vec!["claude".into()];
+    s.evidence_root = Some(evidence.to_string_lossy().into_owned());
     core.launch_run(s).expect("launch");
     assert!(wait_status(
         &core,
@@ -574,12 +700,38 @@ fn a_publish_refuses_qe_skips_and_produces_only_after_a_qe_pass() {
         .benched_seats
         .iter()
         .any(|b| b.cli == "claude" && b.source == "apps"));
-    for (phase, seat) in ran.lock().unwrap().iter() {
-        assert_ne!(seat, "claude", "{phase} ran on a builder seat");
-    }
     // Paused at the produce step's consent gate (unit 3), with produce not run.
     assert_eq!(v.session.unit_ix, 2, "{:?}", v.session);
     assert!(!crew_log("r-publish").contains("apps-produce"));
+    // The QE executor and its isolated reviewer: two seats, neither a builder.
+    let seats = |reviewer: bool| -> Vec<String> {
+        inputs
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|i| i.unit.phase_id() == Some("qe"))
+            .filter(|i| i.unit.qe_review_session.is_some() == reviewer)
+            .filter_map(|i| i.unit.assigned_cli.clone())
+            .collect()
+    };
+    let (executor, reviewer) = (seats(false), seats(true));
+    assert!(
+        !executor.is_empty() && !reviewer.is_empty(),
+        "{executor:?} {reviewer:?}"
+    );
+    for seat in executor.iter().chain(reviewer.iter()) {
+        assert_ne!(seat, "claude", "a builder seat took a QE turn");
+    }
+    assert!(
+        reviewer.iter().all(|r| !executor.contains(r)),
+        "{executor:?} {reviewer:?}"
+    );
+    for (phase, seat) in ran.lock().unwrap().iter() {
+        assert_ne!(seat, "claude", "{phase} ran on a builder seat");
+    }
+    assert_every_input_carries_the_ban(&inputs, "apps-publish");
+    // A gate skip is refused; nothing moved. (Every answer but reject is refused at this gate while
+    // no bound PASS exists: `apps::tests::the_produce_consent_gate_refuses_an_approve_without_a_qe_pass`.)
     let err = core
         .confirm_gate(
             "r-publish",
@@ -589,23 +741,21 @@ fn a_publish_refuses_qe_skips_and_produces_only_after_a_qe_pass() {
         )
         .unwrap_err();
     assert!(format!("{err:#}").contains("cannot be skipped"), "{err:#}");
-    let err = core
-        .confirm_gate(
-            "r-publish",
-            HumanDecision::Approve {
-                amend: None,
-                amend_scope: Default::default(),
-            },
-        )
-        .unwrap_err();
-    assert!(format!("{err:#}").contains("bound QE PASS"), "{err:#}");
-    std::thread::sleep(Duration::from_millis(300));
-    assert_eq!(
-        view(&core, "r-publish").session.status,
-        SessionStatus::AwaitingHuman
-    );
-    assert!(
-        !crew_log("r-publish").contains("apps-produce"),
-        "produce never ran"
-    );
+    assert!(!crew_log("r-publish").contains("apps-produce"));
+    // The bound PASS opens the consent gate: produce runs once, and the publish completes.
+    core.confirm_gate(
+        "r-publish",
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        },
+    )
+    .expect("a bound QE PASS on the run's tree opens the consent gate");
+    assert!(wait_status(&core, "r-publish", SessionStatus::Completed));
+    let produced = crew_log("r-publish")
+        .lines()
+        .filter(|l| l.contains("argv=apps-produce"))
+        .count();
+    assert_eq!(produced, 1, "{}", crew_log("r-publish"));
+    let _ = std::fs::remove_dir_all(&evidence);
 }

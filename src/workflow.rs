@@ -878,6 +878,15 @@ fn tool_binary_resolves(bin: &str) -> bool {
     if bin == "wicked-core" {
         return crate::execute_wrapped::resolve_wicked_core_exe_opt().is_some();
     }
+    // (DES-APPS-001 K0) crew's CLI resolves where the Tool spawn finds it (`WICKED_CREW_BIN`, else
+    // PATH): one resolver for the preflight and the spawn.
+    let crew;
+    let bin = if bin == crate::apps::CREW_BIN {
+        crew = crate::apps::crew_bin();
+        crew.as_str()
+    } else {
+        bin
+    };
     let p = std::path::Path::new(bin);
     if p.components().count() > 1 || p.is_absolute() {
         return p.is_file();

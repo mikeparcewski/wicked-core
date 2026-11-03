@@ -7013,6 +7013,42 @@ impl FloorCheckout {
 
 /// The fail-closed report for a verify floor whose guarded checkout could not be made: nothing
 /// ran, and the floor does not pass.
+/// (DES-APPS-001 K0) The floor's report for a unit of an Apps run: nothing ran, by design. An app
+/// repository holds data (`apps.json`, `queries/`), checked by crew's fixed `apps-check`; a manifest
+/// a builder planted there would otherwise be run by this floor before that check refuses it.
+/// Passed, with no check run and the reason as a skipped entry (the gate's receipt then says the
+/// repository's checks were not applicable).
+pub(crate) fn apps_repository_report(worktree: &Path) -> RepoChecksReport {
+    let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
+    RepoChecksReport {
+        detected: Vec::new(),
+        checks: Vec::new(),
+        skipped: vec![
+            "the repository's own checks: an Apps repository is data, checked by crew's \
+             apps-check, and nothing in it runs"
+                .to_string(),
+        ],
+        passed: true,
+        detect_error: None,
+        sandbox_level: sandbox.level.as_wire().to_string(),
+        sandbox_note: sandbox.downgrade_reason.clone(),
+        sandbox_error: None,
+        engine_writes_removed: Vec::new(),
+        claim: None,
+        env: None,
+        tree: None,
+        rerun: None,
+        waived: Vec::new(),
+        requested_rerun: None,
+        recheck: None,
+        coverage_note: None,
+        key: None,
+        resumed: None,
+        reused_from: None,
+        runner: None,
+    }
+}
+
 pub(crate) fn guarded_checkout_refused(
     worktree: &Path,
     ctx: &FloorContext,

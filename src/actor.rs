@@ -1462,7 +1462,11 @@ pub(crate) fn run(
                     let floor = crate::apps::floor_env();
                     let apps = crate::apps::admit(
                         &store,
-                        &crate::apps::LaunchFacts::of(&spec, floor.as_deref()),
+                        &crate::apps::LaunchFacts::of(
+                            &spec,
+                            floor.as_deref(),
+                            in_process_governance().is_some(),
+                        ),
                     )?;
                     let launch_plan = crate::plan_gate::launch_plan(
                         &store,
@@ -1648,6 +1652,7 @@ pub(crate) fn run(
                         benched_seats: crate::apps::with_exclusion_benches(
                             apps.as_ref(),
                             &spec.exclude_seats,
+                            &spec.clis,
                             crate::distribute::launch_benched(
                                 &spec.clis,
                                 repo_ref.is_some(),
@@ -4865,7 +4870,11 @@ pub(crate) fn launch_run_inner(
         let floor = crate::apps::floor_env();
         crate::apps::admit(
             &*store,
-            &crate::apps::LaunchFacts::of(&spec, floor.as_deref()),
+            &crate::apps::LaunchFacts::of(
+                &spec,
+                floor.as_deref(),
+                in_process_governance().is_some(),
+            ),
         )?;
     }
     // If the run targets a registered repo, create its isolated worktree first.
@@ -10673,16 +10682,6 @@ fn dispatch_unit(
     let Some(mut unit) = units.get(unit_ix).cloned() else {
         return Ok(false);
     };
-    // (DES-APPS-001 K0) An Apps run's agent units run on the container floor only. The launch
-    // refused the host floor; a daemon restarted onto another floor since then refuses the
-    // dispatch here, before anything runs (a Tool unit is the engine's own command).
-    if unit.tool_cmd.is_none() {
-        if let Some(why) = crate::apps::run_preset(&session)
-            .and_then(|p| crate::apps::floor_refusal(p, crate::apps::floor_env().as_deref()))
-        {
-            anyhow::bail!("unit {} of run {run_id} is refused: {why}", unit.ord);
-        }
-    }
     // (wicked-crew#951) QE LEDGER ROOT — where the run's QE unit records its acceptance verdict:
     // `<evidence root>/.wicked-qe`, outside every worktree (the guard discarded a verdict written
     // into the tree, with the PASS) and exactly where the launcher's acceptance check reads the
@@ -11339,6 +11338,23 @@ fn dispatch_unit(
     if session.power.is_some() && review_of.is_none() {
         power_gate::on_dispatch(store, subscribers, run_id, &dispatched_unit);
     }
+    // (DES-APPS-001 K0) THE Apps dispatch guard, on the unit's FINAL seat (after every reseat
+    // above), for every path that reaches a unit (launch, approve, retry, reassign, resume): an
+    // agent unit runs only contained and governed, never on a publish's excluded builder seat,
+    // and a publish's produce step only past its QE backstop. Nothing has run yet.
+    if let Some(why) = crate::apps::dispatch_refusal(
+        &session,
+        &units,
+        &dispatched_unit,
+        crate::apps::floor_env().as_deref(),
+        in_process_governance().is_some(),
+        || current_worktree_tree(&*store, &session),
+    ) {
+        anyhow::bail!(
+            "unit {} of run {run_id} is refused: {why}",
+            dispatched_unit.ord
+        );
+    }
     let input = StepInput {
         run_id: run_id.to_string(),
         unit_ix,
@@ -11497,17 +11513,11 @@ fn dispatch_unit(
         // set it, and the command carries the unit's capability token so crew's route knows which
         // run, unit and attempt is asking. The guards live until the command exits.
         let apps_tool = crate::apps::run_preset(&session).is_some();
-        let cmd = if apps_tool {
-            crate::apps::resolve_tool_cmd(
-                &cmd,
-                std::env::var(crate::apps::CREW_BIN_ENV).ok().as_deref(),
-            )
-        } else {
-            cmd
-        };
         let apps_channel = apps_tool
             .then(|| crate::mcp_gate::arm_tool_unit_channel(&input))
             .flatten();
+        // No token, no command: crew's route authenticates the unit by it.
+        let apps_unarmed = apps_tool && apps_channel.is_none();
         std::thread::spawn(move || {
             let (_apps_token, _apps_binding, apps_env) = match apps_channel {
                 Some((t, b, env)) => (Some(t), Some(b), env),
@@ -11570,6 +11580,14 @@ fn dispatch_unit(
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
+                // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
+                _ if apps_unarmed => (
+                    "wicked-core: refused: an Apps run's Tool command runs only with its unit's \
+                     capability token, and none could be armed (no input governance or no broker \
+                     URL on this daemon)"
+                        .to_string(),
+                    crate::workflow::StepStatus::Failed,
+                ),
                 Ok(admitted) => {
                     // The generation the RUN was judged against, reported like a handoff
                     // (`path: "tool_cmd"`): the log line for the operator and the event crew's
@@ -12355,6 +12373,11 @@ fn run_tool_cmd_jailed(
     let resolved_bin;
     let bin: &str = if bin == "wicked-core" {
         resolved_bin = crate::execute_wrapped::resolve_wicked_core_exe();
+        &resolved_bin
+    } else if bin == crate::apps::CREW_BIN {
+        // (DES-APPS-001 K0) crew's CLI, where crew said it is (`WICKED_CREW_BIN`) — the resolver the
+        // launch preflight reads too.
+        resolved_bin = crate::apps::crew_bin();
         &resolved_bin
     } else {
         bin
@@ -13747,15 +13770,15 @@ pub(crate) fn confirm_gate_as(
     // unit holds a bound QE PASS on a required decision. Whatever let the QE unit count without
     // one — a skip, a judgment, an override — the produce step never runs on it.
     if consent_ord.is_some()
-        && matches!(
-            decision,
-            crate::workflow::HumanDecision::Approve { .. }
-                | crate::workflow::HumanDecision::ConsentChoice { .. }
-        )
+        && !matches!(decision, crate::workflow::HumanDecision::Reject)
+        && crate::apps::is_publish(&session)
     {
         let units = crate::domain::session_units(&*store, run_id)?;
-        if let Some(why) = crate::apps::publish_consent_refusal(&session, &units) {
-            anyhow::bail!("run {run_id}'s consent gate cannot be approved: {why}");
+        let tree = current_worktree_tree(&*store, &session);
+        if let Some(why) = crate::apps::publish_consent_refusal(&session, &units, tree.as_deref()) {
+            anyhow::bail!(
+                "run {run_id}'s consent gate takes only reject until it can produce: {why}"
+            );
         }
     }
     let decision = match consent_ord {
@@ -15153,6 +15176,24 @@ fn apply_suggestion(
         },
         m.suggestion_ref.as_deref().unwrap_or("the suggestion ref")
     ))
+}
+
+/// (DES-APPS-001 K0) The tree the run's worktree holds now (`None` for a repo-less run or one the
+/// snapshot cannot read): what an Apps publish's QE PASS must have been taken on.
+fn current_worktree_tree(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+) -> Option<String> {
+    let wd = session.workdir.as_deref()?;
+    let repo = crate::repo::get_repo(store, session.repo_ref.as_deref()?)
+        .ok()
+        .flatten()?;
+    crate::worktree_guard::snapshot(
+        std::path::Path::new(wd),
+        std::path::Path::new(&repo.root_path),
+    )
+    .ok()
+    .map(|s| s.tree)
 }
 
 /// (operator ruling 2026-10-11) Whether the operator's plain approve at `u`'s gate IS the judgment:

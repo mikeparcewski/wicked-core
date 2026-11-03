@@ -29,7 +29,7 @@
    "depends_on": [
     "check"
    ],
-   "instructions": "Follow the wicked-garden-apps skill's review action. You judge a turn another seat built; change no file. Read the diff from the run's base to the tree you are on, the whole apps.json, queries/ and apps.lock.json at that tree, the check's output and its fixture contact sheet. Judge: the change does what the message asked and nothing else; every query is a read the person would expect; every action is declared, visible and lands without a grant; no value from any data source appears anywhere; nothing outside apps.json and queries/ changed. You have no source tool and need none. Name the tree you judged (git rev-parse HEAD^{tree}) on a line `TREE: <id>` before your verdict."
+   "instructions": "Follow the wicked-garden-apps skill's review action. You judge a turn another seat built; change no file. Read the diff from the run's base to the tree you are on, the whole apps.json, queries/ and apps.lock.json at that tree, the check's output and its fixture contact sheet. Judge: the change does what the message asked and nothing else; every query is a read the person would expect; every action is declared, visible and lands without a grant; no value from any data source appears anywhere; nothing outside apps.json and queries/ changed, except apps.lock.json, which crew's check writes and commits (judge that it matches the queries and actions it pins). You have no source tool and need none. Name the tree you judged (git rev-parse HEAD^{tree}) on a line `TREE: <id>` before your verdict."
   }
  ]
 }

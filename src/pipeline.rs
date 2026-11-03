@@ -43,6 +43,14 @@ pub fn run_session(
     workflow: Option<&str>,
     emit: &mut dyn FnMut(CoreEvent),
 ) -> anyhow::Result<SessionResult> {
+    // (DES-APPS-001 K0) The straight-through driver runs no Tool command, honours no consent gate
+    // and admits nothing: an Apps preset is refused here, never run as if it were checked.
+    if let Some(w) = workflow.filter(|w| crate::apps::is_apps_preset(w)) {
+        anyhow::bail!(
+            "`{w}` must be launched with launch_run: the straight-through driver runs no check, \
+             review gate or consent"
+        );
+    }
     // Clear any prior run's per-run governance dir for this session id (the sync driver, like
     // launch_run_inner, must not inherit a stale decisions log — a leftover Deny would spuriously fail
     // this run; council [14]). A brand-new id is a harmless no-op.
@@ -450,6 +458,7 @@ pub(crate) fn pre_distribute(
     let worktree_bench = crate::apps::with_exclusion_benches(
         apps.as_ref(),
         &exclude_seats,
+        clis,
         crate::distribute::launch_benched(
             clis,
             repo_ref.is_some(),

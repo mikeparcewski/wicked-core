@@ -92,8 +92,20 @@ impl AppsContract {
 
 /// The launch facts admission judges, as every launch route spells them.
 pub(crate) struct LaunchFacts<'a> {
+    /// The launch's run id (named on a typed refusal).
+    pub run_id: &'a str,
     pub workflow: Option<&'a str>,
     pub project_id: Option<&'a str>,
+    /// The launch names a registered repository (the app's repo).
+    pub repo: bool,
+    /// The launch minted an evidence root (where a publish's QE verdict is recorded).
+    pub evidence_root: bool,
+    /// Input governance is armed on this engine (`actor::in_process_governance`): without it no
+    /// unit carries the registry-tool ban and no seat is contained.
+    pub governed: bool,
+    /// The daemon has a broker URL (`WICKED_CREW_URL`): the check and produce Tools reach crew's
+    /// route with their unit's token through it.
+    pub crew_url: bool,
     pub plan: bool,
     pub reduced_assurance: bool,
     pub power: bool,
@@ -106,10 +118,20 @@ pub(crate) struct LaunchFacts<'a> {
 }
 
 impl<'a> LaunchFacts<'a> {
-    pub(crate) fn of(spec: &'a crate::LaunchSpec, floor: Option<&'a str>) -> Self {
+    /// The facts of `spec` on this engine: `floor` is `WICKED_SEAT_FLOOR`, `governed` whether input
+    /// governance is armed on the calling (actor) thread.
+    pub(crate) fn of(spec: &'a crate::LaunchSpec, floor: Option<&'a str>, governed: bool) -> Self {
         LaunchFacts {
+            run_id: &spec.session_id,
             workflow: spec.workflow.as_deref(),
             project_id: spec.project_id.as_deref(),
+            repo: spec.repo_ref.is_some(),
+            evidence_root: spec
+                .evidence_root
+                .as_deref()
+                .is_some_and(|r| !r.trim().is_empty()),
+            governed,
+            crew_url: crate::mcp_gate::daemon_crew_url().is_some_and(|u| !u.trim().is_empty()),
             plan: spec.plan.is_some(),
             reduced_assurance: spec.reduced_assurance,
             power: spec.power,
@@ -142,6 +164,20 @@ pub(crate) fn floor_refusal(preset: &str, floor: Option<&str>) -> Option<String>
     })
 }
 
+/// A launch of an Apps preset that may not run, refused before anything is persisted. Typed, so a
+/// caller that retries transient faults (the bus launch bridge) drops it: the same launch is
+/// refused the same way every time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppsLaunchRefused(pub String);
+
+impl std::fmt::Display for AppsLaunchRefused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AppsLaunchRefused {}
+
 /// (Launch admission) The Apps contract of a launch, or `None` when it names no Apps preset;
 /// `Err` (nothing persisted) when it does and may not run. Every launch route calls this before
 /// it writes anything.
@@ -152,7 +188,11 @@ pub(crate) fn admit(
     let Some(name) = f.workflow.filter(|w| is_apps_preset(w)) else {
         return Ok(None);
     };
-    let refuse = |why: String| anyhow::anyhow!("the `{name}` launch is refused: {why}");
+    let refuse = |why: String| {
+        anyhow::Error::new(AppsLaunchRefused(format!(
+            "the `{name}` launch is refused: {why}"
+        )))
+    };
     match crate::preset::resolve(store, f.project_id, name)? {
         Some(p) if p.created_by == crate::preset::BUILTIN_CREATED_BY => {}
         Some(p) => {
@@ -173,6 +213,26 @@ pub(crate) fn admit(
     }
     if let Some(why) = floor_refusal(name, f.floor) {
         return Err(refuse(why));
+    }
+    if !f.governed {
+        return Err(refuse(
+            "input governance is not armed on this engine (a file-backed store), so no unit could \
+             carry the registry-tool ban or run contained"
+                .into(),
+        ));
+    }
+    if !f.crew_url {
+        return Err(refuse(
+            "the daemon has no broker URL (WICKED_CREW_URL), so crew's check could not be called \
+             with its unit's token"
+                .into(),
+        ));
+    }
+    if !f.repo {
+        return Err(refuse(
+            "an Apps run works in its app's registered repository, and this launch names none"
+                .into(),
+        ));
     }
     if f.reduced_assurance {
         return Err(refuse(
@@ -201,6 +261,13 @@ pub(crate) fn admit(
                 "QE acceptance cannot be skipped on a publish (it is forced by the preset)".into(),
             ));
         }
+        if !f.evidence_root {
+            return Err(refuse(
+                "a publish records its QE verdict under the run's evidence root, and this launch \
+                 minted none"
+                    .into(),
+            ));
+        }
     } else if !matches!(f.qe, QeOverride::Auto | QeOverride::Standing(_)) {
         return Err(refuse(
             "an Apps turn has no QE acceptance to skip or force (its review is the distinct seat)"
@@ -209,29 +276,36 @@ pub(crate) fn admit(
     }
     // The seats the run could seat, as distribution will see them: the roster's work seats minus
     // the launcher's unusable ones, minus (on a publish) the builder exclusion.
-    let mut benched = crate::distribute::launcher_benched(f.clis);
-    for b in exclusion_benches(&contract, f.exclude_seats) {
+    let mut benched = exclusion_benches(&contract, f.exclude_seats, f.clis);
+    for b in crate::distribute::launcher_benched(f.clis) {
         crate::domain::bench_seat(&mut benched, b);
     }
     let eligible = crate::distribute::eligible_seats(f.clis, &benched).len();
-    if contract.publish() && eligible == 0 && !f.clis.is_empty() {
+    if contract.publish() && eligible == 0 {
         return Err(anyhow::Error::new(crate::actor::NoEligibleSeat {
-            run_id: name.to_string(),
+            run_id: f.run_id.to_string(),
             benched: crate::domain::benched_summary(&benched, f.clis.len()).unwrap_or_default(),
             benched_seats: benched,
         })
-        .context(refuse(
-            "every seat built a turn since the last publish, and the QE seat must have built none \
-             — add a seat that did not build, then publish"
-                .into(),
+        .context(format!(
+            "the `{name}` launch is refused: every seat built a turn since the last publish, and \
+             the QE seats must have built none — add seats that did not build, then publish"
         )));
     }
-    if !contract.publish() && eligible < 2 {
-        return Err(refuse(format!(
-            "a turn is reviewed by a seat distinct from its builder, and this roster has {eligible} \
-             usable seat{} — add a seat, or edit the app directly",
-            if eligible == 1 { "" } else { "s" }
-        )));
+    // A publish's QE runs on one seat and its evidence is reviewed, in isolation, on another
+    // (`qe_acceptance::review`); a turn's review is a seat distinct from its builder.
+    if eligible < 2 {
+        return Err(refuse(if contract.publish() {
+            "a publish's QE runs on one seat that built none of the turns and is reviewed on \
+             another, and this roster has 1 such seat — add a seat"
+                .to_string()
+        } else {
+            format!(
+                "a turn is reviewed by a seat distinct from its builder, and this roster has \
+                 {eligible} usable seat{} — add a seat, or edit the app directly",
+                if eligible == 1 { "" } else { "s" }
+            )
+        }));
     }
     Ok(Some(contract))
 }
@@ -298,16 +372,28 @@ pub(crate) fn contract(
     Ok(run)
 }
 
-/// (QE builder exclusion) The benches a publish's launch exclusion becomes: one per named seat,
-/// never lifting by itself (`seat_bench` re-probes quota benches only). Empty on a turn.
-pub(crate) fn exclusion_benches(apps: &AppsContract, exclude_seats: &[String]) -> Vec<BenchedSeat> {
+/// (QE builder exclusion) The benches a publish's launch exclusion becomes: one per roster seat it
+/// names — by seat key, or by CLI key for every instance of that CLI, the rule the QE reviewer's
+/// seating reads (`qe_acceptance::review::candidates`) — never lifting by itself (`seat_bench`
+/// re-probes quota benches only). Empty on a turn.
+pub(crate) fn exclusion_benches(
+    apps: &AppsContract,
+    exclude_seats: &[String],
+    roster: &[crate::AgenticCli],
+) -> Vec<BenchedSeat> {
     if !apps.publish() {
         return Vec::new();
     }
-    crate::domain::normalize_exclude_seats(exclude_seats)
-        .into_iter()
-        .map(|cli| BenchedSeat {
-            cli,
+    let excluded = crate::domain::normalize_exclude_seats(exclude_seats);
+    roster
+        .iter()
+        .filter(|c| {
+            excluded
+                .iter()
+                .any(|e| *e == c.key || e == crate::team::runner::seat_key(&c.key))
+        })
+        .map(|c| BenchedSeat {
+            cli: c.key.clone(),
             reason: EXCLUSION_BENCH_REASON.to_string(),
             source: EXCLUSION_BENCH_SOURCE.to_string(),
             governed_only: false,
@@ -323,12 +409,13 @@ pub(crate) fn exclusion_benches(apps: &AppsContract, exclude_seats: &[String]) -
 pub(crate) fn with_exclusion_benches(
     apps: Option<&AppsContract>,
     exclude_seats: &[String],
+    roster: &[crate::AgenticCli],
     bench: Vec<BenchedSeat>,
 ) -> Vec<BenchedSeat> {
     let Some(apps) = apps else {
         return bench;
     };
-    let mut out = exclusion_benches(apps, exclude_seats);
+    let mut out = exclusion_benches(apps, exclude_seats, roster);
     for b in bench {
         crate::domain::bench_seat(&mut out, b);
     }
@@ -355,7 +442,8 @@ pub(crate) fn reassign_refusal(session: &AgentSession, cli: &str) -> Option<Stri
         .any(|b| b.cli == cli)
         .then(|| {
             format!(
-                "cannot reassign to '{cli}': it {EXCLUSION_BENCH_REASON} — reassign to a seat that                  built none of this app's turns, or stop the run"
+                "seat '{cli}' {EXCLUSION_BENCH_REASON}, so no unit of this publish runs there — \
+                 reassign to a seat that built none of this app's turns, or stop the run"
             )
         })
 }
@@ -374,29 +462,31 @@ pub(crate) fn is_publish(session: &AgentSession) -> bool {
         .is_some_and(AppsContract::publish)
 }
 
-/// The argv a Tool unit of an Apps run spawns: `wicked-crew` resolved through [`CREW_BIN_ENV`]
-/// (crew under `npx` has no `wicked-crew` on PATH), every other argv as written.
-pub(crate) fn resolve_tool_cmd(cmd: &[String], crew_bin: Option<&str>) -> Vec<String> {
-    let mut out = cmd.to_vec();
-    if let (Some(first), Some(bin)) = (
-        out.first_mut(),
-        crew_bin.map(str::trim).filter(|b| !b.is_empty()),
-    ) {
-        if first == CREW_BIN {
-            *first = bin.to_string();
-        }
-    }
-    out
+/// The binary a Tool command's `wicked-crew` runs: `WICKED_CREW_BIN` when crew set it (crew under
+/// `npx` has no `wicked-crew` on PATH), else `wicked-crew` from PATH. The one resolver the launch
+/// preflight and the Tool spawn both read, as `wicked-core` has its own.
+pub(crate) fn crew_bin_from(env: Option<&str>) -> String {
+    env.map(str::trim)
+        .filter(|b| !b.is_empty())
+        .unwrap_or(CREW_BIN)
+        .to_string()
 }
 
-/// (The publish QE backstop) Why the consent gate before an Apps publish's produce step may not be
-/// approved, or `None` when it may: the run's QE decision is required (never skipped or waived)
-/// and its QE unit holds a bound QE PASS. Every path that could let the QE unit count without one
-/// — an operator's skip, an operator's judgment at a gate no reviewer could rule, a floor
-/// override — ends here: produce runs only after the consent gate.
+/// [`crew_bin_from`] the process's [`CREW_BIN_ENV`].
+pub(crate) fn crew_bin() -> String {
+    crew_bin_from(std::env::var(CREW_BIN_ENV).ok().as_deref())
+}
+
+/// (The publish QE backstop) Why an Apps publish may not produce, or `None` when it may: the run's
+/// QE decision is required (never skipped or waived), and its QE unit holds a bound QE PASS that an
+/// isolated reviewer on a seat distinct from the QE executor recorded, taken on the tree the run
+/// holds now (`current_tree`; `None` = unreadable, refused). Checked at the produce step's consent
+/// gate and again when the produce step dispatches, so no answer, skip, judgment or override lets
+/// produce run without one.
 pub(crate) fn publish_consent_refusal(
     session: &AgentSession,
     units: &[WorkUnit],
+    current_tree: Option<&str>,
 ) -> Option<String> {
     if !is_publish(session) {
         return None;
@@ -419,24 +509,98 @@ pub(crate) fn publish_consent_refusal(
                 ))
         ));
     }
-    let qe = units
+    let Some(qe) = units
         .iter()
-        .find(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none());
-    let pass = qe.and_then(|u| u.qe_review.as_ref()).is_some_and(|r| {
-        r.outcome == crate::qe_acceptance::review::OUTCOME_PASS && r.verdict.is_some()
-    });
-    (!pass).then(|| {
-        format!(
-            "an Apps publish produces only after a bound QE PASS, and {}",
-            match qe {
-                None => "the run has no QE unit".to_string(),
-                Some(u) => match u.qe_review.as_ref() {
-                    None => format!("QE unit {} has no reviewer record", u.ord),
-                    Some(r) => format!("QE unit {}'s reviewer record is `{}`", u.ord, r.outcome),
-                },
+        .find(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none())
+    else {
+        return Some(
+            "an Apps publish produces only after QE acceptance, and the run has no QE unit".into(),
+        );
+    };
+    let Some(r) = qe.qe_review.as_ref() else {
+        return Some(format!(
+            "an Apps publish produces only after a bound QE PASS, and QE unit {} has no reviewer \
+             record",
+            qe.ord
+        ));
+    };
+    if r.outcome != crate::qe_acceptance::review::OUTCOME_PASS || r.verdict.is_none() {
+        return Some(format!(
+            "an Apps publish produces only after a bound QE PASS, and QE unit {}'s reviewer \
+             record is `{}`",
+            qe.ord, r.outcome
+        ));
+    }
+    // The verdict's reviewer: the last turn that recorded one, on a seat distinct from the
+    // executor — never the executor's own seat standing in (`BASIS_EXECUTOR`).
+    let distinct = r
+        .attempts
+        .iter()
+        .rev()
+        .find(|a| a.status == "verdict")
+        .is_some_and(|a| {
+            a.basis == crate::qe_acceptance::review::BASIS_DISTINCT
+                && qe.assigned_cli.as_deref() != Some(a.seat.as_str())
+        });
+    if !distinct {
+        return Some(format!(
+            "an Apps publish produces only after its QE evidence was reviewed on a seat distinct \
+             from the QE executor, and QE unit {}'s PASS was not",
+            qe.ord
+        ));
+    }
+    match (r.tree.as_deref(), current_tree) {
+        (Some(judged), Some(now)) if judged == now => None,
+        (judged, now) => Some(format!(
+            "an Apps publish produces exactly the tree its QE accepted, and QE unit {} accepted {} \
+             while the run holds {}",
+            qe.ord,
+            judged.unwrap_or("no recorded tree"),
+            now.unwrap_or("an unreadable tree")
+        )),
+    }
+}
+
+/// (DES-APPS-001 K0) Why the engine refuses to dispatch `unit` of an Apps run, or `None`. Every
+/// path that reaches a unit (a launch, an approve, a retry, a reassign, a resume after a restart)
+/// dispatches through here:
+/// - an agent unit runs only on the container floor (`floor`), with input governance armed
+///   (`governed`: the registry-tool ban rides it);
+/// - no unit of a publish runs on a seat its builder exclusion benched;
+/// - a publish's produce step (a Tool after its QE unit) runs only past [`publish_consent_refusal`].
+pub(crate) fn dispatch_refusal(
+    session: &AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+    floor: Option<&str>,
+    governed: bool,
+    current_tree: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    let preset = run_preset(session)?;
+    if unit.tool_cmd.is_none() {
+        if let Some(why) = floor_refusal(preset, floor) {
+            return Some(why);
+        }
+        if !governed {
+            return Some(format!(
+                "`{preset}` runs its agent units only with input governance armed (the \
+                 registry-tool ban rides it), and this engine has none"
+            ));
+        }
+        if let Some(seat) = unit.assigned_cli.as_deref() {
+            if let Some(why) = reassign_refusal(session, seat) {
+                return Some(why);
             }
-        )
-    })
+        }
+        return None;
+    }
+    let after_qe = units
+        .iter()
+        .any(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none() && u.ord < unit.ord);
+    if is_publish(session) && after_qe {
+        return publish_consent_refusal(session, units, current_tree().as_deref());
+    }
+    None
 }
 
 #[cfg(test)]

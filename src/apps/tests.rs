@@ -42,15 +42,21 @@ fn seeded() -> wicked_apps_core::SqliteStore {
     store
 }
 
-/// A launch as admission reads it: the container floor, two usable seats, no word.
+/// A launch as admission reads it: the container floor, governed, a broker URL, a repo and an
+/// evidence root, two usable seats, no word.
 fn facts<'a>(
     workflow: &'a str,
     clis: &'a [crate::AgenticCli],
     qe: &'a QeOverride,
 ) -> LaunchFacts<'a> {
     LaunchFacts {
+        run_id: "r-admit",
         workflow: Some(workflow),
         project_id: None,
+        repo: true,
+        evidence_root: true,
+        governed: true,
+        crew_url: true,
         plan: false,
         reduced_assurance: false,
         power: false,
@@ -429,13 +435,24 @@ fn publish_with_every_seat_a_builder_is_refused() {
         .iter()
         .all(|b| b.source == EXCLUSION_BENCH_SOURCE));
     assert!(format!("{err:#}").contains("built a turn since the last publish"));
-    // One seat that built nothing is enough.
+    assert_eq!(seat.run_id, "r-admit", "the refusal names the launch's run");
+    // One seat that built nothing is not enough: the QE executor and its isolated reviewer are
+    // two seats (pi r1: one seat would review its own evidence).
     let one = ["claude".to_string()];
     let f = LaunchFacts {
         exclude_seats: &one,
         ..facts(APPS_PUBLISH, &clis, &qe)
     };
+    let err = admit(&store, &f).unwrap_err().to_string();
+    assert!(err.contains("1 such seat"), "{err}");
+    let three = [cli("claude"), cli("codex"), cli("pi")];
+    let f = LaunchFacts {
+        exclude_seats: &one,
+        ..facts(APPS_PUBLISH, &three, &qe)
+    };
     assert!(admit(&store, &f).unwrap().is_some());
+    // An empty roster is refused too (pi r1).
+    assert!(admit(&store, &facts(APPS_PUBLISH, &[], &qe)).is_err());
     // The bench leads, and a later bench of another cause (a quota bench, which can lift) never
     // replaces it.
     let apps = AppsContract {
@@ -450,7 +467,7 @@ fn publish_with_every_seat_a_builder_is_refused() {
         strikes: 1,
         replaced: None,
     };
-    let bench = with_exclusion_benches(Some(&apps), &one, vec![quota.clone()]);
+    let bench = with_exclusion_benches(Some(&apps), &one, &clis, vec![quota.clone()]);
     assert_eq!(bench.len(), 1);
     assert_eq!(bench[0].source, EXCLUSION_BENCH_SOURCE);
     assert_eq!(bench[0].benched_until, None);
@@ -461,7 +478,27 @@ fn publish_with_every_seat_a_builder_is_refused() {
     let turn = AppsContract {
         preset: APPS_TURN.into(),
     };
-    assert!(exclusion_benches(&turn, &one).is_empty());
+    assert!(exclusion_benches(&turn, &one, &clis).is_empty());
+    // A CLI key excludes every instance of that CLI, an instance key only itself (codex r1: the
+    // QE reviewer's own exclusion rule).
+    let instances = [cli("claude"), cli("claude#2"), cli("codex")];
+    let keys = |ex: &[&str]| -> Vec<String> {
+        let ex: Vec<String> = ex.iter().map(|e| e.to_string()).collect();
+        exclusion_benches(&apps, &ex, &instances)
+            .into_iter()
+            .map(|b| b.cli)
+            .collect()
+    };
+    assert_eq!(keys(&["claude"]), ["claude", "claude#2"]);
+    assert_eq!(keys(&["claude#2"]), ["claude#2"]);
+    let f = LaunchFacts {
+        exclude_seats: &builders,
+        ..facts(APPS_PUBLISH, &instances, &qe)
+    };
+    assert!(
+        admit(&store, &f).is_err(),
+        "every instance of an excluded CLI is benched"
+    );
 }
 
 /// §9.2: every turn is reviewed by a distinct seat, so a roster with one usable seat is refused at
@@ -487,16 +524,71 @@ fn a_turn_needs_a_second_usable_seat() {
 }
 
 #[test]
-fn crews_cli_resolves_through_its_env_and_nothing_else_moves() {
-    let cmd: Vec<String> = vec!["wicked-crew".into(), "apps-check".into()];
+fn crews_cli_resolves_through_its_env() {
     assert_eq!(
-        resolve_tool_cmd(&cmd, Some("/opt/crew/bin/wicked-crew")),
-        ["/opt/crew/bin/wicked-crew", "apps-check"]
+        crew_bin_from(Some("/opt/crew/bin/wicked-crew")),
+        "/opt/crew/bin/wicked-crew"
     );
-    assert_eq!(resolve_tool_cmd(&cmd, None), cmd);
-    assert_eq!(resolve_tool_cmd(&cmd, Some("  ")), cmd);
-    let other: Vec<String> = vec!["bash".into(), "wicked-crew".into()];
-    assert_eq!(resolve_tool_cmd(&other, Some("/x")), other);
+    assert_eq!(crew_bin_from(None), CREW_BIN);
+    assert_eq!(crew_bin_from(Some("  ")), CREW_BIN);
+}
+
+/// codex r1: an Apps launch that could not hold its rules is refused at admission — no input
+/// governance (no ban, no containment), no broker URL (no unit token for crew's route), no app
+/// repository, or a publish with no evidence root (no place for its QE verdict) — with the typed
+/// refusal the bus bridge drops instead of retrying.
+#[test]
+fn an_apps_launch_that_could_not_hold_its_rules_is_refused() {
+    let store = seeded();
+    let clis = [cli("claude"), cli("codex"), cli("pi")];
+    let qe = QeOverride::Auto;
+    for name in [APPS_TURN, APPS_PUBLISH] {
+        let base = || facts(name, &clis, &qe);
+        for (f, want) in [
+            (
+                LaunchFacts {
+                    governed: false,
+                    ..base()
+                },
+                "input governance",
+            ),
+            (
+                LaunchFacts {
+                    crew_url: false,
+                    ..base()
+                },
+                "broker URL",
+            ),
+            (
+                LaunchFacts {
+                    repo: false,
+                    ..base()
+                },
+                "registered repository",
+            ),
+        ] {
+            let err = admit(&store, &f).unwrap_err();
+            assert!(err.downcast_ref::<AppsLaunchRefused>().is_some(), "{err:#}");
+            assert!(err.to_string().contains(want), "{name}: {err}");
+        }
+    }
+    let f = LaunchFacts {
+        evidence_root: false,
+        ..facts(APPS_PUBLISH, &clis, &qe)
+    };
+    assert!(admit(&store, &f)
+        .unwrap_err()
+        .to_string()
+        .contains("evidence root"));
+    let f = LaunchFacts {
+        evidence_root: false,
+        ..facts(APPS_TURN, &clis, &qe)
+    };
+    assert!(admit(&store, &f).is_ok(), "a turn records no QE verdict");
+    // A QE word refusal is typed the same way.
+    let skip = QeOverride::Skip("x".into());
+    let err = admit(&store, &facts(APPS_PUBLISH, &clis, &skip)).unwrap_err();
+    assert!(err.downcast_ref::<AppsLaunchRefused>().is_some());
 }
 
 // ─── No registry tool for any agent unit ────────────────────────────────────────────────────────
@@ -809,6 +901,20 @@ fn no_operator_stands_in_for_a_publishs_qe_reviewer() {
     assert!(crate::actor::approve_is_operator_judgment(&publish, &u));
 }
 
+fn reviewed_by(seat: &str, basis: &str) -> crate::domain::QeReviewAttempt {
+    crate::domain::QeReviewAttempt {
+        seat: seat.into(),
+        basis: basis.into(),
+        same_cli: false,
+        status: "verdict".into(),
+        session: "nonce".into(),
+        governed: true,
+        tool_activity: false,
+        attempt: 0,
+    }
+}
+
+/// A bound QE PASS on tree `t1`, reviewed on `codex` (the QE executor runs on `claude`).
 fn pass_review() -> QeReview {
     QeReview {
         outcome: crate::qe_acceptance::review::OUTCOME_PASS.into(),
@@ -817,7 +923,10 @@ fn pass_review() -> QeReview {
         qe_run_id: Some("qe-1".into()),
         tree: Some("t1".into()),
         verdict: Some("PASS".into()),
-        attempts: Vec::new(),
+        attempts: vec![reviewed_by(
+            "codex",
+            crate::qe_acceptance::review::BASIS_DISTINCT,
+        )],
     }
 }
 
@@ -828,25 +937,43 @@ fn the_publish_consent_needs_a_bound_qe_pass() {
     let mut qe = qe_denied_unit("r-pub", s.assurance.qe.clone());
     qe.status = UnitStatus::Done;
     qe.denial = None;
-    let why = publish_consent_refusal(&s, &[qe.clone()]).unwrap();
+    qe.assigned_cli = Some("claude".into());
+    let t1 = Some("t1");
+    let why = publish_consent_refusal(&s, &[qe.clone()], t1).unwrap();
     assert!(why.contains("no reviewer record"), "{why}");
     qe.qe_review = Some(QeReview {
         outcome: crate::qe_acceptance::review::OUTCOME_INCONCLUSIVE.into(),
         verdict: None,
         ..pass_review()
     });
-    assert!(publish_consent_refusal(&s, &[qe.clone()]).is_some());
+    assert!(publish_consent_refusal(&s, &[qe.clone()], t1).is_some());
     qe.qe_review = Some(pass_review());
-    assert_eq!(publish_consent_refusal(&s, &[qe.clone()]), None);
+    assert_eq!(publish_consent_refusal(&s, &[qe.clone()], t1), None);
+    // pi r1: a PASS its executor's own seat reviewed (the `executor_seat` stand-in) refuses.
+    qe.qe_review = Some(QeReview {
+        attempts: vec![reviewed_by(
+            "claude",
+            crate::qe_acceptance::review::BASIS_EXECUTOR,
+        )],
+        ..pass_review()
+    });
+    let why = publish_consent_refusal(&s, &[qe.clone()], t1).unwrap();
+    assert!(why.contains("distinct from the QE executor"), "{why}");
+    qe.qe_review = Some(pass_review());
+    // codex r1: a PASS taken on another tree than the run holds now refuses, and so does an
+    // unreadable tree.
+    let why = publish_consent_refusal(&s, &[qe.clone()], Some("t2")).unwrap();
+    assert!(why.contains("accepted t1 while the run holds t2"), "{why}");
+    assert!(publish_consent_refusal(&s, &[qe.clone()], None).is_some());
     // A decision that is not `required` (however it got there) refuses, PASS or not.
     let mut skipped = s.clone();
     if let Some(q) = skipped.assurance.qe.as_mut() {
         q.status = a::QE_SKIPPED.into();
     }
-    assert!(publish_consent_refusal(&skipped, &[qe.clone()]).is_some());
+    assert!(publish_consent_refusal(&skipped, &[qe.clone()], t1).is_some());
     // No other run is judged here.
     let other = session("r-feat", RunAssurance::default());
-    assert_eq!(publish_consent_refusal(&other, &[]), None);
+    assert_eq!(publish_consent_refusal(&other, &[], None), None);
 }
 
 /// The backstop where it acts: the produce step's consent gate refuses an approve (and a choice)
@@ -928,7 +1055,7 @@ fn the_produce_consent_gate_refuses_an_approve_without_a_qe_pass() {
         },
     ] {
         let err = gate(&mut store, &mut subs, d).unwrap_err().to_string();
-        assert!(err.contains("bound QE PASS"), "{err}");
+        assert!(err.contains("takes only reject"), "{err}");
     }
     assert_eq!(
         crate::domain::get_session(&store, run_id)
@@ -938,9 +1065,23 @@ fn the_produce_consent_gate_refuses_an_approve_without_a_qe_pass() {
         SessionStatus::AwaitingHuman,
         "nothing ran"
     );
+    // codex r1: every answer but reject is refused there — an intent amendment would otherwise
+    // release produce through the ordinary resume.
+    let err = gate(
+        &mut store,
+        &mut subs,
+        crate::workflow::HumanDecision::AmendIntent {
+            text: "ship it anyway".into(),
+        },
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("takes only reject"), "{err}");
+    // A bound PASS on a run with no readable tree still refuses (the positive path, on a real
+    // worktree, is `tests/apps_presets.rs`).
     qe.qe_review = Some(pass_review());
     crate::domain::put_node(&mut store, qe.to_node()).unwrap();
-    gate(
+    let err = gate(
         &mut store,
         &mut subs,
         crate::workflow::HumanDecision::Approve {
@@ -948,7 +1089,15 @@ fn the_produce_consent_gate_refuses_an_approve_without_a_qe_pass() {
             amend_scope: crate::workflow::AmendScope::Cursor,
         },
     )
-    .expect("a bound QE PASS opens the consent gate");
+    .unwrap_err()
+    .to_string();
+    assert!(err.contains("an unreadable tree"), "{err}");
+    gate(
+        &mut store,
+        &mut subs,
+        crate::workflow::HumanDecision::Reject,
+    )
+    .expect("reject stops it");
 }
 
 /// The builder exclusion survives the operator's levers: an explicit reassign to an excluded seat
@@ -968,10 +1117,16 @@ fn no_operator_reassign_seats_a_publish_on_an_excluded_builder() {
         strikes: 0,
         replaced: None,
     };
-    s.benched_seats =
-        with_exclusion_benches(Some(&apps), &["claude".to_string()], vec![signed_out]);
+    let clis = [cli("claude"), cli("codex")];
+    s.benched_seats = with_exclusion_benches(
+        Some(&apps),
+        &["claude".to_string()],
+        &clis,
+        vec![signed_out],
+    );
     let why = reassign_refusal(&s, "claude").expect("refused");
     assert!(why.contains("built an Apps turn"), "{why}");
+    assert!(!why.contains("   "), "one line of words: {why}");
     assert_eq!(
         reassign_refusal(&s, "codex"),
         None,
@@ -982,7 +1137,6 @@ fn no_operator_reassign_seats_a_publish_on_an_excluded_builder() {
     assert_eq!(kept[0].cli, "claude");
     // The re-route over that bench never seats the excluded builder.
     let units = crate::plan::plan_from_def(&def_of(&seeded(), APPS_PUBLISH), "p", "r-pub");
-    let clis = [cli("claude"), cli("codex")];
     let dists =
         crate::distribute::distribute_units_on_benched(&units, &clis, "r-pub", &kept, &s.assurance)
             .unwrap();
@@ -1074,4 +1228,96 @@ fn an_apps_turn_never_lands_over_a_failed_review() {
             .status,
         SessionStatus::AwaitingHuman
     );
+}
+
+/// codex r1: THE dispatch guard, on every path that reaches a unit: an Apps agent unit is refused
+/// off the container floor and without input governance, a publish's unit on an excluded builder
+/// seat is refused, and a publish's produce step dispatches only past the QE backstop.
+#[test]
+fn the_apps_dispatch_guard() {
+    let store = seeded();
+    let mut s = session("r-pub", apps_contract(APPS_PUBLISH));
+    let apps = AppsContract {
+        preset: APPS_PUBLISH.into(),
+    };
+    s.benched_seats = with_exclusion_benches(
+        Some(&apps),
+        &["claude".to_string()],
+        &[cli("claude"), cli("codex"), cli("pi")],
+        Vec::new(),
+    );
+    let mut units = crate::plan::plan_from_def(&def_of(&store, APPS_PUBLISH), "p", "r-pub");
+    let qe_ix = units
+        .iter()
+        .position(|u| u.phase_id() == Some(QE_STEP))
+        .unwrap();
+    // The QE executor runs on pi; `pass_review` was reviewed on codex.
+    units[qe_ix].assigned_cli = Some("pi".into());
+    let qe = units[qe_ix].clone();
+    let produce = units
+        .iter()
+        .find(|u| u.phase_id() == Some(PRODUCE_STEP))
+        .unwrap()
+        .clone();
+    let check = units
+        .iter()
+        .find(|u| u.phase_id() == Some(CHECK_STEP))
+        .unwrap()
+        .clone();
+    let tree = || Some("t1".to_string());
+    let ok = |u: &WorkUnit, units: &[WorkUnit]| {
+        dispatch_refusal(&s, units, u, Some("container"), true, tree)
+    };
+    assert_eq!(ok(&qe, &units), None);
+    assert_eq!(ok(&check, &units), None, "the check precedes the QE unit");
+    assert!(dispatch_refusal(&s, &units, &qe, Some("host"), true, tree)
+        .unwrap()
+        .contains("container floor"));
+    assert!(
+        dispatch_refusal(&s, &units, &qe, Some("container"), false, tree)
+            .unwrap()
+            .contains("input governance")
+    );
+    let mut on_builder = qe.clone();
+    on_builder.assigned_cli = Some("claude".into());
+    assert!(ok(&on_builder, &units)
+        .unwrap()
+        .contains("built an Apps turn"));
+    // produce: refused without the bound PASS, dispatched with it on the same tree.
+    assert!(ok(&produce, &units).unwrap().contains("bound QE PASS"));
+    units[qe_ix].qe_review = Some(pass_review());
+    assert_eq!(ok(&produce, &units), None);
+    assert!(
+        dispatch_refusal(&s, &units, &produce, Some("container"), true, || {
+            Some("t2".into())
+        })
+        .is_some()
+    );
+    // No other run is judged here.
+    let other = session("r-feat", RunAssurance::default());
+    assert_eq!(
+        dispatch_refusal(&other, &units, &qe, Some("host"), false, tree),
+        None
+    );
+}
+
+/// codex r1: the straight-through driver (`Core::launch`, the operator CLI) runs no Tool, gate or
+/// consent, so it refuses an Apps preset instead of reporting a run it never checked.
+#[test]
+fn the_straight_through_driver_refuses_an_apps_preset() {
+    for name in [APPS_TURN, APPS_PUBLISH] {
+        let mut store = seeded();
+        let err = crate::pipeline::run_session(
+            &mut store,
+            vec![cli("claude"), cli("codex")],
+            "p",
+            EntityMode::Shared,
+            "r-straight",
+            Some(name),
+            &mut |_| {},
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("launch_run"), "{name}: {err}");
+    }
 }
