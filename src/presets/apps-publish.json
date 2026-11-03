@@ -30,7 +30,7 @@
    "gate_type": "execution",
    "gate": "consent_before",
    "depends_on": [
-    "qe"
+    "check"
    ],
    "instructions": "Produce the publish with crew's pinned tooling: pack the checked apps.json, queries/ and lock from the tree's git objects and the snapshots by digest, build the targets the manifest names, and record their digests in the published receipt. Nothing in the app repository runs. Nothing has been produced yet: this asks first, and the card lists the manifest: targets, audience and issuer, every source, query and action with its grant, environment names, embed origins and the snapshots shipped.",
    "executor": {

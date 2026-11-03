@@ -233,11 +233,11 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
 /// publish (`apps-publish`, DES-APPS-001 §9.3) require `qe_acceptance` on top of the defaults. `None` ⇒ the defaults. Code data beside [`builtin_presets`], so a re-seed never drops it.
 pub fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
     // (DES-APPS-001 §9.2) An Apps turn has no QE unit: its instrument is the review on a seat
-    // distinct from the builder ("apps-turn requires the distinct evaluator"). A semantic judge on
-    // the review's pinned floor would need a THIRD seat (distinct from the builder and from the
-    // reviewer, the validator's author), and a turn runs on two ("with one seat, the person edits
-    // directly or adds a seat"): the judge runs when a third seat exists and is skipped, disclosed,
-    // when none does — it is not required.
+    // distinct from the builder ("apps-turn requires the distinct evaluator"). `judge` is not
+    // required: the review's pinned judge must be distinct from the builder AND the reviewer (the
+    // validator's author), a third seat, and a turn runs on two ("with one seat, the person edits
+    // directly or adds a seat"). The pinned judge is still convened whenever such a seat is free;
+    // with none, the gate's receipt records it skipped (`no_distinct_seat`) instead of holding.
     if name == crate::apps::APPS_TURN {
         return Some(vec![crate::assurance::DISTINCT_EVALUATOR.to_string()]);
     }
@@ -826,7 +826,8 @@ fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
 /// no agent code runs); review → `review` (a distinct evaluator, the evidence floor and the judge).
 /// publish: check → `run` (`wicked-crew apps-check --publish`); qe → `critique` (the run's QE unit,
 /// [`crate::plan::plan_from_def`]; no diff floor, since a publish changes no tree); produce → `run`
-/// (`wicked-crew apps-produce`) behind `consent_before`. They launch as FIXED plans
+/// (`wicked-crew apps-produce`) behind `consent_before`, depending on the check alone: its consent
+/// card is read from the trusted check's output, never from the QE seat's. They launch as FIXED plans
 /// ([`crate::apps`]): never scoped, floor-filled or re-planned by the plan gate.
 fn apps_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)

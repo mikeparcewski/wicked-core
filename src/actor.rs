@@ -10253,7 +10253,7 @@ pub(crate) const CONSENT_GATE_KIND: &str = "consent";
 /// (core#820) The dry-run plan a consent gate on unit `ord` offers: the approved output of the
 /// newest unit before it whose phase it `depends_on` and which printed a plan
 /// ([`crate::consent_plan::parse_plan`]), or why there is none.
-fn consent_offer(
+pub(crate) fn consent_offer(
     store: &dyn GraphStore,
     session_id: &str,
     ord: u32,

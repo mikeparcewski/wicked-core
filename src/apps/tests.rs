@@ -1427,3 +1427,114 @@ fn the_straight_through_driver_refuses_an_apps_preset() {
         assert!(err.contains("launch_run"), "{name}: {err}");
     }
 }
+
+/// codex r3: the produce step's consent card comes from the trusted check alone. A dry-run plan the
+/// (untrusted) QE seat printed is never the offer, even when the check printed one too.
+#[test]
+fn the_publish_consent_card_is_the_checks_never_the_qe_seats() {
+    let store_seed = seeded();
+    let def = def_of(&store_seed, APPS_PUBLISH);
+    let produce_def = def.phases.iter().find(|p| p.id == PRODUCE_STEP).unwrap();
+    assert_eq!(produce_def.depends_on, [CHECK_STEP]);
+    let mut store = open_store(Some(":memory:")).unwrap();
+    let run_id = "r-card";
+    crate::domain::put_node(
+        &mut store,
+        session(run_id, apps_contract(APPS_PUBLISH)).to_node(),
+    )
+    .unwrap();
+    let units = crate::plan::plan_from_def(&def, "publish", run_id);
+    let plan = |id: &str| {
+        format!(
+            "{{\"dry_run\":true,\"choices\":[{{\"id\":\"{id}\",\"label\":\"{id}\",\"default\":true,\"writes\":[]}}]}}"
+        )
+    };
+    for u in &units {
+        let mut u = u.clone();
+        u.status = UnitStatus::Done;
+        crate::domain::put_node(&mut store, u.to_node()).unwrap();
+        let out = match u.phase_id() {
+            Some(CHECK_STEP) => Some(plan("site")),
+            Some(QE_STEP) => Some(format!("looks good\n{}", plan("everywhere"))),
+            _ => None,
+        };
+        if let Some(out) = out {
+            crate::execute::apply_unit(
+                &mut store,
+                &u,
+                &out,
+                &format!("wf-{run_id}"),
+                EntityMode::Shared,
+                run_id,
+                None,
+                0,
+            )
+            .unwrap();
+        }
+    }
+    let produce = units
+        .iter()
+        .find(|u| u.phase_id() == Some(PRODUCE_STEP))
+        .unwrap();
+    let check = units
+        .iter()
+        .find(|u| u.phase_id() == Some(CHECK_STEP))
+        .unwrap();
+    let offer = crate::actor::consent_offer(&store, run_id, produce.ord).unwrap();
+    assert_eq!(offer.plan_ord, Some(check.ord), "{offer:?}");
+    let ids: Vec<String> = offer
+        .plan
+        .unwrap()
+        .choices
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    assert_eq!(ids, ["site"]);
+}
+
+/// codex r3: a publish's QE evidence is never reviewed on the QE executor's own seat, not even as
+/// the last fallback: with no distinct reviewer the unit is denied as unavailable (an approve
+/// retries) instead of counting on a PASS the produce step would refuse. Elsewhere the executor
+/// fallback stands.
+#[test]
+fn a_publish_has_no_executor_seat_qe_reviewer() {
+    let mut s = session("r-pub", apps_contract(APPS_PUBLISH));
+    s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+    let apps = AppsContract {
+        preset: APPS_PUBLISH.into(),
+    };
+    s.benched_seats = with_exclusion_benches(
+        Some(&apps),
+        &["claude".to_string()],
+        &[cli("claude"), cli("codex"), cli("pi")],
+        Vec::new(),
+    );
+    crate::domain::bench_seat(
+        &mut s.benched_seats,
+        BenchedSeat {
+            cli: "pi".into(),
+            reason: "quota_exhausted".into(),
+            source: "worker".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        },
+    );
+    let mut qe = qe_denied_unit("r-pub", s.assurance.qe.clone());
+    qe.assigned_cli = Some("codex".into());
+    let units = vec![qe.clone()];
+    let seats = |s: &AgentSession| -> Vec<(String, String)> {
+        crate::qe_acceptance::review::candidates(s, &units, &qe)
+            .into_iter()
+            .map(|c| (c.seat, c.basis))
+            .collect()
+    };
+    assert!(seats(&s).is_empty(), "{:?}", seats(&s));
+    let mut other = s.clone();
+    other.assurance = RunAssurance::default();
+    assert!(seats(&other)
+        .iter()
+        .any(|(seat, basis)| seat == "codex"
+            && basis == crate::qe_acceptance::review::BASIS_EXECUTOR));
+}
