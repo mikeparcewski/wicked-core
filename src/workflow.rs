@@ -973,8 +973,8 @@ pub struct PhaseDef {
     /// The floor exists so a near-empty phase cannot starve the units behind it or hand an
     /// evaluator nothing to review. [`WorkflowDef::validate`] therefore accepts the declaration
     /// only where nothing in the run builds on the output or reviews it: the def's LAST phase, an
-    /// agent (not Tool), non-evaluator phase that executes no code, carries no validator pin and
-    /// is owned by the PA (a `team` member's step is reviewed by the PA). The fold checks again
+    /// agent (not Tool), non-evaluator phase of pool 1 that executes no code, carries no validator
+    /// pin and is owned by the PA (a `team` member's step is reviewed by the PA). The fold checks again
     /// that no unit follows it in the run. It changes nothing else: the phase's write posture,
     /// tools and gate are its entry's. `skip_serializing_if`: a phase that
     /// declares nothing serializes byte-identically to before the field existed.
@@ -1364,8 +1364,8 @@ impl WorkflowDef {
             }
             // (crew#1311) An answer-only phase is read by its CALLER, so nothing in the run may build
             // on it or review it: no code (the code-evidence floor's ground), nothing behind it, no
-            // judge (a validator pin), no PA review of a member's work (a `team` owner), and only an
-            // agent's non-evaluator output (the one the floor reads at all).
+            // judge (a validator pin), no PA review of a member's work (a `team` owner), no monitors
+            // (a pool above 1), and only an agent's non-evaluator output (the one the floor reads).
             if p.answer_only {
                 let why = if p.executes_code {
                     Some("it executes code, and a diff is the evidence a code phase owes")
@@ -1375,6 +1375,8 @@ impl WorkflowDef {
                     Some("its validator pin judges its output")
                 } else if p.owner != StepOwner::Pa {
                     Some("a team member's step is reviewed by the PA")
+                } else if p.pool_size() > 1 {
+                    Some("its pool's monitors review its output")
                 } else if !matches!(p.executor, PhaseExecutor::Agent) {
                     Some("a Tool phase's output is not an agent's answer")
                 } else if p.role == PhaseRole::Evaluator {

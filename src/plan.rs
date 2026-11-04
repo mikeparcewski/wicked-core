@@ -4317,6 +4317,20 @@ mod tests {
                 assert!(r.to_string().contains("answer_only"), "{steps}: {r}");
             }
 
+            // A pool's monitors review the step: no catalog entry carries a pool (a step may only
+            // lower one), so this shape reaches only the def's own validation.
+            let mut pooled = crate::workflow::PhaseDef::new("u", crate::domain::StageKind::Recon);
+            pooled.answer_only = true;
+            pooled.pool = Some(2);
+            let def = WorkflowDef {
+                id: "t".to_string(),
+                phases: vec![pooled],
+                base_skill_ref: None,
+                required_instruments: None,
+            };
+            let e = def.validate().expect_err("a pooled answer_only phase");
+            assert!(e.to_string().contains("monitors"), "{e}");
+
             // Floor fill: a creator answer step in a band whose floor adds a step behind it is
             // refused, never exempted (`produce` + band 50 floor-fills an evaluator after it).
             let p =
