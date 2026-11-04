@@ -89,8 +89,8 @@ recall-valued doctrine that never denies.
 
 ## The seven steering types
 
-`steering_type` is the management facet: each type is a sub-page in studio's Steering
-section, a `rules.recall` filter, and an import default. Severity and enforcement class are
+`steering_type` is the management facet: each type is a filter on studio's Steering
+page, a `rules.recall` filter, and an import default. Severity and enforcement class are
 orthogonal — every type can hold guidance and gates alike.
 
 | Type | Governs | Examples |
@@ -186,7 +186,7 @@ wicked-core rules recall --db <store> --type testing      # TST-1001..1003, no e
 | Governed policy packs (per-doctrine ingest units) | [`governance/packs/`](../../governance/packs/README.md) |
 | Bad-rule kill switch runbook | [`docs/break-glass-kill-switch.md`](./docs/break-glass-kill-switch.md) |
 | Agent recall surface (READ-ONLY) | wicked-estate MCP: `rules.recall` (steering_type-facetable), `knowledge.recall` |
-| Human management surface | wicked-studio: **Steering** (top-level nav, one sub-page per steering type), plus the per-run Governance panel |
+| Human management surface | wicked-studio: **Govern → Steering** (one rule list, the seven steering types as its filter; policy Proposals to review), plus the per-run Governance panel |
 | Governed write path (daemon-held store) | wicked-crew `/api/v1/governance/*` routes — ALL non-CLI writes go through crew |
 | CI conformance seam | wicked-ci reusable workflow `rules-conformance.yml` |
 
@@ -218,8 +218,9 @@ is the same verbs pointed at the real stores and surfaces.
 
 ## Manage it — the four flows
 
-Studio's **Steering** nav item (before Settings) holds one sub-page per steering type. On a
-type's page the type is **inferred** — you never re-declare it per action. Every flow below
+Studio's **Steering** page (in the sidebar, under **Govern**) lists every rule, with the seven
+steering types as a filter. The filtered type is **inferred** — you never re-declare it per
+action (with no type picked, the default is `architecture`). Every flow below
 writes through wicked-crew's API (the governed operator path, audited per action) or through
 the operator CLI against a store crew does not hold. The estate MCP writes nothing — see
 § Authoring contract.
@@ -228,8 +229,8 @@ the operator CLI against a store crew does not hold. The estate MCP writes nothi
 
 The import format IS the doc-ingest format: a frontmattered markdown doc, one parse path
 (`src/markdown.rs`), whether it arrives by doc PR + `rules ingest`, by pack directory, or
-pasted into a Steering sub-page's Import action (which stamps the page's type as the default
-`steering_type`). Copy-paste starting point:
+pasted into Steering's Import action (which files it under one `steering_type`, the filtered
+type by default). Copy-paste starting point:
 
 ```markdown
 ---
@@ -303,17 +304,17 @@ id-keyed — re-import is a non-event). Store-split import: § Seed & fan out.
 
 ### 2. Add with chat
 
-On any Steering sub-page, describe the rule you want in the chat action ("deny network
+On Steering, describe the rule you want in the chat action ("deny network
 egress tools during review when the diff touches secrets"). A governed crew run drafts the
-rule — statement, severity, facets, optional effect/trigger — with the page's
+rule — statement, severity, facets, optional effect/trigger — with the filtered type's
 `steering_type` pre-set; you review the draft and approve; crew writes it through its own
 API and audits the write. Chat-authored rules carry provenance `source: "chat"` — first-class,
 not second-class: same store, same recall, same gates.
 
 ### 3. Add / edit individual
 
-The form editor on the type's sub-page: every model field above, type inferred from the
-page. Saving upserts by id — editing IS the same flow (the store is id-keyed; the audit log
+The form editor on Steering: every model field above, the type defaulting to the
+filtered one. Saving upserts by id — editing IS the same flow (the store is id-keyed; the audit log
 records `governance.rule.upserted` per write). UI-authored rules carry provenance
 `source: "ui"`. On the wire (daemon-held store): `POST /api/v1/governance/rules` (body: one
 rule), previewed via `GET /api/v1/governance/rules/preview`, browsed via
@@ -329,7 +330,7 @@ Retire-not-delete is an invariant, not a preference: a retired rule is skipped b
 selection but its node survives, so every past gate decision that cited the id stays
 resolvable.
 
-- **One store / one rule**: the sub-page's Retire action, or
+- **One store / one rule**: the rule's Retire action on Steering (in the list or its drawer), or
   `DELETE /api/v1/governance/rules/:id` (audited as `governance.rule.retired`).
 - **Fanned-out rule (all lanes at once)** — manifest-keyed, re-verified per lane:
 
@@ -390,7 +391,7 @@ row migrates to a steering rule:
   `ops`/`operations`→`operations`, `architecture`→`architecture`,
   `development`→`development`, `design`/`ux`→`design-ux`); **anything else defaults to
   `operations`** — migrated policies are gate rules, and run/tool discipline is what an
-  untyped gate rule almost always is. Re-type outliers from their sub-page afterwards.
+  untyped gate rule almost always is. Re-type outliers on Steering afterwards (edit the rule's type).
 - `effect`/`trigger`/`obligations`/`criteria`/`severity`/`applies_to` carry over verbatim;
   `rule` prose → `statement`.
 - `retired` carries over, and the retired-not-deleted invariant holds through the migration:
@@ -424,9 +425,10 @@ read). Use the `rules` routes.
 
 ### Humans (wicked-studio)
 
-- **Steering** (top-level nav) — one sub-page per steering type: browse, import,
-  add-with-chat, individual add/edit, retire (§ Manage it), plus corpus health
-  (scoreboard/meta). Absorbs the former Settings → Rules RuleManager and the Architecture
+- **Steering** (sidebar, under **Govern**) — one rule list with the seven steering types as
+  its filter: browse, import, add-with-chat, individual add/edit, retire (§ Manage it), the
+  policy proposals waiting on review, and tiles for rules in force, proposals and what the
+  last eval caught. Absorbs the former Settings → Rules RuleManager and the Architecture
   Wiki page.
 - **Run view → Governance panel** — the gate decisions of a run with the steering rules
   each claim cites (the acceptance view's conformance section does the same on the
@@ -536,5 +538,5 @@ would actually **catch** anything. **Evals** replay a corpus of realistic dev be
 `caught` / `gap` / `false_positive` — gaps are the product working: they name the behaviors
 your rules do not cover yet, with nearest-rule hints. CLI: `wicked-core rules eval`; crew:
 `POST /api/v1/testing/evals/run` + `POST /api/v1/testing/corpora/import`; humans:
-studio's **Testing** nav. Full guide (sample format, pinned wire contract, degrade
+studio's **Evaluate** page (Insight → Evaluate). Full guide (sample format, pinned wire contract, degrade
 semantics): **[TESTING.md](./TESTING.md)**.

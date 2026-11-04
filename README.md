@@ -54,9 +54,41 @@ studio/crew surface, projected into the estate graph as recallable, citable rule
 (`crates/wicked-governance` owns the schemas, the `wicked-core rules
 ingest/fanout/relink/drift/recall/scoreboard/retire` CLI, and the seed corpus). Agents recall it
 via the estate MCP's `rules.recall`/`knowledge.recall` (read-only), humans manage it in
-wicked-studio's Steering section, CI comments with it on PRs. Start here:
+wicked-studio's Steering page (Govern → Steering) and test it on Evaluate (Insight → Evaluate),
+CI comments with it on PRs. Start here:
 **[crates/wicked-governance/STEERING.md](./crates/wicked-governance/STEERING.md)** — the
 operator guide from "never heard of it" to seeded and recalling.
+
+## Built-in workflows
+
+Workflows are data: a `WorkflowDef` (JSON) names its phases, and a preset is a fixed plan over the
+phase catalog. The engine seeds its built-in presets into the store at boot (`builtin_presets` in
+[`src/catalog.rs`](./src/catalog.rs); the JSON ones live in [`src/presets/`](./src/presets/)), each
+named after the workflow it replaces, so a launch that names that id keeps working:
+
+`analyze`, `apps-publish`, `apps-turn`, `bug`, `capture-learnings`, `chat`, `demo`, `docs`,
+`domain-extraction`, `editor-plugin`, `feature`, `interactive-chat`, `interactive-draft`,
+`interactive-edit`, `learn`, `mcp-server`, `migration`, `onboarding`, `qe-author-tests`,
+`steering-author`, `test-analysis`, `test-plan`, `validate-docs`.
+
+The rules a built-in carries with it:
+
+- **QE acceptance.** The presets that change the application (`feature`, `bug`, `editor-plugin`,
+  `mcp-server`, `migration`) and `apps-publish` require QE acceptance on top of the default
+  instruments (`builtin_preset_instruments`). An Apps publish's QE is forced (no score, launch
+  word or gate skip waives it), and its QE seat must not have built any turn since the last
+  publish.
+- **Apps runs (D-7).** `apps-turn` (build → check → review) and `apps-publish` (check → qe →
+  produce) are the runs behind wicked-crew's Apps. Every unit of either is refused any MCP tool
+  whose class is `write` or `destructive` (a tool with no hints classes as `write`; an operator's
+  override wins), registered or not, in every mode; the deny's rule id is
+  `engine:apps-no-source-tool`. A read goes on to the gates every unit passes, and crew's data
+  gate decides what it returns. An `apps-turn` has no QE unit: its instrument is the review, on a
+  seat distinct from the builder.
+- **Answer-only steps.** A one-shot answer step may declare `answer_only` (a `PhaseDef` and
+  plan-step field): its answer must exist and be non-blank, instead of meeting the 200-character
+  substance floor. `WorkflowDef::validate` accepts it only on the def's last phase, an agent step
+  the PA owns that executes no code, has no validator pin and a pool of one.
 
 ## Requirements graph
 

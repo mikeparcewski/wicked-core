@@ -33,7 +33,8 @@ open to check a claim.
 ## Conventions
 
 - Single-writer store actor — never open the shared SQLite from a second writer.
-- Workflows are data (`WorkflowDef` JSON, see `workflows/`); gates are
+- Workflows are data (`WorkflowDef` JSON; the built-in presets are `builtin_presets` in
+  `src/catalog.rs`, the JSON ones under `src/presets/`); gates are
   deny-dominates. evaluator≠creator is enforced where it can be and DISCLOSED where it
   cannot (`src/distribute.rs`): a roster whose distinct seat is benched, or a run whose
   assurance contract enforces `distinct_evaluator` (every run not launched `reduced`, unless an
