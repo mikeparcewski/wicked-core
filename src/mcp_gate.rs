@@ -1118,6 +1118,37 @@ pub fn list_mcp_tools_json(request_json: &str) -> Result<String, String> {
     serde_json::to_string(&list).map_err(|e| format!("guard_error: {e}"))
 }
 
+/// (crew#1337) ONE call judged for the unit `token` is bound to with [`evaluate`], the same
+/// function [`evaluate_mcp_call`] runs, WITH the call's own arguments, so a rule whose
+/// `trigger.contains` matches them fires (a deny dominates a first-use ask, as on a call). PURE:
+/// no claim is appended, nothing is recorded; `claimId` names the claim a recorded call would
+/// carry. crew's data gate judges a live source's call with it: the gate records that call itself
+/// (its read record and `calls.ndjson`), and a first-use ask it admits on the person's per-source
+/// switches must not leave a waiting-for-approval claim on the unit. The tool list
+/// ([`list_mcp_tools`]) still judges with no arguments.
+pub fn judge_mcp_call(token: &str, call: &McpCall) -> Result<McpVerdict, McpCallError> {
+    let unit = resolve(token).ok_or(McpCallError::InvalidToken)?;
+    let store = open_store_ro(Some(&unit.db_path))
+        .map_err(|e| McpCallError::GuardError(format!("policy store open failed: {e}")))?;
+    let (verdict, _claim) = evaluate(&store, &unit, call, crate::clock::eval_now())?;
+    Ok(verdict)
+}
+
+/// The JSON face of [`judge_mcp_call`] for the core-ts binding: `{token, call}` in, the verdict
+/// out (the shape [`evaluate_mcp_call_json`] answers); an error string is `<code>: <message>`.
+pub fn judge_mcp_call_json(request_json: &str) -> Result<String, String> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        token: String,
+        call: McpCall,
+    }
+    let req: Request = serde_json::from_str(request_json)
+        .map_err(|e| McpCallError::BadRequest(format!("request: {e}")).to_string())?;
+    let verdict = judge_mcp_call(&req.token, &req.call).map_err(|e| e.to_string())?;
+    serde_json::to_string(&verdict).map_err(|e| format!("guard_error: {e}"))
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // The estate relay's scope (core#1018): which unit a token is, and what its estate calls reach
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2824,6 +2855,92 @@ mod tests {
             !base.join("decisions.ndjson").exists(),
             "a list appends no claim"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PROVING TEST (crew#1337): a live source's call is judged WITH its arguments. An operator rule
+    /// whose `trigger.contains` matches the SQL denies the call (over the first-use ask: deny
+    /// dominates), the same call without the match is the first-use-only ask crew admits, the tool
+    /// list (no arguments) still shows the tool, and judging records nothing.
+    #[test]
+    fn a_judged_call_fires_an_argument_triggered_rule_and_records_nothing() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!(
+            "wicked-mcp-judge-args-{}-{tid}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&db_path)).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+            wicked_governance::register_rule(
+                &mut store,
+                &rule(serde_json::json!({
+                    "id": "SEC-NO-SALARY", "rule_type": "policy",
+                    "statement": "no salary reads", "severity": "error",
+                    "confidence": 1.0, "steering_type": "security",
+                    "applies_to": ["mcp:support-pg/execute_sql"], "effect": "deny",
+                    "trigger": {"contains": "salary"},
+                    "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                })),
+            )
+            .unwrap();
+        }
+        let decisions = base.join("decisions.ndjson");
+        let mut u = unit(
+            WritePosture::Full,
+            PhaseRole::Creator,
+            "claude",
+            McpMode::Autonomous,
+        );
+        u.db_path = db_path.clone();
+        u.decisions_path = decisions.clone();
+        let token = McpToken::mint();
+        let _b = token.bind(u);
+        // The exact request crew's data gate sends, with the call's own arguments.
+        let judged = |sql: &str| -> Value {
+            let req = serde_json::json!({"token": token.value, "call": {
+                "server": "support-pg", "tool": "execute_sql", "args": {"sql": sql},
+                "annotations": {"readOnlyHint": true}, "classOverride": "read",
+                "registered": true, "kind": "mcp-stdio", "carrier": "shim"
+            }});
+            serde_json::from_str(&judge_mcp_call_json(&req.to_string()).unwrap()).unwrap()
+        };
+        let salary = judged("SELECT salary FROM hr.staff");
+        assert_eq!(salary["decision"], "deny", "{salary}");
+        assert_eq!(salary["ruleIds"], serde_json::json!(["SEC-NO-SALARY"]));
+        assert!(salary.get("firstUseOnly").is_none(), "{salary}");
+        let plain = judged("SELECT name FROM hr.staff");
+        assert_eq!(plain["decision"], "ask", "{plain}");
+        assert_eq!(plain["firstUseOnly"], true, "{plain}");
+        // The list judges with no arguments, whatever it is sent: the tool stays listed.
+        let mut with_args = gated_read("support-pg");
+        with_args.args = serde_json::json!({"sql": "SELECT salary FROM hr.staff"});
+        let listed = list_mcp_tools(&token.value, &[with_args]).unwrap();
+        assert_eq!(listed.tools.len(), 1, "{listed:?}");
+        assert_eq!(listed.tools[0].decision, "ask");
+        assert!(!decisions.exists(), "a judgment appends no claim");
+        // Parity: a recorded call of the same shape gets the same verdict (and only it appends a claim).
+        for sql in ["SELECT salary FROM hr.staff", "SELECT name FROM hr.staff"] {
+            let req = serde_json::json!({"token": token.value, "call": {
+                "server": "support-pg", "tool": "execute_sql", "args": {"sql": sql},
+                "annotations": {"readOnlyHint": true}, "classOverride": "read",
+                "registered": true, "kind": "mcp-stdio", "carrier": "shim"
+            }});
+            let called: Value =
+                serde_json::from_str(&evaluate_mcp_call_json(&req.to_string()).unwrap()).unwrap();
+            assert_eq!(judged(sql), called, "{sql}");
+        }
+        assert!(decisions.exists(), "the recorded call appended its claims");
+        let err = judge_mcp_call_json(
+            r#"{"token":"wmt_forged","call":{"server":"s","tool":"t","registered":true}}"#,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("invalid_token:"), "{err}");
+        let err = judge_mcp_call_json(r#"{"token":"x"}"#).unwrap_err();
+        assert!(err.starts_with("bad_request:"), "{err}");
         let _ = std::fs::remove_dir_all(&base);
     }
 
