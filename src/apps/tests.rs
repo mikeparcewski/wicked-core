@@ -591,7 +591,7 @@ fn an_apps_launch_that_could_not_hold_its_rules_is_refused() {
     assert!(err.downcast_ref::<AppsLaunchRefused>().is_some());
 }
 
-// ─── No registry tool for any agent unit ────────────────────────────────────────────────────────
+// ─── No write or destructive registry tool for any Apps unit ─────────────────────────────────────
 
 /// The input a carrier hands unit `u` of a run whose contract names `apps`.
 fn input_for(u: &WorkUnit, db_path: &str, apps: Option<&str>) -> StepInput {
