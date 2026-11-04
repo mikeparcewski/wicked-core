@@ -2224,6 +2224,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.24** — 2026-11-04 — patch release on main 13ec79b, carrying #1263 since 0.15.23.
+  - **`firstUseOnly` on an MCP ask (#1263, crew#1333).** The engine reads the policies' claim before the first-use
+    override and marks an ask `first_use_only` when the claim alone would let the call run (no deny, no
+    `mcp:approval` obligation). The call verdict, the unit's tool list entry (`listMcpTools`) and the preview cell
+    (`previewMcpCalls`) carry it as `firstUseOnly`, on the wire only when true; rule ids and the receipt are
+    unchanged. crew's data gate admits exactly that ask for a live source, so a crew that relies on it needs this
+    release.
+  - **Lockfile:** the 0.15.23 platform entries were not re-stamped (the workflow's re-stamp PR #1264 was closed as
+    superseded by this cut); the five entries stay version-less stubs, which this release's re-stamp fills.
+  - The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol are unchanged
+    since 0.15.23, so the seat and floor image tags and gate protocol 3 are unchanged. No binding method or
+    `LaunchSpec` field is added.
 - **core-ts 0.15.23** — 2026-11-04 — patch release on main 4ba99b7, carrying 3 PRs since 0.15.22: #1258, #1260 and #1261.
   - **`answer_only` (#1260, crew#1311).** A def's last, non-code phase (and a plan step) may declare `answer_only`;
     the substance floor then accepts a short answer from that unit and still rejects an empty or whitespace-only one.
