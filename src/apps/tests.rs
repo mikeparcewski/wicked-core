@@ -669,15 +669,45 @@ fn every_unit(store: &dyn wicked_apps_core::GraphRead) -> Vec<(String, WorkUnit)
     out
 }
 
-/// Acceptance: builder, reviewer and QE units (and the QE reviewer turn, and the check Tool's
-/// token) listing or calling an already registered REST tool are refused — while the same unit
-/// off an Apps run gets it.
+fn rest_tool(tool: &str, read_only: Option<bool>, destructive: Option<bool>) -> McpCall {
+    McpCall {
+        tool: tool.into(),
+        annotations: Some(McpAnnotations {
+            read_only_hint: read_only,
+            destructive_hint: destructive,
+            ..Default::default()
+        }),
+        ..rest_read()
+    }
+}
+
+/// A write tool (`readOnlyHint: false, destructiveHint: false`).
+fn rest_write() -> McpCall {
+    rest_tool("update_ticket", Some(false), Some(false))
+}
+
+/// A destructive tool (`destructiveHint` true).
+fn rest_destructive() -> McpCall {
+    rest_tool("delete_ticket", Some(false), Some(true))
+}
+
+/// Acceptance (D-7 as DES-KNOWLEDGE-DATA-001 §9.3 narrows it): builder, reviewer and QE units (and
+/// the QE reviewer turn, and the check Tool's token) of an Apps run calling or listing a `write` or
+/// `destructive` tool (by its annotations, or by an operator's class override) are refused — while
+/// the same unit calls and lists a `read` tool (crew's data gate then decides rows and visibility),
+/// and the same unit off an Apps run is not refused by D-7.
 #[test]
-fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
+fn an_apps_unit_lists_and_calls_read_tools_and_never_a_write_or_destructive_one() {
     let presets = seeded();
     let (base, db) = policy_db("ban");
     let store = open_store(Some(&db)).unwrap();
-    let call = rest_read();
+    let read = rest_read();
+    let overridden = McpCall {
+        tool: "get_tickets_and_close".into(),
+        class_override: Some(crate::mcp_gate::McpClass::Write),
+        ..rest_read()
+    };
+    let writes = [rest_write(), rest_destructive(), overridden];
     let mut checked = Vec::new();
     for (preset, u) in every_unit(&presets) {
         let mut inputs = vec![input_for(&u, &db, Some(&preset))];
@@ -694,31 +724,64 @@ fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
         }
         for input in inputs {
             let unit = McpUnit::of(&input, &db, McpMode::Autonomous);
-            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &call, 1).unwrap();
-            assert_eq!(v.decision, "deny", "{preset} unit {:?}", u.phase_id());
-            assert_eq!(v.rule_ids, [RULE_NO_SOURCE_TOOL]);
+            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &read, 1).unwrap();
+            assert_eq!(
+                v.decision,
+                "allow",
+                "{preset} unit {:?} read: {v:?}",
+                u.phase_id()
+            );
+            for w in &writes {
+                let (v, _) = crate::mcp_gate::evaluate(&store, &unit, w, 1).unwrap();
+                assert_eq!(
+                    v.decision,
+                    "deny",
+                    "{preset} unit {:?} {}",
+                    u.phase_id(),
+                    w.tool
+                );
+                assert_eq!(v.rule_ids, [RULE_NO_SOURCE_TOOL], "{}", w.tool);
+                // Unregistered or not, a write is D-7's first.
+                let gone = McpCall {
+                    registered: false,
+                    ..w.clone()
+                };
+                let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &gone, 1).unwrap();
+                assert_eq!(v.rule_ids, [RULE_NO_SOURCE_TOOL], "{} unregistered", w.tool);
+            }
             let token = McpToken::mint();
             let _b = token.bind(unit);
-            let listed =
-                crate::mcp_gate::list_mcp_tools(token.value(), std::slice::from_ref(&call))
-                    .unwrap();
-            assert!(
-                listed.tools.is_empty(),
+            let mut calls = vec![read.clone()];
+            calls.extend(writes.iter().cloned());
+            let listed = crate::mcp_gate::list_mcp_tools(token.value(), &calls).unwrap();
+            let subjects: Vec<&str> = listed.tools.iter().map(|t| t.subject.as_str()).collect();
+            assert_eq!(
+                subjects,
+                ["mcp:support-api/get_tickets"],
                 "{preset} {:?} lists {listed:?}",
                 u.phase_id()
             );
-            // The control: the same unit off an Apps run is offered the read tool.
+            // The control: the same unit off an Apps run is not refused by D-7.
             let mut plain = input.clone();
             plain.governance.as_mut().unwrap().apps = None;
             let unit = McpUnit::of(&plain, &db, McpMode::Autonomous);
-            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &call, 1).unwrap();
+            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &read, 1).unwrap();
             assert_eq!(v.decision, "allow", "{preset} {:?}", u.phase_id());
+            for w in &writes {
+                let (v, _) = crate::mcp_gate::evaluate(&store, &unit, w, 1).unwrap();
+                assert!(
+                    !v.rule_ids.iter().any(|r| r == RULE_NO_SOURCE_TOOL),
+                    "{preset} {:?} {} off an Apps run: {v:?}",
+                    u.phase_id(),
+                    w.tool
+                );
+            }
             checked.push(format!("{preset}/{}", u.phase_id().unwrap_or("?")));
         }
     }
     // build, check, review; check, qe (+ its reviewer), produce.
     assert_eq!(checked.len(), 7, "{checked:?}");
-    // The check Tool's own token (the route's credential) reaches no tool either.
+    // The check Tool's own token (the route's credential) lists the read tool and no write.
     let (u_preset, check) = every_unit(&presets)
         .into_iter()
         .find(|(p, u)| p == APPS_TURN && u.phase_id() == Some(CHECK_STEP))
@@ -731,22 +794,29 @@ fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
     assert!(env
         .iter()
         .any(|(k, v)| k == crate::mcp_gate::TOKEN_ENV && v == token.value()));
-    assert!(crate::mcp_gate::list_mcp_tools(token.value(), &[call])
-        .unwrap()
-        .tools
-        .is_empty());
+    let listed = crate::mcp_gate::list_mcp_tools(token.value(), &[read, rest_write()]).unwrap();
+    assert_eq!(
+        listed
+            .tools
+            .iter()
+            .map(|t| t.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp:support-api/get_tickets"]
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Acceptance (S5): marker strings seeded in a fixture source's rows appear in no unit's context
-/// pack. The engine's only path for source rows into an Apps seat is a brokered tool call: the
-/// broker hands rows only on `allow`, and each unit's output becomes the next unit's prior output,
-/// as the actor threads it. Under an Apps run no unit ever receives a row, so no later context
-/// holds one; the control run shows the harness would catch it. (That the real actor stamps the ban
-/// on every dispatched input, QE reviewer turn included, is `tests/apps_presets.rs`; the check
-/// Tool's own output is crew's contract: codes and identifiers only, DES §5.2.)
+/// Acceptance (S5, as DES-KNOWLEDGE-DATA-001 §9.3 amends it): marker strings that a write tool (an
+/// action on a fixture source) would hand back appear in no unit's context pack of an Apps run. The
+/// engine's only path for a tool's answer into an Apps seat is a brokered call: the broker hands an
+/// answer only on `allow`, and each unit's output becomes the next unit's prior output, as the actor
+/// threads it. Under an Apps run no write is ever allowed, so no later context holds its answer. A
+/// READ tool's answer now reaches an Apps unit as it reaches any unit: rows and visibility are crew's
+/// data gate (a query-off source answers no rows; crew's `sources-knowledge-package` test proves it),
+/// and the read control below shows the harness would catch a marker. (That the real actor stamps the
+/// Apps marker on every dispatched input, QE reviewer turn included, is `tests/apps_presets.rs`.)
 #[test]
-fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
+fn marker_strings_behind_a_write_tool_reach_no_apps_context_pack() {
     const MARKERS: [&str; 3] = [
         "MARKER-7f3c-ticket-subject",
         "MARKER-91ab-customer-email",
@@ -755,21 +825,22 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
     let presets = seeded();
     let (base, db) = policy_db("markers");
     let store = open_store(Some(&db)).unwrap();
-    // The fixture source: a registered REST read tool whose rows carry the markers.
+    // The fixture source's answer, whatever tool hands it back.
     let rows = format!(
         "{{\"items\":[{{\"subject\":\"{}\",\"email\":\"{}\",\"cell\":\"{}\"}}]}}",
         MARKERS[0], MARKERS[1], MARKERS[2]
     );
     // A seat lists its tools, then calls the source whether or not it was listed; the broker
-    // answers with rows only on `allow`.
-    let broker = |unit: &McpUnit| -> Option<String> {
+    // answers only on `allow`.
+    let broker = |unit: &McpUnit, call: &McpCall| -> Option<String> {
         let token = McpToken::mint();
         let _b = token.bind(unit.clone());
-        let _listed = crate::mcp_gate::list_mcp_tools(token.value(), &[rest_read()]).unwrap();
-        let (v, _) = crate::mcp_gate::evaluate(&store, unit, &rest_read(), 1).unwrap();
+        let _listed =
+            crate::mcp_gate::list_mcp_tools(token.value(), std::slice::from_ref(call)).unwrap();
+        let (v, _) = crate::mcp_gate::evaluate(&store, unit, call, 1).unwrap();
         (v.decision == "allow").then(|| rows.clone())
     };
-    let run = |apps: bool| -> Vec<String> {
+    let run = |apps: bool, call: &McpCall| -> Vec<String> {
         let mut packs = Vec::new();
         for name in [APPS_TURN, APPS_PUBLISH] {
             let mut prior: Vec<PriorUnitOutput> = Vec::new();
@@ -805,7 +876,7 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
                     ));
                 }
                 let unit = McpUnit::of(&input, &db, McpMode::Autonomous);
-                let output = match broker(&unit) {
+                let output = match broker(&unit, call) {
                     Some(rows) => format!("read the source: {rows}"),
                     None => "worked from the catalog".to_string(),
                 };
@@ -817,23 +888,29 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
         }
         packs
     };
-    let apps_packs = run(true);
-    assert!(!apps_packs.is_empty());
-    for pack in &apps_packs {
-        for m in MARKERS {
-            assert!(
-                !pack.contains(m),
-                "marker {m} reached a context pack:\n{pack}"
-            );
+    for call in [rest_write(), rest_destructive()] {
+        let apps_packs = run(true, &call);
+        assert!(!apps_packs.is_empty());
+        for pack in &apps_packs {
+            for m in MARKERS {
+                assert!(
+                    !pack.contains(m),
+                    "marker {m} from {} reached a context pack:\n{pack}",
+                    call.tool
+                );
+            }
         }
     }
-    let control = run(false);
-    assert!(
-        control
-            .iter()
-            .any(|p| MARKERS.iter().any(|m| p.contains(m))),
-        "the harness sees rows in a later context when a unit may read the source"
-    );
+    // The controls: a read reaches a later context of an Apps run (crew's gate is what withholds a
+    // query-off source's rows), and of any other run.
+    for apps in [true, false] {
+        assert!(
+            run(apps, &rest_read())
+                .iter()
+                .any(|p| MARKERS.iter().any(|m| p.contains(m))),
+            "the harness sees a read's answer in a later context (apps: {apps})"
+        );
+    }
     let _ = std::fs::remove_dir_all(&base);
 }
 

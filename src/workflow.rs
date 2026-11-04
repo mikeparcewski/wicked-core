@@ -237,8 +237,8 @@ pub struct GovernanceContext {
     pub human_confirm: crate::domain::HumanConfirm,
     /// (DES-APPS-001 §5.2, K0) The Apps preset the run is (`apps-turn` | `apps-publish`), from the
     /// session's contract (`RunAssurance::apps`), filled per unit like the fields above. `Some` ⇒
-    /// every brokered MCP call and tool listing of the unit is denied
-    /// (`mcp_gate::RULE_APPS_NO_SOURCE_TOOL`): no agent unit of an Apps run gets any registry tool.
+    /// every brokered write or destructive MCP call and listing of the unit is denied
+    /// (`mcp_gate::RULE_APPS_NO_SOURCE_TOOL`): no agent unit of an Apps run gets a write tool.
     /// `#[serde(default)]` so an older peer's `DispatchedTask` still deserializes (as `None`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub apps: Option<String>,

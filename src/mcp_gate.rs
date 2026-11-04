@@ -77,10 +77,13 @@ pub(crate) const RULE_UNREGISTERED: &str = "engine:mcp-unregistered";
 /// First use of a server (or of a tool whose schema changed) waits for the operator, in every mode.
 pub(crate) const RULE_FIRST_USE: &str = "engine:mcp-first-use";
 
-/// D-7 (DES-APPS-001 §5.2, K0): a unit of an Apps run (`apps-turn`, `apps-publish`) — builder,
-/// reviewer, QE executor, QE reviewer, or the check Tool's token — calls and lists NO registry
-/// tool, of any class, registered or not, in any mode. An Apps seat holds no row data and no
-/// credential; a source tool would hand it both.
+/// D-7 (DES-APPS-001 §5.2, K0; narrowed by DES-KNOWLEDGE-DATA-001 §9.3): a unit of an Apps run
+/// (`apps-turn`, `apps-publish`) — builder, reviewer, QE executor, QE reviewer, or the check Tool's
+/// token — calls and lists NO `write` or `destructive` tool (an action), registered or not, in any
+/// mode, judged from the tool's class ([`classify`]). A `read` tool goes on to the gates every unit
+/// passes. Whether a read may return rows, and which sources a unit may see, is crew's data gate
+/// (its per-source switches, which the engine cannot read): crew hands every live-source tool to
+/// the engine as `read`, and decides rows and visibility itself.
 pub(crate) const RULE_APPS_NO_SOURCE_TOOL: &str = crate::apps::RULE_NO_SOURCE_TOOL;
 
 /// The pack rule that is the first-use APPROVALS LEDGER: its `excludes` lists the approved
@@ -270,7 +273,7 @@ pub(crate) struct McpUnit {
     /// What crew's estate relay scopes this unit's estate calls to (core#1018).
     pub estate: EstateScope,
     /// (DES-APPS-001 K0) The Apps preset the unit's run is, from its governance context: `Some`
-    /// ⇒ D-7, every call and every listing is denied ([`RULE_APPS_NO_SOURCE_TOOL`]).
+    /// ⇒ D-7, every write or destructive call and listing is denied ([`RULE_APPS_NO_SOURCE_TOOL`]).
     pub apps: Option<String>,
 }
 
@@ -481,16 +484,19 @@ pub(crate) fn evaluate(
     let ctx = context(unit, call, class);
 
     // The engine gates hold in every mode and no rule can lift them. D-7 first: an Apps unit is
-    // refused every tool, whatever the registry or its class says.
-    let engine_deny = if let Some(preset) = unit.apps.as_deref() {
+    // refused every write and destructive tool, whatever the registry says; its reads go on to
+    // the gates below, and crew's data gate decides rows and visibility (DES-KNOWLEDGE-DATA-001 §9.3).
+    let engine_deny = if let (Some(preset), true) = (unit.apps.as_deref(), class != McpClass::Read)
+    {
         Some((
             RULE_APPS_NO_SOURCE_TOOL,
             format!(
-                "mcp: `{subject}` is refused: this unit belongs to an `{preset}` run, and no unit \
-                 of an Apps run gets any registry tool (D-7)"
+                "mcp: `{subject}` is a {} tool and this unit belongs to an `{preset}` run: no unit \
+                 of an Apps run gets a write tool or an action (D-7)",
+                class.wire(),
             ),
-            "work from the catalog and the files the task names; an Apps step never calls a \
-             source",
+            "report the change in your output; an Apps step reads its sources and edits only \
+             the app's files",
         ))
     } else if !call.registered {
         Some((
@@ -874,7 +880,7 @@ pub(crate) type ToolChannel = (McpToken, McpBinding, Vec<(String, String)>);
 /// fixed `wicked-crew apps-check` (and `apps-produce`) calls its route with the unit's token, as a
 /// seat calls `/mcp/call`, so crew knows which run, unit and attempt is asking. Bound to the unit for
 /// as long as the guards live (the caller keeps them until the command exits); the unit's Apps
-/// marker rides the binding, so the token itself reaches no registry tool (D-7). `None` for an
+/// marker rides the binding, so the token itself reaches no write tool (D-7). `None` for an
 /// ungoverned unit or a daemon with no broker URL. Returns the env to hand the command.
 pub(crate) fn arm_tool_unit_channel(input: &crate::workflow::StepInput) -> Option<ToolChannel> {
     arm_tool_unit_channel_at(input, daemon_crew_url())
