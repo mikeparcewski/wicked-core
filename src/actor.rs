@@ -13109,6 +13109,77 @@ fn phase_boundary_denied(
     Ok(false)
 }
 
+/// Land an operator's amendment `text` on `u`: appended to its instruction as
+/// " (operator amendment: …)", recorded as a ruling its reviewer reads (core#760), persisted, then
+/// announced as `UnitReworkAmended{scope}`. IDEMPOTENT on the text: a unit that already carries it
+/// is left as it is (the studio pre-fills every gate from the durable guidance note, and a restart
+/// re-applies a staged plan-gate release).
+fn amend_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    u: &mut crate::domain::WorkUnit,
+    text: &str,
+    scope: &str,
+) -> anyhow::Result<()> {
+    let segment = format!(" (operator amendment: {text})");
+    if u.description.contains(&segment) {
+        return Ok(());
+    }
+    u.description.push_str(&segment);
+    u.operator_rulings.push(crate::domain::OperatorRuling {
+        action: "amend".to_string(),
+        text: text.to_string(),
+        attempt: u.last_attempt.unwrap_or(0),
+        at: crate::interaction::now_millis(),
+    });
+    put_node(store, u.to_node())?;
+    // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail. Fires after persist,
+    // before Resumed, so the amendment text is durable before any subscriber sees the run resume.
+    // Resumed alone carries no amendment text; this event is the canonical record.
+    emit(
+        subscribers,
+        CoreEvent::UnitReworkAmended {
+            session: run_id.to_string(),
+            ord: u.ord,
+            amendment: text.to_string(),
+            updated_description: u.description.clone(),
+            scope: scope.to_string(),
+        },
+    );
+    Ok(())
+}
+
+/// (crew#1139) Land a plan-gate approval's note on the steps the plan released: the first creator
+/// phase at or after the cursor (`scope: "creator"`, where a plan's implementing step is), else the
+/// cursor unit (`scope: "cursor"`, a plan with no creator step). Through [`amend_unit`], so it is
+/// idempotent like every other amendment.
+fn land_plan_note(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    unit_ix: usize,
+    note: &str,
+) -> anyhow::Result<()> {
+    let mut units = crate::domain::session_units(store, run_id)?;
+    let creator = units
+        .iter()
+        .enumerate()
+        .skip(unit_ix)
+        .find(|(_, u)| u.role == crate::workflow::PhaseRole::Creator)
+        .map(|(ix, _)| ix);
+    let (ix, scope) = match creator {
+        Some(ix) => (ix, crate::workflow::AmendScope::Creator),
+        None => (unit_ix, crate::workflow::AmendScope::Cursor),
+    };
+    // No unit at the cursor: the release runs nothing more, so there is no step to steer. The note
+    // stays on the gate's recorded answer; a failed apply would fail the run over a note.
+    let Some(u) = units.get_mut(ix) else {
+        return Ok(());
+    };
+    amend_unit(store, subscribers, run_id, u, note, scope.as_wire())
+}
+
 /// (DES-TEAMING-002 §8.6, T3) The `plan_approval` arm of [`confirm_gate`], entered when the run's
 /// OPEN interaction row is a plan gate (DES-001 §6.7: its `gate_kind` is read before the row is
 /// resolved). Approve releases the held plan (`gate.decided{human_approved}` →
@@ -13162,9 +13233,6 @@ fn confirm_plan_gate(
             "a plan_approval gate reviews a plan, not work — approve, approve with an edited \
              plan, or reject"
         ),
-        HumanDecision::Approve { amend: Some(a), .. } if !a.is_empty() => anyhow::bail!(
-            "a plan_approval gate takes an edited plan, not amend text — send the edited steps"
-        ),
         HumanDecision::Approve { .. } | HumanDecision::EditPlan { .. } => {
             // A finished unit is never re-dispatched: the cursor must not have run.
             if !cursor.is_some_and(not_run) {
@@ -13192,12 +13260,25 @@ fn confirm_plan_gate(
              reject"
         ),
     }
+    // (crew#1139) THE OPERATOR'S NOTE: an approve's `amend` (with or without an edited plan) is
+    // carried to the steps the plan releases. It is staged with the answer and lands only when the
+    // answer applies (`team_gate::apply_release`), after any re-plan, so it reaches the units the
+    // plan actually runs. `amend_scope` does not apply here: the note goes to the first creator
+    // phase at or after the cursor, else the cursor unit.
+    let note = match &decision {
+        HumanDecision::Approve { amend, .. } => amend.as_deref(),
+        HumanDecision::EditPlan { note, .. } => note.as_deref(),
+        _ => None,
+    }
+    .map(str::trim)
+    .filter(|n| !n.is_empty())
+    .map(str::to_string);
     let answer = match &decision {
         HumanDecision::Approve { .. } => {
-            serde_json::json!({"approve": true, "action": "approve", "amend": null})
+            serde_json::json!({"approve": true, "action": "approve", "amend": note})
         }
-        HumanDecision::EditPlan { plan } => {
-            serde_json::json!({"approve": true, "action": "edit_plan", "amend": null, "plan": plan})
+        HumanDecision::EditPlan { plan, .. } => {
+            serde_json::json!({"approve": true, "action": "edit_plan", "amend": note, "plan": plan})
         }
         _ => serde_json::json!({"approve": false, "action": "reject", "amend": null}),
     };
@@ -13208,7 +13289,7 @@ fn confirm_plan_gate(
     // refuses the edit exactly as a compose refusal does (acceptance (i)): `plan.refused` names
     // the reason, the gate re-opens, and the held plan, accepted rev and units are untouched.
     let staged = match &decision {
-        HumanDecision::EditPlan { plan } => Some(stage_edit(
+        HumanDecision::EditPlan { plan, .. } => Some(stage_edit(
             store,
             &session,
             &state,
@@ -13281,6 +13362,7 @@ fn confirm_plan_gate(
                     facts: Vec::new(),
                     def: None,
                     reopen: false,
+                    note,
                 },
             )
         }
@@ -13295,6 +13377,7 @@ fn confirm_plan_gate(
                 facts: crate::plan_gate::queued_facts(&events)?,
                 def: Some(crate::plan_gate::StagedDef::new(def)),
                 reopen: false,
+                note,
             },
         ),
         Some(StagedEdit::Refused { reason, events }) => {
@@ -13313,6 +13396,7 @@ fn confirm_plan_gate(
                     facts: crate::plan_gate::queued_facts(&events)?,
                     def: None,
                     reopen: true,
+                    note: None,
                 },
             )
         }
@@ -14046,8 +14130,8 @@ pub(crate) fn confirm_gate_as(
                 serde_json::json!({ "approve": false, "action": "reject", "amend": null })
                     .to_string()
             }
-            crate::workflow::HumanDecision::EditPlan { plan } => serde_json::json!({
-                "approve": true, "action": "edit_plan", "amend": null, "plan": plan,
+            crate::workflow::HumanDecision::EditPlan { plan, note } => serde_json::json!({
+                "approve": true, "action": "edit_plan", "amend": note, "plan": plan,
             })
             .to_string(),
             crate::workflow::HumanDecision::FloorRerun(mode) => serde_json::json!({
@@ -14563,32 +14647,7 @@ pub(crate) fn confirm_gate_as(
                         );
                     };
                     if let Some(u) = units.get_mut(target_ix) {
-                        let segment = format!(" (operator amendment: {a})");
-                        if !u.description.contains(&segment) {
-                            u.description.push_str(&segment);
-                            // (core#760) The amendment is a ruling the unit's reviewer reads.
-                            u.operator_rulings.push(crate::domain::OperatorRuling {
-                                action: "amend".to_string(),
-                                text: a.clone(),
-                                attempt: u.last_attempt.unwrap_or(0),
-                                at: crate::interaction::now_millis(),
-                            });
-                            put_node(store, u.to_node())?;
-                            // (EVT-012) UnitReworkAmended — the authoritative amendment paper trail.
-                            // Fires here (after persist, before Resumed) so the amendment text is
-                            // durable before any subscriber sees the run resume. Resumed alone
-                            // carries no amendment text; this event is the canonical record.
-                            emit(
-                                subscribers,
-                                CoreEvent::UnitReworkAmended {
-                                    session: run_id.to_string(),
-                                    ord: u.ord,
-                                    amendment: a,
-                                    updated_description: u.description.clone(),
-                                    scope: amend_scope.as_wire().to_string(),
-                                },
-                            );
-                        }
+                        amend_unit(store, subscribers, run_id, u, &a, amend_scope.as_wire())?;
                     }
                 }
             }
@@ -32720,6 +32779,145 @@ mod plan_gate_confirm_tests {
             open.iter().any(|r| r.prompt.contains("rev 2")),
             "the plan gate re-opens on the current rev: {open:#?}"
         );
+    }
+
+    /// What [`approve_with_note`] observed: the confirm's result, the run's units after it, the
+    /// `UnitReworkAmended` events `(ord, amendment, scope)` it emitted, and the store.
+    type NoteOutcome = (
+        anyhow::Result<SessionStatus>,
+        Vec<WorkUnit>,
+        Vec<(u32, String, String)>,
+        Box<dyn GraphStore>,
+    );
+
+    /// (crew#1139) Approve the plan gate with `amend`, the fixture plus `extra` units.
+    fn approve_with_note(
+        note: &str,
+        extra: &[(&str, u32, crate::workflow::PhaseRole)],
+    ) -> NoteOutcome {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        fixture(&mut store, UnitStatus::Distributed);
+        for (id, ord, role) in extra {
+            let mut u = WorkUnit::pending(format!("r:{id}"), "r", *ord, format!("{id} it"));
+            u.role = *role;
+            put_node(&mut store, u.to_node()).unwrap();
+        }
+        let mut subs = crate::event_log::EventSink::default();
+        let (etx, erx) = channel::<CoreEvent>();
+        subs.push(etx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let status = confirm_gate(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            "r",
+            crate::workflow::HumanDecision::Approve {
+                amend: Some(note.to_string()),
+                amend_scope: Default::default(),
+            },
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        let amended = erx
+            .try_iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    ord,
+                    amendment,
+                    scope,
+                    ..
+                } => Some((ord, amendment, scope)),
+                _ => None,
+            })
+            .collect();
+        let units = crate::domain::session_units(&store, "r").unwrap();
+        (status, units, amended, Box::new(store))
+    }
+
+    /// (crew#1139) A plan approval carries the operator's note: it lands on the first CREATOR step
+    /// at or after the cursor (where the plan implements), recorded as `UnitReworkAmended{scope:
+    /// "creator"}` and on the gate's answer, while the cursor unit dispatches as it was. Before the
+    /// fix the engine refused it ("takes an edited plan, not amend text") and the gate stayed open.
+    #[test]
+    fn a_plan_approval_lands_its_note_on_the_first_creator_step_1139() {
+        let (status, units, amended, store) = approve_with_note(
+            "  keep the OS-metadata list in the mirrored fixture  ",
+            &[
+                ("review", 3, crate::workflow::PhaseRole::Evaluator),
+                ("fix", 4, crate::workflow::PhaseRole::Creator),
+                ("fix-more", 5, crate::workflow::PhaseRole::Creator),
+            ],
+        );
+        assert_eq!(
+            status.expect("the note is part of the answer"),
+            SessionStatus::Executing
+        );
+        let note = "keep the OS-metadata list in the mirrored fixture";
+        assert_eq!(amended, [(4, note.to_string(), "creator".to_string())]);
+        let carrying: Vec<&str> = units
+            .iter()
+            .filter(|u| u.description.contains("operator amendment"))
+            .map(|u| u.id.as_str())
+            .collect();
+        assert_eq!(
+            carrying,
+            ["r:fix"],
+            "only the first creator step carries it"
+        );
+        let fix = units.iter().find(|u| u.id == "r:fix").unwrap();
+        assert!(fix
+            .description
+            .ends_with(&format!(" (operator amendment: {note})")));
+        assert_eq!(fix.operator_rulings.len(), 1);
+        assert_eq!(fix.operator_rulings[0].text, note);
+        let build = units.iter().find(|u| u.id == "r:build").unwrap();
+        assert_eq!(
+            build.description, "build it",
+            "the cursor dispatches unamended"
+        );
+        let row = crate::interaction::list_interactions(&*store, Some("r"), None)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.gate_kind.as_deref() == Some(crate::plan_gate::GATE_KIND))
+            .unwrap();
+        let answer: serde_json::Value =
+            serde_json::from_str(row.answer.as_deref().unwrap()).unwrap();
+        assert_eq!(answer["amend"], note, "the gate's answer records the note");
+    }
+
+    /// (crew#1139) A plan with no creator step at or after the cursor: the note lands on the
+    /// cursor unit, the step the approval releases (`scope: "cursor"`). A blank note is no note.
+    #[test]
+    fn a_plan_approval_note_without_a_creator_step_lands_on_the_cursor_1139() {
+        let (status, units, amended, _) = approve_with_note("answer in a table", &[]);
+        assert_eq!(status.unwrap(), SessionStatus::Executing);
+        assert_eq!(
+            amended,
+            [(2, "answer in a table".to_string(), "cursor".to_string())]
+        );
+        let build = units.iter().find(|u| u.id == "r:build").unwrap();
+        assert_eq!(
+            build.description,
+            "build it (operator amendment: answer in a table)"
+        );
+        let understand = units.iter().find(|u| u.id == "r:understand").unwrap();
+        assert_eq!(
+            understand.description, "understand the problem",
+            "a unit that ran is never amended"
+        );
+
+        let (status, units, amended, _) = approve_with_note("   ", &[]);
+        assert_eq!(status.unwrap(), SessionStatus::Executing);
+        assert!(amended.is_empty(), "{amended:?}");
+        assert!(units
+            .iter()
+            .all(|u| !u.description.contains("operator amendment")));
     }
 
     #[test]

@@ -457,8 +457,13 @@ pub enum HumanDecision {
     /// (DES-TEAMING-002 §8.6, T3) Approve a `plan_approval` gate WITH AN EDIT: the edited plan is
     /// proposed (`plan.proposed{by:"human", kind:"edit"}`), floor-filled and composed, and
     /// accepted directly as the next rev — the human who edited it approved it. A refused edit
-    /// re-opens the gate with a new `gate_id`. Refused at any other gate.
-    EditPlan { plan: crate::plan::PlanSteps },
+    /// re-opens the gate with a new `gate_id`. Refused at any other gate. `note` (crew#1139) is the
+    /// operator's note to the steps the accepted plan releases, landed as a plan-gate approve's
+    /// `amend` is (see `confirm_plan_gate`); a refused edit lands nothing.
+    EditPlan {
+        plan: crate::plan::PlanSteps,
+        note: Option<String>,
+    },
     /// (core#469) Answer the escalation gate of a repo-checks floor that did not FINISH (denial
     /// source `repo_checks_timeout`): re-run the floor on the tree as it stands — `extend` (every
     /// check under 2× its bound), `targeted` (the declared targeted test set in place of the full

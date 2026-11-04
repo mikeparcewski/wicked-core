@@ -235,6 +235,14 @@ export declare class Core {
    */
   static supportsPlanLaunch(): boolean
   /**
+   * (crew#1139) Whether this addon lets a `plan_approval` approval carry the operator's note:
+   * `confirmGate(run, true, amend)` and `confirmGate(run, true, amend, "edit_plan", undefined,
+   * planJson)` land `amend` on the first creator step the plan releases (else its first step),
+   * as `unitReworkAmended`. An older addon refuses both, so a skin keys on this static before it
+   * offers a note field on the plan card.
+   */
+  static supportsPlanGateNote(): boolean
+  /**
    * (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
    * `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
    * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.

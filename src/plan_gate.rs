@@ -525,6 +525,10 @@ pub struct StagedRelease {
     /// A refused edit: the gate re-opens (a fresh gate) instead of releasing the run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub reopen: bool,
+    /// (crew#1139) The operator's note to the steps the release runs (an approve's `amend`),
+    /// trimmed and non-empty. Landed when the release applies, never on a re-opened gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// The proven def of an accepted edit, durable. [`crate::workflow::PhaseDef::catalog`] is
