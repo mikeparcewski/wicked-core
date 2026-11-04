@@ -421,7 +421,7 @@ own:
   (folded; it opens after a run) shows one row per steering type: what was blocked, what
   slipped through (gaps), what was blocked by mistake (false positives). A row opens that type's numbers, its gaps with their nearest-rule hints
   and a Draft rules hand-off to the steering assistant, and every behaviour with its verdict
-  and nearest rules. A report that says `"degraded": "facet-only"` is labelled **Tags only**,
+  and fired rules (a gap's nearest-rule hints expand under it). A report that says `"degraded": "facet-only"` is labelled **Tags only**,
   and "Read these numbers with this in mind" says what the split cannot: for example, when
   no rule in force carries an effect, no bad behaviour can be caught yet.
 - **Bring your own behaviours** — import a corpus from a file (the Sample shape above), a

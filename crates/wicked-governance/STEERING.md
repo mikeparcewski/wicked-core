@@ -229,8 +229,9 @@ the operator CLI against a store crew does not hold. The estate MCP writes nothi
 
 The import format IS the doc-ingest format: a frontmattered markdown doc, one parse path
 (`src/markdown.rs`), whether it arrives by doc PR + `rules ingest`, by pack directory, or as a
-file chosen in Steering's **⋯ → Import rules…** (a markdown doc or a JSON batch, filed under one
-`steering_type`, the filtered type by default). A starting point (save it as a `.md` file):
+file chosen in Steering's **⋯ → Import rules…** (a markdown doc or a JSON batch; the type you pick,
+the filtered one by default, applies only to entries that omit `steering_type`). A starting point
+(save it as a `.md` file):
 
 ```markdown
 ---
