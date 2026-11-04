@@ -2215,6 +2215,20 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.23** — 2026-11-04 — patch release on main 4ba99b7, carrying 3 PRs since 0.15.22: #1258, #1260 and #1261.
+  - **`answer_only` (#1260, crew#1311).** A def's last, non-code phase (and a plan step) may declare `answer_only`;
+    the substance floor then accepts a short answer from that unit and still rejects an empty or whitespace-only one.
+    `WorkflowDef::validate` refuses it on a code phase and on any phase but the last (`AnswerOnlyMisplaced`,
+    `invalid_def` for a plan). crew's one-shot seat turn (the standing-order parse, and "Ask a question of this
+    data") sends it, and `PlanStep` refuses unknown keys, so a crew that sends it needs this release.
+  - **D-7 narrows (#1261, DES-KNOWLEDGE-DATA-001 §9.3).** An Apps unit (`apps-turn`, `apps-publish`) is refused a
+    brokered tool only when the tool's class is `write` or `destructive`; a `read` goes on to the gates every unit
+    passes, and crew's data gate decides rows and visibility. The rule id `engine:apps-no-source-tool` is kept. The
+    apps-turn and apps-publish prompts say "never call a write tool or an action".
+  - **Lockfile:** #1258 re-stamped the 0.15.22 platform lock entries.
+  - The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol are unchanged
+    since 0.15.22, so the seat and floor image tags and gate protocol 3 are unchanged. No binding method or
+    `LaunchSpec` field is added.
 - **core-ts 0.15.22** — 2026-11-03 — patch release on main 01e91b1, carrying 2 PRs since 0.15.21: #1251 and #1254.
   - **Apps presets (#1251, DES-APPS-001 K0).** Two built-in presets with fixed plans that skip the plan gate:
     `apps-turn` (build, then crew's `wicked-crew apps-check`, then a review on a distinct seat) and `apps-publish`
