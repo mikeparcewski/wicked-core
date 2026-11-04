@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **D-7 narrows: an Apps unit is refused write and destructive tools only; its reads go to crew's data gate
+  (DES-KNOWLEDGE-DATA-001 §9.3, which narrows DES-APPS-001 §5.2).** Every unit of an `apps-turn` or `apps-publish`
+  run (builder, reviewer, QE, the QE reviewer turn, the check Tool's token) was refused every brokered MCP call and
+  listing. It is now refused a tool only when the tool's class (the one derivation, `classify`: no hints is `write`,
+  an operator's override wins) is `write` or `destructive`, registered or not, in every mode; a `read` goes on to
+  the gates every unit passes (D-5, D-1, policy, first use). Rows, query and visibility stay crew's data gate: crew
+  hands every live-source tool to the engine as a read and decides with the person's per-source switches, which the
+  engine cannot read. The rule id `engine:apps-no-source-tool` is kept. The apps-turn and apps-publish prompts say
+  "never call a write tool or an action" instead of "no source tool". Ships to crew with the next core-ts release.
 - **A one-shot answer step may declare `answer_only`, and a short correct answer is then an answer (crew#1311, rig
   run 0f5beafa).** crew's one-shot seat turn (the standing-order parse, and "Ask a question of this data") launches
   one read-only `understand` step that nobody reviews; crew parses its answer and a person confirms it. A correct
