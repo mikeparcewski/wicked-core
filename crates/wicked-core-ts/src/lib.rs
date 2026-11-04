@@ -925,9 +925,10 @@ fn parse_plan(json: &str) -> napi::Result<wicked_core::PlanSteps> {
 }
 
 /// The decision `confirmGate` builds when it is handed `planJson` (an edit at a `plan_approval`
-/// gate): it requires `approve=true` and `action` omitted or `edit_plan`. The edited plan IS the
-/// whole answer (T3 round 10): a non-empty `amend` or any `amendScope` beside it is refused, never
-/// silently dropped.
+/// gate): it requires `approve=true` and `action` omitted or `edit_plan`. `amend` beside it is the
+/// operator's NOTE to the steps the edited plan releases (crew#1139; [`Core::supports_plan_gate_note`]):
+/// the engine lands it on the first creator phase at or after the cursor. `amendScope` is refused,
+/// never silently dropped: a plan gate's note has no scope to choose.
 fn edit_decision(
     approve: bool,
     amend: Option<&str>,
@@ -941,14 +942,18 @@ fn edit_decision(
              action omitted or `edit_plan`"
         )));
     }
-    if amend.is_some_and(|a| !a.trim().is_empty()) || amend_scope.is_some() {
+    if amend_scope.is_some() {
         return Err(err(anyhow::anyhow!(
-            "planJson is the whole answer to a plan_approval gate: send the edit in the plan, \
-             not as amend / amendScope"
+            "planJson answers a plan_approval gate: its note (amend) lands on the plan's first \
+             creator step, so amendScope does not apply"
         )));
     }
     Ok(HumanDecision::EditPlan {
         plan: parse_plan(plan_json)?,
+        note: amend
+            .map(str::trim)
+            .filter(|a| !a.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -1035,6 +1040,16 @@ impl Core {
     /// drop the plan and run the launch unplanned and ungated.
     #[napi]
     pub fn supports_plan_launch() -> bool {
+        true
+    }
+
+    /// (crew#1139) Whether this addon lets a `plan_approval` approval carry the operator's note:
+    /// `confirmGate(run, true, amend)` and `confirmGate(run, true, amend, "edit_plan", undefined,
+    /// planJson)` land `amend` on the first creator step the plan releases (else its first step),
+    /// as `unitReworkAmended`. An older addon refuses both, so a skin keys on this static before it
+    /// offers a note field on the plan card.
+    #[napi]
+    pub fn supports_plan_gate_note() -> bool {
         true
     }
 
@@ -3390,19 +3405,28 @@ mod tests {
         assert!(e.reason.contains("run-x"), "{}", e.reason);
     }
 
-    /// (T3 round 10, LOW 9) `planJson` is the whole answer: an `amend` or `amendScope` beside it
-    /// is refused, never silently dropped; without them the edit decision is built.
+    /// (T3 round 10, LOW 9) An `amendScope` beside `planJson` is refused, never silently dropped.
+    /// (crew#1139) An `amend` beside it is the operator's note to the edited plan, carried on the
+    /// decision trimmed; a blank one is no note.
     #[test]
-    fn an_edit_with_an_amend_or_amend_scope_is_refused() {
+    fn an_edit_carries_its_note_and_refuses_an_amend_scope() {
         let plan = r#"{"steps":[{"catalog":"build","id":"build"}]}"#;
-        assert!(edit_decision(true, Some("tweak"), None, None, plan).is_err());
         assert!(edit_decision(true, None, None, Some("creator"), plan).is_err());
         assert!(edit_decision(true, Some(""), None, Some("cursor"), plan).is_err());
         assert!(matches!(
+            edit_decision(true, Some("  keep it in the fixture "), None, None, plan),
+            Ok(HumanDecision::EditPlan { note: Some(n), .. }) if n == "keep it in the fixture"
+        ));
+        assert!(matches!(
+            edit_decision(true, Some("  "), Some("edit_plan"), None, plan),
+            Ok(HumanDecision::EditPlan { note: None, .. })
+        ));
+        assert!(matches!(
             edit_decision(true, None, Some("edit_plan"), None, plan),
-            Ok(HumanDecision::EditPlan { .. })
+            Ok(HumanDecision::EditPlan { note: None, .. })
         ));
         assert!(edit_decision(false, None, None, None, plan).is_err());
+        assert!(Core::supports_plan_gate_note());
     }
     // Only the tests name a failure kind now that the CoreEvent → JSON mapping lives in core.
     use serde_json::Value;

@@ -761,7 +761,13 @@ fn an_initial_gate_edit_keeps_the_launchs_declared_deliverables() {
         {"catalog": "test", "id": "prove"}
     ]}));
     rig.core
-        .confirm_gate("redl", HumanDecision::EditPlan { plan: edit })
+        .confirm_gate(
+            "redl",
+            HumanDecision::EditPlan {
+                plan: edit,
+                note: None,
+            },
+        )
         .unwrap();
     rig.tap.until("the first dispatch", |s| {
         !dispatched_ords(s, "redl").is_empty()
@@ -802,6 +808,7 @@ fn an_initial_gate_edit_with_no_creator_for_the_deliverables_is_refused_with_its
             "redr",
             HumanDecision::EditPlan {
                 plan: plan(json!({"steps": [{"catalog": "understand", "id": "look"}]})),
+                note: None,
             },
         )
         .unwrap();
@@ -842,7 +849,13 @@ fn e_an_edit_below_the_floor_is_accepted_as_rev_2_with_floor_phases_added() {
     ]}));
     let status = rig
         .core
-        .confirm_gate("re", HumanDecision::EditPlan { plan: edit })
+        .confirm_gate(
+            "re",
+            HumanDecision::EditPlan {
+                plan: edit,
+                note: None,
+            },
+        )
         .unwrap();
     assert_eq!(status, SessionStatus::Executing);
     rig.tap.until("the first dispatch", |s| {
@@ -1031,6 +1044,7 @@ fn run_reopen(restart_between: bool) {
             run,
             HumanDecision::EditPlan {
                 plan: refused_edit(),
+                note: None,
             },
         )
         .unwrap();
@@ -1068,6 +1082,7 @@ fn run_reopen(restart_between: bool) {
             run,
             HumanDecision::EditPlan {
                 plan: plan(json!({"steps": [{"catalog": "build", "id": "build"}]})),
+                note: None,
             },
         )
         .unwrap();
@@ -1410,7 +1425,13 @@ fn an_edit_that_fails_its_preflight_is_refused_before_anything_changes() {
     ]}));
     let status = rig
         .core
-        .confirm_gate("rpf", HumanDecision::EditPlan { plan: edit })
+        .confirm_gate(
+            "rpf",
+            HumanDecision::EditPlan {
+                plan: edit,
+                note: None,
+            },
+        )
         .expect("a refused edit is an answer, not an error");
     assert_eq!(status, SessionStatus::AwaitingHuman);
     rig.tap.until("plan.refused and the re-opened gate", |s| {
@@ -1681,7 +1702,13 @@ fn a_renamed_deliver_step_is_refused_as_a_gate_edit() {
         });
     let status = rig
         .core
-        .confirm_gate("rse", HumanDecision::EditPlan { plan: ship_plan() })
+        .confirm_gate(
+            "rse",
+            HumanDecision::EditPlan {
+                plan: ship_plan(),
+                note: None,
+            },
+        )
         .unwrap();
     assert_eq!(status, SessionStatus::AwaitingHuman);
     rig.tap
@@ -1728,6 +1755,7 @@ fn refused_edit_keeps_the_answered_row(with_bus: bool) {
             name,
             HumanDecision::EditPlan {
                 plan: refused_edit(),
+                note: None,
             },
         )
         .unwrap();

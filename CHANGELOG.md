@@ -22,6 +22,17 @@ Two release tracks share this file, newest entry first regardless of track:
   first-use ask it admits on the person's per-source switches leaves no waiting-for-approval claim. A deny that
   fires on the arguments dominates the first-use ask, as on a call. The tool list still judges with no arguments.
   Ships to crew with the next core-ts release; crew falls back to the list on an engine without it.
+- **A plan approval carries the operator's note (crew#1139).** At a `plan_approval` gate an approve's `amend` was
+  refused ("a plan_approval gate takes an edited plan, not amend text"), and the binding refused `amend` beside
+  `planJson`, so an operator who wanted "go ahead, but keep the list in the fixture" had to approve and correct the
+  work at later gates. The note now rides the answer, with or without an edited plan (`HumanDecision::EditPlan` gains
+  `note`). It is staged with the answer (`StagedRelease.note`, durable on the pending `gate.decided`) and lands when the
+  release applies, after an edit's re-plan, on the first creator step at or after the cursor (else the cursor step),
+  the way `amendScope: "creator"` does: appended to the instruction, recorded as an operator ruling, and announced as
+  `unitReworkAmended{scope: "creator" | "cursor"}`, idempotent across a restart. The gate's recorded answer carries it.
+  A refused edit re-opens the gate and lands nothing. `amendScope` does not apply at a plan gate (the binding still
+  refuses it beside `planJson`). core-ts: `Core.supportsPlanGateNote()` says the addon carries it. Ships to crew with
+  the next core-ts release.
 - **An MCP ask says whether the server's first use is its only reason: `firstUseOnly` (crew#1333).** On a store
   with the `mcp-defaults` pack, MCP-POSTURE-READ (an allow) fires on every read, so a read's first-use ask names
   `[engine:mcp-first-use, MCP-POSTURE-READ]`, and an operator's own asking rule leads with `engine:mcp-first-use`

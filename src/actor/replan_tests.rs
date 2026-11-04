@@ -922,6 +922,7 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
             "man",
             HumanDecision::EditPlan {
                 plan: plan(json!({"steps": [{"catalog": "test_plan"}]})),
+                note: None,
             },
         )
         .unwrap();
@@ -1791,7 +1792,13 @@ fn k2b_a_not_now_edit_at_the_first_creator_gate_drops_the_proposed_units() {
     );
     let status = e
         .core
-        .confirm_gate("nn", HumanDecision::EditPlan { plan: plan(steps) })
+        .confirm_gate(
+            "nn",
+            HumanDecision::EditPlan {
+                plan: plan(steps),
+                note: None,
+            },
+        )
         .expect("the edit is an answer");
     assert_ne!(status, crate::SessionStatus::Failed);
     wait_for("answer-2 to dispatch", || {
@@ -1858,6 +1865,7 @@ fn k2b_a_step_reusing_a_declined_id_is_planned_fresh_not_kept() {
                     {"catalog": "understand", "id": "answer-1"},
                     {"catalog": "design"}
                 ]})),
+                note: None,
             },
         )
         .expect("the edit is an answer");

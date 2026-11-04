@@ -2765,7 +2765,42 @@ fn the_edit() -> HumanDecision {
             {"catalog": "build", "id": "make"},
             {"catalog": "test", "id": "prove"}
         ]})),
+        note: None,
     }
+}
+
+/// (crew#1139) [`the_edit`] with the operator's note.
+fn the_edit_noted(note: &str) -> HumanDecision {
+    match the_edit() {
+        HumanDecision::EditPlan { plan, .. } => HumanDecision::EditPlan {
+            plan,
+            note: Some(note.to_string()),
+        },
+        _ => unreachable!(),
+    }
+}
+
+/// (crew#1139) The run's units whose instruction carries `note` as an operator amendment, with how
+/// many times each carries it.
+fn noted_units(e: &Engine, run: &str, note: &str) -> Vec<(String, usize)> {
+    let segment = format!(" (operator amendment: {note})");
+    e.core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .filter(|v| v.session.id == run)
+        .flat_map(|v| v.units)
+        .filter(|u| u.description.contains(&segment))
+        .map(|u| {
+            let n = u.description.matches(&segment).count();
+            (
+                u.id.strip_prefix(&format!("{run}:"))
+                    .unwrap_or(&u.id)
+                    .to_string(),
+                n,
+            )
+        })
+        .collect()
 }
 
 /// The launch's plan (rev 1, held): its unit ids.
@@ -2982,6 +3017,119 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
     assert_eq!(count(&rig.types("r9b"), tev::PLAN_PROPOSED), 2);
 }
 
+/// (crew#1139) An EDITED plan approval carries the operator's note: it lands after the re-plan on
+/// the edited plan's FIRST creator step (`make`, not the held plan's `build`), once, and the run
+/// dispatches as planned. Before the fix `EditPlan` had no note and the binding refused `amend`
+/// beside `planJson`.
+#[test]
+fn an_edited_approval_lands_its_note_on_the_edited_plans_first_creator_step_1139() {
+    let rig = rig("n1139e");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "ne");
+    let note = "keep the OS-metadata list in the mirrored fixture";
+    e.core.confirm_gate("ne", the_edit_noted(note)).unwrap();
+    wait_for("the first dispatch", || {
+        e.runner.0.load(AtomicOrdering::SeqCst) >= 1
+    });
+    assert_eq!(unit_ids(&e, "ne"), EDITED_UNITS);
+    assert_eq!(noted_units(&e, "ne", note), [("make".to_string(), 1)]);
+    let units = e
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "ne")
+        .unwrap()
+        .units;
+    let first_creator = units
+        .iter()
+        .find(|u| u.role == crate::workflow::PhaseRole::Creator)
+        .map(|u| u.id.as_str());
+    assert_eq!(
+        first_creator,
+        Some("ne:make"),
+        "make is the first creator step"
+    );
+}
+
+/// (crew#1139) A refused edit re-opens the gate and lands nothing: the note goes with a release.
+#[test]
+fn a_refused_edit_lands_no_note_1139() {
+    let rig = rig("n1139r");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "nr");
+    let refused = HumanDecision::EditPlan {
+        plan: steps(serde_json::json!({
+            "steps": [{"catalog": "build", "id": "build"}],
+            "override": {"remove": ["review"], "reason": "trust me"}
+        })),
+        note: Some("never lands".into()),
+    };
+    let status = e.core.confirm_gate("nr", refused).unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    wait_for("the second gate.opened", || {
+        count(&rig.types("nr"), tev::GATE_OPENED) == 2
+    });
+    assert!(noted_units(&e, "nr", "never lands").is_empty());
+    assert_eq!(unit_ids(&e, "nr"), HELD_UNITS);
+    assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
+}
+
+/// (crew#1139) The note rides the STAGED answer: a restart between the `gate.decided` ack and the
+/// apply lands it at boot, once, and a second boot does not land it again.
+#[test]
+fn a_noted_edit_applied_at_boot_lands_its_note_once_1139() {
+    let rig = rig("n1139b");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "nb");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let note = "answer in a table";
+    e.core.confirm_gate("nb", the_edit_noted(note)).unwrap();
+    wait_for("the team_transport pause", || {
+        open_gate_kinds(&e.db, "nb") == vec![TEAM_TRANSPORT_GATE.to_string()]
+    });
+    assert!(
+        noted_units(&e, "nb", note).is_empty(),
+        "nothing lands before the ack"
+    );
+    let db = e.db.clone();
+    drop(e);
+    rig.allow();
+    let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
+    let mut session = crate::domain::get_session(&store, "nb").unwrap().unwrap();
+    let team = session.team.as_mut().expect("team state");
+    team.open_gate = None;
+    let pending = team.pending.as_mut().expect("the pending gate.decided");
+    assert_eq!(
+        pending.staged.as_ref().and_then(|r| r.note.as_deref()),
+        Some(note),
+        "the note is staged with the answer"
+    );
+    pending.stage = crate::domain::PendingStage::Acknowledged;
+    crate::domain::put_node(&mut store, session.to_node()).unwrap();
+    crate::interaction::resolve_open_for_session(
+        &mut store,
+        "nb",
+        crate::interaction::InteractionStatus::Answered,
+        Some(r#"{"approve":true,"action":"approve","amend":null}"#.to_string()),
+        crate::interaction::now_millis(),
+    )
+    .unwrap();
+    drop(store);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(unit_ids(&e, "nb"), EDITED_UNITS, "applied at boot");
+    assert_eq!(noted_units(&e, "nb", note), [("make".to_string(), 1)]);
+    drop(e);
+    std::thread::sleep(Duration::from_millis(300));
+    let e = engine_on(&db, fast(&rig));
+    assert_eq!(
+        noted_units(&e, "nb", note),
+        [("make".to_string(), 1)],
+        "once, after a second boot"
+    );
+}
+
 /// Round 9 sweep: approving the held plan as-is records the accepted rev only once its
 /// `gate.decided` lands — while it is held back the rev is not accepted and nothing dispatches.
 #[test]
@@ -3020,6 +3168,7 @@ fn a_refused_edit_reopens_only_after_its_gate_decided_lands() {
             "steps": [{"catalog": "build", "id": "build"}],
             "override": {"remove": ["review"], "reason": "trust me"}
         })),
+        note: None,
     };
     let reply = answer_async(&e, "r9r", refused);
     std::thread::sleep(Duration::from_millis(600));

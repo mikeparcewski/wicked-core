@@ -768,6 +768,10 @@ pub(super) fn apply_release(
             .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     }
     if !release.reopen {
+        // (crew#1139) The operator's note reaches the units this release runs (after the re-plan).
+        if let Some(note) = release.note.as_deref() {
+            super::land_plan_note(store, subscribers, &run_id, session.unit_ix, note)?;
+        }
         // The cursor unit — which never ran — is released once, at its current attempt.
         let cursor_ord = crate::domain::session_units(store, &run_id)?
             .get(session.unit_ix)
