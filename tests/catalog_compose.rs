@@ -444,7 +444,8 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
     // A fully populated step serializes every field: the table must name exactly those.
     let full_step = json!({"catalog": "full", "id": "x", "instructions": "own", "gate": "auto",
         "gate_type": "value", "validator_pin": "p", "executes_code": true,
-        "writes_nothing": true, "verified_evidence": true, "requires_capture_report": true, "budget_secs": 1,
+        "writes_nothing": true, "verified_evidence": true, "requires_capture_report": true,
+        "answer_only": true, "budget_secs": 1,
         "pool": 1, "skill_ref": "s",
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
@@ -703,6 +704,18 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
                     compose_one("tool", json!({"executor": cmd})).unwrap(),
                     "{field}"
                 );
+            }
+            // (crew#1311) An output declaration: lands on a last phase that executes no code, and
+            // the composed def's validation refuses it on a code phase.
+            FieldRule::OutputDeclaration => {
+                assert_eq!(field, "answer_only");
+                let r = compose_one("full", json!({"answer_only": true}))
+                    .expect_err("answer_only on a code phase");
+                assert_eq!(r.reason(), "invalid_def", "{r}");
+                let cmd = json!({"type": "tool", "cmd": ["true"]});
+                let def = compose_one("tool", json!({"executor": cmd, "answer_only": true}))
+                    .unwrap_or_else(|e| panic!("{field}: {e}"));
+                assert!(def.phases[0].answer_only, "{field}");
             }
             FieldRule::Free => {
                 let change = match field {

@@ -1244,6 +1244,13 @@ pub struct WorkUnit {
     /// byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_capture_report: bool,
+    /// (crew#1311) Whether this unit's backing phase declared
+    /// [`answer_only`](crate::workflow::PhaseDef::answer_only) — carried verbatim at plan time,
+    /// exactly the way `executes_code` is. One consumer: the phase-substance floor in
+    /// `actor::apply_step_result`, which asks such a read-only unit only for a non-empty answer.
+    /// Skip-if-false: every other unit serializes byte-identical to before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_only: bool,
     /// (BC-80, core#535) The counts the capture phase REPORTED, read from its output marker by the
     /// gate fold. `None` on every unit that declares no capture report, and on one whose marker
     /// was missing (that case denies — the denial is the record). Evidence on the persisted unit,
@@ -1765,6 +1772,7 @@ impl WorkUnit {
             required_deliverables: Vec::new(),
             executes_code: false,
             requires_capture_report: false,
+            answer_only: false,
             capture_report: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),

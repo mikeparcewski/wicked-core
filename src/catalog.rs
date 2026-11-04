@@ -1153,6 +1153,7 @@ fn entry(
 ) -> PhaseDef {
     PhaseDef {
         requires_capture_report: false,
+        answer_only: false,
         id: id.to_string(),
         kind,
         instructions: None,

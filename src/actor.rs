@@ -7436,11 +7436,17 @@ fn apply_step_result(
     // codex answer, used to pad such answers past this floor; without it a short, correct chat
     // answer failed the floor and never reached the chat. The exemption lowers the floor to "an
     // answer exists": an empty or whitespace-only output is still no substance.
-    let human_reads_every_output =
-        !unit.executes_code && matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. });
+    //
+    // (crew#1311) The same lowered floor for a read-only unit whose phase declared `answer_only`:
+    // its caller reads the answer (crew's one-shot seat turn: a parse, a drafted query), and the
+    // def's validation put it last, so no unit behind it and no evaluator builds on it. A correct
+    // 192-character draft failed the 200-character floor here and parked at a gate nobody saw.
+    let answer_is_enough = !unit.executes_code
+        && (unit.answer_only
+            || matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. }));
     let prose_chars = output.output.trim().chars().count();
     let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
-        && if human_reads_every_output {
+        && if answer_is_enough {
             prose_chars == 0
         } else {
             prose_chars < MIN_SUBSTANCE_CHARS
@@ -7479,9 +7485,9 @@ fn apply_step_result(
             || (mention.is_none() && floor_red && !clean && !output.output.trim().is_empty()));
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
-    // under the human-confirm exemption, where `no_prose` already means "no answer at all": an
+    // under the answer exemption, where `no_prose` already means "no answer at all": an
     // empty answer is no answer however dirty the worktree is (core#970, codex r5).
-    let prose_rejects = no_prose && (clean || human_reads_every_output);
+    let prose_rejects = no_prose && (clean || answer_is_enough);
     if output.governed
         && (prose_rejects || (code_without_diff && !declared_no_change && left_no_change))
     {
@@ -18802,6 +18808,76 @@ mod substance_gate_tests {
                 unit.denial_reason.as_deref(),
                 Some(NO_SUBSTANCE),
                 "output {output:?}"
+            );
+        }
+    }
+
+    /// crew#1311 (rig run 0f5beafa): crew's one-shot seat turn — ONE `understand` step, nobody
+    /// reviewing it, its answer read by crew and confirmed by a person — drafted a correct
+    /// 192-character query, and the 200-character floor rejected it as "no reviewable substance"
+    /// and parked the run at a gate nobody saw. Planned from the exact plan crew sends, a step
+    /// that declares `answer_only` folds that draft as an answer. The same draft on the same step
+    /// undeclared (or declared false) still meets the 200-character floor, an empty or
+    /// whitespace-only answer is still no substance, and the declaration never exempts a unit
+    /// that executes code (validation refuses that def; the fold does not take it on trust).
+    #[test]
+    fn crew_1311_an_answer_only_step_s_short_answer_is_not_no_substance() {
+        const DRAFT: &str = r#"{"sql": "SELECT count(*) AS open_tickets FROM support.tickets WHERE status = 'open'", "explanation": "Returns a single number: the count of tickets in support.tickets whose status is 'open'."}"#;
+        assert!(
+            DRAFT.chars().count() < 200,
+            "the rig's draft is under the floor"
+        );
+        let planned = |answer_only: Option<bool>| -> WorkUnit {
+            let mut step = serde_json::json!({"catalog": "understand", "id": "draft-1",
+                "budget_secs": 120, "instructions": "Draft one read query."});
+            if let Some(a) = answer_only {
+                step["answer_only"] = serde_json::json!(a);
+            }
+            let plan: crate::plan::PlanSteps = serde_json::from_value(
+                serde_json::json!({"steps": [step], "monitors": {"asked": 0}}),
+            )
+            .unwrap();
+            let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
+            crate::plan::plan_from_def(&def, "How many tickets are open?", "r").remove(0)
+        };
+        let cases: [(Option<bool>, bool, &str, bool); 6] = [
+            (Some(true), false, DRAFT, false),
+            (None, false, DRAFT, true),
+            (Some(false), false, DRAFT, true),
+            (Some(true), false, "", true),
+            (Some(true), false, "  \n\t ", true),
+            (Some(true), true, DRAFT, true),
+        ];
+        for (i, (answer_only, executes_code, output, rejected)) in cases.into_iter().enumerate() {
+            let p = planned(answer_only);
+            assert_eq!(
+                p.answer_only,
+                answer_only == Some(true),
+                "case {i}: carried"
+            );
+            let run_id = format!("substance-answer-only-{i}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_with(&mut store, &run_id, p.role, |u| {
+                u.answer_only = p.answer_only;
+                u.executes_code = executes_code;
+                u.gate = p.gate;
+            });
+            let mut subs = crate::event_log::EventSink::default();
+            let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, output, true);
+            assert_eq!(
+                unit.denial_reason.as_deref() == Some(NO_SUBSTANCE),
+                rejected,
+                "case {i} ({answer_only:?}, code {executes_code}, {output:?}): {:?}",
+                unit.denial_reason
+            );
+            // Past the floor, the fold goes on to the gate (here the harness's governed fold has no
+            // decisions log, so input governance holds it): the floor's own record is the denial
+            // source, and only a rejected case carries it.
+            let source = unit.denial.as_ref().map(|d| d.source.as_str());
+            assert_eq!(
+                source == Some("substance"),
+                rejected,
+                "case {i}: {source:?}"
             );
         }
     }

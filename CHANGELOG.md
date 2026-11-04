@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A one-shot answer step may declare `answer_only`, and a short correct answer is then an answer (crew#1311, rig
+  run 0f5beafa).** crew's one-shot seat turn (the standing-order parse, and "Ask a question of this data") launches
+  one read-only `understand` step that nobody reviews; crew parses its answer and a person confirms it. A correct
+  192-character drafted query failed the substance floor's 200 characters as "no reviewable substance" and parked
+  the run at an escalation gate nobody saw. `answer_only` (a `PhaseDef` and plan-step field, carried onto the unit)
+  gives such a step the floor core#970 gives a human-confirmed answer step: an answer must exist, and an empty or
+  whitespace-only one is still rejected. It holds only where the floor's purpose (a near-empty phase starving the
+  units behind it, or an evaluator reviewing nothing) cannot apply: `WorkflowDef::validate` refuses it on a phase
+  that executes code and on any phase but the def's last (`invalid_def` for a plan, including one that floor fill
+  extends past it). Undeclared phases keep the 200-character floor. Needs a core-ts release before a crew release
+  sends it (`PlanStep` refuses unknown keys).
 - **A review unit can read the work it reviews (rig runs 2e6059da, 968e8c7c, d5374efa, b4f0f93f).** Every interactive
   draft, edit and chat run declares its deliverable inbox under the state home (`<state home>/interactive-drafts/<doc>`)
   as its extra write root. Three things kept the review from it. (1) A read-only unit's container mounted only its

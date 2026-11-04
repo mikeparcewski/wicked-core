@@ -811,6 +811,7 @@ mod tests {
         WorkUnit {
             capture_report: None,
             requires_capture_report: false,
+            answer_only: false,
             base_skill_ref: None,
             id: "u-test".to_string(),
             session_id: "sess-test".to_string(),

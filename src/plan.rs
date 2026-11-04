@@ -252,6 +252,9 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             // same reason `executes_code` rides the unit: the fold that reads the capture marker
             // has no route back to the def.
             unit.requires_capture_report = phase.requires_capture_report;
+            // (crew#1311) The phase's `answer_only` declaration rides the unit for the same reason:
+            // the substance floor that reads it has no route back to the def.
+            unit.answer_only = phase.answer_only;
             // Carry the tool command for Tool-executor phases so the actor can run it directly.
             if let crate::workflow::PhaseExecutor::Tool { cmd } = &phase.executor {
                 unit.tool_cmd = Some(cmd.clone());
@@ -610,6 +613,13 @@ pub struct PlanStep {
     /// that sets it (DES-TEAMING-002 M7: capture-learnings' capture step).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_capture_report: Option<bool>,
+    /// (crew#1311) The step's output is an answer its caller reads, not work a later step builds
+    /// on ([`crate::workflow::PhaseDef::answer_only`]): the substance floor then asks only that an
+    /// answer exists. A declaration the entry does not make (no catalog entry sets it): accepted
+    /// only on the plan's last step, one that executes no code (`WorkflowDef::validate`, so a plan
+    /// that floor fill extends past it is refused as `invalid_def`, never silently exempted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub answer_only: Option<bool>,
     /// (ASK-K1b) The step's wall budget in seconds: may only LOWER the entry's (an entry with no
     /// budget takes any; the carrier's ceiling still applies above it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1020,6 +1030,11 @@ pub enum FieldRule {
     /// (`writes_nothing`): the composed phase is unchanged, and it is refused on a phase where it
     /// cannot hold (`writes_nothing_on_code`).
     PlanFact,
+    /// (crew#1311) What the step's OUTPUT is, declared by the step's author where the entry makes no
+    /// claim (`answer_only`): it lands on the composed phase, and the composed def's validation
+    /// refuses it where the control it relaxes still applies (a code phase, or a phase with any
+    /// phase behind it).
+    OutputDeclaration,
 }
 
 /// Every [`PlanStep`] field and its [`FieldRule`] — the one table `compose` applies
@@ -1036,6 +1051,7 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("writes_nothing", FieldRule::PlanFact),
     ("verified_evidence", FieldRule::TightenOnly),
     ("requires_capture_report", FieldRule::TightenOnly),
+    ("answer_only", FieldRule::OutputDeclaration),
     ("budget_secs", FieldRule::TightenOnly),
     ("pool", FieldRule::TightenOnly),
     ("required_deliverables", FieldRule::TightenOnly),
@@ -1232,6 +1248,11 @@ fn apply_step(
             return refuse(|step, catalog| PlanRefusal::CaptureReportLowered { step, catalog });
         }
         phase.requires_capture_report = report;
+    }
+    // answer_only (crew#1311) — an output declaration: lands on the phase; the composed def's
+    // validation refuses it on a code phase or a phase with anything behind it.
+    if let Some(answer) = step.answer_only {
+        phase.answer_only = answer;
     }
     // budget_secs — TightenOnly: lower the entry's wall budget, never raise it (ASK-K1b).
     if let Some(budget) = step.budget_secs {
@@ -4186,6 +4207,84 @@ mod tests {
                 &plan(json!({"steps": [{"catalog": "produce", "writes_nothing": true}]})),
             )
             .is_ok());
+        }
+
+        /// (crew#1311) `answer_only` lands on the plan's last step when it executes no code, and
+        /// rides the unit; anywhere the substance floor's purpose still holds it is refused: on a
+        /// code step, and on a step with any step behind it (one that would build on its answer,
+        /// or an evaluator that would review it). Floor fill never makes it silently stick: a plan
+        /// it extends past the step is refused the same way.
+        #[test]
+        fn answer_only_lands_only_on_a_last_step_that_executes_no_code() {
+            let composed =
+                |steps: serde_json::Value| compose(crate::catalog::catalog(), &plan(steps));
+            let def = composed(json!({"steps": [
+                {"catalog": "understand", "id": "draft-1", "answer_only": true}
+            ]}))
+            .expect("a lone read-only answer step");
+            assert!(def.phases[0].answer_only);
+            assert!(
+                plan_from_def(&def, "ask", "r")[0].answer_only,
+                "rides the unit"
+            );
+            // Undeclared: the phase and the unit carry nothing, and serialize without the key.
+            let plain = composed(json!({"steps": [{"catalog": "understand", "id": "u"}]})).unwrap();
+            assert!(!plain.phases[0].answer_only);
+            let unit = &plan_from_def(&plain, "ask", "r")[0];
+            assert!(!unit.answer_only);
+            assert!(serde_json::to_value(&plain.phases[0])
+                .unwrap()
+                .get("answer_only")
+                .is_none());
+            assert!(serde_json::to_value(unit)
+                .unwrap()
+                .get("answer_only")
+                .is_none());
+
+            for (steps, why) in [
+                (
+                    json!({"steps": [{"catalog": "build", "answer_only": true}]}),
+                    "executes code",
+                ),
+                (
+                    json!({"steps": [
+                        {"catalog": "produce", "answer_only": true, "executes_code": true,
+                         "validator_pin": crate::builtin_floors::EVIDENCE_FLOOR_PIN}
+                    ]}),
+                    "executes code",
+                ),
+                (
+                    json!({"steps": [
+                        {"catalog": "understand", "id": "u", "answer_only": true},
+                        {"catalog": "design", "id": "d"}
+                    ]}),
+                    "runs behind it",
+                ),
+                (
+                    json!({"steps": [
+                        {"catalog": "produce", "id": "p", "answer_only": true},
+                        {"catalog": "review", "id": "r"}
+                    ]}),
+                    "runs behind it",
+                ),
+            ] {
+                let r = composed(steps.clone()).expect_err(&format!("{steps} must be refused"));
+                assert_eq!(r.reason(), "invalid_def", "{steps}: {r}");
+                assert!(r.to_string().contains(why), "{steps}: {r}");
+                assert!(r.to_string().contains("answer_only"), "{steps}: {r}");
+            }
+
+            // Floor fill: a creator answer step in a band whose floor adds a step behind it is
+            // refused, never exempted (`produce` + band 50 floor-fills an evaluator after it).
+            let p =
+                plan(json!({"steps": [{"catalog": "produce", "id": "p", "answer_only": true}]}));
+            match fill(&p, 50, &AUTO, None) {
+                Err(r) => assert_eq!(r.reason(), "invalid_def", "{r}"),
+                Ok(f) => panic!(
+                    "floor fill put {:?} behind an answer_only step and kept the declaration",
+                    f.steps.steps.iter().map(|s| &s.catalog).collect::<Vec<_>>()
+                ),
+            }
         }
 
         /// T2 (b): a user plan below the floor gets the floor phases added, each marked

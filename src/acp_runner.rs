@@ -3527,6 +3527,7 @@ mod tests {
         crate::domain::WorkUnit {
             capture_report: None,
             requires_capture_report: false,
+            answer_only: false,
             base_skill_ref: None,
             id: "u-gov".to_string(),
             session_id: "run-gov".to_string(),
