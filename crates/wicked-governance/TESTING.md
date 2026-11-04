@@ -14,7 +14,7 @@ know whether to tighten one or write one. [STEERING.md](./STEERING.md) is how yo
 and manage the rules; this guide is how you find out whether they work.
 
 > **Status note.** Evals land with the Testing wave (`wicked-core rules eval`, the crew
-> `/api/v1/testing/*` routes, studio's **Testing** nav). On an installed crew whose core
+> `/api/v1/testing/*` routes, studio's **Evaluate** page under **Insight**). On an installed crew whose core
 > binding predates the wave, the routes answer honestly with `501` (§ The wire contract)
 > rather than pretending — presence-gated, never stubbed.
 
@@ -412,21 +412,24 @@ The napi layer exports the two calls; crew presence-gates its routes on them:
 
 ## Humans (wicked-studio)
 
-**Testing** (top-level nav) is the report and the import, nothing more — studio renders
-what crew returns and computes no verdicts of its own:
+**Evaluate** (in the sidebar, under **Insight**; address `/testing/evals`) is the report and
+the import, nothing more — studio renders what crew returns and computes no verdicts of its
+own:
 
-- **Run** — pick a steering type (or all) and a corpus (built-in, or any imported
-  `evals:` scope), run, read the report: summary tiles (total / caught / gaps /
-  false positives), per-sample rows with the fired rule ids, gap rows carrying their
-  nearest-rule hints, a visible banner when the report says `"degraded":
-  "facet-only"`, and the rule-coverage block (exercised / unexercised / recall-only) —
-  when no rule can fire, the surface must say the eval cannot measure enforcement rather
-  than present the corpus split as coverage.
-- **Corpora** — import a corpus: name + samples JSON (the Sample shape above); the receipt
-  shows the count, the `evals:<name>` scope, and whether embedding happened.
+- **Run an evaluation** — all steering types or one, over the built-in behaviours or an
+  imported `evals:` corpus (what to run is folded away). **The last run, by steering type**
+  (folded; it opens after a run) shows one row per steering type: what was blocked, what
+  slipped through (gaps), what was blocked by mistake (false positives). A row opens that type's numbers, its gaps with their nearest-rule hints
+  and a Draft rules hand-off to the steering assistant, and every behaviour with its verdict
+  and fired rules (a gap's nearest-rule hints expand under it). A report that says `"degraded": "facet-only"` is labelled **Tags only**,
+  and "Read these numbers with this in mind" says what the split cannot: for example, when
+  no rule in force carries an effect, no bad behaviour can be caught yet.
+- **Bring your own behaviours** — import a corpus from a file (the Sample shape above), a
+  pasted transcript or a past job's steps; it lands under an `evals:<name>` scope.
+  **Recommended to run** and **Past runs** sit beside it.
 
-Both pages speak the pinned `/api/v1/testing/*` contract — the same report the CLI's
-`--json` prints.
+Both speak the pinned `/api/v1/testing/*` contract — the same report the CLI's `--json`
+prints.
 
 ---
 
@@ -438,7 +441,7 @@ Both pages speak the pinned `/api/v1/testing/*` contract — the same report the
 | Operator CLI (`rules eval`) | `wicked-core` binary (`src/bin/wicked-core.rs`) |
 | Imported corpora (scope `evals:<name>`, embedded) | estate knowledge store — `~/.wicked-estate/knowledge.db` (`--knowledge-db` / `knowledgeDb` override) |
 | Daemon API (pinned contract) | wicked-crew: `POST /api/v1/testing/evals/run`, `POST /api/v1/testing/corpora/import` |
-| Human surface | wicked-studio: **Testing** (top-level nav — Run + Corpora) |
+| Human surface | wicked-studio: **Insight → Evaluate** (Run an evaluation, The last run by steering type, Bring your own behaviours) |
 | The binding between them | `wicked-core-ts`: `core.governanceEvals` / `core.governanceCorpusImport` (presence-gated → `501`) |
 | The rules under test | the steering corpus — authoring, management, recall: [STEERING.md](./STEERING.md) |
 
