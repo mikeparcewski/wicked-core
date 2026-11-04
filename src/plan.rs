@@ -1089,9 +1089,13 @@ fn gate_rank(g: crate::workflow::GateSpec) -> u8 {
 
 /// Compose a plan into its per-run [`WorkflowDef`] (DES-TEAMING-002 §8.3): each step instantiates
 /// its catalog entry, and the step's fields are applied under the step rules — a step may only
-/// make its entry stricter, field by field as [`STEP_FIELD_RULES`] says. Refused, with a named
-/// [`PlanRefusal`], when a step loosens any field of its entry, and when the composed def fails
-/// the registry's own checks. The def's id is [`COMPOSED_DEF_ID`].
+/// make its entry stricter, field by field as [`STEP_FIELD_RULES`] says. ONE exception, checked
+/// where it lands: an [`FieldRule::OutputDeclaration`] (`answer_only`, crew#1311) lowers the
+/// substance floor for its step, and the composed def's validation admits it only on a last,
+/// PA-owned, unpinned, non-evaluator agent step that runs no code (nothing in the run builds on
+/// or reviews its output). Refused, with a named [`PlanRefusal`], when a step loosens any field of
+/// its entry, and when the composed def fails the registry's own checks. The def's id is
+/// [`COMPOSED_DEF_ID`].
 pub fn compose(
     catalog: &[crate::workflow::PhaseDef],
     plan: &PlanSteps,
@@ -4240,6 +4244,19 @@ mod tests {
                 .unwrap()
                 .get("answer_only")
                 .is_none());
+            // A phase or unit stored before the field existed (no key) reads back undeclared.
+            let stored = serde_json::to_value(unit).unwrap();
+            assert!(
+                !serde_json::from_value::<WorkUnit>(stored)
+                    .unwrap()
+                    .answer_only
+            );
+            let stored = serde_json::to_value(&plain.phases[0]).unwrap();
+            assert!(
+                !serde_json::from_value::<crate::workflow::PhaseDef>(stored)
+                    .unwrap()
+                    .answer_only
+            );
 
             for (steps, why) in [
                 (
@@ -4266,6 +4283,32 @@ mod tests {
                         {"catalog": "review", "id": "r"}
                     ]}),
                     "runs behind it",
+                ),
+                // Last, but still reviewed or judged: a member's step (the PA reviews it), a pinned
+                // step (its validator judges it); and shapes the floor never reads as an answer.
+                (
+                    json!({"steps": [
+                        {"catalog": "understand", "id": "u", "owner": "team", "answer_only": true}
+                    ]}),
+                    "reviewed by the PA",
+                ),
+                (
+                    json!({"steps": [
+                        {"catalog": "understand", "id": "u", "answer_only": true,
+                         "validator_pin": crate::domain_extraction::COVERAGE_VALIDATOR_PIN}
+                    ]}),
+                    "validator pin",
+                ),
+                (
+                    json!({"steps": [
+                        {"catalog": "run", "id": "t", "answer_only": true,
+                         "executor": {"type": "tool", "cmd": ["true"]}}
+                    ]}),
+                    "Tool phase",
+                ),
+                (
+                    json!({"steps": [{"catalog": "critique", "id": "c", "answer_only": true}]}),
+                    "evaluator",
                 ),
             ] {
                 let r = composed(steps.clone()).expect_err(&format!("{steps} must be refused"));

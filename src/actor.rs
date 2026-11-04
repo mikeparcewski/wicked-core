@@ -6018,6 +6018,9 @@ fn apply_step_result(
         .filter(|u| matches!(u.status, crate::domain::UnitStatus::Done))
         .filter_map(|u| u.assigned_cli.clone())
         .collect();
+    // (crew#1311) Whether this unit is the run's last, read off the live unit list (the substance
+    // floor's `answer_only` arm never rests on the stored flag alone).
+    let is_last_unit = output.unit_ix + 1 == units.len();
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
@@ -7438,11 +7441,13 @@ fn apply_step_result(
     // answer exists": an empty or whitespace-only output is still no substance.
     //
     // (crew#1311) The same lowered floor for a read-only unit whose phase declared `answer_only`:
-    // its caller reads the answer (crew's one-shot seat turn: a parse, a drafted query), and the
-    // def's validation put it last, so no unit behind it and no evaluator builds on it. A correct
-    // 192-character draft failed the 200-character floor here and parked at a gate nobody saw.
+    // its CALLER reads the answer (crew's one-shot seat turn: a parse, a drafted query), and
+    // nothing in the run builds on it or reviews it — the def's validation admits the declaration
+    // only on a last, PA-owned, unpinned agent phase, and the fold checks again that no unit
+    // follows it in the live list. A correct 192-character draft failed the 200-character floor
+    // here and parked at a gate nobody saw.
     let answer_is_enough = !unit.executes_code
-        && (unit.answer_only
+        && ((unit.answer_only && is_last_unit)
             || matches!(unit.gate, crate::workflow::GateSpec::HumanConfirm { .. }));
     let prose_chars = output.output.trim().chars().count();
     let no_prose = unit.role != crate::workflow::PhaseRole::Evaluator
@@ -18879,7 +18884,31 @@ mod substance_gate_tests {
                 rejected,
                 "case {i}: {source:?}"
             );
+            if !rejected {
+                assert_eq!(
+                    source,
+                    Some("input_governance"),
+                    "case {i}: reached the gate fold"
+                );
+            }
         }
+
+        // The fold reads "nothing behind it" off the live unit list, not the stored flag alone: a
+        // declared unit with a unit after it (a shape validation refuses) still meets the floor.
+        let run_id = format!("substance-answer-only-not-last-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_with(&mut store, &run_id, PhaseRole::Neutral, |u| {
+            u.answer_only = true
+        });
+        let next = WorkUnit::pending(format!("{run_id}:u2"), &run_id, 2, "build on the answer");
+        put_node(&mut store, next.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (_applied, _session, unit) = fold(&mut store, &mut subs, &run_id, DRAFT, true);
+        assert_eq!(
+            unit.denial_reason.as_deref(),
+            Some(NO_SUBSTANCE),
+            "a unit runs behind it"
+        );
     }
 
     /// Every event the fold emitted, drained.

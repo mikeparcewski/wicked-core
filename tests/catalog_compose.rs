@@ -705,16 +705,23 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
                     "{field}"
                 );
             }
-            // (crew#1311) An output declaration: lands on a last phase that executes no code, and
-            // the composed def's validation refuses it on a code phase.
+            // (crew#1311) An output declaration: the composed def's validation refuses it on a
+            // code phase and on a Tool phase, and it lands on a read-only agent step of the real
+            // catalog (`understand`, the one-shot seat turn's step).
             FieldRule::OutputDeclaration => {
                 assert_eq!(field, "answer_only");
                 let r = compose_one("full", json!({"answer_only": true}))
                     .expect_err("answer_only on a code phase");
                 assert_eq!(r.reason(), "invalid_def", "{r}");
                 let cmd = json!({"type": "tool", "cmd": ["true"]});
-                let def = compose_one("tool", json!({"executor": cmd, "answer_only": true}))
-                    .unwrap_or_else(|e| panic!("{field}: {e}"));
+                let r = compose_one("tool", json!({"executor": cmd, "answer_only": true}))
+                    .expect_err("answer_only on a Tool phase");
+                assert_eq!(r.reason(), "invalid_def", "{r}");
+                let plan: PlanSteps = serde_json::from_value(
+                    json!({"steps": [{"catalog": "understand", "id": "x", "answer_only": true}]}),
+                )
+                .unwrap();
+                let def = compose(catalog(), &plan).unwrap_or_else(|e| panic!("{field}: {e}"));
                 assert!(def.phases[0].answer_only, "{field}");
             }
             FieldRule::Free => {

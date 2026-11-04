@@ -972,9 +972,11 @@ pub struct PhaseDef {
     ///
     /// The floor exists so a near-empty phase cannot starve the units behind it or hand an
     /// evaluator nothing to review. [`WorkflowDef::validate`] therefore accepts the declaration
-    /// only where that cannot happen: on a phase that executes no code and is the def's LAST
-    /// phase (nothing runs behind it, so no evaluator follows it). It changes nothing else: the
-    /// phase's write posture, tools and gate are its entry's. `skip_serializing_if`: a phase that
+    /// only where nothing in the run builds on the output or reviews it: the def's LAST phase, an
+    /// agent (not Tool), non-evaluator phase that executes no code, carries no validator pin and
+    /// is owned by the PA (a `team` member's step is reviewed by the PA). The fold checks again
+    /// that no unit follows it in the run. It changes nothing else: the phase's write posture,
+    /// tools and gate are its entry's. `skip_serializing_if`: a phase that
     /// declares nothing serializes byte-identically to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_only: bool,
@@ -1335,7 +1337,8 @@ impl std::fmt::Display for WorkflowDefError {
             WorkflowDefError::AnswerOnlyMisplaced { phase, why } => write!(
                 f,
                 "answer_only on {phase} would drop the substance floor where it still applies: \
-                 {why} \u{2014} declare it only on the last phase, one that executes no code"
+                 {why} \u{2014} declare it only on the last phase: an agent step the PA owns that \
+                 executes no code and carries no validator pin"
             ),
         }
     }
@@ -1359,23 +1362,30 @@ impl WorkflowDef {
             if !ids.insert(p.id.as_str()) {
                 return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
             }
-            // (crew#1311) An answer-only phase is read by its caller, so nothing may build on it:
-            // no code (the code-evidence floor's ground), and nothing behind it.
+            // (crew#1311) An answer-only phase is read by its CALLER, so nothing in the run may build
+            // on it or review it: no code (the code-evidence floor's ground), nothing behind it, no
+            // judge (a validator pin), no PA review of a member's work (a `team` owner), and only an
+            // agent's non-evaluator output (the one the floor reads at all).
             if p.answer_only {
                 let why = if p.executes_code {
-                    Some(
-                        "it executes code, and a diff is the evidence a code phase owes"
-                            .to_string(),
-                    )
+                    Some("it executes code, and a diff is the evidence a code phase owes")
                 } else if i != last {
-                    Some("a phase runs behind it and would build on its output".to_string())
+                    Some("a phase runs behind it and would build on its output")
+                } else if p.validator_pin.is_some() {
+                    Some("its validator pin judges its output")
+                } else if p.owner != StepOwner::Pa {
+                    Some("a team member's step is reviewed by the PA")
+                } else if !matches!(p.executor, PhaseExecutor::Agent) {
+                    Some("a Tool phase's output is not an agent's answer")
+                } else if p.role == PhaseRole::Evaluator {
+                    Some("an evaluator's output is a verdict, judged by its own contract")
                 } else {
                     None
                 };
                 if let Some(why) = why {
                     return Err(WorkflowDefError::AnswerOnlyMisplaced {
                         phase: p.id.clone(),
-                        why,
+                        why: why.to_string(),
                     });
                 }
             }
