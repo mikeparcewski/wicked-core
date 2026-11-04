@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **`judgeMcpCall`: one MCP call judged WITH its arguments, recorded nowhere (crew#1337).** crew's data gate judged
+  a live source's call (`mcp:<source>/<tool>`) by the unit's tool list, which judges every call with no arguments by
+  design, so an operator rule whose `trigger.contains` matches the call's arguments (a word in the SQL) never fired
+  for it. `judge_mcp_call` (core-ts `Core.judgeMcpCall`, `{token, call}` in, the `evaluateMcpCall` verdict out) runs
+  the same `evaluate` with the call's own arguments and appends no claim: the gate records that call itself, and a
+  first-use ask it admits on the person's per-source switches leaves no waiting-for-approval claim. A deny that
+  fires on the arguments dominates the first-use ask, as on a call. The tool list still judges with no arguments.
+  Ships to crew with the next core-ts release; crew falls back to the list on an engine without it.
 - **An MCP ask says whether the server's first use is its only reason: `firstUseOnly` (crew#1333).** On a store
   with the `mcp-defaults` pack, MCP-POSTURE-READ (an allow) fires on every read, so a read's first-use ask names
   `[engine:mcp-first-use, MCP-POSTURE-READ]`, and an operator's own asking rule leads with `engine:mcp-first-use`

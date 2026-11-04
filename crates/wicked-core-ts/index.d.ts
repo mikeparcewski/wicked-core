@@ -946,6 +946,17 @@ export declare class Core {
    */
   static listMcpTools(requestJson: string): Promise<string>
   /**
+   * (crew#1337) Judge ONE brokered MCP call for the token's unit with the SAME evaluation
+   * `evaluateMcpCall` runs, WITH its arguments (an argument-triggered rule fires), and record
+   * NOTHING. `request_json` is `{ token, call: { server, tool, args?, annotations?,
+   * classOverride?, registered, kind?, carrier? } }`; resolves to the verdict `evaluateMcpCall`
+   * answers (`{ decision: "allow"|"ask"|"deny", subject, class, ruleIds, obligations, reason?,
+   * remedy?, claimId, unit, firstUseOnly? }`). crew's data gate judges a live source's call with
+   * it. Rejects with `invalid_token: …`, `bad_request: …` or `guard_error: …`. Static, like
+   * `evaluateMcpCall`.
+   */
+  static judgeMcpCall(requestJson: string): Promise<string>
+  /**
    * (core#1018) The estate relay's scope for a token: crew's broker relays a container seat's
    * `mcp:estate/<tool>` calls to the host's estate and scopes them by this. `request_json` is
    * `{ token }` — the worker's `WICKED_MCP_TOKEN`. Resolves to `{ unit: { runId, ord, attempt,
