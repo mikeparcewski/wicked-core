@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **An MCP ask says whether the server's first use is its only reason: `firstUseOnly` (crew#1333).** On a store
+  with the `mcp-defaults` pack, MCP-POSTURE-READ (an allow) fires on every read, so a read's first-use ask names
+  `[engine:mcp-first-use, MCP-POSTURE-READ]`, and an operator's own asking rule leads with `engine:mcp-first-use`
+  too while the server is unapproved: the rule ids cannot tell the two apart. The engine now reads the policies'
+  claim before the first-use override and marks the ask `first_use_only` when they alone would let the call run
+  (no deny, no `mcp:approval` obligation). The call verdict, the unit's tool list entry (`listMcpTools`) and the
+  preview cell (`previewMcpCalls`) carry it as `firstUseOnly`, on the wire only when true. Rule ids and the claim
+  (the receipt) are unchanged. crew's data gate admits exactly that ask for a live source, whose per-source switches
+  are the person's consent; every other ask, and a deny, stands. Ships to crew with the next core-ts release.
 - **D-7 narrows: an Apps unit is refused write and destructive tools only; its reads go to crew's data gate
   (DES-KNOWLEDGE-DATA-001 §9.3, which narrows DES-APPS-001 §5.2).** Every unit of an `apps-turn` or `apps-publish`
   run (builder, reviewer, QE, the QE reviewer turn, the check Tool's token) was refused every brokered MCP call and

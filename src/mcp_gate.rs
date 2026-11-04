@@ -355,6 +355,13 @@ pub struct McpVerdict {
     pub claim_id: String,
     /// Who made the call, for the broker's call record (run = trace, unit = parent span).
     pub unit: McpUnitRef,
+    /// An `ask` whose ONLY reason is the server's first use: every other rule that fired would let
+    /// the call run (no deny, no `mcp:approval` obligation). The rules that fired stay in
+    /// `rule_ids` for the receipt; this says which of them asked, so a caller whose own consent
+    /// stands in for first use (crew's per-source switches) admits exactly this ask and no other.
+    /// On the wire only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub first_use_only: bool,
 }
 
 /// The unit a verdict was judged for, as the call record names it.
@@ -553,6 +560,8 @@ pub(crate) fn evaluate(
     );
     // First use asks in every mode, but never over a deny: deny dominates.
     if claim.decision != Decision::Deny && !first_use_approved(store, &call.server, &call.tool)? {
+        // Read BEFORE the override: would the policies alone have let the call run?
+        let first_use_only = !asks_for_approval(&claim);
         let mut claim = claim;
         claim.decision = Decision::AllowWithConditions;
         claim.policy_ids.retain(|id| id != RULE_FIRST_USE);
@@ -566,6 +575,7 @@ pub(crate) fn evaluate(
             class,
             claim,
             "the first use of this server",
+            first_use_only,
         ));
     }
     match claim.decision {
@@ -601,10 +611,8 @@ pub(crate) fn evaluate(
                 evaluated_at,
             ))
         }
-        Decision::AllowWithConditions
-            if claim.obligations.iter().any(|o| o == APPROVAL_OBLIGATION) =>
-        {
-            Ok(ask(unit, &subject, class, claim, "the run's mode"))
+        Decision::AllowWithConditions if asks_for_approval(&claim) => {
+            Ok(ask(unit, &subject, class, claim, "the run's mode", false))
         }
         _ => {
             let mut claim = claim;
@@ -619,20 +627,30 @@ pub(crate) fn evaluate(
                 remedy: None,
                 claim_id: claim.claim_id.clone(),
                 unit: unit.unit_ref(),
+                first_use_only: false,
             };
             Ok((verdict, claim))
         }
     }
 }
 
+/// Whether a policy claim asks for the operator's approval: an `allow_with_conditions` carrying
+/// [`APPROVAL_OBLIGATION`] (a posture rule of the run's mode, or an operator's own asking rule).
+fn asks_for_approval(claim: &ConformanceClaim) -> bool {
+    claim.decision == Decision::AllowWithConditions
+        && claim.obligations.iter().any(|o| o == APPROVAL_OBLIGATION)
+}
+
 /// An ask verdict: the call did not run and waits for the operator. Recorded as the
-/// `allow_with_conditions` claim it is (never as a deny, I5).
+/// `allow_with_conditions` claim it is (never as a deny, I5). `first_use_only`: the server's first
+/// use is the only thing asking ([`McpVerdict::first_use_only`]).
 fn ask(
     unit: &McpUnit,
     subject: &str,
     class: McpClass,
     mut claim: ConformanceClaim,
     why: &str,
+    first_use_only: bool,
 ) -> (McpVerdict, ConformanceClaim) {
     claim.claim_id = format!("{MCP_ASK_PREFIX}{}", unit.phase);
     let verdict = McpVerdict {
@@ -650,6 +668,7 @@ fn ask(
         ),
         claim_id: claim.claim_id.clone(),
         unit: unit.unit_ref(),
+        first_use_only,
     };
     (verdict, claim)
 }
@@ -749,6 +768,7 @@ fn deny(
         remedy: Some(remedy.to_string()),
         claim_id: claim.claim_id.clone(),
         unit: unit.unit_ref(),
+        first_use_only: false,
     };
     (verdict, claim)
 }
@@ -1027,6 +1047,9 @@ pub struct McpVisibleTool {
     pub rule_ids: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// [`McpVerdict::first_use_only`]: on the wire only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub first_use_only: bool,
 }
 
 /// The tools a token's unit may try, and the unit they were judged for.
@@ -1071,6 +1094,7 @@ pub fn list_mcp_tools(token: &str, calls: &[McpCall]) -> Result<McpToolList, Mcp
             decision: v.decision,
             rule_ids: v.rule_ids,
             reason: v.reason,
+            first_use_only: v.first_use_only,
         });
     }
     Ok(McpToolList {
@@ -1235,6 +1259,9 @@ pub struct McpPreviewVerdict {
     pub obligations: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// [`McpVerdict::first_use_only`]: on the wire only when true.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub first_use_only: bool,
 }
 
 /// The preview for one call across every cell.
@@ -1290,6 +1317,7 @@ pub(crate) fn preview_mcp_calls(
                         rule_ids: v.rule_ids,
                         obligations: v.obligations,
                         reason: v.reason,
+                        first_use_only: v.first_use_only,
                     })
                 })
                 .collect::<Result<Vec<_>, McpCallError>>()?;
@@ -2456,6 +2484,7 @@ mod tests {
                 assert_eq!(got.rule_ids, live.rule_ids, "{ctx}");
                 assert_eq!(got.obligations, live.obligations, "{ctx}");
                 assert_eq!(got.reason, live.reason, "{ctx}");
+                assert_eq!(got.first_use_only, live.first_use_only, "{ctx}");
                 seen.insert(got.decision);
             }
         }
@@ -2489,6 +2518,10 @@ mod tests {
         let c = cell(&preview[4], McpPreviewRole::Recon, "pi", "autonomous");
         assert_eq!(c.decision, "ask", "first use asks even for a read");
         assert_eq!(c.rule_ids[0], RULE_FIRST_USE);
+        assert!(
+            c.first_use_only,
+            "only first use asks for an allowed read: {c:?}"
+        );
         let c = cell(&preview[5], McpPreviewRole::Creator, "claude", "autonomous");
         assert_eq!(c.rule_ids, vec![RULE_UNREGISTERED.to_string()]);
         let _ = std::fs::remove_dir_all(&base);
@@ -2536,6 +2569,262 @@ mod tests {
         assert_eq!(McpMode::of(&HumanConfirm::All), McpMode::Ask);
         assert_eq!(McpMode::of(&HumanConfirm::Before(1)), McpMode::Balanced);
         assert_eq!(McpMode::of(&HumanConfirm::None), McpMode::Autonomous);
+    }
+
+    /// crew#1333: the gated read crew's data gate sends (`classOverride: read`, read-only, through
+    /// the shim), the way `DataGate.admitted` builds it.
+    fn gated_read(server: &str) -> McpCall {
+        McpCall {
+            server: server.to_string(),
+            tool: "execute_sql".to_string(),
+            args: serde_json::json!({}),
+            annotations: read_only(),
+            class_override: Some(McpClass::Read),
+            registered: true,
+            kind: default_kind(),
+            carrier: default_carrier(),
+        }
+    }
+
+    /// PROVING TEST (crew#1333): an ask says whether the server's first use is its ONLY reason. On
+    /// a store with the `mcp-defaults` pack, MCP-POSTURE-READ (an allow) fires on every read, so a
+    /// first-use ask's rule ids are `[engine:mcp-first-use, MCP-POSTURE-READ]` and a caller cannot
+    /// tell from them whether another rule asked. `first_use_only` is that answer, read from the
+    /// policies' own claim before the first-use override: true when the policies alone would let
+    /// the call run; false for an operator's asking rule, a mode's asking posture, a deny, and any
+    /// verdict that is not a first-use ask. The receipt (rule ids, claim) is unchanged.
+    #[test]
+    fn first_use_only_is_true_exactly_when_first_use_is_the_only_ask() {
+        let mut store = seeded_store();
+        let modes = [McpMode::Ask, McpMode::Balanced, McpMode::Autonomous];
+        let judge = |store: &wicked_apps_core::SqliteStore, u: &McpUnit, c: &McpCall| {
+            evaluate(store, u, c, 1).unwrap()
+        };
+        // (i) A first use, no other asking rule: every mode, creator and evaluator, an Apps unit.
+        for mode in modes {
+            for (posture, role) in [
+                (WritePosture::Full, PhaseRole::Creator),
+                (WritePosture::ReadOnly, PhaseRole::Evaluator),
+            ] {
+                let mut u = unit(posture, role, "claude", mode);
+                for apps in [None, Some("apps-turn".to_string())] {
+                    u.apps = apps;
+                    let (v, claim) = judge(&store, &u, &gated_read("support-pg"));
+                    let ctx = format!("{mode:?} {role:?} apps={:?}: {v:?}", u.apps);
+                    assert_eq!(v.decision, "ask", "{ctx}");
+                    assert!(v.first_use_only, "{ctx}");
+                    assert_eq!(
+                        v.rule_ids,
+                        vec![RULE_FIRST_USE.to_string(), "MCP-POSTURE-READ".to_string()],
+                        "the receipt keeps the fired allow: {ctx}"
+                    );
+                    assert_eq!(claim.decision, Decision::AllowWithConditions, "{ctx}");
+                    assert!(claim.obligations.contains(&APPROVAL_OBLIGATION.to_string()));
+                }
+            }
+        }
+        let creator = |mode| unit(WritePosture::Full, PhaseRole::Creator, "claude", mode);
+        // A first-use write in balanced mode: MCP-POSTURE-WRITE asks too, so not first use only.
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Balanced),
+            &call("create_issue", None),
+        );
+        assert_eq!(
+            (v.decision, v.first_use_only),
+            ("ask", false),
+            "the mode's posture asks: {v:?}"
+        );
+        assert!(
+            v.rule_ids.contains(&"MCP-POSTURE-WRITE".to_string()),
+            "{v:?}"
+        );
+        // …and in ask mode MCP-MODE-ASK-WRITE does.
+        let (v, _) = judge(&store, &creator(McpMode::Ask), &call("create_issue", None));
+        assert_eq!((v.decision, v.first_use_only), ("ask", false), "{v:?}");
+        // An allow_with_conditions whose obligation is not an approval still runs, so it does not
+        // stop first use from being the only ask.
+        wicked_governance::register_rule(
+            &mut store,
+            &rule(serde_json::json!({
+                "id": "SEC-PG-LOGGED", "rule_type": "policy",
+                "statement": "reads of support-pg are logged", "severity": "info",
+                "confidence": 1.0, "steering_type": "security",
+                "applies_to": ["mcp:support-pg"], "effect": "allow_with_conditions",
+                "obligations": ["audit:log"],
+                "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+            })),
+        )
+        .unwrap();
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Autonomous),
+            &gated_read("support-pg"),
+        );
+        assert_eq!((v.decision, v.first_use_only), ("ask", true), "{v:?}");
+
+        // (iii) An operator's own asking rule on the source: the ask stands, whatever first use says.
+        wicked_governance::register_rule(
+            &mut store,
+            &rule(serde_json::json!({
+                "id": "SEC-PG-ASK", "rule_type": "policy",
+                "statement": "every read of support-pg asks", "severity": "error",
+                "confidence": 1.0, "steering_type": "security",
+                "applies_to": ["mcp:support-pg"], "effect": "allow_with_conditions",
+                "obligations": ["mcp:approval"],
+                "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+            })),
+        )
+        .unwrap();
+        for mode in modes {
+            let (v, _) = judge(&store, &creator(mode), &gated_read("support-pg"));
+            assert_eq!(
+                (v.decision, v.first_use_only),
+                ("ask", false),
+                "{mode:?}: {v:?}"
+            );
+            assert_eq!(v.rule_ids[0], RULE_FIRST_USE, "{v:?}");
+            assert!(v.rule_ids.contains(&"SEC-PG-ASK".to_string()), "{v:?}");
+        }
+        // …and it still asks once the server is approved for first use (the mode's own ask path).
+        approve(&mut store, "MCP-FIRST-USE", "mcp:support-pg");
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Autonomous),
+            &gated_read("support-pg"),
+        );
+        assert_eq!((v.decision, v.first_use_only), ("ask", false), "{v:?}");
+        assert!(v.rule_ids.contains(&"SEC-PG-ASK".to_string()), "{v:?}");
+
+        // A server with no asking rule: on first use only first use asks; once approved, a plain
+        // allow, never flagged.
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Autonomous),
+            &gated_read("other-pg"),
+        );
+        assert_eq!(
+            (v.decision, v.first_use_only),
+            ("ask", true),
+            "other-pg is on first use"
+        );
+        approve(&mut store, "MCP-FIRST-USE", "mcp:other-pg");
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Autonomous),
+            &gated_read("other-pg"),
+        );
+        assert_eq!((v.decision, v.first_use_only), ("allow", false), "{v:?}");
+
+        // (iv) A deny dominates first use and is never flagged.
+        wicked_governance::register_rule(
+            &mut store,
+            &rule(serde_json::json!({
+                "id": "SEC-DENY-PG", "rule_type": "policy",
+                "statement": "no reads of denied-pg", "severity": "critical",
+                "confidence": 1.0, "steering_type": "security",
+                "applies_to": ["mcp:denied-pg/execute_sql"], "effect": "deny",
+                "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+            })),
+        )
+        .unwrap();
+        let (v, _) = judge(
+            &store,
+            &creator(McpMode::Autonomous),
+            &gated_read("denied-pg"),
+        );
+        assert_eq!((v.decision, v.first_use_only), ("deny", false), "{v:?}");
+        assert_eq!(v.rule_ids, vec!["SEC-DENY-PG".to_string()]);
+    }
+
+    /// crew#1333's wire: the list's entry carries `firstUseOnly: true` only for a first-use-only
+    /// ask; the key is absent everywhere else (an allow, another ask), and a deny is left out.
+    #[test]
+    fn the_tool_list_names_a_first_use_only_ask_on_the_wire() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!(
+            "wicked-mcp-first-use-only-{}-{tid}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let db_path = base.join("policy.db").to_string_lossy().into_owned();
+        {
+            let mut store = open_store(Some(&db_path)).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+            approve(&mut store, "MCP-FIRST-USE", "mcp:approved-pg");
+            for (id, server, effect, obligations) in [
+                (
+                    "SEC-ASK-PG",
+                    "asking-pg",
+                    "allow_with_conditions",
+                    vec!["mcp:approval"],
+                ),
+                ("SEC-DENY-PG", "denied-pg", "deny", vec![]),
+            ] {
+                wicked_governance::register_rule(
+                    &mut store,
+                    &rule(serde_json::json!({
+                        "id": id, "rule_type": "policy", "statement": id, "severity": "error",
+                        "confidence": 1.0, "steering_type": "security",
+                        "applies_to": [format!("mcp:{server}")], "effect": effect,
+                        "obligations": obligations,
+                        "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+                    })),
+                )
+                .unwrap();
+            }
+        }
+        let mut u = unit(
+            WritePosture::Full,
+            PhaseRole::Creator,
+            "claude",
+            McpMode::Autonomous,
+        );
+        u.db_path = db_path.clone();
+        u.decisions_path = base.join("decisions.ndjson");
+        let token = McpToken::mint();
+        let _b = token.bind(u);
+        // The exact request crew's `DataGate.admitted` sends.
+        let calls: Vec<Value> = ["support-pg", "asking-pg", "approved-pg", "denied-pg"]
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "server": s, "tool": "execute_sql",
+                    "annotations": {"readOnlyHint": true}, "classOverride": "read",
+                    "registered": true, "kind": "mcp-stdio", "carrier": "shim"
+                })
+            })
+            .collect();
+        let req = serde_json::json!({"token": token.value, "calls": calls});
+        let out: Value =
+            serde_json::from_str(&list_mcp_tools_json(&req.to_string()).unwrap()).unwrap();
+        let tools = out["tools"].as_array().unwrap();
+        let entry = |server: &str| {
+            tools
+                .iter()
+                .find(|t| t["subject"] == format!("mcp:{server}/execute_sql"))
+                .cloned()
+        };
+        let first = entry("support-pg").unwrap();
+        assert_eq!(first["decision"], "ask", "{first}");
+        assert_eq!(first["firstUseOnly"], true, "{first}");
+        assert_eq!(
+            first["ruleIds"],
+            serde_json::json!([RULE_FIRST_USE, "MCP-POSTURE-READ"])
+        );
+        let asking = entry("asking-pg").unwrap();
+        assert_eq!(asking["decision"], "ask", "{asking}");
+        assert!(asking.get("firstUseOnly").is_none(), "{asking}");
+        let approved = entry("approved-pg").unwrap();
+        assert_eq!(approved["decision"], "allow", "{approved}");
+        assert!(approved.get("firstUseOnly").is_none(), "{approved}");
+        assert!(entry("denied-pg").is_none(), "a deny is left out: {out}");
+        assert!(
+            !base.join("decisions.ndjson").exists(),
+            "a list appends no claim"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// PROVING TEST (S4): the shim's `list` shows the token's unit what it may try, judged by the
