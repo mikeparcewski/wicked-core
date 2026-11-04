@@ -228,9 +228,9 @@ the operator CLI against a store crew does not hold. The estate MCP writes nothi
 ### 1. Import (bulk — the doc format)
 
 The import format IS the doc-ingest format: a frontmattered markdown doc, one parse path
-(`src/markdown.rs`), whether it arrives by doc PR + `rules ingest`, by pack directory, or
-pasted into Steering's Import action (which files it under one `steering_type`, the filtered
-type by default). Copy-paste starting point:
+(`src/markdown.rs`), whether it arrives by doc PR + `rules ingest`, by pack directory, or as a
+file chosen in Steering's **⋯ → Import rules…** (a markdown doc or a JSON batch, filed under one
+`steering_type`, the filtered type by default). A starting point (save it as a `.md` file):
 
 ```markdown
 ---
@@ -296,7 +296,8 @@ The load-bearing details (full contract in [`src/markdown.rs`](./src/markdown.rs
   value, zero rules).
 - Enforcement fields the doc contract does not spell (`obligations`, `criteria`) are set
   via the JSON lane (`<dir>/policies/*.json` ingests effect-bearing rules;
-  `<dir>/rules/*.json` ingests bundles) or the individual editor below. A rule without
+  `<dir>/rules/*.json` ingests bundles) or the governed write route below
+  (`POST /api/v1/governance/rules`); studio's individual editor keeps them as they are. A rule without
   `effect` is recall-only — exactly what every doc minted before the key existed.
 
 CLI import into one store: `wicked-core rules ingest <dir> --db <store>` (idempotent,
@@ -313,8 +314,12 @@ not second-class: same store, same recall, same gates.
 
 ### 3. Add / edit individual
 
-The form editor on Steering: every model field above, the type defaulting to the
-filtered one. Saving upserts by id — editing IS the same flow (the store is id-keyed; the audit log
+The form editor on Steering (**⋯ → Add a rule…**, or edit from a rule's drawer): id, rule type,
+statement, severity, weight, `applies_to`, `excludes`, and an optional effect with a `contains`
+trigger. A new rule takes the filtered type (`architecture` when none is picked); an edit keeps
+the rule's type, and every field the form does not manage (`confidence`, `targets`,
+`provenance`, `compliance`, `obligations`, `criteria`) rides through untouched. To re-type a
+rule, use **⋯ → Edit as a table** (its type cell writes `steering_type`). Saving upserts by id — editing IS the same flow (the store is id-keyed; the audit log
 records `governance.rule.upserted` per write). UI-authored rules carry provenance
 `source: "ui"`. On the wire (daemon-held store): `POST /api/v1/governance/rules` (body: one
 rule), previewed via `GET /api/v1/governance/rules/preview`, browsed via
@@ -330,7 +335,7 @@ Retire-not-delete is an invariant, not a preference: a retired rule is skipped b
 selection but its node survives, so every past gate decision that cited the id stays
 resolvable.
 
-- **One store / one rule**: the rule's Retire action on Steering (in the list or its drawer), or
+- **One store / one rule**: the rule's Retire action on Steering, or
   `DELETE /api/v1/governance/rules/:id` (audited as `governance.rule.retired`).
 - **Fanned-out rule (all lanes at once)** — manifest-keyed, re-verified per lane:
 
@@ -391,7 +396,7 @@ row migrates to a steering rule:
   `ops`/`operations`→`operations`, `architecture`→`architecture`,
   `development`→`development`, `design`/`ux`→`design-ux`); **anything else defaults to
   `operations`** — migrated policies are gate rules, and run/tool discipline is what an
-  untyped gate rule almost always is. Re-type outliers on Steering afterwards (edit the rule's type).
+  untyped gate rule almost always is. Re-type outliers afterwards on Steering's **⋯ → Edit as a table** (the type cell).
 - `effect`/`trigger`/`obligations`/`criteria`/`severity`/`applies_to` carry over verbatim;
   `rule` prose → `statement`.
 - `retired` carries over, and the retired-not-deleted invariant holds through the migration:
@@ -426,9 +431,9 @@ read). Use the `rules` routes.
 ### Humans (wicked-studio)
 
 - **Steering** (sidebar, under **Govern**) — one rule list with the seven steering types as
-  its filter: browse, import, add-with-chat, individual add/edit, retire (§ Manage it), the
-  policy proposals waiting on review, and tiles for rules in force, proposals and what the
-  last eval caught. Absorbs the former Settings → Rules RuleManager and the Architecture
+  its filter: browse (Active, Proposed, Not accepted), import, add-with-chat, individual
+  add/edit, edit as a table, retire (§ Manage it), and **Rule health and the last evaluation**
+  (a disclosure: the store's health, the gate record and the last eval's numbers). Absorbs the former Settings → Rules RuleManager and the Architecture
   Wiki page.
 - **Run view → Governance panel** — the gate decisions of a run with the steering rules
   each claim cites (the acceptance view's conformance section does the same on the

@@ -417,9 +417,9 @@ the import, nothing more — studio renders what crew returns and computes no ve
 own:
 
 - **Run an evaluation** — all steering types or one, over the built-in behaviours or an
-  imported `evals:` corpus (what to run is folded away). **Last results** shows one row per
-  steering type: what was blocked, what slipped through (gaps), what was blocked by mistake
-  (false positives). A row opens that type's numbers, its gaps with their nearest-rule hints
+  imported `evals:` corpus (what to run is folded away). **The last run, by steering type**
+  (folded; it opens after a run) shows one row per steering type: what was blocked, what
+  slipped through (gaps), what was blocked by mistake (false positives). A row opens that type's numbers, its gaps with their nearest-rule hints
   and a Draft rules hand-off to the steering assistant, and every behaviour with its verdict
   and nearest rules. A report that says `"degraded": "facet-only"` is labelled **Tags only**,
   and "Read these numbers with this in mind" says what the split cannot: for example, when
@@ -441,7 +441,7 @@ prints.
 | Operator CLI (`rules eval`) | `wicked-core` binary (`src/bin/wicked-core.rs`) |
 | Imported corpora (scope `evals:<name>`, embedded) | estate knowledge store — `~/.wicked-estate/knowledge.db` (`--knowledge-db` / `knowledgeDb` override) |
 | Daemon API (pinned contract) | wicked-crew: `POST /api/v1/testing/evals/run`, `POST /api/v1/testing/corpora/import` |
-| Human surface | wicked-studio: **Insight → Evaluate** (Run an evaluation, Bring your own behaviours) |
+| Human surface | wicked-studio: **Insight → Evaluate** (Run an evaluation, The last run by steering type, Bring your own behaviours) |
 | The binding between them | `wicked-core-ts`: `core.governanceEvals` / `core.governanceCorpusImport` (presence-gated → `501`) |
 | The rules under test | the steering corpus — authoring, management, recall: [STEERING.md](./STEERING.md) |
 

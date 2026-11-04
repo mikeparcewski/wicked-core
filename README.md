@@ -63,8 +63,10 @@ operator guide from "never heard of it" to seeded and recalling.
 
 Workflows are data: a `WorkflowDef` (JSON) names its phases, and a preset is a fixed plan over the
 phase catalog. The engine seeds its built-in presets into the store at boot (`builtin_presets` in
-[`src/catalog.rs`](./src/catalog.rs); the JSON ones live in [`src/presets/`](./src/presets/)), each
-named after the workflow it replaces, so a launch that names that id keeps working:
+[`src/catalog.rs`](./src/catalog.rs); the JSON ones live in [`src/presets/`](./src/presets/)), and a
+launch names one by its id. A preset that replaced an older workflow def kept that def's id, so a
+launch naming it keeps working (`demo` is the exception: it replaced `interactive-demo` and
+`interactive-demo-reauthor`):
 
 `analyze`, `apps-publish`, `apps-turn`, `bug`, `capture-learnings`, `chat`, `demo`, `docs`,
 `domain-extraction`, `editor-plugin`, `feature`, `interactive-chat`, `interactive-draft`,
@@ -87,8 +89,8 @@ The rules a built-in carries with it:
   seat distinct from the builder.
 - **Answer-only steps.** A one-shot answer step may declare `answer_only` (a `PhaseDef` and
   plan-step field): its answer must exist and be non-blank, instead of meeting the 200-character
-  substance floor. `WorkflowDef::validate` accepts it only on the def's last phase, an agent step
-  the PA owns that executes no code, has no validator pin and a pool of one.
+  substance floor. `WorkflowDef::validate` accepts it only on the def's last phase: an agent step
+  the PA owns, not an evaluator, that executes no code, has no validator pin and a pool of one.
 
 ## Requirements graph
 
