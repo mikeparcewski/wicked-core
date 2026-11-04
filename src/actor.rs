@@ -11437,8 +11437,8 @@ fn dispatch_unit(
             repo_id: session.repo_ref.clone(),
             // The run's autonomy, for the unit's MCP posture mode (DES-MCP-TOOLS-001).
             human_confirm: session.human_confirm,
-            // (DES-APPS-001 K0) An Apps run's units get no registry tool: from the SESSION's
-            // contract, so a resume re-arms the same ban.
+            // (DES-APPS-001 K0, narrowed by DES-KNOWLEDGE-DATA-001 §9.3) An Apps run's units get no
+            // write or destructive tool: from the SESSION's contract, so a resume re-arms the same ban.
             apps: crate::apps::run_preset(&session).map(str::to_string),
             ..g
         }),

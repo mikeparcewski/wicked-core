@@ -21,7 +21,7 @@
    "depends_on": [
     "check"
    ],
-   "instructions": "Follow the wicked-garden-apps skill's qe action: QE acceptance of this publish from the publish check's evidence alone (its report, the before and after renders, the generated cards). You built none of this app's turns since the last publish; change no file in the app repository: your QE evidence and verdict go only where the QE acceptance flow writes them, under the run's QE ledger root. You need no browser and no source of your own, and you have no source tool."
+   "instructions": "Follow the wicked-garden-apps skill's qe action: QE acceptance of this publish from the publish check's evidence alone (its report, the before and after renders, the generated cards). You built none of this app's turns since the last publish; change no file in the app repository: your QE evidence and verdict go only where the QE acceptance flow writes them, under the run's QE ledger root. You need no browser and no source of your own, and you never call a write tool or an action."
   },
   {
    "catalog": "run",

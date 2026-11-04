@@ -84,6 +84,11 @@ pub(crate) const RULE_FIRST_USE: &str = "engine:mcp-first-use";
 /// passes. Whether a read may return rows, and which sources a unit may see, is crew's data gate
 /// (its per-source switches, which the engine cannot read): crew hands every live-source tool to
 /// the engine as `read`, and decides rows and visibility itself.
+///
+/// The class is only as good as its inputs, which is the D-4 contract every unit already relies
+/// on: a tool with no hints is `write`, `readOnlyHint` comes from the operator's preview of the
+/// server, and `class_override` is set only by the operator (crew's registry, fenced from workers).
+/// Nothing a worker sends moves it.
 pub(crate) const RULE_APPS_NO_SOURCE_TOOL: &str = crate::apps::RULE_NO_SOURCE_TOOL;
 
 /// The pack rule that is the first-use APPROVALS LEDGER: its `excludes` lists the approved
@@ -492,11 +497,11 @@ pub(crate) fn evaluate(
             RULE_APPS_NO_SOURCE_TOOL,
             format!(
                 "mcp: `{subject}` is a {} tool and this unit belongs to an `{preset}` run: no unit \
-                 of an Apps run gets a write tool or an action (D-7)",
+                 of an Apps run gets a write or destructive tool (D-7)",
                 class.wire(),
             ),
-            "report the change in your output; an Apps step reads its sources and edits only \
-             the app's files",
+            "report the requested action in your output; this Apps unit cannot invoke write or \
+             destructive tools, so continue within its read and file permissions",
         ))
     } else if !call.registered {
         Some((

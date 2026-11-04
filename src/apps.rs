@@ -24,7 +24,8 @@
 //!   the seats that built a turn since the last publish (crew passes them). Each becomes a bench
 //!   that never lifts, so no unit, QE reviewer, judge or failover of the run lands there; with
 //!   every seat excluded the launch is refused, naming why.
-//! - **No write tool for any agent** ([`RULE_NO_SOURCE_TOOL`]): every brokered MCP call and every
+//! - **No write tool for any agent** ([`RULE_NO_SOURCE_TOOL`], an id kept from when it denied
+//!   every class): every brokered MCP call and every
 //!   tool listing of a `write` or `destructive` tool by a unit of an Apps run is denied
 //!   (`mcp_gate::evaluate`, judged from the tool's class). A `read` tool passes the gates every unit
 //!   passes; crew's data gate alone decides whether it may see a source and read its rows
