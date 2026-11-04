@@ -24,8 +24,12 @@
 //!   the seats that built a turn since the last publish (crew passes them). Each becomes a bench
 //!   that never lifts, so no unit, QE reviewer, judge or failover of the run lands there; with
 //!   every seat excluded the launch is refused, naming why.
-//! - **No source tool for any agent** ([`RULE_NO_SOURCE_TOOL`]): every brokered MCP call and every
-//!   tool listing of every unit of an Apps run is denied (`mcp_gate::evaluate`).
+//! - **No write tool for any agent** ([`RULE_NO_SOURCE_TOOL`], an id kept from when it denied
+//!   every class): every brokered MCP call and every
+//!   tool listing of a `write` or `destructive` tool by a unit of an Apps run is denied
+//!   (`mcp_gate::evaluate`, judged from the tool's class). A `read` tool passes the gates every unit
+//!   passes; crew's data gate alone decides whether it may see a source and read its rows
+//!   (DES-KNOWLEDGE-DATA-001 §9.3, which narrows DES-APPS-001 §5.2's D-7).
 //! - **The publish QE backstop** ([`publish_consent_refusal`]): the produce step's consent gate
 //!   cannot be approved unless the run's QE unit holds a bound QE PASS.
 
@@ -52,7 +56,8 @@ pub const CREW_BIN: &str = "wicked-crew";
 /// Where crew tells the engine its CLI is (crew under `npx` has no `wicked-crew` on PATH). Unset or
 /// blank: `wicked-crew` from PATH.
 pub const CREW_BIN_ENV: &str = "WICKED_CREW_BIN";
-/// The engine's MCP deny for a unit of an Apps run: no registry tool, of any class, ever.
+/// The engine's MCP deny for a unit of an Apps run: no write or destructive tool, ever (the id is
+/// kept from when it denied every class: crew and studio key on it).
 pub const RULE_NO_SOURCE_TOOL: &str = "engine:apps-no-source-tool";
 /// `BenchedSeat::source` of the QE builder exclusion.
 pub const EXCLUSION_BENCH_SOURCE: &str = "apps";

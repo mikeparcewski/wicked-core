@@ -591,7 +591,7 @@ fn an_apps_launch_that_could_not_hold_its_rules_is_refused() {
     assert!(err.downcast_ref::<AppsLaunchRefused>().is_some());
 }
 
-// ─── No registry tool for any agent unit ────────────────────────────────────────────────────────
+// ─── No write or destructive registry tool for any Apps unit ─────────────────────────────────────
 
 /// The input a carrier hands unit `u` of a run whose contract names `apps`.
 fn input_for(u: &WorkUnit, db_path: &str, apps: Option<&str>) -> StepInput {
@@ -669,15 +669,110 @@ fn every_unit(store: &dyn wicked_apps_core::GraphRead) -> Vec<(String, WorkUnit)
     out
 }
 
-/// Acceptance: builder, reviewer and QE units (and the QE reviewer turn, and the check Tool's
-/// token) listing or calling an already registered REST tool are refused — while the same unit
-/// off an Apps run gets it.
+fn rest_tool(tool: &str, read_only: Option<bool>, destructive: Option<bool>) -> McpCall {
+    McpCall {
+        tool: tool.into(),
+        annotations: Some(McpAnnotations {
+            read_only_hint: read_only,
+            destructive_hint: destructive,
+            ..Default::default()
+        }),
+        ..rest_read()
+    }
+}
+
+/// A write tool (`readOnlyHint: false, destructiveHint: false`).
+fn rest_write() -> McpCall {
+    rest_tool("update_ticket", Some(false), Some(false))
+}
+
+/// A destructive tool (`destructiveHint` true).
+fn rest_destructive() -> McpCall {
+    rest_tool("delete_ticket", Some(false), Some(true))
+}
+
+/// A policy deny on one read tool (the gates an Apps read still passes, codex r1).
+fn deny_read_rule(db: &str) {
+    let mut store = open_store(Some(db)).unwrap();
+    let rule: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({
+        "id": "SEC-NO-SECRET-TICKETS", "rule_type": "policy",
+        "statement": "never read the secret tickets", "severity": "critical",
+        "confidence": 1.0, "steering_type": "security",
+        "applies_to": ["mcp:support-api/get_secret_tickets"], "effect": "deny",
+        "provenance": {"source": "ui", "ref": "test", "source_kinds": ["doc"]}
+    }))
+    .unwrap();
+    rule.validate().unwrap();
+    wicked_governance::register_rule(&mut store, &rule).unwrap();
+}
+
+/// Every write-class shape D-7 must refuse: explicit hints, the fail-closed defaults (no
+/// annotations, empty annotations, `readOnlyHint: false` alone) and an operator's override.
+fn every_write_shape() -> Vec<McpCall> {
+    vec![
+        rest_write(),
+        rest_destructive(),
+        McpCall {
+            tool: "post_ticket".into(),
+            annotations: None,
+            ..rest_read()
+        },
+        McpCall {
+            tool: "patch_ticket".into(),
+            annotations: Some(McpAnnotations::default()),
+            ..rest_read()
+        },
+        rest_tool("merge_tickets", Some(false), None),
+        McpCall {
+            tool: "get_tickets_and_close".into(),
+            class_override: Some(crate::mcp_gate::McpClass::Write),
+            ..rest_read()
+        },
+        McpCall {
+            tool: "get_tickets_and_purge".into(),
+            class_override: Some(crate::mcp_gate::McpClass::Destructive),
+            ..rest_read()
+        },
+    ]
+}
+
+/// Acceptance (D-7 as DES-KNOWLEDGE-DATA-001 §9.3 narrows it): builder, reviewer and QE units (and
+/// the QE reviewer turn, and the check Tool's token) of an Apps run calling or listing a `write` or
+/// `destructive` tool — by its hints, by the fail-closed defaults, or by an operator's override,
+/// registered or not — are refused, while the same unit calls and lists a `read` tool exactly as
+/// the same unit off an Apps run does: the read still passes D-5, first use and policy (crew's data
+/// gate then decides rows and visibility). Off an Apps run the same write is reachable for a
+/// creator and D-1's for an evaluator, so D-7 is what refuses it.
 #[test]
-fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
+fn an_apps_unit_lists_and_calls_read_tools_and_never_a_write_or_destructive_one() {
     let presets = seeded();
     let (base, db) = policy_db("ban");
+    deny_read_rule(&db);
     let store = open_store(Some(&db)).unwrap();
-    let call = rest_read();
+    let read = rest_read();
+    // An operator's override to read over write hints is the class contract (D-4), not a bypass.
+    let read_override = McpCall {
+        tool: "refresh_ticket_cache".into(),
+        class_override: Some(crate::mcp_gate::McpClass::Read),
+        ..rest_write()
+    };
+    let writes = every_write_shape();
+    // Reads the ordinary gates refuse or defer, Apps or not.
+    let unregistered_read = McpCall {
+        tool: "get_archived_tickets".into(),
+        registered: false,
+        ..rest_read()
+    };
+    let unapproved_read = McpCall {
+        server: "other-api".into(),
+        ..rest_read()
+    };
+    let denied_read = McpCall {
+        tool: "get_secret_tickets".into(),
+        ..rest_read()
+    };
+    let verdict =
+        |unit: &McpUnit, c: &McpCall| crate::mcp_gate::evaluate(&store, unit, c, 1).unwrap().0;
     let mut checked = Vec::new();
     for (preset, u) in every_unit(&presets) {
         let mut inputs = vec![input_for(&u, &db, Some(&preset))];
@@ -693,32 +788,104 @@ fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
             ));
         }
         for input in inputs {
+            let at = format!("{preset} unit {:?}", u.phase_id());
             let unit = McpUnit::of(&input, &db, McpMode::Autonomous);
-            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &call, 1).unwrap();
-            assert_eq!(v.decision, "deny", "{preset} unit {:?}", u.phase_id());
-            assert_eq!(v.rule_ids, [RULE_NO_SOURCE_TOOL]);
+            let mut plain_input = input.clone();
+            plain_input.governance.as_mut().unwrap().apps = None;
+            let plain = McpUnit::of(&plain_input, &db, McpMode::Autonomous);
+
+            assert_eq!(verdict(&unit, &read).decision, "allow", "{at} read");
+            assert_eq!(
+                verdict(&unit, &read_override).decision,
+                "allow",
+                "{at} read override"
+            );
+            // The ordinary gates hold for an Apps read exactly as they do off an Apps run.
+            for (c, decision, rule) in [
+                (
+                    &unregistered_read,
+                    "deny",
+                    crate::mcp_gate::RULE_UNREGISTERED,
+                ),
+                (&unapproved_read, "ask", crate::mcp_gate::RULE_FIRST_USE),
+                (&denied_read, "deny", "SEC-NO-SECRET-TICKETS"),
+            ] {
+                for who in [&unit, &plain] {
+                    let v = verdict(who, c);
+                    assert_eq!(
+                        v.decision, decision,
+                        "{at} {} (apps: {:?}): {v:?}",
+                        c.tool, who.apps
+                    );
+                    assert_eq!(
+                        v.rule_ids.first().map(String::as_str),
+                        Some(rule),
+                        "{at} {}",
+                        c.tool
+                    );
+                }
+            }
+            for w in &writes {
+                let v = verdict(&unit, w);
+                assert_eq!(v.decision, "deny", "{at} {}", w.tool);
+                assert_eq!(v.rule_ids, [RULE_NO_SOURCE_TOOL], "{at} {}", w.tool);
+                // Unregistered or not, a write is D-7's first.
+                let gone = McpCall {
+                    registered: false,
+                    ..w.clone()
+                };
+                assert_eq!(
+                    verdict(&unit, &gone).rule_ids,
+                    [RULE_NO_SOURCE_TOOL],
+                    "{at} {} unregistered",
+                    w.tool
+                );
+                // Off an Apps run the same write is the creator's to make, or D-1's to refuse.
+                let v = verdict(&plain, w);
+                if plain.role == PhaseRole::Evaluator
+                    || plain.posture == crate::write_posture::WritePosture::ReadOnly
+                {
+                    assert_eq!(
+                        v.rule_ids,
+                        [crate::mcp_gate::RULE_PHASE_ROLE],
+                        "{at} {} off Apps: {v:?}",
+                        w.tool
+                    );
+                } else {
+                    assert_ne!(v.decision, "deny", "{at} {} off Apps: {v:?}", w.tool);
+                }
+            }
             let token = McpToken::mint();
             let _b = token.bind(unit);
-            let listed =
-                crate::mcp_gate::list_mcp_tools(token.value(), std::slice::from_ref(&call))
-                    .unwrap();
-            assert!(
-                listed.tools.is_empty(),
-                "{preset} {:?} lists {listed:?}",
-                u.phase_id()
+            let mut calls = vec![
+                read.clone(),
+                read_override.clone(),
+                unregistered_read.clone(),
+                unapproved_read.clone(),
+                denied_read.clone(),
+            ];
+            calls.extend(writes.iter().cloned());
+            let listed = crate::mcp_gate::list_mcp_tools(token.value(), &calls).unwrap();
+            let subjects: Vec<(&str, &str)> = listed
+                .tools
+                .iter()
+                .map(|t| (t.subject.as_str(), t.decision))
+                .collect();
+            assert_eq!(
+                subjects,
+                [
+                    ("mcp:support-api/get_tickets", "allow"),
+                    ("mcp:support-api/refresh_ticket_cache", "allow"),
+                    ("mcp:other-api/get_tickets", "ask"),
+                ],
+                "{at} lists {listed:?}"
             );
-            // The control: the same unit off an Apps run is offered the read tool.
-            let mut plain = input.clone();
-            plain.governance.as_mut().unwrap().apps = None;
-            let unit = McpUnit::of(&plain, &db, McpMode::Autonomous);
-            let (v, _) = crate::mcp_gate::evaluate(&store, &unit, &call, 1).unwrap();
-            assert_eq!(v.decision, "allow", "{preset} {:?}", u.phase_id());
             checked.push(format!("{preset}/{}", u.phase_id().unwrap_or("?")));
         }
     }
     // build, check, review; check, qe (+ its reviewer), produce.
     assert_eq!(checked.len(), 7, "{checked:?}");
-    // The check Tool's own token (the route's credential) reaches no tool either.
+    // The check Tool's own token (the route's credential) lists the read tool and no write.
     let (u_preset, check) = every_unit(&presets)
         .into_iter()
         .find(|(p, u)| p == APPS_TURN && u.phase_id() == Some(CHECK_STEP))
@@ -731,22 +898,32 @@ fn no_unit_of_an_apps_run_lists_or_calls_a_registered_rest_tool() {
     assert!(env
         .iter()
         .any(|(k, v)| k == crate::mcp_gate::TOKEN_ENV && v == token.value()));
-    assert!(crate::mcp_gate::list_mcp_tools(token.value(), &[call])
-        .unwrap()
-        .tools
-        .is_empty());
+    let mut calls = vec![read];
+    calls.extend(writes);
+    let listed = crate::mcp_gate::list_mcp_tools(token.value(), &calls).unwrap();
+    assert_eq!(
+        listed
+            .tools
+            .iter()
+            .map(|t| t.subject.as_str())
+            .collect::<Vec<_>>(),
+        ["mcp:support-api/get_tickets"]
+    );
     let _ = std::fs::remove_dir_all(&base);
 }
 
-/// Acceptance (S5): marker strings seeded in a fixture source's rows appear in no unit's context
-/// pack. The engine's only path for source rows into an Apps seat is a brokered tool call: the
-/// broker hands rows only on `allow`, and each unit's output becomes the next unit's prior output,
-/// as the actor threads it. Under an Apps run no unit ever receives a row, so no later context
-/// holds one; the control run shows the harness would catch it. (That the real actor stamps the ban
-/// on every dispatched input, QE reviewer turn included, is `tests/apps_presets.rs`; the check
-/// Tool's own output is crew's contract: codes and identifiers only, DES §5.2.)
+/// Acceptance (S5, as DES-KNOWLEDGE-DATA-001 §9.3 amends it): marker strings that a write tool (an
+/// action on a fixture source) would hand back appear in no unit's context pack of an Apps run. The
+/// engine's only path for a tool's answer into an Apps seat is a brokered call: the broker hands an
+/// answer only on `allow`, and each unit's output becomes the next unit's prior output, as the actor
+/// threads it. Under an Apps run no write is ever allowed, so neither the calling seat nor any later
+/// context holds its answer. A READ tool's answer now reaches an Apps unit as it reaches any unit:
+/// rows and visibility are crew's data gate (out of this test's scope: crew's
+/// `tests/sources-knowledge-package.test.ts` covers a query-off source), and the controls below show
+/// the harness would catch a marker. (That the real actor stamps the Apps marker on every
+/// dispatched input, QE reviewer turn included, is `tests/apps_presets.rs`.)
 #[test]
-fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
+fn marker_strings_behind_a_write_tool_reach_no_apps_context_pack() {
     const MARKERS: [&str; 3] = [
         "MARKER-7f3c-ticket-subject",
         "MARKER-91ab-customer-email",
@@ -755,21 +932,22 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
     let presets = seeded();
     let (base, db) = policy_db("markers");
     let store = open_store(Some(&db)).unwrap();
-    // The fixture source: a registered REST read tool whose rows carry the markers.
+    // The fixture source's answer, whatever tool hands it back.
     let rows = format!(
         "{{\"items\":[{{\"subject\":\"{}\",\"email\":\"{}\",\"cell\":\"{}\"}}]}}",
         MARKERS[0], MARKERS[1], MARKERS[2]
     );
     // A seat lists its tools, then calls the source whether or not it was listed; the broker
-    // answers with rows only on `allow`.
-    let broker = |unit: &McpUnit| -> Option<String> {
+    // answers only on `allow`.
+    let broker = |unit: &McpUnit, call: &McpCall| -> Option<String> {
         let token = McpToken::mint();
         let _b = token.bind(unit.clone());
-        let _listed = crate::mcp_gate::list_mcp_tools(token.value(), &[rest_read()]).unwrap();
-        let (v, _) = crate::mcp_gate::evaluate(&store, unit, &rest_read(), 1).unwrap();
+        let _listed =
+            crate::mcp_gate::list_mcp_tools(token.value(), std::slice::from_ref(call)).unwrap();
+        let (v, _) = crate::mcp_gate::evaluate(&store, unit, call, 1).unwrap();
         (v.decision == "allow").then(|| rows.clone())
     };
-    let run = |apps: bool| -> Vec<String> {
+    let run = |apps: bool, call: &McpCall| -> Vec<String> {
         let mut packs = Vec::new();
         for name in [APPS_TURN, APPS_PUBLISH] {
             let mut prior: Vec<PriorUnitOutput> = Vec::new();
@@ -791,9 +969,15 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
                     ));
                 }
                 for i in &inputs {
-                    // The context pack: everything the engine hands the seat.
+                    // The context pack: everything the engine hands the seat, and what the broker
+                    // hands THIS seat when it calls (the QE reviewer turn's own call included, and
+                    // a terminal unit's, which no later context would show).
+                    let received = match broker(&McpUnit::of(i, &db, McpMode::Autonomous), call) {
+                        Some(rows) => format!("read the source: {rows}"),
+                        None => "refused".to_string(),
+                    };
                     packs.push(format!(
-                        "{}\n{}\n{}\n{:?}",
+                        "{}\n{}\n{}\n{:?}\n{received}",
                         i.unit.description,
                         i.prior_outputs
                             .iter()
@@ -805,7 +989,7 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
                     ));
                 }
                 let unit = McpUnit::of(&input, &db, McpMode::Autonomous);
-                let output = match broker(&unit) {
+                let output = match broker(&unit, call) {
                     Some(rows) => format!("read the source: {rows}"),
                     None => "worked from the catalog".to_string(),
                 };
@@ -817,23 +1001,39 @@ fn marker_strings_in_a_fixture_source_reach_no_context_pack() {
         }
         packs
     };
-    let apps_packs = run(true);
-    assert!(!apps_packs.is_empty());
-    for pack in &apps_packs {
-        for m in MARKERS {
-            assert!(
-                !pack.contains(m),
-                "marker {m} reached a context pack:\n{pack}"
-            );
+    for call in every_write_shape() {
+        let apps_packs = run(true, &call);
+        assert!(!apps_packs.is_empty());
+        for pack in &apps_packs {
+            for m in MARKERS {
+                assert!(
+                    !pack.contains(m),
+                    "marker {m} from {} reached a context pack:\n{pack}",
+                    call.tool
+                );
+            }
         }
     }
-    let control = run(false);
-    assert!(
-        control
-            .iter()
-            .any(|p| MARKERS.iter().any(|m| p.contains(m))),
-        "the harness sees rows in a later context when a unit may read the source"
-    );
+    // The controls: off an Apps run the same write tools hand their answer to a seat (so D-7 is
+    // what withholds it above); a read's answer reaches a seat of an Apps run and of any other run
+    // (whether a read returns rows is crew's data gate, out of this engine test's scope).
+    for call in [rest_write(), rest_destructive()] {
+        assert!(
+            run(false, &call)
+                .iter()
+                .any(|p| MARKERS.iter().any(|m| p.contains(m))),
+            "the harness sees {}'s answer off an Apps run",
+            call.tool
+        );
+    }
+    for apps in [true, false] {
+        assert!(
+            run(apps, &rest_read())
+                .iter()
+                .any(|p| MARKERS.iter().any(|m| p.contains(m))),
+            "the harness sees a read's answer (apps: {apps})"
+        );
+    }
     let _ = std::fs::remove_dir_all(&base);
 }
 
