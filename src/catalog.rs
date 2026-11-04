@@ -6,7 +6,8 @@
 //! `attach_pinned_validators` attaches each `validator_pin`, and the fence reads `role`. A plan's
 //! steps are composed onto these entries by [`crate::plan::compose`], which lets a step only make
 //! its entry STRICTER (raise the gate, add a pin to an unpinned entry, set `executes_code`) and
-//! never touch `role` or a pin the entry carries.
+//! never touch `role` or a pin the entry carries. The one exception is the `answer_only` output
+//! declaration (crew#1311), admitted only where nothing in the run builds on or reviews the step.
 //!
 //! The evidence floor lives HERE (DES-TEAMING-002 §10, "moved in seam C1"): the `build`, `test`,
 //! `review` and `security_review` entries carry [`EVIDENCE_FLOOR_PIN`] as data, so a composed
@@ -1153,6 +1154,7 @@ fn entry(
 ) -> PhaseDef {
     PhaseDef {
         requires_capture_report: false,
+        answer_only: false,
         id: id.to_string(),
         kind,
         instructions: None,

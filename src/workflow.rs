@@ -964,6 +964,22 @@ pub struct PhaseDef {
     /// to before the field existed (the shipped workflow files do not gain the key).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub requires_capture_report: bool,
+    /// (crew#1311) The phase's output is an ANSWER its caller reads (a parse, a drafted query), not
+    /// work a later phase or an evaluator builds on. The phase-substance floor
+    /// (`actor::apply_step_result`) then asks only that an answer exists, as it does for a
+    /// read-only phase whose every output a human confirms (core#970): a short correct answer is
+    /// an answer, and an empty or whitespace-only output is still "no reviewable substance".
+    ///
+    /// The floor exists so a near-empty phase cannot starve the units behind it or hand an
+    /// evaluator nothing to review. [`WorkflowDef::validate`] therefore accepts the declaration
+    /// only where nothing in the run builds on the output or reviews it: the def's LAST phase, an
+    /// agent (not Tool), non-evaluator phase of pool 1 that executes no code, carries no validator
+    /// pin and is owned by the PA (a `team` member's step is reviewed by the PA). The fold checks again
+    /// that no unit follows it in the run. It changes nothing else: the phase's write posture,
+    /// tools and gate are its entry's. `skip_serializing_if`: a phase that
+    /// declares nothing serializes byte-identically to before the field existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub answer_only: bool,
     /// Whether the phase verdict requires re-verified evidence (re-run the pinned verifier).
     ///
     /// ENFORCED AT REGISTRATION (FINDING-055). The only mechanism that re-verifies anything is a
@@ -1047,6 +1063,7 @@ impl PhaseDef {
             budget_secs: None,
             pool: None,
             requires_capture_report: false,
+            answer_only: false,
             verified_evidence: false,
             required_deliverables: Vec::new(),
             depends_on: Vec::new(),
@@ -1255,6 +1272,12 @@ pub enum WorkflowDefError {
         phase: String,
         why: String,
     },
+    /// (crew#1311) A phase declares [`PhaseDef::answer_only`] where the substance floor's purpose
+    /// still applies: it executes code, or a phase runs behind it. `why` says which.
+    AnswerOnlyMisplaced {
+        phase: String,
+        why: String,
+    },
 }
 
 /// (core#810) The largest [`PhaseDef::pool`]: one creator plus the team's monitor ceiling.
@@ -1311,6 +1334,12 @@ impl std::fmt::Display for WorkflowDefError {
             WorkflowDefError::RepeatRange { phase, why } => {
                 write!(f, "repeat_from on {phase} is not a loop the engine can run: {why}")
             }
+            WorkflowDefError::AnswerOnlyMisplaced { phase, why } => write!(
+                f,
+                "answer_only on {phase} would drop the substance floor where it still applies: \
+                 {why} \u{2014} declare it only on the last phase: an agent step the PA owns that \
+                 executes no code and carries no validator pin"
+            ),
         }
     }
 }
@@ -1328,9 +1357,39 @@ impl WorkflowDef {
                 .map_err(WorkflowDefError::RequiredInstruments)?;
         }
         let mut ids: HashSet<&str> = HashSet::new();
-        for p in &self.phases {
+        let last = self.phases.len() - 1;
+        for (i, p) in self.phases.iter().enumerate() {
             if !ids.insert(p.id.as_str()) {
                 return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
+            }
+            // (crew#1311) An answer-only phase is read by its CALLER, so nothing in the run may build
+            // on it or review it: no code (the code-evidence floor's ground), nothing behind it, no
+            // judge (a validator pin), no PA review of a member's work (a `team` owner), no monitors
+            // (a pool above 1), and only an agent's non-evaluator output (the one the floor reads).
+            if p.answer_only {
+                let why = if p.executes_code {
+                    Some("it executes code, and a diff is the evidence a code phase owes")
+                } else if i != last {
+                    Some("a phase runs behind it and would build on its output")
+                } else if p.validator_pin.is_some() {
+                    Some("its validator pin judges its output")
+                } else if p.owner != StepOwner::Pa {
+                    Some("a team member's step is reviewed by the PA")
+                } else if p.pool_size() > 1 {
+                    Some("its pool's monitors review its output")
+                } else if !matches!(p.executor, PhaseExecutor::Agent) {
+                    Some("a Tool phase's output is not an agent's answer")
+                } else if p.role == PhaseRole::Evaluator {
+                    Some("an evaluator's output is a verdict, judged by its own contract")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    return Err(WorkflowDefError::AnswerOnlyMisplaced {
+                        phase: p.id.clone(),
+                        why: why.to_string(),
+                    });
+                }
             }
             // (core#810) One creator plus at most MAX_MONITORS monitors; a Tool phase has no seat.
             if let Some(pool) = p.pool {

@@ -59,6 +59,7 @@ mod tests {
     fn make_unit(ord: u32, desc: &str, invocation: &str, cli_key: &str) -> WorkUnit {
         WorkUnit {
             requires_capture_report: false,
+            answer_only: false,
             capture_report: None,
             base_skill_ref: None,
             id: format!("u-opapi-{ord}"),
