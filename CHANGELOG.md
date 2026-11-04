@@ -2243,6 +2243,20 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.25** — 2026-11-04 — patch release on main 5b930e5, carrying 5 PRs since 0.15.24: #1266, #1267,
+  #1268, #1269 and #1270.
+  - **`judgeMcpCall` (#1267, crew#1337).** `Core.judgeMcpCall(requestJson)` (static, like `evaluateMcpCall`) judges
+    one brokered MCP call for a unit WITH its arguments, so an argument-triggered rule fires, and records nothing.
+    crew's data gate judges a live source's call with it; crew falls back to the unit's tool list on an older addon.
+  - **A plan approval carries the operator's note (#1270, crew#1139).** At a `plan_approval` gate, `confirmGate`'s
+    `amend` (with or without an edited plan) lands on the first creator step the plan releases, as
+    `unitReworkAmended`; `HumanDecision::EditPlan` gains `note`. `Core.supportsPlanGateNote()` says the addon carries
+    it.
+  - **Dependencies:** #1268 moved rustls to 0.23.46 in both lockfiles. #1266 re-stamped the 0.15.24 platform lock
+    entries. #1269 is docs only.
+  - Two binding methods are added (`judgeMcpCall`, `supportsPlanGateNote`); no `LaunchSpec` field. The seat and floor
+    Dockerfiles, the seat package pins, the base image and the gate-hook protocol are unchanged since 0.15.24, so the
+    seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.24** — 2026-11-04 — patch release on main 13ec79b, carrying #1263 since 0.15.23.
   - **`firstUseOnly` on an MCP ask (#1263, crew#1333).** The engine reads the policies' claim before the first-use
     override and marks an ask `first_use_only` when the claim alone would let the call run (no deny, no
