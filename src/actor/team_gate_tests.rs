@@ -3075,6 +3075,57 @@ fn a_refused_edit_lands_no_note_1139() {
     assert_eq!(e.runner.0.load(AtomicOrdering::SeqCst), 0);
 }
 
+/// (crew#1139, xreview) "Continue without team" applies the staged answer with its note.
+#[test]
+fn continue_without_team_applies_a_noted_edit_with_its_note_1139() {
+    let rig = rig("n1139c");
+    let e = engine(&rig, fast(&rig));
+    at_the_plan_gate(&rig, &e, "nc");
+    rig.refuse(&[tev::GATE_DECIDED]);
+    let note = "stay inside src/";
+    let status = e.core.confirm_gate("nc", the_edit_noted(note)).unwrap();
+    assert_eq!(status, SessionStatus::AwaitingHuman);
+    wait_for("the team_transport pause", || {
+        open_gate_kinds(&e.db, "nc") == vec![TEAM_TRANSPORT_GATE.to_string()]
+    });
+    assert!(
+        noted_units(&e, "nc", note).is_empty(),
+        "nothing lands while it is staged"
+    );
+    e.core
+        .confirm_gate("nc", approve(Some(CONTINUE_WITHOUT_TEAM)))
+        .unwrap();
+    wait_for("the first dispatch", || {
+        e.runner.0.load(AtomicOrdering::SeqCst) >= 1
+    });
+    assert_eq!(unit_ids(&e, "nc"), EDITED_UNITS);
+    assert_eq!(noted_units(&e, "nc", note), [("make".to_string(), 1)]);
+}
+
+/// (crew#1139, xreview) A staged answer recorded before the note existed reads back with none, and
+/// one without a note writes no `note` key.
+#[test]
+fn a_staged_release_without_a_note_round_trips_1139() {
+    let old = crate::plan_gate::StagedRelease {
+        state: crate::plan_gate::TeamPlanState::default(),
+        facts: Vec::new(),
+        def: None,
+        reopen: false,
+        note: None,
+    };
+    let v = serde_json::to_value(&old).unwrap();
+    assert!(v.get("note").is_none(), "{v}");
+    let back: crate::plan_gate::StagedRelease = serde_json::from_value(v).unwrap();
+    assert_eq!(back.note, None);
+    let noted = crate::plan_gate::StagedRelease {
+        note: Some("n".into()),
+        ..old
+    };
+    let back: crate::plan_gate::StagedRelease =
+        serde_json::from_value(serde_json::to_value(&noted).unwrap()).unwrap();
+    assert_eq!(back.note.as_deref(), Some("n"));
+}
+
 /// (crew#1139) The note rides the STAGED answer: a restart between the `gate.decided` ack and the
 /// apply lands it at boot, once, and a second boot does not land it again.
 #[test]

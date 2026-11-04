@@ -964,6 +964,68 @@ fn t4_b_d_manual_every_revision_pauses_and_two_concurrent_proposals_both_land() 
     release_all(&w);
 }
 
+/// (crew#1139, xreview) A note on an edited approval at a MID-RUN plan gate (the edit goes through
+/// `revise_units`): it lands once, at or after the cursor, and never on the creator step that
+/// already ran before it.
+#[test]
+fn t4_a_mid_run_edited_approval_lands_its_note_at_or_after_the_cursor_only_1139() {
+    let w = Worker::new(
+        &pa_output(r#"PLAN+ {"steps":[{"catalog":"design"}]}"#),
+        None,
+    );
+    let mut e = engine("t4note", w.clone());
+    launch(
+        &e,
+        "mn",
+        HumanConfirm::Before(99),
+        plan(
+            json!({"steps": [{"catalog": "produce"}, {"catalog": "critique"}],
+                    "touch": ["README.md"]}),
+        ),
+    );
+    e.wait_awaiting("mn", crate::plan_gate::GATE_KIND, 1);
+    e.core.confirm_gate("mn", approve()).unwrap();
+    // The PA's revision pauses mid-run, after `produce` (a creator) ran.
+    e.wait_awaiting("mn", crate::plan_gate::GATE_KIND, 2);
+    let note = "keep the change to the README";
+    e.core
+        .confirm_gate(
+            "mn",
+            HumanDecision::EditPlan {
+                plan: plan(json!({"steps": [{"catalog": "test_plan"}]})),
+                note: Some(note.into()),
+            },
+        )
+        .unwrap();
+    wait_for("the first unit after the edit", || {
+        e.worker.calls().len() >= 2
+    });
+    let units = view(&e, "mn").units;
+    let segment = format!(" (operator amendment: {note})");
+    let carrying: Vec<&str> = units
+        .iter()
+        .filter(|u| u.description.contains(&segment))
+        .map(|u| u.id.as_str())
+        .collect();
+    assert_eq!(carrying.len(), 1, "once: {units:#?}");
+    let produce = units.iter().find(|u| u.id == "mn:produce").unwrap();
+    assert!(
+        !produce.description.contains(&segment),
+        "the creator that ran is untouched"
+    );
+    let cursor = units.iter().position(|u| u.id == "mn:test_plan").unwrap();
+    let want = units[cursor..]
+        .iter()
+        .find(|u| u.role == crate::workflow::PhaseRole::Creator)
+        .unwrap_or(&units[cursor]);
+    assert_eq!(
+        carrying,
+        [want.id.as_str()],
+        "the first creator at or after the cursor, else the cursor"
+    );
+    release_all(&w);
+}
+
 // ── (e) a member's request becomes a revision only through the PA ──────────────────────────────
 
 /// (e) The PA's `PLAN <change_id>: ACCEPT` and its `PLAN+` restatement, in the step output, are
