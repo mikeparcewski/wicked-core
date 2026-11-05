@@ -2255,6 +2255,15 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.26** — 2026-11-05 — patch release on main 51813f3, carrying 2 PRs since 0.15.25: #1272 and #1274.
+  - **`matchRules` (#1274, DES-RULE-CHECK-001 S1).** `Core.matchRules(argsJson)` (static, pure: no store, no model)
+    answers which in-force rules a job is checked against: one match per rule, none dropped, each `applies`,
+    `may_apply` or `not_applicable` with the facts that decided it. crew's launch brief lists every rule through it, so
+    a crew that relies on it needs this release.
+  - **Lockfile:** #1272 re-stamped the 0.15.25 platform lock entries.
+  - One binding method is added (`matchRules`); no `LaunchSpec` field. The seat and floor Dockerfiles, the seat package
+    pins, the base image and the gate-hook protocol are unchanged since 0.15.25, so the seat and floor image tags and
+    gate protocol 3 are unchanged.
 - **core-ts 0.15.25** — 2026-11-04 — patch release on main 5b930e5, carrying 5 PRs since 0.15.24: #1266, #1267,
   #1268, #1269 and #1270.
   - **`judgeMcpCall` (#1267, crew#1337).** `Core.judgeMcpCall(requestJson)` (static, like `evaluateMcpCall`) judges
