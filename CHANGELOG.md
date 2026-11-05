@@ -52,7 +52,7 @@ Two release tracks share this file, newest entry first regardless of track:
   `[{id, reason}]`; bound to that rule's content and evidence), the step not running again. No answer that counts
   the unit (landing it at review adjudication, the operator's judgment, a QE skip) is taken while one of its rules is
   broken or unchecked. Every rule's row (`kept |
-  broken | n_a | unchecked | skipped`, how: `fact | judge | machine | cache | operator | none`, reason, cite, judge,
+  broken | n_a | unchecked | skipped | waived`, how: `fact | judge | machine | cache | operator | none`, reason, cite, judge,
   rule and evidence keys, full SHA-256) is on the gate receipt (`AssuranceReceipt.rules`) and, worst row per rule, on
   the delivery receipt; a skip carries its reason there. A re-review reuses every verdict whose rule content and
   evidence are unchanged.
