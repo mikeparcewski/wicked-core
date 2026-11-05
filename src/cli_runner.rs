@@ -1192,6 +1192,7 @@ fn run_rule_check(
                     no_seat: no_seat.as_deref(),
                     base: &base,
                     instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
+                    packs: crate::steering_packs::shipped_rule_ids(),
                 },
                 &judge,
                 &FloorMachine {

@@ -320,7 +320,9 @@ impl StepRunner for DomainExtractionRunner {
                 run_id: i.run_id.clone(),
                 unit_ix: i.unit_ix,
                 attempt: i.attempt,
-                output: "PASS\nthe work meets the criterion\nPASS".into(),
+                // (DES-RULE-CHECK-001) …and the review's rule check, the same identity: N/A each.
+                output: wicked_core::stub_rule_verdicts(&i.unit.description)
+                    .unwrap_or_else(|| "PASS\nthe work meets the criterion\nPASS".into()),
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),

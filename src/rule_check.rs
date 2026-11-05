@@ -676,6 +676,9 @@ pub struct CheckInput<'a> {
     /// The person's own instructions for the job (the task as they wrote it, any approved amendment;
     /// never the creator's words): a rule they conflict with is WAIVED, which the person confirms.
     pub instructions: Option<&'a str>,
+    /// The engine's shipped guidance-pack rule ids: each gets a fact row (the phases that cite the
+    /// pack apply it), never a judge call.
+    pub packs: &'a [String],
 }
 
 /// Batch size and parallelism for `n` rules: at most [`MAX_PER_BATCH`] per call unless that needs
@@ -1105,6 +1108,21 @@ pub fn check(
                 rule_key: rk.clone(),
                 evidence_key: ek,
             };
+        if input.packs.iter().any(|p| p == &rule.id) && m.status != MatchStatus::NotApplicable {
+            rows.insert(
+                rule.id.clone(),
+                row(
+                    RuleStatus::NotApplicable,
+                    RuleHow::Fact,
+                    "an engine guidance-pack rule: the workflow phases that cite its pack apply it; \
+                     the review's rule check does not judge it"
+                        .into(),
+                    None,
+                    None,
+                ),
+            );
+            continue;
+        }
         if m.status == MatchStatus::NotApplicable {
             let why = m
                 .facts

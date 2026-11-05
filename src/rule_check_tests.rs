@@ -166,6 +166,7 @@ fn run_on(
             no_seat: None,
             base: "b0",
             instructions: None,
+            packs: &[],
         },
         judge,
         machine,
@@ -484,6 +485,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             no_seat: Some("only the creator's seat `claude` is signed in"),
             base: "b0",
             instructions: None,
+            packs: &[],
         },
         &judge,
         &NoMachine,
@@ -586,6 +588,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             no_seat: None,
             base: "b0",
             instructions: None,
+            packs: &[],
         },
         &judge,
         &NoMachine,
@@ -916,6 +919,7 @@ fn run_told(
             no_seat: None,
             base: "b0",
             instructions: Some(TOUCH_NO_TEST),
+            packs: &[],
         },
         judge,
         &NoMachine,
@@ -1134,6 +1138,7 @@ fn changed_instructions_check_the_rule_again() {
             no_seat: None,
             base: "b0",
             instructions: Some("A new instruction from the person."),
+            packs: &[],
         },
         &judge,
         &NoMachine,
@@ -1157,4 +1162,44 @@ fn the_stub_runner_answers_every_rule_na_in_the_calls_frame() {
         .values()
         .all(|a| a.status == RuleStatus::NotApplicable));
     assert!(stub_rule_verdicts("review the fix").is_none());
+}
+
+/// CI (apps_presets): an engine guidance-pack rule gets a fact row, not a judge call; a rule the
+/// match already ruled out keeps its own fact.
+#[test]
+fn a_guidance_pack_rule_is_a_fact_row_and_asks_no_judge() {
+    let judge = Fake::new(&[]);
+    let c = change();
+    let f = job_facts(&[], None, None, &c);
+    let seats = seats();
+    let packs = vec!["RVWL-1002".to_string()];
+    let r = check(
+        &CheckInput {
+            rules: &[rule(
+                "RVWL-1002",
+                "a review re-runs the failing check on the base",
+            )],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            packs: &packs,
+        },
+        &judge,
+        &NoMachine,
+    );
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::NotApplicable, RuleHow::Fact)
+    );
+    assert!(r.rows[0].reason.contains("guidance-pack"));
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    assert!(crate::steering_packs::shipped_rule_ids()
+        .iter()
+        .any(|i| i == "RVWL-1002"));
 }
