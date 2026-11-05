@@ -888,6 +888,7 @@ mod tests {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            rule_instructions: None,
             read_view: None,
         }
     }

@@ -977,7 +977,9 @@ export declare class Core {
    * recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
    * judge per call; another project; a facet or trigger the
    * job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
-   * `bad_request: …`. Static, like `evaluateMcpCall`.
+   * `bad_request: …`. Static, like `evaluateMcpCall`. (DES-RULE-CHECK-001) `job.repo` (the job's repository
+   * id or name) and `job.paths` (changed files): a rule whose `statement` or `source_ref` document names
+   * the repository, or whose statement names a changed file, applies — so send each rule's `statement`.
    */
   static matchRules(argsJson: string): Promise<string>
   /**

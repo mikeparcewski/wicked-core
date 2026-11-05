@@ -1533,6 +1533,11 @@ pub struct WorkUnit {
     /// action `skip_rules`); each applies while the rule's evidence is the one it was given on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_skips: Vec<crate::rule_check::RuleSkip>,
+    /// (DES-RULE-CHECK-001, codex r3) The PERSON's words for the job, stamped at dispatch on a
+    /// review unit from the run's record (its problem and every approved intent amendment), never
+    /// from a plan's step text: the only authority a rule can be waived by.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_instructions: Option<String>,
     /// (DES-TEAMING-002 §8.8) A team member turn's READ-ONLY view of the repository: a directory
     /// holding the checkpoint tree the member reviews, materialized for that one turn
     /// (`acp_runner::RunnerHost`). The wrapped runner mounts it read-only into the member's seat
@@ -1830,6 +1835,7 @@ impl WorkUnit {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            rule_instructions: None,
             read_view: None,
         }
     }

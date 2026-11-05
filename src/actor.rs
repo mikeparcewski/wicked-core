@@ -11121,10 +11121,22 @@ fn dispatch_unit(
             } else {
                 Vec::new()
             };
+        // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
+        stamped.rule_instructions = (unit.role == crate::workflow::PhaseRole::Evaluator
+            && unit.tool_cmd.is_none())
+        .then(|| {
+            let mut words = session.problem.clone();
+            for a in &session.intent_amendments {
+                words.push_str("\n\nApproved amendment: ");
+                words.push_str(&a.text);
+            }
+            words
+        });
         if unit.qe_acceptance != stamped.qe_acceptance
             || unit.qe_reviewer_seats != stamped.qe_reviewer_seats
             || unit.qe_floor_note != stamped.qe_floor_note
             || unit.rule_steps != stamped.rule_steps
+            || unit.rule_instructions != stamped.rule_instructions
         {
             unit = stamped;
             put_node(store, unit.to_node())?;

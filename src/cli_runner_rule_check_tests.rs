@@ -407,12 +407,18 @@ fn the_base_tree_with_the_tests_holds_the_base_and_the_tests() {
         &git_dir,
         &base,
         &snap.tree,
-        &[
-            "tests/add_test.rs".to_string(),
-            "src/missing_test.rs".to_string(),
-        ],
+        &["tests/add_test.rs".to_string()],
     )
     .unwrap();
+    // A changed test the snapshot does not hold: nothing is decided from a partial overlay.
+    assert!(base_tree_with(
+        &repo,
+        &git_dir,
+        &base,
+        &snap.tree,
+        &["src/missing_test.rs".to_string()]
+    )
+    .is_err());
     let ls = git(&repo, &["ls-tree", "-r", "--name-only", &tree]);
     assert_eq!(
         ls.lines().collect::<Vec<_>>(),
@@ -643,4 +649,15 @@ fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
     );
     let deny = report.denial().expect("broken denies");
     assert_eq!(deny.rule_ids, ["DEV-UNTESTED-1", "learn-tests-with-fixes"]);
+}
+
+/// codex r3: a seat that authored THIS unit's tree (a floor fix) never judges it.
+#[test]
+fn the_seat_that_fixed_this_units_tree_never_judges_it() {
+    let (repo, base, db) = fixture("fixer");
+    let mut input = review_input(&repo, &base, &db);
+    input.unit.authored_by = vec!["codex".into()];
+    let (report, asked) = check_with(&input, Some(&[]), &[seat("claude"), seat("codex")]);
+    assert!(asked.iter().all(|(who, _)| who != "codex"), "{asked:?}");
+    assert!(report.hold().is_some(), "no other distinct seat: held");
 }

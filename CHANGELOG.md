@@ -35,7 +35,7 @@ Two release tracks share this file, newest entry first regardless of track:
   forced to text) plus the floor's per-check outcomes; the
   creator's transcript is never in the prompt. Batches of at most 8 rules, every field whole (statement, criteria,
   obligations; no 600-character cut), at most 3 calls at once; a batch grows past 8 only to stay within 2 rounds
-  (100 rules of ordinary length: 6 calls of 17; a dropped answer adds a round of single re-asks, long statements more calls), and splits by bytes so the prompt
+  (100 rules of ordinary length: 6 calls of 17; a dropped answer adds a round of single re-asks, long statements more calls; machine-backed rules judged after the machine add their own rounds), and splits by bytes so the prompt
   stays one argv argument (a rule too long for one is unchecked, saying so). The judge sees each rule's match facts. Answers count only inside a
   per-call nonce frame (`BEGIN VERDICTS <nonce>`), one `RULE <id>: KEPT|BROKEN|N/A — <cite>` line each, a KEPT citing
   a changed file; a rule a batch did not answer is asked alone, then **unchecked**. A seat that fails as a seat is not

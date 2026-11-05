@@ -121,6 +121,16 @@ pub struct MatchRule {
     /// Where the rule came from (`provenance.ref`, e.g. `tiny-math-tests.md@…#DEV-TINYMATH-2`).
     #[serde(default)]
     pub source_ref: Option<String>,
+    /// The wire's own `provenance` (crew sends whole rules): its `ref` stands in for `source_ref`.
+    #[serde(default, skip_serializing)]
+    pub provenance: Option<MatchProvenance>,
+}
+
+/// A rule's `provenance`, as far as the match reads it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatchProvenance {
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +168,7 @@ impl Default for MatchRule {
             retired: false,
             statement: String::new(),
             source_ref: None,
+            provenance: None,
         }
     }
 }
@@ -186,6 +197,7 @@ impl From<&ConformanceRule> for MatchRule {
                 .reference
                 .clone()
                 .filter(|x| !x.trim().is_empty()),
+            provenance: None,
         }
     }
 }
@@ -382,7 +394,12 @@ pub fn match_rule(rule: &MatchRule, job: &JobFacts) -> RuleMatch {
         let doc = rule
             .source_ref
             .as_deref()
+            .or(rule
+                .provenance
+                .as_ref()
+                .and_then(|p| p.reference.as_deref()))
             .map(|r| r.split(['@', '#']).next().unwrap_or(r))
+            .map(|d| d.rsplit('/').next().unwrap_or(d))
             .unwrap_or("");
         if names_token(&rule.statement, repo) || names_token(doc, repo) {
             yes.push(MatchFact {
@@ -396,7 +413,11 @@ pub fn match_rule(rule: &MatchRule, job: &JobFacts) -> RuleMatch {
         let named: Vec<&str> = paths
             .iter()
             .map(String::as_str)
-            .filter(|p| p.contains('/') && names_token(&rule.statement, p))
+            // A path, or a root file with an extension (`package.json`); never a bare word.
+            .filter(|p| {
+                (p.contains('/') || (p.contains('.') && p.len() >= 5))
+                    && names_token(&rule.statement, p)
+            })
             .collect();
         if !named.is_empty() {
             yes.push(MatchFact {
@@ -1042,6 +1063,27 @@ mod tests {
             match_rules(&[by_path], &review)[0].status,
             MatchStatus::Applies
         );
+        // crew's wire sends the whole rule: `provenance.ref`, directory-qualified, names it too.
+        let wire = r#"{"rules":[{"id":"D","statement":"JSDoc on every export","provenance":{"ref":"docs/tiny-math-jsdoc.md@956a#D"}}],"job":{"repo":"tiny-math"}}"#;
+        assert!(match_rules_json(wire)
+            .unwrap()
+            .contains(r#""status":"applies""#));
+        // A root file it names, at review.
+        let mut root = MatchRule {
+            id: "ROOT".into(),
+            statement: "package.json keeps its engines field".into(),
+            ..Default::default()
+        };
+        let pj = JobFacts {
+            paths: Some(vec!["package.json".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            match_rules(std::slice::from_ref(&root), &pj)[0].status,
+            MatchStatus::Applies
+        );
+        root.statement = "keeps the package tidy".into();
+        assert_eq!(match_rules(&[root], &pj)[0].status, MatchStatus::MayApply);
         // A rule out of scope by fact stays not applicable whatever it names.
         let mut tool = other;
         tool.statement = "tiny-math mcp calls are logged".into();

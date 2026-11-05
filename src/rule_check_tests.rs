@@ -934,7 +934,7 @@ fn a_keep_won_by_the_persons_instruction_is_a_waiver_that_holds() {
         "DEV-TINYMATH-2",
         "KEPT — src/math.js: the intent forbids touching tests, so I judged the explicit instruction to govern",
     )]);
-    let r = run_told(&[rule.clone()], &judge, &[], None);
+    let r = run_told(std::slice::from_ref(&rule), &judge, &[], None);
     assert_eq!(r.rows[0].status, RuleStatus::Waived, "{:?}", r.rows[0]);
     let hold = r.hold().expect("a waiver holds the gate");
     assert!(
@@ -960,7 +960,7 @@ fn a_waiver_quotes_the_instruction_and_an_invented_quote_is_no_answer() {
         "WAIVED — \"Do not add, change or run any test file\"",
     )]);
     assert_eq!(
-        run_told(&[rule.clone()], &quoted, &[], None).rows[0].status,
+        run_told(std::slice::from_ref(&rule), &quoted, &[], None).rows[0].status,
         RuleStatus::Waived
     );
     let invented = Fake::new(&[("DEV-TINYMATH-2", "WAIVED — \"tests are optional here\"")]);
@@ -979,7 +979,7 @@ fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
         "DEV-TINYMATH-2",
         "WAIVED — \"Do not add, change or run any test file\"",
     )]);
-    let first = run_told(&[rule.clone()], &judge, &[], None);
+    let first = run_told(std::slice::from_ref(&rule), &judge, &[], None);
     let row = &first.rows[0];
     let skip = RuleSkip {
         rule_id: row.rule_id.clone(),
@@ -1005,4 +1005,139 @@ fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
 fn the_instructions_drop_the_rules_block() {
     let d = "Fix sum().\n\n<!-- wicked-crew:rules -->\nSteering rules: 30\n<!-- /wicked-crew:rules -->\nTouch no test.";
     assert_eq!(instructions_of(d), "Fix sum().\n\n\nTouch no test.");
+}
+
+// ── Round-3 folds (codex + pi r3) ───────────────────────────────────────────────────────────────
+
+#[test]
+fn an_inline_test_is_a_test_attribute_or_block_that_begins_its_line() {
+    assert!(has_inline_test("+#[test]\n+fn adds() {}\n"));
+    assert!(has_inline_test("+  it('clamps', () => {})\n"));
+    assert!(
+        has_inline_test("+export function test_x() {}\n") || has_inline_test("+def test_x():\n")
+    );
+    for not in [
+        "+    self.bus.emit(evt);\n",
+        "+commit(tx);\n",
+        "+// it(…) is how vitest names one\n",
+        "+    audit(x);\n",
+    ] {
+        assert!(!has_inline_test(not), "{not}");
+    }
+    // A fix that only calls emit() and adds no test is still broken by the machine, with no call.
+    let c = change_of(
+        &format!("{DIFF}+    self.bus.emit(evt);\n"),
+        &["src/add.rs"],
+    );
+    let judge = Fake::new(&[]);
+    let r = run_on(&[learn()], &c, &judge, &NoMachine, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Broken, RuleHow::Machine)
+    );
+}
+
+#[test]
+fn a_kept_cite_names_a_changed_path_whole() {
+    let ids = ["K"];
+    let frame = |c: &str| format!("BEGIN VERDICTS n\nRULE K: KEPT — {c}\nEND VERDICTS n\n");
+    let ok = |c: &str, paths: &[&str]| {
+        parse_rule_lines(&frame(c), &ids, "n", paths, None).contains_key("K")
+    };
+    assert!(ok("src/a.rs:10 adds the check", &["src/a.rs"]));
+    assert!(ok("see src/a.rs.", &["src/a.rs"]));
+    assert!(!ok("src/a.rs.bak:10 is untouched", &["src/a.rs"]));
+    assert!(
+        !ok("the change is fine", &["e"]),
+        "a one-letter root file is not a citation"
+    );
+}
+
+#[test]
+fn a_change_in_a_file_the_engine_cannot_name_leaves_languages_unknown() {
+    let f = job_facts(
+        &[],
+        None,
+        None,
+        &change_of("", &["src/main.lua", "src/a.rs"]),
+    );
+    assert_eq!(
+        f.languages, None,
+        "a Lua rule is not ruled out by a Rust-only inventory"
+    );
+    let mut lua = rule("LUA", "lua modules return a table");
+    lua.targets.language = Some("lua".into());
+    let judge = Fake::new(&[("LUA", "KEPT — src/main.lua returns M")]);
+    let c = change_of(
+        "diff --git a/src/main.lua b/src/main.lua\n+return M\n",
+        &["src/main.lua"],
+    );
+    let r = run_on(&[lua], &c, &judge, &NoMachine, None, &[]);
+    assert_ne!(r.rows[0].how, RuleHow::Fact);
+}
+
+#[test]
+fn an_html_or_config_change_is_not_ruled_out_of_the_test_obligation() {
+    let judge = Fake::new(&[]);
+    for p in ["web/index.html", "config/app.yaml", "package.json"] {
+        let c = change_of(
+            &format!("diff --git a/{p} b/{p}\n+<script>fix()</script>\n"),
+            &[p],
+        );
+        let r = run_on(&[learn()], &c, &judge, &NoMachine, None, &[]);
+        assert_ne!(r.rows[0].how, RuleHow::Fact, "{p}");
+    }
+}
+
+/// codex r3: a path that merely holds the word is no appeal to the instruction, and with no
+/// recorded instructions nothing is "waived by your instruction".
+#[test]
+fn an_appeal_needs_the_persons_words_and_is_not_a_file_name() {
+    let r1 = rule("R", "inputs are validated");
+    let judge = Fake::new(&[(
+        "R",
+        "KEPT — src/math.js:4 calls instructions_ok() in src/instructions.rs to validate the input",
+    )]);
+    assert_eq!(
+        run_told(std::slice::from_ref(&r1), &judge, &[], None).rows[0].status,
+        RuleStatus::Kept
+    );
+    let appeal = Fake::new(&[("R", "KEPT — src/a.rs: the intent forbids touching tests")]);
+    let c = change_of(DIFF, &["src/a.rs"]);
+    let r = run_on(&[r1], &c, &appeal, &NoMachine, None, &[]);
+    assert_ne!(
+        r.rows[0].status,
+        RuleStatus::Waived,
+        "no recorded instructions: no waiver"
+    );
+}
+
+/// codex r3: the person's instructions are part of the evidence a verdict and a skip read.
+#[test]
+fn changed_instructions_check_the_rule_again() {
+    let r1 = rule("R", "r");
+    let judge = Fake::new(&[("R", "KEPT — src/math.js:1")]);
+    let first = run_told(std::slice::from_ref(&r1), &judge, &[], None);
+    let c = change_of(DIFF, &["src/math.js"]);
+    let f = job_facts(&[], None, Some("tiny-math"), &c);
+    let seats = seats();
+    let calls = judge.calls.load(Ordering::SeqCst);
+    let again = check(
+        &CheckInput {
+            rules: &[r1],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: Some(&first),
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: Some("A new instruction from the person."),
+        },
+        &judge,
+        &NoMachine,
+    );
+    assert_eq!(again.rows[0].how, RuleHow::Judge);
+    assert!(judge.calls.load(Ordering::SeqCst) > calls);
 }

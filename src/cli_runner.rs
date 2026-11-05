@@ -915,16 +915,16 @@ fn base_tree_with(
             let entry =
                 crate::worktree_guard::git(wd, &["ls-tree", "-z", snapshot, "--", t], &env[..1])?;
             let entry = String::from_utf8_lossy(&entry);
+            // (codex r3) Every changed test rides the overlay faithfully, or nothing is decided.
             let Some((meta, path)) = entry.trim_end_matches('\0').split_once('\t') else {
-                continue;
+                anyhow::bail!("{t} is not in the engine's snapshot");
             };
             let parts: Vec<&str> = meta.split(' ').collect();
-            // Only a regular (or executable) file of the snapshot.
             let [mode @ ("100644" | "100755"), "blob", blob] = parts.as_slice() else {
-                continue;
+                anyhow::bail!("{t} is not a regular file in the snapshot ({meta})");
             };
             if path != t {
-                continue;
+                anyhow::bail!("{t} reads back from the snapshot as {path}");
             }
             let mut args = no_hooks.to_vec();
             let info = format!("{mode},{blob},{t}");
@@ -1106,9 +1106,23 @@ fn run_rule_check(
                     }
                 }
             }
+            // (codex r3) …and whoever authored THIS unit's tree (a floor fix's seat), by key and binary.
+            ids.extend(
+                input
+                    .unit
+                    .authored_binaries
+                    .iter()
+                    .map(|b| crate::validator::normalize_identity(b)),
+            );
+            for k in &input.unit.authored_by {
+                if let Some(c) = registry.iter().find(|c| &c.key == k) {
+                    ids.extend(record_identities(c));
+                }
+            }
             let excluded: Vec<&str> = creators
                 .iter()
                 .chain(&input.unit.exclude_seats)
+                .chain(&input.unit.authored_by)
                 .map(String::as_str)
                 .collect();
             let keys: Vec<String> = pool
@@ -1137,8 +1151,13 @@ fn run_rule_check(
         gov.repo_id.as_deref(),
         &change,
     );
-    // The person's own words for the job (the review unit's task, the rules block taken out).
-    let instructions = crate::rule_check::instructions_of(&input.unit.description);
+    // The person's own words for the job, as the run recorded them (never a plan's step text).
+    let instructions = input
+        .unit
+        .rule_instructions
+        .as_deref()
+        .map(crate::rule_check::instructions_of)
+        .unwrap_or_default();
     let floor_text = floor.map(crate::rule_check::floor_evidence);
     engine_note(
         emit_delta,

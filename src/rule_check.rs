@@ -391,12 +391,15 @@ pub fn job_facts(
         .iter()
         .filter_map(|(p, _)| language_of(p).map(str::to_string))
         .collect();
+    // (codex r3) A changed file whose language the engine cannot name leaves the inventory
+    // incomplete: unknown, so no language facet can rule a rule out.
+    let complete = change.paths.iter().all(|(p, _)| language_of(p).is_some());
     JobFacts {
         workflow: None,
         steps: (!steps.is_empty()).then(|| steps.to_vec()),
         kinds: None,
         project: project.map(str::to_string),
-        languages: Some(languages.into_iter().collect()),
+        languages: complete.then(|| languages.into_iter().collect()),
         frameworks: None,
         layers: None,
         diff: Some(change.diff.clone()),
@@ -512,6 +515,34 @@ pub fn is_source_path(path: &str) -> bool {
             .is_some_and(|l| !matches!(l, "markdown" | "json" | "yaml" | "toml" | "html" | "css"))
 }
 
+/// (pi r3) Whether the diff ADDS a test inline in a source file: a test attribute or a test function
+/// or block that begins its line (`emit(`, `commit(` are not `it(`).
+pub fn has_inline_test(diff: &str) -> bool {
+    diff.lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .any(|l| {
+            let t = l[1..].trim_start();
+            let t = t
+                .strip_prefix("export ")
+                .or_else(|| t.strip_prefix("pub "))
+                .or_else(|| t.strip_prefix("async "))
+                .unwrap_or(t);
+            ["#[test]", "#[cfg(test)]", "#[tokio::test]", "@Test"]
+                .iter()
+                .any(|m| t.starts_with(m))
+                || [
+                    "fn test_",
+                    "func Test",
+                    "def test_",
+                    "describe(",
+                    "it(",
+                    "test(",
+                ]
+                .iter()
+                .any(|m| t.starts_with(m))
+        })
+}
+
 /// What a machine check concluded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MachineOutcome {
@@ -562,13 +593,11 @@ fn test_fails_on_base_by_diff(change: &Change) -> Option<(RuleStatus, RuleHow, S
     // styles); an unknown extension may be code, and goes to the check.
     let known_non_code = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
-        language_of(p)
-            .is_some_and(|l| matches!(l, "markdown" | "json" | "yaml" | "toml" | "html" | "css"))
-            || [
-                ".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".lock", ".csv",
-            ]
-            .iter()
-            .any(|e| name.ends_with(e))
+        // (codex r3) Docs and images only: HTML, JSON, YAML and the like can carry behaviour.
+        language_of(p).is_some_and(|l| l == "markdown")
+            || [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
+                .iter()
+                .any(|e| name.ends_with(e))
             || matches!(
                 name.as_str(),
                 "license" | "changelog" | "readme" | ".gitignore"
@@ -590,22 +619,7 @@ fn test_fails_on_base_by_diff(change: &Change) -> Option<(RuleStatus, RuleHow, S
     }
     // A test written inline in a source file (`#[test]` in `src/lib.rs`, a Go `func TestX`) is a
     // test too: the change goes to the check, never broken by its file names alone.
-    let inline_test = change.diff.lines().any(|l| {
-        l.starts_with('+')
-            && [
-                "#[test]",
-                "#[cfg(test)]",
-                "#[tokio::test]",
-                "func Test",
-                "def test_",
-                "describe(",
-                "it(",
-                "test(",
-                "@Test",
-            ]
-            .iter()
-            .any(|m| l.contains(m))
-    });
+    let inline_test = has_inline_test(&change.diff);
     if tests.is_empty() && !sources.is_empty() && !inline_test {
         return Some((
             RuleStatus::Broken,
@@ -679,6 +693,11 @@ pub fn plan(n: usize) -> (usize, usize) {
 /// The mark a prompt carries when its diff was cut to fit.
 const DIFF_CUT_MARK: &str = "[the diff is cut";
 
+/// Whether `prompt` cut the diff: the cut note carries the call's nonce, which no diff can hold.
+fn prompt_was_cut(text: &str, nonce: &str) -> bool {
+    text.contains(&format!("{DIFF_CUT_MARK} ({nonce})"))
+}
+
 /// The whole judge prompt rides ONE argv argument: kept under this many bytes (Linux's per-argument
 /// limit is 128 KiB).
 pub const PROMPT_BUDGET: usize = 112 * 1024;
@@ -746,7 +765,11 @@ pub fn parse_rule_lines(
         return BTreeMap::new();
     };
     // A KEPT cites a changed file by its whole path (a bare basename can be ordinary prose).
-    let names_a_path = |cite: &str| paths.iter().any(|p| !p.is_empty() && cite.contains(p));
+    let names_a_path = |cite: &str| {
+        paths
+            .iter()
+            .any(|p| p.len() >= 3 && names_whole_path(cite, p))
+    };
     let mut seen: BTreeMap<String, Option<Answer>> = BTreeMap::new();
     for raw in &lines[start + 1..start + 1 + len] {
         let line = raw.trim().trim_start_matches(['-', '*', ' ']).trim_start();
@@ -795,10 +818,12 @@ pub fn parse_rule_lines(
         let answer = match status {
             // (E7 rerun e1892573) A KEPT the judge reached by letting the person's instruction win
             // is a waiver, which the person confirms: never a silent keep.
-            Some(RuleStatus::Kept) if appeals_to_instruction(&cite) => Some(Answer {
-                status: RuleStatus::Waived,
-                cite: format!("kept on the person's instruction, not on evidence: {cite}"),
-            }),
+            Some(RuleStatus::Kept) if instructions.is_some() && appeals_to_instruction(&cite) => {
+                Some(Answer {
+                    status: RuleStatus::Waived,
+                    cite: format!("kept on the person's instruction, not on evidence: {cite}"),
+                })
+            }
             Some(RuleStatus::Kept) if !names_a_path(&cite) => None,
             // A WAIVED quotes the person's instruction, exactly (a judge cannot invent one).
             Some(RuleStatus::Waived) if !quotes_instruction(&cite, instructions) => None,
@@ -821,11 +846,42 @@ pub fn parse_rule_lines(
         .collect()
 }
 
+/// Whether `text` names `path` whole: not inside a longer path (`src/a.rs.bak`, `x/src/a.rs`).
+fn names_whole_path(text: &str, path: &str) -> bool {
+    let part = |c: char| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-');
+    let mut from = 0;
+    while let Some(i) = text[from..].find(path) {
+        let at = from + i;
+        let before = text[..at].chars().next_back();
+        let mut after = text[at + path.len()..].chars();
+        let a = after.next();
+        // `src/a.rs.` at a sentence end is still the path; `src/a.rs.bak` is not.
+        let a_ok = match a {
+            None => true,
+            Some('.') => after.next().is_none_or(|c| !c.is_ascii_alphanumeric()),
+            Some(c) => !part(c),
+        };
+        if !before.is_some_and(part) && a_ok {
+            return true;
+        }
+        from = at + path.len();
+    }
+    false
+}
+
 /// A cite that rests on what the person asked rather than on the change.
 fn appeals_to_instruction(cite: &str) -> bool {
-    let c = cite.to_ascii_lowercase();
+    // Path-like words (`src/instructions.rs`) are not an appeal (codex r3).
+    let c: String = cite
+        .split_whitespace()
+        .filter(|w| !w.contains('/') && !w.contains('.'))
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
     [
-        "instruction",
+        "the instruction",
+        "explicit instruction",
+        "instructed",
         "the intent",
         "intent says",
         "intent forbids",
@@ -931,8 +987,8 @@ pub fn prompt(
         (
             &diff[..end],
             format!(
-                "\n{DIFF_CUT_MARK} at {end} of {} bytes; answer UNKNOWN for a rule the shown part \
-                 cannot decide]",
+                "\n{DIFF_CUT_MARK} ({nonce}) at {end} of {} bytes; answer UNKNOWN for a rule the \
+                 shown part cannot decide]",
                 diff.len()
             ),
         )
@@ -995,12 +1051,19 @@ pub fn check(
     let floor = input.floor.unwrap_or("");
     // What a judge reads: the whole diff and the floor's result. A machine check reads the base
     // and the change.
-    let judge_key = digest_bytes(&[b"judge", &input.change.raw, floor.as_bytes()]);
+    let told = input.instructions.unwrap_or("");
+    let judge_key = digest_bytes(&[
+        b"judge",
+        &input.change.raw,
+        floor.as_bytes(),
+        told.as_bytes(),
+    ]);
     let machine_key = digest_bytes(&[
         OBLIGATION_TEST_FAILS_ON_BASE.as_bytes(),
         input.base.as_bytes(),
         &input.change.raw,
         floor.as_bytes(),
+        told.as_bytes(),
     ]);
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     let mut pending: Vec<Pending<'_>> = Vec::new();
@@ -1163,6 +1226,26 @@ pub fn check(
                 &mut report,
                 &mut rows,
                 Some(&format!("{OBLIGATION_TEST_FAILS_ON_BASE}: {reason}")),
+            );
+        }
+        // (codex r3) The base ran only the separate test files: an inline test in the change was
+        // not run there, so a "pass on the base too" cannot speak for it — the judge decides.
+        Some(MachineOutcome::Verdict {
+            status: RuleStatus::Broken,
+            reason,
+        }) if has_inline_test(&input.change.diff) => {
+            let note = format!(
+                "{OBLIGATION_TEST_FAILS_ON_BASE}: {reason}; the change also adds an inline test the base \
+                 run did not cover"
+            );
+            judge_rows(
+                &machine_pending,
+                input,
+                judge,
+                &pool,
+                &mut report,
+                &mut rows,
+                Some(&note),
             );
         }
         Some(MachineOutcome::Verdict { status, reason }) => {
@@ -1415,7 +1498,7 @@ fn run_pool(
                             parse_rule_lines(&out, &ids, &nonce, &paths, input.instructions);
                         // (pi r2) A judge shown only part of the diff can find a rule broken, never
                         // kept or not applicable: what it did not see may break it.
-                        let cut = text.contains(DIFF_CUT_MARK);
+                        let cut = prompt_was_cut(&text, &nonce);
                         let mut a = answered.lock().unwrap();
                         let mut w = why.lock().unwrap();
                         for (j, id) in ids.iter().enumerate() {
