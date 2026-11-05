@@ -1,0 +1,59 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "shape",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "instructions": "Phase 1/5 SHAPE: decide what is being started, from the ask's kind (a command-line tool, a service or a library): its name, its language and toolchain (the repository's own when it has one), its public surface and where it lives. List the questions only a person can answer. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files."
+  },
+  {
+   "catalog": "design",
+   "id": "design",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "depends_on": [
+    "shape"
+   ],
+   "skill_ref": "wicked-garden-engineering-solution-architect",
+   "instructions": "Phase 2/5 DESIGN (solution architect): the layout (directories and files), the public surface, the build and test commands, the dependencies (each one justified), the configuration and how it is packaged, following the repository's conventions. Design only: write no source."
+  },
+  {
+   "catalog": "build",
+   "id": "build",
+   "depends_on": [
+    "design"
+   ],
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 3/5 BUILD (engineering skill, scaffold: follow its refs/scaffold.md): create the project as designed, with a working build, a README and a test for every part of its public surface. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "test",
+   "depends_on": [
+    "build"
+   ],
+   "skill_ref": "wicked-garden-qe-test-automation-engineer",
+   "instructions": "Phase 4/5 TEST (test automation engineer, independent evaluator): run the new project's build and tests from a clean state, and check that every part of its public surface has a test. Change nothing: report each failing command and each untested part of the surface, with its file:line. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+  },
+  {
+   "catalog": "review",
+   "id": "security",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "depends_on": [
+    "build",
+    "test"
+   ],
+   "skill_ref": "wicked-garden-platform-security-engineer",
+   "instructions": "Phase 5/5 SECURITY REVIEW (security engineer): review the new project cold: its dependencies and their versions, secrets and configuration, input handling at the public surface, and least privilege. List each finding with its file:line, the most severe first. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+  }
+ ]
+}

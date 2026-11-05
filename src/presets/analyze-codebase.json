@@ -1,0 +1,22 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "map",
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 1/2 MAP (search skill, narrate and service-map): explain how the part of the code the ask names works: its entry points, the main flows from input to effect, the modules and what each is responsible for, the data it keeps, and how it connects to the rest of the system (callers and dependencies from the code graph). GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "map"
+   ],
+   "instructions": "Phase 2/2 CHECK (independent evaluator): report how it works, in plain words first, then each flow and module with its file:line, and what the map got wrong. PASS only when every claim holds at file:line."
+  }
+ ]
+}

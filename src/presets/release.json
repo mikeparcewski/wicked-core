@@ -1,0 +1,45 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "readiness",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "skill_ref": "wicked-garden-qe-release-readiness-engineer",
+   "instructions": "Phase 1/4 READINESS (release readiness engineer): read what merged since the last release (git tags and log, merged pull requests), the open issues marked for it, the CI state and the test evidence. Decide GO or NO-GO with the reasons, and list exactly what the release pull request will change: the version files, the lockfiles the bump touches, and the changelog entries, each with the pull request it comes from. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files. End with a line GO or NO-GO."
+  },
+  {
+   "catalog": "build",
+   "id": "prepare",
+   "depends_on": [
+    "readiness"
+   ],
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 2/4 PREPARE (engineering skill, release: follow its refs/release.md): bump the version in every version file, regenerate the lockfiles the bump changes, and write the changelog section from the merged history the readiness listed. Change only those files. Never tag, never publish a package and never create a release: a person does that after the pull request merges. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "test",
+   "depends_on": [
+    "prepare"
+   ],
+   "instructions": "Phase 3/4 TEST: run the repository's build and test suite on the release tree, and confirm the version is the same in every version file and lockfile."
+  },
+  {
+   "catalog": "critique",
+   "id": "fidelity",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "fidelity-to-source",
+   "depends_on": [
+    "readiness",
+    "prepare"
+   ],
+   "instructions": "Phase 4/4 FIDELITY (independent evaluator): check every changelog entry against the merged history (its pull request and its commits) and every version file against the bump; list an entry with no source, a merged change the changelog misses, and any change outside the version files, the lockfiles and the changelog. PASS only when every entry traces to its source and only those files changed."
+  }
+ ]
+}

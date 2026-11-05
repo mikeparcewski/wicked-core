@@ -2345,7 +2345,7 @@ fn validator_run_id() -> String {
 /// `on_run_complete`, and the wrapped runner TOMBSTONES a released run id — a later launch under
 /// it is born cancelled ("killed by run cancellation") — so an id derived from anything that can
 /// repeat (a re-dispatched unit restarts at attempt 0, core#992) kills the next call.
-fn one_shot_run_id(prefix: &str) -> String {
+pub(crate) fn one_shot_run_id(prefix: &str) -> String {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
         "{prefix}-{}-{}",

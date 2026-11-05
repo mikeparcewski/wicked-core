@@ -1,0 +1,7 @@
+{
+ "id": "cited-findings",
+ "title": "Cited findings",
+ "applies_to": ["critique", "review"],
+ "recheck_excludes_gatherers": true,
+ "instructions": "CITED FINDINGS (independent recheck): re-check every finding yourself at its file:line (or its source line); never trust the gathering step's reading, and drop any finding that does not hold. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`); a claim you could not ground is named as such, never asserted. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+}

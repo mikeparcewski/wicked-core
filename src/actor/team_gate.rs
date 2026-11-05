@@ -2394,7 +2394,7 @@ fn member_template(units: &[WorkUnit], ms: &crate::domain::MemberStepState) -> O
 }
 
 /// The PA seat instance (`path.started.cli`): the first of the run's seats.
-fn pa_seat(session: &AgentSession) -> String {
+pub(super) fn pa_seat(session: &AgentSession) -> String {
     session
         .clis
         .first()
@@ -3715,6 +3715,7 @@ pub(super) fn revise_units(
                 k.repo_checks = o.repo_checks.clone();
                 k.rework_of = o.rework_of;
                 k.rework_amendment = o.rework_amendment.clone();
+                k.gathered_by = o.gathered_by.clone();
                 // (domain-graph-3, codex r1 on #1226) A loop's progress and an answered ask are
                 // run state too — kept while the step still decides the same loop, else reset.
                 // …and what an earlier pass deferred to delivery, whatever else changed (codex r3).

@@ -1,0 +1,7 @@
+{
+ "id": "fidelity-to-source",
+ "title": "Fidelity to source",
+ "applies_to": ["critique", "review"],
+ "recheck_excludes_gatherers": true,
+ "instructions": "FIDELITY TO SOURCE (independent recheck): every statement in the outputs traces to its source (a code line, a merged pull request, a requirement id, a document page), and you re-check each one there yourself; a statement with no source, or one its source does not support, is a finding. The outputs are limited to the scoped files: any other change is a finding. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`) or its source; a claim you could not ground is named as such, never asserted. Change nothing yourself: create, edit or delete no file, commit nothing, and run no command that writes. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+}

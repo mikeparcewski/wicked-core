@@ -450,7 +450,7 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
         "allowed_skills": [], "required_deliverables": [], "depends_on": [],
         "executor": {"type": "agent"}, "owner": "team", "kind": "build", "role": "creator",
         "added_by": "floor", "floor_reason": "band 20-39 requires build",
-        "floor_rule": "TST-1002", "repeat_from": "y"});
+        "floor_rule": "TST-1002", "repeat_from": "y", "rubric": "parity"});
     let parsed: wicked_core::PlanStep = serde_json::from_value(full_step).unwrap();
     let mut keys: Vec<String> = serde_json::to_value(&parsed)
         .unwrap()
@@ -723,6 +723,29 @@ fn every_step_field_is_classified_and_every_loosening_is_refused() {
                 .unwrap();
                 let def = compose(catalog(), &plan).unwrap_or_else(|e| panic!("{field}: {e}"));
                 assert!(def.phases[0].answer_only, "{field}");
+            }
+            // (DES-CATALOG-002 §5.2) A gate rubric: refused unknown, and on an entry it does not
+            // judge (a creator: a build step cannot judge itself); on its entry it appends its
+            // contract and never changes the gate.
+            FieldRule::Rubric => {
+                assert_eq!(field, "rubric");
+                let r = compose_one("full", json!({"rubric": "cited-findings"}))
+                    .expect_err("a rubric on a creator entry");
+                assert_eq!(r.reason(), "rubric_wrong_entry", "{r}");
+                let r = compose_one("full", json!({"rubric": "be-nice"}))
+                    .expect_err("an unknown rubric");
+                assert_eq!(r.reason(), "unknown_rubric", "{r}");
+                let plan = |rubric: Value| -> PlanSteps {
+                    serde_json::from_value(json!({"steps": [
+                        {"catalog": "build", "id": "b"},
+                        {"catalog": "critique", "id": "x", "rubric": rubric}
+                    ]}))
+                    .unwrap()
+                };
+                let with = compose(catalog(), &plan(json!("cited-findings"))).unwrap();
+                let without = compose(catalog(), &plan(Value::Null)).unwrap();
+                assert_eq!(with.phases[1].rubric.as_deref(), Some("cited-findings"));
+                assert_eq!(with.phases[1].gate, without.phases[1].gate, "{field}");
             }
             FieldRule::Free => {
                 let change = match field {

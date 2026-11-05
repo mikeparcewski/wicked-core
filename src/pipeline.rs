@@ -2960,7 +2960,10 @@ fn evaluator_relation(
         .iter()
         .filter(|u| u.ord < unit.ord && authors_work(u))
         .collect();
-    if builders.is_empty() {
+    // (DES-CATALOG-002 §5.1) A cited-findings recheck of a report has no tree author when its
+    // gatherers are read steps: its gatherers are its authors, so the relation still holds.
+    let gatherers = report_gatherer_seats(units, unit);
+    if builders.is_empty() && gatherers.is_empty() {
         return None;
     }
     let authors = work_authors(units, unit.ord);
@@ -2968,7 +2971,8 @@ fn evaluator_relation(
         creator: builders
             .iter()
             .max_by_key(|u| u.ord)
-            .and_then(|c| c.assigned_cli.clone()),
+            .and_then(|c| c.assigned_cli.clone())
+            .or_else(|| gatherers.last().cloned()),
         on_builder_seat: unit
             .assigned_cli
             .as_ref()
@@ -3042,10 +3046,61 @@ pub(crate) fn is_member_read_step(u: &crate::domain::WorkUnit) -> bool {
 /// (crew#972) Every seat that authored the work a unit at `ord` checks: each earlier Build/Recon
 /// agent unit's current seat AND every seat it was ever dispatched on
 /// ([`crate::domain::WorkUnit::authored_by`] — reassigned and failed-over creators included).
+///
+/// (DES-CATALOG-002 §5.1, REPORT-AUTHOR PROVENANCE) When the unit at `ord` carries a rubric that
+/// excludes gatherers (cited findings, fidelity to source), the seats of the plan's earlier agent
+/// `understand` units are its authors too, GUARDED READ STEPS INCLUDED ([`report_gatherer_seats`]):
+/// a report's gatherer never rechecks its own findings.
 pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for u in units.iter().filter(|u| u.ord < ord && authors_work(u)) {
         for s in author_seats(u) {
+            if !out.contains(s) {
+                out.push(s.clone());
+            }
+        }
+    }
+    if let Some(checker) = units.iter().find(|u| u.ord == ord) {
+        for s in report_gatherer_seats(units, checker) {
+            if !out.contains(&s) {
+                out.push(s);
+            }
+        }
+    }
+    out
+}
+
+/// (DES-CATALOG-002 §5.1) A report's gatherer: an agent unit of the catalog `understand` entry,
+/// read step or not — except the PA's scope step, which states what the plan will touch and
+/// gathers no finding.
+pub(crate) fn is_report_gatherer(u: &crate::domain::WorkUnit) -> bool {
+    u.tool_cmd.is_none()
+        && u.catalog.as_deref() == Some("understand")
+        && u.phase_id() != Some(crate::plan_gate::SCOPE_STEP_ID)
+}
+
+/// (DES-CATALOG-002 §5.1) The seats that gathered what a cited-findings (or fidelity-to-source)
+/// unit rechecks: every earlier agent unit of the catalog `understand` entry — its current seat and
+/// every seat it was dispatched on — whether or not it is a read step. Empty for a unit whose
+/// rubric does not exclude gatherers.
+pub(crate) fn report_gatherer_seats(
+    units: &[crate::domain::WorkUnit],
+    checker: &crate::domain::WorkUnit,
+) -> Vec<String> {
+    if !crate::rubric::excludes_gatherers(checker.rubric.as_deref()) {
+        return Vec::new();
+    }
+    let mut out: Vec<String> = Vec::new();
+    for u in units
+        .iter()
+        .filter(|u| u.ord < checker.ord && is_report_gatherer(u))
+    {
+        for s in u
+            .assigned_cli
+            .iter()
+            .chain(u.authored_by.iter())
+            .chain(u.gathered_by.iter())
+        {
             if !out.contains(s) {
                 out.push(s.clone());
             }
@@ -6230,6 +6285,65 @@ mod guarded_read_step_tests {
         ));
         assert_eq!(u.author_probe, Some(probe()));
         assert_eq!(u.authored_by.len(), 2);
+    }
+
+    /// (DES-CATALOG-002 §5.1, report-author provenance) For a unit whose rubric excludes gatherers,
+    /// the seats of the plan's earlier agent `understand` units are its authors — a GUARDED read
+    /// step (no author by dispatch, J6) included, and every seat it ran on — but never the PA's
+    /// scope step, and never for a unit without such a rubric.
+    #[test]
+    fn a_cited_findings_unit_counts_its_gatherers_guarded_read_steps_included() {
+        let mut scope = crate::domain::WorkUnit::pending("s:pa-scope", "s", 1, "scope");
+        scope.stage = crate::domain::StageKind::Recon;
+        scope.catalog = Some("understand".into());
+        scope.assigned_cli = Some("p".into());
+        scope.worktree_guarded = true;
+        let mut gather = crate::domain::WorkUnit::pending("s:claims", "s", 2, "claims");
+        gather.stage = crate::domain::StageKind::Recon;
+        gather.catalog = Some("understand".into());
+        gather.assigned_cli = Some("a".into());
+        gather.authored_by = vec!["a2".into()];
+        gather.worktree_guarded = true;
+        assert!(super::is_guarded_read_step(&gather));
+        let mut check = crate::domain::WorkUnit::pending("s:verify", "s", 3, "verify");
+        check.stage = crate::domain::StageKind::Review;
+        check.role = crate::workflow::PhaseRole::Evaluator;
+        check.catalog = Some("critique".into());
+        check.assigned_cli = Some("b".into());
+        for (rubric, want) in [
+            (Some("cited-findings"), vec!["a", "a2"]),
+            (Some("fidelity-to-source"), vec!["a", "a2"]),
+            // Without the rubric, today's rule: a guarded read step's own seat authors nothing,
+            // a seat it RECORDED as an author (a2) still does.
+            (Some("parity"), vec!["a2"]),
+            (None, vec!["a2"]),
+        ] {
+            let mut check = check.clone();
+            check.rubric = rubric.map(str::to_string);
+            let units = [scope.clone(), gather.clone(), check];
+            // The guarded scope step is a read step too: never an author here, rubric or not.
+            let mut got = super::work_authors(&units, 3);
+            got.sort();
+            assert_eq!(got, want, "{rubric:?}");
+        }
+        // A gatherer-only report (no tree author at all): its recheck on a gatherer's seat still
+        // has an evaluator relation, so the same-seat fence and the gate's denial reach it; and a
+        // gatherer's earlier seat (`gathered_by`, a reassigned read step) stays its author.
+        let mut gather = gather.clone();
+        gather.authored_by.clear();
+        gather.gathered_by = vec!["z".into()];
+        let mut check = check.clone();
+        check.rubric = Some("cited-findings".into());
+        check.assigned_cli = Some("a".into());
+        let units = [gather.clone(), check.clone()];
+        let rel = super::evaluator_relation(&units, &units[1]).expect("a relation");
+        assert!(rel.on_builder_seat);
+        let mut got = super::work_authors(&units, check.ord);
+        got.sort();
+        assert_eq!(got, ["a", "z"]);
+        check.rubric = None;
+        let units = [gather, check];
+        assert!(super::evaluator_relation(&units, &units[1]).is_none());
     }
 }
 

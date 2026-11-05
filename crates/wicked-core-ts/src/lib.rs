@@ -1089,6 +1089,16 @@ impl Core {
         true
     }
 
+    /// (DES-CATALOG-002 §4.6) Whether this addon takes `confirmGate`'s trailing `expectOrd` /
+    /// `expectPlanRev` (checked inside the engine: a stale answer is refused `gate_changed:`) and
+    /// the plan-gate SEND-BACK: `confirmGate(run, false, note, "request_changes", …, planRev)` at a
+    /// `plan_approval` gate has the lead re-plan with the note and holds the next revision for
+    /// approval. napi drops undeclared trailing arguments, so a skin keys on this static first.
+    #[napi]
+    pub fn supports_plan_send_back() -> bool {
+        true
+    }
+
     /// (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
     /// `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
     /// ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
@@ -1385,6 +1395,12 @@ impl Core {
     /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
     /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
     /// refuses it, re-opens the gate with a new gate id.
+    ///
+    /// (DES-CATALOG-002 §4.6, additive.) `expectOrd` / `expectPlanRev` say which gate the answer
+    /// was sent for: the engine compares them inside its serialized decision path and refuses a
+    /// mismatch with an error that starts `gate_changed:`. A plan-gate SEND-BACK
+    /// (`approve=false`, `action` `request_changes`, the person's words in `amend`) needs
+    /// `expectPlanRev`: the lead re-plans with the note, and the next revision is held for approval.
     #[napi(ts_return_type = "Promise<string>")]
     #[allow(clippy::too_many_arguments)]
     pub fn confirm_gate(
@@ -1398,8 +1414,21 @@ impl Core {
         // (operator ruling 2026-10-11) WHO answered, as the gate API recorded it. Optional and
         // trailing, so an older caller that omits it still answers (recorded as `operator`).
         actor: Option<String>,
+        // (DES-CATALOG-002 §4.6) What the answer EXPECTS the open gate to be: the unit ordinal
+        // and, at a `plan_approval` gate, the plan revision it showed. The engine compares them in
+        // its serialized decision path and refuses a mismatch with an error that starts
+        // `gate_changed:`. Optional and trailing; a plan-gate send-back
+        // (`request_changes` at `plan_approval`) needs `expectPlanRev`.
+        expect_ord: Option<u32>,
+        expect_plan_rev: Option<u32>,
     ) -> AsyncTask<CoreTask> {
         let core = self.inner.clone();
+        let expect = (expect_ord.is_some() || expect_plan_rev.is_some()).then_some(
+            wicked_core::GateExpect {
+                ord: expect_ord,
+                plan_rev: expect_plan_rev,
+            },
+        );
         task(move || {
             // (DES-TEAMING-002 T3) Approve a `plan_approval` gate WITH AN EDIT: `planJson` is the
             // edited plan (`action` omitted or `edit_plan`, `approve=true`). The engine accepts it
@@ -1413,7 +1442,7 @@ impl Core {
                     json,
                 )?;
                 return core
-                    .confirm_gate_as(&run_id, decision, actor.clone())
+                    .confirm_gate_expecting(&run_id, decision, actor.clone(), expect)
                     .map(status_token)
                     .map_err(err);
             }
@@ -1559,7 +1588,7 @@ impl Core {
                     )))
                 }
             };
-            core.confirm_gate_as(&run_id, decision, actor.clone())
+            core.confirm_gate_expecting(&run_id, decision, actor.clone(), expect)
                 .map(status_token)
                 .map_err(err)
         })

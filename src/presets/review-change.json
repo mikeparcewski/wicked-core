@@ -1,0 +1,33 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "diff",
+   "instructions": "Phase 1/3 DIFF: read the change the ask names (a pull request, a branch or a commit) and list every file it changes, what each change does, the intent it serves and the code it reaches (callers and blast radius from the code graph). Post nothing to the pull request. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "review",
+   "rubric": "cited-findings",
+   "depends_on": [
+    "diff"
+   ],
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 2/3 REVIEW (engineering skill, review action): review the change for correctness, edge cases and error handling, security, performance, the tests that cover it, and whether it does what its description says. List each finding with its file:line and its severity, most harmful first, and close the findings with your recommendation: approve, approve with conditions (name them) or reject. Post nothing to the pull request: the report is the person's to share."
+  },
+  {
+   "catalog": "critique",
+   "id": "semantic",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "diff",
+    "review"
+   ],
+   "skill_ref": "wicked-garden-qe-semantic-reviewer",
+   "instructions": "Phase 3/3 SEMANTIC CHECK (semantic reviewer): check that the change means what it says: its description, its tests and its code agree, and nothing in it does what its names or comments do not say; then re-check the review's findings and its recommendation. List each finding with its file:line. Post nothing to the pull request. PASS only when every finding holds and the recommendation follows from them."
+  }
+ ]
+}

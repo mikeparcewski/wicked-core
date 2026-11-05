@@ -1,0 +1,33 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "requirements",
+   "skill_ref": "wicked-garden-product-requirements-analyst",
+   "instructions": "Phase 1/3 REQUIREMENTS (requirements analyst): read the requirements the launch attached and list each one with its id, the behaviour it asks for and how it would be shown to hold. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "understand",
+   "id": "trace",
+   "depends_on": [
+    "requirements"
+   ],
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 2/3 TRACE (search skill): for each requirement, find the code that implements it and the tests that check it (lineage and blast radius from the code graph, then the files); mark each requirement implemented, partial or missing, and list the code no requirement explains. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "requirements",
+    "trace"
+   ],
+   "skill_ref": "wicked-garden-qe-semantic-reviewer",
+   "instructions": "Phase 3/3 CHECK (semantic reviewer): report the traceability matrix: each requirement id, its status, the code and the tests at file:line, and what is missing; then the code no requirement explains. PASS only when every row holds at file:line."
+  }
+ ]
+}

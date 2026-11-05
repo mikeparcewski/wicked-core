@@ -1,0 +1,33 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "triage",
+   "skill_ref": "wicked-garden-platform",
+   "instructions": "Phase 1/3 TRIAGE (platform skill, incident action): read the incident the ask pastes in (the error, the logs, the timeline) and state what happened, when, what it affected and the first signal. Form the hypotheses for its cause, each with the evidence that supports or weakens it. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "understand",
+   "id": "trace",
+   "owner": "team",
+   "depends_on": [
+    "triage"
+   ],
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 2/3 TRACE (search skill): follow each hypothesis into the code: the path from the first signal to the failure (lineage and blast radius from the code graph), the recent changes on that path (git log), and the code that confirms or rules out each one. Name the most likely cause with its file:line, how to reproduce it, and what a fix would change. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "findings",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "triage",
+    "trace"
+   ],
+   "instructions": "Phase 3/3 FINDINGS (independent evaluator): report the root cause, its reproduction and its evidence, the most likely cause first; then the contributing factors and anything the triage got wrong. End the report's body with what a fix needs: the cause, the reproduction and the files a fix would touch. Fix nothing yourself: a fix is a separate job. PASS when the root cause is confirmed at file:line; an unconfirmed cause is a FAIL."
+  }
+ ]
+}

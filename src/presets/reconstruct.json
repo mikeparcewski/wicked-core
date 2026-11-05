@@ -1,0 +1,32 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "timeline",
+   "skill_ref": "wicked-garden-repo-learn",
+   "instructions": "Phase 1/3 TIMELINE (repo-learn skill, churn method): build the timeline of what changed around the events the ask names: commits, merged pull requests, releases and any runs the ask names, each dated, with what it changed. Use the skill's bounded git-churn method; never stream the whole history. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "understand",
+   "id": "trace",
+   "depends_on": [
+    "timeline"
+   ],
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 2/3 TRACE (search skill): for each timeline entry that matters, read the code it changed and how that reaches the behaviour the ask is about (lineage and blast radius from the code graph), and reconstruct the chain of cause and effect. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "timeline",
+    "trace"
+   ],
+   "instructions": "Phase 3/3 CHECK (independent evaluator): report the cited timeline: each event with its date, its source (a commit, a pull request, a run record) and its effect, then the chain of cause and effect that explains what happened, and what a fix would need if one is due. Fix nothing yourself. PASS only when every event and every link holds at its source."
+  }
+ ]
+}

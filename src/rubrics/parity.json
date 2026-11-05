@@ -1,0 +1,7 @@
+{
+ "id": "parity",
+ "title": "Parity",
+ "applies_to": ["test"],
+ "recheck_excludes_gatherers": false,
+ "instructions": "PARITY: name the behaviours this change must keep; show each one passes on the same tests before and after the change (run the same commands on the run's base and on the changed tree, or cite the base run's recorded result), listing each behaviour with its test and both results; and confirm the public surface (exported names, command-line flags, endpoints, configuration keys, file and wire formats) is unchanged unless the ask names the change. A behaviour that passed before and fails after, a test that could not run on both trees, or an unnamed change to the public surface is a FAIL. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+}

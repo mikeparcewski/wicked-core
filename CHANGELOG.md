@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The catalog by verb: gate rubrics, 16 presets, and a plan the person can send back (DES-CATALOG-002 Lane A).**
+  Rubrics are data (`src/rubrics/{parity,cited-findings,fidelity-to-source}.json`): a plan step names one
+  (`"rubric"`), compose appends its contract after the step's own text, refuses an unknown one
+  (`unknown_rubric`) and one on an entry it does not judge (`rubric_wrong_entry`: never on `build`), and never
+  changes the gate. A plan that checks parity checks it again after its last tree change (floor fill adds a parity
+  `test`; an ordinary test does not count). A cited-findings or fidelity step is never seated on its gatherers'
+  seats (the plan's earlier agent `understand` units, guarded read steps included). New presets: `plan`,
+  `refactor`, `suite-health`, `investigate-incident`, `reconstruct`, `analyze-codebase`, `map-requirements`,
+  `review-change`, `risk-analysis`, `security-review`, `privacy-review`, `compliance-review`, `decide`, `release`,
+  `scaffold`, `modernize`, each described; `refactor`, `release`, `scaffold` and `modernize` require QE acceptance.
+  Every Investigate, Analyze and Judge preset, and `plan`, is read-only and never delivers. `migration` checks parity at
+  `verify` and again after `cleanup`; `test-plan` starts with `test-analysis`'s analyze step; `validate-docs`,
+  `test-analysis` and `docs` keep their own criteria and gates. A plan-gate decision may carry the gate it
+  expects (`Core::confirm_gate_expecting`, core-ts `confirmGate(…, expectOrd, expectPlanRev)`), compared inside
+  the engine (`gate_changed:`). A SEND-BACK at `plan_approval` (`request_changes` with the person's note and the
+  plan revision) has the lead re-plan with the note: the new revision keeps every check of the old one, is held
+  for a fresh approval, and dispatches nothing; while it is re-planning nothing is approvable, and a failed
+  re-plan (or a restart) re-opens the old revision with the failure recorded.
+
 - **A rule whose subject is the delivery is deferred at review and QE, and checked at the deliver step (SWAP 6).**
   `learn-linked-issue` (the PR description) was unchecked at review and QE and held every job twice. A rule carrying
   `obligations: ["evidence:delivery"]` (rule data, nothing the creator writes) is now `deferred` at review and QE

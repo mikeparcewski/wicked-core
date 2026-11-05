@@ -761,6 +761,25 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
         wt.join("coverage-report.json").is_file(),
         "the coverage phase wrote a store-recomputed coverage-report.json into the worktree"
     );
+    // (DES-CATALOG-002 §3.1, Q17) Analyze · Domain's one bounded exception to a read-only lens: its
+    // writes stay in `.wicked/domain/**` (the extract step's rules, the host steps' records) and the
+    // project graph. The only other path the run changes is its coverage judge's required
+    // deliverable, `coverage-report.json`, in the worktree, which the run never delivers.
+    let changed = Command::new("git")
+        .args(["status", "--porcelain", "--untracked-files=all"])
+        .current_dir(&wt)
+        .output()
+        .expect("git status in the run worktree");
+    let changed = String::from_utf8_lossy(&changed.stdout).into_owned();
+    let stray: Vec<&str> = changed
+        .lines()
+        .map(|l| l.get(3..).unwrap_or(l).trim())
+        .filter(|p| !p.starts_with(".wicked/domain/") && *p != "coverage-report.json")
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "the domain run changed {stray:?}:\n{changed}"
+    );
     // Operator ruling 2026-10-31: the graph is saved into the repo's estate store and read from
     // there (crew's read, `requirements_graph_for_repo`); no JSON file lands in the checkout or the
     // worktree.

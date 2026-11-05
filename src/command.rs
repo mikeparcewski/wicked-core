@@ -99,7 +99,18 @@ pub(crate) enum Command {
         /// the coordinating agent acting for them. Recorded when the answer is an operator judgment
         /// (`judged by operator`); `None` from callers that do not say.
         actor: Option<String>,
+        /// (DES-CATALOG-002 §4.6) The gate the answer expects ([`crate::workflow::GateExpect`]);
+        /// `None` from callers that expect nothing (today's rule).
+        expect: Option<crate::workflow::GateExpect>,
         reply: Sender<anyhow::Result<SessionStatus>>,
+    },
+    /// (DES-CATALOG-002 §2.4) Internal: the lead's off-actor re-plan of a plan-gate send-back
+    /// finished — its output, or why it produced none. Applied only while `token` is the run's
+    /// current send-back.
+    PlanSendBackReady {
+        run_id: String,
+        token: String,
+        result: Result<String, String>,
     },
     /// (rejudge) Whether the run's open gate can re-run its judge now, and from which seats —
     /// read-only ([`crate::domain::RejudgeReadiness`]).

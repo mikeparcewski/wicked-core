@@ -41,8 +41,9 @@ mod scope;
 pub(crate) use preview::preview_plan;
 pub use preview::PlanPreview;
 pub(crate) use revise::{
-    changes_from_output, diff_score_for_run, floor_rises, hold_rescore, path_scored_diff,
-    plan_lines_of, revise, with_scoring, Change, DiffRescore, Outcome, PlanLines, ScoreScope,
+    changes_from_output, diff_score_for_run, floor_rises, hold_rescore, parse_send_back_plan,
+    path_scored_diff, plan_lines_of, revise, send_back, send_back_def, send_back_prompt,
+    with_scoring, Change, DiffRescore, Outcome, PlanLines, ScoreScope,
 };
 pub(crate) use scope::{
     decide_scoped, needs_pa_scope, scope_lines_of, scope_rev, with_scope_step, SCOPE_STEP_ID,
@@ -165,6 +166,41 @@ pub struct TeamPlanState {
     /// this run decides fills its floor without them ([`crate::plan::FloorInput::power_absorbs`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub power_absorbs: Vec<String>,
+    /// (DES-CATALOG-002 §2.4, §11 Lane A) A plan-gate SEND-BACK in progress: the person sent the
+    /// held rev back with a note and the lead is re-planning. While it is set the held rev is not
+    /// approvable (every answer is refused `gate_changed`), no plan gate opens and nothing
+    /// dispatches; the re-plan's result replaces it with a fresh held rev, or a failure (or a
+    /// restart before the re-plan landed) clears it and re-opens the held rev with the failure as
+    /// its refusal. A held rev NEWER than `from_rev` with the send-back still set is a re-plan
+    /// whose units were not swapped in yet: it is finished, not re-planned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_back: Option<SendBack>,
+}
+
+/// (DES-CATALOG-002 §2.4) A send-back the lead is re-planning ([`TeamPlanState::send_back`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendBack {
+    /// The held rev the person sent back (`PendingPlan::rev`).
+    pub from_rev: u32,
+    /// The gate it was sent back at.
+    pub gate_id: String,
+    /// The person's words, recorded as they sent them (trimmed).
+    pub note: String,
+    /// The seat that re-plans (the run's PA).
+    pub lead: String,
+    /// This send-back's id: the re-plan's answer is applied only while it is still current.
+    pub token: String,
+    /// The phase ids of the run's units that already ran (dispatched or done) when it was sent
+    /// back, in running order: kept as they ran, never handed to the lead to re-plan.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub done: Vec<String>,
+    /// The held rev as it was sent back, and the plan state's `rev` then: what a failed re-plan
+    /// restores — also after the new rev was written and its unit swap failed (codex r2), so the
+    /// rev offered for approval is always the one the run's units are.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held: Option<Box<PendingPlan>>,
+    #[serde(default)]
+    pub prior_rev: u32,
 }
 
 /// (WT-C3, DES-walkthrough-proof §4.12) The testing rules the engine read for one proposal at

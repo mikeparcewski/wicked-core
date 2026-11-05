@@ -3594,6 +3594,8 @@ mod tests {
             structured_description: false,
             status: crate::domain::UnitStatus::Pending,
             catalog: None,
+            rubric: None,
+            gathered_by: Vec::new(),
             exclude_seats: Vec::new(),
             assurance: None,
             qe_acceptance: None,

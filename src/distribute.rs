@@ -1154,7 +1154,24 @@ fn enforce_evaluator_distinct(
     // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
     let builder_models: std::collections::HashSet<&str> =
         builder_clis.iter().map(|k| model_of(k)).collect();
-    if builder_clis.is_empty() {
+    // (DES-CATALOG-002 §5.1, report-author provenance) A unit whose rubric excludes gatherers
+    // (cited findings, fidelity to source) is also kept off the seats of the plan's earlier agent
+    // `understand` units, read steps included: the gatherer never rechecks its own findings.
+    let gatherers: Vec<std::collections::HashSet<String>> = units
+        .iter()
+        .map(|u| {
+            if !crate::rubric::excludes_gatherers(u.rubric.as_deref()) {
+                return std::collections::HashSet::new();
+            }
+            units
+                .iter()
+                .zip(dists.iter())
+                .filter(|(g, _)| g.ord < u.ord && crate::pipeline::is_report_gatherer(g))
+                .map(|(_, d)| d.assigned_cli.clone())
+                .collect()
+        })
+        .collect();
+    if builder_clis.is_empty() && gatherers.iter().all(|g| g.is_empty()) {
         return (same_seat, Vec::new()); // nothing built ⇒ nothing to be distinct from
     }
     // Warn when every roster seat is a builder CLI so operators can detect degraded separation.
@@ -1176,29 +1193,33 @@ fn enforce_evaluator_distinct(
             );
         }
     }
-    for ((u, d), candidates) in units.iter().zip(dists.iter_mut()).zip(candidates.iter()) {
+    for (((u, d), candidates), gathered) in units
+        .iter()
+        .zip(dists.iter_mut())
+        .zip(candidates.iter())
+        .zip(gatherers.iter())
+    {
         if u.tool_cmd.is_some() {
             continue; // Tool phases have no CLI to distinct
         }
-        if matches!(u.stage, StageKind::Review | StageKind::Test)
-            && builder_clis.contains(&d.assigned_cli)
-        {
+        let forbidden = |k: &String| builder_clis.contains(k) || gathered.contains(k);
+        if matches!(u.stage, StageKind::Review | StageKind::Test) && forbidden(&d.assigned_cli) {
             let admits = |k: &String| match candidates {
                 Some((eligible, _)) => eligible.iter().any(|c| &c.key == k),
                 None => true,
             };
             let member_step = u.owner == crate::workflow::StepOwner::Team;
             let distinct = |k: &&String| {
-                !builder_clis.contains(*k)
+                !forbidden(k)
                     && admits(k)
                     && !(member_step && team_pa.is_some_and(|pa| pa == k.as_str()))
             };
             let model_distinct = prefer_model_distinct
                 .then(|| {
-                    roster_keys
-                        .iter()
-                        .filter(distinct)
-                        .find(|k| !builder_models.contains(model_of(k)))
+                    roster_keys.iter().filter(distinct).find(|k| {
+                        !builder_models.contains(model_of(k))
+                            && !gathered.iter().any(|g| model_of(g) == model_of(k))
+                    })
                 })
                 .flatten();
             match model_distinct.or_else(|| roster_keys.iter().find(distinct)) {
@@ -1228,14 +1249,17 @@ fn enforce_evaluator_distinct(
     let same_cli_instance: Vec<u32> = units
         .iter()
         .zip(dists.iter())
-        .filter(|(u, d)| {
+        .zip(gatherers.iter())
+        .filter(|((u, d), gathered)| {
+            let model = model_of(&d.assigned_cli);
             u.tool_cmd.is_none()
                 && matches!(u.stage, StageKind::Review | StageKind::Test)
                 && !same_seat.contains(&u.ord)
                 && !builder_clis.contains(&d.assigned_cli)
-                && builder_models.contains(model_of(&d.assigned_cli))
+                && !gathered.contains(&d.assigned_cli)
+                && (builder_models.contains(model) || gathered.iter().any(|g| model_of(g) == model))
         })
-        .map(|(u, _)| u.ord)
+        .map(|((u, _), _)| u.ord)
         .collect();
     (same_seat, same_cli_instance)
 }
@@ -3512,6 +3536,70 @@ mod tests {
                 .contains("only on a team run"),
             "{p:?}"
         );
+    }
+
+    /// A report plan as distribution sees it: a team member's read step gathering (`understand`,
+    /// owner team — no author by dispatch) and the critique that rechecks it, both routed to `a`.
+    fn gather_and_check(rubric: Option<&str>) -> [WorkUnit; 2] {
+        let mut gather = WorkUnit::pending("s1:trace", "s1", 1, "Trace the cause");
+        gather.stage = crate::domain::StageKind::Recon;
+        gather.catalog = Some("understand".into());
+        gather.owner = crate::workflow::StepOwner::Team;
+        let mut check = WorkUnit::pending("s1:findings", "s1", 2, "Recheck the findings");
+        check.stage = crate::domain::StageKind::Review;
+        check.role = crate::workflow::PhaseRole::Evaluator;
+        check.catalog = Some("critique".into());
+        check.rubric = rubric.map(str::to_string);
+        [gather, check]
+    }
+
+    /// (DES-CATALOG-002 §5.1, report-author provenance) A cited-findings step is never seated on its
+    /// gatherer's seat — a read step's, which authors nothing by dispatch, included — while a check
+    /// without that rubric keeps today's rule (no builder, nothing to be distinct from).
+    #[test]
+    fn a_cited_findings_step_is_never_seated_on_its_gatherers_seat() {
+        let clis = [seat("a"), seat("b")];
+        let keys = vec!["a".to_string(), "b".to_string()];
+        for (rubric, want) in [
+            (Some(crate::rubric::CITED_FINDINGS), "b"),
+            (Some(crate::rubric::FIDELITY_TO_SOURCE), "b"),
+            (Some(crate::rubric::PARITY), "a"),
+            (None, "a"),
+        ] {
+            let units = gather_and_check(rubric);
+            let mut dists = [
+                routed_dist("a", "run-a {PROMPT}"),
+                routed_dist("a", "run-a {PROMPT}"),
+            ];
+            let (same, _) = enforce_evaluator_distinct(
+                &units,
+                &mut dists,
+                &keys,
+                &clis,
+                &[None, None],
+                false,
+                None,
+            );
+            assert!(same.is_empty(), "{rubric:?}");
+            assert_eq!(dists[0].assigned_cli, "a", "the gatherer stays");
+            assert_eq!(dists[1].assigned_cli, want, "{rubric:?}");
+        }
+        // With no other seat the check stays, and is reported for the existing disclosure.
+        let units = gather_and_check(Some(crate::rubric::CITED_FINDINGS));
+        let mut dists = [
+            routed_dist("a", "run-a {PROMPT}"),
+            routed_dist("a", "run-a {PROMPT}"),
+        ];
+        let (same, _) = enforce_evaluator_distinct(
+            &units,
+            &mut dists,
+            &["a".to_string()],
+            &[seat("a")],
+            &[None, None],
+            false,
+            None,
+        );
+        assert_eq!(same, vec![2]);
     }
 }
 
