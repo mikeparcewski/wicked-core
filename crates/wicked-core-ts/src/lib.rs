@@ -854,6 +854,42 @@ pub struct LaunchOptions {
     pub force_qe_acceptance: Option<bool>,
 }
 
+/// (DES-RULE-CHECK-001 S2) The `skip_rules` answer's skips: `amend` holds JSON
+/// `[{"id": "...", "reason": "..."}]`, at least one, every id and reason non-empty, no id twice.
+fn parse_rule_skips(amend: Option<&str>) -> Result<Vec<(String, String)>, anyhow::Error> {
+    #[derive(serde::Deserialize)]
+    struct Skip {
+        id: String,
+        reason: String,
+    }
+    let text = amend
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "action `skip_rules` needs the skips in `amend`: JSON [{{\"id\", \"reason\"}}]"
+            )
+        })?;
+    let skips: Vec<Skip> = serde_json::from_str(text).map_err(|e| {
+        anyhow::anyhow!("action `skip_rules`: `amend` is not [{{id, reason}}]: {e}")
+    })?;
+    if skips.is_empty() {
+        anyhow::bail!("action `skip_rules` names no rule to skip");
+    }
+    let mut out: Vec<(String, String)> = Vec::new();
+    for s in skips {
+        let (id, reason) = (s.id.trim().to_string(), s.reason.trim().to_string());
+        if id.is_empty() || reason.is_empty() {
+            anyhow::bail!("action `skip_rules`: every skip needs a rule id and a written reason");
+        }
+        if out.iter().any(|(i, _)| *i == id) {
+            anyhow::bail!("action `skip_rules`: rule `{id}` is skipped twice");
+        }
+        out.push((id, reason));
+    }
+    Ok(out)
+}
+
 /// The body of `Core.considerRules` over the store at `db_path` (read-only).
 fn consider_rules_at(db_path: &str, query_json: &str) -> Result<String, String> {
     use wicked_governance::{consider_rules, RuleQuery};
@@ -1340,6 +1376,11 @@ impl Core {
     /// decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
     /// that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
     ///
+    /// (DES-RULE-CHECK-001 S2, additive.) At a `rules_unchecked` gate (a steering rule no judge
+    /// ruled on): `retry_rules` (`approve=true`, no `amend`) re-runs the rule check on the same work,
+    /// and `skip_rules` (`approve=true`, `amend` = JSON `[{"id", "reason"}]`) skips unchecked rules,
+    /// each with its reason, then re-runs it. The step does not run again; refused at any other gate.
+    ///
     /// (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
     /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
     /// as the next plan rev (floor phases added, never refused for being below the floor) or, if it
@@ -1451,12 +1492,25 @@ impl Core {
                     };
                     HumanDecision::SkipQe { reason }
                 }
+                // (DES-RULE-CHECK-001 S2) Skip unchecked steering rules, each with a reason: the
+                // skips ride `amend` as JSON `[{"id": "...", "reason": "..."}]`; the engine refuses
+                // a rule that is not unchecked on the gated unit.
+                (Some("skip_rules"), true) => {
+                    if amend_scope.is_some() {
+                        return Err(err(anyhow::anyhow!(
+                            "action `skip_rules` takes no amendScope — it answers the gated unit's \
+                             unchecked rules"
+                        )));
+                    }
+                    let skips = parse_rule_skips(amend.as_deref()).map_err(err)?;
+                    HumanDecision::RecheckRules { skips }
+                }
                 // (core#469) The timed-out floor's escalation arms; (core#467) adopt the
                 // evaluator's pinned edit. All approve-shaped, none takes an amendment.
                 (
                     Some(
                         a @ ("extend" | "targeted" | "accept_partial" | "accept_suggestion"
-                        | "rejudge"),
+                        | "rejudge" | "retry_rules"),
                     ),
                     true,
                 ) => {
@@ -1486,15 +1540,15 @@ impl Core {
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
                         | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"
-                        | "operator_judgment" | "skip_qe"),
+                        | "operator_judgment" | "skip_qe" | "retry_rules" | "skip_rules"),
                     ),
                     _,
                 ) => {
                     return Err(err(anyhow::anyhow!(
                         "action `{a}` disagrees with approve={approve} (request_changes and \
                          reject require approve=false; approve, extend, targeted, accept_partial, \
-                         accept_suggestion, amend_intent, rejudge, operator_judgment and skip_qe \
-                         require approve=true)"
+                         accept_suggestion, amend_intent, rejudge, operator_judgment, skip_qe, \
+                         retry_rules and skip_rules require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
@@ -3117,6 +3171,25 @@ mod tests {
                     .contains("seatsJson is not a valid QE reviewer seat array"),
                 "{error}"
             );
+        }
+    }
+
+    /// (DES-RULE-CHECK-001 S2) `skip_rules` takes `[{id, reason}]` in `amend`: every reason
+    /// written, no id twice, at least one; anything else is refused before the engine is asked.
+    #[test]
+    fn skip_rules_parses_each_skip_with_its_reason_and_refuses_a_bare_one() {
+        let ok = parse_rule_skips(Some(r#"[{"id":"R1","reason":"binary fixture"}]"#)).unwrap();
+        assert_eq!(ok, vec![("R1".to_string(), "binary fixture".to_string())]);
+        for bad in [
+            None,
+            Some(""),
+            Some("[]"),
+            Some("R1"),
+            Some(r#"[{"id":"R1","reason":"  "}]"#),
+            Some(r#"[{"id":"R1","reason":"a"},{"id":"R1","reason":"b"}]"#),
+            Some(r#"[{"id":"R1"}]"#),
+        ] {
+            assert!(parse_rule_skips(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -14,6 +14,24 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The review step checks every steering rule in force, with evidence, on a judge distinct from the creators
+  (DES-RULE-CHECK-001 S2; core#1273 items 1-3).** A review (Evaluator) unit's gate now reads the project's in-force
+  rules from the policy store (never the launch brief), matches them against the run's own facts (every step's
+  `unit-<n>` / phase / catalog tokens, stamped at dispatch; the changed files' languages; the diff), and sends every
+  rule that applies or may apply to judge seats distinct from the work's creators (their keys and the binaries they
+  ran; no creator fallback). The evidence is the engine's diff against the run base plus the floor's result; the
+  creator's transcript is never in the prompt. Batches of at most 8 rules, statements whole (no 600-character cut), at
+  most 3 calls at once; a batch grows past 8 only to stay within 2 rounds (100 rules: 6 calls of 17, 2 rounds).
+  Answers are `RULE <id>: KEPT|BROKEN|N/A — <cite>` lines; a rule a batch did not answer, answered twice differently or
+  without a cite is asked alone, then **unchecked**. Outcome, deny-dominant: a **broken** rule denies the gate
+  (`rule_check`, naming each rule and its cite); an **unchecked** rule holds it (escalation condition
+  `rules_unchecked`), where the person can re-run the check on the same work (`retry_rules`) or skip an unchecked rule
+  with a written reason (`skip_rules`, `amend` = `[{id, reason}]`), the step not running again. Every rule's row
+  (`kept | broken | n_a | unchecked | skipped`, how: `fact | judge | cache | operator | none`, reason, cite, judge,
+  rule and evidence keys) is on the gate receipt (`AssuranceReceipt.rules`) and, worst row per rule, on the delivery
+  receipt; a skip carries its reason there. A re-review reuses every verdict whose rule content and evidence are
+  unchanged. Machine checks (`check:test-fails-on-base`) are S3.
+
 - **`matchRules`: which in-force rules a job is checked against, each with the facts that decided it
   (DES-RULE-CHECK-001 S1).** crew's launch brief listed a project's rules in severity order and stopped at 20, so on
   the end-to-end pass a bug job's brief carried 14 MCP-server and review-loop rules ahead of `learn-tests-with-fixes`

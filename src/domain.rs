@@ -1520,6 +1520,19 @@ pub struct WorkUnit {
     /// every unit that ran no reviewer (skipped on the wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_review: Option<QeReview>,
+    /// (DES-RULE-CHECK-001 S2) The run's steps as the gate selects them (each unit's `unit-<n>`,
+    /// phase id and catalog id, and kind), stamped at dispatch on a review unit so the rule check
+    /// on the worker can match `applies_to` against the whole run. Empty on every other unit.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_steps: Vec<wicked_governance::JobStep>,
+    /// (DES-RULE-CHECK-001 S2) The last attempt's rule check: one row per steering rule in force.
+    /// Its rows are the next attempt's cache (rule content x evidence).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_check: Option<crate::rule_check::RuleCheckReport>,
+    /// (DES-RULE-CHECK-001 S2) The person's skips of unchecked rules, each with its reason (gate
+    /// action `skip_rules`); each applies while the rule's evidence is the one it was given on.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_skips: Vec<crate::rule_check::RuleSkip>,
     /// (DES-TEAMING-002 §8.8) A team member turn's READ-ONLY view of the repository: a directory
     /// holding the checkpoint tree the member reviews, materialized for that one turn
     /// (`acp_runner::RunnerHost`). The wrapped runner mounts it read-only into the member's seat
@@ -1814,6 +1827,9 @@ impl WorkUnit {
             qe_floor_note: None,
             qe_review_session: None,
             qe_review: None,
+            rule_steps: Vec::new(),
+            rule_check: None,
+            rule_skips: Vec::new(),
             read_view: None,
         }
     }

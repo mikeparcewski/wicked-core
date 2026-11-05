@@ -774,6 +774,166 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// (DES-RULE-CHECK-001 S2) Whether this attempt's gate runs the steering-rule check: a review
+/// (Evaluator-role) agent unit that answered, bound to a worktree, on a run with a policy store —
+/// not a tool, deliver or team-member step.
+pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool {
+    output.status == StepStatus::Ok
+        && input.unit.role == crate::workflow::PhaseRole::Evaluator
+        && input.unit.tool_cmd.is_none()
+        && input.unit.member_step.is_none()
+        && !crate::deliver_lift::is_deliver_unit(&input.unit)
+        && input.workdir.is_some()
+        && input
+            .governance
+            .as_ref()
+            .is_some_and(|g| !g.db_path.trim().is_empty())
+}
+
+/// The production judge of the rule check: one headless call on a roster seat.
+struct SeatRuleJudge<'a> {
+    seats: &'a [crate::AgenticCli],
+    runner: &'a dyn StepRunner,
+}
+
+impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
+    fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
+        match self.seats.iter().find(|c| c.key == seat) {
+            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner),
+            None => {
+                crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
+            }
+        }
+    }
+}
+
+/// (DES-RULE-CHECK-001 S2) Run the steering-rule check for a review unit: the rules in force from
+/// the policy store (never the brief), the engine's diff against the run base, the floor's
+/// result, and judge seats distinct from the work's creators (`creators` keys and the binaries
+/// they ran) drawn from the run's pool. The creator's transcript is never handed to the judge.
+/// `None` when there is nothing to check (no base, no change); a store that cannot be read is a
+/// report whose note says so and whose rows are empty — the fold holds on it.
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: &[String],
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    floor: Option<&str>,
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    let wd = std::path::Path::new(input.workdir.as_deref()?);
+    let gov = input.governance.as_ref()?;
+    let baseline = input.unit.worktree_baseline.as_ref();
+    let base = input
+        .unit
+        .run_base_commit
+        .clone()
+        .filter(|h| !h.is_empty())
+        .or_else(|| baseline.map(|b| b.head.clone()).filter(|h| !h.is_empty()))?;
+    let git_dir = baseline
+        .and_then(|b| b.git_dir.as_deref())
+        .map(std::path::Path::new);
+    let Some(diff) = crate::rule_check::worktree_diff(wd, git_dir, &base) else {
+        return Some(crate::rule_check::RuleCheckReport {
+            note: Some(format!(
+                "the diff against the run base {base} could not be read"
+            )),
+            ..Default::default()
+        });
+    };
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let rules = match crate::rule_check::rules_in_force(&gov.db_path, gov.project_id.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return Some(crate::rule_check::RuleCheckReport {
+                note: Some(format!(
+                    "the steering rules could not be read from the store: {e:#}"
+                )),
+                ..Default::default()
+            })
+        }
+    };
+    if rules.is_empty() {
+        return None;
+    }
+    // Evaluator ≠ creator: every creator key and every binary a creator ran is out; no fallback.
+    let mut excluded: Vec<&str> = creators.iter().map(String::as_str).collect();
+    excluded.extend(input.unit.exclude_seats.iter().map(String::as_str));
+    let mut author_ids = author_identities(&excluded, registry);
+    author_ids.extend(creator_bins.iter().cloned());
+    let candidates = without_author_binaries(pool, &excluded, &author_ids);
+    let (seats, no_seat): (Vec<String>, Option<String>) = if creators.is_empty() {
+        (
+            Vec::new(),
+            Some(
+                "the work's creators are not known, so no judge can be shown distinct from them"
+                    .into(),
+            ),
+        )
+    } else {
+        let keys = crate::validator::distinct_judge_keys(&excluded, &candidates);
+        let why = keys.is_empty().then(|| {
+            format!(
+                "no signed-in judge seat distinct from the work's creators [{}] on the run's roster",
+                creators.join(", ")
+            )
+        });
+        (keys, why)
+    };
+    let facts =
+        crate::rule_check::job_facts(&input.unit.rule_steps, gov.project_id.as_deref(), &diff);
+    engine_note(
+        emit_delta,
+        &format!(
+            "rule check: {} steering rule(s) in force; judges: {}",
+            rules.len(),
+            if seats.is_empty() {
+                "none".to_string()
+            } else {
+                seats.join(", ")
+            }
+        ),
+    );
+    let judge = SeatRuleJudge {
+        seats: &candidates,
+        runner,
+    };
+    let report = with_floor_heartbeat(
+        emit_delta,
+        "rule check: judging the steering rules",
+        FLOOR_HEARTBEAT_EVERY,
+        || {
+            crate::rule_check::check(
+                &crate::rule_check::CheckInput {
+                    rules: &rules,
+                    facts: &facts,
+                    diff: &diff,
+                    floor,
+                    prior: input.unit.rule_check.as_ref(),
+                    skips: &input.unit.rule_skips,
+                    seats: &seats,
+                    no_seat: no_seat.as_deref(),
+                },
+                &judge,
+            )
+        },
+    );
+    engine_note(
+        emit_delta,
+        &format!(
+            "rule check: {} ({} ms)",
+            report.summary(),
+            report.elapsed_ms
+        ),
+    );
+    Some(report)
+}
+
 /// `run_roster` — the RUN's configured seat keys (`AgentSession::clis`): the judge is drawn from
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `bench` — the
@@ -3967,6 +4127,22 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .filter(|r| r.reason == wicked_council::types::SeatFailureReason::NotLoggedIn.as_str())
         .map(|r| r.seat.clone())
         .collect();
+    // (DES-RULE-CHECK-001 S2) The review step's steering-rule check, after the judge: every rule
+    // in force gets a verdict from a seat distinct from the work's creators.
+    let rule_check = if rule_check_applies(input, &output) {
+        run_rule_check(
+            input,
+            &creators,
+            &creator_bins,
+            &eligible_run,
+            roster,
+            repo_checks.as_ref().map(|r| r.summary()).as_deref(),
+            &**runner,
+            emit_delta,
+        )
+    } else {
+        None
+    };
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
@@ -3978,6 +4154,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         team: team_snapshot,
         qe_review,
         bench_reprobes,
+        rule_check,
     };
     (output, agent_verdict, evidence)
 }
@@ -10649,3 +10826,7 @@ mod judge_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "cli_runner_rule_check_tests.rs"]
+mod rule_check_seat_tests;

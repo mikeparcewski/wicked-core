@@ -2637,6 +2637,44 @@ pub(crate) fn reprobe_seat(
     }
 }
 
+/// (DES-RULE-CHECK-001 S2) ONE rule-check judge call on `seat`: the batch `prompt` in a fresh
+/// one-shot session (never shared with another call), released on every exit. A seat that could
+/// not run, or whose whole answer is a provider refusal with no `RULE` line, failed as a seat (the
+/// check moves to another); a timeout or a stop ends the batch.
+pub(crate) fn run_rule_judge(
+    prompt: &str,
+    seat: &AgenticCli,
+    runner: &dyn StepRunner,
+) -> crate::rule_check::JudgeAnswer {
+    use crate::rule_check::JudgeAnswer;
+    let run_id = one_shot_run_id("rule-check");
+    let mut unit = WorkUnit::pending("rule-check-agent", "rule-check", 1, prompt.to_string());
+    unit.assigned_cli = Some(seat.key.clone());
+    unit.assigned_invocation = Some(seat.headless_invocation.clone());
+    let out = runner.run_unit(&build_validator_input(&run_id, unit));
+    runner.on_run_complete(&run_id);
+    let answered_a_rule = out.output.lines().any(|l| {
+        l.trim_start_matches(['-', '*', ' ', '`'])
+            .to_ascii_uppercase()
+            .starts_with("RULE ")
+    });
+    match out.status {
+        StepStatus::Ok if answered_a_rule => JudgeAnswer::Answered(out.output),
+        StepStatus::Ok => match judge_seat_refusal(&out.output) {
+            Some(cause) => JudgeAnswer::SeatFailed(cause),
+            None => JudgeAnswer::Answered(out.output),
+        },
+        StepStatus::TimedOut | StepStatus::Cancelled => JudgeAnswer::TimedOut(format!(
+            "{:?}: {}",
+            out.status,
+            judge_refusal_text(&out.output)
+        )),
+        StepStatus::Failed | StepStatus::ElicitationFailed => {
+            JudgeAnswer::SeatFailed(judge_refusal_text(&out.output).chars().take(300).collect())
+        }
+    }
+}
+
 fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
         run_id: run_id.to_string(),

@@ -1859,6 +1859,15 @@ pub(crate) fn apply_and_finish_unit(
         Some(d) if crate::qe_acceptance::review::could_not_judge(&d) => (Some(d), None),
         other => (None, other),
     };
+    // (DES-RULE-CHECK-001 S2) The review step's steering-rule check: broken denies, unchecked holds.
+    let rule_broken = evidence
+        .rule_check
+        .as_ref()
+        .and_then(crate::rule_check::RuleCheckReport::denial);
+    let rule_hold = evidence
+        .rule_check
+        .as_ref()
+        .and_then(crate::rule_check::RuleCheckReport::hold);
     // The FIRST layer that denied names the gate; (operator ruling 2026-10-21) every layer
     // after it is kept too (`WorkUnit::denials_behind`), so an answer that overrides ONE layer —
     // the operator's judgment over a failed repo-checks floor — can see the rest still deny.
@@ -1871,6 +1880,9 @@ pub(crate) fn apply_and_finish_unit(
         evaluator_verdict_denial,
         qe_veto,
         judged.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
+        // (DES-RULE-CHECK-001 S2) A broken steering rule is a verdict on the work, beside the
+        // judge's: it denies and names each rule with its cite.
+        rule_broken,
         evaluator_denial,
         hook_denial,
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
@@ -1881,6 +1893,9 @@ pub(crate) fn apply_and_finish_unit(
         judge_hold,
         unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
         qe_unavailable,
+        // (DES-RULE-CHECK-001 S2, operator decision 1) A rule no judge ruled on HOLDS the gate —
+        // like a missing required judge, it wins only when nothing else denied.
+        rule_hold,
     ]
     .into_iter()
     .flatten();
@@ -1943,6 +1958,11 @@ pub(crate) fn apply_and_finish_unit(
     if let Some(review) = evidence.qe_review.as_ref() {
         unit.qe_review = Some(review.clone());
     }
+    // (DES-RULE-CHECK-001 S2) The rule check's rows — the next attempt's cache; `None` (no check
+    // this attempt) leaves the last one.
+    if let Some(rc) = evidence.rule_check.as_ref() {
+        unit.rule_check = Some(rc.clone());
+    }
     if outcome.approved {
         unit.rework_of = None;
     }
@@ -1983,6 +2003,7 @@ pub(crate) fn apply_and_finish_unit(
                 judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
                 qe: evidence.qe_review.is_some(),
                 seat: seat_ran,
+                rules: evidence.rule_check.is_some(),
             },
         )
     };
@@ -2229,6 +2250,7 @@ pub(crate) fn apply_and_finish_unit(
             },
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
+            rules: evidence.rule_check.as_ref(),
             eval_ran: eval.as_ref().is_some_and(|e| !e.policies.is_empty()),
             eval_error: eval_error.as_deref(),
             tree: evidence.verified_tree.clone(),
@@ -2742,6 +2764,8 @@ struct FoldRefresh {
     judge: bool,
     qe: bool,
     seat: bool,
+    /// (DES-RULE-CHECK-001 S2) The steering-rule check ran this attempt.
+    rules: bool,
 }
 
 /// [`crate::domain::WorkUnit::denials_behind`] after a DENYING fold: every layer but the floor that
@@ -2775,6 +2799,10 @@ fn denials_behind_after_fold(
             now.judge
         } else if qe_layer(s) {
             now.qe
+        } else if s == crate::rule_check::DENIAL_SOURCE_BROKEN
+            || s == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+        {
+            now.rules
         } else {
             now.seat
         }
@@ -3304,6 +3332,8 @@ struct GateFacts<'a> {
     checks: Option<Result<(), (&'static str, Option<String>)>>,
     judge: Option<&'a crate::validator::AgentVerdict>,
     judge_skipped: Option<&'a str>,
+    /// (DES-RULE-CHECK-001 S2) The review step's rule check, when it ran.
+    rules: Option<&'a crate::rule_check::RuleCheckReport>,
     eval_ran: bool,
     eval_error: Option<&'a str>,
     tree: Option<String>,
@@ -3405,6 +3435,18 @@ fn gate_receipt(
     // to — a verdict, or an answer without one (codex r1).
     if let Some(fb) = f.judge.and_then(|v| v.judge_fallback.as_ref()) {
         r.judge_fallbacks.push(fb.clone());
+    }
+    // (DES-RULE-CHECK-001 S2) Every rule in force with its verdict; deny-dominates reads them.
+    if let Some(rc) = f.rules {
+        r.rules = rc.rows.clone();
+        match (&rc.note, rc.rows.is_empty()) {
+            (Some(why), true) => r.skip(
+                crate::rule_check::INSTRUMENT,
+                a::SKIP_ERROR,
+                Some(why.clone()),
+            ),
+            _ => r.ran(crate::rule_check::INSTRUMENT),
+        }
     }
     if f.eval_ran {
         r.ran(a::EVALUATOR_PASS);
@@ -6209,6 +6251,7 @@ mod denials_behind_tests {
             judge,
             qe,
             seat: true,
+            rules: false,
         }
     }
     fn floor_only(tree: &str) -> FoldRefresh {
@@ -6377,6 +6420,7 @@ mod denials_behind_unknown_tests {
             judge,
             qe: false,
             seat: true,
+            rules: false,
         };
         assert_eq!(
             denials_behind_after_fold(Vec::new(), unknown(), at("t1", false)),
@@ -6538,6 +6582,7 @@ mod judge_absent_behind_floor_tests {
                 judge: false,
                 qe: false,
                 seat: false,
+                rules: false,
             },
         )
         .expect("known");
@@ -6612,3 +6657,7 @@ mod judge_absent_behind_floor_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "pipeline_rule_check_tests.rs"]
+mod rule_check_fold_tests;

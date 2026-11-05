@@ -430,6 +430,14 @@ impl Campaign {
                     | HumanDecision::AcceptSuggestion
                     | HumanDecision::ConsentChoice { .. }
                     | HumanDecision::Rejudge => None,
+                    // (DES-RULE-CHECK-001 S2) The skips' reasons are the record.
+                    HumanDecision::RecheckRules { skips } => (!skips.is_empty()).then(|| {
+                        skips
+                            .iter()
+                            .map(|(id, why)| format!("{id}: {why}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    }),
                     // (operator ruling 2026-10-21) The rationale is the record, not a unit
                     // instruction — mirrored like an intent amendment's text.
                     HumanDecision::OperatorJudgment { rationale } => Some(rationale.clone()),

@@ -115,6 +115,7 @@ mod repo;
 mod repo_checks;
 mod repo_intel;
 mod review_context;
+mod rule_check;
 mod run_mirror;
 mod runtime_wait;
 pub mod tool_activity;
