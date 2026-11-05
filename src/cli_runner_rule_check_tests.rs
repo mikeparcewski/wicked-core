@@ -662,36 +662,12 @@ fn the_seat_that_fixed_this_units_tree_never_judges_it() {
     assert!(report.hold().is_some(), "no other distinct seat: held");
 }
 
-/// (SWAP 6) The deliver step checks a rule deferred to delivery against the delivered commit's
-/// message (the pull request's text): broken denies; a store with no deferred rule checks nothing.
+/// (SWAP 6) The deliver step checks the rules the reviews deferred against the text the deliver
+/// command published (WICKED_DELIVER_TEXT_OUT): broken denies, and the judge reads that text; with
+/// no text handed back it holds; with nothing deferred it checks nothing.
 #[test]
-fn the_deliver_step_checks_a_deferred_rule_against_the_pr_text() {
+fn the_deliver_step_checks_a_deferred_rule_against_the_published_text() {
     let (repo, _base, db) = fixture("deliver");
-    git(&repo, &["add", "-A"]);
-    git(
-        &repo,
-        &["commit", "-qm", "Fix add()\n\nadd() now takes two numbers."],
-    );
-    let ctx = |db: &str| DeliveryRuleCtx {
-        db_path: db.to_string(),
-        project: None,
-        repo: None,
-        creators: vec!["claude".into()],
-        creator_bins: Some(Vec::new()),
-        exclude_seats: Vec::new(),
-        pool: vec![seat("claude"), seat("codex")],
-        registry: vec![seat("claude"), seat("codex")],
-        runner: Arc::new(Breaks(Mutex::new(Vec::new()))),
-        prior: None,
-        skips: Vec::new(),
-        instructions: String::new(),
-        deliver_tokens: Vec::new(),
-        base: String::new(),
-    };
-    assert!(
-        delivery_rule_check(&ctx(&db), &repo).is_none(),
-        "R1 and R2 are review rules"
-    );
     {
         let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
         let mut r = wicked_governance::ConformanceRule {
@@ -704,7 +680,46 @@ fn the_deliver_step_checks_a_deferred_rule_against_the_pr_text() {
         r.obligations = vec![crate::rule_check::OBLIGATION_EVIDENCE_DELIVERY.into()];
         wicked_governance::register_rule(&mut store, &r).unwrap();
     }
-    let report = delivery_rule_check(&ctx(&db), &repo).expect("checked");
-    assert_eq!(report.rows.len(), 1, "{:?}", report.rows);
+    let out = repo.join("pr-text.md");
+    let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
+    let ctx = |deferred: Vec<String>| DeliveryRuleCtx {
+        db_path: db.clone(),
+        project: None,
+        repo: None,
+        creators: vec!["claude".into()],
+        creator_bins: Some(Vec::new()),
+        exclude_seats: Vec::new(),
+        pool: vec![seat("claude"), seat("codex")],
+        registry: vec![seat("claude"), seat("codex")],
+        runner: runner.clone(),
+        prior: None,
+        skips: Vec::new(),
+        instructions: String::new(),
+        deliver_tokens: Vec::new(),
+        base: String::new(),
+        deferred,
+        text_out: out.clone(),
+    };
+    assert!(
+        delivery_rule_check(&ctx(Vec::new()), &repo).is_none(),
+        "nothing deferred"
+    );
+    let deferred = vec!["learn-linked-issue".to_string()];
+    let none = delivery_rule_check(&ctx(deferred.clone()), &repo).expect("held");
+    assert!(
+        none.hold()
+            .is_some_and(|d| d.reason.contains("did not hand back")),
+        "{none:?}"
+    );
+    std::fs::write(&out, "Fix add()\n\nadd() now takes two numbers.\n").unwrap();
+    let report = delivery_rule_check(&ctx(deferred), &repo).expect("checked");
     assert_eq!(report.denial().unwrap().rule_ids, ["learn-linked-issue"]);
+    let asked = runner.0.lock().unwrap();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p.contains("add() now takes two numbers.")),
+        "the judge read the published text"
+    );
+    assert!(!out.exists(), "the hand-back file is removed once read");
 }

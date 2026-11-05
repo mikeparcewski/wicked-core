@@ -888,7 +888,16 @@ pub(crate) struct DeliveryRuleCtx {
     pub instructions: String,
     pub deliver_tokens: Vec<String>,
     pub base: String,
+    /// The rules the run's reviews deferred to delivery (their ids): the only rules checked here.
+    pub deferred: Vec<String>,
+    /// Where the deliver command writes the pull request text it publishes (title, a blank line,
+    /// the body), handed to it as [`DELIVER_TEXT_ENV`].
+    pub text_out: std::path::PathBuf,
 }
+
+/// (SWAP 6) The env var naming the file crew's deliver command writes the pull request text it
+/// published to (title, blank line, body: the PR description, or its comment on an existing PR).
+pub(crate) const DELIVER_TEXT_ENV: &str = "WICKED_DELIVER_TEXT_OUT";
 
 /// (SWAP 6) The deliver step's rule check: every rule deferred to delivery (by recorded fact,
 /// [`crate::rule_check::delivery_only`]) judged against the pull request's text exactly as the
@@ -897,8 +906,11 @@ pub(crate) struct DeliveryRuleCtx {
 /// `None` when no rule is deferred to delivery.
 pub(crate) fn delivery_rule_check(
     ctx: &DeliveryRuleCtx,
-    workdir: &std::path::Path,
+    _workdir: &std::path::Path,
 ) -> Option<crate::rule_check::RuleCheckReport> {
+    if ctx.deferred.is_empty() {
+        return None;
+    }
     let held = |why: String| {
         Some(crate::rule_check::RuleCheckReport {
             note: Some(why),
@@ -913,31 +925,18 @@ pub(crate) fn delivery_rule_check(
             ))
         }
     };
-    if !rules
-        .iter()
-        .any(|r| crate::rule_check::delivery_only(r, &ctx.deliver_tokens).is_some())
-    {
-        return None;
-    }
-    // Nothing delivered (HEAD is still the run base): no pull request text to judge.
-    let head =
-        crate::worktree_guard::git_string(workdir, &["rev-parse", "HEAD"], &[]).unwrap_or_default();
-    if !ctx.base.is_empty() && head == ctx.base {
-        return None;
-    }
-    let text = match crate::worktree_guard::git_string(
-        workdir,
-        &["log", "-1", "--format=%B", "HEAD"],
-        &[],
-    ) {
+    // The text the delivery PUBLISHED, as its own command wrote it: never a commit message.
+    let text = match std::fs::read_to_string(&ctx.text_out) {
         Ok(t) if !t.trim().is_empty() => t,
-        Ok(_) => return held("the delivered pull request's text is empty".into()),
-        Err(e) => {
+        _ => {
             return held(format!(
-                "the delivered pull request's text could not be read: {e:#}"
+                "the delivery did not hand back the pull request text it published ({DELIVER_TEXT_ENV}), \
+                 so {} rule(s) deferred to delivery could not be checked",
+                ctx.deferred.len()
             ))
         }
     };
+    let _ = std::fs::remove_file(&ctx.text_out);
     let change = crate::rule_check::Change {
         diff: text.clone(),
         paths: Vec::new(),
@@ -974,6 +973,7 @@ pub(crate) fn delivery_rule_check(
             packs: crate::steering_packs::shipped_rule_ids(),
             stage: crate::rule_check::CheckStage::Delivery,
             deliver_tokens: &ctx.deliver_tokens,
+            deferred: &ctx.deferred,
         },
         &judge,
         &NoMachineHere,
@@ -1326,6 +1326,7 @@ fn run_rule_check(
                     packs: crate::steering_packs::shipped_rule_ids(),
                     stage: crate::rule_check::CheckStage::Review,
                     deliver_tokens: &input.unit.rule_deliver_tokens,
+                    deferred: &[],
                 },
                 &judge,
                 &FloorMachine {

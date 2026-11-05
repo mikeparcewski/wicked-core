@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A rule whose subject is the delivery is deferred at review and QE, and checked at the deliver step (SWAP 6).**
+  `learn-linked-issue` (the PR description) was unchecked at review and QE and held every job twice. A rule carrying
+  `obligations: ["evidence:delivery"]` (rule data, nothing the creator writes) is now `deferred` at review and QE
+  (no hold; not applicable on a run with no deliver step). Once the deliver command has written the pull request
+  text it publishes to the file the engine names (`WICKED_DELIVER_TEXT_OUT`, crew's deliver script), the deliver
+  step judges exactly the rules the reviews deferred against that text, on a seat distinct from the creators: broken
+  denies, unchecked holds (no text handed back holds too). Every other rule keeps "unchecked holds". Known: a
+  retry at the deliver step's hold re-runs the delivery command (crew adopts the open PR).
+
 - **A rule the person's own instruction conflicts with is WAIVED, which the person confirms; a rule naming the job's
   repository applies (coord, from the E7 rerun).** The rule-check judge is shown the person's instructions (the
   task as they wrote it, the rules block taken out) and answers a rule they conflict with `WAIVED — "<the

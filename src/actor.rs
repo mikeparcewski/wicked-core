@@ -11625,8 +11625,39 @@ fn dispatch_unit(
                         unit,
                     )),
                     base: session.base_commit.clone().unwrap_or_default(),
+                    // What the run's reviews deferred: their latest rule-check rows.
+                    deferred: {
+                        let mut ids: Vec<String> = Vec::new();
+                        for u in units.iter().filter(|u| u.ord < unit.ord) {
+                            for r in u.rule_check.iter().flat_map(|rc| rc.rows.iter()) {
+                                if r.status == crate::rule_check::RuleStatus::Deferred
+                                    && !ids.contains(&r.rule_id)
+                                {
+                                    ids.push(r.rule_id.clone());
+                                }
+                            }
+                        }
+                        ids
+                    },
+                    text_out: std::env::temp_dir().join(format!(
+                        "wicked-deliver-text-{}-{}-{}-{}.md",
+                        crate::rule_check::file_safe(run_id),
+                        unit.ord,
+                        session.attempt,
+                        std::process::id()
+                    )),
                 }
             });
+        if let Some(c) = delivery_rules.as_ref() {
+            let _ = std::fs::remove_file(&c.text_out);
+        }
+        // The deliver command learns where to write the text it publishes.
+        let text_env: Option<(String, String)> = delivery_rules.as_ref().map(|c| {
+            (
+                crate::cli_runner::DELIVER_TEXT_ENV.to_string(),
+                c.text_out.to_string_lossy().into_owned(),
+            )
+        });
         // (WT-C2) A `walkthrough_review` unit: its proof root, declared env and the tree under
         // review, resolved here (the actor holds the store; the snapshot writes git objects, so it
         // is taken outside the jail). `None` for every other tool unit.
@@ -11876,6 +11907,7 @@ fn dispatch_unit(
                                 // fetch + rebase + push can still race a remote that advances in
                                 // the window; with this it can refuse or re-verify a moved base.
                                 let mut env = run_vars.clone();
+                                env.extend(text_env.clone());
                                 if let Some(b) = clearance.verified_base {
                                     env.push((
                                         crate::deliver_lift::VERIFIED_BASE_ENV.to_string(),
@@ -11894,10 +11926,12 @@ fn dispatch_unit(
                                 (o, st)
                             }
                             None => {
+                                let mut env = run_vars.clone();
+                                env.extend(text_env.clone());
                                 let (o, st, k) = run_tool_cmd(
                                     &cmd,
                                     workdir.as_deref(),
-                                    &run_vars,
+                                    &env,
                                     &stop,
                                     &on_spawn,
                                     &on_done,
