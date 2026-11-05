@@ -1264,19 +1264,27 @@ pub fn check(
         let is_machine = machine_obligation(rule).is_some() && input.stage == CheckStage::Review;
         // The match's facts ride the prompt beside the rule (the judge knows what the engine
         // already established), so they are part of the evidence the verdict read.
-        let note = format!(
-            "  Engine: {} — {}\n",
-            if m.status == MatchStatus::Applies {
-                "applies"
-            } else {
-                "may apply"
-            },
-            m.facts
-                .iter()
-                .map(|f| f.detail.as_str())
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+        // At delivery the review's decision stands: the rule applies (it was deferred, not ruled
+        // out); the text's own match says nothing about it (codex r2).
+        let note = if input.stage == CheckStage::Delivery {
+            "  Engine: applies — the review deferred it to this delivery; judge it on the pull \
+             request text\n"
+                .to_string()
+        } else {
+            format!(
+                "  Engine: {} — {}\n",
+                if m.status == MatchStatus::Applies {
+                    "applies"
+                } else {
+                    "may apply"
+                },
+                m.facts
+                    .iter()
+                    .map(|f| f.detail.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        };
         let ek = digest(&[if is_machine { &machine_key } else { &judge_key }, &note]);
         // A skip answers exactly the unchecked row it was given on: the same rule content and the
         // same evidence.
@@ -1284,7 +1292,13 @@ pub fn check(
             .skips
             .iter()
             .rev()
-            .find(|s| s.rule_id == rule.id && s.rule_key == rk && s.evidence_key == ek)
+            // At delivery the text is re-composed on a retry (it carries the run's own record), so
+            // a skip there answers the rule as it is, whatever the text (codex r2).
+            .find(|s| {
+                s.rule_id == rule.id
+                    && s.rule_key == rk
+                    && (s.evidence_key == ek || input.stage == CheckStage::Delivery)
+            })
         {
             let why = match s.instruction.as_deref() {
                 Some(i) => format!(
@@ -1455,6 +1469,26 @@ pub fn check(
         .iter()
         .filter_map(|m| rows.remove(&m.rule_id))
         .collect();
+    // (codex r2) At delivery every rule the reviews deferred gets a row: one no longer in force as
+    // reviewed (retired, replaced, out of scope) holds, never disappears.
+    if input.stage == CheckStage::Delivery {
+        for id in input.deferred {
+            if !report.rows.iter().any(|r| &r.rule_id == id) {
+                report.rows.push(RuleVerdict {
+                    rule_id: id.clone(),
+                    status: RuleStatus::Unchecked,
+                    how: RuleHow::None,
+                    reason: "deferred to delivery at review, and no longer in force as it was \
+                             reviewed: a person decides"
+                        .into(),
+                    cite: None,
+                    judge: None,
+                    rule_key: String::new(),
+                    evidence_key: None,
+                });
+            }
+        }
+    }
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     report
 }
@@ -1674,6 +1708,22 @@ fn run_pool(
                         let mut w = why.lock().unwrap();
                         for (j, id) in ids.iter().enumerate() {
                             match parsed.get(*id) {
+                                // (codex r2) At delivery a KEPT quotes the published text.
+                                Some(ans)
+                                    if input.stage == CheckStage::Delivery
+                                        && ans.status == RuleStatus::Kept
+                                        && !quotes_instruction(
+                                            &ans.cite,
+                                            Some(&input.change.diff),
+                                        ) =>
+                                {
+                                    w.insert(
+                                        batch[j],
+                                        "a KEPT at delivery must quote the pull request text, and \
+                                         this one did not"
+                                            .into(),
+                                    );
+                                }
                                 Some(ans) if cut && ans.status != RuleStatus::Broken => {
                                     w.insert(
                                         batch[j],

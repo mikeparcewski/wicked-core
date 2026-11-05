@@ -1358,19 +1358,37 @@ fn at_delivery_the_deferred_rules_are_checked_against_the_pr_text() {
         r.rows
     );
     assert_eq!(r.denial().unwrap().rule_ids, ["learn-linked-issue"]);
-    let p = &broken.prompts.lock().unwrap()[0].1;
+    let p = broken.prompts.lock().unwrap()[0].1.clone();
     assert!(
         p.contains("pull request text") && p.contains("quotes the words"),
         "{p}"
     );
+    // A KEPT quotes the published text; a quote the text does not hold is no answer (codex r2).
     let kept = Fake::new(&[(
         "learn-linked-issue",
-        "KEPT — the description says \"Fixes #12\"",
+        "KEPT — the body says \"sum() skipped the first element\"",
     )]);
     assert_eq!(
         run_stage(&rules, &c, &kept, CheckStage::Delivery, &[], &deferred).rows[0].status,
         RuleStatus::Kept
     );
+    let invented = Fake::new(&[(
+        "learn-linked-issue",
+        "KEPT — the description says \"Fixes #12 today\"",
+    )]);
+    assert_eq!(
+        run_stage(&rules, &c, &invented, CheckStage::Delivery, &[], &deferred).rows[0].status,
+        RuleStatus::Unchecked
+    );
+    // A deferred rule no longer in force at delivery holds, never disappears.
+    let gone = run_stage(&rules[1..], &c, &kept, CheckStage::Delivery, &[], &deferred);
+    assert_eq!(gone.rows.len(), 1);
+    assert_eq!(gone.rows[0].status, RuleStatus::Unchecked);
+    assert!(gone.hold().is_some());
+    // The judge is told the review decided applicability, not the text's own match.
+    assert!(broken.prompts.lock().unwrap()[0]
+        .1
+        .contains("the review deferred it to this delivery"));
     let silent = Fake::new(&[]);
     let r = run_stage(&rules, &c, &silent, CheckStage::Delivery, &[], &deferred);
     assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
