@@ -278,6 +278,9 @@ pub use team::{TeamLedger, TeamPlan};
 // (`core.governanceEvals(argsJson)` / `core.governanceCorpusImport(argsJson)`); the report and
 // receipt JSON these return are the pinned crew `/testing/evals` wire contract, passed through
 // verbatim. Typed surface (samples/report/corpus sources) rides along for in-process callers.
+// DES-RULE-CHECK-001 (S1): which in-force rules a job is checked against, each with the facts that decided it
+// (`Core.matchRules(argsJson)`). Pure: no store, no model.
+pub use wicked_governance::match_rules_json;
 pub use wicked_governance::{
     governance_corpus_import, governance_evals, import_corpus as governance_import_corpus,
     load_corpus as governance_load_corpus, run_evals as governance_run_evals, CorpusSource,

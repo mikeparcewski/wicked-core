@@ -2624,6 +2624,19 @@ impl Core {
         task(move || wicked_core::list_mcp_tools_json(&request_json).map_err(err))
     }
 
+    /// (DES-RULE-CHECK-001, S1) Which in-force rules a job is checked against. `args_json` is `{ rules:
+    /// [ConformanceRule…], job: { workflow?, steps?: [{ tokens, kind? }], kinds?, project?, languages?, frameworks?,
+    /// layers?, diff? } }`; resolves to `{ matches: [{ rule_id, status: "applies"|"may_apply"|"not_applicable", facts:
+    /// [{ kind, detail }] }] }`: one match per rule, none dropped, in reading order. "not_applicable" is only ever a
+    /// recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
+    /// judge per call; another project; a facet or trigger the
+    /// job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
+    /// `bad_request: …`. Static, like `evaluateMcpCall`.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn match_rules(args_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::match_rules_json(&args_json).map_err(err))
+    }
+
     /// (crew#1337) Judge ONE brokered MCP call for the token's unit with the SAME evaluation
     /// `evaluateMcpCall` runs, WITH its arguments (an argument-triggered rule fires), and record
     /// NOTHING. `request_json` is `{ token, call: { server, tool, args?, annotations?,
