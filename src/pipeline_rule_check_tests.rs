@@ -40,6 +40,8 @@ fn row(id: &str, status: RuleStatus, how: RuleHow, reason: &str) -> RuleVerdict 
         judge: (how == RuleHow::Judge).then(|| "codex".to_string()),
         rule_key: "k".into(),
         evidence_key: Some("e".into()),
+        origin: (how == RuleHow::Judge).then_some(crate::rule_check::RuleOrigin::Judge),
+        ..Default::default()
     }
 }
 
@@ -321,4 +323,31 @@ fn an_unchecked_rule_outranks_a_missing_judge_and_a_broken_rule_has_its_own_gate
         crate::actor::denial_class_for_test(denial.as_ref()),
         "rule_broken"
     );
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.7.2) A DISPUTED rule — the council reached no ruling — holds the
+/// gate on its own: everything else passes, and the fold is not approved, under `rules_unchecked`.
+/// Without `hold()` learning `Disputed`, the judge's BROKEN would be gone and the gate would pass.
+/// The attempt's councils count toward the run's budget, durably on the unit.
+#[test]
+fn a_disputed_rule_alone_holds_the_gate_and_its_councils_are_counted() {
+    let mut disputed = row(
+        "R1",
+        RuleStatus::Disputed,
+        RuleHow::Council,
+        "the council reached no ruling (1 of 3 answered): no_quorum",
+    );
+    disputed.origin = Some(crate::rule_check::RuleOrigin::Judge);
+    let mut r = report(vec![
+        disputed,
+        row("R2", RuleStatus::Kept, RuleHow::Judge, "src/a.rs:1 typed"),
+    ]);
+    r.councils = 2;
+    let (approved, denial, unit) = fold("rules-disputed", Some(r));
+    assert!(!approved, "a disputed rule is never approved");
+    let d = denial.expect("held");
+    assert_eq!(d.source, crate::rule_check::DENIAL_SOURCE_UNCHECKED);
+    assert_eq!(d.rule_ids, vec!["R1".to_string()]);
+    assert!(d.reason.contains("R1 DISPUTED"), "{}", d.reason);
+    assert_eq!(unit.rule_councils, 2);
 }

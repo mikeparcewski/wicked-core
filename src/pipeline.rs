@@ -1964,6 +1964,9 @@ pub(crate) fn apply_and_finish_unit(
     // this attempt) leaves the last one.
     if let Some(rc) = evidence.rule_check.as_ref() {
         unit.rule_check = Some(rc.clone());
+        // (DES-RULE-CHECK-001 rev 2) Every rule council an attempt convened counts toward the
+        // run's budget, durably.
+        unit.rule_councils = unit.rule_councils.saturating_add(rc.councils);
     }
     if outcome.approved {
         unit.rework_of = None;

@@ -233,6 +233,7 @@ impl FakeCouncil {
             seats: vec!["s1".into(), "s2".into(), "s3".into()],
             seed: 9,
             eligible: vec!["s1".into(), "s2".into(), "s3".into(), "s4".into()],
+            votes: Vec::new(),
             ballots_in: Some("seat_container".into()),
         })
     }

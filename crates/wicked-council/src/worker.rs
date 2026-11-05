@@ -24,8 +24,8 @@ use crate::synthesis;
 use std::time::{Duration, Instant};
 
 use crate::types::{
-    AgenticCli, BallotContext, CouncilTask, DispatchOutcome, Dispatcher, EventSink, RankSignal,
-    RankStore, SeatFailure, SeatFailureKind, TaskState, TimedOutcome, Verdict, SEATS,
+    AgenticCli, BallotContext, BallotFrame, CouncilTask, DispatchOutcome, Dispatcher, EventSink,
+    RankSignal, RankStore, SeatFailure, SeatFailureKind, TaskState, TimedOutcome, Verdict, SEATS,
 };
 
 /// Recover a readable message from a caught panic payload, flattened to a single line.
@@ -112,6 +112,18 @@ pub struct Worker {
     /// starts `i × stagger` after the ballot opens, so a council never forks its whole roster of
     /// heavy CLIs in the same instant. From [`crate::pick::spawn_stagger`].
     stagger: Duration,
+    /// (DES-RULE-CHECK-001 rev 2) The ballot frame, its absolute deadline and its prompt budget.
+    bounds: CouncilBounds,
+}
+
+/// (DES-RULE-CHECK-001 rev 2) What bounds one council beyond its rounds: the ballot frame, an
+/// ABSOLUTE deadline (no ballot starts after it, no budget outlasts it) and the most bytes a
+/// rendered ballot may hold. The default is the team councils' routing frame, unbounded as before.
+#[derive(Debug, Clone, Copy, Default)]
+struct CouncilBounds {
+    frame: BallotFrame,
+    deadline_at: Option<Instant>,
+    prompt_budget: Option<usize>,
 }
 
 impl Worker {
@@ -136,7 +148,22 @@ impl Worker {
                 DEFAULT_DEADLINE,
             ),
             stagger: crate::pick::spawn_stagger(),
+            bounds: CouncilBounds::default(),
         }
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2) A council on one disputed steering-rule verdict: the dispute
+    /// ballot frame, an ABSOLUTE `deadline_at` (replacing the env-overridable relative deadline:
+    /// nothing starts after it, every ballot's budget is cut to the time left) and the most bytes
+    /// any rendered ballot of any round may hold (a round over it ends the council, no ruling).
+    pub fn with_dispute(mut self, deadline_at: Instant, prompt_budget: usize) -> Self {
+        self.deadline = deadline_at.saturating_duration_since(Instant::now());
+        self.bounds = CouncilBounds {
+            frame: BallotFrame::Dispute,
+            deadline_at: Some(deadline_at),
+            prompt_budget: Some(prompt_budget),
+        };
+        self
     }
 
     /// Override the spawn stagger (the constructor reads [`crate::pick::ENV_SPAWN_STAGGER_MS`]).
@@ -196,6 +223,7 @@ impl Worker {
         let work_kind = self.work_kind.clone();
         let deadline = self.deadline;
         let stagger = self.stagger;
+        let bounds = self.bounds;
         let task_for_thread = task;
 
         let ledger_for_panic = ledger.clone();
@@ -216,6 +244,7 @@ impl Worker {
                     &work_kind,
                     deadline,
                     stagger,
+                    bounds,
                     &task_for_thread,
                 );
             }));
@@ -326,6 +355,7 @@ fn run_council(
     work_kind: &str,
     deadline: Duration,
     stagger: Duration,
+    bounds: CouncilBounds,
     task: &CouncilTask,
 ) {
     ledger.update(&task.id, |rec| rec.state = TaskState::Running);
@@ -337,6 +367,16 @@ fn run_council(
     // No usable CLIs → fail honestly (quorum 0).
     if roster.is_empty() {
         ledger.update(&task.id, |rec| rec.state = TaskState::Failed);
+        return;
+    }
+    let past = || bounds.deadline_at.is_some_and(|d| Instant::now() >= d);
+    // (DES-RULE-CHECK-001 rev 2) Nothing starts after the deadline — the first ballot included.
+    if past() {
+        ledger.update(&task.id, |rec| {
+            rec.state = TaskState::TimedOut;
+            rec.failure_detail =
+                Some("the council's deadline passed before its first ballot".into());
+        });
         return;
     }
 
@@ -384,12 +424,27 @@ fn run_council(
                         approval_threshold: APPROVAL_THRESHOLD,
                         prior_tally: prior_tally.clone(),
                         dissent_arguments: dissent_arguments.clone(),
+                        frame: bounds.frame,
+                        deadline: bounds.deadline_at,
+                        prompt_budget: bounds.prompt_budget,
                     };
                     scope.spawn(move || {
                         // The spawn stagger: seat `i` opens its ballot `i × stagger` late. Its
                         // own budget starts when it is dispatched, so the wait costs it nothing.
                         if i > 0 && !stagger.is_zero() {
                             std::thread::sleep(stagger.saturating_mul(i as u32));
+                        }
+                        // (DES-RULE-CHECK-001 rev 2) A seat whose stagger ran past the deadline
+                        // never starts (whatever the dispatcher would do).
+                        if past() {
+                            return TimedOutcome {
+                                outcome: DispatchOutcome::Failed(SeatFailure::new(
+                                    SeatFailureKind::DeadlinePassed,
+                                    "the council's deadline passed before this ballot could start",
+                                )),
+                                queued_ms: 0,
+                                ran_ms: 0,
+                            };
                         }
                         let started = Instant::now();
                         // Catch the unwind HERE rather than at the join, so a seat that panicked
@@ -500,6 +555,22 @@ fn run_council(
             rec.seat_failures = collected_failures;
         });
 
+        // (DES-RULE-CHECK-001 rev 2) A dispute round whose ballot would not fit its budget ends the
+        // council with no ruling: the prior round's tally is not a ruling on the whole evidence.
+        if bounds.frame == BallotFrame::Dispute
+            && failures
+                .iter()
+                .any(|f| f.failure.kind == SeatFailureKind::PromptTooLarge)
+        {
+            ledger.update(&task.id, |rec| {
+                rec.state = TaskState::Failed;
+                rec.failure_detail = Some(format!(
+                    "ballot {ballot}'s prompt is over its budget, so the council ends with no ruling"
+                ));
+            });
+            return;
+        }
+
         // No votes at all (every seat timed out / errored) → timed_out.
         if votes.is_empty() {
             ledger.update(&task.id, |rec| rec.state = TaskState::TimedOut);
@@ -541,6 +612,7 @@ fn run_council(
         if live_agreement >= APPROVAL_THRESHOLD
             || ballot >= MAX_BALLOTS
             || convened_at.elapsed() >= deadline
+            || past()
         {
             break (votes, verdict);
         }
