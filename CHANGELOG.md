@@ -2326,6 +2326,18 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.29** — 2026-11-05 — patch release on main eaea6a2, carrying 2 PRs since 0.15.28: #1283 and #1284.
+  - **The catalog by verb (#1284, DES-CATALOG-002 Lane A).** Gate rubrics as data (`parity`, `cited-findings`,
+    `fidelity-to-source`) and 16 new presets ship in the bundled engine. A plan-gate answer may name the gate it
+    expects: `confirmGate(…, expectOrd, expectPlanRev)` (trailing and optional), compared inside the engine, which
+    refuses a mismatch with an error that starts `gate_changed:`. A SEND-BACK at `plan_approval`
+    (`confirmGate(run, false, note, "request_changes", …, planRev)`) has the lead re-plan with the note and holds the
+    next revision for approval. The new static `Core.supportsPlanSendBack()` returns `true`; napi drops undeclared
+    trailing arguments, so a skin checks it before sending either. crew's catalog v2 wire (Lane C) pins this release.
+  - **Lockfile:** #1283 re-stamped the 0.15.28 platform lock entries.
+  - The only binding changes are the two trailing `confirmGate` arguments and `supportsPlanSendBack`; no `LaunchSpec`
+    field is added. The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol
+    are unchanged since 0.15.28, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.28** — 2026-11-05 — patch release on main 31694e3, carrying 2 PRs since 0.15.27: #1280 and #1281.
   - **A rule whose subject is the delivery is checked at the deliver step (#1281, SWAP 6).** A rule carrying
     `obligations: ["evidence:delivery"]` is `deferred` at review and QE instead of holding the gate; the deliver step
