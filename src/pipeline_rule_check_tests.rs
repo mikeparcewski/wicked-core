@@ -52,13 +52,14 @@ fn fold(
     Option<crate::domain::UnitDenial>,
     crate::domain::WorkUnit,
 ) {
-    let (a, d, u, _) = fold_with_session(sid, report);
+    let (a, d, u, _) = fold_with_session(sid, report, None);
     (a, d, u)
 }
 
 fn fold_with_session(
     sid: &str,
     report: Option<RuleCheckReport>,
+    verdict: Option<&crate::validator::AgentVerdict>,
 ) -> (
     bool,
     Option<crate::domain::UnitDenial>,
@@ -113,7 +114,7 @@ fn fold_with_session(
         false,
         false,
         &cli_keys,
-        None,
+        verdict,
         &evidence,
         &mut |_e| {},
         None,
@@ -251,6 +252,7 @@ fn a_skip_is_labelled_on_the_receipt_and_the_delivery_and_does_not_hold() {
                 "skipped by operator: the judge cannot read the fixture",
             ),
         ])),
+        None,
     );
     assert!(approved, "{denial:?}");
     let receipt = unit.assurance.as_ref().unwrap();
@@ -273,4 +275,50 @@ fn no_rule_check_leaves_the_gate_as_it_was() {
     assert!(approved, "{denial:?}");
     assert!(unit.assurance.as_ref().unwrap().rules.is_empty());
     assert!(unit.rule_check.is_none());
+}
+
+/// codex r1: an unchecked rule outranks the judge's own no-verdict hold, so the operator judgment
+/// that answers a missing judge can never also count an unchecked rule; a broken rule's gate is its
+/// own class, never the review loop's adjudication (whose approve lands the unit).
+#[test]
+fn an_unchecked_rule_outranks_a_missing_judge_and_a_broken_rule_has_its_own_gate() {
+    let no_judge = crate::validator::AgentVerdict {
+        pass: false,
+        reasoning: "every judge seat failed".into(),
+        judge_cli: None,
+        judge_distinct: None,
+        seat_failure: Some("pi (not_logged_in)".into()),
+        judge_fallback: None,
+    };
+    let (approved, denial, unit, _) = fold_with_session(
+        "rc-over-judge",
+        Some(report(vec![row(
+            "SILENT",
+            RuleStatus::Unchecked,
+            RuleHow::None,
+            "no answer",
+        )])),
+        Some(&no_judge),
+    );
+    assert!(!approved);
+    assert_eq!(
+        denial.map(|d| d.source).as_deref(),
+        Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED)
+    );
+    assert!(unit.denials_behind.as_ref().is_some_and(|b| b
+        .iter()
+        .any(|d| d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)));
+    let (_, denial, _) = fold(
+        "rc-own-class",
+        Some(report(vec![row(
+            "B",
+            RuleStatus::Broken,
+            RuleHow::Judge,
+            "src/a.rs",
+        )])),
+    );
+    assert_eq!(
+        crate::actor::denial_class_for_test(denial.as_ref()),
+        "rule_broken"
+    );
 }

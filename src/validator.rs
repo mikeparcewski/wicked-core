@@ -2647,8 +2647,11 @@ pub(crate) fn run_rule_judge(
     runner: &dyn StepRunner,
 ) -> crate::rule_check::JudgeAnswer {
     use crate::rule_check::JudgeAnswer;
-    let run_id = one_shot_run_id("rule-check");
-    let mut unit = WorkUnit::pending("rule-check-agent", "rule-check", 1, prompt.to_string());
+    // The validator's own identity (session `validator`, a `validator-` one-shot id): the engine
+    // runs it as an internal judge call, in the judge's seat container where seats run in one and
+    // with the one-shot cleanup, exactly as the default judge's call.
+    let run_id = validator_run_id();
+    let mut unit = WorkUnit::pending("validator-agent", "validator", 1, prompt.to_string());
     unit.assigned_cli = Some(seat.key.clone());
     unit.assigned_invocation = Some(seat.headless_invocation.clone());
     let out = runner.run_unit(&build_validator_input(&run_id, unit));
@@ -2664,10 +2667,19 @@ pub(crate) fn run_rule_judge(
             Some(cause) => JudgeAnswer::SeatFailed(cause),
             None => JudgeAnswer::Answered(out.output),
         },
-        StepStatus::TimedOut | StepStatus::Cancelled => JudgeAnswer::TimedOut(format!(
-            "{:?}: {}",
-            out.status,
+        StepStatus::TimedOut => JudgeAnswer::TimedOut(format!(
+            "timed out: {}",
             judge_refusal_text(&out.output)
+                .chars()
+                .take(300)
+                .collect::<String>()
+        )),
+        StepStatus::Cancelled => JudgeAnswer::Stopped(format!(
+            "stopped: {}",
+            judge_refusal_text(&out.output)
+                .chars()
+                .take(300)
+                .collect::<String>()
         )),
         StepStatus::Failed | StepStatus::ElicitationFailed => {
             JudgeAnswer::SeatFailed(judge_refusal_text(&out.output).chars().take(300).collect())

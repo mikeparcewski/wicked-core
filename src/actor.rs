@@ -8157,6 +8157,10 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED) => {
             crate::rule_check::DENIAL_SOURCE_UNCHECKED
         }
+        // A broken steering rule: a verdict on the work, but never the review loop's: its gate does
+        // not open `review_adjudication` (whose approve lands the unit with items carried), so no
+        // answer counts a unit that broke a rule — it is reworked, re-run, or the run stops.
+        Some(crate::rule_check::DENIAL_SOURCE_BROKEN) => CLASS_RULE_BROKEN,
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
         // (j4-gates) A floor that DENIED names the gate even when a hook also denied the attempt:
@@ -8173,6 +8177,9 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         _ => "verdict_not_pass",
     }
 }
+
+/// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
+const CLASS_RULE_BROKEN: &str = "rule_broken";
 
 /// [`denial_class`] for the fold tests in other modules.
 #[cfg(test)]
@@ -8784,6 +8791,12 @@ fn denial_gate_prompt(
             reason_head(reason)
         )
         }
+        // (DES-RULE-CHECK-001 S2) A broken steering rule: send it back, run it again, or stop.
+        CLASS_RULE_BROKEN => format!(
+            "Unit {ord} BROKE steering rule(s): {}. Request changes to send it back for rework, \
+             approve to run the step again, or reject to cancel the run{note}",
+            reason_head(reason)
+        ),
         // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
         "rules_unchecked" => format!(
             "Unit {ord}'s steering rules are UNCHECKED — {}. The work was not rejected. Re-run the \
@@ -15254,12 +15267,19 @@ fn rules_recheck_request(
                 cursor.ord
             );
         };
+        let Some(evidence_key) = row.evidence_key.clone() else {
+            anyhow::bail!(
+                "rule `{id}` has no evidence key on unit {}; retry the rule check",
+                cursor.ord
+            );
+        };
         landed.push(crate::rule_check::RuleSkip {
             rule_id: id.clone(),
             reason: reason.trim().to_string(),
             by: by.clone(),
             at,
-            evidence_key: row.evidence_key.clone(),
+            rule_key: row.rule_key.clone(),
+            evidence_key,
         });
     }
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
@@ -24766,7 +24786,10 @@ mod request_changes_tests {
                     let s = &fix.rule_skips[0];
                     assert_eq!((s.rule_id.as_str(), s.reason.as_str()), (*id, *why));
                     assert_eq!(s.by, "coordinator-agent");
-                    assert_eq!(s.evidence_key.as_deref(), Some("ek-R1"));
+                    assert_eq!(
+                        (s.rule_key.as_str(), s.evidence_key.as_str()),
+                        ("k", "ek-R1")
+                    );
                 }
                 None => assert!(fix.rule_skips.is_empty()),
             }

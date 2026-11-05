@@ -40,12 +40,14 @@ impl StepRunner for Recording {
             .lock()
             .unwrap()
             .push((who.clone(), input.unit.description.clone()));
-        let output = if who == "claude" {
+        let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+        let body = if who == "claude" {
             // The creator's seat, were it ever asked, would vouch for everything.
-            "RULE R1: KEPT — I wrote it\nRULE R2: KEPT — trust me".to_string()
+            "RULE R1: KEPT — src/a.rs I wrote it\nRULE R2: KEPT — src/a.rs trust me"
         } else {
-            "RULE R1: KEPT — src/a.rs:1 adds the typed signature".to_string()
+            "RULE R1: KEPT — src/a.rs:1 adds the typed signature"
         };
+        let output = format!("BEGIN VERDICTS {nonce}\n{body}\nEND VERDICTS {nonce}\n");
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: 0,
@@ -177,10 +179,10 @@ fn the_creator_never_judges_and_its_words_never_set_a_verdict() {
     let report = run_rule_check(
         &input,
         &["claude".to_string()],
-        &[],
+        Some(&[]),
         &pool,
         &pool,
-        Some("cargo test: passed"),
+        None,
         &runner,
         &sink,
     )
@@ -233,7 +235,7 @@ fn with_only_the_creators_seat_every_rule_is_unchecked_and_nobody_is_asked() {
     let report = run_rule_check(
         &input,
         &["claude".to_string()],
-        &[],
+        Some(&[]),
         &pool,
         &pool,
         None,
@@ -262,7 +264,7 @@ fn a_seat_sharing_the_creators_binary_is_not_distinct() {
     let report = run_rule_check(
         &input,
         &["claude".to_string()],
-        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
         &pool,
         &pool,
         None,
@@ -288,7 +290,7 @@ fn an_unchanged_worktree_has_nothing_to_check() {
     assert!(run_rule_check(
         &input,
         &["claude".into()],
-        &[],
+        Some(&[]),
         &pool,
         &pool,
         None,
@@ -296,4 +298,172 @@ fn an_unchanged_worktree_has_nothing_to_check() {
         &sink
     )
     .is_none());
+}
+
+fn check_with(
+    input: &StepInput,
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+) -> (crate::rule_check::RuleCheckReport, Vec<(String, String)>) {
+    let runner = Recording(Mutex::new(Vec::new()));
+    let sink = |_: &str| {};
+    let report = run_rule_check(
+        input,
+        &["claude".to_string()],
+        creator_bins,
+        pool,
+        pool,
+        None,
+        &runner,
+        &sink,
+    )
+    .expect("a report");
+    let asked = runner.0.into_inner().unwrap();
+    (report, asked)
+}
+
+/// codex r1: an alias whose invocation runs the creator's binary through a QUOTED path is the
+/// creator's binary all the same.
+#[test]
+fn a_quoted_path_to_the_creators_binary_is_not_distinct() {
+    let (repo, base, db) = fixture("quoted");
+    let input = review_input(&repo, &base, &db);
+    let mut alias = seat("helper");
+    alias.headless_invocation = "\"/opt/Claude Tools/claude\" -p {PROMPT}".into();
+    let (report, asked) = check_with(&input, Some(&[]), &[seat("claude"), alias]);
+    assert!(asked.is_empty(), "{asked:?}");
+    assert!(report.hold().is_some());
+}
+
+/// codex r1: when a creator's binary is not recorded, no judge can be shown distinct: hold.
+#[test]
+fn an_unrecorded_creator_binary_holds_instead_of_guessing() {
+    let (repo, base, db) = fixture("unrecorded");
+    let input = review_input(&repo, &base, &db);
+    let (report, asked) = check_with(&input, None, &[seat("claude"), seat("codex")]);
+    assert!(asked.is_empty());
+    assert!(report
+        .rows
+        .iter()
+        .all(|r| r.status == crate::rule_check::RuleStatus::Unchecked));
+    assert!(report
+        .note
+        .as_deref()
+        .is_some_and(|n| n.contains("no recorded binary")));
+}
+
+/// codex r1: a unit with a baseline but no recorded run base cannot say what changed: hold.
+#[test]
+fn a_missing_run_base_holds() {
+    let (repo, base, db) = fixture("nobase");
+    let mut input = review_input(&repo, &base, &db);
+    input.unit.run_base_commit = None;
+    input.unit.worktree_baseline = Some(
+        serde_json::from_value(serde_json::json!({"head": base, "tree": "t", "taken_at_ms": 1}))
+            .expect("baseline"),
+    );
+    let (report, asked) = check_with(&input, Some(&[]), &[seat("codex")]);
+    assert!(asked.is_empty());
+    assert!(report
+        .hold()
+        .is_some_and(|d| d.reason.contains("run base is not recorded")));
+}
+
+/// pi/codex r1: every untracked file is read (no cap), and a creator's `.gitattributes` cannot turn
+/// a source change into a binary summary.
+#[test]
+fn the_change_is_read_whole_and_as_text() {
+    let (repo, base, db) = fixture("whole");
+    for i in 0..230 {
+        std::fs::write(repo.join(format!("a{i:03}.txt")), "junk\n").unwrap();
+    }
+    std::fs::write(repo.join("zz_late.rs"), "fn late() { unsafe_call() }\n").unwrap();
+    std::fs::write(repo.join(".gitattributes"), "*.rs binary\n").unwrap();
+    let change = crate::rule_check::worktree_diff(&repo, None, &base).expect("read");
+    assert!(
+        change.diff.contains("unsafe_call"),
+        "the 231st untracked file is in the diff"
+    );
+    assert!(
+        change.diff.contains("fn add(a: i32"),
+        "binary attribute ignored"
+    );
+    assert!(change.paths.iter().any(|(p, _)| p == "zz_late.rs"));
+    let _ = db;
+}
+
+/// S3: the base tree with the change's tests in it is the base plus exactly those files.
+#[test]
+fn the_base_tree_with_the_tests_holds_the_base_and_the_tests() {
+    let (repo, base, _db) = fixture("basetree");
+    std::fs::create_dir_all(repo.join("tests")).unwrap();
+    std::fs::write(repo.join("tests/add_test.rs"), "#[test] fn t() {}\n").unwrap();
+    let git_dir = repo.join(".git");
+    let tree = base_tree_with(&repo, &git_dir, &base, &["tests/add_test.rs".to_string()]).unwrap();
+    let ls = git(&repo, &["ls-tree", "-r", "--name-only", &tree]);
+    assert_eq!(
+        ls.lines().collect::<Vec<_>>(),
+        ["src/a.rs", "tests/add_test.rs"]
+    );
+    let a = git(&repo, &["show", &format!("{tree}:src/a.rs")]);
+    assert_eq!(a, "fn add() {}", "the base's source, not the fix");
+}
+
+fn report_of(checks: serde_json::Value) -> crate::repo_checks::RepoChecksReport {
+    serde_json::from_value(serde_json::json!({
+        "detected": [], "checks": checks, "skipped": [], "passed": false, "sandbox_level": "none"
+    }))
+    .expect("a report")
+}
+
+fn run_of(name: &str, exit: i32) -> serde_json::Value {
+    serde_json::json!({"name": name, "argv": ["x"], "source": "s", "exit_code": exit,
+        "timed_out": false, "duration_ms": 1, "stdout_tail": "", "stderr_tail": ""})
+}
+
+/// S3: a test-set check that fails on the base-with-tests tree is a test that fails without the
+/// change; all passing is a test that does not; no test command falls back to the judge.
+#[test]
+fn the_base_run_decides_kept_broken_or_the_judge() {
+    use crate::rule_check::{MachineOutcome, RuleStatus};
+    let tests = vec!["tests/add_test.rs".to_string()];
+    let verdict = |r| decide_tests_on_base(&r, "b0", &tests, Some(true));
+    match verdict(report_of(serde_json::json!([
+        run_of("install", 0),
+        run_of("test_targeted", 101)
+    ]))) {
+        MachineOutcome::Verdict {
+            status: RuleStatus::Kept,
+            reason,
+        } => {
+            assert!(reason.contains("fail on the base"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+    match verdict(report_of(serde_json::json!([run_of("test", 0)]))) {
+        MachineOutcome::Verdict {
+            status: RuleStatus::Broken,
+            reason,
+        } => {
+            assert!(reason.contains("pass on the base"), "{reason}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        verdict(report_of(serde_json::json!([run_of("lint", 1)]))),
+        MachineOutcome::Fallback(_)
+    ));
+    assert!(
+        matches!(
+            verdict(report_of(serde_json::json!([
+                run_of("install", 1),
+                run_of("test", 0)
+            ]))),
+            MachineOutcome::Verdict {
+                status: RuleStatus::Broken,
+                ..
+            }
+        ),
+        "a failed install is not a failing test"
+    );
 }

@@ -1890,12 +1890,14 @@ pub(crate) fn apply_and_finish_unit(
         // question, never a governance veto hidden behind it. (core#969, codex r1) That holds for
         // the REQUIRED judge's hold too (`judge_hold`, same source): it used to rank above the
         // evaluator's and the hook's denials, so an approve there could count a vetoed unit.
+        // (DES-RULE-CHECK-001 S2, operator decision 1) A rule no judge ruled on HOLDS the gate:
+        // it wins only when no verdict denied, and AHEAD of the judge's own holds, so an operator
+        // judgment that answers a missing judge can never also count an unchecked rule (its gate
+        // takes `retry_rules` / `skip_rules`, each skip with its reason).
+        rule_hold,
         judge_hold,
         unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
         qe_unavailable,
-        // (DES-RULE-CHECK-001 S2, operator decision 1) A rule no judge ruled on HOLDS the gate —
-        // like a missing required judge, it wins only when nothing else denied.
-        rule_hold,
     ]
     .into_iter()
     .flatten();
