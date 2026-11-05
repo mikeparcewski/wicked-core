@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **`matchRules`: which in-force rules a job is checked against, each with the facts that decided it
+  (DES-RULE-CHECK-001 S1).** crew's launch brief listed a project's rules in severity order and stopped at 20, so on
+  the end-to-end pass a bug job's brief carried 14 MCP-server and review-loop rules ahead of `learn-tests-with-fixes`
+  and left it out. `wicked_governance::match_rules` (core-ts `Core.matchRules`, `{rules, job}` in, `{matches}` out)
+  answers one match per rule, none dropped: **applies** (a fact selects it), **may apply** (nothing decides it yet),
+  or **not applicable** (a recorded fact rules it out). The facts: no step of the job selects it, with `select_any`'s
+  own semantics (each step's literal tokens: `unit-<n>`, phase id, catalog id; exclusion dominates per step); its
+  `applies_to` names only tool tokens, which the MCP and editor gates judge per call; another project; a facet or a
+  trigger the diff does not meet. A fact not known yet decides nothing: at launch a run's steps are not known (it may
+  be planned into catalog steps), so step scopes stay "may apply" with that said, and there is no diff. Pure: no
+  store, no model. Ships to crew with the next core-ts release; crew lists every rule as "may apply" on an engine
+  without it.
 - **`judgeMcpCall`: one MCP call judged WITH its arguments, recorded nowhere (crew#1337).** crew's data gate judged
   a live source's call (`mcp:<source>/<tool>`) by the unit's tool list, which judges every call with no arguments by
   design, so an operator rule whose `trigger.contains` matches the call's arguments (a word in the SQL) never fired
