@@ -167,6 +167,8 @@ fn run_on(
             base: "b0",
             instructions: None,
             packs: &[],
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         judge,
         machine,
@@ -486,6 +488,8 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             base: "b0",
             instructions: None,
             packs: &[],
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         &judge,
         &NoMachine,
@@ -589,6 +593,8 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             base: "b0",
             instructions: None,
             packs: &[],
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         &judge,
         &NoMachine,
@@ -920,6 +926,8 @@ fn run_told(
             base: "b0",
             instructions: Some(TOUCH_NO_TEST),
             packs: &[],
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         judge,
         &NoMachine,
@@ -1139,6 +1147,8 @@ fn changed_instructions_check_the_rule_again() {
             base: "b0",
             instructions: Some("A new instruction from the person."),
             packs: &[],
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         &judge,
         &NoMachine,
@@ -1189,6 +1199,8 @@ fn a_guidance_pack_rule_is_a_fact_row_and_asks_no_judge() {
             base: "b0",
             instructions: None,
             packs: &packs,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
         },
         &judge,
         &NoMachine,
@@ -1202,4 +1214,140 @@ fn a_guidance_pack_rule_is_a_fact_row_and_asks_no_judge() {
     assert!(crate::steering_packs::shipped_rule_ids()
         .iter()
         .any(|i| i == "RVWL-1002"));
+}
+
+// ── SWAP 6: a rule whose subject only exists at delivery ────────────────────────────────────────
+
+fn linked_issue() -> ConformanceRule {
+    let mut r = rule(
+        "learn-linked-issue",
+        "Every pull request names the issue it closes in its description.",
+    );
+    r.obligations = vec![OBLIGATION_EVIDENCE_DELIVERY.into()];
+    r
+}
+
+fn run_stage(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    stage: CheckStage,
+    deliver_tokens: &[String],
+) -> RuleCheckReport {
+    let f = job_facts(&[], None, None, c);
+    let seats = seats();
+    check(
+        &CheckInput {
+            rules,
+            facts: &f,
+            change: c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            packs: &[],
+            stage,
+            deliver_tokens,
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+/// The control: a delivery-only rule (by recorded fact: its obligation, or `applies_to` naming
+/// only the deliver step) never holds review or QE; it is deferred, with no judge call. A rule
+/// with no such fact is still asked, and still holds when nobody answers.
+#[test]
+fn a_delivery_only_rule_never_holds_review_and_an_ordinary_one_still_does() {
+    let mut by_step = rule("PR-TITLE", "The pull request title says what changed.");
+    by_step.applies_to = vec!["deliver".into()];
+    let tokens = vec!["unit-7".to_string(), "deliver".to_string()];
+    let judge = Fake::new(&[]);
+    let r = run_stage(
+        &[linked_issue(), by_step],
+        &change(),
+        &judge,
+        CheckStage::Review,
+        &tokens,
+    );
+    assert!(
+        r.rows
+            .iter()
+            .all(|x| x.status == RuleStatus::Deferred && x.how == RuleHow::Fact),
+        "{:?}",
+        r.rows
+    );
+    assert!(r.hold().is_none() && r.denial().is_none());
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        r.summary().contains("2 deferred to delivery"),
+        "{}",
+        r.summary()
+    );
+    // Without a recorded fact the same words are an ordinary rule: asked, and unchecked holds.
+    let plain = rule(
+        "learn-linked-issue",
+        "Every pull request names the issue it closes in its description.",
+    );
+    let r = run_stage(&[plain], &change(), &judge, CheckStage::Review, &tokens);
+    assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
+    assert!(r.hold().is_some());
+}
+
+/// At delivery only the deferred rules are checked, against the pull request's text: broken
+/// denies, a silent judge holds, and a KEPT cites the text (there are no files).
+#[test]
+fn at_delivery_the_deferred_rules_are_checked_against_the_pr_text() {
+    let pr = "Fix sum()\n\nsum() skipped the first element.\n";
+    let c = Change {
+        diff: pr.into(),
+        paths: Vec::new(),
+        raw: pr.as_bytes().to_vec(),
+        tree: None,
+    };
+    let rules = [linked_issue(), rule("DEV-1", "code rule")];
+    let broken = Fake::new(&[(
+        "learn-linked-issue",
+        "BROKEN — the description names no issue",
+    )]);
+    let r = run_stage(&rules, &c, &broken, CheckStage::Delivery, &[]);
+    assert_eq!(r.rows.len(), 1, "only the deferred rule: {:?}", r.rows);
+    assert_eq!(r.denial().unwrap().rule_ids, ["learn-linked-issue"]);
+    assert!(broken.prompts.lock().unwrap()[0]
+        .1
+        .contains("the pull request's text"));
+    let kept = Fake::new(&[(
+        "learn-linked-issue",
+        "KEPT — the description says Fixes #12",
+    )]);
+    assert_eq!(
+        run_stage(&rules, &c, &kept, CheckStage::Delivery, &[]).rows[0].status,
+        RuleStatus::Kept
+    );
+    let silent = Fake::new(&[]);
+    let r = run_stage(&rules, &c, &silent, CheckStage::Delivery, &[]);
+    assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
+    assert!(r.hold().is_some());
+}
+
+#[test]
+fn the_delivery_verdict_replaces_the_reviews_deferral() {
+    let row = |s: RuleStatus| RuleVerdict {
+        rule_id: "learn-linked-issue".into(),
+        status: s,
+        how: RuleHow::Judge,
+        reason: String::new(),
+        cite: None,
+        judge: None,
+        rule_key: String::new(),
+        evidence_key: None,
+    };
+    let out = aggregate([
+        &[row(RuleStatus::Deferred)][..],
+        &[row(RuleStatus::NotApplicable)][..],
+    ]);
+    assert_eq!(out[0].status, RuleStatus::NotApplicable);
 }

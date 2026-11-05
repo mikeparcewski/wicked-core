@@ -1538,6 +1538,10 @@ pub struct WorkUnit {
     /// from a plan's step text: the only authority a rule can be waived by.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_instructions: Option<String>,
+    /// (SWAP 6) The run's deliver step's selection tokens, stamped at dispatch on a review unit: a
+    /// rule scoped only to them is deferred to delivery there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_deliver_tokens: Vec<String>,
     /// (DES-TEAMING-002 §8.8) A team member turn's READ-ONLY view of the repository: a directory
     /// holding the checkpoint tree the member reviews, materialized for that one turn
     /// (`acp_runner::RunnerHost`). The wrapped runner mounts it read-only into the member's seat
@@ -1836,6 +1840,7 @@ impl WorkUnit {
             rule_check: None,
             rule_skips: Vec::new(),
             rule_instructions: None,
+            rule_deliver_tokens: Vec::new(),
             read_view: None,
         }
     }

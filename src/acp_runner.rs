@@ -3605,6 +3605,7 @@ mod tests {
             rule_check: None,
             rule_skips: Vec::new(),
             rule_instructions: None,
+            rule_deliver_tokens: Vec::new(),
             read_view: None,
         }
     }

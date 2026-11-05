@@ -11117,6 +11117,7 @@ fn dispatch_unit(
                 } else {
                     crate::domain::session_units(&*store, run_id)?
                 };
+                stamped.rule_deliver_tokens = crate::rule_check::deliver_tokens_of(&all);
                 crate::rule_check::steps_of(&all)
             } else {
                 Vec::new()
@@ -11137,6 +11138,7 @@ fn dispatch_unit(
             || unit.qe_floor_note != stamped.qe_floor_note
             || unit.rule_steps != stamped.rule_steps
             || unit.rule_instructions != stamped.rule_instructions
+            || unit.rule_deliver_tokens != stamped.rule_deliver_tokens
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -11586,6 +11588,45 @@ fn dispatch_unit(
         // registered repo it was linked from — resolved HERE (the actor holds the store), applied
         // off-thread below before the push runs. `None` for every other tool unit.
         let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
+        // (SWAP 6) The deliver step's rule check: the rules deferred to delivery, judged against
+        // the pull request's text once the delivery wrote it. Resolved here (the actor holds the
+        // store); `None` for every other tool unit or a run with no file-backed rule store.
+        let delivery_rules = crate::deliver_lift::is_deliver_unit(unit)
+            .then(in_process_governance)
+            .flatten()
+            .map(|g| {
+                let (_, registry) = judge_registries();
+                let pool: Vec<crate::AgenticCli> = registry
+                    .iter()
+                    .filter(|c| session.clis.iter().any(|k| k == &c.key))
+                    .filter(|c| !session.benched_seats.iter().any(|b| b.cli == c.key))
+                    .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+                    .cloned()
+                    .collect();
+                let mut words = session.problem.clone();
+                for a in &session.intent_amendments {
+                    words.push_str("\n\nApproved amendment: ");
+                    words.push_str(&a.text);
+                }
+                crate::cli_runner::DeliveryRuleCtx {
+                    db_path: g.db_path,
+                    project: session.project_id.clone(),
+                    repo: session.repo_ref.clone(),
+                    creators: crate::pipeline::fallback_work_authors(&units, unit.ord),
+                    creator_bins: crate::pipeline::work_author_binaries(&units, unit.ord),
+                    exclude_seats: unit.exclude_seats.clone(),
+                    pool,
+                    registry,
+                    runner: runner.clone(),
+                    prior: unit.rule_check.clone(),
+                    skips: unit.rule_skips.clone(),
+                    instructions: crate::rule_check::instructions_of(&words),
+                    deliver_tokens: crate::rule_check::deliver_tokens_of(std::slice::from_ref(
+                        unit,
+                    )),
+                    base: session.base_commit.clone().unwrap_or_default(),
+                }
+            });
         // (WT-C2) A `walkthrough_review` unit: its proof root, declared env and the tree under
         // review, resolved here (the actor holds the store; the snapshot writes git objects, so it
         // is taken outside the jail). `None` for every other tool unit.
@@ -11897,6 +11938,13 @@ fn dispatch_unit(
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 launch_seq: my_seq,
             });
+            // (SWAP 6) Once the delivery wrote the pull request, its deferred rules are checked.
+            let delivery_rule_check = match (&delivery_rules, status, workdir.as_deref()) {
+                (Some(ctx), crate::workflow::StepStatus::Ok, Some(wd)) => {
+                    crate::cli_runner::delivery_rule_check(ctx, std::path::Path::new(wd))
+                }
+                _ => None,
+            };
             let _ = tx.send(crate::command::Command::ApplyStepResult {
                 output: crate::workflow::StepOutput {
                     run_id: run_id2,
@@ -11928,7 +11976,7 @@ fn dispatch_unit(
                     team: None,
                     qe_review: None,
                     bench_reprobes: Vec::new(),
-                    rule_check: None,
+                    rule_check: delivery_rule_check,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal

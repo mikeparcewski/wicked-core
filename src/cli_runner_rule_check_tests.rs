@@ -661,3 +661,50 @@ fn the_seat_that_fixed_this_units_tree_never_judges_it() {
     assert!(asked.iter().all(|(who, _)| who != "codex"), "{asked:?}");
     assert!(report.hold().is_some(), "no other distinct seat: held");
 }
+
+/// (SWAP 6) The deliver step checks a rule deferred to delivery against the delivered commit's
+/// message (the pull request's text): broken denies; a store with no deferred rule checks nothing.
+#[test]
+fn the_deliver_step_checks_a_deferred_rule_against_the_pr_text() {
+    let (repo, _base, db) = fixture("deliver");
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "Fix add()\n\nadd() now takes two numbers."],
+    );
+    let ctx = |db: &str| DeliveryRuleCtx {
+        db_path: db.to_string(),
+        project: None,
+        repo: None,
+        creators: vec!["claude".into()],
+        creator_bins: Some(Vec::new()),
+        exclude_seats: Vec::new(),
+        pool: vec![seat("claude"), seat("codex")],
+        registry: vec![seat("claude"), seat("codex")],
+        runner: Arc::new(Breaks(Mutex::new(Vec::new()))),
+        prior: None,
+        skips: Vec::new(),
+        instructions: String::new(),
+        deliver_tokens: Vec::new(),
+        base: String::new(),
+    };
+    assert!(
+        delivery_rule_check(&ctx(&db), &repo).is_none(),
+        "R1 and R2 are review rules"
+    );
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut r = wicked_governance::ConformanceRule {
+            id: "learn-linked-issue".into(),
+            rule_type: wicked_governance::RuleType::Pattern,
+            statement: "Every pull request names the issue it closes in its description.".into(),
+            severity: wicked_governance::ConfSeverity::Warn,
+            ..Default::default()
+        };
+        r.obligations = vec![crate::rule_check::OBLIGATION_EVIDENCE_DELIVERY.into()];
+        wicked_governance::register_rule(&mut store, &r).unwrap();
+    }
+    let report = delivery_rule_check(&ctx(&db), &repo).expect("checked");
+    assert_eq!(report.rows.len(), 1, "{:?}", report.rows);
+    assert_eq!(report.denial().unwrap().rule_ids, ["learn-linked-issue"]);
+}
