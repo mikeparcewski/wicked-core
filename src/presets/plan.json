@@ -1,0 +1,33 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "skill_ref": "wicked-garden-product-requirements-analyst",
+   "instructions": "Phase 1/3 SCOPE (requirements analyst): read the ask and the code and documents in scope; state the goal, what is in and out of scope, the constraints, the acceptance criteria and the open questions, each grounded in the code at file:line or in the ask's own words. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "understand",
+   "id": "plan",
+   "depends_on": [
+    "scope"
+   ],
+   "skill_ref": "wicked-garden-deliberate",
+   "instructions": "Phase 2/3 PLAN (deliberate skill): from the scope, write the plan as a numbered list of steps. Each step is one job a person can start: its kind of work (build a feature, fix a bug, migrate, write tests, document, review), what it changes and why, what it depends on, its risk and how it will be checked. Name the alternatives you weighed and why this order wins. The plan is your reply. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "scope",
+    "plan"
+   ],
+   "skill_ref": "wicked-garden-qe-requirements-quality-analyst",
+   "instructions": "Phase 3/3 CHECK (requirements quality analyst): judge the plan against the scope: every acceptance criterion is covered by a step, every step traces to the scope, the order respects the dependencies, and each step names its risk and its check. List the gaps, most important first. PASS only when every criterion is covered and every claim about the code holds."
+  }
+ ]
+}

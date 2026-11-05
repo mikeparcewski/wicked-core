@@ -168,6 +168,13 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
     vec![
         ("analyze", analyze_preset()),
         (
+            "analyze-codebase",
+            catalog_preset(
+                include_str!("presets/analyze-codebase.json"),
+                "analyze-codebase",
+            ),
+        ),
+        (
             crate::apps::APPS_PUBLISH,
             apps_preset(include_str!("presets/apps-publish.json"), "apps-publish"),
         ),
@@ -178,6 +185,17 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         ("bug", bug_preset()),
         ("capture-learnings", capture_learnings_preset()),
         ("chat", chat_preset()),
+        (
+            "compliance-review",
+            catalog_preset(
+                include_str!("presets/compliance-review.json"),
+                "compliance-review",
+            ),
+        ),
+        (
+            "decide",
+            catalog_preset(include_str!("presets/decide.json"), "decide"),
+        ),
         ("demo", demo_preset()),
         (
             "docs",
@@ -207,12 +225,76 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
                 "interactive-edit",
             ),
         ),
+        (
+            "investigate-incident",
+            catalog_preset(
+                include_str!("presets/investigate-incident.json"),
+                "investigate-incident",
+            ),
+        ),
         ("learn", learn_preset()),
+        (
+            "map-requirements",
+            catalog_preset(
+                include_str!("presets/map-requirements.json"),
+                "map-requirements",
+            ),
+        ),
         ("mcp-server", mcp_server_preset()),
         ("migration", migration_preset()),
+        (
+            "modernize",
+            catalog_preset(include_str!("presets/modernize.json"), "modernize"),
+        ),
         ("onboarding", onboarding_preset()),
+        (
+            "plan",
+            catalog_preset(include_str!("presets/plan.json"), "plan"),
+        ),
+        (
+            "privacy-review",
+            catalog_preset(
+                include_str!("presets/privacy-review.json"),
+                "privacy-review",
+            ),
+        ),
         ("qe-author-tests", qe_author_tests_preset()),
+        (
+            "reconstruct",
+            catalog_preset(include_str!("presets/reconstruct.json"), "reconstruct"),
+        ),
+        (
+            "refactor",
+            catalog_preset(include_str!("presets/refactor.json"), "refactor"),
+        ),
+        (
+            "release",
+            catalog_preset(include_str!("presets/release.json"), "release"),
+        ),
+        (
+            "review-change",
+            catalog_preset(include_str!("presets/review-change.json"), "review-change"),
+        ),
+        (
+            "risk-analysis",
+            catalog_preset(include_str!("presets/risk-analysis.json"), "risk-analysis"),
+        ),
+        (
+            "scaffold",
+            catalog_preset(include_str!("presets/scaffold.json"), "scaffold"),
+        ),
+        (
+            "security-review",
+            catalog_preset(
+                include_str!("presets/security-review.json"),
+                "security-review",
+            ),
+        ),
         ("steering-author", steering_author_preset()),
+        (
+            "suite-health",
+            catalog_preset(include_str!("presets/suite-health.json"), "suite-health"),
+        ),
         (
             "test-analysis",
             interactive_preset(include_str!("presets/test-analysis.json"), "test-analysis"),
@@ -245,7 +327,17 @@ pub fn builtin_preset_instruments(name: &str) -> Option<Vec<String>> {
     // (§9.3) An Apps publish requires QE acceptance, which its launch forces.
     matches!(
         name,
-        "feature" | "bug" | "editor-plugin" | "mcp-server" | "migration" | "apps-publish"
+        "feature"
+            | "bug"
+            | "editor-plugin"
+            | "mcp-server"
+            | "migration"
+            | "apps-publish"
+            // (DES-CATALOG-002 §5.1) The catalog's new application-changing presets.
+            | "modernize"
+            | "refactor"
+            | "release"
+            | "scaffold"
     )
     .then(|| {
         [
@@ -459,6 +551,137 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             &[
                 "are the docs still true",
                 "find stale commands, flags or examples",
+            ],
+        ),
+        // (DES-CATALOG-002 §3) The catalog-by-verb presets.
+        "analyze-codebase" => (
+            "Analyze a codebase",
+            "Explain how part of the code works, from its entry points to its effects, every claim checked.",
+            &[
+                "how does this part of the system work",
+                "map the flows and modules of a service",
+            ],
+        ),
+        "compliance-review" => (
+            "Compliance review",
+            "Check the code against a standard or policy, control by control, with cited evidence and gaps.",
+            &[
+                "are we compliant with this policy",
+                "audit our controls against a standard",
+            ],
+        ),
+        "decide" => (
+            "Decide (ADR)",
+            "Lay out the options for a decision, score them with evidence, and record the option you pick.",
+            &[
+                "choose between two or more approaches",
+                "write up an architecture decision",
+            ],
+        ),
+        "investigate-incident" => (
+            "Incident or root cause",
+            "Find the root cause of an incident from its error, logs and timeline, cited, changing nothing.",
+            &[
+                "why did this break in production",
+                "find the root cause of an outage",
+                "explain this error from its logs",
+            ],
+        ),
+        "map-requirements" => (
+            "Map requirements",
+            "Trace each requirement to the code and tests that satisfy it, and name what is missing.",
+            &[
+                "which requirements are implemented",
+                "build a traceability matrix",
+            ],
+        ),
+        "modernize" => (
+            "Modernize (move)",
+            "Move a system to a new stack: discover, blueprint, transform, check parity, cut over and clean up.",
+            &[
+                "move a service to a new language or stack",
+                "replace a legacy component",
+            ],
+        ),
+        "plan" => (
+            "Plan it",
+            "Turn an ask into a checked plan of jobs, each with its risk and how it will be checked.",
+            &[
+                "plan a larger piece of work",
+                "break an idea into jobs",
+            ],
+        ),
+        "privacy-review" => (
+            "Privacy review",
+            "Check how the code handles personal data: collection, storage, access, sharing, retention.",
+            &[
+                "where do we handle personal data",
+                "review a change for privacy",
+            ],
+        ),
+        "reconstruct" => (
+            "Reconstruct what happened",
+            "Build a cited timeline of what changed and how it led to an outcome, changing nothing.",
+            &[
+                "what changed before this broke",
+                "reconstruct the history of a decision",
+            ],
+        ),
+        "refactor" => (
+            "Refactor or polish",
+            "Restructure or tidy code without changing what it does, with parity checked before and after.",
+            &[
+                "clean up or restructure code",
+                "rename or simplify without behaviour change",
+            ],
+        ),
+        "release" => (
+            "Prepare a release",
+            "Check release readiness, bump versions and write the changelog in a pull request; never tags.",
+            &[
+                "prepare the next release",
+                "bump versions and write the changelog",
+            ],
+        ),
+        "review-change" => (
+            "Review a change",
+            "Review a pull request, branch or commit and recommend approve, conditions or reject.",
+            &[
+                "review this pull request",
+                "is this change safe to merge",
+            ],
+        ),
+        "risk-analysis" => (
+            "Risk analysis",
+            "Assess the risks of a change or area from its blast radius, tests and churn, as a risk matrix.",
+            &[
+                "what could go wrong with this change",
+                "assess the risk of touching this code",
+            ],
+        ),
+        "scaffold" => (
+            "Start something new",
+            "Shape, design, build and test a new command-line tool, service or library.",
+            &[
+                "start a new CLI, service or library",
+                "scaffold a new project",
+            ],
+        ),
+        "security-review" => (
+            "Security review",
+            "Review the code for vulnerabilities and weaknesses, each cited with its fix.",
+            &[
+                "review this code for security issues",
+                "check our attack surface",
+            ],
+        ),
+        "suite-health" => (
+            "Keep the suite healthy",
+            "Find and fix flaky, weak, stale-snapshot or slow tests without touching the code under test.",
+            &[
+                "fix flaky tests",
+                "strengthen weak tests",
+                "speed up a slow test suite",
             ],
         ),
         _ => return None,
@@ -799,10 +1022,19 @@ fn migration_preset() -> Vec<PlanStep> {
             }),
             ..step("build", "cutover", Some("execute"))
         },
-        step("test", "verify", Some("cutover")),
+        // (DES-CATALOG-002 §5.1) verify checks parity, and parity is checked again on the final
+        // tree, after cleanup (the freshness rule would add it; the preset names it).
+        PlanStep {
+            rubric: Some(crate::rubric::PARITY.to_string()),
+            ..step("test", "verify", Some("cutover"))
+        },
         PlanStep {
             gate_type: Some(None),
             ..step("build", "cleanup", Some("verify"))
+        },
+        PlanStep {
+            rubric: Some(crate::rubric::PARITY.to_string()),
+            ..step("test", "parity", Some("cleanup"))
         },
     ]
 }
@@ -830,6 +1062,19 @@ fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
 /// (`wicked-crew apps-produce`) behind `consent_before`, depending on the check alone: its consent
 /// card is read from the trusted check's output, never from the QE seat's. They launch as FIXED plans
 /// ([`crate::apps`]): never scoped, floor-filled or re-planned by the plan gate.
+/// (DES-CATALOG-002 §3.2) The catalog-by-verb presets as data (`src/presets/<name>.json`): each a
+/// plan over existing catalog entries and garden skills, judged by a rubric ([`crate::rubric`]) on
+/// its check step. The read-only ones (Investigate, Analyze, Judge: `investigate-incident`,
+/// `reconstruct`, `analyze-codebase`, `map-requirements`, `review-change`, `risk-analysis`,
+/// `security-review`, `privacy-review`, `compliance-review`, `decide`) and `plan` (its plan is the
+/// reply) have no creator, no Tool and no code step, so they never write and never deliver;
+/// `refactor`, `release`, `scaffold`, `modernize` and `suite-health` change the repo.
+fn catalog_preset(json: &str, name: &str) -> Vec<PlanStep> {
+    let plan: crate::plan::PlanSteps = serde_json::from_str(json)
+        .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
+    plan.steps
+}
+
 fn apps_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)
         .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
@@ -1173,6 +1418,7 @@ fn entry(
         executor: PhaseExecutor::Agent,
         owner: StepOwner::Pa,
         catalog: None,
+        rubric: None,
         repeat_from: None,
     }
 }
@@ -1637,6 +1883,8 @@ mod tests {
             ("bug", "triage"),
             ("capture-learnings", "churn"),
             ("capture-learnings", "hotspots"),
+            // (DES-CATALOG-002 §6) Investigate's research step is a team step at every depth.
+            ("investigate-incident", "trace"),
             ("learn", "research"),
             ("mcp-server", "source-discovery"),
         ]
@@ -1836,5 +2084,264 @@ mod tests {
             !DEMO_RECORD_INSTRUCTIONS.contains("DEMO_ALLOW_WRITES"),
             "{DEMO_RECORD_INSTRUCTIONS}"
         );
+    }
+
+    /// (DES-CATALOG-002 §3.1) The read-only verbs: every Investigate, Analyze and Judge preset —
+    /// and Plan it, whose plan is its reply (a report, never a change).
+    const READ_ONLY_PRESETS: [&str; 12] = [
+        "plan",
+        "investigate-incident",
+        "reconstruct",
+        "analyze-codebase",
+        "map-requirements",
+        "validate-docs",
+        "review-change",
+        "risk-analysis",
+        "security-review",
+        "privacy-review",
+        "compliance-review",
+        "decide",
+    ];
+
+    /// (DES-CATALOG-002 §11 Lane A) Every Investigate, Analyze and Judge preset composes with no
+    /// deliver step and no step that may write: no creator, no Tool, nothing that executes code —
+    /// and, with no creator, floor fill adds nothing (no deliver either) even at the top band on a
+    /// delivering run. Each ends in a cited-findings critique held for a person when it fails. The
+    /// one exception is Domain (`domain-extraction`), whose writes are bounded to `.wicked/domain/`
+    /// and the project graph and which never delivers (Q17; `tests/domain_extraction_e2e.rs`
+    /// asserts the run's diff).
+    #[test]
+    fn every_investigate_analyze_and_judge_preset_is_read_only_and_never_delivers() {
+        use crate::workflow::{GateCond, GateSpec};
+        for name in READ_ONLY_PRESETS {
+            let steps = builtin_preset(name).unwrap_or_else(|| panic!("{name} is a built-in"));
+            let plan = crate::plan::PlanSteps {
+                steps: steps.clone(),
+                ..Default::default()
+            };
+            assert!(!plan.has_creator(), "{name} has a creator");
+            for s in &steps {
+                assert!(
+                    !matches!(s.catalog.as_str(), "build" | "produce" | "run" | "deliver"),
+                    "{name}/{}: {}",
+                    s.id,
+                    s.catalog
+                );
+                assert_ne!(s.executes_code, Some(true), "{name}/{}", s.id);
+            }
+            let def = composed(name);
+            for p in &def.phases {
+                assert!(!p.executes_code, "{name}/{} executes code", p.id);
+                assert!(!is_tool_entry(p), "{name}/{} is a Tool", p.id);
+                assert_ne!(p.role, PhaseRole::Creator, "{name}/{}", p.id);
+            }
+            let last = def.phases.last().unwrap();
+            assert_eq!(last.catalog.as_deref(), Some("critique"), "{name}");
+            assert_eq!(
+                last.rubric.as_deref(),
+                Some(crate::rubric::CITED_FINDINGS),
+                "{name}"
+            );
+            // validate-docs keeps its own (no gate on `verify`, §5.2); every new one holds a FAIL.
+            let gate = if name == "validate-docs" {
+                GateSpec::Auto
+            } else {
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass)
+            };
+            assert_eq!(last.gate, gate, "{name}");
+            let deliver = ["wicked-crew".to_string(), "deliver".to_string()];
+            let filled = crate::plan::floor_fill(
+                catalog(),
+                &plan,
+                crate::plan::FloorInput {
+                    score: 100,
+                    destructive: true,
+                    human_confirm: &crate::domain::HumanConfirm::None,
+                    deliver: Some(&deliver),
+                    obligations: &[],
+                    ran: &[],
+                    requires_evaluator: true,
+                    requires_qe: true,
+                    power_absorbs: &[],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(
+                filled.steps.steps.len(),
+                steps.len(),
+                "{name}: the floor adds nothing"
+            );
+            assert!(filled.floor.is_empty(), "{name}");
+            // Never QE acceptance: a read-only run changes no application.
+            assert_eq!(builtin_preset_instruments(name), None, "{name}");
+        }
+        // The bounded exception: Domain's one creator is its `produce` extract step.
+        let domain = builtin_preset("domain-extraction").unwrap();
+        let creators: Vec<&str> = domain
+            .iter()
+            .filter(|s| catalog_entry(&s.catalog).is_some_and(|e| e.role == PhaseRole::Creator))
+            .map(|s| s.catalog.as_str())
+            .collect();
+        assert_eq!(creators, ["produce"]);
+        assert!(!domain
+            .iter()
+            .any(|s| s.catalog == "deliver" || s.catalog == "build"));
+    }
+
+    /// (DES-CATALOG-002 §5.1) QE acceptance is required by exactly the application-changing
+    /// presets: today's five, the Apps publish, and the catalog's refactor, release, scaffold and
+    /// modernize. Every other built-in runs on the defaults.
+    #[test]
+    fn qe_acceptance_rides_exactly_the_application_changing_presets() {
+        let mut qe: Vec<&str> = builtin_presets()
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| {
+                builtin_preset_instruments(n)
+                    .is_some_and(|i| i.iter().any(|x| x == crate::assurance::QE_ACCEPTANCE))
+            })
+            .collect();
+        qe.sort_unstable();
+        assert_eq!(
+            qe,
+            [
+                "apps-publish",
+                "bug",
+                "editor-plugin",
+                "feature",
+                "mcp-server",
+                "migration",
+                "modernize",
+                "refactor",
+                "release",
+                "scaffold"
+            ]
+        );
+    }
+
+    /// (DES-CATALOG-002 §3.2, §5) Each new preset names the rubric its card's gate shape needs, on
+    /// the step that judges, and every built-in composes (an unknown or misplaced rubric would
+    /// refuse it).
+    #[test]
+    fn the_new_presets_carry_their_gate_rubrics_on_their_judging_steps() {
+        let rubrics = |name: &str| -> Vec<(String, String)> {
+            builtin_preset(name)
+                .unwrap()
+                .into_iter()
+                .filter_map(|s| s.rubric.map(|r| (s.id, r)))
+                .collect()
+        };
+        let p = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs
+                .iter()
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+                .collect()
+        };
+        assert_eq!(rubrics("plan"), p(&[("check", "cited-findings")]));
+        assert_eq!(rubrics("refactor"), p(&[("parity", "parity")]));
+        assert_eq!(rubrics("suite-health"), p(&[("review", "cited-findings")]));
+        assert_eq!(rubrics("release"), p(&[("fidelity", "fidelity-to-source")]));
+        assert_eq!(
+            rubrics("modernize"),
+            p(&[("parity", "parity"), ("final-parity", "parity")])
+        );
+        assert_eq!(
+            rubrics("migration"),
+            p(&[("verify", "parity"), ("parity", "parity")])
+        );
+        assert_eq!(
+            rubrics("review-change"),
+            p(&[("review", "cited-findings"), ("semantic", "cited-findings")])
+        );
+        assert_eq!(rubrics("test-plan"), p(&[("check", "cited-findings")]));
+        assert_eq!(rubrics("docs"), p(&[("check", "fidelity-to-source")]));
+        assert!(rubrics("scaffold").is_empty());
+        // J4/J6: feature, bug, mcp-server and editor-plugin carry no rubric.
+        for name in ["feature", "bug", "mcp-server", "editor-plugin"] {
+            assert!(rubrics(name).is_empty(), "{name}");
+        }
+        for (name, _) in builtin_presets() {
+            if name == crate::apps::APPS_PUBLISH || name == crate::apps::APPS_TURN {
+                continue; // fixed plans, composed by `apps`
+            }
+            let def = composed(name);
+            for ph in def.phases.iter().filter(|ph| ph.rubric.is_some()) {
+                let r = crate::rubric::rubric(ph.rubric.as_deref().unwrap()).unwrap();
+                assert!(
+                    ph.instructions
+                        .as_deref()
+                        .is_some_and(|i| i.ends_with(&r.instructions)),
+                    "{name}/{}: the rubric's contract follows the step's own",
+                    ph.id
+                );
+            }
+        }
+    }
+
+    /// (DES-CATALOG-002 §5.2, semantic regression) `validate-docs`, `test-analysis` and `docs` keep
+    /// their own criteria, their gates and their read-only posture: only the shared cite and VERDICT
+    /// sentences moved into the rubric, and the composed step still says every one of them.
+    #[test]
+    fn validate_docs_test_analysis_and_docs_keep_their_criteria_gates_and_posture() {
+        use crate::workflow::{GateCond, GateSpec};
+        let cite = "Every claim cites its file and line relative to the repository root";
+        let verdict =
+            "End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line";
+        let cases: [(&str, &str, &[&str], GateSpec); 3] = [
+            (
+                "validate-docs",
+                "verify",
+                &[
+                    "Classify each claim: holds, wrong",
+                    "Close with counts per class.",
+                    "PASS only when every checkable claim holds; a wrong, stale or unverifiable \
+                     claim is a FAIL.",
+                    "READ-ONLY",
+                ],
+                GateSpec::Auto,
+            ),
+            (
+                "test-analysis",
+                "verify",
+                &[
+                    "re-check each finding yourself at file:line and drop any that does not hold",
+                    "the one test (or test change) that would close it",
+                    "PASS when the report holds no finding you could not confirm.",
+                    "READ-ONLY",
+                ],
+                GateSpec::Auto,
+            ),
+            (
+                "docs",
+                "check",
+                &[
+                    "List EVERY change the run made",
+                    "FAIL on any other change",
+                    "PASS only when every checkable claim holds and only allowed outputs changed; \
+                     an unverifiable claim is a FAIL",
+                    "Change nothing yourself",
+                ],
+                GateSpec::HumanConfirmIf(GateCond::VerdictNotPass),
+            ),
+        ];
+        for (name, id, criteria, gate) in cases {
+            let def = composed(name);
+            let ph = def.phases.iter().find(|p| p.id == id).unwrap();
+            let text = ph.instructions.as_deref().unwrap();
+            for c in criteria.iter().chain([&cite, &verdict]) {
+                assert!(text.contains(c), "{name}/{id} lost `{c}`: {text}");
+            }
+            assert_eq!(ph.gate, gate, "{name}/{id}: the gate is the preset's own");
+            assert!(!ph.executes_code, "{name}/{id}");
+            assert_eq!(ph.role, PhaseRole::Evaluator, "{name}/{id}");
+            assert!(!text.contains('\n'), "{name}/{id}: one line");
+        }
+        // The two read-only presets stay creator-free.
+        for name in ["validate-docs", "test-analysis"] {
+            assert!(composed(name)
+                .phases
+                .iter()
+                .all(|p| p.role != PhaseRole::Creator && !p.executes_code));
+        }
     }
 }

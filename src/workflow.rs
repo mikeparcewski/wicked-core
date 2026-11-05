@@ -551,6 +551,20 @@ pub enum HumanDecision {
     RecheckRules { skips: Vec<(String, String)> },
 }
 
+/// (DES-CATALOG-002 §4.6, §11 Lane A) What the answer to a gate EXPECTS the open gate to be: the
+/// unit ordinal it showed and, for a `plan_approval` gate, the plan revision it showed. Checked
+/// inside the engine's serialized decision path, so a re-plan that lands after the caller read the
+/// gate still refuses the answer ([`GATE_CHANGED`]). `None` fields expect nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GateExpect {
+    pub ord: Option<u32>,
+    pub plan_rev: Option<u32>,
+}
+
+/// The refusal token that opens the error of an answer whose [`GateExpect`] no longer holds (the
+/// gate moved on, or its plan is being re-planned): `gate_changed: …`. A caller re-reads the gate.
+pub const GATE_CHANGED: &str = "gate_changed";
+
 /// The wire token of [`HumanDecision::SkipQe`]. Its reason rides the gate body's `amend`.
 pub const SKIP_QE_ACTION: &str = "skip_qe";
 
@@ -1068,6 +1082,13 @@ pub struct PhaseDef {
     /// default; skipped on the wire, so defs authored before the field serialize byte-identically).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_from: Option<String>,
+    /// (DES-CATALOG-002 §5.2) The gate rubric the phase is judged by (`parity`, `cited-findings`,
+    /// `fidelity-to-source`, [`crate::rubric`]): set by `plan::compose` from the step's `rubric`,
+    /// whose instructions it appended, so crew and studio can say "Checked by: cited findings".
+    /// `validate` refuses an unknown id and a phase whose instructions do not carry the rubric's
+    /// text, so no def can claim a check it does not ask for. Skipped on the wire when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubric: Option<String>,
 }
 
 impl PhaseDef {
@@ -1099,6 +1120,7 @@ impl PhaseDef {
             executor: PhaseExecutor::default(),
             owner: StepOwner::default(),
             catalog: None,
+            rubric: None,
             repeat_from: None,
         }
     }
@@ -1303,6 +1325,12 @@ pub enum WorkflowDefError {
         phase: String,
         why: String,
     },
+    /// (DES-CATALOG-002 §5.2) A phase names a rubric no data file defines, or one whose
+    /// instructions its own instructions do not carry (a claimed check that asks for nothing).
+    RubricNotExpanded {
+        phase: String,
+        rubric: String,
+    },
 }
 
 /// (core#810) The largest [`PhaseDef::pool`]: one creator plus the team's monitor ceiling.
@@ -1365,6 +1393,11 @@ impl std::fmt::Display for WorkflowDefError {
                  {why} \u{2014} declare it only on the last phase: an agent step the PA owns that \
                  executes no code and carries no validator pin"
             ),
+            WorkflowDefError::RubricNotExpanded { phase, rubric } => write!(
+                f,
+                "rubric {rubric} on {phase} is unknown or not in its instructions \u{2014} name a \
+                 rubric on a plan step, where compose appends its contract"
+            ),
         }
     }
 }
@@ -1386,6 +1419,19 @@ impl WorkflowDef {
         for (i, p) in self.phases.iter().enumerate() {
             if !ids.insert(p.id.as_str()) {
                 return Err(WorkflowDefError::DuplicatePhaseId(p.id.clone()));
+            }
+            if let Some(id) = p.rubric.as_deref() {
+                let carried = crate::rubric::rubric(id).is_some_and(|r| {
+                    p.instructions
+                        .as_deref()
+                        .is_some_and(|i| i.contains(r.instructions.as_str()))
+                });
+                if !carried {
+                    return Err(WorkflowDefError::RubricNotExpanded {
+                        phase: p.id.clone(),
+                        rubric: id.to_string(),
+                    });
+                }
             }
             // (crew#1311) An answer-only phase is read by its CALLER, so nothing in the run may build
             // on it or review it: no code (the code-evidence floor's ground), nothing behind it, no

@@ -117,6 +117,7 @@ mod repo;
 mod repo_checks;
 mod repo_intel;
 mod review_context;
+pub mod rubric;
 mod rule_check;
 mod run_mirror;
 mod runtime_wait;
@@ -312,7 +313,7 @@ pub use plan::{
     PlanRefusal, PlanStep, PlanSteps, COMPOSED_DEF_ID, STEP_FIELD_RULES,
 };
 pub use plan_gate::{
-    PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, TeamPlanState,
+    PendingPlan, PlanPreview, PlanProposal, ScopeAnswer, ScopeHold, SendBack, TeamPlanState,
 };
 pub use preset::{
     compose_preset, gated_preset_name, list_all_presets, put_preset, put_preset_requiring,
@@ -353,10 +354,10 @@ pub use validator_vault::{
 };
 pub use wicked_council::AgenticCli;
 pub use workflow::{
-    bug_def, feature_def, leftover_drop_ins, migration_def, AmendScope, GateCond, GateSpec,
-    GateType, HumanDecision, PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner, StepRunner,
-    StepStatus, StubStepRunner, UnitEvidence, Usage, WorkflowDef, WorkflowDefError,
-    WorkflowRegistry,
+    bug_def, feature_def, leftover_drop_ins, migration_def, AmendScope, GateCond, GateExpect,
+    GateSpec, GateType, HumanDecision, PhaseDef, PhaseRole, StepInput, StepOutput, StepOwner,
+    StepRunner, StepStatus, StubStepRunner, UnitEvidence, Usage, WorkflowDef, WorkflowDefError,
+    WorkflowRegistry, GATE_CHANGED,
 };
 pub use worktree_guard::{ChangedPath, WorktreeGuardOutcome, WorktreeMutation, WorktreeSnapshot};
 
@@ -1138,12 +1139,30 @@ impl Core {
         decision: HumanDecision,
         actor: Option<String>,
     ) -> anyhow::Result<SessionStatus> {
+        self.confirm_gate_expecting(run_id, decision, actor, None)
+    }
+
+    /// (DES-CATALOG-002 §4.6) [`Self::confirm_gate_as`] with what the answer EXPECTS the open gate
+    /// to be: its unit `ord` and, at a `plan_approval` gate, its plan revision. The engine compares
+    /// them inside its serialized decision path and refuses a mismatch with an error that starts
+    /// `gate_changed:` ([`crate::workflow::GATE_CHANGED`]), so an answer to a plan that was
+    /// replaced (a re-plan that landed after the caller's read, a second tab) never applies. A
+    /// plan-gate SEND-BACK (`RequestChanges` at `plan_approval`) is accepted only with the plan
+    /// revision: the lead re-plans with the note, and the next revision is held for approval.
+    pub fn confirm_gate_expecting(
+        &self,
+        run_id: &str,
+        decision: HumanDecision,
+        actor: Option<String>,
+        expect: Option<crate::workflow::GateExpect>,
+    ) -> anyhow::Result<SessionStatus> {
         let (reply, rx) = channel();
         self.tx
             .send(Command::ConfirmGate {
                 run_id: run_id.to_string(),
                 decision,
                 actor,
+                expect,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

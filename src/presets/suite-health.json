@@ -1,0 +1,43 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "diagnose",
+   "skill_ref": "wicked-garden-qe",
+   "instructions": "Phase 1/4 DIAGNOSE (qe skill, insight action): find the tests the ask's kind names: flaky (nondeterminism from timing, ordering, shared state or the network), weak (assertion-free, tautological or over-mocked tests, missing negative cases), snapshots (stale, oversized or never-reviewed snapshots) or slow (the slowest tests and why). Use the ledger, CI history, git churn and the code, and rank them by their cost to the team, each with its file:line and evidence. Do not run the test suite here. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files."
+  },
+  {
+   "catalog": "build",
+   "id": "fix",
+   "depends_on": [
+    "diagnose"
+   ],
+   "skill_ref": "wicked-garden-qe-test-automation-engineer",
+   "instructions": "Phase 2/4 FIX (test automation engineer): fix the ranked tests at their root: make a flaky test deterministic, give a weak test real assertions and its negative case, refresh or shrink a snapshot only after checking the behaviour it pins, and speed up a slow test without dropping what it checks. Change tests and test helpers only, never the code under test. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "verify",
+   "depends_on": [
+    "diagnose",
+    "fix"
+   ],
+   "skill_ref": "wicked-garden-qe",
+   "instructions": "Phase 3/4 VERIFY (qe skill, independent evaluator): run every test the fix changed, and the tests around them, under the repository's own harness and its own commands (several runs in a row for a flaky test, timed for a slow one), and report each with its command and its result. A snapshot change is verified by the test that reads it. Change nothing: report a test that still fails, flakes or is slow, never fix it here. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+  },
+  {
+   "catalog": "review",
+   "id": "review",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "diagnose",
+    "verify"
+   ],
+   "skill_ref": "wicked-garden-qe",
+   "instructions": "Phase 4/4 REVIEW (qe skill, independent evaluator): read the diff and the verify step's report. For each fixed test, confirm the fix addresses the diagnosed cause and that the test still checks what it checked, or more: no assertion weakened, no case deleted, no retry or sleep hiding a flake. List each finding, the most harmful first. PASS only when every fixed test holds and the verify step passed."
+  }
+ ]
+}

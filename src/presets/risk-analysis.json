@@ -1,0 +1,23 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "blast",
+   "skill_ref": "wicked-garden-search",
+   "instructions": "Phase 1/2 BLAST RADIUS (search skill): for the change or area the ask names, find what depends on it (blast radius and lineage from the code graph), the hotspots it touches, the tests that cover it and the ones that do not, and its recent churn. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "risks",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "blast"
+   ],
+   "skill_ref": "wicked-garden-qe-risk-assessor",
+   "instructions": "Phase 2/2 RISKS (risk assessor): report the risk matrix: each risk with its likelihood, its impact, its evidence at file:line and its mitigation (a test, a staged rollout, a guard), the most severe first. PASS only when every risk's evidence holds at file:line."
+  }
+ ]
+}

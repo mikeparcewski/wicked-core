@@ -1,0 +1,77 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "discover",
+   "skill_ref": "wicked-garden-repo-learn",
+   "instructions": "Phase 1/7 DISCOVER (repo-learn skill; the archetype skill's refs/modernize.md, its discover section): map the system being moved: its stack, entry points, data, integrations and the behaviours its users rely on, and read a prior domain map under .wicked/domain/ when there is one. Find the stack adapter the playbook's dispatch names for this move; when it names none, stop: say \"no stack adapter for <from> -> <to>\" and plan nothing further. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files."
+  },
+  {
+   "catalog": "design",
+   "id": "blueprint",
+   "gate": {
+    "human_confirm": {
+     "unconditional": false
+    }
+   },
+   "depends_on": [
+    "discover"
+   ],
+   "skill_ref": "wicked-garden-engineering-solution-architect",
+   "instructions": "Phase 2/7 BLUEPRINT (solution architect; the archetype skill's refs/modernize.md, its blueprint section): the target design, where each old part goes, the behaviours to keep (each with the test that will show it), the cutover plan and how to roll back. Design only: write no source."
+  },
+  {
+   "catalog": "build",
+   "id": "transform",
+   "depends_on": [
+    "blueprint"
+   ],
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 3/7 TRANSFORM (engineering skill; the archetype skill's refs/modernize.md, its transform section): build the new implementation beside the old one, following the blueprint, and keep the old path working until cutover. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "parity",
+   "rubric": "parity",
+   "depends_on": [
+    "blueprint",
+    "transform"
+   ],
+   "skill_ref": "wicked-garden-engineering-migration-engineer",
+   "instructions": "Phase 4/7 PARITY (migration engineer; the archetype skill's refs/modernize.md, its parity section): compare the old and the new path on the blueprint's behaviours."
+  },
+  {
+   "catalog": "build",
+   "id": "cutover",
+   "gate": {
+    "human_confirm": {
+     "unconditional": true
+    }
+   },
+   "depends_on": [
+    "parity"
+   ],
+   "instructions": "Phase 5/7 CUTOVER (the archetype skill's refs/modernize.md, its cutover section): switch the callers, configuration and build to the new implementation as the blueprint's cutover plan says. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "build",
+   "id": "cleanup",
+   "gate_type": null,
+   "depends_on": [
+    "cutover"
+   ],
+   "instructions": "Phase 6/7 CLEANUP (the archetype skill's refs/modernize.md, its cleanup section): remove the old path and anything only it used. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "final-parity",
+   "rubric": "parity",
+   "depends_on": [
+    "blueprint",
+    "cleanup"
+   ],
+   "skill_ref": "wicked-garden-engineering-migration-engineer",
+   "instructions": "Phase 7/7 PARITY ON THE FINAL TREE (migration engineer; the archetype skill's refs/modernize.md, its parity section): re-run the blueprint's behaviours on the tree that ships."
+  }
+ ]
+}

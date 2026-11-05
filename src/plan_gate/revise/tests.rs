@@ -1147,3 +1147,59 @@ fn a_first_creator_change_over_an_already_held_revision_keeps_its_reason() {
     assert!(matches!(r2.outcome, Outcome::Held { .. }));
     assert_eq!(r2.state.pending.as_ref().unwrap().reason, "first_creator");
 }
+
+fn steps_of(v: Value) -> Vec<PlanStep> {
+    serde_json::from_value(v).expect("steps")
+}
+
+/// (DES-CATALOG-002 §2.4, codex r2-r3) A send-back keeps every check ON ITS WORK: a check moved
+/// before the work it checked, that work renamed after it, or an id the check followed reused for
+/// other work, is a lost check; an untouched check beside an appended writer is not.
+#[test]
+fn a_send_back_loses_a_check_moved_off_its_work_by_rename_or_id_reuse() {
+    let held = steps_of(json!([
+        {"catalog": "build", "id": "build"},
+        {"catalog": "test", "id": "parity", "rubric": "parity", "depends_on": ["build"]},
+        {"catalog": "critique", "id": "check", "rubric": "cited-findings", "depends_on": ["build"]},
+        {"catalog": "understand", "id": "context"}
+    ]));
+    // Kept as it was, plus a writer appended after it: nothing lost.
+    let mut appended = held.clone();
+    appended.push(steps_of(json!([{"catalog": "build", "id": "more"}])).remove(0));
+    assert!(super::lost_checks(&held, &[], &appended).is_empty());
+    // The build renamed and moved after the check, which now reads nothing.
+    let renamed = steps_of(json!([
+        {"catalog": "critique", "id": "check", "rubric": "cited-findings", "depends_on": []},
+        {"catalog": "build", "id": "impl"},
+        {"catalog": "test", "id": "parity", "rubric": "parity", "depends_on": ["impl"]},
+        {"catalog": "understand", "id": "context"}
+    ]));
+    let lost = super::lost_checks(&held, &[], &renamed);
+    assert!(lost.iter().any(|l| l.starts_with("check ")), "{lost:?}");
+    // A later id reused for the build work: still a replacement, not the step it was.
+    let reused = steps_of(json!([
+        {"catalog": "critique", "id": "check", "rubric": "cited-findings", "depends_on": []},
+        {"catalog": "build", "id": "context"},
+        {"catalog": "test", "id": "parity", "rubric": "parity", "depends_on": ["context"]}
+    ]));
+    let lost = super::lost_checks(&held, &[], &reused);
+    assert!(lost.iter().any(|l| l.starts_with("check ")), "{lost:?}");
+    // A read-only input rewritten in place is still an input: the check keeps reading it (codex
+    // r4), and keeping the read is enough.
+    let read = steps_of(json!([
+        {"catalog": "understand", "id": "context", "instructions": "read the report"},
+        {"catalog": "build", "id": "build"},
+        {"catalog": "critique", "id": "check", "rubric": "cited-findings",
+         "depends_on": ["context", "build"]}
+    ]));
+    let mut rewritten = read.clone();
+    rewritten[0].instructions = Some("read the report and its appendix".into());
+    assert!(super::lost_checks(&read, &[], &rewritten).is_empty());
+    rewritten[2].depends_on = Some(vec!["build".into()]);
+    let lost = super::lost_checks(&read, &[], &rewritten);
+    assert!(lost.iter().any(|l| l.starts_with("check ")), "{lost:?}");
+    // A check that only moved with its work (both after an added design step): kept.
+    let mut prefixed = steps_of(json!([{"catalog": "design", "id": "design"}]));
+    prefixed.extend(held.clone());
+    assert!(super::lost_checks(&held, &[], &prefixed).is_empty());
+}

@@ -12,7 +12,8 @@
    "depends_on": [
     "analyze"
    ],
-   "instructions": "Phase 2/2 VERIFY (independent evaluator): re-check each finding yourself at file:line and drop any that does not hold. Report the confirmed findings ranked by risk, each with its evidence and the one test (or test change) that would close it, then counts per class. Every claim cites its file and line relative to the repository root (`src/foo.ts:42`); a claim you could not ground is named as such, never asserted. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line. PASS when the report holds no finding you could not confirm. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report. "
+   "instructions": "Phase 2/2 VERIFY (independent evaluator): re-check each finding yourself at file:line and drop any that does not hold. Report the confirmed findings ranked by risk, each with its evidence and the one test (or test change) that would close it, then counts per class. PASS when the report holds no finding you could not confirm.",
+   "rubric": "cited-findings"
   }
  ]
 }

@@ -1341,6 +1341,18 @@ pub struct WorkUnit {
     /// `#[serde(default)]` + skip-if-none: older rows deserialize and serialize byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
+    /// (DES-CATALOG-002 §5.1) The gate rubric of the phase this unit instantiates
+    /// (`PhaseDef::rubric`): a rubric that excludes gatherers makes the plan's earlier agent
+    /// `understand` units this unit's authors ([`crate::pipeline::work_authors`]). Skip-if-none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubric: Option<String>,
+    /// (DES-CATALOG-002 §5.1) Every seat this unit was dispatched on while it GATHERED for a
+    /// report ([`crate::pipeline::is_report_gatherer`]), stamped at dispatch whether or not it is
+    /// a read step (whose seat is never an author of the tree, `authored_by`): a later
+    /// cited-findings recheck keeps off every one of them, a reassigned gatherer's first seat
+    /// included. Skip-if-empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gathered_by: Vec<String>,
     /// (DES-TEAMING-002 P1) The unit's team snapshot, stamped by the actor at dispatch for a team
     /// run ([`UnitTeamSnapshot`]). `None` for a non-team unit. Skip-if-none: non-team units
     /// serialize byte-identical.
@@ -1805,6 +1817,8 @@ impl WorkUnit {
             pre_build_scope: false,
             team_run: false,
             catalog: None,
+            rubric: None,
+            gathered_by: Vec::new(),
             team: None,
             member_step: None,
             scope_warnings: Vec::new(),

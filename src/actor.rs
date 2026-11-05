@@ -1010,6 +1010,40 @@ pub(crate) fn run(
         }
     }
 
+    // (DES-CATALOG-002 §2.4) A send-back whose lead was re-planning when the process stopped has
+    // no turn left to answer it: its held rev re-opens, approvable, with the reason recorded.
+    if let Ok(sessions) = crate::domain::all_sessions(&store) {
+        for s in sessions {
+            let Some(token) = s
+                .team_plan
+                .as_ref()
+                .and_then(|t| t.send_back.as_ref())
+                .map(|b| b.token.clone())
+            else {
+                continue;
+            };
+            if let Err(e) = finish_send_back(
+                &mut store,
+                &mut subscribers,
+                &runner,
+                &self_tx,
+                &mut in_flight,
+                &s.id,
+                &token,
+                Err("the engine restarted while the lead was re-planning".to_string()),
+                &lifecycle_maps,
+                &actor_maps,
+                process_gen,
+                is_acp,
+            ) {
+                eprintln!(
+                    "wicked-core: boot could not re-open the sent-back plan of {}: {e:#}",
+                    s.id
+                );
+            }
+        }
+    }
+
     // Panic-safe reaper (Minor): guarantees every PTY child + reader thread is killed/reaped when
     // this function returns — on a clean `Shutdown` (map already drained ⇒ no-op) OR a handler PANIC
     // (which unwinds past the loop; the old end-of-`run` drain ran only on a NORMAL exit, so a panic
@@ -2258,6 +2292,28 @@ pub(crate) fn run(
                     }
                 }
             }
+            Command::PlanSendBackReady {
+                run_id,
+                token,
+                result,
+            } => {
+                if let Err(e) = finish_send_back(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &mut in_flight,
+                    &run_id,
+                    &token,
+                    result,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
+                ) {
+                    emit_run_error(&mut subscribers, &run_id, e);
+                }
+            }
             Command::PlanFailed { run_id, error } => {
                 in_flight.remove(&run_id);
                 // (D-10 / core#473-M1 = F-RC2-007) EVERY SEAT BENCHED IS A DECISION, NOT A
@@ -2420,6 +2476,7 @@ pub(crate) fn run(
                 run_id,
                 decision,
                 actor,
+                expect,
                 reply,
             } => {
                 // (program DES-POWER-MODE) A gate a person answered on a power run counts for
@@ -2434,7 +2491,7 @@ pub(crate) fn run(
                         }
                     }
                 }
-                let res = confirm_gate_as(
+                let res = confirm_gate_expecting(
                     &mut store,
                     &mut subscribers,
                     &runner,
@@ -2443,6 +2500,7 @@ pub(crate) fn run(
                     &run_id,
                     decision,
                     actor,
+                    expect,
                     &lifecycle_maps,
                     &actor_maps,
                     process_gen,
@@ -8633,6 +8691,7 @@ fn escalate_denied_unit(
                 run_id: session.id.clone(),
                 decision: crate::workflow::HumanDecision::RequestChanges { note: Some(note) },
                 actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
+                expect: None,
                 reply,
             });
         }
@@ -9887,6 +9946,20 @@ fn advance_or_pause_with(
     } else {
         should_pause(&session, &units, unit_ix)
     };
+    // (DES-CATALOG-002 §2.4) A plan being re-planned from a send-back opens no gate and runs
+    // nothing: the run waits, with nothing approvable and nothing dispatched, until the re-plan
+    // lands (whatever else would pause or dispatch here).
+    if session
+        .team_plan
+        .as_ref()
+        .is_some_and(|t| t.send_back.is_some())
+    {
+        if session.status != SessionStatus::AwaitingHuman {
+            session.status = SessionStatus::AwaitingHuman;
+            put_node(store, session.to_node())?;
+        }
+        return Ok(Progress::Paused);
+    }
     if let Some(reason) = pause {
         // Describe the decision the operator is actually being asked to make. A DEF-declared gate
         // fires AFTER the preceding phase's work, so the artifact under review is that phase's
@@ -10867,6 +10940,16 @@ fn dispatch_unit(
                 team_changed = true;
             }
             new_author = before;
+        }
+    }
+    // (DES-CATALOG-002 §5.1) A report's gatherer records every seat it gathered on, read step or
+    // not, so its cited-findings recheck keeps off all of them (`pipeline::report_gatherer_seats`).
+    if crate::pipeline::is_report_gatherer(&unit) {
+        if let Some(seat) = unit.assigned_cli.clone() {
+            if !unit.gathered_by.contains(&seat) {
+                unit.gathered_by.push(seat);
+                team_changed = true;
+            }
         }
     }
     // A probe from an earlier attempt never outlives the next dispatch.
@@ -13386,6 +13469,7 @@ fn confirm_plan_gate(
     session: AgentSession,
     row: crate::interaction::InteractionRequest,
     decision: crate::workflow::HumanDecision,
+    expect: Option<crate::workflow::GateExpect>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -13413,12 +13497,39 @@ fn confirm_plan_gate(
             crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
         )
     };
+    // (DES-CATALOG-002 §4.6) The answer's expectation, inside the serialized decision path: the
+    // gate's unit and its held plan revision.
+    check_gate_expect(run_id, expect, ord, Some(pending.rev))?;
     // REFUSE BEFORE RESOLVING (DES-L1 PR-1B M3): the row stays open on every refusal here.
     match &decision {
-        HumanDecision::RequestChanges { .. } => anyhow::bail!(
-            "a plan_approval gate reviews a plan, not work — approve, approve with an edited \
-             plan, or reject"
-        ),
+        // (DES-CATALOG-002 §2.4) A SEND-BACK: accepted only with the plan revision it answers
+        // (an older client's request for changes is refused, as before), before any unit of the
+        // plan has run.
+        HumanDecision::RequestChanges { note } => {
+            if expect.and_then(|e| e.plan_rev).is_none() {
+                anyhow::bail!(
+                    "a plan_approval gate reviews a plan, not work — approve, approve with an \
+                     edited plan, or reject (a send-back needs the plan revision it answers)"
+                );
+            }
+            if !cursor.is_some_and(not_run) {
+                anyhow::bail!(
+                    "unit {ord} is not pending — a plan is sent back only before it runs"
+                );
+            }
+            return start_send_back(
+                store,
+                runner,
+                self_tx,
+                run_id,
+                session,
+                state,
+                pending,
+                gate_id,
+                ord,
+                note.clone(),
+            );
+        }
         HumanDecision::Approve { .. } | HumanDecision::EditPlan { .. } => {
             // A finished unit is never re-dispatched: the cursor must not have run.
             if !cursor.is_some_and(not_run) {
@@ -13600,6 +13711,394 @@ fn confirm_plan_gate(
         is_acp,
     };
     team_gate::release_plan_gate(&mut cx, session, decided_ev, release)
+}
+
+/// (DES-CATALOG-002 §2.4) The longest the lead's re-plan of a send-back may take.
+const SEND_BACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// (DES-CATALOG-002 §4.6) Refuse an answer whose expectation no longer holds: the open gate's
+/// unit is not `expect.ord`, or its held plan revision is not `expect.plan_rev`.
+fn check_gate_expect(
+    run_id: &str,
+    expect: Option<crate::workflow::GateExpect>,
+    ord: u32,
+    plan_rev: Option<u32>,
+) -> anyhow::Result<()> {
+    let Some(e) = expect else {
+        return Ok(());
+    };
+    if e.ord.is_some_and(|o| o != ord) || e.plan_rev.is_some_and(|r| Some(r) != plan_rev) {
+        anyhow::bail!(
+            "{}: run {run_id}'s open gate is unit {ord}{}, not the one this answer was sent for \
+             (unit {}{}) — read the gate again",
+            crate::workflow::GATE_CHANGED,
+            plan_rev
+                .map(|r| format!(" plan rev {r}"))
+                .unwrap_or_default(),
+            e.ord.map_or_else(|| "?".to_string(), |o| o.to_string()),
+            e.plan_rev
+                .map(|r| format!(" plan rev {r}"))
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+/// (DES-CATALOG-002 §2.4, §11 Lane A) The SEND-BACK at a `plan_approval` gate: the person's
+/// `RequestChanges` with the plan revision they saw. Everything refusable is judged first (the row
+/// stays open on a refusal). Then the row is answered with the note, the send-back is recorded on
+/// the plan state — from this write on the held rev is not approvable and no plan gate opens —
+/// and ONE re-plan turn runs off the actor on the lead's seat: an ungoverned engine call with no
+/// worktree, like the failure triage judge, never a unit of the run, so nothing is dispatched.
+/// Its answer returns as [`Command::PlanSendBackReady`] ([`finish_send_back`]).
+#[allow(clippy::too_many_arguments)]
+fn start_send_back(
+    store: &mut dyn GraphStore,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    run_id: &str,
+    mut session: AgentSession,
+    mut state: crate::plan_gate::TeamPlanState,
+    pending: crate::plan_gate::PendingPlan,
+    gate_id: String,
+    ord: u32,
+    note: Option<String>,
+) -> anyhow::Result<SessionStatus> {
+    let note = note
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "a plan send-back needs the person's note: say what should change in the plan"
+            )
+        })?;
+    let lead = team_gate::pa_seat(&session);
+    let base = lead.split('#').next().unwrap_or(&lead).to_string();
+    let invocation = launch_roster(&session)?
+        .into_iter()
+        .find(|c| c.key == lead || c.key == base)
+        .map(|c| c.headless_invocation)
+        .or_else(|| {
+            crate::registry_roster()
+                .into_iter()
+                .find(|c| c.key == base)
+                .map(|c| c.headless_invocation)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "run {run_id}: the lead seat `{lead}` has no invocation in the run's roster, so it \
+                 cannot re-plan — approve this plan, edit it, or reject it"
+            )
+        })?;
+    // The run's done prefix, read off its units (the held plan's own `done` is empty for the
+    // initial plan a PA scoped, whose `pa-scope` already ran).
+    let units = crate::domain::session_units(&*store, run_id)?;
+    let done: Vec<String> = units[..session.unit_ix.min(units.len())]
+        .iter()
+        .map(|u| u.phase_id().unwrap_or_default().to_string())
+        .collect();
+    let now = crate::interaction::now_millis();
+    let answer = serde_json::json!({"approve": false, "action": "request_changes", "amend": note});
+    crate::interaction::resolve_open_for_session(
+        store,
+        run_id,
+        crate::interaction::InteractionStatus::Answered,
+        Some(answer.to_string()),
+        now,
+    )?;
+    let token = uuid::Uuid::new_v4().to_string();
+    let decided = crate::plan_gate::gate_decided(
+        run_id,
+        &gate_id,
+        ord,
+        session.attempt,
+        crate::team_events::GateDecision::HumanAmended,
+        now,
+    )?;
+    if session
+        .team
+        .as_ref()
+        .is_some_and(crate::domain::RunTeamState::is_teamed)
+    {
+        state
+            .queued
+            .extend(crate::plan_gate::queued_facts(&[decided])?);
+    }
+    state.send_back = Some(crate::plan_gate::SendBack {
+        from_rev: pending.rev,
+        gate_id,
+        note: note.clone(),
+        lead: lead.clone(),
+        token: token.clone(),
+        done: done.clone(),
+        held: Some(Box::new(pending.clone())),
+        prior_rev: state.rev,
+    });
+    session.team_plan = Some(state);
+    if let Some(team) = session.team.as_mut() {
+        team.open_gate = None;
+    }
+    put_node(store, session.to_node())?;
+    let prompt = crate::plan_gate::send_back_prompt(&pending, &done, &note);
+    // A lead that never answers cannot hold the run: past the bound the send-back fails (the held
+    // rev re-opens), and a late answer finds its token gone.
+    let one_shot = crate::validator::one_shot_run_id(&format!("send-back-{run_id}"));
+    {
+        let tx = self_tx.clone();
+        let runner = runner.clone();
+        let (rid, token, one_shot) = (run_id.to_string(), token.clone(), one_shot.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(SEND_BACK_TIMEOUT);
+            // Close whatever the lead's call still holds open (a session runner's process).
+            runner.on_run_complete(&one_shot);
+            let _ = tx.send(Command::PlanSendBackReady {
+                run_id: rid,
+                token,
+                result: Err(format!(
+                    "the lead did not answer within {} minutes",
+                    SEND_BACK_TIMEOUT.as_secs() / 60
+                )),
+            });
+        });
+    }
+    let tx = self_tx.clone();
+    let runner = runner.clone();
+    let rid = run_id.to_string();
+    std::thread::spawn(move || {
+        let mut unit = crate::domain::WorkUnit::pending(
+            "send-back",
+            crate::execute_wrapped::SEND_BACK_SESSION,
+            1,
+            prompt,
+        );
+        unit.assigned_cli = Some(lead);
+        unit.assigned_invocation = Some(invocation);
+        let input = StepInput {
+            run_id: one_shot.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-send-back".to_string(),
+            entity_mode: EntityMode::Isolated,
+            workdir: None,
+            // An engine-internal planning call, ungoverned like the triage judge: it reads the
+            // plan and the note and writes nothing.
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let out =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.run_unit(&input)));
+        runner.on_run_complete(&one_shot);
+        let result = match out {
+            Ok(o) if o.status == crate::workflow::StepStatus::Ok => Ok(o.output),
+            Ok(o) => Err(format!(
+                "the lead's re-plan failed ({:?}): {}",
+                o.status,
+                o.output.chars().take(400).collect::<String>()
+            )),
+            Err(_) => Err("the lead's re-plan panicked".to_string()),
+        };
+        let _ = tx.send(Command::PlanSendBackReady {
+            run_id: rid,
+            token,
+            result,
+        });
+    });
+    Ok(SessionStatus::AwaitingHuman)
+}
+
+/// (DES-CATALOG-002 §2.4, §11 Lane A) Apply the lead's re-plan of the run's CURRENT send-back
+/// (`token`; anything else, or a run that ended, is stale and dropped): the revised plan
+/// ([`crate::plan_gate::send_back`]: every check of the held rev kept, on its work, the floor and
+/// the contract re-applied) is proven with every synchronous check it will run under, then
+/// committed in two writes so a restart between them is finished, never mixed: the new held rev
+/// with the send-back still set, the unit swap, then the send-back cleared. Its plan gate then
+/// opens for a fresh approval; nothing dispatches. A failure of any kind before the swap clears
+/// the send-back and re-opens the held rev, approvable as it was, with the failure as its refusal
+/// ("Couldn't update the plan: …"). Called at boot too, with the re-plan lost to the restart.
+#[allow(clippy::too_many_arguments)]
+fn finish_send_back(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    token: &str,
+    result: Result<String, String>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    let Some(state) = session.team_plan.clone() else {
+        return Ok(());
+    };
+    let Some(sb) = state.send_back.clone().filter(|s| s.token == token) else {
+        return Ok(()); // a newer send-back, or none: this answer is stale
+    };
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) {
+        return Ok(());
+    }
+    let teamed = session
+        .team
+        .as_ref()
+        .is_some_and(crate::domain::RunTeamState::is_teamed);
+    let held_rev = state.pending.as_ref().map(|p| p.rev);
+    // A restart after the new rev's write and before its unit swap: finish the swap.
+    let committed = held_rev.is_some_and(|r| r != sb.from_rev);
+    let now = crate::interaction::now_millis();
+    let applied: Result<
+        crate::workflow::WorkflowDef,
+        (String, Vec<crate::team_events::TeamEvent>),
+    > = if committed {
+        crate::plan_gate::send_back_def(run_id, &state).map_err(|e| (format!("{e:#}"), Vec::new()))
+    } else {
+        match result.and_then(|out| crate::plan_gate::parse_send_back_plan(&out)) {
+            Err(why) => Err((why, Vec::new())),
+            Ok(steps) => {
+                let r = crate::plan_gate::send_back(
+                    run_id,
+                    &state,
+                    steps,
+                    &session.human_confirm,
+                    now,
+                )?;
+                match r.outcome {
+                    crate::plan_gate::Outcome::Held { def } => {
+                        match check_def_runs(store, &session, &def) {
+                            Ok(()) => {
+                                // Write 1: the new held rev, the send-back still set.
+                                let mut next = r.state;
+                                if teamed {
+                                    next.queued
+                                        .extend(crate::plan_gate::queued_facts(&r.events)?);
+                                }
+                                session.team_plan = Some(next);
+                                put_node(store, session.to_node())?;
+                                Ok(def)
+                            }
+                            Err(e) => Err((format!("{e:#}"), r.events)),
+                        }
+                    }
+                    crate::plan_gate::Outcome::Refused { reason } => Err((reason, r.events)),
+                    crate::plan_gate::Outcome::Accepted { .. } => Err((
+                        "a send-back's re-plan is held, never accepted".to_string(),
+                        r.events,
+                    )),
+                }
+            }
+        }
+    };
+    // The unit swap (the refused-edit and accepted-edit paths' own), then write 2.
+    let swapped = match applied {
+        // A restart after the swap itself and before write 2: the units already ARE the new rev
+        // (its phases, in its order), so it is finished as it stands — never swapped again,
+        // whose re-check could fail and restore the old rev over the new units (codex r3).
+        Ok(def) if committed && units_are(store, run_id, &def)? => Ok(()),
+        Ok(def) => replan_for_accepted_edit(store, subscribers, &session, def)
+            .map_err(|e| (format!("{e:#}"), Vec::new())),
+        Err(e) => Err(e),
+    };
+    let mut session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    match swapped {
+        Ok(()) => {
+            if let Some(tp) = session.team_plan.as_mut() {
+                tp.send_back = None;
+            }
+        }
+        Err((why, events)) => {
+            // The held rev as it was sent back, re-opened with the failure recorded — restored
+            // from the send-back's own snapshot, so a new rev written before a failed unit swap
+            // is never the one offered over the old units.
+            let mut back = state;
+            if let Some(h) = sb.held.clone() {
+                back.pending = Some(*h);
+                back.rev = sb.prior_rev;
+            }
+            back.send_back = None;
+            if teamed {
+                back.queued.extend(crate::plan_gate::queued_facts(&events)?);
+            }
+            if let Some(p) = back.pending.as_mut() {
+                p.gate_id = None;
+                p.refusal = Some(format!("Couldn't update the plan: {why}"));
+            }
+            session.team_plan = Some(back);
+            session.status = SessionStatus::AwaitingHuman;
+        }
+    }
+    put_node(store, session.to_node())?;
+    match advance_or_pause(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        session.unit_ix,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    )? {
+        Progress::Paused => {
+            in_flight.remove(run_id);
+            Ok(())
+        }
+        Progress::Dispatched | Progress::Done | Progress::Deferred => {
+            anyhow::bail!("run {run_id}: a send-back must hold its plan for approval")
+        }
+    }
+}
+
+/// Whether `run_id`'s stored units are exactly the units `def` plans, in order: the same ids,
+/// prompts, gates, skills and Tool commands (`plan::plan_from_def`, pure).
+fn units_are(
+    store: &dyn GraphStore,
+    run_id: &str,
+    def: &crate::workflow::WorkflowDef,
+) -> anyhow::Result<bool> {
+    let Some(session) = crate::domain::get_session(store, run_id)? else {
+        return Ok(false);
+    };
+    let units = crate::domain::session_units(store, run_id)?;
+    let mut planned = crate::plan::plan_from_def(def, &session.problem, run_id);
+    // Planning binds a repo-bound Tool's `{repo_root}` / `{code_graph_db}`: compare the bound form.
+    if let Some(repo) = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+    {
+        crate::plan::bind_repo_paths(&mut planned, &repo);
+    }
+    Ok(units.len() == planned.len()
+        && units.iter().zip(&planned).all(|(u, p)| {
+            u.id == p.id
+                && u.description == p.description
+                && u.depends_on == p.depends_on
+                && u.gate == p.gate
+                && u.role == p.role
+                && u.owner == p.owner
+                && u.catalog == p.catalog
+                && u.executes_code == p.executes_code
+                && u.required_deliverables == p.required_deliverables
+                && u.skill_ref == p.skill_ref
+                && u.tool_cmd == p.tool_cmd
+                && u.rubric == p.rubric
+        }))
 }
 
 /// The row of `held`'s gate, re-opened in memory for its answer (the plan arm resolves it). A
@@ -13980,9 +14479,66 @@ pub(crate) fn confirm_gate_as(
     process_gen: uuid::Uuid,
     is_acp: bool,
 ) -> anyhow::Result<SessionStatus> {
+    confirm_gate_expecting(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        run_id,
+        decision,
+        actor,
+        None,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    )
+}
+
+/// (DES-CATALOG-002 §4.6) [`confirm_gate_as`] with what the answer EXPECTS the open gate to be
+/// ([`crate::workflow::GateExpect`]), compared here, inside the serialized decision path.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn confirm_gate_expecting(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    decision: crate::workflow::HumanDecision,
+    actor: Option<String>,
+    expect: Option<crate::workflow::GateExpect>,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<SessionStatus> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    // (DES-CATALOG-002 §4.6) While a send-back is re-planning, the run has no approvable plan:
+    // every answer is refused, whatever it expects.
+    if let Some(sb) = session
+        .team_plan
+        .as_ref()
+        .and_then(|t| t.send_back.as_ref())
+    {
+        anyhow::bail!(
+            "{}: run {run_id}'s plan rev {} was sent back and its lead is re-planning — answer the \
+             next revision when it is held",
+            crate::workflow::GATE_CHANGED,
+            sb.from_rev
+        );
+    }
     if session.status != SessionStatus::AwaitingHuman {
+        // An answer that names the gate it was sent for learns that gate is gone.
+        if expect.is_some() {
+            anyhow::bail!(
+                "{}: run {run_id} has no gate open (status is {:?}) — read the run again",
+                crate::workflow::GATE_CHANGED,
+                session.status
+            );
+        }
         anyhow::bail!(
             "run {run_id} is not awaiting confirmation (status is {:?})",
             session.status
@@ -14011,7 +14567,14 @@ pub(crate) fn confirm_gate_as(
         Some(row) => Some(row),
         None if team_fact_pending => None,
         None => match session.team_plan.as_ref().and_then(|t| t.pending.as_ref()) {
-            Some(held) => Some(reopen_plan_row(&*store, run_id, held)?),
+            Some(held) => Some(reopen_plan_row(&*store, run_id, held).map_err(|e| {
+                // An answer naming its gate learns the gate is not there to answer.
+                if expect.is_some() {
+                    anyhow::anyhow!("{}: {e:#}", crate::workflow::GATE_CHANGED)
+                } else {
+                    e
+                }
+            })?),
             None => None,
         },
     };
@@ -14026,11 +14589,34 @@ pub(crate) fn confirm_gate_as(
             session,
             row,
             decision,
+            expect,
             lifecycle_maps,
             actor_maps,
             process_gen,
             is_acp,
         );
+    }
+    // An answer that expects a plan revision answers a plan gate, and none is open.
+    if expect.is_some_and(|e| e.plan_rev.is_some()) {
+        anyhow::bail!(
+            "{}: run {run_id} has no plan_approval gate open — read the gate again",
+            crate::workflow::GATE_CHANGED
+        );
+    }
+    if let Some(e) = expect.and_then(|e| e.ord) {
+        let open_ord = crate::interaction::list_interactions(
+            &*store,
+            Some(run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )?
+        .into_iter()
+        .find_map(|r| r.ord);
+        if open_ord != Some(e) {
+            anyhow::bail!(
+                "{}: run {run_id}'s open gate is not unit {e} — read the gate again",
+                crate::workflow::GATE_CHANGED
+            );
+        }
     }
     if matches!(decision, crate::workflow::HumanDecision::EditPlan { .. }) {
         anyhow::bail!(

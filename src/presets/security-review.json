@@ -1,0 +1,22 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "instructions": "Phase 1/2 SCOPE: map the attack surface in scope: entry points and the input they take, authentication and authorization, secrets and configuration, dependencies and their versions, and the data each path can reach. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "review",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "scope"
+   ],
+   "skill_ref": "wicked-garden-platform-security-engineer",
+   "instructions": "Phase 2/2 SECURITY REVIEW (security engineer): report each vulnerability or weakness with its file:line, how it could be exploited and its severity, and the fix it needs, the most severe first. Change nothing yourself: a fix is a separate job. PASS only when every finding holds at file:line."
+  }
+ ]
+}

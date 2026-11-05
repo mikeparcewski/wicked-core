@@ -1,0 +1,22 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "scope",
+   "instructions": "Phase 1/2 SCOPE: map the personal data in scope: what is collected, where it is stored, who and what can read it, where it is sent, how long it is kept and how it is deleted. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; your output is the report."
+  },
+  {
+   "catalog": "critique",
+   "id": "review",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "rubric": "cited-findings",
+   "depends_on": [
+    "scope"
+   ],
+   "skill_ref": "wicked-garden-platform-privacy-expert",
+   "instructions": "Phase 2/2 PRIVACY REVIEW (privacy expert): report each place personal data is handled beyond what its purpose needs, or without its consent, retention or deletion, with its file:line, its severity and the change it needs, the most severe first. Change nothing yourself: a fix is a separate job. PASS only when every finding holds at file:line."
+  }
+ ]
+}

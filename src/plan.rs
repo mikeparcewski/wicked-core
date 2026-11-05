@@ -226,6 +226,8 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             unit.team_run = is_per_run_def_id(&def.id, session_id);
             // The catalog entry a composed phase instantiates: governance's third alias (T3).
             unit.catalog = phase.catalog.clone();
+            // (DES-CATALOG-002 §5.1) …and its rubric: seating reads it (report-author provenance).
+            unit.rubric = phase.rubric.clone();
             // Carry the DECLARED dependency graph (FINDING-024). The def states which phases this one
             // consumes; the engine honored that for ordering and dropped it for context, so an
             // Evaluator phase declared `.after("build")` still ran blind to the build. Carrying it
@@ -666,6 +668,12 @@ pub struct PlanStep {
     /// this step's command asks for another pass ([`crate::workflow::PhaseDef::repeat_from`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repeat_from: Option<String>,
+    /// (DES-CATALOG-002 §5.2) The gate rubric the step is judged by, one id per step
+    /// ([`crate::rubric`]): `compose` refuses an unknown id (`unknown_rubric`) and one on an entry
+    /// outside the rubric's `applies_to` (`rubric_wrong_entry`), and appends the rubric's
+    /// instructions after the step's own. It never changes the step's gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rubric: Option<String>,
 }
 
 impl PlanStep {
@@ -776,6 +784,15 @@ pub enum PlanRefusal {
     /// `rule` names the held testing rule whose `step:security_review` obligation added it, and
     /// is `None` for an authored step (a preset, the PA's `PLAN+`, a human edit).
     SecurityReviewOnNonCodePlan { step: String, rule: Option<String> },
+    /// (DES-CATALOG-002 §5.2) The step names a rubric no data file defines.
+    UnknownRubric { step: String, rubric: String },
+    /// (DES-CATALOG-002 §5.2) The step names a rubric that does not apply to its catalog entry
+    /// (cited findings on a `build` step: a creator cannot judge itself).
+    RubricWrongEntry {
+        step: String,
+        catalog: String,
+        rubric: String,
+    },
 }
 
 /// The phase id the engine's deliver protections key on (`deliver_lift::DELIVER_PHASE_ID`).
@@ -821,6 +838,8 @@ impl PlanRefusal {
             PlanRefusal::DeliverDuplicate { .. } => "deliver_duplicate",
             PlanRefusal::UnknownObligation { .. } => "unknown_obligation",
             PlanRefusal::SecurityReviewOnNonCodePlan { .. } => "security_review_on_non_code_plan",
+            PlanRefusal::UnknownRubric { .. } => "unknown_rubric",
+            PlanRefusal::RubricWrongEntry { .. } => "rubric_wrong_entry",
         }
     }
 }
@@ -993,6 +1012,20 @@ impl std::fmt::Display for PlanRefusal {
                      code; drop the step, or scope the rule to code runs"
                 )
             }
+            PlanRefusal::UnknownRubric { step, rubric } => write!(
+                f,
+                "{r}: step {step} names the rubric {rubric}, which no rubric defines (one of \
+                 parity, cited-findings, fidelity-to-source)"
+            ),
+            PlanRefusal::RubricWrongEntry {
+                step,
+                catalog,
+                rubric,
+            } => write!(
+                f,
+                "{r}: step {step} puts the rubric {rubric} on {catalog}, an entry it does not \
+                 judge \u{2014} a rubric rides only the evaluator entries it names"
+            ),
         }
     }
 }
@@ -1026,6 +1059,9 @@ pub enum FieldRule {
     /// Output-only:
     /// [`floor_fill`] refuses it on input and writes it itself; `compose` ignores it.
     Record,
+    /// (DES-CATALOG-002 §5.2) A gate rubric (`rubric`): only on an entry the rubric applies to;
+    /// it APPENDS the rubric's instructions (stricter, never looser) and leaves the gate as it is.
+    Rubric,
     /// (core#649) A fact about the step that the plan gate reads, not a control on its entry
     /// (`writes_nothing`): the composed phase is unchanged, and it is refused on a phase where it
     /// cannot hold (`writes_nothing_on_code`).
@@ -1066,10 +1102,16 @@ pub const STEP_FIELD_RULES: &[(&str, FieldRule)] = &[
     ("floor_reason", FieldRule::Record),
     ("floor_rule", FieldRule::Record),
     ("repeat_from", FieldRule::RunOnly),
+    ("rubric", FieldRule::Rubric),
 ];
 
 /// A gate's position on the §8.3 ladder: `auto` < `human_confirm_if` <
 /// `human_confirm{unconditional:false}` < `human_confirm{unconditional:true}` < `consent_before`.
+/// [`gate_rank`] for the plan gate's send-back check (`plan_gate::revise`).
+pub(crate) fn gate_rank_of(g: crate::workflow::GateSpec) -> u8 {
+    gate_rank(g)
+}
+
 fn gate_rank(g: crate::workflow::GateSpec) -> u8 {
     use crate::workflow::GateSpec;
     match g {
@@ -1357,6 +1399,26 @@ fn apply_step(
         }
         phase.repeat_from = Some(from.clone());
     }
+    // rubric — Rubric: a known id, on an entry it applies to; its contract is appended after the
+    // step's own instructions (the entry carries none on every rubric entry, and the step's text is
+    // already settled above), and the gate is left exactly as the step set it.
+    if let Some(id) = &step.rubric {
+        let Some(r) = crate::rubric::rubric(id) else {
+            return Err(PlanRefusal::UnknownRubric {
+                step: step.id.clone(),
+                rubric: id.clone(),
+            });
+        };
+        if !r.applies_to.iter().any(|c| c == &entry.id) {
+            return Err(PlanRefusal::RubricWrongEntry {
+                step: step.id.clone(),
+                catalog: step.catalog.clone(),
+                rubric: id.clone(),
+            });
+        }
+        phase.instructions = Some(crate::rubric::expand(phase.instructions.as_deref(), r));
+        phase.rubric = Some(r.id.clone());
+    }
     Ok(phase)
 }
 
@@ -1553,6 +1615,39 @@ fn owes_qe_test(
                 s.catalog == "test" && at > after && deliver_at.is_none_or(|d| at < d)
             })
         })
+}
+
+/// (DES-CATALOG-002 §5.1) The floor reason of the parity test floor fill adds after a later tree
+/// change.
+pub const PARITY_FRESH_REASON: &str =
+    "parity is checked again after the last step that changes the tree";
+
+/// (DES-CATALOG-002 §5.1) Whether a plan that carries a parity step owes a FRESH one: no `test`
+/// step carrying the parity rubric runs after its last tree-changing step (in running order, and
+/// before the deliver step). An ordinary test after the change does not count: parity is its own
+/// check, so a writer a revision adds after the parity step, and an ordinary test after that writer,
+/// still owe parity again.
+fn owes_parity_test(
+    catalog: &[crate::workflow::PhaseDef],
+    steps: &[PlanStep],
+    ran: &[String],
+) -> bool {
+    let parity =
+        |s: &PlanStep| s.catalog == "test" && s.rubric.as_deref() == Some(crate::rubric::PARITY);
+    if !steps.iter().any(parity) {
+        return false;
+    }
+    let deliver_at = (0..steps.len())
+        .filter(|&i| steps[i].catalog == DELIVER_ID)
+        .map(|i| run_position(steps, ran, i))
+        .min();
+    last_tree_changing_step(catalog, steps, ran).is_some_and(|c| {
+        let after = run_position(steps, ran, c);
+        !steps.iter().enumerate().any(|(i, s)| {
+            let at = run_position(steps, ran, i);
+            parity(s) && at > after && deliver_at.is_none_or(|d| at < d)
+        })
+    })
 }
 
 /// The phase types floor fill could insert into `plan` in the WORST case: the top band's floor
@@ -1780,6 +1875,25 @@ pub fn floor_fill(
                 added_by: Some(AddedBy::Floor),
                 floor_reason: Some(floor_reason),
                 floor_rule,
+                ..PlanStep::default()
+            },
+        );
+    }
+    // (DES-CATALOG-002 §5.1) PARITY FRESHNESS: a plan that checks parity checks it again after
+    // its last tree change. Placed right after that step, like the QE contract's test below —
+    // which this test also satisfies, so the contract then adds none.
+    if owes_parity_test(catalog, &steps, input.ran) {
+        let c = last_tree_changing_step(catalog, &steps, input.ran)
+            .expect("parity is owed after a tree change");
+        let id = fresh_id(&steps, "parity");
+        steps.insert(
+            c + 1,
+            PlanStep {
+                catalog: "test".to_string(),
+                id,
+                rubric: Some(crate::rubric::PARITY.to_string()),
+                added_by: Some(AddedBy::Floor),
+                floor_reason: Some(PARITY_FRESH_REASON.to_string()),
                 ..PlanStep::default()
             },
         );
@@ -5220,5 +5334,210 @@ mod tests {
                 "provenance_supplied"
             );
         }
+    }
+
+    fn rubric_plan(v: serde_json::Value) -> PlanSteps {
+        serde_json::from_value(v).expect("a plan")
+    }
+
+    fn fill(plan: &PlanSteps, ran: &[String], requires_qe: bool) -> FloorFilled {
+        floor_fill(
+            crate::catalog::catalog(),
+            plan,
+            FloorInput {
+                score: 0,
+                destructive: false,
+                human_confirm: &crate::domain::HumanConfirm::Before(1),
+                deliver: None,
+                obligations: &[],
+                ran,
+                requires_evaluator: false,
+                requires_qe,
+                power_absorbs: &[],
+            },
+        )
+        .expect("the plan fills")
+    }
+
+    /// (DES-CATALOG-002 §5.2) A rubric on an entry it does not judge is refused — cited findings on
+    /// a `build` step would have a creator judge itself — and so is an unknown rubric. A known
+    /// rubric on its entry appends its contract after the step's own text, on one line, and the
+    /// composed phase carries it.
+    #[test]
+    fn compose_refuses_a_rubric_on_a_build_step_and_an_unknown_rubric() {
+        let cat = crate::catalog::catalog();
+        let refused = |v: serde_json::Value| compose(cat, &rubric_plan(v)).unwrap_err();
+        let r = refused(
+            serde_json::json!({"steps": [{"catalog": "build", "id": "b", "rubric": "cited-findings"}]}),
+        );
+        assert_eq!(r.reason(), "rubric_wrong_entry", "{r}");
+        let r = refused(
+            serde_json::json!({"steps": [{"catalog": "build", "id": "b", "rubric": "parity"}]}),
+        );
+        assert_eq!(r.reason(), "rubric_wrong_entry", "{r}");
+        let r = refused(
+            serde_json::json!({"steps": [{"catalog": "understand", "id": "u", "rubric": "cited-findings"}]}),
+        );
+        assert_eq!(r.reason(), "rubric_wrong_entry", "{r}");
+        let r = refused(
+            serde_json::json!({"steps": [{"catalog": "critique", "id": "c", "rubric": "be-nice"}]}),
+        );
+        assert_eq!(r.reason(), "unknown_rubric", "{r}");
+        let def = compose(
+            cat,
+            &rubric_plan(serde_json::json!({"steps": [
+                {"catalog": "understand", "id": "u"},
+                {"catalog": "critique", "id": "c", "rubric": "cited-findings",
+                 "instructions": "Check the claims.", "depends_on": ["u"]}
+            ]})),
+        )
+        .unwrap();
+        let c = &def.phases[1];
+        let r = crate::rubric::rubric("cited-findings").unwrap();
+        assert_eq!(c.rubric.as_deref(), Some("cited-findings"));
+        assert_eq!(
+            c.instructions.as_deref(),
+            Some(format!("Check the claims. {}", r.instructions).as_str())
+        );
+        assert!(!c.instructions.as_deref().unwrap().contains('\n'));
+        // The unit carries it, so seating can read it.
+        let units = plan_from_def(&def, "x", "s");
+        assert_eq!(units[1].rubric.as_deref(), Some("cited-findings"));
+        assert_eq!(units[0].rubric, None);
+    }
+
+    /// (DES-CATALOG-002 §5.2) A rubric never changes a gate: the composed phase's gate is exactly
+    /// the step's (or the entry's), with and without the rubric, on every rubric's entries.
+    #[test]
+    fn a_rubric_never_changes_a_gate() {
+        use crate::workflow::{GateCond, GateSpec};
+        let cat = crate::catalog::catalog();
+        for r in crate::rubric::rubrics() {
+            for entry in &r.applies_to {
+                for gate in [
+                    None,
+                    Some(GateSpec::HumanConfirmIf(GateCond::VerdictNotPass)),
+                    Some(GateSpec::HumanConfirm {
+                        unconditional: true,
+                    }),
+                ] {
+                    let step = |rubric: Option<&str>| PlanSteps {
+                        steps: vec![
+                            PlanStep {
+                                catalog: "build".into(),
+                                id: "b".into(),
+                                ..PlanStep::default()
+                            },
+                            PlanStep {
+                                catalog: entry.clone(),
+                                id: "x".into(),
+                                gate,
+                                rubric: rubric.map(str::to_string),
+                                ..PlanStep::default()
+                            },
+                        ],
+                        ..Default::default()
+                    };
+                    let with = compose(cat, &step(Some(&r.id))).unwrap();
+                    let without = compose(cat, &step(None)).unwrap();
+                    assert_eq!(
+                        with.phases[1].gate, without.phases[1].gate,
+                        "{} on {entry}",
+                        r.id
+                    );
+                    assert_eq!(with.phases[1].gate_type, without.phases[1].gate_type);
+                    assert_eq!(
+                        with.phases[1].validator_pin,
+                        without.phases[1].validator_pin
+                    );
+                }
+            }
+        }
+    }
+
+    /// (DES-CATALOG-002 §5.2) A def can never claim a rubric it does not ask for: a phase naming a
+    /// rubric whose contract is not in its instructions (or an unknown one) does not register.
+    #[test]
+    fn a_def_phase_claiming_a_rubric_it_does_not_carry_is_refused() {
+        let def = compose(
+            crate::catalog::catalog(),
+            &rubric_plan(serde_json::json!({"steps": [{"catalog": "critique", "id": "c", "rubric": "cited-findings"}]})),
+        )
+        .unwrap();
+        assert!(def.validate().is_ok());
+        let mut forged = def.clone();
+        forged.phases[0].instructions = Some("anything".into());
+        assert!(matches!(
+            forged.validate(),
+            Err(crate::workflow::WorkflowDefError::RubricNotExpanded { .. })
+        ));
+        let mut unknown = def;
+        unknown.phases[0].rubric = Some("be-nice".into());
+        assert!(unknown.validate().is_err());
+    }
+
+    /// (DES-CATALOG-002 §5.1) PARITY FRESHNESS: a plan with a parity step owes parity again after its
+    /// last tree change. A writer a revision adds after the parity step gets a fresh parity test,
+    /// even with an ordinary test between them, and even off a QE contract; one inserted parity test
+    /// also satisfies the QE contract (no second test). A plan whose parity runs last owes nothing.
+    #[test]
+    fn parity_reruns_after_a_later_writer_even_after_an_ordinary_test() {
+        let base = serde_json::json!([
+            {"catalog": "build", "id": "build"},
+            {"catalog": "test", "id": "parity", "rubric": "parity", "depends_on": ["build"]},
+            {"catalog": "critique", "id": "review", "depends_on": ["build"]}
+        ]);
+        // Fresh: nothing added.
+        let plan = rubric_plan(serde_json::json!({ "steps": base }));
+        let f = fill(&plan, &[], false);
+        assert!(
+            !f.steps
+                .steps
+                .iter()
+                .any(|s| s.floor_reason.as_deref() == Some(PARITY_FRESH_REASON)),
+            "{:?}",
+            f.steps.steps
+        );
+        // A revision: build and parity RAN, then a writer and an ordinary test were added.
+        let mut steps = base.as_array().unwrap().clone();
+        steps.push(serde_json::json!({"catalog": "build", "id": "rollback"}));
+        steps.push(
+            serde_json::json!({"catalog": "test", "id": "smoke", "depends_on": ["rollback"]}),
+        );
+        let plan = rubric_plan(serde_json::json!({ "steps": steps }));
+        let ran = vec!["build".to_string(), "parity".to_string()];
+        for qe in [false, true] {
+            let f = fill(&plan, &ran, qe);
+            let ids: Vec<&str> = f.steps.steps.iter().map(|s| s.id.as_str()).collect();
+            let at = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+            let fresh: Vec<&PlanStep> = f
+                .steps
+                .steps
+                .iter()
+                .filter(|s| s.floor_reason.as_deref() == Some(PARITY_FRESH_REASON))
+                .collect();
+            assert_eq!(fresh.len(), 1, "qe={qe}: {ids:?}");
+            let fresh = fresh[0];
+            assert_eq!(fresh.catalog, "test");
+            assert_eq!(fresh.rubric.as_deref(), Some(crate::rubric::PARITY));
+            assert_eq!(fresh.added_by, Some(AddedBy::Floor));
+            assert!(at(&fresh.id) == at("rollback") + 1, "qe={qe}: {ids:?}");
+            // The parity test is the QE contract's test after the last change: no second one.
+            assert!(
+                !f.steps
+                    .steps
+                    .iter()
+                    .any(|s| s.floor_reason.as_deref() == Some(CONTRACT_QE_REASON)),
+                "qe={qe}: {ids:?}"
+            );
+        }
+        // A plan with no parity step owes none.
+        let plan = rubric_plan(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "build"},
+            {"catalog": "test", "id": "test"},
+            {"catalog": "build", "id": "more"}
+        ]}));
+        let f = fill(&plan, &[], false);
+        assert!(f.steps.steps.iter().all(|s| s.rubric.is_none()));
     }
 }

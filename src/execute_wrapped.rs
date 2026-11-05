@@ -3016,7 +3016,8 @@ struct OneShotScratch {
 
 /// The run-id prefixes of the engine's one-shot sessions (`decision` ballots, `validator`'s
 /// `one_shot_run_id`, team member turns): only a seat home named for one of them is ever removed.
-const ONE_SHOT_RUN_PREFIXES: [&str; 4] = ["council-", "validator-", "triage-", "member-"];
+const ONE_SHOT_RUN_PREFIXES: [&str; 5] =
+    ["council-", "validator-", "triage-", "member-", "send-back-"];
 
 impl OneShotScratch {
     fn new(run_id: &str) -> Self {
@@ -7641,10 +7642,18 @@ const LAYOUT_PREFIX: &str =
 /// skill (`WrappedCliStepRunner::exec`), and they follow the seat floor ungoverned
 /// ([`runs_in_seat`]).
 pub(crate) fn is_engine_internal(unit: &WorkUnit) -> bool {
-    matches!(unit.session_id.as_str(), "validator" | "triage")
-        || is_council_ballot(unit)
+    matches!(
+        unit.session_id.as_str(),
+        "validator" | "triage" | SEND_BACK_SESSION
+    ) || is_council_ballot(unit)
         || is_team_member_turn(unit)
 }
+
+/// (DES-CATALOG-002 §2.4) The session of the lead's re-plan turn for a plan-gate send-back: one of
+/// the engine's own one-shot calls, so it follows the seat floor (its seat's container, the
+/// gateway as the only egress) and runs in a one-shot scratch, never a run worktree, exactly as
+/// the triage judge does.
+pub(crate) const SEND_BACK_SESSION: &str = "send-back";
 
 /// The session and unit id of a team member's turn (`acp_runner::RunnerHost`, DES-TEAMING-002
 /// §8.8): a read-only review of a step another seat is working on, run as one of the engine's
@@ -13203,9 +13212,12 @@ mod tests {
         assert_eq!(
             evaluators,
             vec![
+                "analyze-codebase/check",
                 "apps-publish/qe",
                 "apps-turn/review",
                 "bug/verify",
+                "compliance-review/review",
+                "decide/score",
                 "demo/review",
                 "docs/check",
                 "domain-extraction/coverage",
@@ -13215,12 +13227,32 @@ mod tests {
                 "feature/adversarial-review",
                 "feature/review",
                 "feature/test",
+                "investigate-incident/findings",
                 "learn/review",
+                "map-requirements/check",
                 "mcp-server/observability-review",
                 "mcp-server/security-review",
                 "mcp-server/test",
+                "migration/parity",
                 "migration/verify",
+                "modernize/final-parity",
+                "modernize/parity",
+                "plan/check",
+                "privacy-review/review",
                 "qe-author-tests/review",
+                "reconstruct/check",
+                "refactor/parity",
+                "refactor/review",
+                "release/fidelity",
+                "release/test",
+                "review-change/review",
+                "review-change/semantic",
+                "risk-analysis/risks",
+                "scaffold/security",
+                "scaffold/test",
+                "security-review/review",
+                "suite-health/review",
+                "suite-health/verify",
                 "test-analysis/verify",
                 "test-plan/check",
                 "validate-docs/verify",

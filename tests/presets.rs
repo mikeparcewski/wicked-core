@@ -616,14 +616,30 @@ fn f_presets_survive_a_restart() {
 }
 
 /// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
-const NO_MAPPING_ROW: [&str; 10] = [
+const NO_MAPPING_ROW: [&str; 26] = [
     "analyze",
+    "analyze-codebase",
     "apps-publish",
     "apps-turn",
+    "compliance-review",
+    "decide",
     "demo",
     "docs",
     "editor-plugin",
+    "investigate-incident",
     "learn",
+    "map-requirements",
+    "modernize",
+    "plan",
+    "privacy-review",
+    "reconstruct",
+    "refactor",
+    "release",
+    "review-change",
+    "risk-analysis",
+    "scaffold",
+    "security-review",
+    "suite-health",
     "test-analysis",
     "test-plan",
     "validate-docs",
@@ -645,11 +661,14 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
         names,
         [
             "analyze",
+            "analyze-codebase",
             "apps-publish",
             "apps-turn",
             "bug",
             "capture-learnings",
             "chat",
+            "compliance-review",
+            "decide",
             "demo",
             "docs",
             "domain-extraction",
@@ -658,12 +677,25 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "interactive-chat",
             "interactive-draft",
             "interactive-edit",
+            "investigate-incident",
             "learn",
+            "map-requirements",
             "mcp-server",
             "migration",
+            "modernize",
             "onboarding",
+            "plan",
+            "privacy-review",
             "qe-author-tests",
+            "reconstruct",
+            "refactor",
+            "release",
+            "review-change",
+            "risk-analysis",
+            "scaffold",
+            "security-review",
             "steering-author",
+            "suite-health",
             "test-analysis",
             "test-plan",
             "validate-docs"
@@ -682,8 +714,21 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
         .into_iter()
         .filter(|(n, _)| !NO_MAPPING_ROW.contains(n))
     {
-        let want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
+        let mut want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // (DES-CATALOG-002 §5.1) `migration` gains ONLY its parity steps over its mapping: verify
+        // checks parity, and a final `parity` test checks it again after cleanup.
+        if name == "migration" {
+            let verify = want.iter_mut().find(|s| s.id == "verify").unwrap();
+            verify.rubric = Some("parity".to_string());
+            want.push(PlanStep {
+                catalog: "test".to_string(),
+                id: "parity".to_string(),
+                depends_on: Some(vec!["cleanup".to_string()]),
+                rubric: Some("parity".to_string()),
+                ..PlanStep::default()
+            });
+        }
         assert_eq!(steps, want, "the built-in `{name}` is its C1 mapping");
     }
 }
@@ -754,8 +799,9 @@ fn m3_chat_launches_its_c1_unit_list_with_no_scope_step() {
 /// creator plan with no declared `touch`, the PA scopes it first (`pa-scope`, ord 1, X1), and this
 /// rig's PA declares nothing, so the plan fails closed at 100 and floor fill adds the 70-100 phases
 /// migration lacks (`test_plan`, `architecture`, `review`, `security_review`) at their catalog-order
-/// positions. (core#960) migration requires QE acceptance, and `cleanup` changes code after `verify`,
-/// so the QE contract adds a `test` after `cleanup`: QE judges the tree that ships.
+/// positions. (core#960) migration requires QE acceptance, and `cleanup` changes code after `verify`;
+/// (DES-CATALOG-002 §5.1) the preset's final `parity` test runs after `cleanup`, so QE judges the
+/// tree that ships and the contract adds no second test.
 #[test]
 fn m2_migration_launches_the_preset_with_its_bold_cells() {
     let dir = tmp_dir("migration");
@@ -792,9 +838,11 @@ fn m2_migration_launches_the_preset_with_its_bold_cells() {
             r("cutover", "build", "creator", hcu, f),
             r("verify", "test", "evaluator", hci, f),
             r("cleanup", "build", "creator", "auto", f),
-            r("test", "test", "evaluator", hci, f),
             r("review", "review", "evaluator", "auto", f),
             r("security_review", "review", "evaluator", "auto", f),
+            // (DES-CATALOG-002 §5.1) The preset's own final parity test is the test after the last
+            // tree change (cleanup), so the QE contract adds none.
+            r("parity", "test", "evaluator", hci, f),
         ]
     );
     let cleanup = units
@@ -1527,11 +1575,14 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
             "test-plan",
             true,
             vec![
+                // (DES-CATALOG-002 §3.2) test-analysis's analyze is Plan tests' first stage.
+                r("analyze", "recon", "neutral", "auto", None),
                 r("recon", "recon", "neutral", "auto", None),
                 r("plan", "build", "creator", "auto", Some(EVIDENCE_FLOOR_PIN)),
                 r("check", "review", "evaluator", hif, None),
             ],
             &[
+                ("analyze", Some("wicked-garden-qe")),
                 ("recon", Some("wicked-garden-qe-test-strategist")),
                 ("plan", Some("wicked-garden-qe-test-strategist")),
                 ("check", Some("wicked-garden-qe-risk-assessor")),
@@ -1574,17 +1625,18 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
         // with their kind, role, gate and pin, never filtered.
         let mut whole = Vec::new();
         if creator {
+            let n = want.len();
             whole.push(r("pa-scope", "recon", "neutral", "auto", None));
-            whole.push(want[0].clone());
+            whole.extend(want[..n - 2].iter().cloned());
             whole.push(r("test_plan", "test", "neutral", "auto", None));
             whole.push(r("design", "recon", "neutral", "auto", None));
             whole.push(r("architecture", "recon", "neutral", "auto", None));
-            whole.push(want[1].clone());
+            whole.push(want[n - 2].clone());
             // The writer is a code-work `build` step, so the floor adds its diff-floored review and
             // security review at this band.
             let f = Some(EVIDENCE_FLOOR_PIN);
             whole.push(r("review", "review", "evaluator", "auto", f));
-            whole.push(want[2].clone());
+            whole.push(want[n - 1].clone());
             whole.push(r("security_review", "review", "evaluator", "auto", f));
         } else {
             whole.extend(want.iter().cloned());

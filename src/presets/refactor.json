@@ -1,0 +1,42 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "survey",
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 1/4 SURVEY (engineering skill): read the code the ask names and map what the refactor or polish touches: the modules, their callers (blast radius from the code graph), the tests that cover them, and the public surface (exported names, flags, endpoints, configuration keys, formats) that must not change. List the behaviours to keep, each with the test that shows it. GROUND FIRST: query the code graph through the wicked-garden-search skill and the read-only estate shim, one call per lookup: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/_estate_client.py --readonly call '{\"tool\":\"SearchEntity\",\"arguments\":{\"name\":\"<symbol>\"}}' (always --readonly); then open and read every file you cite, at the lines you cite. Analysis only: write no files."
+  },
+  {
+   "catalog": "build",
+   "id": "refactor",
+   "depends_on": [
+    "survey"
+   ],
+   "skill_ref": "wicked-garden-engineering",
+   "instructions": "Phase 2/4 REFACTOR (engineering skill): make the change the ask names without changing behaviour: restructure, rename, simplify or polish, keeping the public surface as it is unless the ask names the change. Keep every existing test passing, and add a test where a kept behaviour had none. Never push, never open or edit a pull request — the run's deliver phase does that."
+  },
+  {
+   "catalog": "test",
+   "id": "parity",
+   "rubric": "parity",
+   "depends_on": [
+    "survey",
+    "refactor"
+   ],
+   "skill_ref": "wicked-garden-qe-code-analyzer",
+   "instructions": "Phase 3/4 PARITY (code analyzer): check the survey's list of behaviours to keep on the run's base and on the refactored tree."
+  },
+  {
+   "catalog": "critique",
+   "id": "review",
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "depends_on": [
+    "refactor",
+    "parity"
+   ],
+   "instructions": "Phase 4/4 REVIEW (independent evaluator): read the diff cold and judge whether it does what the ask names and nothing else: no behaviour change, no public-surface change the ask did not name, no dead code left behind, and the code is simpler or clearer than before. List each finding with its file:line, most harmful first. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
+  }
+ ]
+}

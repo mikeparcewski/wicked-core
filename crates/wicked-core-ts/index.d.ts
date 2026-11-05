@@ -243,6 +243,14 @@ export declare class Core {
    */
   static supportsPlanGateNote(): boolean
   /**
+   * (DES-CATALOG-002 §4.6) Whether this addon takes `confirmGate`'s trailing `expectOrd` /
+   * `expectPlanRev` (checked inside the engine: a stale answer is refused `gate_changed:`) and
+   * the plan-gate SEND-BACK: `confirmGate(run, false, note, "request_changes", …, planRev)` at a
+   * `plan_approval` gate has the lead re-plan with the note and holds the next revision for
+   * approval. napi drops undeclared trailing arguments, so a skin keys on this static first.
+   */
+  static supportsPlanSendBack(): boolean
+  /**
    * (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
    * `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
    * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
@@ -399,8 +407,14 @@ export declare class Core {
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
    * as the next plan rev (floor phases added, never refused for being below the floor) or, if it
    * refuses it, re-opens the gate with a new gate id.
+   *
+   * (DES-CATALOG-002 §4.6, additive.) `expectOrd` / `expectPlanRev` say which gate the answer
+   * was sent for: the engine compares them inside its serialized decision path and refuses a
+   * mismatch with an error that starts `gate_changed:`. A plan-gate SEND-BACK
+   * (`approve=false`, `action` `request_changes`, the person's words in `amend`) needs
+   * `expectPlanRev`: the lead re-plans with the note, and the next revision is held for approval.
    */
-  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null): Promise<string>
+  confirmGate(runId: string, approve: boolean, amend?: string | undefined | null, action?: string | undefined | null, amendScope?: string | undefined | null, planJson?: string | undefined | null, actor?: string | undefined | null, expectOrd?: number | undefined | null, expectPlanRev?: number | undefined | null): Promise<string>
   /**
    * Cancel a run — mark it terminally `Cancelled` and stop advancing it. Resolves to the status
    * token. Safe whether the run is executing or paused.
