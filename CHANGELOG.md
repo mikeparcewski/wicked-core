@@ -2298,6 +2298,17 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.27** — 2026-11-05 — patch release on main 59f33f5, carrying 2 PRs since 0.15.26: #1276 and #1277.
+  - **Every steering rule in force is checked at review (#1277, DES-RULE-CHECK-001 S2 + S3).** A review unit's gate
+    reads the project's in-force rules from the policy store, matches them against the job, and has a judge distinct
+    from the creators rule on each one with evidence; a rule can carry a machine check that decides it. A rule that
+    neither its machine check nor a judge decided holds the gate (`rules_unchecked`): `confirmGate` answers it with `retry_rules` or `skip_rules` (each skipped rule with
+    its reason). A rule the person's own instruction conflicts with is WAIVED, and the person confirms it.
+    `matchRules` gains `job.repo` and `job.paths`. crew's rules route (crew#1370) needs this release.
+  - **Lockfile:** #1276 re-stamped the 0.15.26 platform lock entries.
+  - No binding method or `LaunchSpec` field is added (`confirmGate` takes two new answers; `matchRules` reads two new
+    job fields). The seat and floor Dockerfiles, the seat package pins, the base image and the gate-hook protocol are
+    unchanged since 0.15.26, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.26** — 2026-11-05 — patch release on main 51813f3, carrying 2 PRs since 0.15.25: #1272 and #1274.
   - **`matchRules` (#1274, DES-RULE-CHECK-001 S1).** `Core.matchRules(argsJson)` (static, pure: no store, no model)
     answers which in-force rules a job is checked against: one match per rule, none dropped, each `applies`,
