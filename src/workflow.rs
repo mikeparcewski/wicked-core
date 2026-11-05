@@ -673,6 +673,11 @@ pub trait StepRunner: Send + Sync {
 /// emitter for both stub paths so they cannot diverge; the predicate is the fold's
 /// (`PhaseRole::Evaluator` + no `tool_cmd`).
 pub fn stub_output(unit: &WorkUnit) -> String {
+    // (DES-RULE-CHECK-001) A rule-check judge call: the stub answers every rule N/A in the call's
+    // frame, so a stub run's review is never held on rules nobody could judge.
+    if let Some(v) = crate::rule_check::stub_rule_verdicts(&unit.description) {
+        return v;
+    }
     let base = format!("stub-output for {}", unit.description);
     if unit.role == PhaseRole::Evaluator && unit.tool_cmd.is_none() {
         format!("{base}\nVERDICT: PASS")

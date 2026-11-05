@@ -953,6 +953,27 @@ pub fn instructions_of(description: &str) -> String {
     t[..end].to_string()
 }
 
+/// A test or stub runner's answer to a rule-check prompt: every asked rule N/A, framed with the
+/// call's nonce (a stub judges nothing, and says so). `None` when `prompt` is not one.
+pub fn stub_rule_verdicts(prompt: &str) -> Option<String> {
+    let at =
+        prompt.find("between a line `BEGIN VERDICTS ")? + "between a line `BEGIN VERDICTS ".len();
+    let nonce = prompt[at..].split('`').next()?;
+    let ids: Vec<&str> = prompt
+        .lines()
+        .skip_while(|l| *l != "RULES:")
+        .skip(1)
+        .filter(|l| l.starts_with("RULE "))
+        .filter_map(|l| l[5..].split(" (").next())
+        .collect();
+    let mut out = format!("BEGIN VERDICTS {nonce}\n");
+    for id in ids {
+        out.push_str(&format!("RULE {id}: N/A — a stub runner judged nothing\n"));
+    }
+    out.push_str(&format!("END VERDICTS {nonce}\n"));
+    Some(out)
+}
+
 /// The judge prompt for one batch: the rules whole, the evidence fenced as data, the answers
 /// framed by `nonce`. The diff is cut so the whole prompt stays within [`PROMPT_BUDGET`].
 pub fn prompt(

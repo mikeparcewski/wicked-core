@@ -1141,3 +1141,20 @@ fn changed_instructions_check_the_rule_again() {
     assert_eq!(again.rows[0].how, RuleHow::Judge);
     assert!(judge.calls.load(Ordering::SeqCst) > calls);
 }
+
+/// CI (power test pw9): a stub or scripted runner answers the rule check in the call's frame, so a
+/// stub run is never held on rules nobody could judge, and the answer parses as N/A for each rule.
+#[test]
+fn the_stub_runner_answers_every_rule_na_in_the_calls_frame() {
+    let rules = [rule("A", "a"), rule("proposal:b", "b")];
+    let p = prompt(&[(&rules[0], ""), (&rules[1], "")], DIFF, None, None, "n42");
+    let mut u = crate::domain::WorkUnit::pending("validator-agent", "validator", 1, p.clone());
+    u.assigned_cli = Some("x".into());
+    let out = crate::workflow::stub_output(&u);
+    let parsed = parse_rule_lines(&out, &["A", "proposal:b"], "n42", &[], None);
+    assert_eq!(parsed.len(), 2);
+    assert!(parsed
+        .values()
+        .all(|a| a.status == RuleStatus::NotApplicable));
+    assert!(stub_rule_verdicts("review the fix").is_none());
+}
