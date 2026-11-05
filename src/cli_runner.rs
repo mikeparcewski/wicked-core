@@ -1131,8 +1131,14 @@ fn run_rule_check(
             (keys, why)
         }
     };
-    let facts =
-        crate::rule_check::job_facts(&input.unit.rule_steps, gov.project_id.as_deref(), &change);
+    let facts = crate::rule_check::job_facts(
+        &input.unit.rule_steps,
+        gov.project_id.as_deref(),
+        gov.repo_id.as_deref(),
+        &change,
+    );
+    // The person's own words for the job (the review unit's task, the rules block taken out).
+    let instructions = crate::rule_check::instructions_of(&input.unit.description);
     let floor_text = floor.map(crate::rule_check::floor_evidence);
     engine_note(
         emit_delta,
@@ -1166,6 +1172,7 @@ fn run_rule_check(
                     seats: &seats,
                     no_seat: no_seat.as_deref(),
                     base: &base,
+                    instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
                 },
                 &judge,
                 &FloorMachine {

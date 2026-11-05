@@ -8209,6 +8209,7 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                     r.status,
                     crate::rule_check::RuleStatus::Broken
                         | crate::rule_check::RuleStatus::Unchecked
+                        | crate::rule_check::RuleStatus::Waived
                 )
             })
             .map(|r| r.rule_id.as_str())
@@ -8841,10 +8842,10 @@ fn denial_gate_prompt(
         ),
         // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
         "rules_unchecked" => format!(
-            "Unit {ord}'s steering rules are UNCHECKED — {}. The work was not rejected. Re-run the \
-             rule check on the same work (action `{}`; the step does not run again), skip an \
-             unchecked rule with a written reason (action `{}`: labelled on the run, the gate and \
-             the delivery), approve to run the step again, request changes to send it back for \
+            "Unit {ord}'s steering rules are UNCHECKED or waived by your instruction — {}. The \
+             work was not rejected. Re-run the rule check on the same work (action `{}`; the step \
+             does not run again), confirm a waiver or skip an unchecked rule with a written \
+             reason (action `{}`: labelled on the run, the gate and the delivery), approve to run the step again, request changes to send it back for \
              rework, or reject to cancel the run{note}",
             reason_head(reason),
             crate::rule_check::RETRY_ACTION,
@@ -15321,10 +15322,14 @@ fn rules_recheck_request(
         if reason.trim().is_empty() {
             anyhow::bail!("skip of rule `{id}` needs a written reason");
         }
-        let Some(row) = rows
-            .iter()
-            .find(|r| &r.rule_id == id && r.status == crate::rule_check::RuleStatus::Unchecked)
-        else {
+        let Some(row) = rows.iter().find(|r| {
+            &r.rule_id == id
+                && matches!(
+                    r.status,
+                    crate::rule_check::RuleStatus::Unchecked
+                        | crate::rule_check::RuleStatus::Waived
+                )
+        }) else {
             anyhow::bail!(
                 "rule `{id}` is not an unchecked rule of unit {} — only a rule no judge ruled on \
                  can be skipped (a broken rule denies the gate)",
@@ -15344,6 +15349,8 @@ fn rules_recheck_request(
             at,
             rule_key: row.rule_key.clone(),
             evidence_key,
+            instruction: (row.status == crate::rule_check::RuleStatus::Waived)
+                .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
         });
     }
     let output = crate::domain::get_unit_transcript(store, &cursor.id)

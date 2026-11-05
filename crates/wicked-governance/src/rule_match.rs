@@ -88,6 +88,13 @@ pub struct JobFacts {
     /// The diff text a trigger is matched against (review time).
     #[serde(default)]
     pub diff: Option<String>,
+    /// The job's repository (its registered id or name, e.g. `tiny-math`): a rule that names it in its
+    /// statement or its source document applies (E7 rerun: a tiny-math rule came back "may apply").
+    #[serde(default)]
+    pub repo: Option<String>,
+    /// The changed files (review time): a rule whose statement names one applies.
+    #[serde(default)]
+    pub paths: Option<Vec<String>>,
 }
 
 /// The facets a match reads, so a caller holding a partial rule (crew's wire shape) can match it too.
@@ -108,6 +115,12 @@ pub struct MatchRule {
     pub trigger: Option<MatchTrigger>,
     #[serde(default)]
     pub retired: bool,
+    /// The rule's statement: a repository or a changed file it names is a fact that selects it.
+    #[serde(default)]
+    pub statement: String,
+    /// Where the rule came from (`provenance.ref`, e.g. `tiny-math-tests.md@…#DEV-TINYMATH-2`).
+    #[serde(default)]
+    pub source_ref: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -143,6 +156,8 @@ impl Default for MatchRule {
             targets: MatchTargets::default(),
             trigger: None,
             retired: false,
+            statement: String::new(),
+            source_ref: None,
         }
     }
 }
@@ -165,6 +180,12 @@ impl From<&ConformanceRule> for MatchRule {
                 contains: t.contains.clone(),
             }),
             retired: r.retired,
+            statement: r.statement.clone(),
+            source_ref: r
+                .provenance
+                .reference
+                .clone()
+                .filter(|x| !x.trim().is_empty()),
         }
     }
 }
@@ -234,6 +255,27 @@ fn step_name(step: &JobStep) -> Option<String> {
         .find(|t| !t.starts_with("unit-"))
         .or(step.tokens.first())
         .cloned()
+}
+
+/// Whether `text` names `token` as a whole word: not inside a longer identifier or path
+/// (`tiny-math` in "tiny-math's src" or `tiny-math-tests.md`, never in `tiny-mathx`), case-insensitively.
+fn names_token(text: &str, token: &str) -> bool {
+    let (text, token) = (text.to_ascii_lowercase(), token.to_ascii_lowercase());
+    if token.is_empty() {
+        return false;
+    }
+    let ident = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(&token) {
+        let at = from + i;
+        let before = text[..at].chars().next_back();
+        let after = text[at + token.len()..].chars().next();
+        if !before.is_some_and(|c| ident(c) || c == '/') && !after.is_some_and(ident) {
+            return true;
+        }
+        from = at + token.len().max(1);
+    }
+    false
 }
 
 /// Match ONE rule against the job.
@@ -332,6 +374,35 @@ pub fn match_rule(rule: &MatchRule, job: &JobFacts) -> RuleMatch {
                     scope_words()
                 ),
             }),
+        }
+    }
+
+    // The job's repository, named by the rule (its statement, or its source document's name): it applies.
+    if let Some(repo) = job.repo.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        let doc = rule
+            .source_ref
+            .as_deref()
+            .map(|r| r.split(['@', '#']).next().unwrap_or(r))
+            .unwrap_or("");
+        if names_token(&rule.statement, repo) || names_token(doc, repo) {
+            yes.push(MatchFact {
+                kind: "repo".into(),
+                detail: format!("it names this job's repository {repo}"),
+            });
+        }
+    }
+    // A changed file the rule names (review time): it applies.
+    if let Some(paths) = job.paths.as_ref() {
+        let named: Vec<&str> = paths
+            .iter()
+            .map(String::as_str)
+            .filter(|p| p.contains('/') && names_token(&rule.statement, p))
+            .collect();
+        if !named.is_empty() {
+            yes.push(MatchFact {
+                kind: "path".into(),
+                detail: format!("it names the changed file(s) {}", named.join(", ")),
+            });
         }
     }
 
@@ -915,5 +986,69 @@ mod tests {
             .unwrap_err()
             .to_string()
             .starts_with("bad_request:"));
+    }
+
+    /// E7 rerun (coord, 2026-11-05): a rule that names the job's repository, in its statement or its
+    /// source document, applies; a changed file it names makes it apply at review; a longer name is
+    /// not the repository.
+    #[test]
+    fn a_rule_naming_the_jobs_repo_or_a_changed_file_applies() {
+        let tiny = MatchRule {
+            id: "DEV-TINYMATH-2".into(),
+            statement:
+                "Every change to a function in tiny-math's src/math.js adds or updates a test"
+                    .into(),
+            ..Default::default()
+        };
+        let by_doc = MatchRule {
+            id: "DOC".into(),
+            statement: "Every exported function has a JSDoc block".into(),
+            source_ref: Some("tiny-math-jsdoc.md@956a514#DEV-TINYMATH-1".into()),
+            ..Default::default()
+        };
+        let other = MatchRule {
+            id: "OTHER".into(),
+            statement: "tiny-mathx keeps its cache warm".into(),
+            ..Default::default()
+        };
+        let job = JobFacts {
+            repo: Some("tiny-math".into()),
+            ..Default::default()
+        };
+        let out = match_rules(&[tiny.clone(), by_doc, other.clone()], &job);
+        let st = |id: &str| out.iter().find(|m| m.rule_id == id).unwrap().clone();
+        assert_eq!(
+            st("DEV-TINYMATH-2").status,
+            MatchStatus::Applies,
+            "{:?}",
+            st("DEV-TINYMATH-2")
+        );
+        assert!(st("DEV-TINYMATH-2").facts[0]
+            .detail
+            .contains("names this job's repository tiny-math"));
+        assert_eq!(st("DOC").status, MatchStatus::Applies);
+        assert_eq!(st("OTHER").status, MatchStatus::MayApply);
+        // No repo known: the same rule may apply (a fact not known decides nothing).
+        let none = match_rules(&[tiny.clone()], &JobFacts::default());
+        assert_eq!(none[0].status, MatchStatus::MayApply);
+        // At review, a changed file the rule names.
+        let mut by_path = tiny;
+        by_path.statement = "Every change to src/math.js adds a test".into();
+        let review = JobFacts {
+            paths: Some(vec!["src/math.js".into()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            match_rules(&[by_path], &review)[0].status,
+            MatchStatus::Applies
+        );
+        // A rule out of scope by fact stays not applicable whatever it names.
+        let mut tool = other;
+        tool.statement = "tiny-math mcp calls are logged".into();
+        tool.applies_to = vec!["mcp".into()];
+        assert_eq!(
+            match_rules(&[tool], &job)[0].status,
+            MatchStatus::NotApplicable
+        );
     }
 }

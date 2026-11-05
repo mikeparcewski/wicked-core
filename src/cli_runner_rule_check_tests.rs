@@ -500,3 +500,147 @@ fn an_index_flag_cannot_hide_an_edit_from_the_snapshot() {
     let change = crate::rule_check::worktree_diff(&repo, Some(&repo.join(".git")), &base).unwrap();
     assert!(change.diff.contains("fn add(a: i32"), "{}", change.diff);
 }
+
+/// A judge that rules every asked rule BROKEN with a fixed cite, recording what it was asked.
+struct Breaks(Mutex<Vec<String>>);
+
+impl StepRunner for Breaks {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let p = input.unit.description.clone();
+        self.0.lock().unwrap().push(p.clone());
+        let nonce = crate::rule_check::tests::nonce_of(&p);
+        let ids: Vec<String> = p
+            .lines()
+            .skip_while(|l| *l != "RULES:")
+            .skip(1)
+            .filter(|l| l.starts_with("RULE "))
+            .filter_map(|l| l[5..].split(" (").next().map(str::to_string))
+            .collect();
+        let body: String = ids
+            .iter()
+            .map(|id| {
+                format!("RULE {id}: BROKEN — src/math.js fixes clamp and no test exercises it\n")
+            })
+            .collect();
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: format!("BEGIN VERDICTS {nonce}\n{body}END VERDICTS {nonce}\n"),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// (coord, E7 rerun) The "broken" fixture: tiny-math-untested has a bug in clamp() that no test
+/// covers. A fix that changes src/math.js and adds no test breaks learn-tests-with-fixes by the
+/// machine check (no model call) and the repo's own test rule by the judge, and the gate denies
+/// naming both. The repo rule applies (it names the job's repository).
+#[test]
+fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
+    let dir = std::env::temp_dir().join(format!("rule-check-untested-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("tiny-math-untested");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(repo.join("test")).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("src/math.js"), "export function sum(xs) { return xs.reduce((a, b) => a + b, 0); }\nexport function clamp(n, lo, hi) { return Math.min(Math.max(n, hi), lo); }\n").unwrap();
+    std::fs::write(repo.join("test/math.test.js"), "import { sum } from '../src/math.js';\nimport test from 'node:test';\ntest('sum', () => { if (sum([1, 2, 3]) !== 6) throw new Error('sum'); });\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "base: clamp is wrong and untested"],
+    );
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("src/math.js"), "export function sum(xs) { return xs.reduce((a, b) => a + b, 0); }\nexport function clamp(n, lo, hi) { return Math.min(Math.max(n, lo), hi); }\n").unwrap();
+    let db = dir.join("rules.db").to_string_lossy().into_owned();
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut learn = wicked_governance::ConformanceRule {
+            id: "learn-tests-with-fixes".into(),
+            rule_type: wicked_governance::RuleType::Pattern,
+            statement: "A bug fix includes a test that fails without the fix.".into(),
+            severity: wicked_governance::ConfSeverity::Warn,
+            ..Default::default()
+        };
+        learn.obligations = vec![crate::rule_check::OBLIGATION_TEST_FAILS_ON_BASE.into()];
+        wicked_governance::register_rule(&mut store, &learn).unwrap();
+        wicked_governance::register_rule(
+            &mut store,
+            &wicked_governance::ConformanceRule {
+                id: "DEV-UNTESTED-1".into(),
+                rule_type: wicked_governance::RuleType::Pattern,
+                statement: "Every change to a function in tiny-math-untested's src/math.js adds or updates a test in test/math.test.js.".into(),
+                severity: wicked_governance::ConfSeverity::Warn,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    }
+    let mut input = review_input(&repo, &base, &db);
+    input.governance.as_mut().unwrap().repo_id = Some("tiny-math-untested".into());
+    let runner = Breaks(Mutex::new(Vec::new()));
+    let sink = |_: &str| {};
+    let pool = vec![seat("claude"), seat("codex")];
+    let report = run_rule_check(
+        &input,
+        &["claude".to_string()],
+        Some(&[]),
+        &pool,
+        &pool,
+        None,
+        &runner,
+        &sink,
+    )
+    .expect("a report");
+    let row = |id: &str| {
+        report
+            .rows
+            .iter()
+            .find(|r| r.rule_id == id)
+            .unwrap()
+            .clone()
+    };
+    let learn = row("learn-tests-with-fixes");
+    assert_eq!(
+        (learn.status, learn.how),
+        (
+            crate::rule_check::RuleStatus::Broken,
+            crate::rule_check::RuleHow::Machine
+        ),
+        "{learn:?}"
+    );
+    assert!(
+        learn.reason.contains("src/math.js") && learn.reason.contains("no test"),
+        "{}",
+        learn.reason
+    );
+    let dev = row("DEV-UNTESTED-1");
+    assert_eq!(
+        (dev.status, dev.how),
+        (
+            crate::rule_check::RuleStatus::Broken,
+            crate::rule_check::RuleHow::Judge
+        )
+    );
+    let asked = runner.0.into_inner().unwrap();
+    assert!(
+        asked
+            .iter()
+            .all(|p| !p.contains("RULE learn-tests-with-fixes (")),
+        "no model call for the machine rule"
+    );
+    assert!(
+        asked
+            .iter()
+            .any(|p| p.contains("Engine: applies") && p.contains("tiny-math-untested")),
+        "the repo rule applies"
+    );
+    let deny = report.denial().expect("broken denies");
+    assert_eq!(deny.rule_ids, ["DEV-UNTESTED-1", "learn-tests-with-fixes"]);
+}

@@ -152,7 +152,7 @@ fn run_on(
     prior: Option<&RuleCheckReport>,
     skips: &[RuleSkip],
 ) -> RuleCheckReport {
-    let f = job_facts(&[], None, c);
+    let f = job_facts(&[], None, None, c);
     let seats = seats();
     check(
         &CheckInput {
@@ -165,6 +165,7 @@ fn run_on(
             seats: &seats,
             no_seat: None,
             base: "b0",
+            instructions: None,
         },
         judge,
         machine,
@@ -222,7 +223,7 @@ fn rule_lines_count_only_inside_the_calls_frame() {
                 RULE R7: KEPT — add.rs looks right\n\
                 RULE OTHER: KEPT — not asked\n\
                 END VERDICTS n1\n";
-    let p = parse_rule_lines(text, &ids, "n1", &paths);
+    let p = parse_rule_lines(text, &ids, "n1", &paths, None);
     assert_eq!(p["DEV-1"].status, RuleStatus::Kept);
     assert_eq!(p["DEV-1"].cite, "src/add.rs:1 adds the typed signature");
     assert_eq!(
@@ -238,7 +239,7 @@ fn rule_lines_count_only_inside_the_calls_frame() {
         );
     }
     assert!(
-        parse_rule_lines(text, &ids, "other-nonce", &paths).is_empty(),
+        parse_rule_lines(text, &ids, "other-nonce", &paths, None).is_empty(),
         "another call's frame"
     );
 }
@@ -348,7 +349,7 @@ fn long_statements_split_batches_so_every_prompt_fits_one_argument() {
         .map(|(a, b)| (a.as_str(), b.as_str()))
         .collect();
     let judge = Fake::new(&refs);
-    let big = format!("{DIFF}{}", "+x\n".repeat(30_000));
+    let big = DIFF.to_string();
     let c = change_of(&big, &["src/add.rs"]);
     let r = run_on(&rules, &c, &judge, &NoMachine, None, &[]);
     assert!(r.rows.iter().all(|x| x.status == RuleStatus::Kept));
@@ -470,7 +471,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
     let rules = [rule("A", "a")];
     let judge = Fake::new(&[("A", "KEPT — src/add.rs")]);
     let c = change();
-    let f = job_facts(&[], None, &c);
+    let f = job_facts(&[], None, None, &c);
     let r = check(
         &CheckInput {
             rules: &rules,
@@ -482,6 +483,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             seats: &[],
             no_seat: Some("only the creator's seat `claude` is signed in"),
             base: "b0",
+            instructions: None,
         },
         &judge,
         &NoMachine,
@@ -499,6 +501,7 @@ fn skip_of(row: &RuleVerdict, reason: &str) -> RuleSkip {
         at: 1,
         rule_key: row.rule_key.clone(),
         evidence_key: row.evidence_key.clone().unwrap(),
+        instruction: None,
     }
 }
 
@@ -568,7 +571,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
         kind: Some("build".into()),
     }];
     let c = change();
-    let f = job_facts(&steps, None, &c);
+    let f = job_facts(&steps, None, None, &c);
     let judge = Fake::new(&[]);
     let seats = seats();
     let r = check(
@@ -582,6 +585,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             seats: &seats,
             no_seat: None,
             base: "b0",
+            instructions: None,
         },
         &judge,
         &NoMachine,
@@ -598,12 +602,12 @@ fn the_prompt_carries_every_rule_field_whole_and_fences_the_diff() {
     let mut r = rule("LONG", &long);
     r.criteria = "the fix names the issue".into();
     r.obligations = vec!["cite:issue".into()];
-    let p = prompt(&[(&r, "")], DIFF, Some("ok"), "n");
+    let p = prompt(&[(&r, "")], DIFF, Some("ok"), None, "n");
     assert!(p.contains(&long), "no 600-character cut (core#1273 item 2)");
     assert!(p.contains("the fix names the issue") && p.contains("cite:issue"));
     assert!(p.contains("fn add(a: i32"));
     let big = format!("diff --git a/a.rs b/a.rs\n{}", "+x\n".repeat(EVIDENCE_CAP));
-    let p = prompt(&[(&r, "")], &big, None, "n");
+    let p = prompt(&[(&r, "")], &big, None, None, "n");
     assert!(p.len() < PROMPT_BUDGET, "one argv argument");
     assert!(p.contains("answer UNKNOWN"));
 }
@@ -640,7 +644,7 @@ fn the_delivery_keeps_the_worst_row_per_rule() {
 #[test]
 fn languages_come_from_gits_path_list() {
     let c = change_of("", &["src/add.rs", "web/a b\tc.ts"]);
-    let f = job_facts(&[], None, &c);
+    let f = job_facts(&[], None, None, &c);
     assert_eq!(
         f.languages,
         Some(vec!["rust".to_string(), "typescript".to_string()])
@@ -856,4 +860,149 @@ fn the_judge_sees_the_engines_match_facts() {
         "{}",
         prompts[0].1
     );
+}
+
+/// pi r2: on a diff too large for one call, a KEPT or N/A is not a verdict (what the judge did not
+/// see may break the rule); a BROKEN still is.
+#[test]
+fn on_a_cut_diff_only_a_broken_verdict_counts() {
+    let big = format!("{DIFF}{}", "+x\n".repeat(EVIDENCE_CAP));
+    let c = change_of(&big, &["src/add.rs"]);
+    let judge = Fake::new(&[
+        ("K", "KEPT — src/add.rs looks fine"),
+        ("B", "BROKEN — src/add.rs:1 unsafe"),
+    ]);
+    let r = run_on(
+        &[rule("K", "k"), rule("B", "b")],
+        &c,
+        &judge,
+        &NoMachine,
+        None,
+        &[],
+    );
+    let st = |id: &str| r.rows.iter().find(|x| x.rule_id == id).unwrap().clone();
+    assert_eq!(st("K").status, RuleStatus::Unchecked);
+    assert!(
+        st("K").reason.contains("larger than one judge call"),
+        "{}",
+        st("K").reason
+    );
+    assert_eq!(st("B").status, RuleStatus::Broken);
+}
+
+// ── The person's instruction against a rule (E7 rerun e1892573, operator: "flag it; you confirm") ──
+
+const TOUCH_NO_TEST: &str =
+    "Fix it with a one-line change to src/math.js only. Do not add, change or run any test file.";
+
+fn run_told(
+    rules: &[ConformanceRule],
+    judge: &Fake,
+    skips: &[RuleSkip],
+    prior: Option<&RuleCheckReport>,
+) -> RuleCheckReport {
+    let c = change_of(DIFF, &["src/math.js"]);
+    let f = job_facts(&[], None, Some("tiny-math"), &c);
+    let seats = seats();
+    check(
+        &CheckInput {
+            rules,
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior,
+            skips,
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: Some(TOUCH_NO_TEST),
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+/// The control for e1892573: the judge let "touch no test" win and marked DEV-TINYMATH-2 KEPT.
+/// That answer is a WAIVER, which holds the gate for the person to confirm; never a keep.
+#[test]
+fn a_keep_won_by_the_persons_instruction_is_a_waiver_that_holds() {
+    let rule = rule(
+        "DEV-TINYMATH-2",
+        "Every change to a function in tiny-math's src/math.js adds or updates a test",
+    );
+    let judge = Fake::new(&[(
+        "DEV-TINYMATH-2",
+        "KEPT — src/math.js: the intent forbids touching tests, so I judged the explicit instruction to govern",
+    )]);
+    let r = run_told(&[rule.clone()], &judge, &[], None);
+    assert_eq!(r.rows[0].status, RuleStatus::Waived, "{:?}", r.rows[0]);
+    let hold = r.hold().expect("a waiver holds the gate");
+    assert!(
+        hold.reason.contains("WAIVED by your instruction"),
+        "{}",
+        hold.reason
+    );
+    assert!(r.denial().is_none());
+    // The judge was shown the instruction, and told what to answer.
+    let prompts = judge.prompts.lock().unwrap();
+    assert!(prompts[0].1.contains(TOUCH_NO_TEST) && prompts[0].1.contains("WAIVED"));
+    drop(prompts);
+    assert!(r.rows[0]
+        .reason
+        .contains("kept on the person's instruction"));
+}
+
+#[test]
+fn a_waiver_quotes_the_instruction_and_an_invented_quote_is_no_answer() {
+    let rule = rule("DEV-TINYMATH-2", "Every change to src/math.js adds a test");
+    let quoted = Fake::new(&[(
+        "DEV-TINYMATH-2",
+        "WAIVED — \"Do not add, change or run any test file\"",
+    )]);
+    assert_eq!(
+        run_told(&[rule.clone()], &quoted, &[], None).rows[0].status,
+        RuleStatus::Waived
+    );
+    let invented = Fake::new(&[("DEV-TINYMATH-2", "WAIVED — \"tests are optional here\"")]);
+    assert_eq!(
+        run_told(&[rule], &invented, &[], None).rows[0].status,
+        RuleStatus::Unchecked
+    );
+}
+
+/// The person confirms the waiver with a reason: the row says waived by instruction, confirmed,
+/// with both; the gate no longer holds on it.
+#[test]
+fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
+    let rule = rule("DEV-TINYMATH-2", "Every change to src/math.js adds a test");
+    let judge = Fake::new(&[(
+        "DEV-TINYMATH-2",
+        "WAIVED — \"Do not add, change or run any test file\"",
+    )]);
+    let first = run_told(&[rule.clone()], &judge, &[], None);
+    let row = &first.rows[0];
+    let skip = RuleSkip {
+        rule_id: row.rule_id.clone(),
+        reason: "the regression is covered by the existing suite".into(),
+        by: "operator".into(),
+        at: 1,
+        rule_key: row.rule_key.clone(),
+        evidence_key: row.evidence_key.clone().unwrap(),
+        instruction: row.cite.clone(),
+    };
+    let r = run_told(&[rule], &judge, &[skip], Some(&first));
+    assert_eq!(r.rows[0].status, RuleStatus::Skipped);
+    assert!(
+        r.rows[0].reason.starts_with("waived by instruction (")
+            && r.rows[0].reason.contains("covered by the existing suite"),
+        "{}",
+        r.rows[0].reason
+    );
+    assert!(r.hold().is_none());
+}
+
+#[test]
+fn the_instructions_drop_the_rules_block() {
+    let d = "Fix sum().\n\n<!-- wicked-crew:rules -->\nSteering rules: 30\n<!-- /wicked-crew:rules -->\nTouch no test.";
+    assert_eq!(instructions_of(d), "Fix sum().\n\n\nTouch no test.");
 }

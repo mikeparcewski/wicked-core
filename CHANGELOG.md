@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A rule the person's own instruction conflicts with is WAIVED, which the person confirms; a rule naming the job's
+  repository applies (coord, from the E7 rerun).** The rule-check judge is shown the person's instructions (the
+  task as they wrote it, the rules block taken out) and answers a rule they conflict with `WAIVED — "<the
+  instruction, quoted>"` (a quote the instructions do not contain is no answer); a KEPT that rests on the
+  instruction ("the intent forbids touching tests, so I judged the explicit instruction to govern") is a waiver too,
+  never a keep. A waived rule holds the gate (`rules_unchecked`) until the person confirms it with a reason
+  (`skip_rules`), labelled "waived by instruction (…), confirmed by <who>: <reason>" on the gate and the delivery;
+  never skipped silently. `match_rules` (core-ts `matchRules`) gains `job.repo` and `job.paths`: a rule whose
+  statement or source document names the job's repository, or whose statement names a changed file, **applies**
+  (a tiny-math rule came back "may apply" on the rig); `MatchRule` reads `statement` and `source_ref`.
 - **The review step checks every steering rule in force, with evidence, on a judge distinct from the creators;
   a rule can carry a machine check (DES-RULE-CHECK-001 S2 + S3; core#1273 items 1-3).** A review (Evaluator) unit's
   gate reads the project's in-force rules from the policy store (never the launch brief), matches them against the
@@ -25,7 +35,7 @@ Two release tracks share this file, newest entry first regardless of track:
   forced to text) plus the floor's per-check outcomes; the
   creator's transcript is never in the prompt. Batches of at most 8 rules, every field whole (statement, criteria,
   obligations; no 600-character cut), at most 3 calls at once; a batch grows past 8 only to stay within 2 rounds
-  (100 rules: 6 calls of 17; a dropped answer adds a round of single re-asks), and splits by bytes so the prompt
+  (100 rules of ordinary length: 6 calls of 17; a dropped answer adds a round of single re-asks, long statements more calls), and splits by bytes so the prompt
   stays one argv argument (a rule too long for one is unchecked, saying so). The judge sees each rule's match facts. Answers count only inside a
   per-call nonce frame (`BEGIN VERDICTS <nonce>`), one `RULE <id>: KEPT|BROKEN|N/A — <cite>` line each, a KEPT citing
   a changed file; a rule a batch did not answer is asked alone, then **unchecked**. A seat that fails as a seat is not
@@ -36,7 +46,7 @@ Two release tracks share this file, newest entry first regardless of track:
   beside the judge batches (the test blobs taken from the engine's snapshot, no hooks or filters, the checkout held
   to its tree): a test that fails there is evidence a distinct judge weighs (does it assert what the rule asks?),
   tests that pass there too are broken; an inline test or a repo the floor cannot run goes to the judge, saying so. Outcome, deny-dominant: a **broken** rule denies the gate (`rule_check`,
-  escalation class `rule_broken`, never the review loop's adjudication), naming each rule and its cite; an
+  escalation class `rule_broken`, never the review loop's adjudication), naming each rule and its cite; on a diff too large for one call only a BROKEN verdict counts (the rest hold); an
   **unchecked** rule holds it (`rules_unchecked`, ahead of the judge's own holds), where the person can re-run the
   check on the same work (`retry_rules`) or skip an unchecked rule with a written reason (`skip_rules`, `amend` =
   `[{id, reason}]`; bound to that rule's content and evidence), the step not running again. No answer that counts
