@@ -8153,6 +8153,14 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         // (j4-gates) The QE reviewer could not run its checks: no verdict on the work either — the
         // operator's approve is the judgment, labelled, exactly as when no reviewer could run.
         Some(crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE) => "judge_unavailable",
+        // (DES-RULE-CHECK-001 S2) A steering rule no judge ruled on: a hold, never a verdict.
+        Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED) => {
+            crate::rule_check::DENIAL_SOURCE_UNCHECKED
+        }
+        // A broken steering rule: a verdict on the work, but never the review loop's: its gate does
+        // not open `review_adjudication` (whose approve lands the unit with items carried), so no
+        // answer counts a unit that broke a rule — it is reworked, re-run, or the run stops.
+        Some(crate::rule_check::DENIAL_SOURCE_BROKEN) => CLASS_RULE_BROKEN,
         // (core#469) A floor that did not FINISH is booked under `repo_checks_timeout` — a floor
         // class too, never a verdict: the gate keys extend / targeted / accept on it (S4b).
         // (j4-gates) A floor that DENIED names the gate even when a hook also denied the attempt:
@@ -8168,6 +8176,58 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
         _ if hook_denied => "boundary_deny",
         _ => "verdict_not_pass",
     }
+}
+
+/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
+/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
+/// or `None`.
+fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
+    let rule_layer = |d: &crate::domain::UnitDenial| {
+        d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+            || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+    };
+    let named: Vec<&crate::domain::UnitDenial> = unit
+        .denial
+        .iter()
+        .chain(unit.denials_behind.iter().flatten())
+        .filter(|d| rule_layer(d))
+        .collect();
+    if !named.is_empty() {
+        let ids: Vec<&str> = named
+            .iter()
+            .flat_map(|d| d.rule_ids.iter().map(String::as_str))
+            .collect();
+        return Some(format!("broken or unchecked ({})", ids.join(", ")));
+    }
+    if unit.denials_behind.is_none() {
+        let rc = unit.rule_check.as_ref()?;
+        let open: Vec<&str> = rc
+            .rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    crate::rule_check::RuleStatus::Broken
+                        | crate::rule_check::RuleStatus::Unchecked
+                        | crate::rule_check::RuleStatus::Waived
+                )
+            })
+            .map(|r| r.rule_id.as_str())
+            .collect();
+        if !open.is_empty() {
+            return Some(format!("broken or unchecked ({})", open.join(", ")));
+        }
+    }
+    None
+}
+
+/// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
+const CLASS_RULE_BROKEN: &str = "rule_broken";
+
+/// [`denial_class`] for the fold tests in other modules.
+#[cfg(test)]
+pub(crate) fn denial_class_for_test(denial: Option<&crate::domain::UnitDenial>) -> &'static str {
+    denial_class(denial, false)
 }
 
 /// Whether a gate fold's record of the layers behind a failed floor lets the operator's judgment
@@ -8774,6 +8834,23 @@ fn denial_gate_prompt(
             reason_head(reason)
         )
         }
+        // (DES-RULE-CHECK-001 S2) A broken steering rule: send it back, run it again, or stop.
+        CLASS_RULE_BROKEN => format!(
+            "Unit {ord} BROKE steering rule(s): {}. Request changes to send it back for rework, \
+             approve to run the step again, or reject to cancel the run{note}",
+            reason_head(reason)
+        ),
+        // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
+        "rules_unchecked" => format!(
+            "Unit {ord}'s steering rules are UNCHECKED or waived by your instruction — {}. The \
+             work was not rejected. Re-run the rule check on the same work (action `{}`; the step \
+             does not run again), confirm a waiver or skip an unchecked rule with a written \
+             reason (action `{}`: labelled on the run, the gate and the delivery), approve to run the step again, request changes to send it back for \
+             rework, or reject to cancel the run{note}",
+            reason_head(reason),
+            crate::rule_check::RETRY_ACTION,
+            crate::rule_check::SKIP_ACTION,
+        ),
         "judge_unavailable" => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
              not rejected. Approve to judge it yourself (it counts, labelled \"judged by \
@@ -11031,9 +11108,35 @@ fn dispatch_unit(
         } else {
             None
         };
+        // (DES-RULE-CHECK-001 S2) A review unit's rule check matches `applies_to` against the
+        // whole run's steps: stamped here, the worker has no store.
+        stamped.rule_steps =
+            if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
+                let all = if qe_unit {
+                    units.clone()
+                } else {
+                    crate::domain::session_units(&*store, run_id)?
+                };
+                crate::rule_check::steps_of(&all)
+            } else {
+                Vec::new()
+            };
+        // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
+        stamped.rule_instructions = (unit.role == crate::workflow::PhaseRole::Evaluator
+            && unit.tool_cmd.is_none())
+        .then(|| {
+            let mut words = session.problem.clone();
+            for a in &session.intent_amendments {
+                words.push_str("\n\nApproved amendment: ");
+                words.push_str(&a.text);
+            }
+            words
+        });
         if unit.qe_acceptance != stamped.qe_acceptance
             || unit.qe_reviewer_seats != stamped.qe_reviewer_seats
             || unit.qe_floor_note != stamped.qe_floor_note
+            || unit.rule_steps != stamped.rule_steps
+            || unit.rule_instructions != stamped.rule_instructions
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -11825,6 +11928,7 @@ fn dispatch_unit(
                     team: None,
                     qe_review: None,
                     bench_reprobes: Vec::new(),
+                    rule_check: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -13253,6 +13357,7 @@ fn confirm_plan_gate(
         | HumanDecision::AmendIntent { .. }
         | HumanDecision::ConsentChoice { .. }
         | HumanDecision::Rejudge
+        | HumanDecision::RecheckRules { .. }
         | HumanDecision::OperatorJudgment { .. }
         | HumanDecision::SkipQe { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
@@ -13945,6 +14050,8 @@ pub(crate) fn confirm_gate_as(
     // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
     // second read after it could refuse an answer whose row is already answered.
     let mut armed_rejudge: Option<crate::domain::RequestedRejudge> = None;
+    // (DES-RULE-CHECK-001 S2) The rule skips a `skip_rules` answer lands with its re-check.
+    let mut armed_rule_skips: Vec<crate::rule_check::RuleSkip> = Vec::new();
     // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
     // are checked here, before the durable prompt below is marked `answered` — a refused answer
     // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
@@ -13992,11 +14099,34 @@ pub(crate) fn confirm_gate_as(
                 );
             }
         }
+        // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
+        // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
+        // that counts it — is refused while a steering rule of that unit is broken or unchecked,
+        // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
+        // or skipped with its reason (`retry_rules` / `skip_rules`).
+        let counts_unit = match &decision {
+            crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
+            crate::workflow::HumanDecision::OperatorJudgment { .. }
+            | crate::workflow::HumanDecision::SkipQe { .. } => true,
+            _ => false,
+        };
+        if counts_unit {
+            if let Some(open) = cursor.and_then(rule_layers_open) {
+                anyhow::bail!(
+                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                     rule with a reason (`{}`), or reject",
+                    crate::rule_check::RETRY_ACTION,
+                    crate::rule_check::SKIP_ACTION
+                );
+            }
+        }
         match &decision {
             crate::workflow::HumanDecision::FloorRerun(_)
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
             | crate::workflow::HumanDecision::Rejudge
+            | crate::workflow::HumanDecision::RecheckRules { .. }
                 if adjudication_open =>
             {
                 anyhow::bail!(
@@ -14045,6 +14175,7 @@ pub(crate) fn confirm_gate_as(
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
             | crate::workflow::HumanDecision::Rejudge
+            | crate::workflow::HumanDecision::RecheckRules { .. }
                 if team_gate::transport_gate_open(&session)
                     || team_gate::dispute_gate_open(&session) =>
             {
@@ -14057,6 +14188,14 @@ pub(crate) fn confirm_gate_as(
             // the engine's judge selection names a seat now — the row stays open otherwise.
             crate::workflow::HumanDecision::Rejudge => {
                 armed_rejudge = Some(rejudge_request(&*store, run_id)?);
+            }
+            // (DES-RULE-CHECK-001 S2) Refused unless the cursor unit is held `rules_unchecked`
+            // and every skip names one of its unchecked rules with a reason.
+            crate::workflow::HumanDecision::RecheckRules { skips } => {
+                let (request, rule_skips) =
+                    rules_recheck_request(&*store, run_id, skips, actor.as_deref())?;
+                armed_rejudge = Some(request);
+                armed_rule_skips = rule_skips;
             }
             // (operator ruling 2026-10-21) The operator's judgment over a failed repo-checks
             // floor: refused HERE, before the row resolves, unless it applies — the gate stays
@@ -14144,6 +14283,20 @@ pub(crate) fn confirm_gate_as(
             .to_string(),
             crate::workflow::HumanDecision::Rejudge => serde_json::json!({
                 "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
+            })
+            .to_string(),
+            // (DES-RULE-CHECK-001 S2) The skips (id + reason) are the durable answer's record.
+            crate::workflow::HumanDecision::RecheckRules { skips } => serde_json::json!({
+                "approve": true,
+                "action": if skips.is_empty() {
+                    crate::rule_check::RETRY_ACTION
+                } else {
+                    crate::rule_check::SKIP_ACTION
+                },
+                "amend": (!skips.is_empty()).then(|| serde_json::json!(skips
+                    .iter()
+                    .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason }))
+                    .collect::<Vec<_>>()).to_string()),
             })
             .to_string(),
             // (operator ruling 2026-10-21) The rationale rides `amend`, so the durable prompt's
@@ -14467,6 +14620,12 @@ pub(crate) fn confirm_gate_as(
             rejudge = true;
             (None, crate::workflow::AmendScope::Cursor, None)
         }
+        // (DES-RULE-CHECK-001 S2) A rule re-check rides the re-judge re-dispatch: the seat does
+        // not run again, the rule check does.
+        crate::workflow::HumanDecision::RecheckRules { .. } => {
+            rejudge = true;
+            (None, crate::workflow::AmendScope::Cursor, None)
+        }
         // Answered above (`judge_by_operator`), never a re-dispatch.
         crate::workflow::HumanDecision::OperatorJudgment { .. } => {
             anyhow::bail!("run {run_id}: an operator judgment is answered before any re-dispatch")
@@ -14585,6 +14744,7 @@ pub(crate) fn confirm_gate_as(
                         let from_attempt = request.attempt;
                         let seats = request.seats.clone();
                         cursor.requested_rejudge = Some(request);
+                        cursor.rule_skips.append(&mut armed_rule_skips);
                         put_node(store, cursor.to_node())?;
                         emit(
                             subscribers,
@@ -15114,6 +15274,117 @@ fn rejudge_request(
         consumed: false,
         at: crate::interaction::now_millis(),
     })
+}
+
+/// (DES-RULE-CHECK-001 S2) The rule re-check to arm on `run_id`'s cursor unit, with the skips it
+/// lands: refused (the gate stays open) unless the cursor unit is held `rules_unchecked`, and
+/// unless every skip names one of its UNCHECKED rules with a non-empty reason. Carries the
+/// reviewed attempt's transcript: the seat does not run again.
+fn rules_recheck_request(
+    store: &dyn GraphStore,
+    run_id: &str,
+    skips: &[(String, String)],
+    by: Option<&str>,
+) -> anyhow::Result<(
+    crate::domain::RequestedRejudge,
+    Vec<crate::rule_check::RuleSkip>,
+)> {
+    let session = crate::domain::get_session(store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    let units = crate::domain::session_units(store, run_id)?;
+    let cursor = units
+        .get(session.unit_ix)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    let source = cursor.denial.as_ref().map(|d| d.source.as_str());
+    if session.status != SessionStatus::AwaitingHuman
+        || cursor.status != crate::domain::UnitStatus::Rejected
+        || source != Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED)
+    {
+        anyhow::bail!(
+            "`{}` / `{}` answer the gate of a unit held because some steering rule was unchecked \
+             (denial source `{}`); unit {} is {:?}, denied by `{}`",
+            crate::rule_check::RETRY_ACTION,
+            crate::rule_check::SKIP_ACTION,
+            crate::rule_check::DENIAL_SOURCE_UNCHECKED,
+            cursor.ord,
+            cursor.status,
+            source.unwrap_or("nothing")
+        );
+    }
+    if cursor.member_step.is_some() {
+        anyhow::bail!(
+            "unit {} is a team member's step — its team gate takes approve, request changes or \
+             reject",
+            cursor.ord
+        );
+    }
+    let rows = cursor
+        .rule_check
+        .as_ref()
+        .map(|r| r.rows.as_slice())
+        .unwrap_or_default();
+    let by = by
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator")
+        .to_string();
+    let at = crate::interaction::now_millis();
+    let mut landed = Vec::new();
+    for (id, reason) in skips {
+        if reason.trim().is_empty() {
+            anyhow::bail!("skip of rule `{id}` needs a written reason");
+        }
+        let Some(row) = rows.iter().find(|r| {
+            &r.rule_id == id
+                && matches!(
+                    r.status,
+                    crate::rule_check::RuleStatus::Unchecked
+                        | crate::rule_check::RuleStatus::Waived
+                )
+        }) else {
+            anyhow::bail!(
+                "rule `{id}` is not an unchecked rule of unit {} — only a rule no judge ruled on \
+                 can be skipped (a broken rule denies the gate)",
+                cursor.ord
+            );
+        };
+        let Some(evidence_key) = row.evidence_key.clone() else {
+            anyhow::bail!(
+                "rule `{id}` has no evidence key on unit {}; retry the rule check",
+                cursor.ord
+            );
+        };
+        landed.push(crate::rule_check::RuleSkip {
+            rule_id: id.clone(),
+            reason: reason.trim().to_string(),
+            by: by.clone(),
+            at,
+            rule_key: row.rule_key.clone(),
+            evidence_key,
+            instruction: (row.status == crate::rule_check::RuleStatus::Waived)
+                .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+        });
+    }
+    let output = crate::domain::get_unit_transcript(store, &cursor.id)
+        .and_then(|t| t.output)
+        .unwrap_or_default();
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
+    Ok((
+        crate::domain::RequestedRejudge {
+            output,
+            attempt,
+            seats: Vec::new(),
+            monitors: crate::cli_runner::unit_team_monitors(cursor),
+            consumed: false,
+            at,
+        },
+        landed,
+    ))
 }
 
 /// (core#469) The floor re-run `mode` asks for on `unit` — refused unless the unit's denial is a
@@ -24513,6 +24784,184 @@ mod request_changes_tests {
         assert!(err.contains("agent_validator"), "{err}");
         let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
         assert!(fix.requested_rejudge.is_none());
+    }
+
+    /// (DES-RULE-CHECK-001 S2) The fix step of [`seed_rejudge_fix`] held `rules_unchecked`: R1
+    /// unchecked (no judge answered), R2 kept.
+    fn seed_rules_unchecked(store: &mut dyn GraphStore, run_id: &str) {
+        seed_rejudge_fix(store, run_id, &["claude", "pi"]);
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let row = |id: &str, status| crate::rule_check::RuleVerdict {
+            rule_id: id.into(),
+            status,
+            how: crate::rule_check::RuleHow::Judge,
+            reason: "r".into(),
+            cite: None,
+            judge: None,
+            rule_key: "k".into(),
+            evidence_key: Some(format!("ek-{id}")),
+        };
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![
+                row("R1", crate::rule_check::RuleStatus::Unchecked),
+                row("R2", crate::rule_check::RuleStatus::Kept),
+            ],
+            ..Default::default()
+        };
+        let hold = report.hold().unwrap();
+        units[2].denial_reason = Some(hold.reason.clone());
+        units[2].denial = Some(hold);
+        units[2].rule_check = Some(report);
+        put_node(store, units[2].to_node()).unwrap();
+    }
+
+    fn recheck(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        skips: &[(&str, &str)],
+    ) -> anyhow::Result<SessionStatus> {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let mut subs = crate::event_log::EventSink::default();
+        confirm_gate_as(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::RecheckRules {
+                skips: skips
+                    .iter()
+                    .map(|(a, b)| (a.to_string(), b.to_string()))
+                    .collect(),
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+    }
+
+    /// (DES-RULE-CHECK-001 S2) `skip_rules` lands each skip with its reason, who and the evidence
+    /// it answered, and re-arms the check on the same work (the seat does not run again);
+    /// `retry_rules` re-arms it with no skip.
+    #[test]
+    fn skip_rules_lands_the_skip_with_its_reason_and_re_checks_the_same_work() {
+        for skips in [
+            vec![("R1", "the judge cannot read the binary fixture")],
+            vec![],
+        ] {
+            let run_id = format!("rules-skip-{}-{}", skips.len(), std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_rules_unchecked(&mut store, &run_id);
+            let status = recheck(&mut store, &run_id, &skips).unwrap();
+            assert_eq!(status, SessionStatus::Executing);
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let fix = &units[2];
+            let armed = fix.requested_rejudge.as_ref().expect("re-check armed");
+            assert_eq!(armed.output, "Fixed the retry: callers pass an empty head.");
+            match skips.first() {
+                Some((id, why)) => {
+                    assert_eq!(fix.rule_skips.len(), 1);
+                    let s = &fix.rule_skips[0];
+                    assert_eq!((s.rule_id.as_str(), s.reason.as_str()), (*id, *why));
+                    assert_eq!(s.by, "coordinator-agent");
+                    assert_eq!(
+                        (s.rule_key.as_str(), s.evidence_key.as_str()),
+                        ("k", "ek-R1")
+                    );
+                }
+                None => assert!(fix.rule_skips.is_empty()),
+            }
+        }
+    }
+
+    /// (DES-RULE-CHECK-001 S2, codex r2) An answer that would COUNT the unit (here the operator's
+    /// judgment over a failed floor) is refused while a steering rule of it is broken or unchecked
+    /// behind the winning layer; the gate stays open.
+    #[test]
+    fn an_answer_that_counts_the_unit_is_refused_while_a_rule_is_open_behind_the_gate() {
+        let run_id = format!("rules-behind-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let mut broken = UnitDenial::new(crate::rule_check::DENIAL_SOURCE_BROKEN, "R9 broken");
+        broken.rule_ids = vec!["R9".into()];
+        units[2].denials_behind = Some(vec![broken]);
+        units[2].denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE,
+            "tests failed",
+        ));
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let mut subs = crate::event_log::EventSink::default();
+        let err = confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::OperatorJudgment {
+                rationale: "the failures are load flakes".into(),
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steering rules") && err.contains("R9"),
+            "{err}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status,
+            SessionStatus::AwaitingHuman,
+            "the gate stays open"
+        );
+    }
+
+    /// (DES-RULE-CHECK-001 S2) Only an UNCHECKED rule can be skipped, only with a reason, and only
+    /// at a `rules_unchecked` gate: every refusal leaves the gate open and nothing armed.
+    #[test]
+    fn skip_rules_is_refused_for_a_ruled_rule_an_empty_reason_or_another_gate() {
+        let run_id = format!("rules-refuse-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let err = recheck(&mut store, &run_id, &[("R2", "it is fine")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not an unchecked rule"), "{err}");
+        let err = recheck(&mut store, &run_id, &[("R1", "  ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("written reason"), "{err}");
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert!(fix.requested_rejudge.is_none() && fix.rule_skips.is_empty());
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status,
+            SessionStatus::AwaitingHuman,
+            "the gate stays open"
+        );
+        // At a judge_unavailable gate the rule answers are refused.
+        let other = format!("rules-other-{}", std::process::id());
+        seed_rejudge_fix(&mut store, &other, &["claude", "pi"]);
+        let err = recheck(&mut store, &other, &[]).unwrap_err().to_string();
+        assert!(err.contains("rules_unchecked"), "{err}");
     }
 
     /// (rejudge) A re-judge left armed by an attempt that never folded is void the moment the

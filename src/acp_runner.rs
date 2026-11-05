@@ -3601,6 +3601,10 @@ mod tests {
             qe_floor_note: None,
             qe_review_session: None,
             qe_review: None,
+            rule_steps: Vec::new(),
+            rule_check: None,
+            rule_skips: Vec::new(),
+            rule_instructions: None,
             read_view: None,
         }
     }

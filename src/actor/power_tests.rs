@@ -609,7 +609,11 @@ fn a_counted_hand_off_step_reads_passed_before_the_next_unit_dispatches() {
                 std::fs::write(wd.join("README.md"), "hello, power\n").unwrap();
                 turn("changed README.md\nHANDOFF: done", None)
             }
-            "validator-agent" => turn("PASS", None),
+            // (DES-RULE-CHECK-001) The review's rule check asks the same judge identity.
+            "validator-agent" => match crate::rule_check::stub_rule_verdicts(&i.unit.description) {
+                Some(v) => turn(&v, None),
+                None => turn("PASS", None),
+            },
             p if p.starts_with("review") || p == "verify" => turn(
                 "ITEM 1: PASS — the heading is right (README.md:1)\nVERDICT: PASS",
                 None,

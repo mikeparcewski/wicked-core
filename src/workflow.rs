@@ -396,6 +396,11 @@ pub struct UnitEvidence {
     /// wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bench_reprobes: Vec<crate::seat_bench::BenchReprobe>,
+    /// (DES-RULE-CHECK-001 S2) The review unit's rule check this attempt: every steering rule in
+    /// force with its verdict. `None` when no check ran (not a review unit, no rule store, no
+    /// change against the base).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_check: Option<crate::rule_check::RuleCheckReport>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation
@@ -535,6 +540,15 @@ pub enum HumanDecision {
     /// Refused on a run that does not require QE acceptance (or already skipped or waived it), at a
     /// plan, team or adjudication pause, and on a team member's step.
     SkipQe { reason: String },
+    /// (DES-RULE-CHECK-001 S2) RE-CHECK THE STEERING RULES of a unit held `rules_unchecked` (no
+    /// judge ruled on some rule): wire token [`crate::rule_check::RETRY_ACTION`] (no skips) or
+    /// [`crate::rule_check::SKIP_ACTION`] (the skips ride the gate body's `amend` as JSON
+    /// `[{"id", "reason"}]`, every reason required). The seat does not run again: the reviewed
+    /// output is folded again and the rule check re-runs, reusing every verdict whose rule and
+    /// evidence are unchanged. A skipped rule's row is `skipped` with its reason, labelled on the
+    /// run, the gate and the delivery; only an UNCHECKED rule can be skipped (a broken rule
+    /// denies, deny-dominates). Refused at every other gate.
+    RecheckRules { skips: Vec<(String, String)> },
 }
 
 /// The wire token of [`HumanDecision::SkipQe`]. Its reason rides the gate body's `amend`.
@@ -570,6 +584,7 @@ impl HumanDecision {
             "accept_partial" => Self::FloorRerun(Mode::AcceptPartial),
             "accept_suggestion" => Self::AcceptSuggestion,
             REJUDGE_ACTION => Self::Rejudge,
+            crate::rule_check::RETRY_ACTION => Self::RecheckRules { skips: Vec::new() },
             t if t.starts_with(crate::consent_plan::CHOICE_PREFIX)
                 && t.len() > crate::consent_plan::CHOICE_PREFIX.len() =>
             {
@@ -658,6 +673,11 @@ pub trait StepRunner: Send + Sync {
 /// emitter for both stub paths so they cannot diverge; the predicate is the fold's
 /// (`PhaseRole::Evaluator` + no `tool_cmd`).
 pub fn stub_output(unit: &WorkUnit) -> String {
+    // (DES-RULE-CHECK-001) A rule-check judge call: the stub answers every rule N/A in the call's
+    // frame, so a stub run's review is never held on rules nobody could judge.
+    if let Some(v) = crate::rule_check::stub_rule_verdicts(&unit.description) {
+        return v;
+    }
     let base = format!("stub-output for {}", unit.description);
     if unit.role == PhaseRole::Evaluator && unit.tool_cmd.is_none() {
         format!("{base}\nVERDICT: PASS")

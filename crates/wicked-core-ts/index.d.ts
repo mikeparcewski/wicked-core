@@ -390,6 +390,11 @@ export declare class Core {
    * decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
    * that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
    *
+   * (DES-RULE-CHECK-001 S2, additive.) At a `rules_unchecked` gate (a steering rule no judge
+   * ruled on): `retry_rules` (`approve=true`, no `amend`) re-runs the rule check on the same work,
+   * and `skip_rules` (`approve=true`, `amend` = JSON `[{"id", "reason"}]`) skips unchecked rules,
+   * each with its reason, then re-runs it. The step does not run again; refused at any other gate.
+   *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
    * edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
    * as the next plan rev (floor phases added, never refused for being below the floor) or, if it
@@ -972,7 +977,9 @@ export declare class Core {
    * recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
    * judge per call; another project; a facet or trigger the
    * job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
-   * `bad_request: …`. Static, like `evaluateMcpCall`.
+   * `bad_request: …`. Static, like `evaluateMcpCall`. (DES-RULE-CHECK-001) `job.repo` (the job's repository
+   * id or name) and `job.paths` (changed files): a rule whose `statement` or `source_ref` document names
+   * the repository, or whose statement names a changed file, applies — so send each rule's `statement`.
    */
   static matchRules(argsJson: string): Promise<string>
   /**

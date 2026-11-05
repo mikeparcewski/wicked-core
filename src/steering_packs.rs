@@ -86,6 +86,18 @@ fn shipped_rules() -> anyhow::Result<Vec<wicked_governance::ConformanceRule>> {
     Ok(rules)
 }
 
+/// (DES-RULE-CHECK-001) The ids of the engine's shipped guidance-pack rules (parsed once). The
+/// review's rule check gives each a fact row instead of a judge call: the workflow phases that cite
+/// a pack apply it.
+pub(crate) fn shipped_rule_ids() -> &'static [String] {
+    static IDS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        shipped_rules()
+            .map(|r| r.into_iter().map(|r| r.id).collect())
+            .unwrap_or_default()
+    })
+}
+
 /// Seed the shipped guidance packs INSERT-ONLY. Returns how many rules were inserted.
 pub(crate) fn seed_shipped_packs(
     store: &mut dyn wicked_apps_core::GraphStore,

@@ -78,6 +78,8 @@ pub use editor_gate::{
     EditorGrant, EditorGrantError, EditorGrantRequest, EditorGrants, EDITOR_PERMISSIONS,
 };
 pub use mcp_gate::evaluate_mcp_output_json;
+/// (DES-RULE-CHECK-001) A stub or scripted judge's answer to a rule-check prompt (every rule N/A).
+pub use rule_check::stub_rule_verdicts;
 
 /// (core#709) The conformance-rule ids the BOOT SEED owns — the `mcp-defaults` and
 /// `editor-defaults` packs' JSON rules (their approvals ledgers `MCP-FIRST-USE` / `EDITOR-GRANTS`
@@ -115,6 +117,7 @@ mod repo;
 mod repo_checks;
 mod repo_intel;
 mod review_context;
+mod rule_check;
 mod run_mirror;
 mod runtime_wait;
 pub mod tool_activity;

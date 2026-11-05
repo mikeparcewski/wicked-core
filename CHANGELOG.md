@@ -14,6 +14,49 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A rule the person's own instruction conflicts with is WAIVED, which the person confirms; a rule naming the job's
+  repository applies (coord, from the E7 rerun).** The rule-check judge is shown the person's instructions (the
+  task as they wrote it, the rules block taken out) and answers a rule they conflict with `WAIVED — "<the
+  instruction, quoted>"` (a quote the instructions do not contain is no answer); a KEPT that rests on the
+  instruction ("the intent forbids touching tests, so I judged the explicit instruction to govern") is a waiver too,
+  never a keep. A waived rule holds the gate (`rules_unchecked`) until the person confirms it with a reason
+  (`skip_rules`), labelled "waived by instruction (…), confirmed by <who>: <reason>" on the gate and the delivery;
+  never skipped silently. `match_rules` (core-ts `matchRules`) gains `job.repo` and `job.paths`: a rule whose
+  statement or source document names the job's repository, or whose statement names a changed file, **applies**
+  (a tiny-math rule came back "may apply" on the rig); `MatchRule` reads `statement` and `source_ref`.
+- **The review step checks every steering rule in force, with evidence, on a judge distinct from the creators;
+  a rule can carry a machine check (DES-RULE-CHECK-001 S2 + S3; core#1273 items 1-3).** A review (Evaluator) unit's
+  gate reads the project's in-force rules from the policy store (never the launch brief), matches them against the
+  run's own facts (every step's `unit-<n>` / phase / catalog tokens, stamped at dispatch; the changed files' languages
+  from git's NUL-delimited path list; the diff), and sends every rule that applies or may apply to judge seats
+  distinct from the work's creators: no seat whose key, or any binary it may run (quote-aware), is a creator's or one
+  a creator ran; no creator fallback; a creator binary that is not recorded holds. The evidence is the engine's diff
+  against the recorded run base, read from the engine's own snapshot of the worktree (no index flag hides an edit;
+  forced to text) plus the floor's per-check outcomes; the
+  creator's transcript is never in the prompt. Batches of at most 8 rules, every field whole (statement, criteria,
+  obligations; no 600-character cut), at most 3 calls at once; a batch grows past 8 only to stay within 2 rounds
+  (100 rules of ordinary length: 6 calls of 17; a dropped answer adds a round of single re-asks, long statements more calls; machine-backed rules judged after the machine add their own rounds), and splits by bytes so the prompt
+  stays one argv argument (a rule too long for one is unchecked, saying so). The judge sees each rule's match facts. Answers count only inside a
+  per-call nonce frame (`BEGIN VERDICTS <nonce>`), one `RULE <id>: KEPT|BROKEN|N/A — <cite>` line each, a KEPT citing
+  a changed file; a rule a batch did not answer is asked alone, then **unchecked**. A seat that fails as a seat is not
+  asked again by the check; a stopped run makes no further call. **Machine check:** a rule carrying
+  `obligations: ["check:test-fails-on-base"]` is not applicable when no source file changed, **broken with no model
+  call** when source changed and no test did (the E7 case: a bug fix with no test), and otherwise the changed tests
+  run on the base tree through the repo-checks floor (the base's tree plus the test files, checked out clean),
+  beside the judge batches (the test blobs taken from the engine's snapshot, no hooks or filters, the checkout held
+  to its tree): a test that fails there is evidence a distinct judge weighs (does it assert what the rule asks?),
+  tests that pass there too are broken; an inline test or a repo the floor cannot run goes to the judge, saying so. Outcome, deny-dominant: a **broken** rule denies the gate (`rule_check`,
+  escalation class `rule_broken`, never the review loop's adjudication), naming each rule and its cite; on a diff too large for one call only a BROKEN verdict counts (the rest hold); an
+  **unchecked** rule holds it (`rules_unchecked`, ahead of the judge's own holds), where the person can re-run the
+  check on the same work (`retry_rules`) or skip an unchecked rule with a written reason (`skip_rules`, `amend` =
+  `[{id, reason}]`; bound to that rule's content and evidence), the step not running again. No answer that counts
+  the unit (landing it at review adjudication, the operator's judgment, a QE skip) is taken while one of its rules is
+  broken or unchecked. Every rule's row (`kept |
+  broken | n_a | unchecked | skipped | waived`, how: `fact | judge | machine | cache | operator | none`, reason, cite, judge,
+  rule and evidence keys, full SHA-256) is on the gate receipt (`AssuranceReceipt.rules`) and, worst row per rule, on
+  the delivery receipt; a skip carries its reason there. A re-review reuses every verdict whose rule content and
+  evidence are unchanged.
+
 - **`matchRules`: which in-force rules a job is checked against, each with the facts that decided it
   (DES-RULE-CHECK-001 S1).** crew's launch brief listed a project's rules in severity order and stopped at 20, so on
   the end-to-end pass a bug job's brief carried 14 MCP-server and review-loop rules ahead of `learn-tests-with-fixes`

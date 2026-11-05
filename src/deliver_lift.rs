@@ -1411,6 +1411,14 @@ pub(crate) fn delivery_receipt(
         // …and every gate whose judge was a fallback seat (operator ruling 2026-10-14).
         r.judge_fallbacks.extend(g.judge_fallbacks.iter().cloned());
     }
+    // (DES-RULE-CHECK-001 S2) Every steering rule's verdict across the run's gates, the worst row
+    // per rule (deny-dominates): a skip stays labelled with its reason on the delivery.
+    r.rules = crate::rule_check::aggregate(
+        units
+            .iter()
+            .filter_map(|u| u.assurance.as_ref())
+            .map(|g| g.rules.as_slice()),
+    );
     // …and every council a member-step review convened after its gate (a PA rejection the member
     // held): those rulings land on the step's review record, not on a gate receipt (codex r1).
     for u in units {

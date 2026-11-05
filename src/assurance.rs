@@ -561,6 +561,11 @@ pub struct AssuranceReceipt {
     /// every gate's. Absent when every judge was the run's own (the routine case).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub judge_fallbacks: Vec<JudgeFallback>,
+    /// (DES-RULE-CHECK-001 S2) Every steering rule in force and its verdict at this gate (kept,
+    /// broken, n_a, unchecked, skipped), with how it was reached; on a delivery receipt the worst
+    /// row per rule across the run's gates. Absent when no rule check ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<crate::rule_check::RuleVerdict>,
 }
 
 impl AssuranceReceipt {

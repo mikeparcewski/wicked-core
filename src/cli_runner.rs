@@ -774,6 +774,449 @@ fn worktree_evidence_for_judge(workdir: &std::path::Path) -> Option<String> {
     Some(s)
 }
 
+/// (DES-RULE-CHECK-001 S2) Whether this attempt's gate runs the steering-rule check: a review
+/// (Evaluator-role) agent unit that answered, bound to a worktree, on a run with a policy store —
+/// not a tool, deliver or team-member step.
+pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool {
+    output.status == StepStatus::Ok
+        && input.unit.role == crate::workflow::PhaseRole::Evaluator
+        && input.unit.tool_cmd.is_none()
+        && input.unit.member_step.is_none()
+        && !crate::deliver_lift::is_deliver_unit(&input.unit)
+        && input.workdir.is_some()
+        && input
+            .governance
+            .as_ref()
+            .is_some_and(|g| !g.db_path.trim().is_empty())
+}
+
+/// The production judge of the rule check: one headless call on a roster seat.
+struct SeatRuleJudge<'a> {
+    seats: &'a [crate::AgenticCli],
+    runner: &'a dyn StepRunner,
+}
+
+impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
+    fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
+        match self.seats.iter().find(|c| c.key == seat) {
+            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner),
+            None => {
+                crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
+            }
+        }
+    }
+}
+
+/// (DES-RULE-CHECK-001 S3) The engine's machine check `check:test-fails-on-base`: the run base's
+/// tree with the change's test files written into it, checked out clean through the pinned git dir
+/// and run through the repo-checks floor (the creator stage: the targeted test set over the files
+/// that differ from the base, i.e. the tests). A check that FAILS there is a test that fails
+/// without the change (kept); every one passing is a test that does not (broken). A repo with no
+/// test command, no pinned git dir or no OS boundary falls back to the judge, saying so.
+struct FloorMachine<'a> {
+    wd: &'a std::path::Path,
+    git_dir: Option<&'a std::path::Path>,
+    base: &'a str,
+    run_id: &'a str,
+    /// This attempt's own floor on the head: `Some(false)` = its checks did not pass.
+    head_floor: Option<bool>,
+    /// The engine's snapshot tree of the worktree: the test files are taken from it (their blobs,
+    /// never re-read from the live worktree).
+    snapshot: Option<&'a str>,
+}
+
+impl crate::rule_check::MachineCheck for FloorMachine<'_> {
+    fn test_fails_on_base(&self, tests: &[String]) -> crate::rule_check::MachineOutcome {
+        use crate::rule_check::{MachineOutcome, RuleStatus};
+        if self.head_floor == Some(false) {
+            return MachineOutcome::Verdict {
+                status: RuleStatus::Unchecked,
+                reason: "the head's own checks did not pass at this gate, so a test failing on \
+                         the base proves nothing yet"
+                    .into(),
+            };
+        }
+        if tests.is_empty() {
+            return MachineOutcome::Fallback(
+                "no separate test file changed (an inline test, or a file the engine does not \
+                 classify)"
+                    .into(),
+            );
+        }
+        let (Some(git_dir), Some(snapshot)) = (self.git_dir, self.snapshot) else {
+            return MachineOutcome::Fallback(
+                "the run has no pinned git dir to export its base".into(),
+            );
+        };
+        let tree = match base_tree_with(self.wd, git_dir, self.base, snapshot, tests) {
+            Ok(t) => t,
+            Err(e) => {
+                return MachineOutcome::Fallback(format!(
+                    "the base tree with the tests could not be built: {e}"
+                ))
+            }
+        };
+        let label = format!("{}-rule-check-{}", self.run_id, &tree[..tree.len().min(12)]);
+        let checkout =
+            match crate::repo_checks::checkout_guarded_tree(self.wd, git_dir, &tree, &label) {
+                Ok(c) => c,
+                Err(e) => {
+                    return MachineOutcome::Fallback(format!(
+                        "the base tree could not be checked out: {e}"
+                    ))
+                }
+            };
+        let ctx = crate::repo_checks::FloorContext {
+            stage: crate::repo_checks::FloorStage::Creator,
+            force_install: false,
+            base_head: Some(self.base.to_string()),
+            git_dir: Some(git_dir.to_path_buf()),
+            claim_text: None,
+            package_dir: None,
+            run_id: Some(self.run_id.to_string()),
+            code_graph: None,
+        };
+        let mut report = crate::repo_checks::run_floor_journaled(&checkout.dir, &ctx, None, None);
+        // A check that rewrote the tree it ran on proves nothing about it (codex r2).
+        checkout.hold_to(&tree, &mut report);
+        drop(checkout);
+        decide_tests_on_base(&report, self.base, tests, self.head_floor)
+    }
+}
+
+/// The run base's tree with each of `tests` written into it AS THE ENGINE'S SNAPSHOT HOLDS IT
+/// (its blob and mode from `snapshot`, never re-read from the live worktree: no filter, hook or
+/// symlink is involved), through a private index on the pinned git dir. Returns the tree id.
+fn base_tree_with(
+    wd: &std::path::Path,
+    git_dir: &std::path::Path,
+    base: &str,
+    snapshot: &str,
+    tests: &[String],
+) -> Result<String, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let idx = std::env::temp_dir().join(format!(
+        "wicked-rule-check-{}-{}.index",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let env: [(&str, &std::path::Path); 2] = [("GIT_DIR", git_dir), ("GIT_INDEX_FILE", &idx)];
+    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
+    let run = || -> anyhow::Result<String> {
+        let base_tree = crate::worktree_guard::git_string(
+            wd,
+            &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
+            &env[..1],
+        )?;
+        let mut args = no_hooks.to_vec();
+        args.extend(["read-tree", base_tree.as_str()]);
+        crate::worktree_guard::git(wd, &args, &env)?;
+        for t in tests {
+            let entry =
+                crate::worktree_guard::git(wd, &["ls-tree", "-z", snapshot, "--", t], &env[..1])?;
+            let entry = String::from_utf8_lossy(&entry);
+            // (codex r3) Every changed test rides the overlay faithfully, or nothing is decided.
+            let Some((meta, path)) = entry.trim_end_matches('\0').split_once('\t') else {
+                anyhow::bail!("{t} is not in the engine's snapshot");
+            };
+            let parts: Vec<&str> = meta.split(' ').collect();
+            let [mode @ ("100644" | "100755"), "blob", blob] = parts.as_slice() else {
+                anyhow::bail!("{t} is not a regular file in the snapshot ({meta})");
+            };
+            if path != t {
+                anyhow::bail!("{t} reads back from the snapshot as {path}");
+            }
+            let mut args = no_hooks.to_vec();
+            let info = format!("{mode},{blob},{t}");
+            args.extend(["update-index", "--add", "--cacheinfo", info.as_str()]);
+            crate::worktree_guard::git(wd, &args, &env)?;
+        }
+        crate::worktree_guard::git_string(wd, &["write-tree"], &env)
+    };
+    let out = run().map_err(|e| format!("{e:#}"));
+    let _ = std::fs::remove_file(&idx);
+    out
+}
+
+/// The floor's run on the base-with-tests tree: a test-set or build check that FAILED there (an
+/// exit, not a timeout or a spawn error) is a test that fails without the change.
+fn decide_tests_on_base(
+    report: &crate::repo_checks::RepoChecksReport,
+    base: &str,
+    tests: &[String],
+    head_floor: Option<bool>,
+) -> crate::rule_check::MachineOutcome {
+    use crate::rule_check::{MachineOutcome, RuleStatus};
+    if let Some(e) = report
+        .sandbox_error
+        .as_ref()
+        .or(report.detect_error.as_ref())
+    {
+        return MachineOutcome::Fallback(format!("the floor could not run on the base: {e}"));
+    }
+    let short = &base[..base.len().min(10)];
+    let head = match head_floor {
+        Some(true) => "they pass on the head (this gate's floor)",
+        _ => "the head's run is the creator floor's (not re-run at this gate)",
+    };
+    // Only the test set decides (codex r2): a typecheck, build or lint failure is not a test that
+    // fails, and the judge reads this result as evidence only.
+    let test_set = |n: &str| {
+        matches!(n, "test" | "test_targeted" | "cargo-test" | "e2e") || n.starts_with("journey")
+    };
+    let deciding = test_set;
+    if !report.checks.iter().any(|c| test_set(&c.name)) {
+        return MachineOutcome::Fallback(
+            "the repository declares no test command the floor runs".into(),
+        );
+    }
+    let failed: Vec<String> = report
+        .checks
+        .iter()
+        .filter(|c| {
+            deciding(&c.name)
+                && c.spawn_error.is_none()
+                && !c.timed_out
+                && c.exit_code.is_some_and(|x| x != 0)
+        })
+        .map(|c| format!("`{}` exited {}", c.name, c.exit_code.unwrap_or(-1)))
+        .collect();
+    if !failed.is_empty() {
+        return MachineOutcome::Verdict {
+            status: RuleStatus::Kept,
+            reason: format!(
+                "the changed tests ({}) fail on the base {short}: {}; {head}",
+                tests.join(", "),
+                failed.join(", ")
+            ),
+        };
+    }
+    if let Some(c) = report
+        .checks
+        .iter()
+        .find(|c| deciding(&c.name) && !c.passed())
+    {
+        return MachineOutcome::Fallback(format!(
+            "the base run of `{}` did not finish ({})",
+            c.name,
+            c.outcome()
+        ));
+    }
+    MachineOutcome::Verdict {
+        status: RuleStatus::Broken,
+        reason: format!(
+            "the changed tests ({}) pass on the base {short} too: none fails without the change",
+            tests.join(", ")
+        ),
+    }
+}
+
+/// (DES-RULE-CHECK-001 S2) Run the steering-rule check for a review unit: the rules in force from
+/// the policy store (never the brief), the engine's diff against the run base, the floor's
+/// result, and judge seats distinct from the work's creators (`creators` keys and the binaries
+/// they ran) drawn from the run's pool. The creator's transcript is never handed to the judge.
+/// `None` when there is nothing to check (no base, no change); a store that cannot be read is a
+/// report whose note says so and whose rows are empty — the fold holds on it.
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    floor: Option<&crate::repo_checks::RepoChecksReport>,
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    let wd = std::path::Path::new(input.workdir.as_deref()?);
+    let gov = input.governance.as_ref()?;
+    let baseline = input.unit.worktree_baseline.as_ref();
+    let held = |why: String| {
+        Some(crate::rule_check::RuleCheckReport {
+            note: Some(why),
+            ..Default::default()
+        })
+    };
+    // The run base, recorded at dispatch. A unit with a baseline but no recorded base cannot say
+    // what changed (a creator's commits may already be in its baseline HEAD): it holds. A unit
+    // with neither is not on a repository: there is no change to check.
+    let base = match input
+        .unit
+        .run_base_commit
+        .as_deref()
+        .filter(|h| !h.is_empty())
+    {
+        Some(b) => b.to_string(),
+        None if baseline.is_some() => {
+            return held(
+                "the run base is not recorded on this unit, so the change under review \
+                         cannot be read"
+                    .into(),
+            )
+        }
+        None => return None,
+    };
+    let git_dir = baseline
+        .and_then(|b| b.git_dir.as_deref())
+        .map(std::path::Path::new);
+    let change = match crate::rule_check::worktree_diff(wd, git_dir, &base) {
+        Ok(c) => c,
+        Err(e) => {
+            return held(format!(
+                "the change against the run base {base} could not be read: {e}"
+            ))
+        }
+    };
+    if change.diff.trim().is_empty() && change.paths.is_empty() {
+        return None;
+    }
+    let rules = match crate::rule_check::rules_in_force(&gov.db_path, gov.project_id.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return held(format!(
+                "the steering rules could not be read from the store: {e:#}"
+            ))
+        }
+    };
+    if rules.is_empty() {
+        return None;
+    }
+    // Evaluator ≠ creator, no fallback: a seat is a judge only when neither its key nor any
+    // binary it may execute (quote-aware, `record_identities`) is a creator's — the creators'
+    // registry records and every binary they actually ran.
+    let (seats, no_seat): (Vec<String>, Option<String>) = match creator_bins {
+        _ if creators.is_empty() => (
+            Vec::new(),
+            Some("the work's creators are not known, so no judge can be shown distinct from them".into()),
+        ),
+        None => (
+            Vec::new(),
+            Some("a creator of this work has no recorded binary, so no judge can be shown distinct from it".into()),
+        ),
+        Some(bins) => {
+            let mut ids: std::collections::BTreeSet<String> = bins
+                .iter()
+                .map(|b| crate::validator::normalize_identity(b))
+                .collect();
+            for k in creators {
+                match registry.iter().find(|c| &c.key == k) {
+                    Some(c) => ids.extend(record_identities(c)),
+                    None => {
+                        ids.insert(crate::validator::normalize_identity(k));
+                    }
+                }
+            }
+            // (codex r3) …and whoever authored THIS unit's tree (a floor fix's seat), by key and binary.
+            ids.extend(
+                input
+                    .unit
+                    .authored_binaries
+                    .iter()
+                    .map(|b| crate::validator::normalize_identity(b)),
+            );
+            for k in &input.unit.authored_by {
+                if let Some(c) = registry.iter().find(|c| &c.key == k) {
+                    ids.extend(record_identities(c));
+                }
+            }
+            let excluded: Vec<&str> = creators
+                .iter()
+                .chain(&input.unit.exclude_seats)
+                .chain(&input.unit.authored_by)
+                .map(String::as_str)
+                .collect();
+            let keys: Vec<String> = pool
+                .iter()
+                .filter(|c| {
+                    !excluded.contains(&c.key.as_str())
+                        && !c.headless_invocation.trim().is_empty()
+                        && c.seat_eligible_for_work
+                        && record_identities(c).iter().all(|i| !ids.contains(i))
+                })
+                .map(|c| c.key.clone())
+                .collect();
+            let why = keys.is_empty().then(|| {
+                format!(
+                    "no signed-in judge seat distinct from the work's creators [{}] on the run's \
+                     roster",
+                    creators.join(", ")
+                )
+            });
+            (keys, why)
+        }
+    };
+    let facts = crate::rule_check::job_facts(
+        &input.unit.rule_steps,
+        gov.project_id.as_deref(),
+        gov.repo_id.as_deref(),
+        &change,
+    );
+    // The person's own words for the job, as the run recorded them (never a plan's step text).
+    let instructions = input
+        .unit
+        .rule_instructions
+        .as_deref()
+        .map(crate::rule_check::instructions_of)
+        .unwrap_or_default();
+    let floor_text = floor.map(crate::rule_check::floor_evidence);
+    engine_note(
+        emit_delta,
+        &format!(
+            "rule check: {} steering rule(s) in force; judges: {}",
+            rules.len(),
+            if seats.is_empty() {
+                "none".to_string()
+            } else {
+                seats.join(", ")
+            }
+        ),
+    );
+    let judge = SeatRuleJudge {
+        seats: pool,
+        runner,
+    };
+    let report = with_floor_heartbeat(
+        emit_delta,
+        "rule check: judging the steering rules",
+        FLOOR_HEARTBEAT_EVERY,
+        || {
+            crate::rule_check::check(
+                &crate::rule_check::CheckInput {
+                    rules: &rules,
+                    facts: &facts,
+                    change: &change,
+                    floor: floor_text.as_deref(),
+                    prior: input.unit.rule_check.as_ref(),
+                    skips: &input.unit.rule_skips,
+                    seats: &seats,
+                    no_seat: no_seat.as_deref(),
+                    base: &base,
+                    instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
+                    packs: crate::steering_packs::shipped_rule_ids(),
+                },
+                &judge,
+                &FloorMachine {
+                    wd,
+                    git_dir,
+                    base: &base,
+                    run_id: &input.run_id,
+                    head_floor: floor.map(|r| r.passed),
+                    snapshot: change.tree.as_deref(),
+                },
+            )
+        },
+    );
+    engine_note(
+        emit_delta,
+        &format!(
+            "rule check: {} ({} ms)",
+            report.summary(),
+            report.elapsed_ms
+        ),
+    );
+    Some(report)
+}
+
 /// `run_roster` — the RUN's configured seat keys (`AgentSession::clis`): the judge is drawn from
 /// the registry seats the launcher actually configured for this run (review of #449, RT-1), not
 /// from every registry record; empty = no intersection (the bus path, tests). `bench` — the
@@ -3853,6 +4296,27 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 FloorRun::LiveWorktree => floor_live(plan, emit_delta),
             }),
     };
+    // (DES-RULE-CHECK-001 S2) The review step's steering-rule check: every rule in force gets a
+    // verdict from a seat distinct from the work's creators. Before the guard's final comparison,
+    // so a tree changed while the rules were judged is caught like any other mutation.
+    let rule_check = if rule_check_applies(input, &output) {
+        run_rule_check(
+            input,
+            &creators,
+            if creators.is_empty() {
+                Some(&[][..])
+            } else {
+                fallback.author_binaries
+            },
+            &eligible_run,
+            roster,
+            repo_checks.as_ref(),
+            &**runner,
+            emit_delta,
+        )
+    } else {
+        None
+    };
     // F-036 WORKTREE GUARD, the FINAL comparison — the last thing this thread does before the
     // result is posted to the gate fold. Everything the phase owned has run and been quiesced by
     // now (the seat's process group is killed when it exits; each check's group likewise), so
@@ -3978,6 +4442,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         team: team_snapshot,
         qe_review,
         bench_reprobes,
+        rule_check,
     };
     (output, agent_verdict, evidence)
 }
@@ -10649,3 +11114,7 @@ mod judge_fallback_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[cfg(test)]
+#[path = "cli_runner_rule_check_tests.rs"]
+mod rule_check_seat_tests;
