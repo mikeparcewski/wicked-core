@@ -129,10 +129,10 @@ pub struct RuleVerdict {
     /// The seat that ruled (on a cache row, the seat that ruled first).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub judge: Option<String>,
-    /// 12 hex of the rule's content (id, statement, facets, obligations).
+    /// SHA-256 (64 hex) of the rule's judged content (statement, criteria, obligations, facets).
     #[serde(default)]
     pub rule_key: String,
-    /// 12 hex of the evidence the verdict read; absent on a fact row.
+    /// SHA-256 (64 hex) of the evidence the verdict read; absent on a fact row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_key: Option<String>,
 }
@@ -345,6 +345,11 @@ pub struct Change {
     /// Every changed path (tracked and untracked, NUL-delimited from git: no quoting), with
     /// whether it still exists in the worktree.
     pub paths: Vec<(String, bool)>,
+    /// The diff's exact bytes: the evidence keys hash these, never the lossy text.
+    pub raw: Vec<u8>,
+    /// The engine's own snapshot tree of the worktree (a fresh index through the pinned git dir:
+    /// no index flag the creator set can hide an edit), when the run has a pinned git dir.
+    pub tree: Option<String>,
 }
 
 impl Change {
@@ -379,11 +384,15 @@ pub fn job_facts(steps: &[JobStep], project: Option<&str>, change: &Change) -> J
 /// Full SHA-256 hex of length-prefixed parts: the cache and skip keys (equality is trusted, so
 /// never truncated).
 fn digest(parts: &[&str]) -> String {
+    digest_bytes(&parts.iter().map(|p| p.as_bytes()).collect::<Vec<_>>())
+}
+
+fn digest_bytes(parts: &[&[u8]]) -> String {
     use sha2::Digest;
     let mut h = sha2::Sha256::new();
     for p in parts {
         h.update((p.len() as u64).to_le_bytes());
-        h.update(p.as_bytes());
+        h.update(p);
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -475,12 +484,8 @@ pub fn is_test_path(path: &str) -> bool {
 /// A source file the change could break: a programming-language file that is not a test.
 pub fn is_source_path(path: &str) -> bool {
     !is_test_path(path)
-        && language_of(path).is_some_and(|l| {
-            !matches!(
-                l,
-                "markdown" | "json" | "yaml" | "toml" | "html" | "css" | "sql"
-            )
-        })
+        && language_of(path)
+            .is_some_and(|l| !matches!(l, "markdown" | "json" | "yaml" | "toml" | "html" | "css"))
 }
 
 /// What a machine check concluded.
@@ -529,7 +534,23 @@ fn test_fails_on_base_by_diff(change: &Change) -> Option<(RuleStatus, RuleHow, S
         }
         s
     };
-    if sources.is_empty() {
+    // Not applicable only when every changed file is a KNOWN non-code type (docs, data, config,
+    // styles); an unknown extension may be code, and goes to the check.
+    let known_non_code = |p: &str| {
+        let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
+        language_of(p)
+            .is_some_and(|l| matches!(l, "markdown" | "json" | "yaml" | "toml" | "html" | "css"))
+            || [
+                ".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".lock", ".csv",
+            ]
+            .iter()
+            .any(|e| name.ends_with(e))
+            || matches!(
+                name.as_str(),
+                "license" | "changelog" | "readme" | ".gitignore"
+            )
+    };
+    if sources.is_empty() && changed.iter().all(|p| known_non_code(p)) {
         return Some((
             RuleStatus::NotApplicable,
             RuleHow::Fact,
@@ -543,7 +564,25 @@ fn test_fails_on_base_by_diff(change: &Change) -> Option<(RuleStatus, RuleHow, S
             ),
         ));
     }
-    if tests.is_empty() {
+    // A test written inline in a source file (`#[test]` in `src/lib.rs`, a Go `func TestX`) is a
+    // test too: the change goes to the check, never broken by its file names alone.
+    let inline_test = change.diff.lines().any(|l| {
+        l.starts_with('+')
+            && [
+                "#[test]",
+                "#[cfg(test)]",
+                "#[tokio::test]",
+                "func Test",
+                "def test_",
+                "describe(",
+                "it(",
+                "test(",
+                "@Test",
+            ]
+            .iter()
+            .any(|m| l.contains(m))
+    });
+    if tests.is_empty() && !sources.is_empty() && !inline_test {
         return Some((
             RuleStatus::Broken,
             RuleHow::Machine,
@@ -675,12 +714,8 @@ pub fn parse_rule_lines(
     let Some(len) = lines[start + 1..].iter().position(|l| l.trim() == close) else {
         return BTreeMap::new();
     };
-    let names_a_path = |cite: &str| {
-        paths.iter().any(|p| {
-            !p.is_empty()
-                && (cite.contains(p) || p.rsplit('/').next().is_some_and(|n| cite.contains(n)))
-        })
-    };
+    // A KEPT cites a changed file by its whole path (a bare basename can be ordinary prose).
+    let names_a_path = |cite: &str| paths.iter().any(|p| !p.is_empty() && cite.contains(p));
     let mut seen: BTreeMap<String, Option<Answer>> = BTreeMap::new();
     for raw in &lines[start + 1..start + 1 + len] {
         let line = raw.trim().trim_start_matches(['-', '*', ' ']).trim_start();
@@ -748,8 +783,16 @@ pub fn parse_rule_lines(
 
 /// The judge prompt for one batch: the rules whole, the evidence fenced as data, the answers
 /// framed by `nonce`. The diff is cut so the whole prompt stays within [`PROMPT_BUDGET`].
-pub fn prompt(batch: &[&ConformanceRule], diff: &str, floor: Option<&str>, nonce: &str) -> String {
-    let rules: String = batch.iter().map(|r| rule_text(r)).collect();
+pub fn prompt(
+    batch: &[(&ConformanceRule, &str)],
+    diff: &str,
+    floor: Option<&str>,
+    nonce: &str,
+) -> String {
+    let rules: String = batch
+        .iter()
+        .map(|(r, note)| format!("{}{note}", rule_text(r)))
+        .collect();
     let floor: String = floor
         .map(|f| {
             let f: String = f.trim().chars().take(2000).collect();
@@ -798,6 +841,9 @@ struct Pending<'a> {
     rule: &'a ConformanceRule,
     rule_key: String,
     evidence_key: String,
+    /// What the judge is told beside the rule: the engine's match facts, and a machine check's
+    /// result when it is evidence for the judge.
+    note: String,
 }
 
 /// Run the check: match, skips, cache, the machine check beside the judge batches, single re-asks.
@@ -815,11 +861,12 @@ pub fn check(
     let floor = input.floor.unwrap_or("");
     // What a judge reads: the whole diff and the floor's result. A machine check reads the base
     // and the change.
-    let judge_key = digest(&["judge", &input.change.diff, floor]);
-    let machine_key = digest(&[
-        OBLIGATION_TEST_FAILS_ON_BASE,
-        input.base,
-        &input.change.diff,
+    let judge_key = digest_bytes(&[b"judge", &input.change.raw, floor.as_bytes()]);
+    let machine_key = digest_bytes(&[
+        OBLIGATION_TEST_FAILS_ON_BASE.as_bytes(),
+        input.base.as_bytes(),
+        &input.change.raw,
+        floor.as_bytes(),
     ]);
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     let mut pending: Vec<Pending<'_>> = Vec::new();
@@ -854,11 +901,22 @@ pub fn check(
             continue;
         }
         let is_machine = machine_obligation(rule).is_some();
-        let ek = if is_machine {
-            machine_key.clone()
-        } else {
-            judge_key.clone()
-        };
+        // The match's facts ride the prompt beside the rule (the judge knows what the engine
+        // already established), so they are part of the evidence the verdict read.
+        let note = format!(
+            "  Engine: {} — {}\n",
+            if m.status == MatchStatus::Applies {
+                "applies"
+            } else {
+                "may apply"
+            },
+            m.facts
+                .iter()
+                .map(|f| f.detail.as_str())
+                .collect::<Vec<_>>()
+                .join("; ")
+        );
+        let ek = digest(&[if is_machine { &machine_key } else { &judge_key }, &note]);
         // A skip answers exactly the unchecked row it was given on: the same rule content and the
         // same evidence.
         if let Some(s) = input
@@ -907,6 +965,7 @@ pub fn check(
                 rule,
                 rule_key: rk,
                 evidence_key: ek,
+                note,
             });
             continue;
         }
@@ -914,6 +973,7 @@ pub fn check(
             rule,
             rule_key: rk,
             evidence_key: ek,
+            note,
         });
     }
 
@@ -929,10 +989,12 @@ pub fn check(
         .filter(|p| is_test_path(p))
         .map(str::to_string)
         .collect();
+    // ONE pool for the whole check: a seat that failed, or a stop, holds for every round.
+    let pool = Pool::default();
     let machine_out: Option<MachineOutcome> = std::thread::scope(|s| {
         let run =
             (!machine_pending.is_empty()).then(|| s.spawn(|| machine.test_fails_on_base(&tests)));
-        judge_rows(&pending, input, judge, &mut report, &mut rows, None);
+        judge_rows(&pending, input, judge, &pool, &mut report, &mut rows, None);
         run.map(|h| {
             h.join().unwrap_or_else(|_| {
                 MachineOutcome::Fallback("the base run of the changed tests panicked".into())
@@ -940,6 +1002,29 @@ pub fn check(
         })
     });
     match machine_out {
+        // A failing test on the base is evidence, not a verdict: a distinct judge decides whether
+        // the changed tests assert what the rule asks (codex r2). Only a machine BROKEN (no test,
+        // or tests that pass on the base too) stands without a judge.
+        Some(MachineOutcome::Verdict {
+            status: RuleStatus::Kept,
+            reason,
+        }) => {
+            for p in machine_pending.iter_mut() {
+                p.note.push_str(&format!(
+                    "  Engine check {OBLIGATION_TEST_FAILS_ON_BASE}: {reason}. KEEP it only if \
+                     those tests assert what the rule asks (not an incidental difference).\n"
+                ));
+            }
+            judge_rows(
+                &machine_pending,
+                input,
+                judge,
+                &pool,
+                &mut report,
+                &mut rows,
+                Some(&format!("{OBLIGATION_TEST_FAILS_ON_BASE}: {reason}")),
+            );
+        }
         Some(MachineOutcome::Verdict { status, reason }) => {
             for p in &machine_pending {
                 let ruled = status != RuleStatus::Unchecked;
@@ -968,6 +1053,7 @@ pub fn check(
                 &machine_pending,
                 input,
                 judge,
+                &pool,
                 &mut report,
                 &mut rows,
                 Some(&note),
@@ -975,6 +1061,8 @@ pub fn check(
         }
         None => {}
     }
+    report.calls = pool.calls.load(std::sync::atomic::Ordering::Relaxed);
+    report.refused = pool.dead.lock().unwrap().iter().cloned().collect();
     // The match's reading order, every rule once.
     report.rows = matches
         .iter()
@@ -990,6 +1078,7 @@ fn judge_rows(
     pending: &[Pending<'_>],
     input: &CheckInput<'_>,
     judge: &dyn RuleJudge,
+    pool: &Pool,
     report: &mut RuleCheckReport,
     rows: &mut BTreeMap<String, RuleVerdict>,
     note: Option<&str>,
@@ -1013,7 +1102,10 @@ fn judge_rows(
         return;
     }
     let (size, parallel) = plan(pending.len());
-    let texts: Vec<usize> = pending.iter().map(|p| rule_text(p.rule).len()).collect();
+    let texts: Vec<usize> = pending
+        .iter()
+        .map(|p| rule_text(p.rule).len() + p.note.len())
+        .collect();
     let batches = batches_for(&texts, size);
     let parallel = parallel.min(batches.len()).max(1);
     if report.batch_size == 0 {
@@ -1022,8 +1114,7 @@ fn judge_rows(
     }
     report.waves += batches.len().div_ceil(parallel) as u32;
     let first = batches.len();
-    let pool = Pool::default();
-    let (mut answered, mut why) = run_pool(pending, batches, 0, parallel, input, judge, &pool);
+    let (mut answered, mut why) = run_pool(pending, batches, 0, parallel, input, judge, pool);
     let missing: Vec<Vec<usize>> = (0..pending.len())
         .filter(|i| !answered.contains_key(i))
         .map(|i| vec![i])
@@ -1031,17 +1122,11 @@ fn judge_rows(
     if !missing.is_empty() && !pool.stopped() {
         let par = missing.len().min(MAX_PARALLEL);
         report.waves += missing.len().div_ceil(par) as u32;
-        let (more, why2) = run_pool(pending, missing, first, par, input, judge, &pool);
+        let (more, why2) = run_pool(pending, missing, first, par, input, judge, pool);
         answered.extend(more);
         // The first round's reason names the failed seats; a re-ask that found none left keeps it.
         for (k, v) in why2 {
             why.entry(k).or_insert(v);
-        }
-    }
-    report.calls += pool.calls.load(std::sync::atomic::Ordering::Relaxed);
-    for seat in pool.dead.into_inner().unwrap() {
-        if !report.refused.contains(&seat) {
-            report.refused.push(seat);
         }
     }
     for (i, p) in pending.iter().enumerate() {
@@ -1129,10 +1214,22 @@ fn run_pool(
                     unanswered("the run was stopped before a judge ruled".into());
                     continue;
                 }
-                let rules: Vec<&ConformanceRule> = batch.iter().map(|i| pending[*i].rule).collect();
-                let ids: Vec<&str> = rules.iter().map(|r| r.id.as_str()).collect();
+                let asked: Vec<(&ConformanceRule, &str)> = batch
+                    .iter()
+                    .map(|i| (pending[*i].rule, pending[*i].note.as_str()))
+                    .collect();
+                let ids: Vec<&str> = asked.iter().map(|(r, _)| r.id.as_str()).collect();
                 let nonce = uuid::Uuid::new_v4().simple().to_string();
-                let text = prompt(&rules, &input.change.diff, input.floor, &nonce);
+                let text = prompt(&asked, &input.change.diff, input.floor, &nonce);
+                // (codex r2) A rule whose own text cannot fit one argv argument is never sent.
+                if text.len() > PROMPT_BUDGET {
+                    unanswered(format!(
+                        "its text is too long to send to a judge in one argument ({} bytes, limit \
+                         {PROMPT_BUDGET})",
+                        text.len()
+                    ));
+                    continue;
+                }
                 let n = input.seats.len();
                 let mut failures: Vec<String> = Vec::new();
                 let mut got: Option<(String, String)> = None;
@@ -1202,10 +1299,12 @@ pub fn rules_in_force(
     Ok(wicked_governance::consider_rules(&store, &query)?.in_force)
 }
 
-/// The change under review against `base`: tracked changes (committed and not) plus every
-/// untracked file, all forced to text (`--text --no-textconv --no-ext-diff`), and git's own
-/// NUL-delimited path list. Read through the pinned git dir when the baseline has one. `Err` when
-/// any part cannot be read: the caller holds, it never checks a partial change.
+/// The change under review against `base`, read through the pinned git dir when the run has one:
+/// the engine's own snapshot of the worktree (a fresh index: tracked and untracked files, no index
+/// flag the creator set can hide an edit) diffed against the base, forced to text
+/// (`--text --no-textconv --no-ext-diff`), with git's NUL-delimited path list. Without a pinned git
+/// dir: `git diff <base>` over the worktree plus every untracked file. `Err` when any part cannot
+/// be read: the caller holds, it never checks a partial change.
 pub fn worktree_diff(
     workdir: &std::path::Path,
     git_dir: Option<&std::path::Path>,
@@ -1217,11 +1316,15 @@ pub fn worktree_diff(
         // spawn-audit: hardened — read-only git plumbing over the run's own worktree.
         c.hardened();
         if let Some(g) = git_dir {
-            c.arg(format!("--git-dir={}", g.display()))
-                .arg(format!("--work-tree={}", workdir.display()));
+            c.env("GIT_DIR", g).env("GIT_WORK_TREE", workdir);
         }
         let out = c
-            .args(["-c", "core.quotepath=false", "-c", "diff.noprefix=false"])
+            .args([
+                "-c",
+                "core.quotepath=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
             .args(args)
             .current_dir(workdir)
             .output()
@@ -1237,7 +1340,6 @@ pub fn worktree_diff(
             ))
         }
     };
-    let text = |b: Vec<u8>| String::from_utf8_lossy(&b).into_owned();
     let diff_args = [
         "--no-color",
         "--no-ext-diff",
@@ -1245,30 +1347,68 @@ pub fn worktree_diff(
         "--text",
         "-M",
     ];
-    let mut args: Vec<&str> = vec!["diff"];
-    args.extend(diff_args);
-    args.extend([base, "--"]);
-    let mut diff = text(git(&args, &[0])?);
+    let exists = |p: &str| workdir.join(p).symlink_metadata().is_ok();
+    let mut raw: Vec<u8> = Vec::new();
     let mut paths: Vec<(String, bool)> = Vec::new();
-    let names = git(
-        &["diff", "--no-renames", "--name-only", "-z", base, "--"],
-        &[0],
-    )?;
-    for p in names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let p = String::from_utf8_lossy(p).into_owned();
-        let exists = workdir.join(&p).symlink_metadata().is_ok();
-        paths.push((p, exists));
-    }
-    let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"], &[0])?;
-    for p in untracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
-        let p = String::from_utf8_lossy(p).into_owned();
-        let mut args: Vec<&str> = vec!["diff"];
-        args.extend(diff_args);
-        args.extend(["--no-index", "--", "/dev/null", p.as_str()]);
-        diff.push_str(&text(git(&args, &[0, 1])?));
-        paths.push((p, true));
-    }
-    Ok(Change { diff, paths })
+    let tree = match git_dir {
+        Some(g) => {
+            let snap = crate::worktree_guard::snapshot_through(workdir, g)
+                .map_err(|e| format!("the worktree snapshot failed: {e:#}"))?;
+            let mut args: Vec<&str> = vec!["diff"];
+            args.extend(diff_args);
+            args.extend([base, snap.tree.as_str(), "--"]);
+            raw.extend(git(&args, &[0])?);
+            let names = git(
+                &[
+                    "diff",
+                    "--no-renames",
+                    "--name-only",
+                    "-z",
+                    base,
+                    &snap.tree,
+                    "--",
+                ],
+                &[0],
+            )?;
+            for p in names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let p = String::from_utf8_lossy(p).into_owned();
+                let e = exists(&p);
+                paths.push((p, e));
+            }
+            Some(snap.tree)
+        }
+        None => {
+            let mut args: Vec<&str> = vec!["diff"];
+            args.extend(diff_args);
+            args.extend([base, "--"]);
+            raw.extend(git(&args, &[0])?);
+            let names = git(
+                &["diff", "--no-renames", "--name-only", "-z", base, "--"],
+                &[0],
+            )?;
+            for p in names.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let p = String::from_utf8_lossy(p).into_owned();
+                let e = exists(&p);
+                paths.push((p, e));
+            }
+            let untracked = git(&["ls-files", "--others", "--exclude-standard", "-z"], &[0])?;
+            for p in untracked.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+                let p = String::from_utf8_lossy(p).into_owned();
+                let mut args: Vec<&str> = vec!["diff"];
+                args.extend(diff_args);
+                args.extend(["--no-index", "--", "/dev/null", p.as_str()]);
+                raw.extend(git(&args, &[0, 1])?);
+                paths.push((p, true));
+            }
+            None
+        }
+    };
+    Ok(Change {
+        diff: String::from_utf8_lossy(&raw).into_owned(),
+        paths,
+        raw,
+        tree,
+    })
 }
 
 #[cfg(test)]

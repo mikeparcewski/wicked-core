@@ -399,7 +399,20 @@ fn the_base_tree_with_the_tests_holds_the_base_and_the_tests() {
     std::fs::create_dir_all(repo.join("tests")).unwrap();
     std::fs::write(repo.join("tests/add_test.rs"), "#[test] fn t() {}\n").unwrap();
     let git_dir = repo.join(".git");
-    let tree = base_tree_with(&repo, &git_dir, &base, &["tests/add_test.rs".to_string()]).unwrap();
+    let snap = crate::worktree_guard::snapshot_through(&repo, &git_dir).unwrap();
+    // The live worktree changes after the snapshot: the snapshot's blob is what is used.
+    std::fs::write(repo.join("tests/add_test.rs"), "tampered\n").unwrap();
+    let tree = base_tree_with(
+        &repo,
+        &git_dir,
+        &base,
+        &snap.tree,
+        &[
+            "tests/add_test.rs".to_string(),
+            "src/missing_test.rs".to_string(),
+        ],
+    )
+    .unwrap();
     let ls = git(&repo, &["ls-tree", "-r", "--name-only", &tree]);
     assert_eq!(
         ls.lines().collect::<Vec<_>>(),
@@ -407,6 +420,15 @@ fn the_base_tree_with_the_tests_holds_the_base_and_the_tests() {
     );
     let a = git(&repo, &["show", &format!("{tree}:src/a.rs")]);
     assert_eq!(a, "fn add() {}", "the base's source, not the fix");
+    let t = git(&repo, &["show", &format!("{tree}:tests/add_test.rs")]);
+    assert_eq!(
+        t, "#[test] fn t() {}",
+        "the snapshot's test, not the live file"
+    );
+    // Read through the pinned git dir, the change is the engine's own snapshot.
+    let change = crate::rule_check::worktree_diff(&repo, Some(&git_dir), &base).unwrap();
+    assert!(change.tree.is_some());
+    assert!(change.paths.iter().any(|(p, _)| p == "tests/add_test.rs"));
 }
 
 fn report_of(checks: serde_json::Value) -> crate::repo_checks::RepoChecksReport {
@@ -466,4 +488,15 @@ fn the_base_run_decides_kept_broken_or_the_judge() {
         ),
         "a failed install is not a failing test"
     );
+}
+
+/// codex r2: an edit the creator hid with an index flag (`assume-unchanged`) is still in the change
+/// the engine reads through its own snapshot.
+#[test]
+fn an_index_flag_cannot_hide_an_edit_from_the_snapshot() {
+    let (repo, base, _db) = fixture("flags");
+    git(&repo, &["add", "src/a.rs"]);
+    git(&repo, &["update-index", "--assume-unchanged", "src/a.rs"]);
+    let change = crate::rule_check::worktree_diff(&repo, Some(&repo.join(".git")), &base).unwrap();
+    assert!(change.diff.contains("fn add(a: i32"), "{}", change.diff);
 }

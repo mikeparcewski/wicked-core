@@ -820,6 +820,9 @@ struct FloorMachine<'a> {
     run_id: &'a str,
     /// This attempt's own floor on the head: `Some(false)` = its checks did not pass.
     head_floor: Option<bool>,
+    /// The engine's snapshot tree of the worktree: the test files are taken from it (their blobs,
+    /// never re-read from the live worktree).
+    snapshot: Option<&'a str>,
 }
 
 impl crate::rule_check::MachineCheck for FloorMachine<'_> {
@@ -833,12 +836,19 @@ impl crate::rule_check::MachineCheck for FloorMachine<'_> {
                     .into(),
             };
         }
-        let Some(git_dir) = self.git_dir else {
+        if tests.is_empty() {
+            return MachineOutcome::Fallback(
+                "no separate test file changed (an inline test, or a file the engine does not \
+                 classify)"
+                    .into(),
+            );
+        }
+        let (Some(git_dir), Some(snapshot)) = (self.git_dir, self.snapshot) else {
             return MachineOutcome::Fallback(
                 "the run has no pinned git dir to export its base".into(),
             );
         };
-        let tree = match base_tree_with(self.wd, git_dir, self.base, tests) {
+        let tree = match base_tree_with(self.wd, git_dir, self.base, snapshot, tests) {
             Ok(t) => t,
             Err(e) => {
                 return MachineOutcome::Fallback(format!(
@@ -866,18 +876,22 @@ impl crate::rule_check::MachineCheck for FloorMachine<'_> {
             run_id: Some(self.run_id.to_string()),
             code_graph: None,
         };
-        let report = crate::repo_checks::run_floor_journaled(&checkout.dir, &ctx, None, None);
+        let mut report = crate::repo_checks::run_floor_journaled(&checkout.dir, &ctx, None, None);
+        // A check that rewrote the tree it ran on proves nothing about it (codex r2).
+        checkout.hold_to(&tree, &mut report);
         drop(checkout);
         decide_tests_on_base(&report, self.base, tests, self.head_floor)
     }
 }
 
-/// The run base's tree with each of `tests` (worktree-relative, a regular file in the worktree)
-/// written into it, through a private index on the pinned git dir. Returns the tree id.
+/// The run base's tree with each of `tests` written into it AS THE ENGINE'S SNAPSHOT HOLDS IT
+/// (its blob and mode from `snapshot`, never re-read from the live worktree: no filter, hook or
+/// symlink is involved), through a private index on the pinned git dir. Returns the tree id.
 fn base_tree_with(
     wd: &std::path::Path,
     git_dir: &std::path::Path,
     base: &str,
+    snapshot: &str,
     tests: &[String],
 ) -> Result<String, String> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -887,40 +901,35 @@ fn base_tree_with(
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
     let env: [(&str, &std::path::Path); 2] = [("GIT_DIR", git_dir), ("GIT_INDEX_FILE", &idx)];
+    let no_hooks = ["-c", "core.hooksPath=/dev/null"];
     let run = || -> anyhow::Result<String> {
         let base_tree = crate::worktree_guard::git_string(
             wd,
-            &["rev-parse", &format!("{base}^{{tree}}")],
+            &["rev-parse", "--verify", &format!("{base}^{{tree}}")],
             &env[..1],
         )?;
-        crate::worktree_guard::git(wd, &["read-tree", &base_tree], &env)?;
+        let mut args = no_hooks.to_vec();
+        args.extend(["read-tree", base_tree.as_str()]);
+        crate::worktree_guard::git(wd, &args, &env)?;
         for t in tests {
-            let Ok(meta) = std::fs::symlink_metadata(wd.join(t)) else {
+            let entry =
+                crate::worktree_guard::git(wd, &["ls-tree", "-z", snapshot, "--", t], &env[..1])?;
+            let entry = String::from_utf8_lossy(&entry);
+            let Some((meta, path)) = entry.trim_end_matches('\0').split_once('\t') else {
                 continue;
             };
-            if !meta.is_file() {
+            let parts: Vec<&str> = meta.split(' ').collect();
+            // Only a regular (or executable) file of the snapshot.
+            let [mode @ ("100644" | "100755"), "blob", blob] = parts.as_slice() else {
+                continue;
+            };
+            if path != t {
                 continue;
             }
-            #[cfg(unix)]
-            let exec = {
-                use std::os::unix::fs::PermissionsExt;
-                meta.permissions().mode() & 0o111 != 0
-            };
-            #[cfg(not(unix))]
-            let exec = false;
-            let blob =
-                crate::worktree_guard::git_string(wd, &["hash-object", "-w", "--", t], &env[..1])?;
-            let mode = if exec { "100755" } else { "100644" };
-            crate::worktree_guard::git(
-                wd,
-                &[
-                    "update-index",
-                    "--add",
-                    "--cacheinfo",
-                    &format!("{mode},{blob},{t}"),
-                ],
-                &env,
-            )?;
+            let mut args = no_hooks.to_vec();
+            let info = format!("{mode},{blob},{t}");
+            args.extend(["update-index", "--add", "--cacheinfo", info.as_str()]);
+            crate::worktree_guard::git(wd, &args, &env)?;
         }
         crate::worktree_guard::git_string(wd, &["write-tree"], &env)
     };
@@ -950,10 +959,12 @@ fn decide_tests_on_base(
         Some(true) => "they pass on the head (this gate's floor)",
         _ => "the head's run is the creator floor's (not re-run at this gate)",
     };
-    let deciding = |n: &str| !matches!(n, "install" | "lint" | "cargo-fmt-check" | "format");
+    // Only the test set decides (codex r2): a typecheck, build or lint failure is not a test that
+    // fails, and the judge reads this result as evidence only.
     let test_set = |n: &str| {
         matches!(n, "test" | "test_targeted" | "cargo-test" | "e2e") || n.starts_with("journey")
     };
+    let deciding = test_set;
     if !report.checks.iter().any(|c| test_set(&c.name)) {
         return MachineOutcome::Fallback(
             "the repository declares no test command the floor runs".into(),
@@ -1163,6 +1174,7 @@ fn run_rule_check(
                     base: &base,
                     run_id: &input.run_id,
                     head_floor: floor.map(|r| r.passed),
+                    snapshot: change.tree.as_deref(),
                 },
             )
         },

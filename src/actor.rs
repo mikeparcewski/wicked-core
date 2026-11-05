@@ -8178,6 +8178,48 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     }
 }
 
+/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
+/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
+/// or `None`.
+fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
+    let rule_layer = |d: &crate::domain::UnitDenial| {
+        d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+            || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+    };
+    let named: Vec<&crate::domain::UnitDenial> = unit
+        .denial
+        .iter()
+        .chain(unit.denials_behind.iter().flatten())
+        .filter(|d| rule_layer(d))
+        .collect();
+    if !named.is_empty() {
+        let ids: Vec<&str> = named
+            .iter()
+            .flat_map(|d| d.rule_ids.iter().map(String::as_str))
+            .collect();
+        return Some(format!("broken or unchecked ({})", ids.join(", ")));
+    }
+    if unit.denials_behind.is_none() {
+        let rc = unit.rule_check.as_ref()?;
+        let open: Vec<&str> = rc
+            .rows
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status,
+                    crate::rule_check::RuleStatus::Broken
+                        | crate::rule_check::RuleStatus::Unchecked
+                )
+            })
+            .map(|r| r.rule_id.as_str())
+            .collect();
+        if !open.is_empty() {
+            return Some(format!("broken or unchecked ({})", open.join(", ")));
+        }
+    }
+    None
+}
+
 /// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
 const CLASS_RULE_BROKEN: &str = "rule_broken";
 
@@ -14041,6 +14083,28 @@ pub(crate) fn confirm_gate_as(
                 anyhow::bail!(
                     "no creator phase precedes unit {cursor_ord} to rework — approve (the work \
                      counts) or reject"
+                );
+            }
+        }
+        // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
+        // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
+        // that counts it — is refused while a steering rule of that unit is broken or unchecked,
+        // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
+        // or skipped with its reason (`retry_rules` / `skip_rules`).
+        let counts_unit = match &decision {
+            crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
+            crate::workflow::HumanDecision::OperatorJudgment { .. }
+            | crate::workflow::HumanDecision::SkipQe { .. } => true,
+            _ => false,
+        };
+        if counts_unit {
+            if let Some(open) = cursor.and_then(rule_layers_open) {
+                anyhow::bail!(
+                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                     rule with a reason (`{}`), or reject",
+                    crate::rule_check::RETRY_ACTION,
+                    crate::rule_check::SKIP_ACTION
                 );
             }
         }
@@ -24794,6 +24858,59 @@ mod request_changes_tests {
                 None => assert!(fix.rule_skips.is_empty()),
             }
         }
+    }
+
+    /// (DES-RULE-CHECK-001 S2, codex r2) An answer that would COUNT the unit (here the operator's
+    /// judgment over a failed floor) is refused while a steering rule of it is broken or unchecked
+    /// behind the winning layer; the gate stays open.
+    #[test]
+    fn an_answer_that_counts_the_unit_is_refused_while_a_rule_is_open_behind_the_gate() {
+        let run_id = format!("rules-behind-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let mut broken = UnitDenial::new(crate::rule_check::DENIAL_SOURCE_BROKEN, "R9 broken");
+        broken.rule_ids = vec!["R9".into()];
+        units[2].denials_behind = Some(vec![broken]);
+        units[2].denial = Some(UnitDenial::new(
+            crate::repo_checks::DENIAL_SOURCE,
+            "tests failed",
+        ));
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let mut subs = crate::event_log::EventSink::default();
+        let err = confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            &run_id,
+            HumanDecision::OperatorJudgment {
+                rationale: "the failures are load flakes".into(),
+            },
+            Some("operator".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steering rules") && err.contains("R9"),
+            "{err}"
+        );
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            session.status,
+            SessionStatus::AwaitingHuman,
+            "the gate stays open"
+        );
     }
 
     /// (DES-RULE-CHECK-001 S2) Only an UNCHECKED rule can be skipped, only with a reason, and only

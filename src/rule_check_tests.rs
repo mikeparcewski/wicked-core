@@ -19,6 +19,8 @@ fn change_of(diff: &str, paths: &[&str]) -> Change {
     Change {
         diff: diff.to_string(),
         paths: paths.iter().map(|p| (p.to_string(), true)).collect(),
+        raw: diff.as_bytes().to_vec(),
+        tree: None,
     }
 }
 
@@ -205,6 +207,7 @@ fn rule_lines_count_only_inside_the_calls_frame() {
         "R4",
         "R5",
         "R6",
+        "R7",
     ];
     let paths = ["src/add.rs"];
     let text = "RULE R6: KEPT — src/add.rs outside the frame\n\
@@ -216,6 +219,7 @@ fn rule_lines_count_only_inside_the_calls_frame() {
                 RULE R3: KEPT\n\
                 RULE R4: UNKNOWN — the diff is cut\n\
                 RULE R5: KEPT — it looks fine to me\n\
+                RULE R7: KEPT — add.rs looks right\n\
                 RULE OTHER: KEPT — not asked\n\
                 END VERDICTS n1\n";
     let p = parse_rule_lines(text, &ids, "n1", &paths);
@@ -227,7 +231,7 @@ fn rule_lines_count_only_inside_the_calls_frame() {
         "longest id wins"
     );
     assert_eq!(p["proposal:a"].status, RuleStatus::NotApplicable);
-    for gone in ["R2", "R3", "R4", "R5", "R6", "OTHER"] {
+    for gone in ["R2", "R3", "R4", "R5", "R6", "R7", "OTHER"] {
         assert!(
             !p.contains_key(gone),
             "{gone} must count as not answered: {p:?}"
@@ -594,12 +598,12 @@ fn the_prompt_carries_every_rule_field_whole_and_fences_the_diff() {
     let mut r = rule("LONG", &long);
     r.criteria = "the fix names the issue".into();
     r.obligations = vec!["cite:issue".into()];
-    let p = prompt(&[&r], DIFF, Some("ok"), "n");
+    let p = prompt(&[(&r, "")], DIFF, Some("ok"), "n");
     assert!(p.contains(&long), "no 600-character cut (core#1273 item 2)");
     assert!(p.contains("the fix names the issue") && p.contains("cite:issue"));
     assert!(p.contains("fn add(a: i32"));
     let big = format!("diff --git a/a.rs b/a.rs\n{}", "+x\n".repeat(EVIDENCE_CAP));
-    let p = prompt(&[&r], &big, None, "n");
+    let p = prompt(&[(&r, "")], &big, None, "n");
     assert!(p.len() < PROMPT_BUDGET, "one argv argument");
     assert!(p.contains("answer UNKNOWN"));
 }
@@ -683,34 +687,70 @@ fn a_change_with_no_source_code_is_not_applicable_by_fact() {
         (r.rows[0].status, r.rows[0].how),
         (RuleStatus::NotApplicable, RuleHow::Fact)
     );
+    // codex r2: a file type the engine does not know may be code: it is checked, not ruled out.
+    let c = change_of("diff --git a/gen.zig b/gen.zig\n+x\n", &["gen.zig"]);
+    let r = run_on(&[learn()], &c, &judge, &NoMachine, None, &[]);
+    assert_ne!(r.rows[0].how, RuleHow::Fact);
 }
 
+/// codex r2: a test that fails on the base is EVIDENCE for a distinct judge (it may fail for an
+/// incidental reason), never a KEPT on its own; tests that pass on the base too are broken outright.
 #[test]
-fn a_changed_test_runs_on_the_base_and_its_outcome_is_the_verdict() {
+fn a_changed_test_failing_on_the_base_goes_to_the_judge_and_passing_there_is_broken() {
     let c = change_of(DIFF, &["src/add.rs", "tests/add_test.rs"]);
-    for (out, want) in [
-        (
-            MachineOutcome::Verdict {
-                status: RuleStatus::Kept,
-                reason: "tests/add_test.rs fails on the base".into(),
-            },
-            RuleStatus::Kept,
-        ),
-        (
-            MachineOutcome::Verdict {
-                status: RuleStatus::Broken,
-                reason: "tests/add_test.rs passes on the base too".into(),
-            },
-            RuleStatus::Broken,
-        ),
-    ] {
-        let judge = Fake::new(&[]);
-        let machine = FakeMachine::new(out);
-        let r = run_on(&[learn()], &c, &judge, &machine, None, &[]);
-        assert_eq!((r.rows[0].status, r.rows[0].how), (want, RuleHow::Machine));
-        assert_eq!(*machine.tests.lock().unwrap(), ["tests/add_test.rs"]);
-        assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
-    }
+    let judge = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "KEPT — tests/add_test.rs asserts add(2, 3) == 5, which the base got wrong",
+    )]);
+    let machine = FakeMachine::new(MachineOutcome::Verdict {
+        status: RuleStatus::Kept,
+        reason: "the changed tests (tests/add_test.rs) fail on the base b0".into(),
+    });
+    let r = run_on(&[learn()], &c, &judge, &machine, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Kept, RuleHow::Judge)
+    );
+    assert_eq!(*machine.tests.lock().unwrap(), ["tests/add_test.rs"]);
+    let prompts = judge.prompts.lock().unwrap();
+    assert!(
+        prompts[0].1.contains("fail on the base b0") && prompts[0].1.contains("KEEP it only if")
+    );
+    drop(prompts);
+    // The judge finding the test incidental breaks the rule.
+    let skeptic = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "BROKEN — tests/add_test.rs only checks a version string, not the fix",
+    )]);
+    let r = run_on(&[learn()], &c, &skeptic, &machine, None, &[]);
+    assert_eq!(r.rows[0].status, RuleStatus::Broken);
+    let judge = Fake::new(&[]);
+    let machine = FakeMachine::new(MachineOutcome::Verdict {
+        status: RuleStatus::Broken,
+        reason: "tests/add_test.rs passes on the base too".into(),
+    });
+    let r = run_on(&[learn()], &c, &judge, &machine, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Broken, RuleHow::Machine)
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+}
+
+/// codex r2: an inline test (`#[test]` in a source file) is a test: never broken by file names.
+#[test]
+fn an_inline_test_is_not_broken_by_file_names_and_goes_to_the_judge() {
+    let inline = format!("{DIFF}+#[cfg(test)]\n+mod t {{ #[test] fn adds() {{ assert_eq!(super::add(2, 3), 5) }} }}\n");
+    let c = change_of(&inline, &["src/add.rs"]);
+    let judge = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "KEPT — src/add.rs adds a #[test] for the fix",
+    )]);
+    let r = run_on(&[learn()], &c, &judge, &NoMachine, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Kept, RuleHow::Judge)
+    );
 }
 
 #[test]
@@ -754,5 +794,66 @@ fn test_paths_are_recognised_by_the_common_layouts() {
         is_source_path("src/add.rs")
             && !is_source_path("README.md")
             && !is_source_path("tests/a.rs")
+    );
+}
+
+/// codex r2: one pool for the whole check — a seat that failed on the ordinary rules is not asked
+/// again by the machine rule's fallback.
+#[test]
+fn a_seat_that_failed_is_not_asked_again_by_a_machine_fallback() {
+    let c = change_of(DIFF, &["src/add.rs", "tests/add_test.rs"]);
+    let mut judge = Fake::new(&[
+        ("A", "KEPT — src/add.rs"),
+        (
+            "learn-tests-with-fixes",
+            "KEPT — tests/add_test.rs asserts the fix",
+        ),
+    ]);
+    judge.dead = vec!["codex".into()];
+    let machine = FakeMachine::new(MachineOutcome::Fallback("no test command".into()));
+    let r = run_on(&[rule("A", "a"), learn()], &c, &judge, &machine, None, &[]);
+    assert!(
+        r.rows.iter().all(|x| x.status == RuleStatus::Kept),
+        "{:?}",
+        r.rows
+    );
+    let codex = judge
+        .prompts
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(s, _)| s == "codex")
+        .count();
+    assert_eq!(
+        codex, 1,
+        "asked once across the ordinary and fallback rounds"
+    );
+}
+
+/// codex r2: a rule too long to send in one argument is never sent; it is unchecked, saying why.
+#[test]
+fn a_rule_too_long_for_one_argument_is_unchecked_and_never_sent() {
+    let giant = rule("GIANT", &"x".repeat(PROMPT_BUDGET + 1));
+    let judge = Fake::new(&[("GIANT", "KEPT — src/add.rs")]);
+    let r = run(&[giant], &judge, None);
+    assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
+    assert!(
+        r.rows[0].reason.contains("too long"),
+        "{}",
+        r.rows[0].reason
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+}
+
+/// codex r2: the match's facts ride the prompt, and the keys hash the exact bytes.
+#[test]
+fn the_judge_sees_the_engines_match_facts() {
+    let judge = Fake::new(&[("A", "KEPT — src/add.rs")]);
+    let _ = run(&[rule("A", "a")], &judge, None);
+    let prompts = judge.prompts.lock().unwrap();
+    assert!(
+        prompts[0].1.contains("Engine: may apply"),
+        "{}",
+        prompts[0].1
     );
 }
