@@ -1050,7 +1050,7 @@ mod tests {
         assert_eq!(st("DOC").status, MatchStatus::Applies);
         assert_eq!(st("OTHER").status, MatchStatus::MayApply);
         // No repo known: the same rule may apply (a fact not known decides nothing).
-        let none = match_rules(&[tiny.clone()], &JobFacts::default());
+        let none = match_rules(std::slice::from_ref(&tiny), &JobFacts::default());
         assert_eq!(none[0].status, MatchStatus::MayApply);
         // At review, a changed file the rule names.
         let mut by_path = tiny;
