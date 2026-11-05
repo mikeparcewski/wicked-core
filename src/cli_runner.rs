@@ -807,6 +807,189 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     }
 }
 
+/// (DES-RULE-CHECK-001) The rule-check judge seats: never a creator's key or any binary a creator
+/// may run (quote-aware), nor this unit's own authors or launch-excluded seats; no fallback. With
+/// none, the reason.
+#[allow(clippy::too_many_arguments)]
+fn rule_judge_seats(
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    exclude_seats: &[String],
+    authored_by: &[String],
+    authored_binaries: &[String],
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+) -> (Vec<String>, Option<String>) {
+    match creator_bins {
+        _ if creators.is_empty() => (
+            Vec::new(),
+            Some("the work's creators are not known, so no judge can be shown distinct from them".into()),
+        ),
+        None => (
+            Vec::new(),
+            Some("a creator of this work has no recorded binary, so no judge can be shown distinct from it".into()),
+        ),
+        Some(bins) => {
+            let mut ids: std::collections::BTreeSet<String> = bins
+                .iter()
+                .chain(authored_binaries)
+                .map(|b| crate::validator::normalize_identity(b))
+                .collect();
+            for k in creators.iter().chain(authored_by) {
+                match registry.iter().find(|c| &c.key == k) {
+                    Some(c) => ids.extend(record_identities(c)),
+                    None => {
+                        ids.insert(crate::validator::normalize_identity(k));
+                    }
+                }
+            }
+            let excluded: Vec<&str> = creators
+                .iter()
+                .chain(exclude_seats)
+                .chain(authored_by)
+                .map(String::as_str)
+                .collect();
+            let keys: Vec<String> = pool
+                .iter()
+                .filter(|c| {
+                    !excluded.contains(&c.key.as_str())
+                        && !c.headless_invocation.trim().is_empty()
+                        && c.seat_eligible_for_work
+                        && record_identities(c).iter().all(|i| !ids.contains(i))
+                })
+                .map(|c| c.key.clone())
+                .collect();
+            let why = keys.is_empty().then(|| {
+                format!(
+                    "no signed-in judge seat distinct from the work's creators [{}] on the run's \
+                     roster",
+                    creators.join(", ")
+                )
+            });
+            (keys, why)
+        }
+    }
+}
+
+/// (SWAP 6) What the deliver step's rule check needs, resolved on the actor thread (it holds the
+/// store): the rule store, the run's facts, the judge pool and the creators to keep out of it.
+pub(crate) struct DeliveryRuleCtx {
+    pub db_path: String,
+    pub project: Option<String>,
+    pub repo: Option<String>,
+    pub creators: Vec<String>,
+    pub creator_bins: Option<Vec<String>>,
+    pub exclude_seats: Vec<String>,
+    pub pool: Vec<crate::AgenticCli>,
+    pub registry: Vec<crate::AgenticCli>,
+    pub runner: Arc<dyn StepRunner>,
+    pub prior: Option<crate::rule_check::RuleCheckReport>,
+    pub skips: Vec<crate::rule_check::RuleSkip>,
+    pub instructions: String,
+    pub deliver_tokens: Vec<String>,
+    pub base: String,
+    /// The rules the run's reviews deferred to delivery (their ids): the only rules checked here.
+    pub deferred: Vec<String>,
+    /// Where the deliver command writes the pull request text it publishes (title, a blank line,
+    /// the body), handed to it as [`DELIVER_TEXT_ENV`].
+    pub text_out: std::path::PathBuf,
+}
+
+/// (SWAP 6) The env var naming the file crew's deliver command writes the pull request text it
+/// published to (title, blank line, body: the PR description, or its comment on an existing PR).
+pub(crate) const DELIVER_TEXT_ENV: &str = "WICKED_DELIVER_TEXT_OUT";
+
+/// (SWAP 6) The deliver step's rule check: every rule deferred to delivery (by recorded fact,
+/// [`crate::rule_check::delivery_only`]) judged against the pull request's text exactly as the
+/// delivery wrote it (the delivered commit's message, which crew writes from the same text as the
+/// PR body), on a seat distinct from the creators. Broken denies, unchecked holds, as at review.
+/// `None` when no rule is deferred to delivery.
+pub(crate) fn delivery_rule_check(
+    ctx: &DeliveryRuleCtx,
+    _workdir: &std::path::Path,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    if ctx.deferred.is_empty() {
+        return None;
+    }
+    let held = |why: String| {
+        Some(crate::rule_check::RuleCheckReport {
+            note: Some(why),
+            ..Default::default()
+        })
+    };
+    let rules = match crate::rule_check::rules_in_force(&ctx.db_path, ctx.project.as_deref()) {
+        Ok(r) => r,
+        Err(e) => {
+            return held(format!(
+                "the steering rules could not be read from the store: {e:#}"
+            ))
+        }
+    };
+    // The text the delivery PUBLISHED, as its own command wrote it: never a commit message.
+    let text = match std::fs::read_to_string(&ctx.text_out) {
+        Ok(t) if !t.trim().is_empty() => t,
+        _ => {
+            return held(format!(
+                "the delivery did not hand back the pull request text it published ({DELIVER_TEXT_ENV}), \
+                 so {} rule(s) deferred to delivery could not be checked",
+                ctx.deferred.len()
+            ))
+        }
+    };
+    let _ = std::fs::remove_file(&ctx.text_out);
+    let change = crate::rule_check::Change {
+        diff: text.clone(),
+        paths: Vec::new(),
+        raw: text.into_bytes(),
+        tree: None,
+    };
+    let (seats, no_seat) = rule_judge_seats(
+        &ctx.creators,
+        ctx.creator_bins.as_deref(),
+        &ctx.exclude_seats,
+        &[],
+        &[],
+        &ctx.pool,
+        &ctx.registry,
+    );
+    let facts =
+        crate::rule_check::job_facts(&[], ctx.project.as_deref(), ctx.repo.as_deref(), &change);
+    let judge = SeatRuleJudge {
+        seats: &ctx.pool,
+        runner: &*ctx.runner,
+    };
+    let report = crate::rule_check::check(
+        &crate::rule_check::CheckInput {
+            rules: &rules,
+            facts: &facts,
+            change: &change,
+            floor: None,
+            prior: ctx.prior.as_ref(),
+            skips: &ctx.skips,
+            seats: &seats,
+            no_seat: no_seat.as_deref(),
+            base: &ctx.base,
+            instructions: Some(ctx.instructions.as_str()).filter(|t| !t.is_empty()),
+            packs: crate::steering_packs::shipped_rule_ids(),
+            stage: crate::rule_check::CheckStage::Delivery,
+            deliver_tokens: &ctx.deliver_tokens,
+            deferred: &ctx.deferred,
+        },
+        &judge,
+        &NoMachineHere,
+    );
+    Some(report)
+}
+
+/// The deliver step runs no machine check (its evidence is text).
+struct NoMachineHere;
+
+impl crate::rule_check::MachineCheck for NoMachineHere {
+    fn test_fails_on_base(&self, _tests: &[String]) -> crate::rule_check::MachineOutcome {
+        crate::rule_check::MachineOutcome::Fallback("the deliver step judges text only".into())
+    }
+}
+
 /// (DES-RULE-CHECK-001 S3) The engine's machine check `check:test-fails-on-base`: the run base's
 /// tree with the change's test files written into it, checked out clean through the pinned git dir
 /// and run through the repo-checks floor (the creator stage: the targeted test set over the files
@@ -1084,67 +1267,15 @@ fn run_rule_check(
     // Evaluator ≠ creator, no fallback: a seat is a judge only when neither its key nor any
     // binary it may execute (quote-aware, `record_identities`) is a creator's — the creators'
     // registry records and every binary they actually ran.
-    let (seats, no_seat): (Vec<String>, Option<String>) = match creator_bins {
-        _ if creators.is_empty() => (
-            Vec::new(),
-            Some("the work's creators are not known, so no judge can be shown distinct from them".into()),
-        ),
-        None => (
-            Vec::new(),
-            Some("a creator of this work has no recorded binary, so no judge can be shown distinct from it".into()),
-        ),
-        Some(bins) => {
-            let mut ids: std::collections::BTreeSet<String> = bins
-                .iter()
-                .map(|b| crate::validator::normalize_identity(b))
-                .collect();
-            for k in creators {
-                match registry.iter().find(|c| &c.key == k) {
-                    Some(c) => ids.extend(record_identities(c)),
-                    None => {
-                        ids.insert(crate::validator::normalize_identity(k));
-                    }
-                }
-            }
-            // (codex r3) …and whoever authored THIS unit's tree (a floor fix's seat), by key and binary.
-            ids.extend(
-                input
-                    .unit
-                    .authored_binaries
-                    .iter()
-                    .map(|b| crate::validator::normalize_identity(b)),
-            );
-            for k in &input.unit.authored_by {
-                if let Some(c) = registry.iter().find(|c| &c.key == k) {
-                    ids.extend(record_identities(c));
-                }
-            }
-            let excluded: Vec<&str> = creators
-                .iter()
-                .chain(&input.unit.exclude_seats)
-                .chain(&input.unit.authored_by)
-                .map(String::as_str)
-                .collect();
-            let keys: Vec<String> = pool
-                .iter()
-                .filter(|c| {
-                    !excluded.contains(&c.key.as_str())
-                        && !c.headless_invocation.trim().is_empty()
-                        && c.seat_eligible_for_work
-                        && record_identities(c).iter().all(|i| !ids.contains(i))
-                })
-                .map(|c| c.key.clone())
-                .collect();
-            let why = keys.is_empty().then(|| {
-                format!(
-                    "no signed-in judge seat distinct from the work's creators [{}] on the run's \
-                     roster",
-                    creators.join(", ")
-                )
-            });
-            (keys, why)
-        }
-    };
+    let (seats, no_seat) = rule_judge_seats(
+        creators,
+        creator_bins,
+        &input.unit.exclude_seats,
+        &input.unit.authored_by,
+        &input.unit.authored_binaries,
+        pool,
+        registry,
+    );
     let facts = crate::rule_check::job_facts(
         &input.unit.rule_steps,
         gov.project_id.as_deref(),
@@ -1193,6 +1324,9 @@ fn run_rule_check(
                     base: &base,
                     instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
                     packs: crate::steering_packs::shipped_rule_ids(),
+                    stage: crate::rule_check::CheckStage::Review,
+                    deliver_tokens: &input.unit.rule_deliver_tokens,
+                    deferred: &[],
                 },
                 &judge,
                 &FloorMachine {
