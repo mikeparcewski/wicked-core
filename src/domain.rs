@@ -1545,14 +1545,11 @@ pub struct WorkUnit {
     /// action `skip_rules`); each applies while the rule's evidence is the one it was given on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_skips: Vec<crate::rule_check::RuleSkip>,
-    /// (DES-RULE-CHECK-001 rev 2) Rule councils this unit's attempts have convened, every one of
-    /// them (folded from each attempt's report; never reset): the run's budget is their sum.
+    /// (DES-RULE-CHECK-001 rev 2) Rule councils this unit's attempts have convened: each one is
+    /// charged here by the actor BEFORE it starts (`Command::ReserveRuleCouncil`), never reset, so
+    /// an attempt that is superseded or never folds still spent it. The run's budget is their sum.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub rule_councils: u32,
-    /// (DES-RULE-CHECK-001 rev 2) Rule councils the whole run had spent when this attempt was
-    /// dispatched (stamped then: the worker has no store).
-    #[serde(default, skip_serializing_if = "is_zero_u32")]
-    pub rule_councils_run: u32,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1866,7 +1863,6 @@ impl WorkUnit {
             rule_check: None,
             rule_skips: Vec::new(),
             rule_councils: 0,
-            rule_councils_run: 0,
             rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),

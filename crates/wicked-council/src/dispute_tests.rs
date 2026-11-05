@@ -295,6 +295,60 @@ fn a_routing_ballot_is_the_unchanged_routing_scaffold() {
     assert!(!seen[0].0.contains("BEGIN BALLOT"));
 }
 
+/// (codex r1, P3) The routing (team) ballot, byte for byte as main renders it: a fixture, not the
+/// renderer compared with itself.
+#[test]
+fn the_routing_ballot_is_byte_unchanged() {
+    let want =
+        "You are one independent evaluator on a routing council. You do NOT know which other \
+evaluators exist or which system you are. Your only job is to pick the best-fit capability profile \
+for the task described below.\n\nTask: Does this change BREAK steering rule R1?\n\nCapability \
+profiles:\n  1. BROKEN\n  2. KEPT\n\nEvaluation criteria: general\n\nAnswer with EXACTLY these \
+four lines. For RECOMMENDATION, give the option NUMBER only (e.g. \"2\"), followed by a brief \
+rationale — do NOT name any tool, CLI, or AI system:\nRECOMMENDATION: <option number and \
+rationale>\nTOP_RISK: <the single biggest risk with that profile for this task>\nCHANGE_MY_MIND: \
+<evidence or condition that would reverse your pick>\nDISQUALIFIER: <option number of any profile \
+fundamentally unviable for this task, or 'None'>";
+    assert_eq!(render_ballot(&task(), &BallotContext::default()), want);
+}
+
+/// A seat that reads its prompt from stdin and never does cannot block the ballot past its budget.
+#[cfg(unix)]
+#[test]
+fn a_seat_that_never_reads_its_stdin_cannot_outlast_the_budget() {
+    let seat = AgenticCli {
+        headless_invocation: "sh -c \"sleep 120\"".into(),
+        binary: "sh".into(),
+        input_mode: InputMode::Stdin,
+        ..cli("deaf")
+    };
+    let d = RealDispatcher {
+        timeout: Duration::from_secs(60),
+        local_runner_timeout: Duration::from_secs(60),
+        ..RealDispatcher::default()
+    };
+    let big = "p".repeat(512 * 1024);
+    let started = Instant::now();
+    let out = d.dispatch_prompt_timed(
+        &seat,
+        &task(),
+        &big,
+        &Bounds {
+            deadline: Some(Instant::now() + Duration::from_secs(8)),
+            ..Bounds::default()
+        },
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(40),
+        "{:?}",
+        started.elapsed()
+    );
+    match out.outcome {
+        DispatchOutcome::Failed(f) => assert_eq!(f.kind, SeatFailureKind::TimedOut),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// (codex r2 7) A seat that exits cleanly while something it started still holds its stdout used
 /// to hang on `wait_with_output` for as long as that process lived. It is cut at the deadline.
 #[cfg(unix)]

@@ -647,7 +647,7 @@ fn digest_bytes(parts: &[&[u8]]) -> String {
 
 /// What a judge is told about a rule, in one canonical form: the prompt shows it and the rule key
 /// hashes it, so a rule edited in any judged field is checked again.
-pub(crate) fn rule_text(r: &ConformanceRule) -> String {
+fn rule_text(r: &ConformanceRule) -> String {
     let mut s = format!(
         "RULE {} ({:?}, {}): {}",
         r.id,
@@ -1469,7 +1469,8 @@ pub fn established(m: &wicked_governance::RuleMatch) -> bool {
 /// The rows a council must settle: a JUDGE's reading where exactly one side — the judge or the
 /// reviewer — says BROKEN. Never a fact, a machine check (fresh or cached), an earlier ruling, a
 /// skip, a non-blocking process row, or a reviewer's DEFERRED (deferral is decided only by the
-/// rule's recorded data). Indices into `report.rows`.
+/// rule's recorded data). Indices into `report.rows`. A dispute CARRIED from the last attempt on the
+/// same evidence ([`carried`]) is settled on its recorded readings instead.
 pub fn disputes(report: &RuleCheckReport, positions: &SeatPositions) -> Vec<usize> {
     report
         .rows
@@ -1484,6 +1485,23 @@ pub fn disputes(report: &RuleCheckReport, positions: &SeatPositions) -> Vec<usiz
                 |s: RuleStatus| matches!(s, RuleStatus::Kept | RuleStatus::NotApplicable);
             (r.status == RuleStatus::Broken && not_broken(p.status))
                 || (not_broken(r.status) && p.status == RuleStatus::Broken)
+        })
+        .map(|(i, _)| i)
+        .collect()
+}
+
+/// The disputes carried open from the last attempt (same rule, same evidence): indices into
+/// `report.rows`, each still `disputed` with both recorded readings.
+pub fn carried(report: &RuleCheckReport) -> Vec<usize> {
+    report
+        .rows
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r.status == RuleStatus::Disputed
+                && r.how == RuleHow::Cache
+                && r.blocking != Some(false)
+                && r.council.as_ref().is_some_and(|c| c.positions.len() == 2)
         })
         .map(|(i, _)| i)
         .collect()
@@ -1634,7 +1652,7 @@ pub fn dispute_request(
 pub struct VoteBars<'a> {
     /// The changed paths: a KEPT names one by its whole path.
     pub paths: &'a [&'a str],
-    /// The rule's own words: an N/A quotes them.
+    /// The rule's own words (its statement and criteria): an N/A quotes them.
     pub rule_text: &'a str,
     /// The match established a fact the rule applies by: no N/A counts.
     pub established: bool,
@@ -2325,8 +2343,10 @@ fn origin_of(how: RuleHow) -> Option<RuleOrigin> {
 /// when it may be reused: a verdict keeps WHO reached it (`origin`), so a cached machine BROKEN is
 /// never a judge reading to dispute and a cached council ruling stays settled. A row recorded
 /// before `origin` existed and already reused once cannot say who ruled it: it is ruled again. A
-/// DISPUTED row is never reused as a ruling; the judge's reading inside it is (so a retry convenes
-/// the council again without asking the judge again).
+/// DISPUTED row is never reused as a ruling: it is CARRIED, open, with both recorded readings — on
+/// the same evidence the dispute stands until a council settles it or the person skips it, whatever
+/// a later reviewer writes (codex r1: restoring the judge's KEPT alone let a later review that
+/// omitted its BROKEN line pass). The settle step convenes on it again, within the budgets.
 fn reuse(r: &RuleVerdict) -> Option<RuleVerdict> {
     let ruled = matches!(
         r.status,
@@ -2345,35 +2365,54 @@ fn reuse(r: &RuleVerdict) -> Option<RuleVerdict> {
             ..r.clone()
         });
     }
+    carried_dispute(r)
+}
+
+/// A disputed row as the next attempt carries it: still `disputed`, its judge reading and the
+/// reviewer reading it was disputed on kept (nothing else of the last council).
+fn carried_dispute(r: &RuleVerdict) -> Option<RuleVerdict> {
     if r.status != RuleStatus::Disputed {
         return None;
     }
+    let c = r.council.as_ref()?;
+    let judge = c.positions.iter().find(|p| p.by == BY_RULE_JUDGE)?;
+    let reviewer = c.positions.iter().find(|p| p.by == BY_REVIEWER)?;
+    if !matches!(
+        judge.status,
+        RuleStatus::Kept | RuleStatus::Broken | RuleStatus::NotApplicable
+    ) {
+        return None;
+    }
+    Some(RuleVerdict {
+        how: RuleHow::Cache,
+        origin: Some(RuleOrigin::Judge),
+        reviewer: None,
+        cite: Some(judge.cite.clone()),
+        judge: Some(judge.seat.clone()),
+        council: Some(RuleCouncil {
+            positions: vec![judge.clone(), reviewer.clone()],
+            reason: c.reason.clone(),
+            ..Default::default()
+        }),
+        ..r.clone()
+    })
+}
+
+/// The judge's reading of a carried dispute, as the row it was (the base a new ruling is written
+/// on).
+pub fn judge_reading(r: &RuleVerdict) -> Option<RuleVerdict> {
     let judge = r
         .council
         .as_ref()?
         .positions
         .iter()
         .find(|p| p.by == BY_RULE_JUDGE)?;
-    matches!(
-        judge.status,
-        RuleStatus::Kept | RuleStatus::Broken | RuleStatus::NotApplicable
-    )
-    .then(|| RuleVerdict {
-        rule_id: r.rule_id.clone(),
+    Some(RuleVerdict {
         status: judge.status,
-        how: RuleHow::Cache,
         reason: judge.cite.clone(),
         cite: Some(judge.cite.clone()),
-        judge: Some(judge.seat.clone()),
-        rule_key: r.rule_key.clone(),
-        evidence_key: r.evidence_key.clone(),
-        origin: Some(RuleOrigin::Judge),
-        judge_ids: r.judge_ids.clone(),
-        evidence_complete: r.evidence_complete,
-        party: r.party.clone(),
-        blocking: r.blocking,
-        reviewer: None,
         council: None,
+        ..r.clone()
     })
 }
 

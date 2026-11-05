@@ -59,6 +59,8 @@ struct FakeCouncil {
     answer: Answer,
     lock_path: std::path::PathBuf,
     seen: Mutex<Vec<(DecisionRequest, Vec<String>)>>,
+    /// The run's councils left (the actor's durable count, faked).
+    left: Mutex<u32>,
 }
 
 impl FakeCouncil {
@@ -69,6 +71,7 @@ impl FakeCouncil {
             answer,
             lock_path,
             seen: Mutex::new(Vec::new()),
+            left: Mutex::new(crate::rule_check::RUN_COUNCILS),
         }
     }
     fn convened(&self) -> usize {
@@ -82,6 +85,17 @@ impl FakeCouncil {
 }
 
 impl DisputeCouncil for FakeCouncil {
+    fn reserve(&self, _run_id: &str, _ord: u32) -> Result<bool, String> {
+        let mut left = self.left.lock().unwrap();
+        Ok(match left.checked_sub(1) {
+            Some(n) => {
+                *left = n;
+                true
+            }
+            None => false,
+        })
+    }
+
     fn convene(
         &self,
         req: DecisionRequest,
@@ -89,8 +103,9 @@ impl DisputeCouncil for FakeCouncil {
         lock: HostCouncilLock,
         deadline: std::time::Instant,
     ) -> DisputeOutcome {
-        assert!(
-            HostCouncilLock::acquire_until(&self.lock_path, std::time::Instant::now()).is_none(),
+        assert_eq!(
+            HostCouncilLock::acquire_until(&self.lock_path, std::time::Instant::now()).err(),
+            Some(SlotRefused::Busy),
             "the host slot is held while the council runs"
         );
         assert!(deadline > std::time::Instant::now());
@@ -300,13 +315,16 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
         seat("codex"),
         seat("opencode"),
         alias("wrapped", "wrapped", "/opt/launch.sh {PROMPT}"),
+        // (codex r1) A record that declares its own wrapper as its binary is no shipped CLI.
+        alias("selfwrap", "launch.sh", "launch.sh {PROMPT}"),
+        alias("shell", "sh", "sh -c \"claude -p {PROMPT}\""),
         seat("agy"),
         seat("copilot"),
     ];
-    let seats_for = |reg: &[crate::AgenticCli], rev_inv: &str| {
+    let seats_for = |reg: &[crate::AgenticCli], rev_inv: &str, bins: &[String]| {
         rule_council_seats(
             &["claude".to_string()],
-            Some(&["claude".to_string()][..]),
+            Some(bins),
             &["helper".to_string()],
             &[],
             &[],
@@ -315,19 +333,23 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
             reg,
         )
     };
+    let claude = ["claude".to_string()];
     // The reviewer `codex` was launched running opencode: opencode is a party too. Two left.
-    let err = seats_for(&reg, "opencode run {PROMPT}").unwrap_err();
+    let err = seats_for(&reg, "opencode run {PROMPT}", &claude).unwrap_err();
     assert!(err.starts_with("seats_benched"), "{err}");
-    reg.push(seat("qwen"));
-    let mut got: Vec<String> = seats_for(&reg, "opencode run {PROMPT}")
+    reg.push(alias("agy#2", "agy", "agy -p {PROMPT}"));
+    let mut got: Vec<String> = seats_for(&reg, "opencode run {PROMPT}", &claude)
         .unwrap()
         .into_iter()
         .map(|c| c.key)
         .collect();
     got.sort();
-    assert_eq!(got, vec!["agy", "copilot", "qwen"]);
-    // A party launched through a script cannot be seen through.
-    let err = seats_for(&reg, "/opt/wrap.sh {PROMPT}").unwrap_err();
+    assert_eq!(got, vec!["agy", "agy#2", "copilot"]);
+    // A party launched through a script cannot be seen through…
+    let err = seats_for(&reg, "/opt/wrap.sh {PROMPT}", &claude).unwrap_err();
+    assert!(err.starts_with("identity_unknown"), "{err}");
+    // …nor a creator that ran one (it could be running any CLI underneath).
+    let err = seats_for(&reg, "codex -p {PROMPT}", &["wrap.sh".to_string()]).unwrap_err();
     assert!(err.starts_with("identity_unknown"), "{err}");
     // …nor a judge whose identity was not recorded.
     let err = rule_council_seats(
@@ -416,10 +438,10 @@ fn councils_are_capped_per_attempt_and_per_run() {
         .unwrap();
     assert!(why.starts_with("cap: this gate attempt"), "{why}");
 
-    let mut input = reviewed("cap-run");
+    let input = reviewed("cap-run");
     more_rules(&input);
-    input.unit.rule_councils_run = crate::rule_check::RUN_COUNCILS - 1;
     let council = FakeCouncil::new("cap-run", broken_3_0);
+    *council.left.lock().unwrap() = 1;
     let r = settle_with(&input, &judge(), all_kept, &council, &registry());
     assert_eq!(council.convened(), 1, "one left in the run's budget");
     let caps = r
@@ -507,6 +529,59 @@ fn a_recheck_reuses_a_ruling_and_reconvenes_on_a_disputed_row() {
     assert_eq!(row(&r, "R1").status, RuleStatus::Broken);
 }
 
+/// (codex r1, P1) An OPEN dispute on unchanged evidence stands: the judge KEPT, the reviewer said
+/// BROKEN, no council ruled. A later review that omits its BROKEN line does not make the rule pass:
+/// the carried dispute holds, and is put to a council again on its recorded readings.
+#[test]
+fn an_open_dispute_stands_on_the_same_evidence_whatever_a_later_review_writes() {
+    fn timeout(_: &DecisionRequest, _: &[crate::AgenticCli]) -> DisputeOutcome {
+        DisputeOutcome::TimedOut
+    }
+    let mut input = reviewed("open-kept");
+    let judge = Judging::says("KEPT — src/a.rs:2 typed");
+    let council = FakeCouncil::new("open-kept", timeout);
+    let first = settle_with(
+        &input,
+        &judge,
+        "RULE R1: BROKEN — src/a.rs:2 no test ships with the fix\nVERDICT: FAIL",
+        &council,
+        &registry(),
+    );
+    assert_eq!(row(&first, "R1").status, RuleStatus::Disputed);
+    input.unit.rule_check = Some(first);
+    // No council this time (none left): still disputed, still holding.
+    let none = FakeCouncil::new("open-kept-2", kept_3_0);
+    *none.left.lock().unwrap() = 0;
+    let r = settle_with(&input, &judge, "VERDICT: PASS", &none, &registry());
+    assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
+    assert!(r.hold().is_some(), "never a pass on an unsettled dispute");
+    // With one: convened again on the recorded readings, and its ruling decides.
+    let again = FakeCouncil::new("open-kept-3", kept_3_0);
+    let r = settle_with(&input, &judge, "VERDICT: PASS", &again, &registry());
+    assert_eq!(again.convened(), 1);
+    let (req, _) = &again.seen.lock().unwrap()[0];
+    assert!(req
+        .evidence
+        .contains("the reviewer said BROKEN: src/a.rs:2 no test"));
+    assert_eq!(row(&r, "R1").status, RuleStatus::Kept);
+}
+
+/// (codex r1) A host where the slot's lock cannot be established convenes no council: no
+/// per-process fallback, the dispute holds.
+#[test]
+fn no_council_runs_where_the_host_slot_cannot_be_established() {
+    let input = reviewed("no-slot");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let mut council = FakeCouncil::new("no-slot", broken_3_0);
+    council.lock_path = std::path::PathBuf::from("/nonexistent-wicked-dir/rule-council.lock");
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    assert_eq!(council.convened(), 0);
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed);
+    let why = r1.council.as_ref().unwrap().reason.clone().unwrap();
+    assert!(why.contains("cannot be established"), "{why}");
+}
+
 /// A.7.11: a reviewer output the runner cut, with an early PASS, against a judge KEPT: held, never
 /// approved, and no council (its positions cannot be read whole).
 #[test]
@@ -570,7 +645,8 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
         }
     });
     let port = ActorDisputeCouncil { tx };
-    let lock = HostCouncilLock::acquire_until(&path, std::time::Instant::now()).unwrap();
+    let lock =
+        HostCouncilLock::acquire_until(&path, std::time::Instant::now()).expect("the slot is free");
     let past = std::time::Instant::now() - crate::rule_check::COUNCIL_REPLY_GRACE
         + Duration::from_millis(100);
     let req = DecisionRequest {
@@ -585,9 +661,9 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
         DisputeOutcome::TimedOut
     ));
     assert!(
-        HostCouncilLock::acquire_until(&path, std::time::Instant::now()).is_none(),
+        HostCouncilLock::acquire_until(&path, std::time::Instant::now()).is_err(),
         "still held by the council after the caller stopped waiting"
     );
     actor.join().unwrap();
-    assert!(HostCouncilLock::acquire_until(&path, std::time::Instant::now()).is_some());
+    assert!(HostCouncilLock::acquire_until(&path, std::time::Instant::now()).is_ok());
 }

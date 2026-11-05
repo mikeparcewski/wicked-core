@@ -896,10 +896,12 @@ fn excluded_identities(
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.3) Whether a seat's identity can be verified: the first executable
-/// its invocation launches IS its declared `binary` (or its ACP carrier's CLI). A launcher script
-/// is not seen through, so a seat that runs anything else cannot be shown distinct.
+/// its invocation launches IS its declared `binary` (or its ACP carrier's CLI) AND that is one of
+/// the CLIs the engine ships ([`shipped_identities`]). A launcher script, a shell or `env`, or a
+/// record that merely declares its own wrapper as its binary is not seen through (codex r1), so it
+/// cannot be shown distinct from anyone.
 fn launches_its_own_binary(c: &crate::AgenticCli, launched: &str) -> bool {
-    if launched.is_empty() {
+    if launched.is_empty() || !shipped_identities().contains(launched) {
         return false;
     }
     let carrier = c.acp.as_ref().map(|a| {
@@ -913,10 +915,28 @@ fn launches_its_own_binary(c: &crate::AgenticCli, launched: &str) -> bool {
         || carrier.as_deref() == Some(launched)
 }
 
+/// The identities of the CLIs the engine ships (each built-in record's binary and its ACP carrier's
+/// CLI): the only identities a rule council can verify.
+fn shipped_identities() -> &'static std::collections::BTreeSet<String> {
+    static SHIPPED: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    SHIPPED.get_or_init(|| {
+        wicked_council::registry::builtin()
+            .iter()
+            .flat_map(record_identities)
+            .filter(|i| !i.is_empty())
+            .collect()
+    })
+}
+
 /// The council port of the settle step: production sends [`crate::command::Command::ConveneRuleCouncil`]
 /// to the actor ([`ActorDisputeCouncil`]); tests inject a fake. The host slot (`lock`) is MOVED in:
 /// the council drops it only after its last ballot, whether or not the caller is still waiting.
 pub(crate) trait DisputeCouncil: Sync {
+    /// Charge one rule council to the run, DURABLY, before it starts: `Ok(true)` when the run had
+    /// one left of its [`crate::rule_check::RUN_COUNCILS`] (now spent, whatever becomes of this
+    /// attempt), `Ok(false)` when it had none.
+    fn reserve(&self, run_id: &str, ord: u32) -> Result<bool, String>;
     fn convene(
         &self,
         req: crate::decision::DecisionRequest,
@@ -943,6 +963,21 @@ pub(crate) struct ActorDisputeCouncil {
 }
 
 impl DisputeCouncil for ActorDisputeCouncil {
+    fn reserve(&self, run_id: &str, ord: u32) -> Result<bool, String> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(crate::command::Command::ReserveRuleCouncil {
+                run_id: run_id.to_string(),
+                ord,
+                reply,
+            })
+            .map_err(|_| "the engine stopped".to_string())?;
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r.map_err(|e| format!("{e:#}")),
+            Err(_) => Err("the engine did not answer the council reservation".into()),
+        }
+    }
+
     fn convene(
         &self,
         req: crate::decision::DecisionRequest,
@@ -978,96 +1013,67 @@ impl DisputeCouncil for ActorDisputeCouncil {
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.6) The host-wide rule-council slot: an advisory lock on a FIXED
-/// absolute path every daemon on the host shares (`/tmp`, never the per-user `$TMPDIR`; the temp
-/// dir on Windows), so one rule council runs at a time on the host. A daemon that cannot open the
-/// path degrades to one council at a time in its own process. Released when dropped.
+/// absolute path every daemon on the host shares (`/tmp`, never the per-user `$TMPDIR`; on Windows
+/// `%ProgramData%`), so one rule council runs at a time on the host. A host where the lock cannot
+/// be established convenes NO rule council (codex r1: a per-process fallback would let two daemons
+/// run councils at once) — the dispute holds. Released when dropped (the file closes).
 pub(crate) struct HostCouncilLock {
-    _file: Option<std::fs::File>,
-    local: bool,
+    _file: std::fs::File,
 }
 
-/// The fallback slot of a process that cannot open the host lock file.
-static LOCAL_COUNCIL_SLOT: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// Why the host slot was not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotRefused {
+    /// Another rule council held it until the deadline.
+    Busy,
+    /// The lock file could not be opened or locked: no host-wide exclusion can be shown.
+    Unavailable(String),
+}
 
 impl HostCouncilLock {
     /// The host lock's path.
     pub(crate) fn host_path() -> std::path::PathBuf {
         if cfg!(windows) {
-            std::env::temp_dir().join("wicked-rule-council.lock")
+            std::env::var_os("ProgramData")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
+                .join("wicked-rule-council.lock")
         } else {
             std::path::PathBuf::from("/tmp/wicked-rule-council.lock")
         }
     }
 
-    /// Take the slot at `path`, waiting no later than `deadline`. `None` when it did not come free.
+    /// Take the slot at `path`, waiting no later than `deadline`.
     pub(crate) fn acquire_until(
         path: &std::path::Path,
         deadline: std::time::Instant,
-    ) -> Option<HostCouncilLock> {
+    ) -> Result<HostCouncilLock, SlotRefused> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(path)
+            // Another user's file on a shared /tmp: a read-only handle locks as well.
             .or_else(|_| std::fs::File::open(path))
-            .ok();
+            .map_err(|e| SlotRefused::Unavailable(format!("{}: {e}", path.display())))?;
         loop {
-            match &file {
-                Some(f) => match f.try_lock() {
-                    Ok(()) => {
-                        return Some(HostCouncilLock {
-                            _file: file,
-                            local: false,
-                        })
-                    }
-                    Err(std::fs::TryLockError::WouldBlock) => {}
-                    // A lock the OS cannot take degrades to the process slot, as an unopenable path.
-                    Err(std::fs::TryLockError::Error(_)) => {
-                        return Self::acquire_local(deadline);
-                    }
-                },
-                None => return Self::acquire_local(deadline),
+            match file.try_lock() {
+                Ok(()) => return Ok(HostCouncilLock { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(SlotRefused::Unavailable(format!("{}: {e}", path.display())))
+                }
             }
             if std::time::Instant::now() >= deadline {
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
-
-    fn acquire_local(deadline: std::time::Instant) -> Option<HostCouncilLock> {
-        use std::sync::atomic::Ordering;
-        loop {
-            if LOCAL_COUNCIL_SLOT
-                .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(HostCouncilLock {
-                    _file: None,
-                    local: true,
-                });
-            }
-            if std::time::Instant::now() >= deadline {
-                return None;
+                return Err(SlotRefused::Busy);
             }
             std::thread::sleep(Duration::from_millis(200));
         }
     }
 }
 
-impl Drop for HostCouncilLock {
-    fn drop(&mut self) {
-        if self.local {
-            LOCAL_COUNCIL_SLOT.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-        // The file's lock is released when `_file` closes.
-    }
-}
-
-/// What the settle step may use: the council, the host slot's path, and how many rule councils
-/// the run has already spent (stamped at dispatch).
+/// What the settle step may use: the council (and its run budget) and the host slot's path.
 pub(crate) struct CouncilCtx<'a> {
     pub council: &'a dyn DisputeCouncil,
     pub lock_path: &'a std::path::Path,
@@ -1098,6 +1104,18 @@ pub(crate) fn rule_council_seats(
     let Some(bins) = creator_bins else {
         return unknown("a creator of this work has no recorded binary");
     };
+    // Every binary an author ran must be a CLI the engine can name: a creator launched through a
+    // wrapper could be running any CLI underneath (codex r1).
+    if let Some(b) = bins
+        .iter()
+        .chain(authored_binaries)
+        .map(|b| crate::validator::normalize_identity(b))
+        .find(|b| !shipped_identities().contains(b))
+    {
+        return unknown(&format!(
+            "an author of this work ran `{b}`, which is no shipped CLI"
+        ));
+    }
     let (judge_key, judge_ids) = judge;
     if judge_ids.is_empty() {
         return unknown("the rule judge's identity was not recorded when it ruled");
@@ -1114,7 +1132,7 @@ pub(crate) fn rule_council_seats(
         .find(|c| launches_its_own_binary(c, &rev_launched))
     else {
         return unknown(&format!(
-            "the reviewer `{rev_key}` ran `{rev_launched}`, which is no registered CLI's binary"
+            "the reviewer `{rev_key}` ran `{rev_launched}`, which is no shipped CLI"
         ));
     };
     let mut ids: std::collections::BTreeSet<String> = bins
@@ -1212,7 +1230,7 @@ fn settle_rule_disputes(
 ) {
     use crate::rule_check::{
         disputed_row, positions_of, Answer, RuleCouncil, RuleOrigin, RulePosition, RuleStatus,
-        BY_REVIEWER,
+        RuleVerdict, BY_REVIEWER,
     };
     let reviewer_seat = input.unit.assigned_cli.clone().unwrap_or_default();
     let ids: Vec<&str> = report.rows.iter().map(|r| r.rule_id.as_str()).collect();
@@ -1251,14 +1269,28 @@ fn settle_rule_disputes(
         }
         return;
     }
-    let spent = input.unit.rule_councils_run;
     let paths: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
+    // The disputes to settle: this attempt's (judge vs this reviewer), then those carried open from
+    // the last attempt on the same evidence (on their recorded readings: the dispute stands until a
+    // council settles it or the person skips it, whatever this reviewer wrote).
+    let mut work: Vec<(usize, RuleVerdict, Vec<RulePosition>)> = Vec::new();
     for i in crate::rule_check::disputes(report, &positions) {
         let row = report.rows[i].clone();
-        let Some(reading) = positions.by_id.get(&row.rule_id) else {
-            continue;
-        };
-        let pos = positions_of(&row, &reviewer_seat, reading);
+        if let Some(reading) = positions.by_id.get(&row.rule_id) {
+            let pos = positions_of(&row, &reviewer_seat, reading);
+            work.push((i, row, pos));
+        }
+    }
+    for i in crate::rule_check::carried(report) {
+        let carried = &report.rows[i];
+        if let (Some(base), Some(c)) = (
+            crate::rule_check::judge_reading(carried),
+            carried.council.as_ref(),
+        ) {
+            work.push((i, base, c.positions.clone()));
+        }
+    }
+    for (i, row, pos) in work {
         let hold = |why: String| {
             disputed_row(
                 &row,
@@ -1280,17 +1312,23 @@ fn settle_rule_disputes(
             ));
             continue;
         }
-        if spent + report.councils >= crate::rule_check::RUN_COUNCILS {
-            report.rows[i] = hold(format!(
-                "cap: the run has spent its {} rule councils",
-                crate::rule_check::RUN_COUNCILS
-            ));
-            continue;
-        }
         if row.evidence_complete != Some(true) {
             report.rows[i] = hold(
                 "incomplete_evidence: the rule judge saw only part of the change, and partial \
                  evidence cannot settle a rule"
+                    .into(),
+            );
+            continue;
+        }
+        // A dispute carried from an attempt another seat reviewed: that reviewer is a party too,
+        // and its launched identity was not recorded — no council can be shown distinct from it.
+        if pos
+            .iter()
+            .any(|p| p.by == BY_REVIEWER && p.seat != reviewer_seat)
+        {
+            report.rows[i] = hold(
+                "identity_unknown: the reviewer this dispute was recorded with is not this \
+                 attempt's reviewer"
                     .into(),
             );
             continue;
@@ -1321,12 +1359,22 @@ fn settle_rule_disputes(
         // One absolute deadline from here: the host slot is taken on THIS thread (the unit's own
         // worker) before any council thread or envelope copy exists.
         let deadline = std::time::Instant::now() + crate::rule_check::COUNCIL_DEADLINE;
-        let Some(lock) = HostCouncilLock::acquire_until(ctx.lock_path, deadline) else {
-            report.rows[i] = hold(
-                "timeout: the host's rule-council slot did not come free before the deadline"
-                    .into(),
-            );
-            continue;
+        let lock = match HostCouncilLock::acquire_until(ctx.lock_path, deadline) {
+            Ok(l) => l,
+            Err(SlotRefused::Busy) => {
+                report.rows[i] = hold(
+                    "timeout: the host's rule-council slot did not come free before the deadline"
+                        .into(),
+                );
+                continue;
+            }
+            Err(SlotRefused::Unavailable(why)) => {
+                report.rows[i] = hold(format!(
+                    "error: the host's rule-council slot cannot be established ({why}), so no \
+                     council can be shown to be the only one running"
+                ));
+                continue;
+            }
         };
         let m = wicked_governance::match_rules(&[wicked_governance::MatchRule::from(rule)], facts)
             .into_iter()
@@ -1352,6 +1400,24 @@ fn settle_rule_disputes(
             );
             continue;
         };
+        // Charged to the run durably BEFORE it starts: a council whose attempt is superseded or
+        // whose result never folds is still spent.
+        match ctx.council.reserve(&input.run_id, input.unit.ord) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(lock);
+                report.rows[i] = hold(format!(
+                    "cap: the run has spent its {} rule councils",
+                    crate::rule_check::RUN_COUNCILS
+                ));
+                continue;
+            }
+            Err(e) => {
+                drop(lock);
+                report.rows[i] = hold(format!("error: {e}"));
+                continue;
+            }
+        }
         report.councils += 1;
         let outcome = with_floor_heartbeat(
             emit_delta,
@@ -1363,7 +1429,9 @@ fn settle_rule_disputes(
             Duration::from_secs(60),
             || ctx.council.convene(req, seats, lock, deadline),
         );
-        let rule_words = crate::rule_check::rule_text(rule);
+        // The rule's own words an N/A must quote: its statement and criteria, never the header
+        // the engine writes around them (`RULE <id> (<severity>, …)`).
+        let rule_words = format!("{}\n{}", rule.statement, rule.criteria);
         let bars = crate::rule_check::VoteBars {
             paths: &paths,
             rule_text: &rule_words,

@@ -22,6 +22,10 @@ fn judged(id: &str, status: RuleStatus, cite: &str) -> RuleVerdict {
     }
 }
 
+fn carried_dispute_ix(r: &RuleVerdict) -> usize {
+    carried(&report(vec![r.clone()])).len()
+}
+
 fn report(rows: Vec<RuleVerdict>) -> RuleCheckReport {
     RuleCheckReport {
         rows,
@@ -64,7 +68,7 @@ const PATHS: &[&str] = &["src/add.rs"];
 fn bars<'a>(established: bool, instructions: Option<&'a str>) -> VoteBars<'a> {
     VoteBars {
         paths: PATHS,
-        rule_text: "RULE R1 (Warn, ): add() takes typed numbers when it is a public API\n",
+        rule_text: "add() takes typed numbers when it is a public API\n",
         established,
         instructions,
     }
@@ -274,6 +278,20 @@ fn not_applicable_votes_need_the_rules_own_words_and_no_established_fact() {
     // With no established fact, a quoted scope condition counts.
     let out = settle(&row, pos.clone(), &quoted, &bars(false, None));
     assert_eq!(out.status, RuleStatus::NotApplicable, "{out:?}");
+    // A quote of the engine's header around the rule is not the rule's words.
+    let header = verdict(&[
+        (
+            "agy",
+            Some(1),
+            "2 \"RULE R1 (Warn\" says nothing of this change",
+        ),
+        ("opencode", Some(1), "2 \"RULE R1 (Warn\" again"),
+        ("copilot", Some(0), "1 broken"),
+    ]);
+    assert_eq!(
+        settle(&row, pos.clone(), &header, &bars(false, None)).status,
+        RuleStatus::Disputed
+    );
     // An N/A that quotes nothing of the rule does not.
     let bare = verdict(&[
         ("agy", Some(1), "2 it does not apply"),
@@ -410,8 +428,8 @@ fn the_request_carries_both_readings_bounded_inside_a_fresh_fence() {
 
 #[test]
 fn a_council_ruling_is_reused_but_a_disputed_row_only_lends_its_judge_reading() {
-    // A.7.9: a council row is reused as settled; a disputed one never is as a ruling — its judge
-    // reading is, so a retry convenes the council again without asking the judge again.
+    // A.7.9: a council row is reused as settled; a disputed one never is as a ruling — it is
+    // carried open with both readings, so a retry convenes the council again without the judge.
     let row = judged("R1", RuleStatus::Broken, "src/add.rs:1 untyped");
     let v = verdict(&[
         ("agy", Some(1), "2 src/add.rs typed"),
@@ -438,11 +456,18 @@ fn a_council_ruling_is_reused_but_a_disputed_row_only_lends_its_judge_reading() 
             ..Default::default()
         },
     );
-    let lent = reuse(&open).expect("the judge's reading");
-    assert_eq!(lent.status, RuleStatus::Broken);
-    assert_eq!(lent.origin, Some(RuleOrigin::Judge));
-    assert_eq!(lent.judge_ids, vec!["pi".to_string()]);
-    assert!(lent.council.is_none());
+    let carried = reuse(&open).expect("carried open");
+    assert_eq!(
+        carried.status,
+        RuleStatus::Disputed,
+        "never reused as a ruling"
+    );
+    assert_eq!(carried.how, RuleHow::Cache);
+    assert_eq!(carried.origin, Some(RuleOrigin::Judge));
+    assert_eq!(carried.judge_ids, vec!["pi".to_string()]);
+    assert_eq!(carried.council.as_ref().unwrap().positions.len(), 2);
+    assert_eq!(carried_dispute_ix(&carried), 1);
+    assert_eq!(judge_reading(&carried).unwrap().status, RuleStatus::Broken);
     // A legacy row reused once (origin unknown) is ruled again, never guessed.
     let legacy = RuleVerdict {
         how: RuleHow::Cache,

@@ -1152,6 +1152,9 @@ fn run_in_isolation(
     timeout_note: Option<&str>,
     stdout_cap: usize,
 ) -> Result<BallotRun, SeatFailure> {
+    // (DES-RULE-CHECK-001 rev 2, codex r1) The budget runs from HERE — preparation, the spawn and
+    // the prompt's delivery all count — never restarted after the input is written.
+    let deadline = Instant::now() + timeout;
     let mut argv = tokenize(&cli.headless_invocation);
     if argv.is_empty() {
         return Err(SeatFailure::new(
@@ -1296,6 +1299,12 @@ fn run_in_isolation(
         command.stdin(Stdio::null());
     }
 
+    if Instant::now() >= deadline {
+        return Err(SeatFailure::new(
+            SeatFailureKind::TimedOut,
+            format!("the {timeout:?} dispatch budget ran out before the seat could start"),
+        ));
+    }
     let mut child = match command.spawn() {
         Ok(c) => c,
         // (F-7R3-001) `NotFound` classifies `not_installed` from the error KIND — the run
@@ -1316,16 +1325,19 @@ fn run_in_isolation(
         .take()
         .map(|p| BoundedReader::spawn(p, STDERR_READ_CAP));
 
+    // The prompt is written on its own thread: a seat that never reads its stdin cannot block the
+    // watcher below (a prompt larger than the pipe buffer would, forever).
     if let Some(payload) = stdin_payload {
-        use std::io::Write;
         if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(payload.as_bytes());
-            // Drop closes stdin so the child sees EOF.
+            std::thread::spawn(move || {
+                use std::io::Write;
+                let _ = stdin.write_all(payload.as_bytes());
+                // Drop closes stdin so the child sees EOF.
+            });
         }
     }
 
     // Bounded wait (watcher loop, std-only).
-    let deadline = Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,

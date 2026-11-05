@@ -3188,6 +3188,11 @@ pub(crate) fn run(
                     let _ = reply.send(result);
                 });
             }
+            // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
+            // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
+            Command::ReserveRuleCouncil { run_id, ord, reply } => {
+                let _ = reply.send(reserve_rule_council(&mut store, &run_id, ord));
+            }
             // (DES-RULE-CHECK-001 rev 2) A rule council: the same narrowing and carrier as a
             // decision council, in the dispute frame (three seats or none, framed ballots, one
             // absolute deadline). The host slot rides into the council thread and is dropped there
@@ -4577,6 +4582,28 @@ fn council_roster(
                     .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
         })
         .collect()
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.6) Charge one rule council to `run_id`'s unit `ord`, durably:
+/// `false` (nothing charged) once the run's units have spent [`crate::rule_check::RUN_COUNCILS`]
+/// between them, across every gate, attempt, send-back and re-check.
+fn reserve_rule_council(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    ord: u32,
+) -> anyhow::Result<bool> {
+    let mut units = crate::domain::session_units(&*store, run_id)?;
+    let spent: u32 = units.iter().map(|u| u.rule_councils).sum();
+    if spent >= crate::rule_check::RUN_COUNCILS {
+        return Ok(false);
+    }
+    let unit = units
+        .iter_mut()
+        .find(|u| u.ord == ord)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit {ord}"))?;
+    unit.rule_councils += 1;
+    put_node(store, unit.to_node())?;
+    Ok(true)
 }
 
 /// (C5 follow-up) The dispatcher a decision council's ballots go through, and where they run.
@@ -11261,12 +11288,10 @@ fn dispatch_unit(
             } else {
                 Vec::new()
             };
-        // (DES-RULE-CHECK-001 rev 2) A review unit's rule councils: how many the run has spent
-        // (its budget is per run, across every gate and attempt), and the rulings of the run's
-        // other gates (reused on an equal rule and evidence key only).
+        // (DES-RULE-CHECK-001 rev 2) A review unit's rule check reuses the council rulings of
+        // the run's other gates (on an equal rule and evidence key only).
         if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
             let all = crate::domain::session_units(&*store, run_id)?;
-            stamped.rule_councils_run = all.iter().map(|u| u.rule_councils).sum();
             stamped.rule_settled = all
                 .iter()
                 .filter(|u| u.ord != unit.ord)
@@ -11300,6 +11325,7 @@ fn dispatch_unit(
             || unit.rule_steps != stamped.rule_steps
             || unit.rule_instructions != stamped.rule_instructions
             || unit.rule_deliver_tokens != stamped.rule_deliver_tokens
+            || unit.rule_settled != stamped.rule_settled
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -25616,6 +25642,40 @@ mod request_changes_tests {
             uuid::Uuid::nil(),
             false,
         )
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2, A.7.5, codex r1) The run's rule-council budget is charged
+    /// durably, per council, before it starts — across every unit of the run — and refused once
+    /// six are spent: no superseded attempt or lost result can spend the budget twice.
+    #[test]
+    fn the_run_budget_charges_each_council_durably_and_stops_at_six() {
+        let run_id = format!("rules-budget-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let ords: Vec<u32> = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .iter()
+            .map(|u| u.ord)
+            .collect();
+        for k in 0..crate::rule_check::RUN_COUNCILS {
+            // Two gates of the run share one budget.
+            let ord = ords[(k as usize) % 2 + 1];
+            assert!(
+                reserve_rule_council(&mut store, &run_id, ord).unwrap(),
+                "council {k}"
+            );
+        }
+        assert!(!reserve_rule_council(&mut store, &run_id, ords[1]).unwrap());
+        let spent: u32 = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .iter()
+            .map(|u| u.rule_councils)
+            .sum();
+        assert_eq!(
+            spent,
+            crate::rule_check::RUN_COUNCILS,
+            "persisted, and nothing past the cap"
+        );
     }
 
     /// (DES-RULE-CHECK-001 rev 2, A.7.10) A DISPUTED rule behind a reviewer's FAIL — at an ordinary
