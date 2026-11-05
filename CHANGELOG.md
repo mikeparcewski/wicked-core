@@ -2307,6 +2307,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.28** — 2026-11-05 — patch release on main 31694e3, carrying 2 PRs since 0.15.27: #1280 and #1281.
+  - **A rule whose subject is the delivery is checked at the deliver step (#1281, SWAP 6).** A rule carrying
+    `obligations: ["evidence:delivery"]` is `deferred` at review and QE instead of holding the gate; the deliver step
+    judges exactly those deferred rules against the pull request text the deliver command writes to
+    `WICKED_DELIVER_TEXT_OUT`, on a seat distinct from the creators (broken denies, unchecked holds). crew's deliver
+    script writes that file, so crew 0.17.0 pins this release.
+  - **Lockfile:** #1280 re-stamped the 0.15.27 platform lock entries.
+  - No binding method or `LaunchSpec` field is added. The seat and floor Dockerfiles, the seat package pins, the base
+    image and the gate-hook protocol are unchanged since 0.15.27, so the seat and floor image tags and gate protocol 3
+    are unchanged.
 - **core-ts 0.15.27** — 2026-11-05 — patch release on main 59f33f5, carrying 2 PRs since 0.15.26: #1276 and #1277.
   - **Every steering rule in force is checked at review (#1277, DES-RULE-CHECK-001 S2 + S3).** A review unit's gate
     reads the project's in-force rules from the policy store, matches them against the job, and has a judge distinct
