@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Fixed: a rule's machine check no longer refuses work the rule is not about (F11).** Studio's Learn starter "Tests
+  with every fix" (`check:test-fails-on-base`, no step scope) refused every new app by chat: an apps turn adds
+  `queries/*.sql` and no test. A machine obligation now decides its rule alone only where a step scope the rule's
+  author wrote selects it. Anywhere else a distinct judge rules whether the change is the work the rule speaks of:
+  its N/A stands (an app turn is not a bug fix), and its KEPT or BROKEN means the rule applies, so the engine's
+  negative finding (no test changed, or the changed tests pass on the base too) is the machine's BROKEN. An untested
+  bug fix still denies.
+
 - **The catalog by verb: gate rubrics, 16 presets, and a plan the person can send back (DES-CATALOG-002 Lane A).**
   Rubrics are data (`src/rubrics/{parity,cited-findings,fidelity-to-source}.json`): a plan step names one
   (`"rubric"`), compose appends its contract after the step's own text, refuses an unknown one

@@ -1451,9 +1451,13 @@ fn settle_rule_disputes(
         let m = wicked_governance::match_rules(&[wicked_governance::MatchRule::from(rule)], facts)
             .into_iter()
             .next();
+        // (F11) A machine rule no step scope selects: the council rules the judge's question.
         let note = m
             .as_ref()
-            .map(|m| crate::rule_check::match_note(m, crate::rule_check::CheckStage::Review))
+            .map(|m| {
+                crate::rule_check::match_note(m, crate::rule_check::CheckStage::Review)
+                    + &crate::rule_check::machine_council_note(rule, m, change)
+            })
             .unwrap_or_default();
         let evidence = crate::rule_check::Evidence::of_change(&row, change, floor_text);
         let Some(req) = crate::rule_check::dispute_request(
@@ -1507,7 +1511,9 @@ fn settle_rule_disputes(
         let bars = crate::rule_check::VoteBars {
             paths: &paths,
             rule_text: &rule_words,
-            established: m.as_ref().is_some_and(crate::rule_check::established),
+            established: m
+                .as_ref()
+                .is_some_and(|m| crate::rule_check::council_established(rule, m)),
             instructions,
         };
         report.rows[i] = match outcome {

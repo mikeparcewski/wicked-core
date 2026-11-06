@@ -544,8 +544,9 @@ impl StepRunner for Breaks {
 
 /// (coord, E7 rerun) The "broken" fixture: tiny-math-untested has a bug in clamp() that no test
 /// covers. A fix that changes src/math.js and adds no test breaks learn-tests-with-fixes by the
-/// machine check (no model call) and the repo's own test rule by the judge, and the gate denies
-/// naming both. The repo rule applies (it names the job's repository).
+/// machine check (the judge rules only that the unscoped starter applies, F11) and the repo's own
+/// test rule by the judge, and the gate denies naming both. The repo rule applies (it names the
+/// job's repository).
 #[test]
 fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
     let dir = std::env::temp_dir().join(format!("rule-check-untested-{}", std::process::id()));
@@ -575,6 +576,7 @@ fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
             ..Default::default()
         };
         learn.obligations = vec![crate::rule_check::OBLIGATION_TEST_FAILS_ON_BASE.into()];
+        // (F11) As the Learn starter ships it and the rig adopted it: `applies_to: []`.
         wicked_governance::register_rule(&mut store, &learn).unwrap();
         wicked_governance::register_rule(
             &mut store,
@@ -590,6 +592,20 @@ fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
     }
     let mut input = review_input(&repo, &base, &db);
     input.governance.as_mut().unwrap().repo_id = Some("tiny-math-untested".into());
+    // The bug job's steps as the actor stamps them (`steps_of`).
+    input.unit.rule_steps = [
+        (1, "triage", "understand"),
+        (2, "reproduce", "test_plan"),
+        (3, "fix", "build"),
+        (4, "review", "review"),
+        (5, "verify", "test"),
+    ]
+    .iter()
+    .map(|(n, id, cat)| wicked_governance::JobStep {
+        tokens: vec![format!("unit-{n}"), id.to_string(), cat.to_string()],
+        kind: Some(cat.to_string()),
+    })
+    .collect();
     let runner = Breaks(Mutex::new(Vec::new()));
     let sink = |_: &str| {};
     let pool = vec![seat("claude"), seat("codex")];
@@ -635,11 +651,14 @@ fn a_fix_with_no_test_on_an_untested_bug_is_broken_and_denies() {
         )
     );
     let asked = runner.0.into_inner().unwrap();
+    // (F11) No step scope selects the starter: the judge rules only that it applies (this is a
+    // bug fix), and the engine's finding breaks it (the row is the machine's).
     assert!(
         asked
             .iter()
-            .all(|p| !p.contains("RULE learn-tests-with-fixes (")),
-        "no model call for the machine rule"
+            .any(|p| p.contains("RULE learn-tests-with-fixes (")
+                && p.contains("first decide whether this change is the kind of work")),
+        "the judge is asked whether the starter applies"
     );
     assert!(
         asked
