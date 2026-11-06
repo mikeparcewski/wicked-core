@@ -1117,6 +1117,15 @@ fn m9_interactive_presets_launch_repo_less_with_the_draft_skill() {
                 "{name}/{id}"
             );
             assert!(!u.executes_code, "{name}/{id}");
+            // F8 (e2e-1105): a draft that hard-codes its colours can never be restyled, so the draft
+            // styles itself through the theme tokens the service supplies.
+            if name == "interactive-draft" {
+                let t = u.instructions.as_deref().unwrap_or_default();
+                assert!(
+                    t.contains("var(--wi-bg, #…)") && t.contains("never declare --wi-* yourself"),
+                    "{name}/{id}: the draft is told to style through the theme tokens"
+                );
+            }
         }
         assert!(
             !ids.iter().any(|i| *i == "build" || *i == "security_review"),

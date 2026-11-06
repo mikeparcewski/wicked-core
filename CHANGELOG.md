@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A drafted document can be restyled (F8, e2e-1105).** The `interactive-draft` preset now tells the drafter to
+  write every colour and font as a theme token with a fallback (`var(--wi-bg, #…)`, `var(--wi-text, #…)`, …) and
+  never to declare `--wi-*` itself. Drafts used to hard-code every colour, so Slides → Style changed nothing; with
+  the tokens, the theme wicked-interactive supplies re-colours every slide or page.
+
 - **A deliver rule check that cannot run names each deferred rule (e2e-1105 F4c).** When the delivery hands back
   no pull request text, or the rules cannot be read, every rule deferred to delivery gets an `unchecked` row with an
   evidence key instead of a report with no rows. The gate still holds, and now the person can skip each rule with a
