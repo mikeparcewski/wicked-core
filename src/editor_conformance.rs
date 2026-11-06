@@ -629,6 +629,8 @@ mod tests {
         let jail = crate::validator::serve_jail(&[tmp.path()], port);
         assert_eq!(jail.level, crate::validator::SandboxLevel::Sandboxed);
         let out = tmp.path().join("report.json");
+        // spawn-audit: test-only — the opt-in live run of the real harness in the real jail; it clears the
+        // environment itself (apply_minimal_env) as the Tool's spawn does.
         let mut cmd = std::process::Command::new(&jail.wrapper[0]);
         cmd.args(&jail.wrapper[1..])
             .arg("python3")
