@@ -152,7 +152,51 @@ fn run_on(
     prior: Option<&RuleCheckReport>,
     skips: &[RuleSkip],
 ) -> RuleCheckReport {
-    let f = job_facts(&[], None, None, c);
+    // A bug job's steps: a rule scoped to a step of it is selected by fact (pi r1: say so here).
+    run_steps(rules, c, judge, machine, prior, skips, &bug_steps(), None)
+}
+
+/// A step as `steps_of` stamps it: `unit-<n>`, the phase id and the catalog id.
+fn step(ord: u32, id: &str, catalog: &str) -> JobStep {
+    JobStep {
+        tokens: vec![format!("unit-{ord}"), id.into(), catalog.into()],
+        kind: Some(catalog.into()),
+    }
+}
+
+/// The bug preset's steps (catalog.rs `bug_preset`, plus the floor's review).
+fn bug_steps() -> Vec<JobStep> {
+    vec![
+        step(0, "pa-scope", "understand"),
+        step(1, "triage", "understand"),
+        step(2, "reproduce", "test_plan"),
+        step(3, "fix", "build"),
+        step(4, "review", "review"),
+        step(5, "verify", "test"),
+    ]
+}
+
+/// An apps turn's steps (presets/apps-turn.json: build, check, review).
+fn app_turn_steps() -> Vec<JobStep> {
+    vec![
+        step(0, "build", "build"),
+        step(1, "check", "run"),
+        step(2, "review", "review"),
+    ]
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_steps(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    machine: &dyn MachineCheck,
+    prior: Option<&RuleCheckReport>,
+    skips: &[RuleSkip],
+    steps: &[JobStep],
+    project: Option<&str>,
+) -> RuleCheckReport {
+    let f = job_facts(steps, project, None, c);
     let seats = seats();
     check(
         &CheckInput {
@@ -669,13 +713,306 @@ fn languages_come_from_gits_path_list() {
 
 // ── S3: check:test-fails-on-base ────────────────────────────────────────────────────────────────
 
+/// The rule scoped by its author to the bug workflow's `fix` step (a step scope: the machine
+/// check decides it alone).
 fn learn() -> ConformanceRule {
+    let mut r = learn_unscoped();
+    r.applies_to = vec!["fix".into()];
+    r
+}
+
+/// The Learn starter as studio ships it (and as the rig adopted it): `applies_to: []`.
+fn learn_unscoped() -> ConformanceRule {
     let mut r = rule(
         "learn-tests-with-fixes",
         "A bug fix includes a test that fails without the fix",
     );
     r.obligations = vec![OBLIGATION_TEST_FAILS_ON_BASE.into()];
     r
+}
+
+const APP_DIFF: &str = "diff --git a/queries/open_tickets.sql b/queries/open_tickets.sql\nnew file mode 100644\n--- /dev/null\n+++ b/queries/open_tickets.sql\n@@ -0,0 +1 @@\n+select id, title from tickets where status = 'open'\n";
+
+fn app_change() -> Change {
+    change_of(APP_DIFF, &["apps.json", "queries/open_tickets.sql"])
+}
+
+/// The RULES block of a judge prompt (engine-authored text, before the fenced evidence).
+fn rules_block(prompt: &str) -> &str {
+    let after = prompt.split_once("RULES:\n").expect("a RULES block").1;
+    after.split_once(" BEGIN (").map_or(after, |(r, _)| r)
+}
+
+/// F11 (e2e-1105): an app turn that adds a query is not refused by the "Tests with every fix"
+/// starter's machine check. Adopted as studio ships it (unscoped), the judge rules whether the
+/// rule applies, told the engine's finding, and its N/A stands. Scoped by step, it is N/A by fact
+/// with no call. Scoped only by project (in force there, not a work kind), the judge still rules.
+#[test]
+fn an_app_turn_is_not_refused_by_the_fix_rules_machine_check() {
+    let machine = FakeMachine::new(MachineOutcome::Fallback("unused".into()));
+    let na = "N/A — queries/open_tickets.sql adds an app query; the change is not a bug fix";
+    let judge = Fake::new(&[("learn-tests-with-fixes", na)]);
+    let r = run_steps(
+        &[learn_unscoped()],
+        &app_change(),
+        &judge,
+        &machine,
+        None,
+        &[],
+        &app_turn_steps(),
+        None,
+    );
+    let row = &r.rows[0];
+    assert_eq!(
+        (row.status, row.how),
+        (RuleStatus::NotApplicable, RuleHow::Judge),
+        "{row:?}"
+    );
+    assert!(
+        row.reason
+            .contains("the engine's check found: no test file is added"),
+        "{}",
+        row.reason
+    );
+    assert!(
+        r.denial().is_none() && r.hold().is_none(),
+        "{:?}",
+        r.denial()
+    );
+    assert_eq!(machine.runs.load(Ordering::SeqCst), 0);
+    let prompts = judge.prompts.lock().unwrap();
+    assert_eq!(prompts.len(), 1);
+    let block = rules_block(&prompts[0].1);
+    assert!(
+        block.contains("first decide whether this change is the kind of work"),
+        "{block}"
+    );
+    assert!(
+        block.contains("no test file is added or changed"),
+        "{block}"
+    );
+    // codex r1: the engine's own words carry no creator-chosen path.
+    assert!(!block.contains("queries/"), "{block}");
+    drop(prompts);
+    // Scoped by step: N/A by fact, no judge, no run.
+    let judge = Fake::new(&[]);
+    let r = run_steps(
+        &[learn()],
+        &app_change(),
+        &judge,
+        &machine,
+        None,
+        &[],
+        &app_turn_steps(),
+        None,
+    );
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::NotApplicable, RuleHow::Fact)
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    // codex r1: scoped only by the project, the judge still rules applicability.
+    let mut in_project = learn_unscoped();
+    in_project.targets.project = Some("support".into());
+    let judge = Fake::new(&[("learn-tests-with-fixes", na)]);
+    let r = run_steps(
+        &[in_project],
+        &app_change(),
+        &judge,
+        &machine,
+        None,
+        &[],
+        &app_turn_steps(),
+        Some("support"),
+    );
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::NotApplicable, RuleHow::Judge)
+    );
+    assert!(r.denial().is_none());
+}
+
+/// F11, the safety: an untested bug fix is still BROKEN. Scoped by step, the machine breaks it
+/// with no call. Unscoped, the judge only rules whether the rule applies: its BROKEN, and its KEPT
+/// (codex r1: never a KEPT on a change the check found untested), are the machine's BROKEN, and
+/// the gate denies. The same holds for changed tests that pass on the base too.
+#[test]
+fn an_untested_bug_fix_is_still_broken_scoped_or_not() {
+    let machine = FakeMachine::new(MachineOutcome::Fallback("unused".into()));
+    let judge = Fake::new(&[("learn-tests-with-fixes", "KEPT — src/add.rs")]);
+    let r = run_on(&[learn()], &change(), &judge, &machine, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Broken, RuleHow::Machine)
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(r.denial().unwrap().rule_ids, ["learn-tests-with-fixes"]);
+    for answer in [
+        "BROKEN — src/add.rs fixes add() and no test fails without it",
+        "KEPT — src/add.rs is a small, clear fix",
+    ] {
+        let judge = Fake::new(&[("learn-tests-with-fixes", answer)]);
+        let r = run_on(&[learn_unscoped()], &change(), &judge, &machine, None, &[]);
+        let row = &r.rows[0];
+        assert_eq!(
+            (row.status, row.how, row.origin),
+            (
+                RuleStatus::Broken,
+                RuleHow::Machine,
+                Some(RuleOrigin::Machine)
+            ),
+            "{answer}: {row:?}"
+        );
+        assert!(
+            row.reason.contains("no test file is added")
+                && row.reason.contains("the judge found the rule applies"),
+            "{}",
+            row.reason
+        );
+        assert_eq!(r.denial().unwrap().rule_ids, ["learn-tests-with-fixes"]);
+        let p = judge.prompts.lock().unwrap()[0].1.clone();
+        assert!(
+            rules_block(&p).contains("that finding decides it: answer BROKEN"),
+            "{p}"
+        );
+    }
+    // Tests that pass on the base too.
+    let c = change_of(DIFF, &["src/add.rs", "tests/add_test.rs"]);
+    let passes = FakeMachine::new(MachineOutcome::Verdict {
+        status: RuleStatus::Broken,
+        reason: "tests/add_test.rs passes on the base too".into(),
+    });
+    let judge = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "KEPT — tests/add_test.rs covers add",
+    )]);
+    let r = run_on(&[learn()], &c, &judge, &passes, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Broken, RuleHow::Machine)
+    );
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
+    let r = run_on(&[learn_unscoped()], &c, &judge, &passes, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Broken, RuleHow::Machine)
+    );
+    assert!(
+        r.rows[0].reason.contains("passes on the base too"),
+        "{}",
+        r.rows[0].reason
+    );
+    assert!(rules_block(&judge.prompts.lock().unwrap()[0].1).contains("pass on the run base too"));
+    // No judge answer: unchecked, and it holds.
+    let silent = Fake::new(&[]);
+    let r = run_on(&[learn_unscoped()], &change(), &silent, &machine, None, &[]);
+    assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
+    assert!(r.hold().is_some());
+}
+
+/// codex r1-r3: a council settling a judge's N/A on an unscoped machine rule is asked the judge's
+/// question, with the no-test finding the change shows (derived from the change, never from a
+/// row's text); a step-scoped one adds nothing. A project fact never bars the council's N/A on an
+/// unscoped machine rule; a step-selected one, or an ordinary rule, keeps the bar.
+#[test]
+fn a_council_on_an_unscoped_machine_rule_gets_the_applicability_question() {
+    let c = change();
+    let facts = job_facts(&bug_steps(), Some("support"), None, &c);
+    let m = |r: &ConformanceRule| {
+        wicked_governance::match_rules(&[MatchRule::from(r)], &facts)
+            .pop()
+            .unwrap()
+    };
+    let n = machine_council_note(&learn_unscoped(), &m(&learn_unscoped()), &c);
+    assert!(
+        n.contains("first decide") && n.contains("no test file is added"),
+        "{n}"
+    );
+    assert!(!n.contains("src/add.rs"), "{n}");
+    assert!(machine_council_note(&learn(), &m(&learn()), &c).is_empty());
+    assert!(machine_council_note(&rule("A", "a"), &m(&rule("A", "a")), &c).is_empty());
+    // A change with tests: no finding the change alone shows (the base run is not repeated).
+    let tested = change_of(DIFF, &["src/add.rs", "tests/add_test.rs"]);
+    let n = machine_council_note(&learn_unscoped(), &m(&learn_unscoped()), &tested);
+    assert!(
+        n.contains("first decide") && !n.contains("answer BROKEN"),
+        "{n}"
+    );
+    let mut in_project = learn_unscoped();
+    in_project.targets.project = Some("support".into());
+    let mp = m(&in_project);
+    assert!(established(&mp) && !council_established(&in_project, &mp));
+    // codex r3: scoped to the project AND a step of the job: the bar stays.
+    let mut both = learn();
+    both.targets.project = Some("support".into());
+    assert!(council_established(&both, &m(&both)));
+    let mut plain = rule("P", "every query is reviewed");
+    plain.targets.project = Some("support".into());
+    assert!(council_established(&plain, &m(&plain)));
+}
+
+/// pi r2: the machine's BROKEN on an unscoped rule (the judge said it applies) is not a judge's
+/// reading, so a reviewer's KEPT never opens a council on it; a judge's N/A against the reviewer's
+/// BROKEN does.
+#[test]
+fn a_machine_broken_on_an_unscoped_rule_is_never_disputed() {
+    let machine = FakeMachine::new(MachineOutcome::Fallback("unused".into()));
+    let reviewer = |status| SeatPositions {
+        cut: false,
+        by_id: [(
+            "learn-tests-with-fixes".to_string(),
+            Answer {
+                status,
+                cite: "src/add.rs".into(),
+            },
+        )]
+        .into_iter()
+        .collect(),
+    };
+    let judge = Fake::new(&[("learn-tests-with-fixes", "BROKEN — src/add.rs is a fix")]);
+    let r = run_on(&[learn_unscoped()], &change(), &judge, &machine, None, &[]);
+    assert_eq!(r.rows[0].origin, Some(RuleOrigin::Machine));
+    assert!(disputes(&r, &reviewer(RuleStatus::Kept)).is_empty());
+    let judge = Fake::new(&[("learn-tests-with-fixes", "N/A — not a bug fix")]);
+    let r = run_on(&[learn_unscoped()], &change(), &judge, &machine, None, &[]);
+    assert_eq!(disputes(&r, &reviewer(RuleStatus::Broken)), [0]);
+}
+
+/// codex r2: where the engine could not run the changed tests, a judge's KEPT (the rule applies)
+/// keeps the hold: the rule is unchecked, never kept on an applicability answer. Its N/A stands.
+#[test]
+fn a_check_that_could_not_run_stays_unchecked_where_the_rule_applies() {
+    let c = change_of(DIFF, &["src/add.rs", "tests/add_test.rs"]);
+    let not_run = FakeMachine::new(MachineOutcome::Verdict {
+        status: RuleStatus::Unchecked,
+        reason: "the head checks failed, so the base run proves nothing".into(),
+    });
+    let judge = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "KEPT — tests/add_test.rs covers add",
+    )]);
+    let r = run_on(&[learn_unscoped()], &c, &judge, &not_run, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::Unchecked, RuleHow::None)
+    );
+    assert!(r.hold().is_some());
+    assert!(rules_block(&judge.prompts.lock().unwrap()[0].1).contains("stays unchecked"));
+    let judge = Fake::new(&[(
+        "learn-tests-with-fixes",
+        "N/A — an app query, not a bug fix",
+    )]);
+    let r = run_on(&[learn_unscoped()], &c, &judge, &not_run, None, &[]);
+    assert_eq!(
+        (r.rows[0].status, r.rows[0].how),
+        (RuleStatus::NotApplicable, RuleHow::Judge)
+    );
+    assert!(r.hold().is_none() && r.denial().is_none());
+    // Scoped by step: the machine's unchecked stands, no judge.
+    let judge = Fake::new(&[]);
+    let r = run_on(&[learn()], &c, &judge, &not_run, None, &[]);
+    assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
+    assert_eq!(judge.calls.load(Ordering::SeqCst), 0);
 }
 
 /// E7: a bug fix that ships no test is broken by the machine check, with the evidence, and no

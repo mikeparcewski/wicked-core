@@ -22,8 +22,18 @@
 //!   cite a changed file. The whole prompt stays under one argv argument ([`PROMPT_BUDGET`]).
 //! * **Machine checks (S3).** A rule carrying `obligations: ["check:test-fails-on-base"]` is checked
 //!   by the engine: no source change is not applicable, a source change with no test is broken (no
-//!   model call), and otherwise the changed tests run on the base tree through the repo-checks floor
-//!   beside the judge batches; a repo the floor cannot run falls back to the judge, saying so.
+//!   model call, under a step scope; see F11 below), and otherwise the changed tests run on the base
+//!   tree through the repo-checks floor beside the judge batches; a repo the floor cannot run falls
+//!   back to the judge, saying so.
+//!   (F11) The obligation is part of its rule: its negative finding (no test changed, or the changed
+//!   tests pass on the base too) decides the rule alone only where a step scope the rule's author
+//!   wrote selects it ([`machine_decides`]); a positive or fallen-back result goes to the judge
+//!   either way. Anywhere else (no scope, or only a project, repository, path, facet or trigger
+//!   fact) a distinct judge rules whether the change is the work the rule speaks of: its N/A stands
+//!   (an app turn is not a bug fix), and its KEPT or BROKEN means the rule applies, so a negative
+//!   finding is the machine's BROKEN, and a check that could not run stays unchecked
+//!   ([`apply_findings`]). The judge decides applicability, never compliance with a
+//!   finding the engine established.
 //! * **Cache.** A prior verdict is reused when the rule's content (its canonical text: statement,
 //!   criteria, obligations; and its facets) and the evidence the judge read (the whole diff and the
 //!   floor's result; for a machine check, the base and the diff) hash the same (full SHA-256), so a
@@ -857,6 +867,91 @@ fn test_fails_on_base_by_diff(change: &Change) -> Option<(RuleStatus, RuleHow, S
         ));
     }
     None
+}
+
+/// (F11) Whether a machine obligation decides its rule on its own: only where a STEP SCOPE the rule's
+/// author wrote (`applies_to` / `excludes`) selects it for this job. Any other match (no fact, or
+/// only the project, the repository, a named path, a facet or a trigger) says where the rule is
+/// in force, not that this change is the work it speaks of ("a bug fix …"): there a distinct judge
+/// decides whether it applies, and the engine's finding decides whether it is kept.
+pub fn machine_decides(m: &wicked_governance::RuleMatch) -> bool {
+    m.status == MatchStatus::Applies && m.facts.iter().any(|f| f.kind == "phase")
+}
+
+/// (F11) What the judge (and a council) is told beside a machine rule it must rule applicability
+/// on. Engine-authored and path-free: nothing the creator wrote rides it.
+pub fn machine_scope_note() -> String {
+    format!(
+        "  Engine check {OBLIGATION_TEST_FAILS_ON_BASE}: no step scope selects this rule for this \
+         job, so first decide whether this change is the kind of work the rule speaks of. If it is \
+         not, answer N/A and say why.\n"
+    )
+}
+
+/// (F11) What a rule council settling `rule` is told beside the match note: for a machine rule no
+/// step scope selects, the same applicability question the judge had and, when the change alone
+/// shows it untested, the finding that decides it where the rule applies. Derived from the change
+/// on every attempt (never from a row's text, which carries paths and citations), so a retried
+/// council is told the same; a base run is not repeated for a council (its result is in the row's
+/// reason for the person, and the council's choice is the same: N/A, or BROKEN where it applies).
+pub fn machine_council_note(
+    rule: &ConformanceRule,
+    m: &wicked_governance::RuleMatch,
+    change: &Change,
+) -> String {
+    if machine_obligation(rule).is_none() || machine_decides(m) {
+        return String::new();
+    }
+    let mut note = machine_scope_note();
+    if matches!(
+        test_fails_on_base_by_diff(change),
+        Some((RuleStatus::Broken, _, _))
+    ) {
+        note.push_str(&machine_finding_note(Finding::NoTest));
+    }
+    note
+}
+
+/// (F11, codex r2/r3) Whether a council's N/A on `rule` is barred because the match established
+/// that it applies. For a machine rule no step scope selects, the match says where it is in force,
+/// never that this change is the work it speaks of: that is the judge's (and the council's)
+/// question. A step-selected machine rule keeps the bar.
+pub fn council_established(rule: &ConformanceRule, m: &wicked_governance::RuleMatch) -> bool {
+    established(m) && (machine_obligation(rule).is_none() || machine_decides(m))
+}
+
+/// (F11) A machine finding a judge rules applicability on: where the rule applies, it decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Finding {
+    /// A source change and no test changed.
+    NoTest,
+    /// The changed tests pass on the run base too.
+    PassesOnBase,
+    /// The engine could not run the check here: where the rule applies, it stays unchecked.
+    NotRun,
+}
+
+/// (F11) The engine's finding as the judge reads it, path-free (the changed files are in the
+/// fenced evidence).
+fn machine_finding_note(f: Finding) -> String {
+    let (found, then) = match f {
+        Finding::NoTest => (
+            "no test file is added or changed, and the change touches source code",
+            "that finding decides it: answer BROKEN",
+        ),
+        Finding::PassesOnBase => (
+            "the change's tests pass on the run base too, so none of them fails without the change",
+            "that finding decides it: answer BROKEN",
+        ),
+        Finding::NotRun => (
+            "it could not run the changed tests on the run base here",
+            "it stays unchecked for a person to decide: answer KEPT or BROKEN to say it applies",
+        ),
+    };
+    format!(
+        "  Engine check {OBLIGATION_TEST_FAILS_ON_BASE} found: {found}. If the rule applies to this \
+         change, {then}.\n"
+    )
 }
 
 // ── The judge seam ──────────────────────────────────────────────────────────────────────────────
@@ -1905,6 +2000,10 @@ struct Pending<'a> {
     /// What the judge is told beside the rule: the engine's match facts, and a machine check's
     /// result when it is evidence for the judge.
     note: String,
+    /// (F11) A machine rule a step scope selects ([`machine_decides`]): the engine's own verdict
+    /// stands. Any other machine rule (no fact, or only a project, repository, path, facet or
+    /// trigger fact, even when its match APPLIES) goes to the judge for applicability.
+    decides: bool,
 }
 
 /// Run the check: match, skips, cache, the machine check beside the judge batches, single re-asks.
@@ -1939,6 +2038,8 @@ pub fn check(
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     let mut pending: Vec<Pending<'_>> = Vec::new();
     let mut machine_pending: Vec<Pending<'_>> = Vec::new();
+    // (F11) The negative machine findings a judge rules applicability on: rule id → the finding.
+    let mut findings: BTreeMap<String, (Finding, String)> = BTreeMap::new();
     for m in &matches {
         let Some(rule) = by_id.get(m.rule_id.as_str()).copied() else {
             continue;
@@ -2021,7 +2122,15 @@ pub fn check(
         // already established), so they are part of the evidence the verdict read.
         // At delivery the review's decision stands: the rule applies (it was deferred, not ruled
         // out); the text's own match says nothing about it (codex r2).
-        let note = match_note(m, input.stage);
+        let mut note = match_note(m, input.stage);
+        // (F11) An obligation is part of its rule: its finding decides the rule alone only where a
+        // step scope selects it ([`machine_decides`]). Elsewhere a distinct judge rules whether the
+        // rule applies (an app turn or a feature with no fix is N/A), and where it does, a negative
+        // finding still breaks it ([`apply_findings`]).
+        let decides = is_machine && machine_decides(m);
+        if is_machine && !decides {
+            note.push_str(&machine_scope_note());
+        }
         let ek = digest(&[if is_machine { &machine_key } else { &judge_key }, &note]);
         // A skip answers exactly the unchecked row it was given on: the same rule content and the
         // same evidence.
@@ -2076,17 +2185,35 @@ pub fn check(
             continue;
         }
         if is_machine {
-            // Decided from the change where it can be: no model call, no run.
-            if let Some((status, how, reason)) = test_fails_on_base_by_diff(input.change) {
-                let cite = Some(reason.clone());
-                rows.insert(rule.id.clone(), row(status, how, reason, cite, Some(ek)));
-                continue;
+            // Decided from the change where it can be: no model call, no run. A change with no
+            // source code is not applicable whatever the scope; a finding against the change
+            // stands alone only where the rule applies (F11).
+            match test_fails_on_base_by_diff(input.change) {
+                Some((status, how, reason)) if decides || status == RuleStatus::NotApplicable => {
+                    let cite = Some(reason.clone());
+                    rows.insert(rule.id.clone(), row(status, how, reason, cite, Some(ek)));
+                    continue;
+                }
+                Some((_, _, reason)) => {
+                    note.push_str(&machine_finding_note(Finding::NoTest));
+                    findings.insert(rule.id.clone(), (Finding::NoTest, reason));
+                    pending.push(Pending {
+                        rule,
+                        rule_key: rk,
+                        evidence_key: ek,
+                        note,
+                        decides,
+                    });
+                    continue;
+                }
+                None => {}
             }
             machine_pending.push(Pending {
                 rule,
                 rule_key: rk,
                 evidence_key: ek,
                 note,
+                decides,
             });
             continue;
         }
@@ -2095,6 +2222,7 @@ pub fn check(
             rule_key: rk,
             evidence_key: ek,
             note,
+            decides,
         });
     }
 
@@ -2167,7 +2295,31 @@ pub fn check(
             );
         }
         Some(MachineOutcome::Verdict { status, reason }) => {
-            for p in &machine_pending {
+            // (F11) A rule that only may apply: the base run's result is evidence for the judge.
+            let (decided, mut advised): (Vec<Pending<'_>>, Vec<Pending<'_>>) =
+                machine_pending.into_iter().partition(|p| p.decides);
+            // (codex r2) A check that could not run keeps its hold where the rule applies.
+            let found = match status {
+                RuleStatus::Broken => Some(Finding::PassesOnBase),
+                RuleStatus::Unchecked => Some(Finding::NotRun),
+                _ => None,
+            };
+            for p in advised.iter_mut() {
+                if let Some(f) = found {
+                    p.note.push_str(&machine_finding_note(f));
+                    findings.insert(p.rule.id.clone(), (f, reason.clone()));
+                }
+            }
+            judge_rows(
+                &advised,
+                input,
+                judge,
+                &pool,
+                &mut report,
+                &mut rows,
+                Some(&format!("{OBLIGATION_TEST_FAILS_ON_BASE}: {reason}")),
+            );
+            for p in &decided {
                 let ruled = status != RuleStatus::Unchecked;
                 rows.insert(
                     p.rule.id.clone(),
@@ -2204,6 +2356,7 @@ pub fn check(
         }
         None => {}
     }
+    apply_findings(&mut rows, &findings);
     report.calls = pool.calls.load(std::sync::atomic::Ordering::Relaxed);
     report.refused = pool.dead.lock().unwrap().iter().cloned().collect();
     // The match's reading order, every rule once.
@@ -2234,6 +2387,50 @@ pub fn check(
     }
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     report
+}
+
+/// (F11) A judge ruled only whether a machine rule applies; the engine's negative finding rules
+/// whether it is kept. A judge's KEPT or BROKEN says it applies: the row is the machine's BROKEN
+/// (never a KEPT on a change the check found untested), naming the judge's reading. Its N/A stands,
+/// with the finding beside it (a council may still settle it against the reviewer's BROKEN). A row
+/// no judge ruled (unchecked, waived) keeps its status and holds, with the finding in its reason.
+fn apply_findings(
+    rows: &mut BTreeMap<String, RuleVerdict>,
+    findings: &BTreeMap<String, (Finding, String)>,
+) {
+    for (id, (kind, found)) in findings {
+        let Some(row) = rows.get_mut(id) else {
+            continue;
+        };
+        let applies = matches!(row.status, RuleStatus::Kept | RuleStatus::Broken)
+            && row.origin == Some(RuleOrigin::Judge);
+        match (applies, kind) {
+            (true, Finding::NotRun) => {
+                let read = row.cite.clone().unwrap_or_default();
+                row.status = RuleStatus::Unchecked;
+                row.how = RuleHow::None;
+                row.origin = None;
+                row.reason = format!(
+                    "the check could not run: {found} (the judge found the rule applies: {read})"
+                );
+                row.cite = None;
+            }
+            (true, _) => {
+                let read = row.cite.clone().unwrap_or_default();
+                row.status = RuleStatus::Broken;
+                row.how = RuleHow::Machine;
+                row.origin = Some(RuleOrigin::Machine);
+                row.reason = format!("{found} (the judge found the rule applies: {read})");
+                row.cite = Some(found.clone());
+            }
+            (false, Finding::NotRun) => {
+                row.reason = format!("{} (the engine's check could not run: {found})", row.reason)
+            }
+            (false, _) => {
+                row.reason = format!("{} (the engine's check found: {found})", row.reason)
+            }
+        }
+    }
 }
 
 /// Judge `pending` in batches (round 1) and re-ask each unanswered rule alone (round 2), writing
