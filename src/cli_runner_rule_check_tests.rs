@@ -743,5 +743,118 @@ fn the_deliver_step_checks_a_deferred_rule_against_the_published_text() {
     assert!(!out.exists(), "the hand-back file is removed once read");
 }
 
+/// (e2e-1105 F4c) A deliver check that cannot run (no text handed back, or the rules unreadable)
+/// names each deferred rule as unchecked, with an evidence key, so the gate offers a skip with a
+/// reason per rule; a skip given for the rule as it is makes it `skipped` and the gate no longer
+/// holds on it. A deferred rule no longer in force is named too, and can be skipped (before, its
+/// row had no evidence key and the engine refused the skip). A skip given with no text to judge
+/// never covers text the check can read: a broken verdict on it denies. Before, the report had no
+/// rows: nothing could be skipped and re-checking looped.
+#[test]
+fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped() {
+    let (repo, _base, db) = fixture("deliver-unchecked");
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut r = wicked_governance::ConformanceRule {
+            id: "learn-linked-issue".into(),
+            rule_type: wicked_governance::RuleType::Pattern,
+            statement: "Every pull request names the issue it closes in its description.".into(),
+            severity: wicked_governance::ConfSeverity::Warn,
+            ..Default::default()
+        };
+        r.obligations = vec![crate::rule_check::OBLIGATION_EVIDENCE_DELIVERY.into()];
+        wicked_governance::register_rule(&mut store, &r).unwrap();
+    }
+    let out = repo.join("pr-text.md");
+    let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
+    let ctx = |db_path: String, deferred: Vec<String>, skips: Vec<crate::rule_check::RuleSkip>| {
+        DeliveryRuleCtx {
+            db_path,
+            project: None,
+            repo: None,
+            creators: vec!["claude".into()],
+            creator_bins: Some(Vec::new()),
+            exclude_seats: Vec::new(),
+            pool: vec![seat("claude"), seat("codex")],
+            registry: vec![seat("claude"), seat("codex")],
+            runner: runner.clone(),
+            prior: None,
+            skips,
+            instructions: String::new(),
+            deliver_tokens: Vec::new(),
+            base: String::new(),
+            deferred,
+            text_out: out.clone(),
+        }
+    };
+    let skip_of = |row: &crate::rule_check::RuleVerdict| crate::rule_check::RuleSkip {
+        rule_id: row.rule_id.clone(),
+        reason: "the PR says Fixes #1; checked by hand".into(),
+        by: "local (human)".into(),
+        at: 1,
+        rule_key: row.rule_key.clone(),
+        evidence_key: row
+            .evidence_key
+            .clone()
+            .expect("a skip needs the row's evidence key"),
+        instruction: None,
+    };
+    let deferred = vec!["learn-linked-issue".to_string(), "retired-rule".to_string()];
+    let held =
+        delivery_rule_check(&ctx(db.clone(), deferred.clone(), Vec::new()), &repo).expect("held");
+    assert_eq!(held.rows.len(), 2, "{held:?}");
+    let row = &held.rows[0];
+    assert_eq!(row.rule_id, "learn-linked-issue");
+    assert_eq!(row.status, crate::rule_check::RuleStatus::Unchecked);
+    assert!(row.reason.contains("did not hand back"), "{row:?}");
+    assert!(!row.rule_key.is_empty());
+    assert_eq!(held.rows[1].rule_id, "retired-rule");
+    assert!(held.rows[1].reason.contains("no longer in force"));
+    assert!(held.rows.iter().all(|r| r.evidence_key.is_some()));
+    let hold = held.hold().expect("unchecked holds");
+    assert_eq!(hold.rule_ids, ["learn-linked-issue", "retired-rule"]);
+    assert!(hold.reason.contains("skip"), "{}", hold.reason);
+    assert!(
+        runner.0.lock().unwrap().is_empty(),
+        "no judge asked: no text"
+    );
+
+    // The person's skips, as the gate lands them from those rows: skipped, labelled, no hold.
+    let skips: Vec<_> = held.rows.iter().map(skip_of).collect();
+    let skipped = delivery_rule_check(&ctx(db.clone(), deferred.clone(), skips.clone()), &repo)
+        .expect("reported");
+    assert!(skipped
+        .rows
+        .iter()
+        .all(|r| r.status == crate::rule_check::RuleStatus::Skipped));
+    assert!(skipped.rows[0].reason.contains("checked by hand"));
+    assert!(skipped.hold().is_none(), "{skipped:?}");
+    assert!(skipped.denial().is_none());
+
+    // With text to read, the no-text skip does not cover the rule: the judge rules, and broken
+    // denies. The retired rule's skip still answers its row (it has no text to be judged on).
+    std::fs::write(&out, "Fix add()\n\nRefs: #1\n").unwrap();
+    let judged =
+        delivery_rule_check(&ctx(db.clone(), deferred.clone(), skips), &repo).expect("checked");
+    assert_eq!(judged.denial().unwrap().rule_ids, ["learn-linked-issue"]);
+    let retired = judged
+        .rows
+        .iter()
+        .find(|r| r.rule_id == "retired-rule")
+        .unwrap();
+    assert_eq!(retired.status, crate::rule_check::RuleStatus::Skipped);
+    assert!(judged.hold().is_none(), "{judged:?}");
+
+    // The rules cannot be read: each deferred id is still named, and can still be skipped.
+    let bad_db = repo.join("no-such-dir/none.db").display().to_string();
+    let unreadable = delivery_rule_check(&ctx(bad_db.clone(), deferred.clone(), Vec::new()), &repo)
+        .expect("held");
+    assert_eq!(unreadable.rows.len(), 2, "{unreadable:?}");
+    assert!(unreadable.hold().is_some());
+    let skips: Vec<_> = unreadable.rows.iter().map(skip_of).collect();
+    let both = delivery_rule_check(&ctx(bad_db, deferred, skips), &repo).expect("reported");
+    assert!(both.hold().is_none(), "{both:?}");
+}
+
 #[path = "cli_runner_rule_council_tests.rs"]
 mod council;

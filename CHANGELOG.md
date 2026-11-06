@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A deliver rule check that cannot run names each deferred rule (e2e-1105 F4c).** When the delivery hands back
+  no pull request text, or the rules cannot be read, every rule deferred to delivery gets an `unchecked` row with an
+  evidence key instead of a report with no rows. The gate still holds, and now the person can skip each rule with a
+  written reason (`skip_rules`, labelled on the run, the gate and the delivery) as well as re-check it; before, the
+  check had nothing to skip and "Re-check the rules" could loop forever. A deferred rule no longer in force (which
+  already held) now carries an evidence key too, so it can be skipped instead of looping. A skip given when there was
+  no text to judge answers only that: once the delivery hands back text, the rule is judged and a broken verdict denies.
+
 - **Fixed: a rule's machine check no longer refuses work the rule is not about (F11).** Studio's Learn starter "Tests
   with every fix" (`check:test-fails-on-base`, no step scope) refused every new app by chat: an apps turn adds
   `queries/*.sql` and no test. A machine obligation now decides its rule alone only where a step scope the rule's
