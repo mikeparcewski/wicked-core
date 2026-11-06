@@ -469,8 +469,9 @@ pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
         .unwrap_or_default();
     if review::applies(unit) {
         return format!(
-            "{}{floor}",
-            review::evidence_directive(skill, review::resume_dir(unit))
+            "{}{floor}{}",
+            review::evidence_directive(skill, review::resume_dir(unit)),
+            review::redo_note(unit)
         );
     }
     unit.qe_acceptance

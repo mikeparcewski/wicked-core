@@ -1347,3 +1347,226 @@ fn millis_format_as_node_writes_them_and_round_trip() {
         assert_eq!(millis_iso(iso_millis(s).unwrap()), s);
     }
 }
+
+// ── F23: redo the QE check on a non-verdict ─────────────────────────────────────────────────────
+
+fn record(outcome: &str, verdict: Option<&str>, seat: &str) -> QeReview {
+    QeReview {
+        outcome: outcome.into(),
+        reason: format!("the reviewer on `{seat}` said {outcome}"),
+        evidence_dir: Some("/l/.wicked-qe/evidence/old".into()),
+        qe_run_id: Some("old".into()),
+        tree: Some("t1".into()),
+        verdict: verdict.map(str::to_string),
+        attempts: vec![QeReviewAttempt {
+            seat: seat.into(),
+            basis: BASIS_DISTINCT.into(),
+            same_cli: false,
+            status: "verdict".into(),
+            session: "old-nonce".into(),
+            governed: true,
+            tool_activity: true,
+            attempt: 1,
+        }],
+    }
+}
+
+/// The QE unit at its gate: `review` is its last record, and the fold's denial of it.
+fn parked(review: QeReview, ledger: &Path) -> WorkUnit {
+    let mut u = qe_unit("pi", ledger);
+    u.denial = denial(&review);
+    u.qe_review = Some(review);
+    u.last_attempt = Some(1);
+    u
+}
+
+fn redo(u: &mut WorkUnit) {
+    let rec = redo_record(u, "mike", 1).expect("a non-verdict is redone");
+    u.qe_redos.push(rec);
+    u.qe_review = None;
+}
+
+/// (F23) INCONCLUSIVE, then a redo: the executor takes its evidence again (no `--resume`, the
+/// redo's note in its directive), the seat that gave no verdict is tried last in its tier, a NEW
+/// reviewer session reviews a NEW QE run, and its PASS binds as the reviewer's PASS: nothing about
+/// it is the operator's.
+#[test]
+fn a_redo_takes_fresh_evidence_on_a_fresh_seat_and_its_pass_is_the_reviewers() {
+    let (first, _) = review_with(
+        vec![("claude", "inconclusive")],
+        vec![
+            seat("claude", BASIS_DISTINCT),
+            seat("codex", BASIS_DISTINCT),
+        ],
+    );
+    let first = first.unwrap();
+    assert_eq!(first.outcome, OUTCOME_INCONCLUSIVE);
+    let first_nonce = first.attempts[0].session.clone();
+
+    let l = Ledger::new("redo");
+    let mut u = parked(first.clone(), &l.root);
+    u.qe_review.as_mut().unwrap().tree = Some("t1".into());
+    assert_eq!(redo_offer(&u), Ok(1), "two redos per tree, none taken yet");
+    redo(&mut u);
+    let rec = &u.qe_redos[0];
+    assert_eq!(
+        (rec.outcome.as_str(), rec.tree.as_deref(), rec.seats.clone()),
+        (OUTCOME_INCONCLUSIVE, Some("t1"), vec!["claude".to_string()])
+    );
+    assert_eq!(rec.by, "mike");
+    assert!(rec.reason.contains("Rolldown binding"), "{}", rec.reason);
+    // No resume of the inconclusive QE run: the executor takes its evidence again, and is told why.
+    assert_eq!(resume_dir(&u), None);
+    let directive = super::super::unit_directive(&u, "q");
+    assert!(!directive.contains("--resume"), "{directive}");
+    assert!(
+        directive.contains("This is QE redo 1 of 2") && directive.contains("Rolldown binding"),
+        "{directive}"
+    );
+    // The seat that gave no verdict goes last in its tier; the executor-seat tier keeps its place.
+    let order = prefer_fresh(
+        vec![
+            seat("claude", BASIS_DISTINCT),
+            seat("codex", BASIS_DISTINCT),
+            seat("pi", BASIS_EXECUTOR),
+        ],
+        &u,
+        Some("t1"),
+    );
+    let names: Vec<&str> = order.iter().map(|c| c.seat.as_str()).collect();
+    assert_eq!(names, ["codex", "claude", "pi"]);
+
+    // The redone attempt: a new QE run, reviewed by codex in a new session, which records PASS.
+    let (id2, dir2) = l.evidence(RUN, &now_iso());
+    u.qe_reviewer_seats = order;
+    let scripted = Arc::new(Scripted {
+        ledger: l.root.clone(),
+        qe_run: id2.clone(),
+        answers: vec![("codex", "pass"), ("claude", "inconclusive")],
+        seen: Mutex::new(Vec::new()),
+    });
+    let runner: Arc<dyn StepRunner> = scripted.clone();
+    let got = run(
+        &runner,
+        &input_for(u.clone()),
+        &executor_output(&dir2.to_string_lossy()),
+        0,
+        &|_: &str| {},
+    )
+    .unwrap();
+    assert_eq!(got.outcome, OUTCOME_PASS, "{got:?}");
+    assert_eq!(got.verdict.as_deref(), Some("PASS"));
+    assert_eq!(got.qe_run_id.as_deref(), Some(id2.as_str()), "a new QE run");
+    let seen = scripted.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "the fresh seat answered first");
+    assert_eq!(seen[0].unit.assigned_cli.as_deref(), Some("codex"));
+    assert!(seen[0].prior_outputs.is_empty());
+    assert!(
+        !seen[0].unit.description.contains("QE redo"),
+        "the isolated reviewer never sees the redo note"
+    );
+    let a = &got.attempts[0];
+    assert_eq!(
+        (a.seat.as_str(), a.basis.as_str()),
+        ("codex", BASIS_DISTINCT)
+    );
+    assert_ne!(a.session, first_nonce, "a new reviewer session");
+    assert_eq!(Some(&a.session), seen[0].unit.qe_review_session.as_ref());
+    // The ledger's newest verdict on that run is the reviewer's own, stamped with its session.
+    let v = newest(&l, &id2);
+    assert_eq!(field(&v, "verdict"), Some("PASS"));
+    assert_eq!(field(&v, "review_session"), Some(a.session.as_str()));
+    assert_eq!(field(&v, "reviewer"), Some("acceptance-test-reviewer"));
+    // A PASS denies nothing and is never recorded as the operator's judgment.
+    assert!(denial(&got).is_none());
+    let mut done = u.clone();
+    done.qe_review = Some(got);
+    assert!(operator_judged(&done, "mike").is_none());
+    assert!(non_verdict(&done).is_none());
+}
+
+/// (F23) Which records a redo answers, and the cap: 2 per unit and tree, a new tree starts over.
+#[test]
+fn a_redo_answers_only_a_non_verdict_and_is_capped_at_two_per_tree() {
+    let l = Ledger::new("cap");
+    // INCONCLUSIVE, no reviewer, no bound verdict: each is no verdict on the work.
+    for (outcome, verdict) in [
+        (OUTCOME_INCONCLUSIVE, Some("FAIL")),
+        (OUTCOME_UNAVAILABLE, None),
+        (OUTCOME_INVALID, None),
+    ] {
+        let u = parked(record(outcome, verdict, "claude"), &l.root);
+        assert!(non_verdict(&u).is_some(), "{outcome}");
+        assert_eq!(redo_offer(&u), Ok(1), "{outcome}");
+    }
+    // A recorded FAIL is a verdict; so is a stale record that kept its verdict.
+    for (outcome, verdict) in [
+        (OUTCOME_FAIL, Some("FAIL")),
+        (OUTCOME_INVALID, Some("FAIL")),
+    ] {
+        let u = parked(record(outcome, verdict, "claude"), &l.root);
+        assert!(non_verdict(&u).is_none(), "{outcome} {verdict:?}");
+        assert!(redo_offer(&u).is_err());
+    }
+    // A unit another layer denied is not the QE record's gate.
+    let mut other = parked(
+        record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"),
+        &l.root,
+    );
+    other.denial = Some(crate::domain::UnitDenial::new("repo_checks", "red"));
+    assert!(non_verdict(&other).is_none());
+    // A run that no longer requires QE acceptance takes no redo.
+    let mut skipped = parked(
+        record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"),
+        &l.root,
+    );
+    skipped.qe_acceptance = None;
+    assert!(redo_offer(&skipped).is_err());
+
+    // INCONCLUSIVE again after a redo: offered again, then refused at the cap, with why.
+    let mut u = parked(
+        record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"),
+        &l.root,
+    );
+    redo(&mut u);
+    u.qe_review = Some(record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "codex"));
+    assert_eq!(redo_offer(&u), Ok(0), "the second redo is the last");
+    assert!(redo_note(&u).contains("QE redo 1 of 2"));
+    redo(&mut u);
+    assert!(redo_note(&u).contains("QE redo 2 of 2"));
+    u.qe_review = Some(record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"));
+    let why = redo_offer(&u).unwrap_err();
+    assert!(why.contains("already redone 2 times on this tree"), "{why}");
+    // Both seats that gave no verdict are tried last, in their tier.
+    let names: Vec<String> = prefer_fresh(
+        vec![
+            seat("claude", BASIS_DISTINCT),
+            seat("codex", BASIS_DISTINCT),
+            seat("gemini", BASIS_DISTINCT),
+        ],
+        &u,
+        Some("t1"),
+    )
+    .into_iter()
+    .map(|c| c.seat)
+    .collect();
+    assert_eq!(names, ["gemini", "claude", "codex"]);
+    // A new tree (after a send-back) starts the count over; the old redos neither cap it nor
+    // reorder its seats.
+    let mut r = record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude");
+    r.tree = Some("t2".into());
+    u.qe_review = Some(r);
+    assert_eq!(redo_offer(&u), Ok(1));
+    let names: Vec<String> = prefer_fresh(
+        vec![
+            seat("claude", BASIS_DISTINCT),
+            seat("codex", BASIS_DISTINCT),
+        ],
+        &u,
+        Some("t2"),
+    )
+    .into_iter()
+    .map(|c| c.seat)
+    .collect();
+    assert_eq!(names, ["claude", "codex"]);
+}

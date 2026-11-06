@@ -1532,6 +1532,12 @@ pub struct WorkUnit {
     /// every unit that ran no reviewer (skipped on the wire).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_review: Option<QeReview>,
+    /// (F23) Every "redo the QE check" the operator asked for on this unit (gate action
+    /// `retry_qe`), oldest first: each answered a reviewer record that was no verdict on the work.
+    /// It caps the redos per tree and tells the next dispatch which reviewer seats to try last.
+    /// Never a verdict itself (skipped on the wire when empty).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qe_redos: Vec<QeRedo>,
     /// (DES-RULE-CHECK-001 S2) The run's steps as the gate selects them (each unit's `unit-<n>`,
     /// phase id and catalog id, and kind), stamped at dispatch on a review unit so the rule check
     /// on the worker can match `applies_to` against the whole run. Empty on every other unit.
@@ -1620,6 +1626,30 @@ pub struct QeReview {
     /// Every reviewer turn of the attempt, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attempts: Vec<QeReviewAttempt>,
+}
+
+/// (F23) One "redo the QE check" ([`crate::workflow::HumanDecision::RetryQe`]): the QE unit ran
+/// again from fresh evidence, with a new isolated reviewer session, because its last reviewer record
+/// was no verdict on the work (inconclusive, no reviewer, or no bound verdict).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QeRedo {
+    /// The tree the redone record was taken on (the cap counts redos per tree).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
+    /// The unit attempt whose record was redone.
+    pub from_attempt: u32,
+    /// The redone record's outcome (`inconclusive` | `unavailable` | `invalid`).
+    pub outcome: String,
+    /// The seats that record's reviewer turns ran on: the next dispatch tries them last in their
+    /// basis tier, so a seat that gave no verdict is not the first one asked again.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seats: Vec<String>,
+    /// The record's reason, bounded (what the reviewer said it could not do).
+    pub reason: String,
+    /// Who asked for the redo (the gate's actor, else `operator`).
+    pub by: String,
+    /// When (unix millis).
+    pub at: i64,
 }
 
 /// One reviewer turn: the seat, its basis and how the turn ended.
@@ -1864,6 +1894,7 @@ impl WorkUnit {
             qe_floor_note: None,
             qe_review_session: None,
             qe_review: None,
+            qe_redos: Vec::new(),
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),

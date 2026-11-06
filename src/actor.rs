@@ -9191,17 +9191,33 @@ fn denial_gate_prompt(
         // (j4-gates) The QE reviewer ran but could not run its checks on its seat: its words say
         // what could not run. Approve is the operator's judgment, and the run's QE decision becomes
         // theirs (`qe_acceptance::review::operator_judged`), labelled on every later surface.
+        // (F23) The redo of the QE check leads: an infrastructure miss is not the person's verdict.
         "judge_unavailable"
             if source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE =>
         {
             format!(
             "Unit {ord}'s QE acceptance is INCONCLUSIVE — the isolated reviewer could not run its \
-             checks: {}. No product failure was found and none was ruled out. Approve to judge it \
+             checks: {}. No product failure was found and none was ruled out.{} Approve to judge it \
              yourself (it counts; the run's QE acceptance becomes skipped by operator, labelled \
              \"QE acceptance: skipped by operator\" on the run, every gate and the delivery), \
              request changes to send it back for rework, or reject to cancel the run{note}",
-            reason_head(reason)
+            reason_head(reason),
+            qe_redo_clause(unit)
         )
+        }
+        // (F23) No isolated reviewer could run: the same "judge it yourself" gate, led by the redo
+        // (once a reviewer seat can run again).
+        "judge_unavailable"
+            if source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE =>
+        {
+            format!(
+                "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
+                 not rejected.{} Approve to judge it yourself (it counts, labelled \"judged by \
+                 operator\"), request changes to send it back for rework, or reject to cancel the \
+                 run{note}",
+                reason_head(reason),
+                qe_redo_clause(unit)
+            )
         }
         // (DES-RULE-CHECK-001 S2) A broken steering rule: send it back, run it again, or stop.
         CLASS_RULE_BROKEN => format!(
@@ -9249,12 +9265,37 @@ fn denial_gate_prompt(
             } else {
                 ""
             };
+            // (F23) A QE record that bound no verdict leads with the redo of the QE check.
+            let redo = qe_redo_clause(unit);
+            let confirm = if redo.is_empty() { " confirm" } else { " Or confirm" };
             format!(
-                "Unit {ord} verdict is NOT PASS{said} — confirm to retry the phase, request \
+                "Unit {ord} verdict is NOT PASS{said} —{redo}{confirm} to retry the phase, request \
                  changes to send the review back to the creator phase,{skip} or reject to cancel \
                  the run{note}"
             )
         }
+    }
+}
+
+/// (F23) The prompt's "redo the QE check" clause for a QE unit whose isolated reviewer gave no
+/// verdict on the work ([`crate::qe_acceptance::review::non_verdict`]): offered with what it does
+/// and how many redos stay, or — at the cap, or once QE acceptance is no longer required — why it
+/// is not offered. Empty for every other gate. It never says "approve": the redo is not a verdict.
+fn qe_redo_clause(unit: &crate::domain::WorkUnit) -> String {
+    use crate::qe_acceptance::review as r;
+    if r::non_verdict(unit).is_none() {
+        return String::new();
+    }
+    match r::redo_offer(unit) {
+        Ok(left) => format!(
+            " Redo the QE check (action `{}`): the QE step takes its evidence again and a new \
+             isolated reviewer session judges it, on another reviewer seat when one can run. It is \
+             not a verdict: only that reviewer's PASS counts ({left} more redo{} on this tree \
+             after this one).",
+            crate::workflow::RETRY_QE_ACTION,
+            if left == 1 { "" } else { "s" }
+        ),
+        Err(why) => format!(" The QE check is not offered again: {why}."),
     }
 }
 
@@ -11478,8 +11519,14 @@ fn dispatch_unit(
         } else {
             Vec::new()
         };
+        // (F23) After a redo of the QE check, a seat whose record gave no verdict on this tree is
+        // tried last in its basis tier: who may review is still `candidates`' decision alone.
         stamped.qe_reviewer_seats = if crate::qe_acceptance::review::applies(&stamped) {
-            crate::qe_acceptance::review::candidates(&session, &units, &stamped)
+            crate::qe_acceptance::review::prefer_fresh(
+                crate::qe_acceptance::review::candidates(&session, &units, &stamped),
+                &stamped,
+                stamped.worktree_baseline.as_ref().map(|b| b.tree.as_str()),
+            )
         } else {
             Vec::new()
         };
@@ -14583,12 +14630,13 @@ fn confirm_plan_gate(
         | HumanDecision::AmendIntent { .. }
         | HumanDecision::ConsentChoice { .. }
         | HumanDecision::Rejudge
+        | HumanDecision::RetryQe
         | HumanDecision::RecheckRules { .. }
         | HumanDecision::OperatorJudgment { .. }
         | HumanDecision::SkipQe { .. } => anyhow::bail!(
             "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
-             amendment, a judge re-run or a QE skip — approve, approve with an edited plan, or \
-             reject"
+             amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
+             plan, or reject"
         ),
     }
     // (crew#1139) THE OPERATOR'S NOTE: an approve's `amend` (with or without an edited plan) is
@@ -15830,6 +15878,7 @@ pub(crate) fn confirm_gate_expecting(
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
             | crate::workflow::HumanDecision::Rejudge
+            | crate::workflow::HumanDecision::RetryQe
                 if adjudication_open =>
             {
                 anyhow::bail!(
@@ -15879,14 +15928,21 @@ pub(crate) fn confirm_gate_expecting(
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
             | crate::workflow::HumanDecision::Rejudge
+            | crate::workflow::HumanDecision::RetryQe
             | crate::workflow::HumanDecision::RecheckRules { .. }
                 if team_gate::transport_gate_open(&session)
                     || team_gate::dispute_gate_open(&session) =>
             {
                 anyhow::bail!(
                     "a team pause takes approve, request changes or reject — not a floor re-run, \
-                     an evaluator's edit, an intent amendment or a judge re-run"
+                     an evaluator's edit, an intent amendment, a judge re-run or a QE redo"
                 );
+            }
+            // (F23) Refused HERE, before the row resolves, unless the cursor unit's QE reviewer
+            // gave no verdict, QE acceptance is still required, the cap allows it and a reviewer
+            // seat can run now.
+            crate::workflow::HumanDecision::RetryQe => {
+                qe_redo_check(&session, &units, cursor, run_id)?;
             }
             // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
             // the engine's judge selection names a seat now — the row stays open otherwise.
@@ -15987,6 +16043,10 @@ pub(crate) fn confirm_gate_expecting(
             .to_string(),
             crate::workflow::HumanDecision::Rejudge => serde_json::json!({
                 "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
+            })
+            .to_string(),
+            crate::workflow::HumanDecision::RetryQe => serde_json::json!({
+                "approve": true, "action": crate::workflow::RETRY_QE_ACTION, "amend": null,
             })
             .to_string(),
             // (DES-RULE-CHECK-001 S2) The skips (id + reason) are the durable answer's record.
@@ -16265,6 +16325,8 @@ pub(crate) fn confirm_gate_expecting(
     let mut adopt_suggestion = false;
     // (rejudge) The operator re-armed the judge of the cursor unit's `judge_unavailable` gate.
     let mut rejudge = false;
+    // (F23) The operator asked to redo the QE check of the cursor unit (no verdict on the work).
+    let mut qe_redo = false;
     // The operator's plain approve (retry, with or without a note) — the one answer that arms a
     // re-run of an escalated unit's floor on an unchanged tree.
     let mut operator_retry = false;
@@ -16322,6 +16384,13 @@ pub(crate) fn confirm_gate_expecting(
         // below, after the boundary check).
         crate::workflow::HumanDecision::Rejudge => {
             rejudge = true;
+            (None, crate::workflow::AmendScope::Cursor, None)
+        }
+        // (F23) A redo of the QE check is a re-dispatch of the QE unit, as the operator's retry
+        // (its floor re-runs once on an unchanged tree), from fresh evidence (applied below).
+        crate::workflow::HumanDecision::RetryQe => {
+            operator_retry = true;
+            qe_redo = true;
             (None, crate::workflow::AmendScope::Cursor, None)
         }
         // (DES-RULE-CHECK-001 S2) A rule re-check rides the re-judge re-dispatch: the seat does
@@ -16479,6 +16548,36 @@ pub(crate) fn confirm_gate_expecting(
                         }
                     }
                 }
+            }
+            // (F23) THE REDO OF THE QE CHECK: recorded on the unit (who, when, the record it redoes,
+            // the seats that gave no verdict), and the unit's last reviewer record dropped, so the
+            // next attempt takes its evidence again (no resume of that QE run) and a new reviewer
+            // session judges it. Nothing is counted and the run's QE decision is not touched: only
+            // that reviewer's bound PASS counts the unit.
+            if qe_redo {
+                let mut units = crate::domain::session_units(store, run_id)?;
+                let cursor = units
+                    .get_mut(session.unit_ix)
+                    .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+                let by = actor
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                    .unwrap_or("operator");
+                let redo = crate::qe_acceptance::review::redo_record(
+                    cursor,
+                    by,
+                    crate::interaction::now_millis(),
+                )
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run {run_id}: unit {}'s QE record is no longer one a redo answers",
+                        cursor.ord
+                    )
+                })?;
+                cursor.qe_redos.push(redo);
+                cursor.qe_review = None;
+                put_node(store, cursor.to_node())?;
             }
             // The OPERATOR RETRY of an escalated unit: its floor re-runs ONCE on the next attempt
             // even when that attempt leaves the tree unchanged (a flaky result is not sticky per
@@ -16918,6 +17017,85 @@ pub(crate) fn rejudge_readiness(
         missing,
         reason: cursor.denial_reason.clone(),
     })
+}
+
+/// (F23) Whether "redo the QE check" answers `run_id`'s open gate: the cursor unit is the run's QE
+/// unit, denied at its escalation gate by a reviewer record that is no verdict on the work
+/// ([`crate::qe_acceptance::review::non_verdict`]), the run still requires QE acceptance, fewer
+/// than [`crate::qe_acceptance::review::QE_REDO_MAX`] redos ran on that tree, it is not a team
+/// member's step, and a reviewer seat can run now ([`crate::qe_acceptance::review::candidates`]:
+/// never an author of the work, unless the run is reduced assurance). The refusal says what is
+/// still offered.
+fn qe_redo_check(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    cursor: Option<&crate::domain::WorkUnit>,
+    run_id: &str,
+) -> anyhow::Result<()> {
+    use crate::qe_acceptance::review as r;
+    let still = "approve to judge it yourself, skip QE acceptance with a reason, request changes, \
+                 or reject";
+    let Some(cursor) = cursor else {
+        anyhow::bail!("run {run_id} has no unit at its cursor to redo the QE check of");
+    };
+    if session.status != SessionStatus::AwaitingHuman
+        || cursor.status != crate::domain::UnitStatus::Rejected
+    {
+        anyhow::bail!(
+            "`{}` answers the gate of a QE step whose reviewer gave no verdict; unit {} is {:?}",
+            crate::workflow::RETRY_QE_ACTION,
+            cursor.ord,
+            cursor.status
+        );
+    }
+    if cursor.member_step.is_some() {
+        anyhow::bail!(
+            "unit {} is a team member's step — its team gate takes approve, request changes or \
+             reject",
+            cursor.ord
+        );
+    }
+    if r::non_verdict(cursor).is_none() {
+        anyhow::bail!(
+            "`{}` answers only a QE review that gave no verdict on the work (inconclusive, no \
+             reviewer, or no bound verdict); unit {} is denied by `{}` — {}",
+            crate::workflow::RETRY_QE_ACTION,
+            cursor.ord,
+            cursor
+                .denial
+                .as_ref()
+                .map(|d| d.source.as_str())
+                .unwrap_or("nothing"),
+            if cursor
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.source == r::DENIAL_SOURCE_QE_REVIEW)
+            {
+                "the reviewer's verdict stands: confirm to retry the phase, request changes, skip \
+                 QE acceptance with a reason, or reject"
+            } else {
+                "approve, request changes or reject"
+            }
+        );
+    }
+    if !session.assurance.qe.as_ref().is_some_and(|q| q.required()) {
+        anyhow::bail!(
+            "run {run_id} no longer requires QE acceptance (its QE decision was skipped or \
+             waived) — approve, request changes or reject"
+        );
+    }
+    if let Err(why) = r::redo_offer(cursor) {
+        anyhow::bail!("unit {}: {why} — {still}", cursor.ord);
+    }
+    if r::candidates(session, units, cursor).is_empty() {
+        anyhow::bail!(
+            "no run seat can review unit {}'s QE evidence in isolation now (every seat is benched, \
+             excluded, an author of the work, or does not admit the QE skill) — sign a distinct \
+             seat in and redo the QE check, or {still}",
+            cursor.ord
+        );
+    }
+    Ok(())
 }
 
 /// (rejudge) The re-judge to arm on `run_id`'s cursor unit — refused (the gate stays open) unless
@@ -27834,6 +28012,305 @@ mod request_changes_tests {
         let p = denial_gate_prompt(&u, "floor_failed", "repo checks failed", None, "");
         assert!(p.contains("also: a tool call was refused (`Bash`)"), "{p}");
         assert!(!p.contains("DENIED by input governance"), "{p}");
+    }
+
+    // ── F23: redo the QE check on a non-verdict ────────────────────────────────────────────────
+
+    /// The verify unit (ord 4, index 3) of a seeded bug run, parked at its QE gate: `denial` and
+    /// `review` are the fold's record of its isolated reviewer. Seats: `claude` built the work,
+    /// `codex` is a distinct reviewer seat (`with_distinct`), on a run that is not reduced assurance.
+    fn park_qe_gate(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        denial: UnitDenial,
+        review: crate::domain::QeReview,
+        with_distinct: bool,
+    ) {
+        let mut session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        session.status = SessionStatus::AwaitingHuman;
+        session.unit_ix = 3;
+        session.clis = if with_distinct {
+            vec!["claude".into(), "codex".into()]
+        } else {
+            vec!["claude".into()]
+        };
+        let qe = session.assurance.qe.clone();
+        session.assurance = crate::assurance::RunAssurance::new(None, false);
+        session.assurance.qe = qe;
+        put_node(store, session.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let v = &mut units[3];
+        v.status = UnitStatus::Rejected;
+        v.denial_reason = Some(denial.reason.clone());
+        v.denial = Some(denial);
+        v.qe_review = Some(review);
+        v.qe_ledger_root = Some("/l/.wicked-qe".into());
+        v.repo_checks_floor = true;
+        put_node(store, v.to_node()).unwrap();
+    }
+
+    fn qe_record(outcome: &str, verdict: Option<&str>) -> crate::domain::QeReview {
+        crate::domain::QeReview {
+            outcome: outcome.into(),
+            reason:
+                "the isolated QE reviewer on `codex` (distinct) recorded FAIL on QE run dd76 as \
+                     INCONCLUSIVE — it could not run its checks: no macOS sandbox tool on the seat"
+                    .into(),
+            evidence_dir: Some("/l/.wicked-qe/evidence/dd76".into()),
+            qe_run_id: Some("dd76".into()),
+            tree: Some("t".into()),
+            verdict: verdict.map(str::to_string),
+            attempts: vec![crate::domain::QeReviewAttempt {
+                seat: "codex".into(),
+                basis: crate::qe_acceptance::review::BASIS_DISTINCT.into(),
+                same_cli: false,
+                status: "verdict".into(),
+                session: "n-1".into(),
+                governed: true,
+                tool_activity: true,
+                attempt: 0,
+            }],
+        }
+    }
+
+    /// (F23) At an INCONCLUSIVE QE gate the redo leads the prompt and names the reviewer's reason;
+    /// `retry_qe` re-dispatches the QE unit from fresh evidence (its record dropped, the redo on
+    /// the record) and is never a verdict: no operator judgment, QE acceptance still required, no
+    /// QE decision event. Twice; the third is refused at the cap, and the plain approve is still the
+    /// operator's own judgment, exactly as before.
+    #[test]
+    fn retry_qe_redoes_an_inconclusive_qe_check_up_to_the_cap_and_is_never_a_verdict() {
+        let run_id = format!("f23-redo-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        for round in 1..=3usize {
+            park_qe_gate(
+                &mut store,
+                &run_id,
+                qe_inconclusive(),
+                qe_record(
+                    crate::qe_acceptance::review::OUTCOME_INCONCLUSIVE,
+                    Some("FAIL"),
+                ),
+                true,
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let u = &units[3];
+            let class = denial_class(u.denial.as_ref(), false);
+            assert_eq!(class, "judge_unavailable");
+            let p = denial_gate_prompt(u, class, u.denial_reason.as_deref().unwrap(), None, "");
+            let judge_at = p.find("Approve to judge it yourself").expect(&p);
+            if round < 3 {
+                let redo_at = p.find("Redo the QE check (action `retry_qe`)").expect(&p);
+                assert!(redo_at < judge_at, "the redo leads: {p}");
+                assert!(p.contains("no macOS sandbox tool on the seat"), "{p}");
+                assert!(p.contains("It is not a verdict"), "{p}");
+                let left = if round == 1 {
+                    "(1 more redo on"
+                } else {
+                    "(0 more redos on"
+                };
+                assert!(p.contains(left), "{p}");
+            } else {
+                assert!(!p.contains("action `retry_qe`"), "{p}");
+                assert!(
+                    p.contains("not offered again: the QE check was already redone 2 times"),
+                    "{p}"
+                );
+            }
+            let (r, evs) = answer(&mut store, &run_id, HumanDecision::RetryQe);
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            if round == 3 {
+                let err = r.expect_err("the third redo is refused").to_string();
+                assert!(err.contains("already redone 2 times"), "{err}");
+                assert_eq!(
+                    session.status,
+                    SessionStatus::AwaitingHuman,
+                    "the gate stays open"
+                );
+                assert_eq!(units[3].qe_redos.len(), 2);
+                break;
+            }
+            r.unwrap_or_else(|e| panic!("round {round}: {e}"));
+            let v = &units[3];
+            assert_eq!(session.unit_ix, 3, "the QE unit runs again");
+            assert!(
+                v.qe_review.is_none(),
+                "the inconclusive record is not resumed"
+            );
+            assert_eq!(crate::qe_acceptance::review::resume_dir(v), None);
+            assert_eq!(v.qe_redos.len(), round);
+            let rec = v.qe_redos.last().unwrap();
+            assert_eq!(rec.by, "mike");
+            assert_eq!(
+                rec.outcome,
+                crate::qe_acceptance::review::OUTCOME_INCONCLUSIVE
+            );
+            assert_eq!(rec.seats, vec!["codex".to_string()]);
+            assert!(evs
+                .iter()
+                .any(|e| matches!(e, CoreEvent::UnitDispatched { ord: 4, .. })));
+            // The re-dispatch's own QE decision (every QE dispatch scores it) stays required: the
+            // redo never skips or decides it.
+            assert!(evs.iter().all(|e| match e {
+                CoreEvent::QeAcceptanceDecided { qe, .. } => qe.required(),
+                _ => true,
+            }));
+            assert!(
+                session.assurance.qe.as_ref().is_some_and(|q| q.required()),
+                "a redo never decides QE: {:?}",
+                session.assurance.qe
+            );
+            assert!(v
+                .assurance
+                .as_ref()
+                .is_none_or(|a| a.operator_judges.is_empty()
+                    && !a.ran.iter().any(|i| i == crate::assurance::OPERATOR_JUDGE)));
+            assert_ne!(v.status, UnitStatus::Done, "a redo counts nothing");
+        }
+        // At the cap the person's own judgment is still there, unchanged.
+        let (r, _) = answer(
+            &mut store,
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        );
+        r.unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let qe = session.assurance.qe.as_ref().unwrap();
+        assert_eq!(
+            (qe.status.as_str(), qe.basis.as_str()),
+            (
+                crate::assurance::QE_SKIPPED,
+                crate::assurance::QE_BASIS_OPERATOR
+            )
+        );
+    }
+
+    /// (F23) No reviewer at all, and a record that bound no verdict, take the redo too (each leads
+    /// its prompt); a recorded FAIL refuses it (the reviewer's verdict stands); a run whose only
+    /// other seat built the work has no reviewer seat to redo it on (the creator never reviews).
+    #[test]
+    fn retry_qe_answers_every_non_verdict_and_never_a_fail_or_the_creators_seat() {
+        use crate::qe_acceptance::review as r;
+        let unavailable = UnitDenial::new(
+            r::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE,
+            "QE acceptance: every reviewer seat failed as a seat (codex: seat_failure:quota)",
+        );
+        let unbound = UnitDenial::new(
+            r::DENIAL_SOURCE_QE_REVIEW,
+            "QE acceptance: the QE evidence could not be bound: no run record",
+        );
+        for (name, denial, outcome, lead) in [
+            (
+                "unavail",
+                unavailable,
+                r::OUTCOME_UNAVAILABLE,
+                "The work was not rejected. Redo",
+            ),
+            (
+                "unbound",
+                unbound,
+                r::OUTCOME_INVALID,
+                "— Redo the QE check",
+            ),
+        ] {
+            let run_id = format!("f23-{name}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_judge_unavailable_verify(&mut store, &run_id);
+            require_qe(&mut store, &run_id);
+            park_qe_gate(&mut store, &run_id, denial, qe_record(outcome, None), true);
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let u = &units[3];
+            let class = denial_class(u.denial.as_ref(), false);
+            let p = denial_gate_prompt(u, class, u.denial_reason.as_deref().unwrap(), None, "");
+            assert!(p.contains(lead), "{name}: {p}");
+            if outcome == r::OUTCOME_INVALID {
+                assert!(p.contains("Or confirm to retry the phase"), "{p}");
+            } else {
+                assert!(
+                    p.contains("could not be judged — no eligible judge seat"),
+                    "{p}"
+                );
+            }
+            let (res, _) = answer(&mut store, &run_id, HumanDecision::RetryQe);
+            res.unwrap_or_else(|e| panic!("{name}: {e}"));
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            assert_eq!(units[3].qe_redos.len(), 1, "{name}");
+        }
+
+        // A recorded FAIL: the verdict stands; the prompt does not offer the redo.
+        let run_id = format!("f23-fail-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        park_qe_gate(
+            &mut store,
+            &run_id,
+            qe_fail(),
+            qe_record(r::OUTCOME_FAIL, Some("FAIL")),
+            true,
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let p = denial_gate_prompt(&units[3], "verdict_not_pass", &qe_fail().reason, None, "");
+        assert!(!p.contains("retry_qe"), "{p}");
+        assert!(p.contains("— confirm to retry the phase"), "unchanged: {p}");
+        let (res, _) = answer(&mut store, &run_id, HumanDecision::RetryQe);
+        let err = res.expect_err("a FAIL is a verdict").to_string();
+        assert!(err.contains("the reviewer's verdict stands"), "{err}");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+
+        // Only the creator's seat on the run: no reviewer seat may redo it.
+        let run_id = format!("f23-creator-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        park_qe_gate(
+            &mut store,
+            &run_id,
+            qe_inconclusive(),
+            qe_record(r::OUTCOME_INCONCLUSIVE, Some("FAIL")),
+            false,
+        );
+        let (res, _) = answer(&mut store, &run_id, HumanDecision::RetryQe);
+        let err = res.expect_err("no distinct reviewer seat").to_string();
+        assert!(err.contains("no run seat can review unit 4"), "{err}");
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert!(units[3].qe_redos.is_empty());
+
+        // A run that no longer requires QE acceptance takes no redo.
+        let run_id = format!("f23-skipped-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        require_qe(&mut store, &run_id);
+        park_qe_gate(
+            &mut store,
+            &run_id,
+            qe_inconclusive(),
+            qe_record(r::OUTCOME_INCONCLUSIVE, Some("FAIL")),
+            true,
+        );
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        s.assurance.qe.as_mut().unwrap().status = crate::assurance::QE_SKIPPED.into();
+        put_node(&mut store, s.to_node()).unwrap();
+        let (res, _) = answer(&mut store, &run_id, HumanDecision::RetryQe);
+        assert!(res
+            .unwrap_err()
+            .to_string()
+            .contains("no longer requires QE acceptance"));
     }
 }
 
