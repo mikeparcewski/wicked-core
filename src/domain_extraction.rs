@@ -259,8 +259,9 @@ impl MinSource {
 /// `graph_db` (e2e F29): its own target when one is set, else the daemon's setting — the same rule
 /// as the binary's bare flag ([`wicked_governance::effective_min_coverage_pct`]), read through a
 /// READ-ONLY connection (the store belongs to the run; nothing here writes it). An empty, in-memory
-/// or URL path, or a store that cannot be opened, reads the daemon's setting: the validator hands the
-/// script no store in exactly those cases, so the script applies that minimum too.
+/// or URL path, or a store that cannot be opened, reads the daemon's setting. That is only the
+/// number this note and the denial quote: with no store the script itself takes its file-only
+/// branch (full coverage, no placeholders), and an unreadable store fails the script's recompute.
 pub(crate) fn applied_min_coverage(graph_db: Option<&str>) -> Result<(u8, MinSource), String> {
     let usable = graph_db.filter(|p| !p.is_empty() && *p != ":memory:" && !p.contains("://"));
     if let Some(path) = usable {
@@ -639,6 +640,10 @@ mod tests {
     #[test]
     fn a_governed_coverage_judge_is_told_the_repository_target() {
         use wicked_apps_core::spawn::HardenedCommand;
+        // The graph root reads a process-wide override another test sets under the write lock.
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let dir = std::env::temp_dir().join(format!("wicked-domainext-gov-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let repo = dir.join("repo");

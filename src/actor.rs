@@ -3898,9 +3898,12 @@ pub(crate) fn run(
                 // (e2e F30) A Tool unit's escalation names the send-back when a creator precedes
                 // it: request changes there reworks that creator (the unit is not marked Rejected
                 // at this gate, so `rewind_to_creator_scoped` targets the creator, not the Tool).
+                // Only a CHECK (a Test-stage Tool step, such as qe-author-tests' `verify`) judges a
+                // creator's work; any other Tool (an install, a host step) failing is its own
+                // command's failure, and its send-back re-runs that command (core#803, codex r3).
                 let send_back_to = units
                     .get(unit_ix)
-                    .filter(|u| u.tool_cmd.is_some())
+                    .filter(|u| u.tool_cmd.is_some() && u.stage == crate::domain::StageKind::Test)
                     .and_then(|u| crate::pipeline::most_recent_prior_creator(&units, u.ord))
                     .map(|c| c.ord);
                 let Some(unit) = units.get_mut(unit_ix) else {
@@ -4047,6 +4050,17 @@ pub(crate) fn run(
                     TriageDecision::Escalate(analysis) => {
                         unit.denial_reason =
                             Some(format!("triage escalation: {analysis} — {failure_excerpt}"));
+                        // (e2e F30, codex r3) A Tool that is not a check failed as a COMMAND: it is
+                        // recorded so (Rejected, `worker_failure`), which routes request changes back
+                        // to the command itself (core#803) and lets approve re-run it at a fresh
+                        // attempt. A check stays as it is, so request changes reworks its creator.
+                        if unit.tool_cmd.is_some() && unit.stage != crate::domain::StageKind::Test {
+                            unit.status = crate::domain::UnitStatus::Rejected;
+                            unit.denial = Some(crate::domain::UnitDenial::new(
+                                "worker_failure",
+                                format!("triage escalation: {analysis}"),
+                            ));
+                        }
                         let _ = put_node(&mut store, unit.to_node());
                         let options = match (unit.tool_cmd.is_some(), send_back_to) {
                             (true, Some(c)) => format!(

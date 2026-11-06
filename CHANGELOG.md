@@ -31,18 +31,21 @@ Two release tracks share this file, newest entry first regardless of track:
   the engine recorded for the run (`WICKED_RUN_BASE`, now handed to every generic Tool step; git replacement refs are
   ignored), the run changed no file other than tests, test fixtures and the plan, the base copy fails too, both runs
   print exactly one readable runner summary, and head has no more failing tests, more passing ones and no fewer
-  tests in all than the base. Anything else, including a summary line printed twice (a test can print one), is the
-  run's own failure, as before. The suite check excuses a shared failure only on readable counts with head no worse
+  tests in all than the base (cancelled node subtests, vitest unhandled errors, jest suite errors and playwright flaky
+  tests count as failing; colour is off). Anything else, including a summary line printed twice (a test can print
+  one), is the run's own failure, as before. The suite check excuses a shared failure only on readable counts with head no worse
   and no non-test change (it used to excuse on exit codes alone); without a recorded base it still derives one as
   before. The base runs see the head's installed dependencies (`node_modules`, `.venv`, up to the worktree root).
   The review step is told to fail a `pre-existing-on-base` file when any failing test is not failing on main or any
   added test fails. Known limits, covered by that review and the deliver floor: in one file, a new failing test plus
   a fixed main failure tie the counts; a test that prints a forged summary and then kills its runner before the real
   one is read as that forged summary.
-- **A failed check parks instead of ending the run (e2e F30).** When a Tool step (a check such as verify) exits
-  non-zero and the failure judge rules `fail`, the run now parks at the triage gate ("Unit N failed and triage
-  escalated") instead of ending FAILED: approve runs the check again, request changes sends the work back to the step
-  that made it, reject stops. Agent steps and the deliver step are unchanged. No override of a failed check is added.
+- **A failed check parks instead of ending the run (e2e F30).** When a Tool step exits non-zero and the failure judge
+  rules `fail`, the run now parks at the triage gate ("Unit N failed and triage escalated") instead of ending FAILED.
+  For a check (a Test-stage Tool step such as verify), approve runs the check again, request changes sends the work
+  back to the step that made it, reject stops. Any other Tool step (an install, a host step) is recorded as its
+  command's failure, so request changes re-runs that command, never the creator (core#803). Agent steps and the
+  deliver step are unchanged. No override of a failed check is added.
 
 - **Redo the QE check when the isolated reviewer gave no verdict (e2e-1105 F23).** When the QE reviewer came back
   INCONCLUSIVE (it could not run its checks), no reviewer seat could run, or no verdict could be bound, the only

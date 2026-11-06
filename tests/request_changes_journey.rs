@@ -365,6 +365,7 @@ impl StepRunner for FailingCheckSeat {
 fn launch_tool_check(
     name: &str,
     run: &str,
+    check_kind: &str,
 ) -> (
     Core,
     std::sync::mpsc::Receiver<CoreEvent>,
@@ -397,7 +398,7 @@ fn launch_tool_check(
             "id": "tool-check",
             "phases": [
                 { "id": "author", "kind": "build", "gate": "auto", "role": "creator" },
-                { "id": "verify", "kind": "test", "depends_on": ["author"],
+                { "id": "verify", "kind": check_kind, "depends_on": ["author"],
                   "executor": { "type": "tool", "cmd": ["sh", "-c", script] } }
             ]
         })
@@ -439,7 +440,7 @@ fn launch_tool_check(
 #[test]
 fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
     let run = "tool-check-run";
-    let (core, ev, handed, triaged, _log) = launch_tool_check("tool-check", run);
+    let (core, ev, handed, triaged, _log) = launch_tool_check("tool-check", run, "test");
 
     let parked = |seen: &[CoreEvent]| {
         assert!(
@@ -553,7 +554,7 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
 #[test]
 fn no_answer_at_a_failed_checks_gate_skips_the_check() {
     let run = "tool-check-t2";
-    let (core, ev, _handed, _triaged, log) = launch_tool_check("tool-check-t2", run);
+    let (core, ev, _handed, _triaged, log) = launch_tool_check("tool-check-t2", run, "test");
     let parked_again = |seen: &[CoreEvent]| {
         seen.iter().any(|e| {
             matches!(e, CoreEvent::AwaitingHuman { ord: 2, gate_kind, .. } if gate_kind == "triage")
@@ -625,4 +626,60 @@ fn no_answer_at_a_failed_checks_gate_skips_the_check() {
         }
         assert!(parked_again(&seen), "`{token}`: {seen:?}");
     }
+}
+
+/// (e2e F30, codex r3) A Tool step that is NOT a check (an install, a host step: here a `build`
+/// Tool) failing is its own command's failure: ruled `fail`, it parks too, but the prompt offers
+/// no send-back to the creator, and request changes re-runs the command itself (core#803), never
+/// the creator.
+#[cfg(unix)]
+#[test]
+fn a_failed_command_tool_parks_and_request_changes_reruns_the_command_not_the_creator() {
+    let run = "tool-command-run";
+    let (core, ev, handed, _triaged, log) = launch_tool_check("tool-command", run, "build");
+    let first = drain_until(&ev, run, |e| {
+        matches!(
+            e,
+            CoreEvent::AwaitingHuman { .. } | CoreEvent::SessionFailed { .. }
+        )
+    });
+    assert!(
+        first.iter().any(
+            |e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, gate_kind, prompt, .. }
+            if gate_kind == "triage"
+                && prompt.starts_with("Unit 2 failed and triage escalated")
+                && !prompt.contains("send the work back"))
+        ),
+        "{first:?}"
+    );
+    core.confirm_gate(
+        run,
+        HumanDecision::RequestChanges {
+            note: Some("retry the install".into()),
+        },
+    )
+    .expect("request changes");
+    let again = drain_until(&ev, run, |e| {
+        matches!(
+            e,
+            CoreEvent::AwaitingHuman { .. }
+                | CoreEvent::SessionFailed { .. }
+                | CoreEvent::SessionCompleted { .. }
+        )
+    });
+    assert!(
+        !again
+            .iter()
+            .any(|e| matches!(e, CoreEvent::UnitReworkAmended { ord: 1, .. })),
+        "the creator is not handed the command's note: {again:?}"
+    );
+    let creators = handed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(o, _)| *o == 1)
+        .count();
+    assert_eq!(creators, 1, "the creator ran once, at the start");
+    let runs = std::fs::read_to_string(&log).unwrap_or_default();
+    assert_eq!(runs.lines().count(), 2, "the command ran again: {runs}");
 }
