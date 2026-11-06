@@ -8565,6 +8565,7 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
     }
     if unit.denials_behind.is_none() {
         let rc = unit.rule_check.as_ref()?;
+        // (DES-RULE-CHECK-001 rev 2, Part B, Q6) A process rule's row is reported, never open.
         let open: Vec<&str> = rc
             .rows
             .iter()
@@ -8575,7 +8576,7 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                         | crate::rule_check::RuleStatus::Unchecked
                         | crate::rule_check::RuleStatus::Waived
                         | crate::rule_check::RuleStatus::Disputed
-                )
+                ) && !r.reported_only()
             })
             .map(|r| r.rule_id.as_str())
             .collect();
@@ -27101,6 +27102,140 @@ mod request_changes_tests {
             assert_eq!(v.rule_skips[0].evidence_key, "ek-R1");
             assert!(v.requested_rejudge.is_some(), "the re-check is armed");
         }
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2, Part B, B.5.7) A PROCESS rule's BROKEN row (RVWL-*, `blocking:
+    /// false`) never refuses "land with carried items" at the third FAIL's `review_adjudication`,
+    /// even when the unit's record has no `denials_behind` (the row fallback reads it). Negative
+    /// control: the same row as an ordinary rule (no `blocking`) is refused.
+    #[test]
+    fn a_process_rule_row_never_refuses_land_with_carried_items() {
+        for (blocking, lands) in [(Some(false), true), (None, false)] {
+            let run_id = format!("adj-process-{lands}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let mut subs = crate::event_log::EventSink::default();
+            fold_verify_after_send_backs(&mut store, &mut subs, &run_id, 2, THIRD_FAIL);
+            assert_eq!(
+                open_gate_kind(&store, &run_id).as_deref(),
+                Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+            );
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            let v = &mut units[3];
+            v.rule_check = Some(crate::rule_check::RuleCheckReport {
+                rows: vec![crate::rule_check::RuleVerdict {
+                    rule_id: "RVWL-1001".into(),
+                    status: crate::rule_check::RuleStatus::Broken,
+                    how: crate::rule_check::RuleHow::Judge,
+                    reason: "the reviewer re-raised a RULED item".into(),
+                    rule_key: "k".into(),
+                    evidence_key: Some("ek".into()),
+                    origin: Some(crate::rule_check::RuleOrigin::Judge),
+                    party: blocking.map(|_| "reviewer".to_string()),
+                    blocking,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+            v.denials_behind = None;
+            put_node(&mut store, v.to_node()).unwrap();
+            let out = gate(
+                &mut store,
+                &mut subs,
+                &run_id,
+                HumanDecision::Approve {
+                    amend: Some("land it; carry the items".into()),
+                    amend_scope: AmendScope::Cursor,
+                },
+            );
+            if lands {
+                assert_eq!(
+                    out.unwrap(),
+                    SessionStatus::Completed,
+                    "a process row lands"
+                );
+            } else {
+                let err = out.unwrap_err().to_string();
+                assert!(
+                    err.contains("steering rules") && err.contains("RVWL-1001"),
+                    "an ordinary broken rule is refused: {err}"
+                );
+            }
+        }
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2 Part B, operator Q2) Rule against rule: the person's confirm of the
+    /// judge's WAIVED on a shipped PACK rule (MCPS-1002 waived for this change by their gate
+    /// ruling) goes through `skip_rules` like any open rule, carrying the pack row's own keys and
+    /// the quoted ruling; a process rule's open row beside it neither holds the gate nor is named.
+    #[test]
+    fn skip_rules_confirms_a_waived_pack_rule_and_a_process_row_is_not_open() {
+        let run_id = format!("rules-waived-pack-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let mcps = crate::steering_packs::shipped_pack_rules()
+            .into_iter()
+            .find(|r| r.id == "MCPS-1002")
+            .unwrap();
+        let quote = "\"MCPS-1002 is waived for this change: telemetry comes in the next slice\"";
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![
+                crate::rule_check::RuleVerdict {
+                    rule_id: "MCPS-1002".into(),
+                    status: crate::rule_check::RuleStatus::Waived,
+                    how: crate::rule_check::RuleHow::Judge,
+                    reason: quote.into(),
+                    cite: Some(quote.into()),
+                    rule_key: crate::rule_check::rule_key(&mcps),
+                    evidence_key: Some("ek-pack".into()),
+                    origin: Some(crate::rule_check::RuleOrigin::Judge),
+                    ..Default::default()
+                },
+                crate::rule_check::RuleVerdict {
+                    rule_id: "RVWL-1001".into(),
+                    status: crate::rule_check::RuleStatus::Unchecked,
+                    how: crate::rule_check::RuleHow::None,
+                    reason: "the judge was unsure".into(),
+                    rule_key: "k".into(),
+                    evidence_key: Some("ek-rvwl".into()),
+                    party: Some("reviewer".into()),
+                    blocking: Some(false),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(report.denial().is_none());
+        let hold = report.hold().expect("the waiver holds");
+        assert_eq!(hold.rule_ids, vec!["MCPS-1002".to_string()]);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let u = &mut units[2];
+        u.denial = Some(hold.clone());
+        u.denials_behind = Some(vec![hold]);
+        u.rule_check = Some(report);
+        put_node(&mut store, u.to_node()).unwrap();
+        recheck(
+            &mut store,
+            &run_id,
+            &[("MCPS-1002", "the ruling at the gate stands")],
+        )
+        .expect("a waived pack rule is confirmed with a reason");
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert_eq!(fix.rule_skips.len(), 1);
+        let skip = &fix.rule_skips[0];
+        assert_eq!(
+            (
+                skip.rule_id.as_str(),
+                skip.rule_key.as_str(),
+                skip.evidence_key.as_str()
+            ),
+            (
+                "MCPS-1002",
+                crate::rule_check::rule_key(&mcps).as_str(),
+                "ek-pack"
+            )
+        );
+        assert_eq!(skip.instruction.as_deref(), Some(quote));
+        assert!(fix.requested_rejudge.is_some(), "the re-check is armed");
     }
 
     /// (F19, operator Q1=B, codex r1) The judge's WAIVED on the person's ruling is confirmed through

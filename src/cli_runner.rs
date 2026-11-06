@@ -1457,6 +1457,7 @@ fn settle_rule_disputes(
             .map(|m| {
                 crate::rule_check::match_note(m, crate::rule_check::CheckStage::Review)
                     + &crate::rule_check::machine_council_note(rule, m, change)
+                    + crate::rule_check::pack_council_note(rule)
             })
             .unwrap_or_default();
         let evidence = crate::rule_check::Evidence::of_change(&row, change, floor_text);
@@ -1507,7 +1508,7 @@ fn settle_rule_disputes(
         );
         // The rule's own words an N/A must quote: its statement and criteria, never the header
         // the engine writes around them (`RULE <id> (<severity>, …)`).
-        let rule_words = format!("{}\n{}", rule.statement, rule.criteria);
+        let rule_words = crate::rule_check::rule_words(rule);
         let bars = crate::rule_check::VoteBars {
             paths: &paths,
             rule_text: &rule_words,
@@ -1654,7 +1655,8 @@ pub(crate) fn delivery_rule_check(
             no_seat: no_seat.as_deref(),
             base: &ctx.base,
             instructions: Some(ctx.instructions.as_str()).filter(|t| !t.is_empty()),
-            packs: crate::steering_packs::shipped_rule_ids(),
+            engine_record: None,
+            creator_records: None,
             stage: crate::rule_check::CheckStage::Delivery,
             deliver_tokens: &ctx.deliver_tokens,
             deferred: &ctx.deferred,
@@ -1882,7 +1884,9 @@ fn decide_tests_on_base(
 /// (DES-RULE-CHECK-001 S2) Run the steering-rule check for a review unit: the rules in force from
 /// the policy store (never the brief), the engine's diff against the run base, the floor's
 /// result, and judge seats distinct from the work's creators (`creators` keys and the binaries
-/// they ran) drawn from the run's pool. The creator's transcript is never handed to the judge.
+/// they ran) drawn from the run's pool. The creator's transcript is never handed to the judge of
+/// the change; (Part B) only POL-2101's separate record-clause call reads the creator steps'
+/// records, and a process rule's call reads the engine's record.
 /// `None` when there is nothing to check (no base, no change); a store that cannot be read is a
 /// report whose note says so and whose rows are empty — the fold holds on it.
 #[cfg(test)]
@@ -2009,6 +2013,21 @@ fn run_rule_check_with(
         .map(crate::rule_check::instructions_of)
         .unwrap_or_default();
     let floor_text = floor.map(crate::rule_check::floor_evidence);
+    // (DES-RULE-CHECK-001 rev 2, Part B) What the pack rules are judged on beside the change: the
+    // engine's own record of this step (process rules), and the creator steps' records (POL-2101's
+    // record clause, read from the run's store read-only, as the rules are). Neither reaches the
+    // change's judge.
+    let engine_record = engine_record(input, floor, settle.as_ref().map(|s| s.reviewer_output));
+    let creator_records = match creator_records(&gov.db_path, &input.run_id, input.unit.ord) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            engine_note(
+                emit_delta,
+                &format!("rule check: the creator steps' records could not be read: {e}"),
+            );
+            None
+        }
+    };
     engine_note(
         emit_delta,
         &format!(
@@ -2042,7 +2061,8 @@ fn run_rule_check_with(
                     no_seat: no_seat.as_deref(),
                     base: &base,
                     instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
-                    packs: crate::steering_packs::shipped_rule_ids(),
+                    engine_record: Some(engine_record.as_str()),
+                    creator_records: creator_records.as_deref(),
                     stage: crate::rule_check::CheckStage::Review,
                     deliver_tokens: &input.unit.rule_deliver_tokens,
                     deferred: &[],
@@ -2086,7 +2106,194 @@ fn run_rule_check_with(
             report.elapsed_ms
         ),
     );
+    raise_engine_defects(&report, emit_delta);
     Some(report)
+}
+
+/// (DES-RULE-CHECK-001 rev 2, Part B, Q6) A process rule about the ENGINE found broken is a defect
+/// in the harness, not in the person's work: it never blocks the gate, so it is raised where the
+/// person sees it, as an attention item in the run's live record (and the daemon's log).
+fn raise_engine_defects(report: &crate::rule_check::RuleCheckReport, emit_delta: &DeltaSink) {
+    for r in report.rows.iter().filter(|r| {
+        r.reported_only()
+            && r.party.as_deref() == Some("engine")
+            && r.status == crate::rule_check::RuleStatus::Broken
+    }) {
+        let text = format!(
+            "attention: engine defect: {} broken (engine): {}. Reported; it does not block your \
+             work",
+            r.rule_id,
+            r.cite.as_deref().unwrap_or(&r.reason)
+        );
+        eprintln!("wicked-core: {text}");
+        engine_note(emit_delta, &text);
+    }
+}
+
+/// The handed-on review context blocks the engine record repeats (engine-authored labels,
+/// `review_context::evaluator_brief`): never a creator's output.
+const HANDED_ON: &[&str] = &[
+    "[review checklist —",
+    "[prior verdicts —",
+    "[operator rulings —",
+    "[floor record —",
+];
+/// The most of one handed-on block, and of the reviewer's output, the engine record carries.
+const ENGINE_BLOCK_CAP: usize = 8 * 1024;
+const ENGINE_REVIEWER_CAP: usize = 16 * 1024;
+
+/// The last `cap` bytes of `text` (on a char boundary), marked when cut.
+fn tail_marked(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut start = text.len() - cap;
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!(
+        "[cut: its last {} of {} bytes]\n{}",
+        text.len() - start,
+        text.len(),
+        &text[start..]
+    )
+}
+
+/// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The engine's record of this review step, which the
+/// process rules (RVWL-1001..1004) are judged on: the step and its round, the send-backs against
+/// the rework cap, the review context actually handed to the reviewer (its prior verdicts as cut,
+/// the rulings, the checklist, the floor record), the floor's runs on this tree (argv and exit
+/// code) and the reviewer's own output. No creator prose; it is what the engine records, and it
+/// says what it does not.
+pub(crate) fn engine_record(
+    input: &StepInput,
+    floor: Option<&crate::repo_checks::RepoChecksReport>,
+    reviewer_output: Option<&str>,
+) -> String {
+    let u = &input.unit;
+    let mut s = format!(
+        "Step: unit {} (`{}`), attempt {}. Review round {} of this unit. Sent back to the creator \
+         so far: {} (the engine's rework cap is {}; a FAIL past it opens the review adjudication \
+         gate for the person).\n",
+        u.ord,
+        u.phase_id().unwrap_or("review"),
+        input.attempt,
+        u.review_rounds.len() + 1,
+        crate::review_context::sent_back_count(&u.review_rounds),
+        crate::review_context::MAX_REVIEW_SENDBACKS
+    );
+    let blocks: Vec<&crate::workflow::PriorUnitOutput> = input
+        .prior_outputs
+        .iter()
+        .filter(|p| HANDED_ON.iter().any(|l| p.label.starts_with(l)))
+        .collect();
+    if blocks.is_empty() {
+        s.push_str("\nThe engine handed the reviewer no checklist, prior verdict, ruling or floor record.\n");
+    }
+    // (codex r1) Each block exactly as the carrier handed it to the reviewer (the same clip, sized
+    // by the count of every block it was handed), then cut here only when still over this
+    // record's own cap, marked as such.
+    for p in blocks {
+        let handed =
+            crate::execute_wrapped::clip_prior_output(&p.output, input.prior_outputs.len());
+        s.push_str(&format!(
+            "\n{} (as the reviewer received it)\n{}\n",
+            p.label,
+            tail_marked(handed.trim(), ENGINE_BLOCK_CAP)
+        ));
+    }
+    match floor {
+        Some(f) => {
+            s.push_str(&format!(
+                "\nThe engine's floor on this tree: {}.\n",
+                if f.passed { "passed" } else { "FAILED" }
+            ));
+            for c in &f.checks {
+                let how = if let Some(e) = c.spawn_error.as_deref() {
+                    format!("did not start ({e})")
+                } else if c.timed_out {
+                    "timed out".to_string()
+                } else {
+                    match c.exit_code {
+                        Some(x) => format!("exit {x}"),
+                        None => "no exit code".to_string(),
+                    }
+                };
+                s.push_str(&format!("  `{}`: {how}\n", c.argv.join(" ")));
+            }
+            if !f.skipped.is_empty() {
+                s.push_str(&format!("  not run: {}\n", f.skipped.join(", ")));
+            }
+        }
+        None => s.push_str("\nThe engine ran no floor on this tree at this gate.\n"),
+    }
+    match reviewer_output {
+        Some(o) => s.push_str(&format!(
+            "\nTHE REVIEWER'S OUTPUT this round ({} bytes):\n{}\n",
+            o.len(),
+            tail_marked(o.trim(), ENGINE_REVIEWER_CAP)
+        )),
+        None => s.push_str("\nThe reviewer's output is not part of this record.\n"),
+    }
+    s.push_str(
+        "\nNot recorded by the engine: which checks a worker started or whether they finished, \
+         and any history beyond what is shown here.\n",
+    );
+    s
+}
+
+/// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the
+/// approved output of EVERY agent step that writes code (a creator, or an `executes_code` phase)
+/// done before `ord`,
+/// read from the run's store READ-ONLY (as the rules are). A step with no approved output is kept
+/// with an empty record (codex r1: it recorded nothing, which the check decides; it is never left
+/// out). `Err` when the store or a record cannot be read.
+fn creator_records(
+    db_path: &str,
+    run_id: &str,
+    ord: u32,
+) -> Result<Vec<crate::rule_check::CreatorRecord>, String> {
+    use wicked_apps_core::GraphRead;
+    let store = wicked_apps_core::open_store_ro(Some(db_path)).map_err(|e| format!("{e:#}"))?;
+    let units = crate::domain::session_units(&store, run_id).map_err(|e| format!("{e:#}"))?;
+    let mut out: Vec<crate::rule_check::CreatorRecord> = Vec::new();
+    // (codex r3) A step that writes code, by the same rule the planner applies to plan steps
+    // (`plan::is_creator_step`, which reads the catalog, not a unit): a creator, or any agent
+    // step whose phase declares `executes_code`.
+    for u in units.iter().filter(|u| {
+        u.ord < ord
+            && u.tool_cmd.is_none()
+            && (u.role == crate::workflow::PhaseRole::Creator || u.executes_code)
+            && u.status == crate::domain::UnitStatus::Done
+    }) {
+        let node = store
+            .get_node(&wicked_apps_core::synthetic_symbol(
+                crate::execute::WORK_OUTPUT,
+                &u.id,
+            ))
+            .map_err(|e| format!("unit {}'s record: {e:#}", u.ord))?;
+        // The same reading as every engine read of a resolution record (`get_work_output`): a
+        // rejected one is no record.
+        let text = node
+            .filter(|n| {
+                n.metadata
+                    .get(crate::execute::RESOLUTION_KEY)
+                    .and_then(|v| v.as_str())
+                    != Some(crate::execute::RESOLUTION_REJECTED)
+            })
+            .and_then(|n| {
+                n.metadata
+                    .get("output")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or_default();
+        out.push(crate::rule_check::CreatorRecord {
+            label: format!("unit {} (`{}`)", u.ord, u.phase_id().unwrap_or("build")),
+            text,
+        });
+    }
+    Ok(out)
 }
 
 /// `run_roster` — the RUN's configured seat keys (`AgentSession::clis`): the judge is drawn from
