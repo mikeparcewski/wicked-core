@@ -1048,15 +1048,36 @@ impl HostCouncilLock {
         path: &std::path::Path,
         deadline: std::time::Instant,
     ) -> Result<HostCouncilLock, SlotRefused> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)
+        // (codex r2) Never follow a link and never block on a special file (a FIFO planted at the
+        // path would hang this worker thread before any deadline): open non-blocking, no-follow,
+        // and accept only a regular file.
+        let open = |write: bool| {
+            let mut o = std::fs::OpenOptions::new();
+            o.read(true);
+            if write {
+                o.write(true).create(true).truncate(false);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            o.open(path)
+        };
+        let file = open(true)
             // Another user's file on a shared /tmp: a read-only handle locks as well.
-            .or_else(|_| std::fs::File::open(path))
+            .or_else(|_| open(false))
             .map_err(|e| SlotRefused::Unavailable(format!("{}: {e}", path.display())))?;
+        match file.metadata() {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(SlotRefused::Unavailable(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )))
+            }
+            Err(e) => return Err(SlotRefused::Unavailable(format!("{}: {e}", path.display()))),
+        }
         loop {
             match file.try_lock() {
                 Ok(()) => return Ok(HostCouncilLock { _file: file }),
@@ -1095,9 +1116,38 @@ pub(crate) fn rule_council_seats(
     authored_binaries: &[String],
     judge: (Option<&str>, &[String]),
     reviewer: (Option<&str>, Option<&str>),
+    recorded: Option<&[crate::rule_check::RulePosition]>,
     registry: &[crate::AgenticCli],
 ) -> Result<Vec<crate::AgenticCli>, String> {
     let unknown = |why: &str| Err(format!("identity_unknown: {why}"));
+    // A carried dispute's parties are the seats that READ it, as they launched then (recorded on
+    // the readings): a seat key that now launches something else must not readmit them.
+    if let Some(r) = recorded {
+        if let Some(p) = r.iter().find(|p| p.ids.is_empty()) {
+            return unknown(&format!(
+                "the {} `{}` this dispute was recorded with has no recorded identity",
+                p.by, p.seat
+            ));
+        }
+    }
+    // (codex r2) A launch-excluded seat is a party only by its identity: one whose record cannot
+    // be found, or whose launch cannot be verified, cannot be shown absent from the council.
+    for k in exclude_seats {
+        let cli = wicked_apps_core::spawn::seat_cli_key(k);
+        match registry
+            .iter()
+            .find(|c| &c.key == k)
+            .or_else(|| registry.iter().find(|c| c.key == cli))
+        {
+            Some(c) if launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)) => {
+            }
+            _ => {
+                return unknown(&format!(
+                    "the launch-excluded seat `{k}` cannot be verified"
+                ))
+            }
+        }
+    }
     if creators.is_empty() {
         return unknown("the work's creators are not known");
     }
@@ -1152,6 +1202,9 @@ pub(crate) fn rule_council_seats(
     ids.extend(judge_ids.iter().cloned());
     ids.extend(launched_identities(rev_key, reviewer.1.map(str::to_string)));
     ids.extend(record_identities(rev_ran));
+    for p in recorded.unwrap_or_default() {
+        ids.extend(p.ids.iter().cloned());
+    }
     ids.remove("");
     let mut keys: Vec<&str> = Vec::new();
     for k in creators
@@ -1161,6 +1214,7 @@ pub(crate) fn rule_council_seats(
         .map(String::as_str)
         .chain(judge_key)
         .chain([rev_key, rev_ran.key.as_str()])
+        .chain(recorded.unwrap_or_default().iter().map(|p| p.seat.as_str()))
     {
         keys.push(k);
         keys.push(wicked_apps_core::spawn::seat_cli_key(k));
@@ -1184,6 +1238,29 @@ pub(crate) fn rule_council_seats(
         ));
     }
     Ok(seats)
+}
+
+/// Every identity the reviewer of `input` may have executed, as it launched (its
+/// `assigned_invocation` overrides its record): empty when its launch cannot be verified.
+fn reviewer_identities(input: &StepInput, registry: &[crate::AgenticCli]) -> Vec<String> {
+    let Some(key) = input.unit.assigned_cli.as_deref().filter(|k| !k.is_empty()) else {
+        return Vec::new();
+    };
+    let inv = input.unit.assigned_invocation.clone();
+    let launched = launched_identity(key, inv.clone());
+    let Some(ran) = registry
+        .iter()
+        .find(|c| launches_its_own_binary(c, &launched))
+    else {
+        return Vec::new();
+    };
+    let mut ids = launched_identities(key, inv);
+    for i in record_identities(ran) {
+        if !ids.contains(&i) {
+            ids.push(i);
+        }
+    }
+    ids
 }
 
 /// (DES-RULE-CHECK-001 rev 2) The judge identities a fresh judge row records: its seat's every
@@ -1241,6 +1318,7 @@ fn settle_rule_disputes(
             seat: reviewer_seat.clone(),
             status: a.status,
             cite: a.cite.clone(),
+            ids: Vec::new(),
         });
     }
     if positions.cut {
@@ -1273,12 +1351,18 @@ fn settle_rule_disputes(
     // The disputes to settle: this attempt's (judge vs this reviewer), then those carried open from
     // the last attempt on the same evidence (on their recorded readings: the dispute stands until a
     // council settles it or the person skips it, whatever this reviewer wrote).
-    let mut work: Vec<(usize, RuleVerdict, Vec<RulePosition>)> = Vec::new();
+    // The reviewer as it launched this attempt: recorded on each reading it gives a dispute, so a
+    // carried dispute keeps it out of a later council whatever its seat key launches then.
+    let reviewer_ids = reviewer_identities(input, registry);
+    let mut work: Vec<(usize, RuleVerdict, Vec<RulePosition>, bool)> = Vec::new();
     for i in crate::rule_check::disputes(report, &positions) {
         let row = report.rows[i].clone();
         if let Some(reading) = positions.by_id.get(&row.rule_id) {
-            let pos = positions_of(&row, &reviewer_seat, reading);
-            work.push((i, row, pos));
+            let mut pos = positions_of(&row, &reviewer_seat, reading);
+            if let Some(p) = pos.iter_mut().find(|p| p.by == BY_REVIEWER) {
+                p.ids = reviewer_ids.clone();
+            }
+            work.push((i, row, pos, false));
         }
     }
     for i in crate::rule_check::carried(report) {
@@ -1287,10 +1371,10 @@ fn settle_rule_disputes(
             crate::rule_check::judge_reading(carried),
             carried.council.as_ref(),
         ) {
-            work.push((i, base, c.positions.clone()));
+            work.push((i, base, c.positions.clone(), true));
         }
     }
-    for (i, row, pos) in work {
+    for (i, row, pos, was_carried) in work {
         let hold = |why: String| {
             disputed_row(
                 &row,
@@ -1320,19 +1404,6 @@ fn settle_rule_disputes(
             );
             continue;
         }
-        // A dispute carried from an attempt another seat reviewed: that reviewer is a party too,
-        // and its launched identity was not recorded — no council can be shown distinct from it.
-        if pos
-            .iter()
-            .any(|p| p.by == BY_REVIEWER && p.seat != reviewer_seat)
-        {
-            report.rows[i] = hold(
-                "identity_unknown: the reviewer this dispute was recorded with is not this \
-                 attempt's reviewer"
-                    .into(),
-            );
-            continue;
-        }
         let Some(rule) = rules.iter().find(|r| r.id == row.rule_id) else {
             report.rows[i] = hold("error: the rule is no longer in force as it was judged".into());
             continue;
@@ -1348,6 +1419,7 @@ fn settle_rule_disputes(
                 input.unit.assigned_cli.as_deref(),
                 input.unit.assigned_invocation.as_deref(),
             ),
+            was_carried.then_some(pos.as_slice()),
             registry,
         ) {
             Ok(s) => s,

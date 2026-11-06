@@ -432,7 +432,13 @@ fn run_council(
                         // The spawn stagger: seat `i` opens its ballot `i × stagger` late. Its
                         // own budget starts when it is dispatched, so the wait costs it nothing.
                         if i > 0 && !stagger.is_zero() {
-                            std::thread::sleep(stagger.saturating_mul(i as u32));
+                            // (DES-RULE-CHECK-001 rev 2, codex r2) Never sleeping past the
+                            // council's deadline: such a seat wakes at it and does not start.
+                            let wait = stagger.saturating_mul(i as u32);
+                            std::thread::sleep(match bounds.deadline_at {
+                                Some(d) => wait.min(d.saturating_duration_since(Instant::now())),
+                                None => wait,
+                            });
                         }
                         // (DES-RULE-CHECK-001 rev 2) A seat whose stagger ran past the deadline
                         // never starts (whatever the dispatcher would do).

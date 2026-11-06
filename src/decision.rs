@@ -1110,12 +1110,14 @@ mod tests {
                 seat: "pi".into(),
                 status: crate::rule_check::RuleStatus::Broken,
                 cite: "src/x.rs:3 broken".into(),
+                ids: Vec::new(),
             },
             crate::rule_check::RulePosition {
                 by: crate::rule_check::BY_REVIEWER.into(),
                 seat: "codex".into(),
                 status: crate::rule_check::RuleStatus::Kept,
                 cite: "src/x.rs fine".into(),
+                ids: Vec::new(),
             },
         ];
         let out = crate::rule_check::settle(

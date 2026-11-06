@@ -330,6 +330,7 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
             &[],
             (Some("pi"), &["pi".to_string()][..]),
             (Some("codex"), Some(rev_inv)),
+            None,
             reg,
         )
     };
@@ -360,10 +361,99 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
         &[],
         (Some("pi"), &[]),
         (Some("codex"), Some("codex -p {PROMPT}")),
+        None,
         &reg,
     )
     .unwrap_err();
     assert!(err.starts_with("identity_unknown"), "{err}");
+    // (codex r2) …nor a launch-excluded seat the registry cannot name or verify.
+    for excluded in ["ghost", "wrapped"] {
+        let err = rule_council_seats(
+            &["claude".to_string()],
+            Some(&["claude".to_string()][..]),
+            &[excluded.to_string()],
+            &[],
+            &[],
+            (Some("pi"), &["pi".to_string()][..]),
+            (Some("codex"), Some("codex -p {PROMPT}")),
+            None,
+            &reg,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("identity_unknown"), "{excluded}: {err}");
+    }
+    // …nor a carried dispute whose reading has no recorded identity.
+    let unrecorded = [crate::rule_check::RulePosition {
+        by: crate::rule_check::BY_REVIEWER.into(),
+        seat: "codex".into(),
+        status: RuleStatus::Broken,
+        cite: "x".into(),
+        ids: Vec::new(),
+    }];
+    let err = rule_council_seats(
+        &["claude".to_string()],
+        Some(&["claude".to_string()][..]),
+        &[],
+        &[],
+        &[],
+        (Some("pi"), &["pi".to_string()][..]),
+        (Some("codex"), Some("codex -p {PROMPT}")),
+        Some(&unrecorded),
+        &reg,
+    )
+    .unwrap_err();
+    assert!(err.starts_with("identity_unknown"), "{err}");
+}
+
+/// (codex r2) A carried dispute keeps the reviewer that READ it out of a later council, as it
+/// launched then — even when the same seat key now launches another CLI.
+#[test]
+fn a_carried_dispute_keeps_its_original_reviewer_out_whatever_the_seat_now_runs() {
+    fn timeout(_: &DecisionRequest, _: &[crate::AgenticCli]) -> DisputeOutcome {
+        DisputeOutcome::TimedOut
+    }
+    let mut input = reviewed("carried-id");
+    // Attempt 1: the reviewer seat `codex` launched running opencode.
+    input.unit.assigned_invocation = Some("opencode run {PROMPT}".into());
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("carried-id", timeout);
+    let first = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    // opencode is a party (the reviewer ran it): two seats left, no council, a recorded dispute.
+    assert_eq!(council.convened(), 0);
+    let r1 = row(&first, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed);
+    let rec = &r1.council.as_ref().unwrap().positions[1];
+    assert!(rec.ids.contains(&"opencode".to_string()), "{rec:?}");
+    // Attempt 2: the same key now launches codex. opencode read the dispute: it does not sit.
+    input.unit.rule_check = Some(first);
+    input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
+    let again = FakeCouncil::new("carried-id-2", kept_3_0);
+    let r = settle_with(&input, &judge, "VERDICT: PASS", &again, &registry());
+    assert_eq!(again.convened(), 0, "two seats left: no council");
+    let why = row(&r, "R1")
+        .council
+        .as_ref()
+        .unwrap()
+        .reason
+        .clone()
+        .unwrap();
+    assert!(why.starts_with("seats_benched"), "{why}");
+}
+
+/// (codex r2) A special file planted at the slot's path (a FIFO) is refused at once: never a
+/// blocking open on the unit's worker thread.
+#[cfg(unix)]
+#[test]
+fn a_fifo_at_the_slot_path_is_refused_without_blocking() {
+    let path = std::env::temp_dir().join(format!("rule-council-fifo-{}.lock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let c = std::ffi::CString::new(path.to_string_lossy().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o644) }, 0);
+    let t0 = std::time::Instant::now();
+    let got = HostCouncilLock::acquire_until(&path, t0 + Duration::from_secs(30));
+    assert!(matches!(got, Err(SlotRefused::Unavailable(_))));
+    assert!(t0.elapsed() < Duration::from_secs(5));
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A.7.4, end to end: too few distinct seats convenes nothing (zero ballots), and the row holds.

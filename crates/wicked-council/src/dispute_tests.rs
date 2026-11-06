@@ -491,10 +491,11 @@ fn a_seat_whose_stagger_runs_past_the_deadline_never_starts() {
         calls: AtomicU32::new(0),
         too_large_on: None,
     });
+    let t0 = Instant::now();
     let (w, _) = dispute_worker(
         d.clone(),
         Instant::now() + Duration::from_millis(200),
-        Duration::from_millis(400),
+        Duration::from_secs(3),
     );
     let _ = w.queue_blocking(task());
     assert_eq!(
@@ -502,6 +503,8 @@ fn a_seat_whose_stagger_runs_past_the_deadline_never_starts() {
         1,
         "only the unstaggered seat ran"
     );
+    // (codex r2) …and no seat sleeps past the deadline: not the 6 s its stagger asks for.
+    assert!(t0.elapsed() < Duration::from_secs(2), "{:?}", t0.elapsed());
 }
 
 #[test]

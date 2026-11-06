@@ -157,6 +157,10 @@ pub struct RulePosition {
     pub seat: String,
     pub status: RuleStatus,
     pub cite: String,
+    /// Every identity that seat may have executed when it read the rule (recorded with the
+    /// reading): a carried dispute keeps its parties out of a later council by these.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
 }
 
 /// One council seat's vote on a disputed rule, and whether it passed the vote bars.
@@ -1828,12 +1832,14 @@ pub fn positions_of(
             seat: row.judge.clone().unwrap_or_default(),
             status: row.status,
             cite: row.cite.clone().unwrap_or_else(|| row.reason.clone()),
+            ids: row.judge_ids.clone(),
         },
         RulePosition {
             by: BY_REVIEWER.into(),
             seat: reviewer_seat.to_string(),
             status: reviewer.status,
             cite: reviewer.cite.clone(),
+            ids: Vec::new(),
         },
     ]
 }
