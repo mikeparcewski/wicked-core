@@ -13195,6 +13195,24 @@ fn run_conformance_tool(
         &format!("editor-conformance-{}", d.ord),
     ) {
         Ok(c) => c,
+        // The checkout refused to WRITE an entry of the tree (a path or a link the guarded checkout will not
+        // materialize): the creator's tree is what must change, so it is a verdict sent back to the creator,
+        // never a retry of the same tree. Any other failure (git, the temp dir) is the host's: a refusal.
+        Err(e) if e.contains("could not be written for the floor") => {
+            let why = format!(
+                "the tree {} holds an entry the engine will not check out for the cases: {e}",
+                snap.tree
+            );
+            let mut rec = ec::ConformanceRecord::refused(attempt, "pack_invalid", why.clone());
+            rec.outcome = ec::OUTCOME_FAIL.to_string();
+            rec.tree = Some(snap.tree.clone());
+            return (
+                format!("{}: ran nothing: pack_invalid: {why}", ec::CATALOG),
+                StepStatus::Ok,
+                None,
+                rec,
+            );
+        }
         Err(e) => {
             return refused(
                 "engine_refused",
