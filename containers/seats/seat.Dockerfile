@@ -27,7 +27,7 @@ RUN apt-get update \
 # install would change the tree under review), and the daemon's own copy is not mounted in, because
 # its SQLite addon is built for the host, not for this Linux image. Best effort: a base image this
 # cannot install on still builds, and its QE unit then reports the ledger as unavailable.
-ARG LEDGER_PACKAGE=wicked-ledger@0.6.0
+ARG LEDGER_PACKAGE=wicked-ledger@0.6.1
 RUN mkdir -p /opt/wicked-ledger \
  && (npm install --prefix /opt/wicked-ledger --no-fund --no-audit --omit=dev "$LEDGER_PACKAGE" \
      || { rm -rf /opt/wicked-ledger; echo "wicked-seat: $LEDGER_PACKAGE did not install; QE verdicts cannot be recorded in this seat" >&2; }) \

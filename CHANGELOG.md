@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Container seats record QE verdicts with wicked-ledger 0.6.1 (F23).** The seat image's exact pin
+  (`containers/seats/seat.Dockerfile`, `LEDGER_PACKAGE`) moves from 0.6.0 to 0.6.1, whose `get` / `list` / `search` keep a
+  record's keys beyond the schema columns, so an isolated QE reviewer in a container seat sees the run's `crew_run_id`
+  instead of returning INCONCLUSIVE. The seat image tag is a content hash of the Dockerfile, so each seat image is
+  rebuilt on its next use.
+
 - **A Demo video is recorded by the engine on the host, never by a seat (DES-DEMO-RECORD-001, core#1249).** The
   `demo` preset's `record` step ran garden's recorder inside its seat's container, which cannot reach the person's
   app (its loopback is its own) and has no ffmpeg or browser, so no demo reached its review gate. New catalog Tools
