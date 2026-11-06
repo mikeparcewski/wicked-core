@@ -129,13 +129,16 @@ fn seen() -> &'static Seen {
 struct Reviewer;
 impl StepRunner for Reviewer {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
-        // The agent judge (the creator's gate) answers in its own contract.
+        // The agent judge (the creator's gate) answers in its own contract; (DES-RULE-CHECK-001
+        // rev 2 Part B) a rule-check judge call (the shipped pack rules are judged now) gets the
+        // stub's framed N/A answers.
         if i.unit.session_id == "validator" {
             return StepOutput {
                 run_id: i.run_id.clone(),
                 unit_ix: i.unit_ix,
                 attempt: i.attempt,
-                output: "PASS\nthe work is there\nPASS".into(),
+                output: wicked_core::stub_rule_verdicts(&i.unit.description)
+                    .unwrap_or_else(|| "PASS\nthe work is there\nPASS".into()),
                 status: StepStatus::Ok,
                 usage: None,
                 files: Vec::new(),

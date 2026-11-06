@@ -169,7 +169,11 @@ impl StepRunner for ScriptedSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         let phase = input.unit.phase_id().unwrap_or("").to_string();
         let mut output = format!("did: {phase}");
-        if input.unit.session_id == "validator" {
+        // (DES-RULE-CHECK-001 rev 2 Part B) The review's rule-check judge calls (the shipped pack
+        // rules are judged now): the stub answers each asked rule N/A in the call's frame.
+        if let Some(v) = wicked_core::stub_rule_verdicts(&input.unit.description) {
+            output = v;
+        } else if input.unit.session_id == "validator" {
             output = "PASS\nthe work meets the criterion\nPASS".to_string();
         } else {
             self.ran.lock().unwrap().push((
