@@ -406,6 +406,10 @@ pub struct UnitEvidence {
     /// only on this receipt (`demo_record::judge`). `None` for every other unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub demo_take: Option<crate::demo_record::DemoTake>,
+    /// (DES-EDITOR-CONFORMANCE-HOST) An `editor_conformance` Tool's record as the worker thread read
+    /// it right after the Tool exited (bound to the tree before and after). `None` for every other unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_conformance: Option<crate::editor_conformance::ConformanceRecord>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation

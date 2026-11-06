@@ -1550,6 +1550,11 @@ pub struct WorkUnit {
     /// an attempt that is superseded or never folds still spent it. The run's budget is their sum.
     #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub rule_councils: u32,
+    /// (DES-EDITOR-CONFORMANCE-HOST) An `editor_conformance` unit's record of its last attempt: what
+    /// the engine ran on the host, on which tree, and what it found. The reviewers' briefs cite it.
+    /// `None` on every other unit, and cleared when a send-back resets the unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_conformance: Option<crate::editor_conformance::ConformanceRecord>,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1863,6 +1868,7 @@ impl WorkUnit {
             rule_check: None,
             rule_skips: Vec::new(),
             rule_councils: 0,
+            editor_conformance: None,
             rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),

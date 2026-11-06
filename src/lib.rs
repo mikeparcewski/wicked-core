@@ -150,6 +150,9 @@ pub fn nested_sandbox() -> bool {
 }
 /// (DES-DEMO-RECORD-001, core#1249) The Demo video's host-run Tools: demo root, jail, receipt, fold.
 pub mod demo_record;
+/// (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The editor-plugin workflow's conformance step, run by the
+/// engine on the host in a one-port jail; its record is the fact the review cites.
+pub mod editor_conformance;
 mod validator_vault;
 pub mod walkthrough;
 mod worker_sandbox;

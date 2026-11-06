@@ -546,6 +546,13 @@ enum NetworkPolicy {
     /// reachable, so a Linux host gets no `Sandboxed` launcher for this policy (the caller reports
     /// `no_port_scoped_jail`).
     LoopbackPort(u16),
+    /// (DES-EDITOR-CONFORMANCE-HOST, e2e F18) ONE loopback port the jailed process SERVES and talks to,
+    /// and nothing else: bind, inbound and outbound on `localhost:<port>` only. The editor conformance
+    /// harness serves its own origin there (studio's host page from a dist, the candidate's entry) and
+    /// drives headless Chromium against it; no daemon, no other local service, no public address.
+    /// macOS: the deny plus three rules for that port; Linux bwrap: `--unshare-net` (the namespace's own
+    /// `lo` holds only what the jail starts) plus the same AF_UNIX seccomp program as `LoopbackOnly`.
+    LoopbackServe(u16),
 }
 
 /// Whether the jail may allocate pseudo-terminals. Only the repo-checks floor asks for `Own`: a
@@ -664,6 +671,16 @@ fn macos_sandbox_profile_for_roots(
         // refused, a bind is EPERM).
         p.push_str(&format!(
             "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
+    }
+    if let NetworkPolicy::LoopbackServe(port) = network {
+        // After the deny, so they win for this one port only (spiked on macOS 26 with Python's
+        // http.server and headless Chromium: the jail serves and fetches its own port; crew's port, a
+        // public address and a bind on another port are refused).
+        p.push_str(&format!(
+            "(allow network-bind (local ip \"localhost:{port}\"))\n\
+             (allow network-inbound (local ip \"localhost:{port}\"))\n\
+             (allow network-outbound (remote ip \"localhost:{port}\"))\n"
         ));
     }
     // C3: explicitly DENY reads of the curated high-value secret dirs (after `allow default`, so the
@@ -883,6 +900,18 @@ pub(crate) fn port_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
     detect_sandbox_launcher_for_roots(
         write_roots,
         NetworkPolicy::LoopbackPort(port),
+        PtyPolicy::Deny,
+    )
+}
+
+/// (DES-EDITOR-CONFORMANCE-HOST) The jail the `editor_conformance` Tool runs in: writes only under
+/// `write_roots`, network only on `localhost:<port>` (the harness's own origin: bind, inbound,
+/// outbound), the curated secret dirs unreadable. `Sandboxed` on macOS (sandbox-exec) and on Linux
+/// (bwrap's own network namespace); Windows has no jail, and the caller refuses to run.
+pub(crate) fn serve_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
+    detect_sandbox_launcher_for_roots(
+        write_roots,
+        NetworkPolicy::LoopbackServe(port),
         PtyPolicy::Deny,
     )
 }
@@ -1121,7 +1150,10 @@ fn launcher_for_roots_masking(
             // read-only `/`. The seccomp program rides `bwrap --seccomp 9`, opened by a `sh`
             // prefix so the fd is the jail's own (bwrap reads it; a shared one would be at EOF
             // for the next jail).
-            if matches!(network, NetworkPolicy::LoopbackOnly) {
+            if matches!(
+                network,
+                NetworkPolicy::LoopbackOnly | NetworkPolicy::LoopbackServe(_)
+            ) {
                 // Fail CLOSED (codex r1): a loopback jail that cannot load its program is no jail
                 // at all — the caller treats a non-`Sandboxed` launcher as "cannot jail".
                 let Some(filter) = seccomp::af_unix_filter_path() else {
@@ -4636,6 +4668,163 @@ mod tests {
             "a write inside the root works"
         );
         drop((allowed, other));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (DES-EDITOR-CONFORMANCE-HOST) The serve jail's profile admits bind, inbound and outbound on ONE
+    /// loopback port: no `localhost:*`, no other port, writes still denied outside the roots.
+    #[test]
+    fn the_serve_jail_profile_admits_one_port_only() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-serve-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::LoopbackServe(18799),
+            PtyPolicy::Deny,
+        )
+        .unwrap();
+        assert!(p.contains("(deny network*)"), "{p}");
+        assert_eq!(p.matches("(allow network").count(), 3, "{p}");
+        for rule in [
+            "(allow network-bind (local ip \"localhost:18799\"))",
+            "(allow network-inbound (local ip \"localhost:18799\"))",
+            "(allow network-outbound (remote ip \"localhost:18799\"))",
+        ] {
+            assert!(p.contains(rule), "{rule} in {p}");
+        }
+        assert!(!p.contains("localhost:*"), "{p}");
+        assert!(p.contains("(deny file-write*)"), "{p}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// (DES-EDITOR-CONFORMANCE-HOST, coordinator ruling 3) End to end: inside the serve jail a process
+    /// serves its one port and fetches from itself, and NOTHING else is reachable: not a listener on
+    /// another loopback port (crew's daemon, in the real run), not a public address, and it cannot bind
+    /// another port. A write outside its root is refused too. macOS (sandbox-exec) and Linux (bwrap's
+    /// own network namespace) both; a host with no `Sandboxed` launcher returns early (the Tool refuses
+    /// to run there).
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_serve_jail_reaches_only_its_own_port() {
+        if find_on_path("python3").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-serve-jail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        // Stands in for crew's daemon: a host listener on another loopback port, answering.
+        let crew = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let crew_port = crew.local_addr().unwrap().port();
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done_in = done.clone();
+        let accepting = std::thread::spawn(move || {
+            crew.set_nonblocking(true).unwrap();
+            let mut reached = false;
+            while !done_in.load(std::sync::atomic::Ordering::SeqCst) {
+                match crew.accept() {
+                    Ok(_) => reached = true,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                }
+            }
+            reached
+        });
+        let free = |_: ()| {
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let (own, other) = (free(()), free(()));
+        let jail = serve_jail(&[dir.as_path()], own);
+        if jail.level != SandboxLevel::Sandboxed {
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let run = |code: &str| {
+            // spawn-audit: test-only — runs python inside the test's own jail.
+            std::process::Command::new(&jail.wrapper[0])
+                .args(&jail.wrapper[1..])
+                .args(["python3", "-c", code])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("the jail runs")
+                .success()
+        };
+        // Serve the own port and fetch it over HTTP from inside the same jail (what the harness and
+        // its browser do).
+        let serve_and_fetch = format!(
+            "import http.server, threading, urllib.request\n\
+             s = http.server.ThreadingHTTPServer(('127.0.0.1', {own}), http.server.SimpleHTTPRequestHandler)\n\
+             threading.Thread(target=s.serve_forever, daemon=True).start()\n\
+             assert urllib.request.urlopen('http://127.0.0.1:{own}/', timeout=5).status == 200\n\
+             s.shutdown()"
+        );
+        assert!(
+            run(&serve_and_fetch),
+            "the jail serves and reaches its own port"
+        );
+        let connect = |host: &str, port: u16| {
+            format!("import socket; s=socket.create_connection(('{host}', {port}), timeout=3); s.close()")
+        };
+        assert!(
+            !run(&connect("127.0.0.1", crew_port)),
+            "crew's port (a host listener on another loopback port) is refused"
+        );
+        assert!(
+            !run(&connect("localhost", crew_port)),
+            "crew's port by name is refused"
+        );
+        // A non-loopback address of THIS host, with a positive control: reachable outside the jail,
+        // refused inside it (a failed connect to a public address alone could just be an offline runner).
+        let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|u| u.connect("1.1.1.1:80").map(|()| u))
+            .and_then(|u| u.local_addr())
+            .map(|a| a.ip())
+            .ok()
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        match lan_ip.and_then(|ip| std::net::TcpListener::bind((ip, 0)).ok()) {
+            Some(lan) => {
+                let addr = lan.local_addr().unwrap();
+                assert!(
+                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
+                        .is_ok(),
+                    "positive control: {addr} is reachable outside the jail"
+                );
+                assert!(
+                    !run(&connect(&addr.ip().to_string(), addr.port())),
+                    "a non-loopback address ({addr}) is refused inside the jail"
+                );
+            }
+            None => eprintln!(
+                "SKIP (non-loopback leg): no non-loopback address on this host to prove the refusal against"
+            ),
+        }
+        assert!(!run(&connect("1.1.1.1", 80)), "a public address is refused");
+        // macOS: a bind on another port is refused. (Linux: the jail's own namespace may bind
+        // anything; nothing outside it can reach that port.)
+        if cfg!(target_os = "macos") {
+            assert!(
+                !run(&format!(
+                    "import socket; s=socket.socket(); s.bind(('127.0.0.1', {other})); s.listen()"
+                )),
+                "a bind on another port is refused"
+            );
+        }
+        let outside = std::env::temp_dir().join(format!("wicked-serve-out-{}", std::process::id()));
+        assert!(
+            !run(&format!(
+                "open({:?}, 'w').write('x')",
+                outside.to_string_lossy()
+            )),
+            "a write outside the root is refused"
+        );
+        assert!(!outside.exists());
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            !accepting.join().unwrap(),
+            "nothing inside the jail ever reached crew's port"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -160,16 +160,34 @@ pub(crate) fn reviewer_unit(
 }
 
 /// The reviewer turn's input: a NEW `StepInput` — no prior outputs (the executor's reply, the
-/// team boundary, nothing), the reviewer unit, the run's own identity and boundary.
+/// team boundary, nothing), the reviewer unit, the run's own identity and boundary. The ONE
+/// exception is the engine's own editor conformance record (DES-EDITOR-CONFORMANCE-HOST, e2e F18):
+/// the engine wrote it from its own run on the host, not a seat, and no reviewer seat can run those
+/// cases itself; the brief says to cite it.
 pub(crate) fn reviewer_input(
     input: &StepInput,
     seat: &QeReviewerSeat,
     dir: &str,
     nonce: &str,
 ) -> StepInput {
+    let engine_records: Vec<_> = input
+        .prior_outputs
+        .iter()
+        .filter(|p| p.label.starts_with(crate::editor_conformance::RECORD_LABEL))
+        .cloned()
+        .collect();
+    let mut unit = reviewer_unit(&input.unit, seat, dir, Some(nonce));
+    if !engine_records.is_empty() {
+        unit.description.push_str(
+            " The [editor conformance record] beside this brief is the engine's own run of the \
+             editor conformance cases on this host, not part of the evidence directory: cite it for \
+             the conformance cases; never run them yourself (no seat has a headless browser), and \
+             their absence from the evidence is not a gap.",
+        );
+    }
     StepInput {
-        unit: reviewer_unit(&input.unit, seat, dir, Some(nonce)),
-        prior_outputs: Vec::new(),
+        unit,
+        prior_outputs: engine_records,
         ..input.clone()
     }
 }

@@ -891,6 +891,7 @@ mod tests {
             rule_check: None,
             rule_skips: Vec::new(),
             rule_councils: 0,
+            editor_conformance: None,
             rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),

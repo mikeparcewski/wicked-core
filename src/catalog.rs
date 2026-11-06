@@ -45,9 +45,10 @@ pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer
 /// ([`crate::plan`]'s `code_work_step`).
 pub const DOMAIN_COVERAGE_SKILL: &str = "wicked-garden-domain-coverage";
 
-/// The seventeen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
-/// after `test`; the two demo Tools, DES-DEMO-RECORD-001, close the table).
-pub const CATALOG_IDS: [&str; 17] = [
+/// The eighteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
+/// after `test`; the two demo Tools, DES-DEMO-RECORD-001, then the editor conformance Tool,
+/// DES-EDITOR-CONFORMANCE-HOST, close the table).
+pub const CATALOG_IDS: [&str; 18] = [
     "understand",
     "test_plan",
     "design",
@@ -65,6 +66,7 @@ pub const CATALOG_IDS: [&str; 17] = [
     "deliver",
     crate::demo_record::PROBE_CATALOG_ID,
     crate::demo_record::RECORD_CATALOG_ID,
+    crate::editor_conformance::CATALOG_ID,
 ];
 
 /// The walkthrough author (DES-walkthrough-proof §4.3, WT-C1): an EVALUATOR agent step that writes
@@ -83,7 +85,7 @@ pub const WALKTHROUGH_RECORD_CMD: [&str; 4] = [
     "record",
 ];
 
-/// The phase catalog: seventeen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The phase catalog: eighteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -1129,7 +1131,9 @@ fn mcp_server_preset() -> Vec<PlanStep> {
 /// `editor-plugin` (operator ruling X3, 2026-10-10): make an artifact editor plugin for wicked-studio
 /// as data (`src/presets/editor-plugin.json`), modelled on `mcp-server`. scope → `understand`; design →
 /// `design` (the contract against DES-EDITOR-PLUGINS-001); build → `build` (the
-/// `wicked-garden-editor-scaffold` skill); test → `test`, which runs the editor conformance harness and is
+/// `wicked-garden-editor-scaffold` skill); conformance → `editor_conformance`, the engine's own run of the
+/// editor conformance cases on the host (DES-EDITOR-CONFORMANCE-HOST, e2e F18: no seat has a headless
+/// browser); test → `test`, which cites that record, judges the editor's behaviour and is
 /// the run's QE phase (`qe_acceptance` required, as for every app-change preset); security-review →
 /// `review` keeping the platform specialist; install-plan and install → `run` with their Tool
 /// commands, install gated `consent_before`. The ids `install-plan` / `install` are the ones a
@@ -1454,6 +1458,26 @@ fn build_catalog() -> Vec<PhaseDef> {
                 false,
             )
         },
+        PhaseDef {
+            // (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The editor conformance cases: the engine's own
+            // fixed command on the host, jailed to the harness's own loopback port; its unit passes
+            // only on the engine's record of a PASS (the editor conformance floor), so no pin.
+            executor: PhaseExecutor::Tool {
+                cmd: crate::editor_conformance::CONFORMANCE_CMD
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            },
+            ..entry(
+                crate::editor_conformance::CATALOG_ID,
+                Test,
+                Neutral,
+                auto,
+                Execution,
+                None,
+                false,
+            )
+        },
     ]
 }
 
@@ -1498,7 +1522,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_seventeen_entries_of_the_table() {
+    fn the_catalog_is_the_eighteen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -1547,6 +1571,7 @@ mod tests {
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
             ("demo_probe", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("demo_record", j("build"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
+            ("editor_conformance", j("test"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
         ];
         assert_eq!(got, want);
         let ids: Vec<_> = catalog().iter().map(|e| e.id.as_str()).collect();

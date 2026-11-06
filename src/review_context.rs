@@ -444,6 +444,7 @@ pub(crate) fn evaluator_brief(
     amendments: &[IntentAmendment],
     units: &[WorkUnit],
     unit: &WorkUnit,
+    current_tree: Option<&str>,
 ) -> Vec<(u32, String, String)> {
     let ord = unit.ord;
     let mut out = Vec::new();
@@ -511,6 +512,17 @@ pub(crate) fn evaluator_brief(
         "- [floor record] is the engine's own run of the repository's checks on the tree under \
          review: cite it; do not report the floor results as unavailable.",
     );
+    // (DES-EDITOR-CONFORMANCE-HOST) The editor conformance cases are the engine's to run, on the host.
+    if units
+        .iter()
+        .any(|u| u.ord < ord && u.editor_conformance.is_some())
+    {
+        c.push_str(
+            "\n- [editor conformance record] is the engine's own run of the editor conformance cases \
+             on this host: cite it for any conformance item. Never run conformance.py in your seat \
+             (no seat has a headless browser), and its absence there is not a finding.",
+        );
+    }
     out.push((ord, format!("[review checklist — unit {ord}]"), c));
 
     // 2. Its own prior verdicts.
@@ -588,6 +600,27 @@ pub(crate) fn evaluator_brief(
                 "The engine ran the repository's checks itself after unit {fo}{tree}: {} — {}",
                 if report.passed { "PASSED" } else { "FAILED" },
                 report.summary()
+            ),
+        ));
+    }
+
+    // 5. (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The engine's own editor conformance run — the latest
+    // record before this unit, judged against the tree under review NOW (`current_tree`): a record for
+    // another tree (a change after it, by a creator or a floor fix) says so and is not evidence.
+    if let Some((co, rec)) = units
+        .iter()
+        .filter(|u| u.ord < ord)
+        .filter_map(|u| u.editor_conformance.as_ref().map(|r| (u.ord, r)))
+        .max_by_key(|(o, _)| *o)
+    {
+        out.push((
+            co,
+            format!("{} — unit {co}]", crate::editor_conformance::RECORD_LABEL),
+            crate::editor_conformance::brief_block(
+                co,
+                creator.map(|c| c.ord).filter(|c| *c < co),
+                rec,
+                current_tree,
             ),
         ));
     }
@@ -716,6 +749,56 @@ mod tests {
         u
     }
 
+    /// (DES-EDITOR-CONFORMANCE-HOST) The reviewer is handed the engine's conformance record and the rule
+    /// never to run the harness; a PASS on another tree than the one under review (a change after it,
+    /// by any unit) is labelled UNVERIFIED, never "the evidence for this tree".
+    #[test]
+    fn the_conformance_record_is_handed_and_a_stale_one_is_not_evidence() {
+        use crate::editor_conformance as ec;
+        use crate::workflow::PhaseRole;
+        let mut conf = unit(2, PhaseRole::Neutral);
+        conf.editor_conformance = Some(ec::ConformanceRecord {
+            outcome: ec::OUTCOME_PASS.into(),
+            cause: None,
+            reason: None,
+            tree: Some("t1".into()),
+            jail: Some("sandbox-exec".into()),
+            editors: Vec::new(),
+            attempt: 0,
+        });
+        let eval = unit(3, PhaseRole::Evaluator);
+        let units = [unit(1, PhaseRole::Creator), conf, eval.clone()];
+        let brief = evaluator_brief("just do it", &[], &units, &eval, Some("t1"));
+        let rec = brief
+            .iter()
+            .find(|(_, l, _)| l == "[editor conformance record — unit 2]")
+            .expect("the record is handed");
+        assert!(
+            rec.2.contains("PASSED") && !rec.2.contains("UNVERIFIED"),
+            "{}",
+            rec.2
+        );
+        assert!(brief[0].2.contains("Never run conformance.py in your seat"));
+        let stale = evaluator_brief("just do it", &[], &units, &eval, Some("t2"));
+        let rec = stale
+            .iter()
+            .find(|(_, l, _)| l.starts_with("[editor conformance record"))
+            .unwrap();
+        assert!(rec.2.contains("UNVERIFIED"), "{}", rec.2);
+        // A unit with no record before it gets neither the block nor the rule.
+        let plain = evaluator_brief(
+            "just do it",
+            &[],
+            &[unit(1, PhaseRole::Creator), eval.clone()],
+            &eval,
+            Some("t1"),
+        );
+        assert!(plain
+            .iter()
+            .all(|(_, l, _)| !l.starts_with("[editor conformance record")));
+        assert!(!plain[0].2.contains("conformance.py"));
+    }
+
     fn ruling(text: &str, at: i64) -> crate::domain::OperatorRuling {
         crate::domain::OperatorRuling {
             action: "request_changes".into(),
@@ -765,6 +848,7 @@ mod tests {
             &amend,
             &units,
             &eval,
+            None,
         );
         let labels: Vec<&str> = brief.iter().map(|(_, l, _)| l.as_str()).collect();
         assert_eq!(
@@ -814,6 +898,7 @@ mod tests {
             &[],
             &[before, unit(2, PhaseRole::Creator)],
             &fresh,
+            None,
         );
         assert_eq!(brief.len(), 1, "{brief:?}");
         assert!(brief[0].2.contains("The intent names no Done-when list"));
@@ -881,6 +966,7 @@ mod tests {
             &[],
             &units,
             &eval,
+            None,
         );
         let c = &brief[0].2;
         assert!(
@@ -922,6 +1008,7 @@ mod tests {
             &[],
             &units,
             &eval,
+            None,
         );
         let c = &plain[0].2;
         assert!(c.contains("The intent names no Done-when list"), "{c}");
@@ -930,7 +1017,7 @@ mod tests {
             "{c}"
         );
         assert!(c.contains(DEFERRAL_RULE), "{c}");
-        let none = evaluator_brief("Done when:\n- a\n", &[], &units, &eval);
+        let none = evaluator_brief("Done when:\n- a\n", &[], &units, &eval, None);
         assert!(none[0].2.contains(DEFERRAL_RULE) && !none[0].2.contains("After delivery —"));
     }
 

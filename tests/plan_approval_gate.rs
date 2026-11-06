@@ -1865,4 +1865,35 @@ fn the_straight_through_launch_refuses_a_preset() {
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+    // (DES-EDITOR-CONFORMANCE-HOST) A stub `wicked-garden` first on `PATH`: the editor-plugin preset's
+    // `conformance` Tool names it, and the launch's tool preflight must find it (a CI runner has no garden
+    // installed). Nothing here runs it.
+    let bin =
+        std::env::temp_dir().join(format!("wicked-core-plan-gate-bin-{}", std::process::id()));
+    if std::fs::create_dir_all(&bin).is_ok() {
+        let stub = bin.join(if cfg!(windows) {
+            "wicked-garden.cmd"
+        } else {
+            "wicked-garden"
+        });
+        let body = if cfg!(windows) {
+            "@exit /b 0\r\n"
+        } else {
+            "#!/bin/sh\nexit 0\n"
+        };
+        if std::fs::write(&stub, body).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755));
+            }
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                std::env::set_var("PATH", joined);
+            }
+        }
+    }
 }
