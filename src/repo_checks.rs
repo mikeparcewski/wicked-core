@@ -7187,6 +7187,28 @@ pub(crate) fn introduced_dir(
     if !at(&base_tree)?.is_empty() {
         return Ok(NewDir::No);
     }
+    // ...nor anything but a directory at an ANCESTOR (codex review: a base `alias -> ../shared`
+    // link reached a package at `alias/pkg` that `ls-tree` never walks into; the change replacing
+    // the link with a real directory does not make that package new).
+    let parts: Vec<&str> = dir.split('/').collect();
+    for n in 1..parts.len() {
+        let ancestor = parts[..n].join("/");
+        let raw = crate::worktree_guard::git(
+            worktree,
+            &["ls-tree", "-z", "--full-tree", &base_tree, "--", &ancestor],
+            &env,
+        )
+        .map_err(|e| e.to_string())?;
+        let not_a_dir = raw
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .map(String::from_utf8_lossy)
+            .filter(|r| r.split_once('\t').is_some_and(|(_, p)| p == ancestor))
+            .any(|r| r.split_whitespace().nth(1) != Some("tree"));
+        if not_a_dir {
+            return Ok(NewDir::No);
+        }
+    }
     let head = crate::worktree_guard::snapshot_through(worktree, git_dir)
         .map_err(|e| format!("the head's tree could not be read: {e}"))?;
     let is_tree = |e: &String| e.split_whitespace().nth(1) == Some("tree");
@@ -7194,21 +7216,37 @@ pub(crate) fn introduced_dir(
         return Ok(NewDir::No);
     }
     // A rename INTO the directory (`git mv old new`, a moved tree with edits git still pairs):
-    // the base's files under a new name are not the change's own.
-    let raw = crate::worktree_guard::git(
-        worktree,
-        &[
+    // the base's files under a new name are not the change's own. `-l0`: no rename limit, so
+    // neither a big move nor a low `diff.renameLimit` skips the pairing (pi review: with the
+    // limit hit, git lists the move as deletes + adds and exits 0); a skip git still reports
+    // anyway makes no claim.
+    // spawn-audit: hardened — git plumbing over the pinned repository; reads no engine state.
+    let mut diff = Command::new("git");
+    diff.hardened()
+        .args([
             "diff-tree",
             "-r",
             "-z",
             "-M",
+            "-l0",
             "--name-status",
             &base_tree,
             &head.tree,
-        ],
-        &[("GIT_DIR", git_dir)],
-    )
-    .map_err(|e| e.to_string())?;
+        ])
+        .current_dir(worktree)
+        .env("GIT_DIR", git_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = diff.output().map_err(|e| format!("git diff-tree: {e}"))?;
+    let said = String::from_utf8_lossy(&out.stderr);
+    if !out.status.success() {
+        return Err(format!("git diff-tree failed: {}", said.trim()));
+    }
+    if said.contains("rename detection was skipped") {
+        return Err(format!("git skipped rename detection: {}", said.trim()));
+    }
+    let raw = out.stdout;
     let prefix = format!("{dir}/");
     let mut fields = raw
         .split(|b| *b == 0)
@@ -7238,6 +7276,32 @@ pub(crate) fn introduced_dir(
     } else {
         NewDir::Moved(moved)
     })
+}
+
+/// (F24) Nothing is at `dir` in the base export, walked one component at a time and following no
+/// link: a missing component is absence; a link, a file, or anything unreadable on the way is not
+/// (no claim). A case-folding filesystem resolving `pkg` to the base's `Pkg` finds it here.
+fn absent_in_export(root: &Path, dir: &str) -> bool {
+    let mut p = root.to_path_buf();
+    for c in dir.split('/') {
+        p.push(c);
+        match std::fs::symlink_metadata(&p) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+            Ok(m) if m.is_dir() => {}
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// (F24) Whether a base side's error leaves the head's failure a new one (the base has nothing to
+/// compare it with, by the change's own doing or the repo's opt-out) rather than an unknown base.
+/// Matched by the engine's own PREFIX only: a repo-controlled path quoted inside another error can
+/// never carry it.
+fn base_error_leaves_a_new_failure(e: &str) -> bool {
+    [DECLARES_NO_PREFIX, NEW_DIR_PREFIX, BASELINE_DIFF_OFF_PREFIX]
+        .iter()
+        .any(|p| e.starts_with(p))
 }
 
 /// The base export's directory name under the worktree's engine scratch (`tmp/`).
@@ -7569,8 +7633,7 @@ impl BaseTree {
         // answer makes no claim: the base is detected as before, and a missing directory fails
         // closed below.
         if !check.dir.is_empty() {
-            let on_disk = std::fs::symlink_metadata(self.dir.join(&check.dir));
-            let absent = matches!(&on_disk, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+            let absent = absent_in_export(&self.dir, &check.dir);
             match introduced_dir(&self.worktree, &self.git_dir, &self.head, &check.dir) {
                 Ok(NewDir::Introduced) if absent => {
                     return fail(format!(
@@ -7885,8 +7948,10 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 /// excluded precisely. Denies.
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
-/// base inventory): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 13;
+/// base inventory; v14, F24: a check in a package directory the change introduced is decided as
+/// the change's own, so a recorded `base_red_unseparated` for one is not reused): a record of any
+/// other version, or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 14;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -9488,11 +9553,7 @@ fn decide(
             .base
             .error
             .as_deref()
-            .filter(|e| {
-                ![DECLARES_NO_PREFIX, NEW_DIR_PREFIX, BASELINE_DIFF_OFF_PREFIX]
-                    .iter()
-                    .any(|p| e.starts_with(p))
-            })
+            .filter(|e| !base_error_leaves_a_new_failure(e))
             .map(|e| format!("the base could not be run ({e})")),
         _ => None,
     });
@@ -14058,6 +14119,87 @@ exit 1
         assert!(c.regressions.is_empty(), "{c:#?}");
         eprintln!("repo_checks: F24 comparable-red floor asserted");
         let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (F24, pi review) The rename guard holds past git's rename limit: a moved package whose files
+    /// changed names and content is still a move with `diff.renameLimit = 1` in the repository's
+    /// config (git would otherwise list it as deletes + adds, exit 0).
+    #[test]
+    fn a_rename_past_the_rename_limit_is_still_a_move_f24() {
+        let repo = f24_repo("f24-rename-limit");
+        std::fs::create_dir_all(repo.join("old")).unwrap();
+        let body = |i: usize| {
+            (1..=20)
+                .map(|n| format!("f{i} line {n}\n"))
+                .collect::<String>()
+        };
+        for i in 1..=3 {
+            std::fs::write(repo.join(format!("old/a{i}.txt")), body(i)).unwrap();
+        }
+        let base = git_repo_with_commit(&repo);
+        git(&repo, &["config", "diff.renameLimit", "1"]);
+        std::fs::create_dir_all(repo.join("new")).unwrap();
+        for i in 1..=3 {
+            std::fs::remove_file(repo.join(format!("old/a{i}.txt"))).unwrap();
+            std::fs::write(
+                repo.join(format!("new/b{i}.txt")),
+                format!("{}extra\n", body(i)),
+            )
+            .unwrap();
+        }
+        match introduced_dir(&repo, &repo.join(".git"), &base, "new").unwrap() {
+            NewDir::Moved(m) => assert!(m.iter().any(|x| x == "old/a1.txt -> new/b1.txt"), "{m:?}"),
+            other => panic!("a move past the rename limit read as {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (F24, codex review) Only the engine's own leading words exempt a base error; the same words
+    /// quoted inside another error (a repo path in an ENOENT) leave the base unknown.
+    #[test]
+    fn only_the_engines_leading_words_exempt_a_base_error_f24() {
+        for ok in [
+            "the change introduced `pkg`: the run base has no such directory",
+            "the run base declares no `e2e` check (the change introduced it)",
+            "baseline diff disabled by `.wicked/checks.json` (baseline_diff: false)",
+        ] {
+            assert!(base_error_leaves_a_new_failure(ok), "{ok}");
+        }
+        for laundered in [
+            "the base's checks could not be determined: `the change introduced `x``: No such file",
+            "the base's checks could not be determined: `a/declares no `b`/c`: No such file",
+            "the base's dependency install did not pass (baseline_diff: false)",
+            "the run base has no `new`, but the change moved base files into it (old/a -> new/a)",
+            " the change introduced `pkg`",
+        ] {
+            assert!(!base_error_leaves_a_new_failure(laundered), "{laundered}");
+        }
+    }
+
+    /// (F24, codex review) A base LINK at an ancestor (`alias -> ../shared`, dangling in the
+    /// export) reached a package the change then made a real directory: not one the change added.
+    #[cfg(unix)]
+    #[test]
+    fn a_package_behind_a_base_link_is_not_one_the_change_added_f24() {
+        let repo = f24_repo("f24-link-ancestor");
+        f24_red_package(&repo, "shared/pkg", "shared::pkg");
+        std::os::unix::fs::symlink("shared", repo.join("alias")).unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::remove_file(repo.join("alias")).unwrap();
+        f24_red_package(&repo, "alias/pkg", "shared::pkg");
+        assert_eq!(
+            introduced_dir(&repo, &repo.join(".git"), &base, "alias/pkg").unwrap(),
+            NewDir::No
+        );
+        // The export walk refuses a link on the way, dangling or not.
+        let export = scratch("f24-link-export");
+        std::os::unix::fs::symlink("../nowhere", export.join("alias")).unwrap();
+        assert!(!absent_in_export(&export, "alias/pkg"));
+        assert!(absent_in_export(&export, "fresh/pkg"));
+        std::fs::write(export.join("file"), "x").unwrap();
+        assert!(!absent_in_export(&export, "file/pkg"));
+        let _ = std::fs::remove_dir_all(&repo);
+        let _ = std::fs::remove_dir_all(&export);
     }
 
     /// (F24) One change, both: a new red package and an old red one it touched. The floor stops at

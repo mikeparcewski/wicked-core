@@ -21,7 +21,10 @@ Two release tracks share this file, newest entry first regardless of track:
   head has a directory there, and no base file was renamed into it, the base side says "the change introduced
   `<dir>`" and the failure is `new_failure`, its failing tests named as the change's. A renamed directory is not
   "added": base files moved into it (staged or not, edited or not, as git pairs them) keep the comparison unknown,
-  the move named. A red base on a comparable directory is unchanged. The floor's other base-side exemptions ("the
+  the move named (rename detection runs with no limit; a skipped detection makes no claim). Nor is a directory
+  the base reached through a link (`alias -> shared`, `alias/pkg`) that the change made real. A red base on a
+  comparable directory is unchanged. The floor policy version moves to 14, so a recorded decision from before is
+  not reused. The floor's other base-side exemptions ("the
   base declares no such check", `baseline_diff: false`) now match the engine's own wording at the start of the
   error, so a repository path quoted inside some other error cannot carry them.
 - **The rule judge's answers are kept or explained, never read as silence (e2e-1105 F20, the judge half of F22).**
