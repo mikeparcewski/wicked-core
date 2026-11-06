@@ -4068,6 +4068,13 @@ pub(crate) fn run(
                                  changes to send the work back to unit {c} for rework, or reject \
                                  to stop the run."
                             ),
+                            // A command Tool (recorded Rejected above): request changes re-runs it.
+                            (true, None) if unit.stage != crate::domain::StageKind::Test => {
+                                "Approve to run the step again (optionally amend), request \
+                                 changes to run it again with your note, or reject to stop the run."
+                                    .to_string()
+                            }
+                            // A check with no creator before it: nothing to send back to.
                             (true, None) => "Approve to run the step again (optionally amend), \
                                              or reject to stop the run."
                                 .to_string(),
@@ -7156,7 +7163,11 @@ fn apply_step_result(
             } else if human_present
                 && seat_refusal.is_none()
                 && output.attempt > 0
-                && !crate::acp_runner::is_worker_originated_failure(&output.output)
+                // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
+                // out" or "connection"), never a seat's: the seat classifier does not apply, and
+                // with no seat failover for a Tool, skipping this gate would end the run.
+                && (unit.tool_cmd.is_some()
+                    || !crate::acp_runner::is_worker_originated_failure(&output.output))
             {
                 // (core#556) A RETRIED attempt that failed again without starting work (a launch
                 // refusal: fence, snapshot, environment, permission). The triage judge already

@@ -326,6 +326,8 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
 /// exits 1 until the creator's second pass writes `flag`; the triage judge rules `fail`. Records
 /// every `(ord, attempt)` a seat ran, and every triage call.
 struct FailingCheckSeat {
+    /// The triage judge's ruling line (`DECISION: FAIL` unless a test says otherwise).
+    ruling: &'static str,
     flag: std::path::PathBuf,
     handed: Arc<Mutex<Vec<(u32, u32)>>>,
     triaged: Arc<Mutex<u32>>,
@@ -334,7 +336,10 @@ impl StepRunner for FailingCheckSeat {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
         let output = if i.run_id.starts_with("triage-") {
             *self.triaged.lock().unwrap() += 1;
-            "DECISION: FAIL\n2 of the produced tests fail (fixture verdict)".to_string()
+            format!(
+                "{}\n2 of the produced tests fail (fixture verdict)",
+                self.ruling
+            )
         } else if i.unit.session_id == "validator" {
             "PASS\nthe work meets the criterion\nPASS".to_string()
         } else {
@@ -366,6 +371,7 @@ fn launch_tool_check(
     name: &str,
     run: &str,
     check_kind: &str,
+    ruling: &'static str,
 ) -> (
     Core,
     std::sync::mpsc::Receiver<CoreEvent>,
@@ -382,6 +388,7 @@ fn launch_tool_check(
         db,
         Arc::new(NumericDispatcher),
         Arc::new(FailingCheckSeat {
+            ruling,
             flag: flag.clone(),
             handed: Arc::clone(&handed),
             triaged: Arc::clone(&triaged),
@@ -389,7 +396,7 @@ fn launch_tool_check(
     );
     let script = format!(
         "if [ -f '{}' ]; then echo pass >> '{log}'; echo 'qe-verify: PASS'; exit 0; fi; echo fail \
-         >> '{log}'; echo 'qe-verify: FAIL — 2 of 5 tests failed'; exit 1",
+         >> '{log}'; echo 'qe-verify: FAIL — 2 of 5 tests failed (connection timed out)'; exit 1",
         flag.display(),
         log = log.display()
     );
@@ -440,7 +447,8 @@ fn launch_tool_check(
 #[test]
 fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
     let run = "tool-check-run";
-    let (core, ev, handed, triaged, _log) = launch_tool_check("tool-check", run, "test");
+    let (core, ev, handed, triaged, _log) =
+        launch_tool_check("tool-check", run, "test", "DECISION: FAIL");
 
     let parked = |seen: &[CoreEvent]| {
         assert!(
@@ -554,7 +562,8 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
 #[test]
 fn no_answer_at_a_failed_checks_gate_skips_the_check() {
     let run = "tool-check-t2";
-    let (core, ev, _handed, _triaged, log) = launch_tool_check("tool-check-t2", run, "test");
+    let (core, ev, _handed, _triaged, log) =
+        launch_tool_check("tool-check-t2", run, "test", "DECISION: FAIL");
     let parked_again = |seen: &[CoreEvent]| {
         seen.iter().any(|e| {
             matches!(e, CoreEvent::AwaitingHuman { ord: 2, gate_kind, .. } if gate_kind == "triage")
@@ -636,7 +645,8 @@ fn no_answer_at_a_failed_checks_gate_skips_the_check() {
 #[test]
 fn a_failed_command_tool_parks_and_request_changes_reruns_the_command_not_the_creator() {
     let run = "tool-command-run";
-    let (core, ev, handed, _triaged, log) = launch_tool_check("tool-command", run, "build");
+    let (core, ev, handed, _triaged, log) =
+        launch_tool_check("tool-command", run, "build", "DECISION: FAIL");
     let first = drain_until(&ev, run, |e| {
         matches!(
             e,
@@ -682,4 +692,67 @@ fn a_failed_command_tool_parks_and_request_changes_reruns_the_command_not_the_cr
     assert_eq!(creators, 1, "the creator ran once, at the start");
     let runs = std::fs::read_to_string(&log).unwrap_or_default();
     assert_eq!(runs.lines().count(), 2, "the command ran again: {runs}");
+}
+
+/// (e2e F30, codex r4) A command Tool the judge ESCALATES (not fail) is recorded as its command's
+/// failure, so approve re-runs it at a fresh attempt. That retry failing again, with output a
+/// seat classifier would read as a worker timeout ("connection timed out"), parks at a gate
+/// again: a Tool has no seat failover, and that classifier no longer ends its run.
+#[cfg(unix)]
+#[test]
+fn an_escalated_command_tool_retried_and_failing_again_parks_again() {
+    let run = "tool-command-esc";
+    let (core, ev, _handed, _triaged, log) =
+        launch_tool_check("tool-command-esc", run, "build", "DECISION: ESCALATE");
+    let stop = |e: &CoreEvent| {
+        matches!(
+            e,
+            CoreEvent::AwaitingHuman { .. }
+                | CoreEvent::SessionFailed { .. }
+                | CoreEvent::SessionCompleted { .. }
+        )
+    };
+    let first = drain_until(&ev, run, stop);
+    assert!(
+        first
+            .iter()
+            .any(|e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, .. })),
+        "{first:?}"
+    );
+    core.confirm_gate(
+        run,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: AmendScope::Cursor,
+        },
+    )
+    .expect("approve re-runs the command");
+    let again = drain_until(&ev, run, stop);
+    assert!(
+        again.iter().any(|e| matches!(
+            e,
+            CoreEvent::UnitDispatched {
+                ord: 2,
+                attempt: 1,
+                ..
+            }
+        )),
+        "the retry is a fresh attempt: {again:?}"
+    );
+    assert!(
+        again
+            .iter()
+            .any(|e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, .. })),
+        "the second failure parks, it does not end the run: {again:?}"
+    );
+    assert!(!again
+        .iter()
+        .any(|e| matches!(e, CoreEvent::SessionFailed { .. })));
+    assert_eq!(
+        std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .count(),
+        2
+    );
 }
