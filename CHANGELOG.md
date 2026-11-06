@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A failing check in a package directory the change added is the change's own failure (e2e-1105 F24).** The base
+  has nothing to compare there, so the floor used to class the failure "base red, cannot separate" and the gate card
+  recommended the operator's floor override instead of Send back (W10 run 57bafff0, unit 7). The floor now reads the
+  base COMMIT and the head's tree through the pinned git dir: when the base has nothing at the check's directory, the
+  head has a directory there, and no base file was renamed into it, the base side says "the change introduced
+  `<dir>`" and the failure is `new_failure`, its failing tests named as the change's. A renamed directory is not
+  "added": base files moved into it (staged or not, edited or not, as git pairs them) keep the comparison unknown,
+  the move named. A red base on a comparable directory is unchanged. The floor's other base-side exemptions ("the
+  base declares no such check", `baseline_diff: false`) now match the engine's own wording at the start of the
+  error, so a repository path quoted inside some other error cannot carry them.
 - **The rule judge's answers are kept or explained, never read as silence (e2e-1105 F20, the judge half of F22).**
   An answer the engine does not count used to become "the judge did not answer for it, in its batch or asked
   alone". The row now says why, naming the seat: "the judge (pi) answered KEPT without citing a changed file by its

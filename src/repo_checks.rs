@@ -5694,7 +5694,7 @@ fn run_detected(
                                 cached: false,
                                 run: None,
                                 error: Some(format!(
-                                "baseline diff disabled by `{CONFIG_PATH}` (baseline_diff: false)"
+                                "{BASELINE_DIFF_OFF_PREFIX}{CONFIG_PATH}` (baseline_diff: false)"
                             )),
                             },
                             toc: None,
@@ -7111,6 +7111,133 @@ pub(crate) struct BaseTree {
     /// write or removal in it goes through this.
     pub(crate) held: HeldDir,
     head: String,
+    /// (F24) The head worktree and the PINNED git dir the export was taken through: whether the
+    /// change itself introduced a package directory is read from the base commit and the head's
+    /// tree, never inferred from a missing path in the export.
+    worktree: PathBuf,
+    git_dir: PathBuf,
+}
+
+/// (F24) How a base error that the change introduced the check's package directory begins.
+/// Engine text only: [`decide`] matches the PREFIX, so a repo-controlled path quoted inside some
+/// other error can never carry it.
+pub(crate) const NEW_DIR_PREFIX: &str = "the change introduced `";
+/// How the "the base declares no such check" base error begins ([`decide`] matches the prefix).
+const DECLARES_NO_PREFIX: &str = "the run base declares no `";
+/// How the `baseline_diff: false` opt-out's base error begins ([`decide`] matches the prefix).
+const BASELINE_DIFF_OFF_PREFIX: &str = "baseline diff disabled by `";
+
+/// (F24) What the base commit and the head's tree say about a check's package directory.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum NewDir {
+    /// The base commit has nothing at the path, the head's tree has a directory there, and no
+    /// base file was renamed into it: the change introduced it.
+    Introduced,
+    /// The base has no such directory, but the change moved base files into it (`old -> new`,
+    /// at most three named): a red there may be the base's own, under a new name.
+    Moved(Vec<String>),
+    /// The base has something at the path, the head has no directory there, or the path is not
+    /// a plain relative one: no claim (the base is detected and run as before).
+    No,
+}
+
+/// (F24) Did the change introduce `dir` (repo-relative, `/`-separated)? Read through the PINNED
+/// `git_dir` only: the base side from the base COMMIT (a literal pathspec, so no pathspec magic
+/// in a repo-controlled name), the head side from a fresh snapshot of the worktree's tree
+/// (tracked + untracked-not-ignored, [`crate::worktree_guard::snapshot_through`]), and the
+/// rename guard from git's own rename detection between the two trees. `Err` when git cannot
+/// answer: the caller then makes no claim.
+pub(crate) fn introduced_dir(
+    worktree: &Path,
+    git_dir: &Path,
+    base: &str,
+    dir: &str,
+) -> Result<NewDir, String> {
+    let plain = !dir.is_empty()
+        && !dir.contains('\\')
+        && Path::new(dir)
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)))
+        && dir
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..");
+    if !plain {
+        return Ok(NewDir::No);
+    }
+    let one = Path::new("1");
+    let env: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_LITERAL_PATHSPECS", one)];
+    // `<mode> <type> <id>\t<path>` entries of `tree` at exactly `dir`.
+    let at = |tree: &str| -> Result<Vec<String>, String> {
+        let raw = crate::worktree_guard::git(
+            worktree,
+            &["ls-tree", "-z", "--full-tree", tree, "--", dir],
+            &env,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(raw
+            .split(|b| *b == 0)
+            .filter(|r| !r.is_empty())
+            .map(|r| String::from_utf8_lossy(r).into_owned())
+            .filter(|r| r.split_once('\t').is_some_and(|(_, p)| p == dir))
+            .collect())
+    };
+    // The base commit's tree first: it must hold nothing at the path (a file, a link or a
+    // submodule there is the base's, not the change's).
+    let base_tree = format!("{base}^{{tree}}");
+    if !at(&base_tree)?.is_empty() {
+        return Ok(NewDir::No);
+    }
+    let head = crate::worktree_guard::snapshot_through(worktree, git_dir)
+        .map_err(|e| format!("the head's tree could not be read: {e}"))?;
+    let is_tree = |e: &String| e.split_whitespace().nth(1) == Some("tree");
+    if !at(&head.tree)?.iter().any(is_tree) {
+        return Ok(NewDir::No);
+    }
+    // A rename INTO the directory (`git mv old new`, a moved tree with edits git still pairs):
+    // the base's files under a new name are not the change's own.
+    let raw = crate::worktree_guard::git(
+        worktree,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "-M",
+            "--name-status",
+            &base_tree,
+            &head.tree,
+        ],
+        &[("GIT_DIR", git_dir)],
+    )
+    .map_err(|e| e.to_string())?;
+    let prefix = format!("{dir}/");
+    let mut fields = raw
+        .split(|b| *b == 0)
+        .filter(|f| !f.is_empty())
+        .map(|f| String::from_utf8_lossy(f).into_owned());
+    let mut moved = Vec::new();
+    let mut renames = 0usize;
+    while let Some(status) = fields.next() {
+        let paired = status.starts_with('R') || status.starts_with('C');
+        let Some(path) = fields.next() else { break };
+        if !paired {
+            continue;
+        }
+        let Some(to) = fields.next() else { break };
+        if status.starts_with('R') && to.starts_with(&prefix) {
+            renames += 1;
+            if moved.len() < 3 {
+                moved.push(format!("{path} -> {to}"));
+            }
+        }
+    }
+    if renames > moved.len() {
+        moved.push(format!("{} more", renames - moved.len()));
+    }
+    Ok(if moved.is_empty() {
+        NewDir::Introduced
+    } else {
+        NewDir::Moved(moved)
+    })
 }
 
 /// The base export's directory name under the worktree's engine scratch (`tmp/`).
@@ -7338,6 +7465,8 @@ impl BaseTree {
             dir,
             held,
             head: head.to_string(),
+            worktree: worktree.to_path_buf(),
+            git_dir: git_dir.to_path_buf(),
         })
     }
 
@@ -7432,6 +7561,40 @@ impl BaseTree {
             stage: ctx.stage,
             ..FloorContext::default()
         };
+        // (F24) A package directory the change itself introduced has no base to compare: its
+        // failure is the change's own, as a red test is on a comparable green base. Established
+        // from the base COMMIT and the head's tree ([`introduced_dir`]), and from the export
+        // holding nothing there either (a case-folding filesystem resolves `pkg` to the base's
+        // `Pkg`); base files moved into it keep the comparison unknown. Anything git cannot
+        // answer makes no claim: the base is detected as before, and a missing directory fails
+        // closed below.
+        if !check.dir.is_empty() {
+            let on_disk = std::fs::symlink_metadata(self.dir.join(&check.dir));
+            let absent = matches!(&on_disk, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+            match introduced_dir(&self.worktree, &self.git_dir, &self.head, &check.dir) {
+                Ok(NewDir::Introduced) if absent => {
+                    return fail(format!(
+                        "{NEW_DIR_PREFIX}{}`: the run base has no such directory, so its \
+                         failures are the change's own",
+                        check.dir
+                    ));
+                }
+                Ok(NewDir::Moved(moved)) if absent => {
+                    return fail(format!(
+                        "the run base has no `{}`, but the change moved base files into it ({}): \
+                         its failures may be the base's own",
+                        check.dir,
+                        moved.join(", ")
+                    ));
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!(
+                    "wicked-core: repo checks floor — whether the change introduced `{}` could \
+                     not be read ({e}); the base is detected as before",
+                    check.dir
+                ),
+            }
+        }
         // (core#817) A subdirectory package's check is detected in the BASE's copy of that
         // directory; a package the change introduced has none, and fails closed below.
         let detected = match detect_with(&self.dir.join(&check.dir), &base_ctx) {
@@ -7450,7 +7613,7 @@ impl BaseTree {
             && !detected.iter().any(|c| c.name == check.name)
         {
             return fail(format!(
-                "the run base declares no `{}` check (the change introduced it)",
+                "{DECLARES_NO_PREFIX}{}` check (the change introduced it)",
                 check.name
             ));
         }
@@ -9312,7 +9475,9 @@ fn decide(
     let base_passed = base_run.is_some_and(CheckRun::passed);
     // A base that could not be established — it timed out, could not start, or could not be
     // exported or provisioned — separates nothing: escalate. (A base that declares no such check,
-    // and a repo that opted out of the comparison, leave the head's failure a new one.)
+    // a package directory the change introduced (F24), and a repo that opted out of the
+    // comparison, leave the head's failure a new one. Matched by the engine's own prefix: a
+    // repo-controlled path quoted inside another error can never carry the exemption.)
     let base_unknown: Option<String> = side.as_ref().and_then(|s| match &s.base.run {
         Some(b) if b.timed_out => Some("the base run did not finish".to_string()),
         Some(b) if b.spawn_error.is_some() => Some(format!(
@@ -9323,7 +9488,11 @@ fn decide(
             .base
             .error
             .as_deref()
-            .filter(|e| !e.contains("declares no `") && !e.contains("baseline_diff: false"))
+            .filter(|e| {
+                ![DECLARES_NO_PREFIX, NEW_DIR_PREFIX, BASELINE_DIFF_OFF_PREFIX]
+                    .iter()
+                    .any(|p| e.starts_with(p))
+            })
             .map(|e| format!("the base could not be run ({e})")),
         _ => None,
     });
@@ -13746,6 +13915,247 @@ exit 1
         if r.passed() {
             assert!(r.stdout_tail.trim_end().ends_with("/giphy"), "{r:?}");
         }
+    }
+
+    /// (F24) A red package fixture: `dir/package.json` and a `.wicked/checks.json` whose `test`
+    /// prints the libtest failure line for `id` and exits 101.
+    fn f24_red_package(repo: &Path, dir: &str, id: &str) {
+        std::fs::create_dir_all(repo.join(dir).join(".wicked")).unwrap();
+        std::fs::write(
+            repo.join(dir).join("package.json"),
+            format!(r#"{{"name":"{}"}}"#, dir.replace('/', "-")),
+        )
+        .unwrap();
+        let script = format!("echo 'test {id} ... FAILED'; exit 101");
+        std::fs::write(
+            repo.join(dir).join(CONFIG_PATH),
+            serde_json::json!({ "test": ["sh", "-c", script] }).to_string(),
+        )
+        .unwrap();
+    }
+
+    /// (F24) A repo with a green root (`test` = `true`) and a `.gitignore` for the engine scratch.
+    fn f24_repo(name: &str) -> PathBuf {
+        let repo = scratch(name);
+        std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+        std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+        std::fs::write(repo.join(CONFIG_PATH), r#"{"test":["true"]}"#).unwrap();
+        std::fs::write(repo.join("index.txt"), "root\n").unwrap();
+        repo
+    }
+
+    fn f24_ctx(repo: &Path, base: &str) -> FloorContext {
+        FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base.to_string()),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        }
+    }
+
+    /// The `test` check the floor ran in `dir`.
+    fn f24_check<'a>(report: &'a RepoChecksReport, dir: &str) -> &'a CheckRun {
+        report
+            .checks
+            .iter()
+            .find(|c| c.name == "test" && c.source.starts_with(&format!("{dir}/")))
+            .unwrap_or_else(|| panic!("no `test` ran in `{dir}`: {report:#?}"))
+    }
+
+    fn f24_base_error(c: &CheckRun) -> String {
+        c.base
+            .as_ref()
+            .and_then(|b| b.error.clone())
+            .unwrap_or_default()
+    }
+
+    /// (F24, W10 57bafff0 unit 7) A failing test in a package directory the change ADDED is the
+    /// change's own failure, as a red test on a comparable green base is: `new_failure`, the
+    /// failing test named as the change's (so the card leads with Send back), never "base red,
+    /// cannot separate" with the operator's override as the path through.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_check_in_a_package_the_change_added_is_the_changes_own_f24() {
+        let repo = f24_repo("f24-new-pkg");
+        let base = git_repo_with_commit(&repo);
+        f24_red_package(&repo, "pkg", "pkg::adds");
+        let git_dir = repo.join(".git");
+        assert_eq!(
+            introduced_dir(&repo, &git_dir, &base, "pkg").unwrap(),
+            NewDir::Introduced
+        );
+        // No claim on a path that is not a plain relative one, or on what the base has.
+        for odd in ["", ".", "./pkg", "pkg/", "../pkg", "/pkg", "pkg//x"] {
+            assert_eq!(
+                introduced_dir(&repo, &git_dir, &base, odd).unwrap(),
+                NewDir::No,
+                "{odd:?}"
+            );
+        }
+        assert_eq!(
+            introduced_dir(&repo, &git_dir, &base, "index.txt").unwrap(),
+            NewDir::No
+        );
+        // The head has no directory there: no claim.
+        assert_eq!(
+            introduced_dir(&repo, &git_dir, &base, "nowhere").unwrap(),
+            NewDir::No
+        );
+        let report = run_floor(&repo, &f24_ctx(&repo, &base));
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the F24 floor cannot run");
+            return;
+        }
+        assert!(!report.passed, "{report:?}");
+        let c = f24_check(&report, "pkg");
+        let d = c.decision.as_ref().expect("decided");
+        // The change's own either way: failed, or failed twice (its identical retry failed too).
+        assert!(
+            matches!(
+                d.outcome.as_str(),
+                OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE
+            ),
+            "{c:#?}"
+        );
+        assert_ne!(c.classification.as_deref(), Some(BASE_RED_UNSEPARATED));
+        assert_eq!(c.regressions, s(&["test pkg::adds"]), "{c:#?}");
+        let err = f24_base_error(c);
+        assert!(
+            err.starts_with("the change introduced `pkg`") && err.contains("no such directory"),
+            "{err}"
+        );
+        let why = report.denial_reason();
+        assert!(!why.contains("floor override is the path through"), "{why}");
+        eprintln!("repo_checks: F24 new-package floor asserted");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (F24) The negative control: the package is in the base and red there too (a comparable
+    /// red base) — the head's failure cannot be told apart, so it stays `base_red_unseparated`.
+    #[cfg(unix)]
+    #[test]
+    fn a_red_package_the_base_already_had_stays_unseparated_f24() {
+        let repo = f24_repo("f24-old-pkg");
+        f24_red_package(&repo, "pkg", "pkg::shared");
+        std::fs::write(repo.join("pkg/notes.txt"), "v1\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(repo.join("pkg/notes.txt"), "v2\n").unwrap();
+        assert_eq!(
+            introduced_dir(&repo, &repo.join(".git"), &base, "pkg").unwrap(),
+            NewDir::No
+        );
+        let report = run_floor(&repo, &f24_ctx(&repo, &base));
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the F24 floor cannot run");
+            return;
+        }
+        let c = f24_check(&report, "pkg");
+        assert_eq!(
+            c.classification.as_deref(),
+            Some(BASE_RED_UNSEPARATED),
+            "{c:#?}"
+        );
+        assert!(c.regressions.is_empty(), "{c:#?}");
+        eprintln!("repo_checks: F24 comparable-red floor asserted");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (F24) One change, both: a new red package and an old red one it touched. The floor stops at
+    /// its first failure (`fresh` runs first): that is the change's own, naming only its test —
+    /// the old package's base red is neither laundered into it nor hidden behind it. Once the new
+    /// package is green, the old one is still the base's, unseparated.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_red_package_beside_an_old_red_one_is_told_apart_f24() {
+        let repo = f24_repo("f24-mixed");
+        f24_red_package(&repo, "old", "old::shared");
+        std::fs::write(repo.join("old/notes.txt"), "v1\n").unwrap();
+        let base = git_repo_with_commit(&repo);
+        std::fs::write(repo.join("old/notes.txt"), "v2\n").unwrap();
+        f24_red_package(&repo, "fresh", "fresh::adds");
+        let ctx = f24_ctx(&repo, &base);
+        let report = run_floor(&repo, &ctx);
+        if report.sandbox_error.is_some() {
+            eprintln!("repo_checks: no sandbox tool here — the F24 floor cannot run");
+            return;
+        }
+        let fresh = f24_check(&report, "fresh");
+        assert!(
+            matches!(
+                fresh.decision.as_ref().map(|d| d.outcome.as_str()),
+                Some(OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE)
+            ),
+            "{fresh:#?}"
+        );
+        assert_ne!(fresh.classification.as_deref(), Some(BASE_RED_UNSEPARATED));
+        assert_eq!(fresh.regressions, s(&["test fresh::adds"]), "{fresh:#?}");
+        assert!(f24_base_error(fresh).starts_with("the change introduced `fresh`"));
+        assert!(
+            !report.checks.iter().any(|c| c.source.starts_with("old/")),
+            "the floor stopped at its first failure: {report:#?}"
+        );
+        // The new package fixed: the old package's red is the base's, as before.
+        std::fs::write(repo.join("fresh").join(CONFIG_PATH), r#"{"test":["true"]}"#).unwrap();
+        let report = run_floor(&repo, &ctx);
+        let old = f24_check(&report, "old");
+        assert_eq!(
+            old.classification.as_deref(),
+            Some(BASE_RED_UNSEPARATED),
+            "{old:#?}"
+        );
+        assert!(old.regressions.is_empty(), "{old:#?}");
+        assert!(f24_check(&report, "fresh").passed());
+        eprintln!("repo_checks: F24 mixed floor asserted");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+
+    /// (F24, path tricks) A RENAMED red package is not one the change added: the base's files
+    /// under a new name keep the comparison unknown (`base_red_unseparated`, the move named) —
+    /// untracked, staged (`git mv`), and with an edit git still pairs.
+    #[cfg(unix)]
+    #[test]
+    fn a_renamed_red_package_is_not_one_the_change_added_f24() {
+        let repo = f24_repo("f24-renamed");
+        f24_red_package(&repo, "old", "old::shared");
+        std::fs::write(
+            repo.join("old/lib.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\n",
+        )
+        .unwrap();
+        let base = git_repo_with_commit(&repo);
+        let git_dir = repo.join(".git");
+        std::fs::rename(repo.join("old"), repo.join("new")).unwrap();
+        let moved = |r: NewDir| match r {
+            NewDir::Moved(m) => m,
+            other => panic!("a rename read as {other:?}"),
+        };
+        let m = moved(introduced_dir(&repo, &git_dir, &base, "new").unwrap());
+        assert!(m.iter().any(|x| x == "old/lib.txt -> new/lib.txt"), "{m:?}");
+        let report = run_floor(&repo, &f24_ctx(&repo, &base));
+        if report.sandbox_error.is_none() {
+            let c = f24_check(&report, "new");
+            assert_eq!(
+                c.classification.as_deref(),
+                Some(BASE_RED_UNSEPARATED),
+                "{c:#?}"
+            );
+            let err = f24_base_error(c);
+            assert!(
+                err.starts_with("the run base has no `new`, but the change moved base files"),
+                "{err}"
+            );
+            eprintln!("repo_checks: F24 renamed floor asserted");
+        }
+        // Staged, and with an edit git still pairs as a rename.
+        git(&repo, &["add", "-A"]);
+        assert!(!moved(introduced_dir(&repo, &git_dir, &base, "new").unwrap()).is_empty());
+        std::fs::write(
+            repo.join("new/lib.txt"),
+            "one\ntwo\nthree\nfour\nfive\nsix\nseven\nEIGHT\n",
+        )
+        .unwrap();
+        assert!(!moved(introduced_dir(&repo, &git_dir, &base, "new").unwrap()).is_empty());
+        let _ = std::fs::remove_dir_all(&repo);
     }
 
     /// core#432 F-3R2-023: a verify floor that ran no end-to-end check over a change touching e2e
