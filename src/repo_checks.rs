@@ -13980,6 +13980,7 @@ exit 1
 
     /// (F24) A red package fixture: `dir/package.json` and a `.wicked/checks.json` whose `test`
     /// prints the libtest failure line for `id` and exits 101.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn f24_red_package(repo: &Path, dir: &str, id: &str) {
         std::fs::create_dir_all(repo.join(dir).join(".wicked")).unwrap();
         std::fs::write(
@@ -14005,6 +14006,7 @@ exit 1
         repo
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn f24_ctx(repo: &Path, base: &str) -> FloorContext {
         FloorContext {
             stage: FloorStage::Verify,
@@ -14015,6 +14017,7 @@ exit 1
     }
 
     /// The `test` check the floor ran in `dir`.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn f24_check<'a>(report: &'a RepoChecksReport, dir: &str) -> &'a CheckRun {
         report
             .checks
@@ -14023,6 +14026,7 @@ exit 1
             .unwrap_or_else(|| panic!("no `test` ran in `{dir}`: {report:#?}"))
     }
 
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn f24_base_error(c: &CheckRun) -> String {
         c.base
             .as_ref()
