@@ -68,6 +68,8 @@ serde_yaml = "0.9"
 # uses, so cargo unifies one compilation.
 toml = "0.8"
 sha2 = "0.10"
+# (DES-EDITOR-CONFORMANCE-HOST) the editor conformance export verifies each blob against its SHA-1 object id.
+sha1 = "0.10"
 # The build guide's line rules (DES-BUILD-GUIDE): RE2-syntax regexes, linear time. Same major the
 # governance crate uses, so cargo unifies one compilation.
 regex = "1"
