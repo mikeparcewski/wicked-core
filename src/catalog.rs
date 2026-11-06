@@ -1566,7 +1566,7 @@ mod tests {
                 j("agent"),
                 Some("wicked-garden-qe-security-test-engineer"),
             ),
-            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("9fddcc159580ed33"), false, j("agent"), None),
+            ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("9a2c71609c3e3ced"), false, j("agent"), None),
             ("run", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
             ("demo_probe", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
@@ -1682,11 +1682,111 @@ mod tests {
         match &verify.executor {
             PhaseExecutor::Tool { cmd } => {
                 assert_eq!(cmd.first().map(String::as_str), Some("bash"));
-                assert!(cmd.last().unwrap().contains("QE-VERIFY-SUMMARY:"));
+                let script = cmd.last().unwrap();
+                assert!(script.contains("QE-VERIFY-SUMMARY:"));
+                // (e2e F30) A produced file red on main too is classed, counted apart and not
+                // against the run; the base is the engine's recorded run base when there is one.
+                assert!(script.contains("failed_on_base=$FB"), "{script}");
+                assert!(script.contains("class=$FCLASS"), "{script}");
+                assert!(script.contains("WICKED_RUN_BASE"), "{script}");
             }
             other => panic!("verify is a Tool step, got {other:?}"),
         }
         assert_eq!(by("review").role, PhaseRole::Evaluator);
+    }
+
+    /// (e2e F30) The shipped verify script, run for real on a node:test repository whose main
+    /// already has a red test file (two failing tests). Tests ADDED to that file that pass are
+    /// verified: the file is `class=pre-existing-on-base`, `failed=0 failed_on_base=1`, exit 0
+    /// (it failed with `failed=1` before the fix, runs 3f971e4e / 973e9b42). One more FAILING test
+    /// in the same file is the run's own failure: exit 1. Skipped only where `node` is absent.
+    #[cfg(unix)]
+    #[test]
+    fn qe_verify_counts_a_file_red_on_main_apart_but_fails_a_new_failing_test() {
+        use wicked_apps_core::spawn::HardenedCommand;
+        // spawn-audit: hardened probe for the harness this test needs.
+        let has_node = std::process::Command::new("node")
+            .hardened()
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_node {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let def = composed("qe-author-tests");
+        let PhaseExecutor::Tool { cmd } = &def
+            .phases
+            .iter()
+            .find(|p| p.id == "verify")
+            .unwrap()
+            .executor
+        else {
+            panic!("verify is a Tool step");
+        };
+        let script = cmd.last().unwrap().clone();
+        let setup = r#"set -e
+git init -q -b main src && cd src
+git config user.email t@example.invalid && git config user.name t && git config commit.gpgsign false
+printf '{"name":"m","version":"1.0.0","scripts":{"test":"node --test"}}\n' > package.json
+mkdir -p test lib tests
+printf 'exports.add=(a,b)=>a+b;\nexports.clamp=(x,lo,hi)=>Math.min(Math.max(x,lo),hi);\n' > lib/m.js
+printf "const test=require('node:test');const assert=require('node:assert');const m=require('../lib/m.js');\ntest('add',()=>assert.equal(m.add(1,2),3));\ntest('red-on-main-1',()=>assert.equal(m.add(1,1),3));\ntest('red-on-main-2',()=>assert.equal(m.add(2,2),5));\n" > test/m.test.js
+git add -A && git commit -qm base
+echo '# plan' > tests/PLAN-clamp.md
+printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',()=>assert.equal(m.clamp(9,0,5),5));\n" >> test/m.test.js
+"#;
+        for (case, extra, want_ok) in [
+            ("only main's failures", "", true),
+            (
+                "one new failing test",
+                "printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\n\" >> test/m.test.js\n",
+                false,
+            ),
+        ] {
+            let root = std::env::temp_dir().join(format!(
+                "wicked-qe-verify-{}-{}",
+                std::process::id(),
+                want_ok
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            // spawn-audit: hardened fixture build (git + files under a temp dir).
+            let made = std::process::Command::new("bash")
+                .hardened()
+                .args(["-c", &format!("{setup}{extra}")])
+                .current_dir(&root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{case}: fixture: {made:?}");
+            // spawn-audit: hardened run of the shipped script, exactly as the Tool step runs it.
+            let out = std::process::Command::new("bash")
+                .hardened()
+                .args(["-c", &script])
+                .current_dir(root.join("src"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("TMPDIR", &root)
+                .output()
+                .unwrap();
+            let text = String::from_utf8_lossy(&out.stdout).to_string();
+            let _ = std::fs::remove_dir_all(&root);
+            if want_ok {
+                assert!(out.status.success(), "{case}: {text}");
+                assert!(
+                    text.contains("status=failed class=pre-existing-on-base"),
+                    "{case}: {text}"
+                );
+                assert!(text.contains("failed=0 not_executed=0 failed_on_base=1"), "{case}: {text}");
+                assert!(text.contains("fail on main too"), "{case}: {text}");
+            } else {
+                assert!(!out.status.success(), "{case}: {text}");
+                assert!(text.contains("class=produced-test-failure"), "{case}: {text}");
+                assert!(text.contains("failed=1 not_executed=0 failed_on_base=0"), "{case}: {text}");
+            }
+        }
     }
 
     /// M6: the built-in `domain-extraction` composes to the def the shipped JSON describes (the C1

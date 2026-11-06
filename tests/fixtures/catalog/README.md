@@ -14,8 +14,8 @@ Read by `tests/catalog_compose.rs`.
 
 - `migrated-defs.json`: the today-defs of the consumers whose def a migration seam deleted: `chat`
   (M3, the deleted `workflows/chat.json`) and `onboarding` (M4, the deleted `onboarding_def()`,
-  serialized with every field spelled), `qe-author-tests` (M10, crew's def, unchanged since the
-  dump), `capture-learnings` (M7, crew's def as of crew `842f099`, current instructions and
+  serialized with every field spelled), `qe-author-tests` (M10, crew's def; its verify script and review instruction moved with e2e F30,
+  the per-file base comparison), `capture-learnings` (M7, crew's def as of crew `842f099`, current instructions and
   `requires_capture_report` on capture) and `steering-author` (M8, crew's def as of crew
   `842f099`, with the #789 reply-is-the-proposal instruction) and `interactive-chat`,
   `interactive-draft` and `interactive-edit` (M9, crew's defs as of crew `fb1bca7`, where the draft

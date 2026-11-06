@@ -3895,6 +3895,14 @@ pub(crate) fn run(
                         continue;
                     }
                 };
+                // (e2e F30) A Tool unit's escalation names the send-back when a creator precedes
+                // it: request changes there reworks that creator (the unit is not marked Rejected
+                // at this gate, so `rewind_to_creator_scoped` targets the creator, not the Tool).
+                let send_back_to = units
+                    .get(unit_ix)
+                    .filter(|u| u.tool_cmd.is_some())
+                    .and_then(|u| crate::pipeline::most_recent_prior_creator(&units, u.ord))
+                    .map(|c| c.ord);
                 let Some(unit) = units.get_mut(unit_ix) else {
                     continue;
                 };
@@ -4040,10 +4048,23 @@ pub(crate) fn run(
                         unit.denial_reason =
                             Some(format!("triage escalation: {analysis} — {failure_excerpt}"));
                         let _ = put_node(&mut store, unit.to_node());
+                        let options = match (unit.tool_cmd.is_some(), send_back_to) {
+                            (true, Some(c)) => format!(
+                                "Approve to run the step again (optionally amend), request \
+                                 changes to send the work back to unit {c} for rework, or reject \
+                                 to stop the run."
+                            ),
+                            (true, None) => "Approve to run the step again (optionally amend), \
+                                             or reject to stop the run."
+                                .to_string(),
+                            (false, _) => "Approve to retry (optionally amend), reject to fail \
+                                           the run, or reassign the unit to a different CLI \
+                                           first."
+                                .to_string(),
+                        };
                         let prompt = format!(
                             "Unit {ord} failed and triage escalated: {analysis}. Failure output: \
-                             \"{failure_excerpt}\". Approve to retry (optionally amend), reject \
-                             to fail the run, or reassign the unit to a different CLI first."
+                             \"{failure_excerpt}\". {options}"
                         );
                         if let Err(e) = pause_for_human(
                             &mut store,
@@ -10595,6 +10616,18 @@ fn filter_triage_decision(
                 "triage proposed privileged flag {flag} — operator approval required"
             ))
         }
+        // (e2e F30) A TOOL step's non-zero exit is a check failing (qe-author-tests' `verify`,
+        // a domain host step), not a seat to retry or a run to end: a `fail` ruling parks at the
+        // triage gate, where the person can send the work back to the step that made it, run the
+        // check again, or stop. It used to call `fail_run` (runs 3f971e4e, 973e9b42: FAILED with
+        // only Retry/Stop on resume). The deliver unit keeps its own arms (never reaches here).
+        TriageDecision::Fail(reason)
+            if unit.tool_cmd.is_some() && !crate::deliver_lift::is_deliver_unit(unit) =>
+        {
+            TriageDecision::Escalate(format!(
+                "triage ruled the step's check failed ({reason}); a failed check asks the person"
+            ))
+        }
         other => other,
     }
 }
@@ -12189,6 +12222,7 @@ fn dispatch_unit(
                     )
                 }),
                 evidence_root: session.evidence_root.clone(),
+                base_commit: session.base_commit.clone(),
                 tree_from: session.workdir.clone().zip(
                     session
                         .repo_ref
@@ -13424,7 +13458,15 @@ struct ToolRunEnv {
     repeat: Option<(u32, Option<String>)>,
     evidence_root: Option<String>,
     tree_from: Option<(String, String)>,
+    /// (e2e F30) The commit the run's worktree was minted from (`AgentSession::base_commit`),
+    /// handed on as [`RUN_BASE_ENV`]: a check that compares head against the base (qe-author-tests'
+    /// `verify`) reads the base the ENGINE recorded, never one derived from refs a worker in the
+    /// same worktree can move. Unset when the run recorded none.
+    base_commit: Option<String>,
 }
+
+/// (e2e F30) The variable a generic Tool unit reads the run's base commit from.
+pub(crate) const RUN_BASE_ENV: &str = "WICKED_RUN_BASE";
 
 impl ToolRunEnv {
     fn vars(&self) -> Vec<(String, String)> {
@@ -13449,6 +13491,9 @@ impl ToolRunEnv {
                 crate::walkthrough::EVIDENCE_ROOT_ENV.to_string(),
                 root.clone(),
             ));
+        }
+        if let Some(base) = self.base_commit.as_deref().filter(|b| !b.trim().is_empty()) {
+            env.push((RUN_BASE_ENV.to_string(), base.to_string()));
         }
         if let Some((wd, repo)) = &self.tree_from {
             if let Ok(s) = crate::worktree_guard::snapshot(
@@ -20428,6 +20473,36 @@ retry the deliver phase";
             ),
             TriageDecision::Escalate(_)
         ));
+    }
+
+    /// (e2e F30) A triage `fail` on a TOOL step (a check that exited non-zero) parks at the triage
+    /// gate instead of ending the run; on an agent step it stays `fail`, and the deliver unit keeps
+    /// its own arms. Fails without the fix: the tool step's `Fail` passed through to `fail_run`.
+    #[test]
+    fn a_triage_fail_on_a_tool_step_escalates_and_an_agent_step_still_fails() {
+        use crate::validator::TriageDecision;
+        let mut verify = WorkUnit::pending("r:verify", "r", 3, "verify — run the produced tests");
+        verify.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "exit 1".into()]);
+        match filter_triage_decision(TriageDecision::Fail("tests failed".into()), &verify) {
+            TriageDecision::Escalate(why) => assert!(why.contains("tests failed"), "{why}"),
+            other => panic!("a tool step's fail must escalate, got {other:?}"),
+        }
+        let author = WorkUnit::pending("r:author", "r", 2, "author — write tests");
+        assert_eq!(
+            filter_triage_decision(TriageDecision::Fail("x".into()), &author),
+            TriageDecision::Fail("x".into())
+        );
+        let mut deliver = WorkUnit::pending("r:deliver", "r", 5, "deliver — x");
+        deliver.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "true".into()]);
+        assert_eq!(
+            filter_triage_decision(TriageDecision::Fail("x".into()), &deliver),
+            TriageDecision::Fail("x".into())
+        );
+        // A tool step's other rulings are untouched (retry stays retry).
+        assert_eq!(
+            filter_triage_decision(TriageDecision::Retry, &verify),
+            TriageDecision::Retry
+        );
     }
 
     /// N3 (ship re-proof): on a non-GitHub origin the deliver gate said both "no pull request can
@@ -36473,12 +36548,15 @@ mod consent_plan_tests {
             repeat: None,
             evidence_root: None,
             tree_from: None,
+            base_commit: Some("0123abcd".into()),
         }
         .vars();
         assert!(env.contains(&(
             crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
             "operator".to_string()
         )));
+        // (e2e F30) The run's recorded base rides every generic Tool unit.
+        assert!(env.contains(&(RUN_BASE_ENV.to_string(), "0123abcd".to_string())));
         // A choice the plan does not offer is refused, and records nothing new.
         let err = resolve_consent_answer(
             &mut store,

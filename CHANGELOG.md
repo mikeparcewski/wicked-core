@@ -14,6 +14,31 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The coverage judge honours a lowered minimum (e2e F29).** After the person answered "Lower the minimum" (the
+  repository's own target, 66% in run 1ec395da), the coverage step's deterministic floor passed, but its pinned
+  judge rejected twice: the criterion it was given hard-coded "default 80%" and a no-store branch it cannot see, and
+  a report written before the lowering still said "minimum 80%". The criterion now names no number: the minimum is
+  the repository's own target when one is set, else the daemon's setting, recomputed by the engine from the run's
+  store, and a share or minimum written in the work decides nothing (new validator pin `9a2c71609c3e3ced`; the
+  script is unchanged and the pin re-seeds on every plan). The judge is also told the minimum the engine applies to
+  this run, read from the repository's graph just before it judges ("held to 66%, the repository's own target"); with
+  no graph it gets the same sentence without a number. A coverage denial now quotes the minimum the floor applied
+  (the repository's target), not the daemon-wide one. Runs already parked keep the validator they were planned with.
+- **A test file that is red on main no longer fails qe-author-tests' verify (e2e F30).** The verify step ran each
+  produced test file and counted any non-zero exit, so tests added to a file that already fails on main failed the
+  run. A produced file that fails is now run again on the run's base: when the base copy fails too, with at least as
+  many failing tests and no more passing ones (and no fewer tests in all), the file is `class=pre-existing-on-base`,
+  counted in a new `failed_on_base=` summary field and not against the run. Anything else, including counts the
+  runner did not print, is the run's own failure, as before; exit codes excuse, the printed counts can only deny. The
+  suite check takes the same count tightening. The base is the commit the engine recorded for the run
+  (`WICKED_RUN_BASE`, now handed to every generic Tool step), not one derived from refs a worker in the worktree can
+  move. The review step is told to fail a `pre-existing-on-base` file when any failing test is not failing on main or
+  any added test fails. Known tie, covered by that review: in one file, a new failing test plus a fixed main failure.
+- **A failed check parks instead of ending the run (e2e F30).** When a Tool step (a check such as verify) exits
+  non-zero and the failure judge rules `fail`, the run now parks at the triage gate ("Unit N failed and triage
+  escalated") instead of ending FAILED: approve runs the check again, request changes sends the work back to the step
+  that made it, reject stops. Agent steps and the deliver step are unchanged. No override of a failed check is added.
+
 - **Redo the QE check when the isolated reviewer gave no verdict (e2e-1105 F23).** When the QE reviewer came back
   INCONCLUSIVE (it could not run its checks), no reviewer seat could run, or no verdict could be bound, the only
   clean way on was "approve as your own judgment", which turned an infrastructure miss into the person's verdict.

@@ -2585,7 +2585,7 @@ fn pinned_validator_denial_with_env(
         ));
     };
     match crate::validator::run_validator_reporting_with_env(v, cwd, db_path, extra_env) {
-        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion, cwd),
+        Ok((outcome, _)) => denial_for_outcome(&outcome, &v.criterion, cwd, db_path),
         Err(e) => Some(format!("pinned validator error: {e}")),
     }
 }
@@ -2616,7 +2616,7 @@ fn pinned_validator_denial_with_env(
 ///
 /// The numbers are already on disk when the denial is rendered. This reads them rather than
 /// recomputing, so the message reports what the validator ACTUALLY gated on.
-fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
+fn failing_measurement(cwd: &std::path::Path, db_path: Option<&str>) -> Option<String> {
     // FINDING-099: this read `.wicked/domain/coverage-report.json`, a path nothing else in the
     // system writes. It therefore never found the report, and every legitimate coverage denial was
     // reported as "no coverage report was produced" — the floor blamed for not measuring when it
@@ -2637,7 +2637,10 @@ fn failing_measurement(cwd: &std::path::Path) -> Option<String> {
     };
     // The sentence names what actually failed: a minimum the operator mistyped, a store with
     // nothing to map, or the real share itself.
-    let lead = match wicked_governance::min_coverage_pct_from_env() {
+    // (e2e F29) The minimum the floor APPLIED: the repository's own target in the store it
+    // measured (the person may have lowered it during the run), else the daemon's setting —
+    // never the daemon's setting alone, which quoted "minimum 80%" on a 66% repository.
+    let lead = match crate::domain_extraction::applied_min_coverage(db_path).map(|(m, _)| m) {
         Err(e) => format!("the configured minimum is invalid ({e})"),
         Ok(_) if report.behavior_bearing == 0 => {
             "no behaviour-bearing code in the store to map (index the repository first)".to_string()
@@ -2662,11 +2665,12 @@ fn denial_for_outcome(
     outcome: &crate::validator::ValidatorOutcome,
     criterion: &str,
     cwd: &std::path::Path,
+    db_path: Option<&str>,
 ) -> Option<String> {
     use crate::validator::ValidatorOutcome as O;
     match outcome {
         O::Passed => None,
-        O::Failed => Some(match failing_measurement(cwd) {
+        O::Failed => Some(match failing_measurement(cwd, db_path) {
             // Naming the measurement is the point: without it a wrong-store read and a genuine
             // shortfall are indistinguishable (FINDING-092).
             Some(m) => format!("pinned validator failed: {criterion} — {m}"),
@@ -3579,7 +3583,7 @@ mod denial_message_tests {
                 report,
             )
             .unwrap();
-            let msg = denial_for_outcome(&O::Failed, CRITERION, &dir).expect("denies");
+            let msg = denial_for_outcome(&O::Failed, CRITERION, &dir, None).expect("denies");
             let _ = std::fs::remove_dir_all(&dir);
             msg
         }
@@ -3611,14 +3615,23 @@ mod denial_message_tests {
     #[test]
     fn a_no_verdict_outcome_is_never_worded_as_a_criterion_failure() {
         assert_eq!(
-            denial_for_outcome(&O::Passed, CRITERION, std::path::Path::new("/nonexistent")),
+            denial_for_outcome(
+                &O::Passed,
+                CRITERION,
+                std::path::Path::new("/nonexistent"),
+                None
+            ),
             None,
             "pass ⇒ no denial"
         );
 
-        let failed =
-            denial_for_outcome(&O::Failed, CRITERION, std::path::Path::new("/nonexistent"))
-                .expect("denies");
+        let failed = denial_for_outcome(
+            &O::Failed,
+            CRITERION,
+            std::path::Path::new("/nonexistent"),
+            None,
+        )
+        .expect("denies");
         assert!(
             failed.starts_with(&format!("pinned validator failed: {CRITERION}")),
             "the genuine criterion failure keeps its established wording: {failed}"
@@ -3628,12 +3641,14 @@ mod denial_message_tests {
             &O::TimedOut,
             CRITERION,
             std::path::Path::new("/nonexistent"),
+            None,
         )
         .expect("denies");
         let unrunnable = denial_for_outcome(
             &O::Unrunnable("No such file or directory (os error 2)".into()),
             CRITERION,
             std::path::Path::new("/nonexistent"),
+            None,
         )
         .expect("denies");
 
@@ -3928,10 +3943,41 @@ mod resolve_tests {
         )
         .expect("write report");
 
-        let m = failing_measurement(&dir).expect("the report at the worktree root must be read");
+        let m =
+            failing_measurement(&dir, None).expect("the report at the worktree root must be read");
         assert!(m.contains("behavior_bearing=5769"), "{m}");
         assert!(m.contains("unaccounted=5641"), "{m}");
         assert!(m.contains("coverage=0.0222"), "{m}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (e2e F29) The denial quotes the minimum the floor APPLIED. A repository whose own target is
+    /// 66% (the person's "Lower the minimum") is measured against 66%, so a 50% share is denied as
+    /// "minimum 66%", never the daemon's 80% (no env is set here; the daemon default is 80). Fails
+    /// without the fix: the lead read `min_coverage_pct_from_env()` alone.
+    #[test]
+    fn the_denial_quotes_the_repository_target_the_floor_applied() {
+        let dir = std::env::temp_dir().join(format!("wicked-cov-{}-target", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let db = dir.join("graph.db");
+        {
+            let mut store =
+                wicked_apps_core::open_store(Some(db.to_str().unwrap())).expect("store");
+            wicked_governance::set_repo_min_coverage_pct(&mut store, Some(66)).expect("target");
+        }
+        std::fs::write(
+            dir.join(crate::domain_extraction::COVERAGE_REPORT_FILE),
+            r#"{"behavior_bearing":10,"resolved":5,"risk_flagged":5,"unaccounted":0,"coverage":1.0}"#,
+        )
+        .expect("write report");
+
+        let with_store = failing_measurement(&dir, db.to_str()).expect("measured");
+        assert!(with_store.contains("minimum 66%"), "{with_store}");
+        assert!(!with_store.contains("minimum 80%"), "{with_store}");
+        // Without a store (or with none readable) the daemon's setting is the minimum, as before.
+        let no_store = failing_measurement(&dir, None).expect("measured");
+        assert!(!no_store.contains("minimum 66%"), "{no_store}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3950,7 +3996,7 @@ mod resolve_tests {
         .expect("write report");
 
         assert!(
-            failing_measurement(&dir).is_none(),
+            failing_measurement(&dir, None).is_none(),
             "the nested path is not where anything writes; consulting it invites two spellings again"
         );
         let _ = std::fs::remove_dir_all(&dir);

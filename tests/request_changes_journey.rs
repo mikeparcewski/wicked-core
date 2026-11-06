@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PhaseRole, StepInput,
-    StepOutput, StepRunner, StepStatus,
+    AmendScope, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PhaseRole,
+    StepInput, StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -320,4 +320,207 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
         .map(|(_, a, _)| *a)
         .collect();
     assert_eq!(reviews, vec![0, 1]);
+}
+
+/// (e2e F30) A creator then a Tool CHECK (qe-author-tests' `build` → `verify` shape). The check
+/// exits 1 until the creator's second pass writes `flag`; the triage judge rules `fail`. Records
+/// every `(ord, attempt)` a seat ran, and every triage call.
+struct FailingCheckSeat {
+    flag: std::path::PathBuf,
+    handed: Arc<Mutex<Vec<(u32, u32)>>>,
+    triaged: Arc<Mutex<u32>>,
+}
+impl StepRunner for FailingCheckSeat {
+    fn run_unit(&self, i: &StepInput) -> StepOutput {
+        let output = if i.run_id.starts_with("triage-") {
+            *self.triaged.lock().unwrap() += 1;
+            "DECISION: FAIL\n2 of the produced tests fail (fixture verdict)".to_string()
+        } else if i.unit.session_id == "validator" {
+            "PASS\nthe work meets the criterion\nPASS".to_string()
+        } else {
+            self.handed.lock().unwrap().push((i.unit.ord, i.attempt));
+            if i.attempt >= 1 {
+                std::fs::write(&self.flag, "fixed").unwrap();
+            }
+            format!("wrote the tests (attempt {})", i.attempt)
+        };
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            output,
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
+    let db = db_path("tool-check");
+    let flag = std::path::Path::new(&db).with_file_name("creator-fixed");
+    let handed = Arc::new(Mutex::new(Vec::new()));
+    let triaged = Arc::new(Mutex::new(0));
+    let core = Core::spawn_with_engine(
+        db,
+        Arc::new(NumericDispatcher),
+        Arc::new(FailingCheckSeat {
+            flag: flag.clone(),
+            handed: Arc::clone(&handed),
+            triaged: Arc::clone(&triaged),
+        }),
+    );
+    let script = format!(
+        "if [ -f '{}' ]; then echo 'qe-verify: PASS'; exit 0; fi; echo 'qe-verify: FAIL — 2 of 5 \
+         tests failed'; exit 1",
+        flag.display()
+    );
+    core.register_workflow(
+        serde_json::json!({
+            "id": "tool-check",
+            "phases": [
+                { "id": "author", "kind": "build", "gate": "auto", "role": "creator" },
+                { "id": "verify", "kind": "test", "depends_on": ["author"],
+                  "executor": { "type": "tool", "cmd": ["sh", "-c", script] } }
+            ]
+        })
+        .to_string(),
+    )
+    .expect("register the def");
+    let ev = core.subscribe();
+    let run = "tool-check-run";
+    core.launch_run(LaunchSpec {
+        base_ref: None,
+        project_id: None,
+        problem: "write tests for clamp".into(),
+        clis: vec![cli("a"), cli("b")],
+        entity_mode: EntityMode::Shared,
+        session_id: run.into(),
+        // A person is present (the failure triages), but no gate ord matches (nothing else pauses).
+        human_confirm: HumanConfirm::Before(99),
+        auto_deliver: false,
+        repo_ref: None,
+        workflow: Some("tool-check".into()),
+        extra_write_roots: Vec::new(),
+        extra_read_roots: Vec::new(),
+        project_graph: None,
+        plan: None,
+        deliver_step: None,
+        exclude_seats: Vec::new(),
+        evidence_root: None,
+        primary: None,
+        reduced_assurance: false,
+        power: false,
+        voice: None,
+        deliverables: Vec::new(),
+        qe_acceptance: Default::default(),
+    })
+    .expect("launch");
+
+    let parked = |seen: &[CoreEvent]| {
+        assert!(
+            seen.iter().any(|e| matches!(e, CoreEvent::FailureTriaged { ord: 2, decision, .. } if decision == "escalate")),
+            "the judge's fail on the check becomes an escalation: {seen:?}"
+        );
+        assert!(
+            seen.iter().any(
+                |e| matches!(e, CoreEvent::AwaitingHuman { ord: 2, gate_kind, prompt, .. }
+                if gate_kind == "triage"
+                    && prompt.starts_with("Unit 2 failed and triage escalated")
+                    && prompt.contains("request changes to send the work back to unit 1"))
+            ),
+            "the check parks at the triage gate offering the send-back: {seen:?}"
+        );
+        assert!(!seen.iter().any(|e| matches!(
+            e,
+            CoreEvent::SessionFailed { .. } | CoreEvent::SessionCompleted { .. }
+        )));
+    };
+    // ── 1. The check fails, the judge rules fail, the run PARKS (it used to end FAILED). ──
+    let first = drain_until(&ev, run, |e| {
+        matches!(
+            e,
+            CoreEvent::AwaitingHuman { .. } | CoreEvent::SessionFailed { .. }
+        )
+    });
+    parked(&first);
+    assert_eq!(
+        *triaged.lock().unwrap(),
+        1,
+        "the triage judge actually ruled"
+    );
+
+    // ── 2. No answer skips the check: an operator judgment is refused here (it answers a failed
+    //       repo-checks floor only), and approve runs the same check again, which parks again. ──
+    assert!(core
+        .confirm_gate(
+            run,
+            HumanDecision::OperatorJudgment {
+                rationale: "these fail on main too".into()
+            }
+        )
+        .is_err());
+    core.confirm_gate(
+        run,
+        HumanDecision::Approve {
+            amend: None,
+            amend_scope: AmendScope::Cursor,
+        },
+    )
+    .expect("approve re-runs the check");
+    let again = drain_until(&ev, run, |e| {
+        matches!(
+            e,
+            CoreEvent::AwaitingHuman { .. } | CoreEvent::SessionFailed { .. }
+        )
+    });
+    parked(&again);
+    assert_eq!(*triaged.lock().unwrap(), 2);
+
+    // ── 3. Send back → the creator reworks (and fixes it), the check passes, the run completes. ──
+    core.confirm_gate(
+        run,
+        HumanDecision::RequestChanges {
+            note: Some("make the new tests pass".into()),
+        },
+    )
+    .expect("request changes");
+    let done = drain_until(&ev, run, |e| {
+        matches!(
+            e,
+            CoreEvent::SessionCompleted { .. }
+                | CoreEvent::SessionFailed { .. }
+                | CoreEvent::RunCancelled { .. }
+        )
+    });
+    assert!(
+        done.iter().any(
+            |e| matches!(e, CoreEvent::UnitReworkAmended { ord: 1, scope, amendment, .. }
+            if scope == "request_changes" && amendment.contains("make the new tests pass"))
+        ),
+        "the send-back reworks the creator, not the check: {done:?}"
+    );
+    assert!(
+        done.iter()
+            .any(|e| matches!(e, CoreEvent::SessionCompleted { .. })),
+        "{done:?}"
+    );
+    // The passing check is not re-judged by triage (a passing tool step is unchanged).
+    assert_eq!(*triaged.lock().unwrap(), 2);
+    let creators: Vec<u32> = handed
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(o, _)| *o == 1)
+        .map(|(_, a)| *a)
+        .collect();
+    assert_eq!(
+        creators,
+        vec![0, 1],
+        "the creator ran once more, on the send-back"
+    );
 }

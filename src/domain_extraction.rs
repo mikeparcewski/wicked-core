@@ -39,8 +39,15 @@ pub const DOMAIN_EXTRACTION_WORKFLOW_ID: &str = "domain-extraction";
 /// behaviours in product code; risk-flagged placeholders are shown in the graph as unconfirmed but
 /// never count, and tests, data, manifests and documents are not in the denominator. The script is
 /// unchanged: `wicked-core coverage --min-coverage-pct` decides.
+///
+/// NO NUMBER (e2e F29, run 1ec395da): this text is also the pinned judge's criterion
+/// (`validator::pinned_judge_criterion`). It used to name "default 80%" and a no-store branch the
+/// judge cannot see, so after the person lowered the repository's minimum to 66% the judge re-derived
+/// the share from a stale report in the work against the 80% written here and rejected twice while
+/// the engine's own recompute passed. The minimum is whatever the engine applies from the run's
+/// store; the judge is told that number beside this text ([`coverage_judge_note`]).
 pub const COVERAGE_CRITERION: &str =
-    "at least one behavior-bearing node in product code, real requirements (resolved behaviours; risk-flagged placeholders never count) at or above the configured minimum (WICKED_REQUIREMENTS_MIN_COVERAGE_PCT, default 80%) recomputed from the store, or every behaviour a real requirement (coverage == 1.0, zero unaccounted, zero placeholders) when no store is given, and at least one requirement genuinely resolved (resolved > 0)";
+    "at least one behavior-bearing node in product code; real requirements (resolved behaviours; risk-flagged placeholders never count, and placeholders may remain) at or above the repository's minimum, which the engine recomputes from the run's store: the repository's own target when one is set (the person may lower it during the run), else the daemon's setting. The engine's recompute decides the share and the minimum; a share, minimum or met/not-met flag written in the work does not. Only when the engine has no store to recompute from must every behaviour be a real requirement, and the engine decides which applies; and at least one requirement genuinely resolved (resolved > 0)";
 
 /// The host step BEFORE the seat's `extract` (wicked-garden#1362): a seat container has no
 /// `wicked-core`, no `wicked-estate` and no writable store (the broker relay is read-only by
@@ -193,7 +200,7 @@ pub const COVERAGE_REPORT_FILE: &str = "coverage-report.json";
 /// [`crate::validator_vault::pin`]. Re-derived and asserted equal to the vaulted approved copy and to
 /// the JSON's embedded pin by [`tests::embedded_pin_matches_the_approved_vaulted_validator`]; if the
 /// criterion or script ever changes, that test fails loudly and this const must be regenerated.
-pub const COVERAGE_VALIDATOR_PIN: &str = "9fddcc159580ed33";
+pub const COVERAGE_VALIDATOR_PIN: &str = "9a2c71609c3e3ced";
 
 /// The authored (UNAPPROVED) coverage validator — the artifact a human/council reviews before it can
 /// gate. Authoring never authorizes running: `approved == false` (rev0.4 fork 3). Route it through the
@@ -227,6 +234,104 @@ pub fn provision_and_approve_coverage_validator(
             anyhow::anyhow!("coverage validator vanished from the vault between store and approve")
         })?;
     Ok(approved_pin)
+}
+
+/// Where the coverage minimum in force came from (e2e F29).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinSource {
+    /// The repository's own target in its store (`requirements-target --set`, which the person's
+    /// "Lower the minimum" answer writes).
+    Repository,
+    /// The daemon-wide setting (`WICKED_REQUIREMENTS_MIN_COVERAGE_PCT`, else the default).
+    Daemon,
+}
+
+impl MinSource {
+    fn phrase(self) -> &'static str {
+        match self {
+            Self::Repository => "the repository's own target",
+            Self::Daemon => "the daemon's setting",
+        }
+    }
+}
+
+/// The minimum `wicked-core coverage --min-coverage-pct` applies to the repository graph at
+/// `graph_db` (e2e F29): its own target when one is set, else the daemon's setting — the same rule
+/// as the binary's bare flag ([`wicked_governance::effective_min_coverage_pct`]), read through a
+/// READ-ONLY connection (the store belongs to the run; nothing here writes it). An empty, in-memory
+/// or URL path, or a store that cannot be opened, reads the daemon's setting: the validator hands the
+/// script no store in exactly those cases, so the script applies that minimum too.
+pub(crate) fn applied_min_coverage(graph_db: Option<&str>) -> Result<(u8, MinSource), String> {
+    let usable = graph_db.filter(|p| !p.is_empty() && *p != ":memory:" && !p.contains("://"));
+    if let Some(path) = usable {
+        if let Ok(store) = wicked_apps_core::open_store_ro(Some(path)) {
+            return match wicked_governance::repo_min_coverage_pct(&store) {
+                Ok(Some(pct)) => Ok((pct, MinSource::Repository)),
+                Ok(None) => {
+                    wicked_governance::min_coverage_pct_from_env().map(|m| (m, MinSource::Daemon))
+                }
+                Err(e) => Err(format!(
+                    "the repository's coverage target could not be read: {e}"
+                )),
+            };
+        }
+    }
+    wicked_governance::min_coverage_pct_from_env().map(|m| (m, MinSource::Daemon))
+}
+
+/// The repository graph the coverage FLOOR measures for a governed unit (e2e F29): the operational
+/// store (read-only) names the run's repository, and its graph is the repo-local one — the same
+/// resolution as `actor::repo_code_graph_db`, never the project graph (a sibling repository's
+/// target must not set this one's bar). `None` when the unit carries no repository or no graph.
+fn floor_graph_for(gov: &crate::workflow::GovernanceContext) -> Option<String> {
+    let repo_id = gov.repo_id.as_deref()?;
+    let store = wicked_apps_core::open_store_ro(Some(&gov.db_path)).ok()?;
+    let repo = crate::repo::get_repo(&store, repo_id).ok().flatten()?;
+    let path = crate::code_graph::existing_code_graph(std::path::Path::new(&repo.root_path))?;
+    Some(path.to_string_lossy().into_owned())
+}
+
+/// (e2e F29) What the pinned coverage judge is told about the minimum, beside
+/// [`COVERAGE_CRITERION`]: the number the engine applies to this run, read from the run's store
+/// just before the judge runs, and that a minimum written in the work is not it. `None` for every
+/// other validator. The floor still runs after the judge and denies below that minimum on its own;
+/// this only stops the judge from rejecting on a stale number (run 1ec395da: the person lowered the
+/// minimum to 66%, the floor passed, the judge rejected against "80%").
+pub(crate) fn coverage_judge_note(
+    v: &DeterministicValidator,
+    gov: Option<&crate::workflow::GovernanceContext>,
+) -> Option<String> {
+    if v.criterion != COVERAGE_CRITERION || v.script != COVERAGE_SCRIPT {
+        return None;
+    }
+    // No repository graph to read ⇒ no number: the floor may still resolve one the runner cannot
+    // see (an in-memory operational store), and a guessed daemon default is the F29 bait again.
+    let applied = gov
+        .and_then(floor_graph_for)
+        .ok_or_else(|| "the run's repository graph could not be resolved".to_string())
+        .and_then(|g| applied_min_coverage(Some(&g)));
+    Some(coverage_judge_note_for(applied))
+}
+
+/// [`coverage_judge_note`]'s text for a resolved (or unresolvable) minimum.
+fn coverage_judge_note_for(applied: Result<(u8, MinSource), String>) -> String {
+    let head = match applied {
+        Ok((pct, source)) => format!(
+            "[applied minimum] The engine holds this run's real-requirements share to {pct}% ({}), \
+             read from the run's store just before this review.",
+            source.phrase()
+        ),
+        Err(_) => "[applied minimum] The minimum is the one the engine applies from the run's \
+                   store (the repository's own target when one is set, else the daemon's \
+                   setting); it could not be read for this note."
+            .to_string(),
+    };
+    format!(
+        "{head} A different minimum, share or `minimum_met` written in the WORK (an earlier page's \
+         report, a log line from before the person changed the target) is stale and decides \
+         nothing: do not reject on it. The engine's floor re-measures the share against this \
+         minimum after your verdict."
+    )
 }
 
 #[cfg(test)]
@@ -487,6 +592,64 @@ mod tests {
              reads the criterion to understand a denial; if it omits a requirement the script \
              enforces, the denial is unexplainable (FINDING-050)."
         );
+    }
+
+    /// (e2e F29) The criterion is also the pinned judge's text, so it names no number and no
+    /// default: run 1ec395da's judge rejected a repository the person had lowered to 66% against the
+    /// "default 80%" written here. Fails on the old text.
+    #[test]
+    fn the_criterion_names_no_fixed_minimum_and_lets_the_recompute_decide() {
+        let c = COVERAGE_CRITERION;
+        assert!(!c.contains("80"), "{c}");
+        assert!(!c.contains("default"), "{c}");
+        assert!(!c.contains("WICKED_REQUIREMENTS_MIN_COVERAGE_PCT"), "{c}");
+        assert!(
+            c.contains("the engine recomputes from the run's store"),
+            "{c}"
+        );
+        assert!(c.contains("the repository's own target"), "{c}");
+        assert!(c.contains("written in the work does not"), "{c}");
+        assert!(c.contains("resolved > 0"), "{c}");
+    }
+
+    /// (e2e F29) The judge is told the minimum the engine APPLIES: the repository's own target read
+    /// from its store (66 after "Lower the minimum"), not the daemon's 80. Fails without the fix:
+    /// the judge's text carried only the criterion.
+    #[test]
+    fn the_judge_note_carries_the_minimum_applied_from_the_store() {
+        let dir = std::env::temp_dir().join(format!("wicked-domainext-min-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("graph.db");
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap();
+            wicked_governance::set_repo_min_coverage_pct(&mut store, Some(66)).unwrap();
+        }
+        let applied = applied_min_coverage(db.to_str());
+        assert_eq!(applied, Ok((66, MinSource::Repository)));
+        let note = coverage_judge_note_for(applied);
+        assert!(note.contains("66%"), "{note}");
+        assert!(note.contains("the repository's own target"), "{note}");
+        assert!(note.contains("is stale and decides nothing"), "{note}");
+        // The whole judge prompt: criterion + floor contract + the applied minimum, and no 80.
+        let v = coverage_eq_one_validator();
+        let prompt = format!("{}\n\n{note}", crate::validator::pinned_judge_criterion(&v));
+        assert!(
+            prompt.contains("66%") && !prompt.contains("80%"),
+            "{prompt}"
+        );
+        // Unresolvable store: no number at all (never a guessed default).
+        let blind = coverage_judge_note_for(Err("no graph".into()));
+        assert!(!blind.chars().any(|c| c.is_ascii_digit()), "{blind}");
+        // Only the coverage validator gets a note.
+        assert!(coverage_judge_note(&v, None).is_some());
+        let other = DeterministicValidator {
+            criterion: "lint passes".into(),
+            script: "true".into(),
+            approved: true,
+        };
+        assert!(coverage_judge_note(&other, None).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

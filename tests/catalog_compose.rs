@@ -21,7 +21,7 @@ use wicked_core::{catalog, compose, plan_from_def, PlanRefusal, PlanSteps, Workf
 
 const EVIDENCE_FLOOR_PIN: &str = "e2e7af1db9e48454";
 /// `COVERAGE_VALIDATOR_PIN`: shipped and APPROVED (the `domain_coverage` entry's pin).
-const COVERAGE_PIN: &str = "9fddcc159580ed33";
+const COVERAGE_PIN: &str = "9a2c71609c3e3ced";
 
 /// The acceptance tuple, in the DES's order.
 const FIELDS: [&str; 10] = [
