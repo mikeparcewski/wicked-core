@@ -300,7 +300,9 @@ pub struct RuleVerdict {
 }
 
 /// A person's skip of an unchecked rule (gate action [`SKIP_ACTION`]): it applies while the
-/// rule's evidence is the one it was skipped on.
+/// rule's evidence is the one it was skipped on. At delivery it answers the rule as it is whatever
+/// the re-composed text (codex r2), except a skip given on a row with no evidence
+/// ([`no_evidence_key`]), which answers only such rows (e2e-1105 F4c).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSkip {
@@ -312,7 +314,8 @@ pub struct RuleSkip {
     pub at: i64,
     /// The rule content key of the unchecked row it answered: an edited rule is checked again.
     pub rule_key: String,
-    /// The evidence key of the unchecked row it answered: a changed diff is checked again.
+    /// The evidence key of the unchecked row it answered: a changed diff is checked again (at
+    /// delivery, see the struct doc: re-composed text is not, unless the key is the no-evidence one).
     pub evidence_key: String,
     /// When it confirms a WAIVER: the person's instruction the rule was waived by, quoted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2139,11 +2142,15 @@ pub fn check(
             .iter()
             .rev()
             // At delivery the text is re-composed on a retry (it carries the run's own record), so
-            // a skip there answers the rule as it is, whatever the text (codex r2).
+            // a skip there answers the rule as it is, whatever the text (codex r2) — except a skip
+            // given when there was NO text to judge (e2e-1105 F4c): text the check can read is
+            // judged, and a broken verdict on it denies.
             .find(|s| {
                 s.rule_id == rule.id
                     && s.rule_key == rk
-                    && (s.evidence_key == ek || input.stage == CheckStage::Delivery)
+                    && (s.evidence_key == ek
+                        || (input.stage == CheckStage::Delivery
+                            && s.evidence_key != no_evidence_key()))
             })
         {
             let why = match s.instruction.as_deref() {
@@ -2369,19 +2376,12 @@ pub fn check(
     if input.stage == CheckStage::Delivery {
         for id in input.deferred {
             if !report.rows.iter().any(|r| &r.rule_id == id) {
-                report.rows.push(RuleVerdict {
-                    rule_id: id.clone(),
-                    status: RuleStatus::Unchecked,
-                    how: RuleHow::None,
-                    reason: "deferred to delivery at review, and no longer in force as it was \
-                             reviewed: a person decides"
-                        .into(),
-                    cite: None,
-                    judge: None,
-                    rule_key: String::new(),
-                    evidence_key: None,
-                    ..Default::default()
-                });
+                report.rows.push(deferred_row(
+                    id,
+                    String::new(),
+                    NOT_IN_FORCE_AT_DELIVERY,
+                    input.skips,
+                ));
             }
         }
     }
@@ -2783,6 +2783,88 @@ fn run_pool(
         }
     });
     (answered.into_inner().unwrap(), why.into_inner().unwrap())
+}
+
+/// Why a rule the reviews deferred to delivery is no longer judged there: it is not in force as it
+/// was reviewed (retired, replaced, out of scope). A person decides.
+const NOT_IN_FORCE_AT_DELIVERY: &str = "deferred to delivery at review, and no longer in force as \
+                                        it was reviewed: a person decides";
+
+/// (e2e-1105 F4c) The evidence key of a delivery row with no evidence behind it (no text handed
+/// back, the rules unreadable, the rule no longer in force). A skip given on such a row answers
+/// only rows like it: text the check can read is judged ([`check`]).
+pub fn no_evidence_key() -> String {
+    digest(&["delivery", "no evidence"])
+}
+
+/// One deferred rule nobody could judge at delivery: `unchecked` with `why` (it holds the gate),
+/// or `skipped` when the person already skipped it as it is (`rule_key`; empty for a rule not in
+/// force or not readable) on a row with no evidence. It carries [`no_evidence_key`], so the gate's
+/// `skip_rules` can answer it with a written reason.
+fn deferred_row(id: &str, rule_key: String, why: &str, skips: &[RuleSkip]) -> RuleVerdict {
+    let ek = no_evidence_key();
+    let skip = skips
+        .iter()
+        .rev()
+        .find(|s| s.rule_id == id && s.rule_key == rule_key && s.evidence_key == ek);
+    let (status, how, reason) = match skip {
+        Some(s) => (
+            RuleStatus::Skipped,
+            RuleHow::Operator,
+            match s.instruction.as_deref() {
+                Some(i) => format!(
+                    "waived by instruction ({i}), confirmed by {}: {}",
+                    s.by, s.reason
+                ),
+                None => format!("skipped by {}: {}", s.by, s.reason),
+            },
+        ),
+        None => (RuleStatus::Unchecked, RuleHow::None, why.to_string()),
+    };
+    RuleVerdict {
+        rule_id: id.to_string(),
+        status,
+        how,
+        reason,
+        cite: None,
+        judge: None,
+        rule_key,
+        evidence_key: Some(ek),
+        ..Default::default()
+    }
+}
+
+/// (e2e-1105 F4c) The deliver step's rule check when it could not run (`why`: no pull request text
+/// was handed back, or the rules could not be read; `rules` = the rules in force, `None` when they
+/// could not be read): one row per rule deferred to delivery ([`deferred_row`]), so the gate names
+/// each rule and the person can re-check it or skip it with a written reason ([`SKIP_ACTION`]).
+/// Before, a check that could not run had no rows, nothing could be skipped, and re-checking (which
+/// re-runs the deliver step) could loop. A deferred rule no longer in force gets the same row as in
+/// [`check`]. Unchecked holds the gate, as everywhere ([`RuleCheckReport::hold`]).
+pub fn delivery_unchecked(
+    rules: Option<&[ConformanceRule]>,
+    deferred: &[String],
+    skips: &[RuleSkip],
+    why: &str,
+) -> RuleCheckReport {
+    let mut rows: Vec<RuleVerdict> = Vec::new();
+    for id in deferred {
+        if rows.iter().any(|r| &r.rule_id == id) {
+            continue;
+        }
+        rows.push(match rules {
+            Some(rules) => match rules.iter().find(|r| &r.id == id) {
+                Some(r) => deferred_row(id, rule_key(r), why, skips),
+                None => deferred_row(id, String::new(), NOT_IN_FORCE_AT_DELIVERY, skips),
+            },
+            None => deferred_row(id, String::new(), why, skips),
+        });
+    }
+    RuleCheckReport {
+        note: (!rows.is_empty()).then(|| why.to_string()),
+        rows,
+        ..Default::default()
+    }
 }
 
 // ── Reading the store and the worktree ──────────────────────────────────────────────────────────

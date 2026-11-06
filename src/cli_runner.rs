@@ -1568,15 +1568,18 @@ pub(crate) struct DeliveryRuleCtx {
     pub text_out: std::path::PathBuf,
 }
 
-/// (SWAP 6) The env var naming the file crew's deliver command writes the pull request text it
-/// published to (title, blank line, body: the PR description, or its comment on an existing PR).
+/// (SWAP 6) The env var naming the file crew's deliver command writes the pull request text to
+/// (title, blank line, body): the description it opened the PR with, or, on the run's existing PR,
+/// that PR's title and description as GitHub holds them (e2e-1105 F4c). A delivery with no PR
+/// description to show (a revision's comment, push-only, Azure DevOps) writes nothing.
 pub(crate) const DELIVER_TEXT_ENV: &str = "WICKED_DELIVER_TEXT_OUT";
 
 /// (SWAP 6) The deliver step's rule check: every rule deferred to delivery (by recorded fact,
-/// [`crate::rule_check::delivery_only`]) judged against the pull request's text exactly as the
-/// delivery wrote it (the delivered commit's message, which crew writes from the same text as the
-/// PR body), on a seat distinct from the creators. Broken denies, unchecked holds, as at review.
-/// `None` when no rule is deferred to delivery.
+/// [`crate::rule_check::delivery_only`]) judged against the pull request's text the delivery
+/// handed back ([`DELIVER_TEXT_ENV`]; never a commit message), on a seat distinct from the
+/// creators. Broken denies, unchecked holds, as at review; a check that cannot run names each
+/// deferred rule unchecked ([`crate::rule_check::delivery_unchecked`]). `None` when no rule is
+/// deferred to delivery.
 pub(crate) fn delivery_rule_check(
     ctx: &DeliveryRuleCtx,
     _workdir: &std::path::Path,
@@ -1584,29 +1587,37 @@ pub(crate) fn delivery_rule_check(
     if ctx.deferred.is_empty() {
         return None;
     }
-    let held = |why: String| {
-        Some(crate::rule_check::RuleCheckReport {
-            note: Some(why),
-            ..Default::default()
-        })
+    // (e2e-1105 F4c) A check that cannot run still names each deferred rule as unchecked, so the
+    // gate can be answered rule by rule: re-checked, or skipped with a reason.
+    let held = |rules: Option<&[wicked_governance::ConformanceRule]>, why: String| {
+        Some(crate::rule_check::delivery_unchecked(
+            rules,
+            &ctx.deferred,
+            &ctx.skips,
+            &why,
+        ))
     };
     let rules = match crate::rule_check::rules_in_force(&ctx.db_path, ctx.project.as_deref()) {
         Ok(r) => r,
         Err(e) => {
-            return held(format!(
-                "the steering rules could not be read from the store: {e:#}"
-            ))
+            return held(
+                None,
+                format!("the steering rules could not be read from the store: {e:#}"),
+            )
         }
     };
     // The text the delivery PUBLISHED, as its own command wrote it: never a commit message.
     let text = match std::fs::read_to_string(&ctx.text_out) {
         Ok(t) if !t.trim().is_empty() => t,
         _ => {
-            return held(format!(
-                "the delivery did not hand back the pull request text it published ({DELIVER_TEXT_ENV}), \
-                 so {} rule(s) deferred to delivery could not be checked",
-                ctx.deferred.len()
-            ))
+            return held(
+                Some(&rules),
+                format!(
+                    "the delivery did not hand back the pull request text it published ({DELIVER_TEXT_ENV}), \
+                     so {} rule(s) deferred to delivery could not be checked",
+                    ctx.deferred.len()
+                ),
+            )
         }
     };
     let _ = std::fs::remove_file(&ctx.text_out);
