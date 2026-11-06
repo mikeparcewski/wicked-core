@@ -29793,9 +29793,9 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            3,
-            "the substance gate, the deliverable floor and the dead-seat worker exit (core#461) \
-             each open the escalation gate"
+            5,
+            "the substance gate, the deliverable floor, the dead-seat worker exit (core#461), the \
+             demo floor and the demo plan snapshot (core#1249) each open the escalation gate"
         );
     }
 
