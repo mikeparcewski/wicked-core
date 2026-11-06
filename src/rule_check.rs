@@ -1280,10 +1280,23 @@ fn appeals_to_instruction(cite: &str) -> bool {
 /// Whether `cite` quotes (in "…", “…” or `…`) a fragment of at least 8 characters that the
 /// person's instructions contain, whitespace and case folded.
 fn quotes_instruction(cite: &str, instructions: Option<&str>) -> bool {
-    let Some(text) = instructions else {
+    quotes_in(cite, instructions, true)
+}
+
+/// (F19, codex r2) A quote of text the engine never frames (the published pull request text, a
+/// rule's own text): matched literally, brackets and all.
+fn quotes_text(cite: &str, text: &str) -> bool {
+    quotes_in(cite, Some(text), false)
+}
+
+/// A quoted fragment (8 characters or more) of `text`. With `framed`, the engine's framed labels in
+/// it (and in the quote) are blanked first, so a quote must rest on the person's own words.
+fn quotes_in(cite: &str, text: Option<&str>, framed: bool) -> bool {
+    let Some(text) = text else {
         return false;
     };
     let fold = |s: &str| {
+        let s = if framed { unframed(s) } else { s.to_string() };
         s.split_whitespace()
             .collect::<Vec<_>>()
             .join(" ")
@@ -1303,7 +1316,77 @@ fn quotes_instruction(cite: &str, instructions: Option<&str>) -> bool {
     frags
         .iter()
         .map(|f| fold(f.trim_matches(|c: char| c.is_ascii_punctuation() || c.is_whitespace())))
-        .any(|f| f.chars().count() >= 8 && hay.contains(&f))
+        .any(|f| f.chars().filter(|c| *c != FRAMED).count() >= 8 && hay.contains(&f))
+}
+
+/// (F19, operator Q1=B) Engine framing inside the person's instructions (a gate ruling's label,
+/// shown to the judge) runs from [`FRAME_OPEN`] to [`FRAME_CLOSE`]. It is never the person's words,
+/// so a WAIVED cannot rest on quoting it. Tagged, so brackets in the person's own text stay theirs.
+pub const FRAME_OPEN: &str = "\u{27E6}engine: ";
+/// The bracket [`FRAME_OPEN`] starts with: the engine replaces it (and [`FRAME_CLOSE`]) in the
+/// text it frames, so that text can neither open nor close a frame.
+pub const FRAME_MARK: char = '\u{27E6}';
+/// The close of [`FRAME_OPEN`].
+pub const FRAME_CLOSE: char = '\u{27E7}';
+/// What a frame becomes when a quote is matched: a mark no quoted words can span.
+const FRAMED: char = '\u{1}';
+
+/// `text` with every engine frame (an unclosed one runs to the end) replaced by [`FRAMED`].
+fn unframed(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(FRAME_OPEN) {
+        out.push_str(&rest[..i]);
+        out.push(' ');
+        out.push(FRAMED);
+        out.push(' ');
+        let after = &rest[i + FRAME_OPEN.len()..];
+        rest = after
+            .find(FRAME_CLOSE)
+            .map_or("", |j| &after[j + FRAME_CLOSE.len_utf8()..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// (F19, codex r2) Only the engine's tagged frames are blanked, and only in the person's
+    /// instructions: their own brackets stay quotable, and the published text and a rule's text
+    /// are matched literally.
+    #[test]
+    fn only_the_engines_frames_are_blanked_and_only_in_the_instructions() {
+        let problem = "Fix this. \u{27E6}Touch no tests\u{27E7} and \u{27E6}keep the API";
+        assert!(quotes_instruction("\"Touch no tests\"", Some(problem)));
+        assert!(quotes_instruction(
+            "\"\u{27E6}Touch no tests\u{27E7}\"",
+            Some(problem)
+        ));
+        assert!(
+            quotes_instruction("\"keep the API\"", Some(problem)),
+            "unclosed: theirs"
+        );
+        let told =
+            format!("{FRAME_OPEN}ruling at the unit 4 gate (amend){FRAME_CLOSE} R2 is waived here");
+        assert!(!quotes_instruction(
+            "\"ruling at the unit 4 gate (amend)\"",
+            Some(&told)
+        ));
+        assert!(!quotes_instruction(
+            &format!("\"{FRAME_OPEN}ruling at the unit 4 gate (amend){FRAME_CLOSE}\""),
+            Some(&told)
+        ));
+        assert!(quotes_instruction("\"R2 is waived here\"", Some(&told)));
+        let pr = format!("Release status: {FRAME_OPEN}old value{FRAME_CLOSE} is documented");
+        let cite = format!("\"Release status: {FRAME_OPEN}new value{FRAME_CLOSE} is documented\"");
+        assert!(
+            !quotes_text(&cite, &pr),
+            "the published text is matched literally"
+        );
+        assert!(quotes_text(&format!("\"{FRAME_OPEN}old value\""), &pr));
+    }
 }
 
 /// The person's instructions as a judge reads them: the crew rules brief block taken out (the
@@ -1796,9 +1879,7 @@ pub fn settle(
                  cannot count"
                     .into(),
             ),
-            Some(RuleStatus::NotApplicable)
-                if !quotes_instruction(&v.rationale, Some(bars.rule_text)) =>
-            {
+            Some(RuleStatus::NotApplicable) if !quotes_text(&v.rationale, bars.rule_text) => {
                 Some("a NOT APPLICABLE vote must quote the rule's own words".into())
             }
             Some(_) => None,
@@ -2745,10 +2826,7 @@ fn run_pool(
                                 Some(ans)
                                     if input.stage == CheckStage::Delivery
                                         && ans.status == RuleStatus::Kept
-                                        && !quotes_instruction(
-                                            &ans.cite,
-                                            Some(&input.change.diff),
-                                        ) =>
+                                        && !quotes_text(&ans.cite, &input.change.diff) =>
                                 {
                                     w.insert(
                                         batch[j],

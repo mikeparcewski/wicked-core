@@ -3601,10 +3601,12 @@ pub(super) fn apply_held_revision(
 /// (DES-RULE-CHECK-001 rev 2, codex r2) The steering-rule state a retained unit keeps through a
 /// plan revision: its last rule check (an open dispute stays open on the same evidence), the
 /// person's skips, and the rule councils its attempts spent (the run's budget never refunds).
+/// (F19) …and the person's gate rulings, which the rule judge now reads as their instructions.
 pub(super) fn carry_rule_state(k: &mut crate::domain::WorkUnit, o: &crate::domain::WorkUnit) {
     k.rule_check = o.rule_check.clone();
     k.rule_skips = o.rule_skips.clone();
     k.rule_councils = o.rule_councils;
+    k.operator_rulings = o.operator_rulings.clone();
 }
 
 pub(super) fn revise_units(
@@ -3857,10 +3859,18 @@ mod rule_state_tests {
             instruction: None,
         }];
         old.rule_councils = 4;
+        // (F19) The person's gate ruling, which the rule judge reads as their instruction.
+        old.operator_rulings.push(crate::domain::OperatorRuling {
+            action: "request_changes".into(),
+            text: "learn-small-prs is waived for this plugin".into(),
+            attempt: 0,
+            at: 1,
+        });
         let mut kept = crate::domain::WorkUnit::pending("r:review", "r", 3, "review, revised");
         super::carry_rule_state(&mut kept, &old);
         assert_eq!(kept.rule_check, old.rule_check);
         assert_eq!(kept.rule_skips, old.rule_skips);
         assert_eq!(kept.rule_councils, 4);
+        assert_eq!(kept.operator_rulings, old.operator_rulings);
     }
 }
