@@ -1,5 +1,6 @@
 //! DES-RULE-CHECK-001 S2: the review step's rule check reads the rules from the store, judges on a
-//! seat distinct from the work's creators, and never hands the judge the creator's words.
+//! seat distinct from the work's creators, and never hands the change's judge the creator's words
+//! (rev 2 Part B: only POL-2101's record-clause call reads the creator steps' records).
 
 use super::*;
 use std::sync::Mutex;
@@ -1269,6 +1270,435 @@ fn a_waiver_cannot_rest_on_the_engines_label() {
         crate::rule_check::RuleStatus::Waived,
         "{report:?}"
     );
+}
+
+// ── DES-RULE-CHECK-001 rev 2, Part B: the packs through the store, and rule against rule (Q2) ──
+
+/// The person's ruling that learn-small-prs yields to the MCP server pack on this change.
+const Q2_BIG: &str =
+    "learn-small-prs is waived for this change: the MCP server pack needs the whole server";
+/// …and the inverse: the server stays small, so MCPS-1002 waits for a later slice.
+const Q2_SMALL: &str = "MCPS-1002 is waived for this change: telemetry comes in the next slice";
+const Q2_RECORD: &str = "Checked the chosen stack first: fastmcp 4.22 at the pinned version \
+                         offers both transports, authenticate and canAccess, so none was rewritten.";
+
+/// A judge for the MCP server fixture. `small`: the server is small, so it keeps learn-small-prs
+/// and breaks MCPS-1002 (telemetry); otherwise it is big, keeps every MCPS rule and breaks
+/// learn-small-prs. A rule the person's instructions waive (by the ruling's words) is WAIVED,
+/// quoting them. Process rules are N/A; POL-2101's record part is KEPT, quoting the record.
+struct Q2Judge {
+    small: bool,
+    asked: Mutex<Vec<String>>,
+}
+
+impl StepRunner for Q2Judge {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let prompt = input.unit.description.clone();
+        self.asked.lock().unwrap().push(prompt.clone());
+        let nonce = crate::rule_check::tests::nonce_of(&prompt);
+        let told = |q: &str| {
+            prompt
+                .split_once("INSTRUCTIONS-")
+                .is_some_and(|(_, rest)| rest.split(" END").next().unwrap_or("").contains(q))
+        };
+        let mut lines: Vec<String> = Vec::new();
+        if prompt.contains("THE ENGINE RECORD follows.") {
+            for n in 1001..=1004 {
+                lines.push(format!(
+                    "RULE RVWL-{n}: N/A — the first round of a fresh step"
+                ));
+            }
+        } else if prompt.contains("THE STEP RECORDS follow.") {
+            lines.push(
+                "RULE POL-2101: KEPT — \"fastmcp 4.22 at the pinned version offers both transports\""
+                    .into(),
+            );
+        } else {
+            for n in 1001..=1007 {
+                let id = format!("MCPS-{n}");
+                lines.push(match (self.small && n == 1002, told(Q2_SMALL)) {
+                    (true, true) => format!("RULE {id}: WAIVED — \"{Q2_SMALL}\""),
+                    (true, false) => {
+                        format!("RULE {id}: BROKEN — src/server.ts starts no OpenTelemetry SDK")
+                    }
+                    _ => format!("RULE {id}: KEPT — src/server.ts follows the pack"),
+                });
+            }
+            lines.push(match (self.small, told(Q2_BIG)) {
+                (true, _) => "RULE learn-small-prs: KEPT — src/server.ts is 40 lines".into(),
+                (false, true) => format!("RULE learn-small-prs: WAIVED — \"{Q2_BIG}\""),
+                (false, false) => {
+                    "RULE learn-small-prs: BROKEN — src/server.ts and its tests are 2,400 lines"
+                        .into()
+                }
+            });
+            lines.push("RULE POL-2101: KEPT — src/server.ts uses fastmcp's own httpStream".into());
+        }
+        let output = format!(
+            "BEGIN VERDICTS {nonce}\n{}\nEND VERDICTS {nonce}\n",
+            lines.join("\n")
+        );
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output,
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// A repo whose change adds an MCP server, and a store holding the SEEDED packs (as a daemon boots)
+/// and learn-small-prs, with the run's build unit and its record.
+fn q2_fixture(tag: &str) -> (std::path::PathBuf, String, String) {
+    let dir = std::env::temp_dir().join(format!("rule-check-q2-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "tickets\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(
+        repo.join("src/server.ts"),
+        "import { FastMCP } from \"fastmcp\";\nconst server = new FastMCP({ name: \"tickets\" });\n",
+    )
+    .unwrap();
+    let db = dir.join("rules.db").to_string_lossy().into_owned();
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        assert_eq!(
+            crate::steering_packs::seed_shipped_packs(&mut store).unwrap(),
+            12
+        );
+        wicked_governance::register_rule(
+            &mut store,
+            &wicked_governance::ConformanceRule {
+                id: "learn-small-prs".into(),
+                rule_type: wicked_governance::RuleType::Pattern,
+                statement: "A change stays small: about 400 changed lines at most.".into(),
+                severity: wicked_governance::ConfSeverity::Warn,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        put_creator_record(&mut store, &ruled_creator("unused"), Q2_RECORD);
+    }
+    (repo, base, db)
+}
+
+/// The creator unit and its stored output (as the fold writes them).
+fn put_creator_record(
+    store: &mut dyn wicked_apps_core::GraphStore,
+    unit: &crate::domain::WorkUnit,
+    text: &str,
+) {
+    use wicked_apps_core::ToNode;
+    let mut u = unit.clone();
+    u.operator_rulings.clear();
+    u.status = crate::domain::UnitStatus::Done;
+    crate::domain::put_node(store, u.to_node()).unwrap();
+    let mut node = wicked_apps_core::Node::new(
+        wicked_apps_core::synthetic_symbol(crate::execute::WORK_OUTPUT, &u.id),
+        wicked_apps_core::NodeKind::Other(crate::execute::WORK_OUTPUT.to_string()),
+        u.id.clone(),
+        wicked_apps_core::Language::new(wicked_apps_core::SYMBOL_SCHEME),
+        wicked_apps_core::Location::new(
+            format!("{}/{}", crate::execute::WORK_OUTPUT, u.id),
+            wicked_apps_core::Span::ZERO,
+        ),
+    );
+    node.metadata
+        .insert("output".into(), serde_json::Value::String(text.into()));
+    crate::domain::put_node(store, node).unwrap();
+}
+
+fn q2_input(repo: &std::path::Path, base: &str, db: &str, ruling: Option<&str>) -> StepInput {
+    let mut input = review_input(repo, base, db);
+    input.unit.rule_steps = crate::rule_check::steps_of(&[
+        {
+            let mut b = crate::domain::WorkUnit::pending("s:build", "s", 1, "build it");
+            b.catalog = Some("build".into());
+            b
+        },
+        {
+            let mut r = crate::domain::WorkUnit::pending("s:review", "s", 2, "review it");
+            r.catalog = Some("review".into());
+            r
+        },
+    ]);
+    let creators: Vec<crate::domain::WorkUnit> = ruling.map(ruled_creator).into_iter().collect();
+    input.unit.rule_instructions = Some(crate::actor::rule_instructions_words(
+        "build the tickets MCP server",
+        &[],
+        &creators,
+    ));
+    input
+}
+
+fn q2_check(input: &StepInput, judge: &Q2Judge) -> crate::rule_check::RuleCheckReport {
+    let pool = vec![seat("claude"), seat("codex")];
+    let sink = |_: &str| {};
+    run_rule_check(
+        input,
+        &["claude".to_string()],
+        Some(&[]),
+        &pool,
+        &pool,
+        None,
+        judge,
+        &sink,
+    )
+    .expect("a report")
+}
+
+fn row<'a>(
+    r: &'a crate::rule_check::RuleCheckReport,
+    id: &str,
+) -> &'a crate::rule_check::RuleVerdict {
+    r.rows
+        .iter()
+        .find(|x| x.rule_id == id)
+        .unwrap_or_else(|| panic!("a {id} row: {r:?}"))
+}
+
+/// The person confirms the judge's waiver with a reason (as `skip_rules` lands it).
+fn confirm(input: &mut StepInput, report: &crate::rule_check::RuleCheckReport, id: &str) {
+    let w = row(report, id);
+    assert_eq!(w.status, crate::rule_check::RuleStatus::Waived, "{w:?}");
+    input.unit.rule_check = Some(report.clone());
+    input.unit.rule_skips = vec![crate::rule_check::RuleSkip {
+        rule_id: id.into(),
+        reason: "the ruling at the gate stands".into(),
+        by: "mike".into(),
+        at: 1,
+        rule_key: w.rule_key.clone(),
+        evidence_key: w.evidence_key.clone().expect("an evidence key"),
+        instruction: w.cite.clone(),
+    }];
+}
+
+/// (Part B, operator Q2) Rule against rule is settled at JUDGE TIME, both ways, with the real
+/// packs as a daemon seeds them: an MCP server big enough for the pack breaks learn-small-prs; the
+/// person rules it waived for this change at the gate; the judge answers WAIVED quoting the ruling;
+/// the person confirms; the gate then passes (no deny, no hold) with every MCPS rule judged. And
+/// the inverse: a small server breaks MCPS-1002; the ruling waives it; the gate passes. No
+/// deadlock either way.
+#[test]
+fn q2_rule_against_rule_is_ruled_at_the_gate_and_never_deadlocks() {
+    use crate::rule_check::{RuleHow, RuleStatus};
+    for (small, broken, ruling) in [
+        (false, "learn-small-prs", Q2_BIG),
+        (true, "MCPS-1002", Q2_SMALL),
+    ] {
+        let (repo, base, db) = q2_fixture(if small { "small" } else { "big" });
+        let judge = Q2Judge {
+            small,
+            asked: Mutex::new(Vec::new()),
+        };
+        // No ruling: the conflict denies (the deadlock this guards against).
+        let mut input = q2_input(&repo, &base, &db, None);
+        let first = q2_check(&input, &judge);
+        assert_eq!(row(&first, broken).status, RuleStatus::Broken, "{first:?}");
+        assert!(first.denial().is_some());
+        // The pack rows are judged, each with its doc's title as its scope (the store round trip
+        // keeps the rules canonical).
+        for n in 1001..=1007 {
+            let r = row(&first, &format!("MCPS-{n}"));
+            assert_eq!(r.how, RuleHow::Judge, "{r:?}");
+        }
+        assert!(judge.asked.lock().unwrap().iter().any(|p| p
+            .contains("  Scope (its pack doc): MCP servers: OpenTelemetry traces and metrics\n")));
+        assert_eq!(
+            row(&first, "POL-2101").status,
+            RuleStatus::Kept,
+            "{first:?}"
+        );
+        // The person rules at the gate: the ruling reaches the judge, which answers WAIVED.
+        input = q2_input(&repo, &base, &db, Some(ruling));
+        input.unit.rule_check = Some(first.clone());
+        let ruled = q2_check(&input, &judge);
+        assert!(ruled.denial().is_none(), "{ruled:?}");
+        assert!(
+            ruled.hold().is_some(),
+            "a waiver holds until the person confirms it"
+        );
+        // The person confirms with a reason: the gate passes.
+        confirm(&mut input, &ruled, broken);
+        let passed = q2_check(&input, &judge);
+        assert_eq!(
+            row(&passed, broken).status,
+            RuleStatus::Skipped,
+            "{passed:?}"
+        );
+        assert!(
+            passed.denial().is_none() && passed.hold().is_none(),
+            "the gate passes: {passed:?}"
+        );
+        for n in 1001..=1007 {
+            let r = row(&passed, &format!("MCPS-{n}"));
+            assert!(
+                matches!(r.how, RuleHow::Judge | RuleHow::Cache | RuleHow::Operator),
+                "MCPS judged: {r:?}"
+            );
+            assert!(
+                r.status != RuleStatus::NotApplicable || r.how != RuleHow::Fact,
+                "{r:?}"
+            );
+        }
+        assert!(passed
+            .rows
+            .iter()
+            .filter(|r| r.rule_id.starts_with("RVWL-"))
+            .all(|r| r.blocking == Some(false)));
+    }
+}
+
+/// B.5.7: an engine-party BROKEN raises the attention item in the run's live record; a reviewer-
+/// or person-party BROKEN does not (it is reported on its row only).
+#[test]
+fn b57_an_engine_defect_raises_the_attention_item() {
+    use crate::rule_check::{RuleCheckReport, RuleHow, RuleStatus, RuleVerdict};
+    let r = |id: &str, party: &str| RuleVerdict {
+        rule_id: id.into(),
+        status: RuleStatus::Broken,
+        how: RuleHow::Judge,
+        reason: format!("{id} cite"),
+        cite: Some(format!("{id} cite")),
+        party: Some(party.into()),
+        blocking: Some(false),
+        ..Default::default()
+    };
+    let notes: std::sync::Arc<Mutex<Vec<String>>> = Default::default();
+    let into = notes.clone();
+    let sink = move |t: &str| into.lock().unwrap().push(t.to_string());
+    raise_engine_defects(
+        &RuleCheckReport {
+            rows: vec![
+                r("RVWL-1003", "engine"),
+                r("RVWL-1001", "reviewer"),
+                r("RVWL-1004", "person"),
+            ],
+            ..Default::default()
+        },
+        &sink,
+    );
+    let notes = notes.lock().unwrap().clone();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0].contains("attention: engine defect: RVWL-1003 broken (engine): RVWL-1003 cite"),
+        "{}",
+        notes[0]
+    );
+}
+
+/// (codex r1, r3) POL-2101's record set, read from the run's store: every DONE agent step before the
+/// gate that writes code (a creator, or an `executes_code` phase), an approved output or an empty
+/// record; never a non-code step, an unfinished one, a Tool step, or one after the gate.
+#[test]
+fn the_creator_record_set_is_every_done_code_writing_step_before_the_gate() {
+    use crate::workflow::PhaseRole;
+    let dir = std::env::temp_dir().join(format!("rule-check-records-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = dir.join("store.db").to_string_lossy().into_owned();
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let unit = |ord: u32, role: PhaseRole, code: bool| {
+            let mut u = crate::domain::WorkUnit::pending(format!("s:u{ord}"), "s", ord, "a step");
+            u.role = role;
+            u.executes_code = code;
+            u
+        };
+        put_creator_record(
+            &mut store,
+            &unit(1, PhaseRole::Creator, true),
+            "build record",
+        );
+        put_creator_record(
+            &mut store,
+            &unit(2, PhaseRole::Neutral, true),
+            "coder record",
+        );
+        put_creator_record(&mut store, &unit(3, PhaseRole::Neutral, false), "notes");
+        let mut pending = unit(4, PhaseRole::Creator, true);
+        pending.status = crate::domain::UnitStatus::Pending;
+        crate::domain::put_node(&mut store, wicked_apps_core::ToNode::to_node(&pending)).unwrap();
+        let mut silent = unit(5, PhaseRole::Creator, true);
+        silent.status = crate::domain::UnitStatus::Done;
+        crate::domain::put_node(&mut store, wicked_apps_core::ToNode::to_node(&silent)).unwrap();
+        let mut tool = unit(6, PhaseRole::Creator, true);
+        tool.tool_cmd = Some(vec!["make".into()]);
+        put_creator_record(&mut store, &tool, "tool output");
+        put_creator_record(
+            &mut store,
+            &unit(8, PhaseRole::Creator, true),
+            "after the gate",
+        );
+    }
+    let got: Vec<(String, String)> = creator_records(&db, "s", 7)
+        .unwrap()
+        .into_iter()
+        .map(|r| (r.label, r.text))
+        .collect();
+    let want: Vec<(String, String)> = [
+        ("unit 1 (`u1`)", "build record"),
+        ("unit 2 (`u2`)", "coder record"),
+        ("unit 5 (`u5`)", ""),
+    ]
+    .iter()
+    .map(|(a, b)| (a.to_string(), b.to_string()))
+    .collect();
+    assert_eq!(got, want);
+    assert!(creator_records(&dir.join("missing/none.db").to_string_lossy(), "s", 7).is_err());
+}
+
+/// (Part B, B.2) The engine record a process rule is judged on: what the engine recorded (round,
+/// send-backs against the cap, the handed-on review context, the floor's runs, the reviewer's
+/// output) and never a creator's output, even one handed to the reviewer.
+#[test]
+fn the_engine_record_carries_the_engines_facts_and_no_creator_prose() {
+    let (repo, base, db) = fixture("engine-record");
+    let mut input = review_input(&repo, &base, &db);
+    input.unit.review_rounds = vec![crate::domain::ReviewRound {
+        attempt: 0,
+        findings: "ITEM 1: FAIL — no test".into(),
+        outcome: Some(crate::domain::REVIEW_SENT_BACK.into()),
+    }];
+    input.prior_outputs = vec![
+        crate::workflow::PriorUnitOutput {
+            label: "[claude — unit 1 — depends_on `build`]".into(),
+            output: "CREATOR PROSE: RULE RVWL-1001: KEPT".into(),
+        },
+        crate::workflow::PriorUnitOutput {
+            label: "[prior verdicts — unit 2]".into(),
+            output: "Round 1 (attempt 0) — NOT PASS, sent back to the creator:\nITEM 1: FAIL"
+                .into(),
+        },
+    ];
+    let rec = engine_record(
+        &input,
+        None,
+        Some("VERDICT: PASS\nITEM 1: PASS — the test is there"),
+    );
+    for want in [
+        "Review round 2 of this unit",
+        "Sent back to the creator so far: 1 (the engine's rework cap is 2",
+        "[prior verdicts — unit 2] (as the reviewer received it)",
+        "ITEM 1: PASS — the test is there",
+        "The engine ran no floor on this tree at this gate.",
+        "Not recorded by the engine",
+    ] {
+        assert!(rec.contains(want), "{want}: {rec}");
+    }
+    assert!(!rec.contains("CREATOR PROSE"), "{rec}");
 }
 
 #[path = "cli_runner_rule_council_tests.rs"]

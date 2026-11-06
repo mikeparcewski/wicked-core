@@ -132,7 +132,11 @@ impl StepRunner for ScriptedSeat {
             self.inputs.lock().unwrap().push(input.clone());
         }
         let mut output = format!("did: {phase}");
-        if input.unit.session_id == "validator" {
+        if let Some(v) = wicked_core::stub_rule_verdicts(&input.unit.description) {
+            // (DES-RULE-CHECK-001 rev 2 Part B) A rule-check judge call (the shipped pack rules
+            // are judged now): the stub's framed N/A answers.
+            output = v;
+        } else if input.unit.session_id == "validator" {
             // The agent judge's contract: the SAME verdict word on the first and the last line.
             output = "PASS\nthe work meets the criterion\nPASS".to_string();
         } else if let Some(wd) = &input.workdir {
