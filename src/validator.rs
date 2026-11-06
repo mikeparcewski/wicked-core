@@ -539,6 +539,13 @@ enum NetworkPolicy {
     /// namespace has only `lo`). No system-temp carve-out: the caller hands its private temp dir in
     /// as a write root.
     LoopbackOnly,
+    /// (DES-DEMO-RECORD-001 §3.4, core#1249) ONE outbound TCP port on `localhost` and nothing else: no
+    /// bind, no inbound, no other loopback port. The demo recorder drives the person's app on the host,
+    /// which may be the crew daemon itself, so `localhost:*` would hand it every local service. macOS
+    /// only: Linux bwrap's `--unshare-net` gives the jail its own loopback, where the host's app is not
+    /// reachable, so a Linux host gets no `Sandboxed` launcher for this policy (the caller reports
+    /// `no_port_scoped_jail`).
+    LoopbackPort(u16),
 }
 
 /// Whether the jail may allocate pseudo-terminals. Only the repo-checks floor asks for `Own`: a
@@ -570,7 +577,7 @@ impl NetworkPolicy {
 /// returns empty when `HOME` is unset (the block then degrades cleanly — the floor still applies). These
 /// are the credential stores an untrusted validator has no legitimate reason to read; the rest of the FS
 /// stays readable ON PURPOSE (see the module HONEST LIMITS note — this is a denylist, not a read jail).
-fn secret_read_block_dirs() -> Vec<std::path::PathBuf> {
+pub(crate) fn secret_read_block_dirs() -> Vec<std::path::PathBuf> {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
     secret_read_block_dirs_under(home.as_deref())
 }
@@ -650,6 +657,14 @@ fn macos_sandbox_profile_for_roots(
         p.push_str("(allow network-outbound (remote ip \"localhost:*\"))\n");
         p.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
         p.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
+    }
+    if let NetworkPolicy::LoopbackPort(port) = network {
+        // After the deny, so it wins for this one port only (spiked on macOS 26 with curl and
+        // headless Chromium: the port connects, another loopback port and a public address are
+        // refused, a bind is EPERM).
+        p.push_str(&format!(
+            "(allow network-outbound (remote ip \"localhost:{port}\"))\n"
+        ));
     }
     // C3: explicitly DENY reads of the curated high-value secret dirs (after `allow default`, so the
     // deny wins for those paths). Resolved from HOME; SBPL-quoted like the cwd. Missing HOME ⇒ no rules.
@@ -861,6 +876,17 @@ pub(crate) fn loopback_jail(write_roots: &[&Path]) -> SandboxLauncher {
     detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::LoopbackOnly, PtyPolicy::Deny)
 }
 
+/// (DES-DEMO-RECORD-001 §3.4) The jail the demo Tools (`demo_probe`, `demo_record`) run in: writes only
+/// under `write_roots`, network to `localhost:<port>` outbound only, the curated secret dirs unreadable.
+/// `Sandboxed` on macOS only; elsewhere the caller gets a non-`Sandboxed` level and records nothing.
+pub(crate) fn port_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
+    detect_sandbox_launcher_for_roots(
+        write_roots,
+        NetworkPolicy::LoopbackPort(port),
+        PtyPolicy::Deny,
+    )
+}
+
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
 /// (core#703) The seccomp program the loopback-only jail loads: every way to reach a pathname
@@ -1002,7 +1028,11 @@ fn launcher_for_roots_masking(
     // caller names — a validator's private `TMPDIR`, the coverage store's dir), unshare the network,
     // mask the curated secret dirs that exist with an empty tmpfs, and put the sandbox in its own PID
     // namespace tied to the launcher so the whole tree dies on timeout (C4).
-    if let Some(tool) = find_on_path("bwrap") {
+    if let Some(tool) = find_on_path("bwrap").filter(|_| {
+        // A port-scoped jail cannot be expressed with `--unshare-net` (the host's app is outside
+        // the new namespace): no bwrap launcher for it, so the caller sees "no jail" and says so.
+        !matches!(network, NetworkPolicy::LoopbackPort(_))
+    }) {
         if let Some(primary) = write_roots
             .first()
             .and_then(|root| root.canonicalize().ok())
@@ -4504,6 +4534,108 @@ mod tests {
             !run("import socket; socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)"),
             "a datagram AF_UNIX socketpair is refused (it could sendto any pathname socket)"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (DES-DEMO-RECORD-001 §3.4) The port jail's profile admits ONE outbound loopback port: no
+    /// `localhost:*`, no bind, no inbound, writes still denied outside the roots.
+    #[test]
+    fn the_port_jail_profile_admits_one_outbound_port_only() {
+        let root = std::env::temp_dir().join(format!("wicked-port-profile-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let p = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::LoopbackPort(7721),
+            PtyPolicy::Deny,
+        )
+        .unwrap();
+        assert!(p.contains("(deny network*)"), "{p}");
+        assert_eq!(p.matches("(allow network").count(), 1, "{p}");
+        assert!(
+            p.contains("(allow network-outbound (remote ip \"localhost:7721\"))"),
+            "{p}"
+        );
+        assert!(!p.contains("localhost:*"), "{p}");
+        assert!(p.contains("(deny file-write*)"), "{p}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// (DES-DEMO-RECORD-001 §3.4) bwrap cannot scope a jail to one HOST port (`--unshare-net` gives
+    /// it its own loopback), so on a host whose only jail is bwrap the port jail is never
+    /// `Sandboxed`: the demo recorder then records nothing and says why.
+    #[test]
+    fn the_port_jail_is_never_a_bwrap_jail() {
+        if cfg!(target_os = "macos") {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-port-bwrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let jail = port_jail(&[dir.as_path()], 7721);
+        assert_ne!(jail.level, SandboxLevel::Sandboxed, "{:?}", jail.wrapper);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (DES-DEMO-RECORD-001 §3.4, the first build step) End to end on macOS: inside the port jail a
+    /// process connects to the allowed loopback port, and is refused another loopback port, a
+    /// public address and a bind; a write outside its root is refused too.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_port_jail_reaches_only_its_port_on_macos() {
+        if find_on_path("python3").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("wicked-port-jail-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dir = dir.canonicalize().unwrap();
+        let allowed = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (ap, op) = (
+            allowed.local_addr().unwrap().port(),
+            other.local_addr().unwrap().port(),
+        );
+        let jail = port_jail(&[dir.as_path()], ap);
+        if jail.level != SandboxLevel::Sandboxed {
+            return;
+        }
+        let run = |code: &str| {
+            // spawn-audit: test-only — runs python inside the test's own jail.
+            std::process::Command::new(&jail.wrapper[0])
+                .args(&jail.wrapper[1..])
+                .args(["python3", "-c", code])
+                .current_dir(&dir)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("the jail runs")
+                .success()
+        };
+        let connect = |port: u16| {
+            format!("import socket; s=socket.create_connection(('127.0.0.1', {port}), timeout=3); s.close()")
+        };
+        assert!(run(&connect(ap)), "the allowed port connects");
+        assert!(!run(&connect(op)), "another loopback port is refused");
+        assert!(
+            !run("import socket; socket.create_connection(('1.1.1.1', 80), timeout=3)"),
+            "a public address is refused"
+        );
+        assert!(
+            !run("import socket; s=socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()"),
+            "a bind is refused"
+        );
+        let outside = std::env::temp_dir().join(format!("wicked-port-out-{}", std::process::id()));
+        assert!(
+            !run(&format!(
+                "open({:?}, 'w').write('x')",
+                outside.to_string_lossy()
+            )),
+            "a write outside the root is refused"
+        );
+        assert!(!outside.exists());
+        assert!(
+            run("open('inside.txt', 'w').write('x')"),
+            "a write inside the root works"
+        );
+        drop((allowed, other));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -148,6 +148,8 @@ mod validator;
 pub fn nested_sandbox() -> bool {
     validator::nested_sandbox()
 }
+/// (DES-DEMO-RECORD-001, core#1249) The Demo video's host-run Tools: demo root, jail, receipt, fold.
+pub mod demo_record;
 mod validator_vault;
 pub mod walkthrough;
 mod worker_sandbox;

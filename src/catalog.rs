@@ -45,9 +45,9 @@ pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer
 /// ([`crate::plan`]'s `code_work_step`).
 pub const DOMAIN_COVERAGE_SKILL: &str = "wicked-garden-domain-coverage";
 
-/// The fifteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
-/// after `test`).
-pub const CATALOG_IDS: [&str; 15] = [
+/// The seventeen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
+/// after `test`; the two demo Tools, DES-DEMO-RECORD-001, close the table).
+pub const CATALOG_IDS: [&str; 17] = [
     "understand",
     "test_plan",
     "design",
@@ -63,6 +63,8 @@ pub const CATALOG_IDS: [&str; 15] = [
     "domain_coverage",
     "run",
     "deliver",
+    crate::demo_record::PROBE_CATALOG_ID,
+    crate::demo_record::RECORD_CATALOG_ID,
 ];
 
 /// The walkthrough author (DES-walkthrough-proof §4.3, WT-C1): an EVALUATOR agent step that writes
@@ -81,7 +83,7 @@ pub const WALKTHROUGH_RECORD_CMD: [&str; 4] = [
     "record",
 ];
 
-/// The phase catalog: fifteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The phase catalog: seventeen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -197,6 +199,7 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
             catalog_preset(include_str!("presets/decide.json"), "decide"),
         ),
         ("demo", demo_preset()),
+        ("demo-human-review", demo_human_review_preset()),
         (
             "docs",
             interactive_preset(include_str!("presets/docs.json"), "docs"),
@@ -423,6 +426,14 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             "Demo video",
             "Plan, record and review a narrated demo video of an app.",
             &["record a product demo", "show a feature working on video"],
+        ),
+        "demo-human-review" => (
+            "Demo video (reviewed by you)",
+            "Plan and record a narrated demo video of an app whose data stays out of model context; you review the take.",
+            &[
+                "record a demo of an app with private data",
+                "a demo no model may watch",
+            ],
         ),
         "docs" => (
             "Write documentation",
@@ -787,55 +798,33 @@ fn onboarding_preset() -> Vec<PlanStep> {
 /// review.
 pub const DEMO_SKILL: &str = "wicked-garden-demo";
 
-/// `demo` (M9b, studio#373): the wicked-garden demo skill's three actions as a team plan over the
-/// DEMO ROOT — the one launch-declared write root (`LaunchSpec.extra_write_roots`) the launcher
-/// names in the task. Every deliverable is relative, so it resolves inside that root
-/// (`path_policy::missing_deliverables`) and nothing is written anywhere else.
+/// `demo` (M9b; DES-DEMO-RECORD-001, core#1249): plan, record and review a product demo of the app
+/// the person names, from crew's demo route (it mints the demo root, writes its launch manifest and
+/// hands the root as the run's evidence root; the run's only write root is `<root>/plan`).
 ///
-/// - `plan` → `produce` (creator), gated `human_confirm`: THE PLAN GATE. The presenter script and
-///   the chapter list are reviewed before anything records; approve moves on, `request_changes`
-///   re-runs `plan` with the note.
-/// - `record` → `produce` (creator): records every chapter as its own segment, stitches the MP4,
-///   then writes the three contact sheets the review reads. The sheets are the recorder's work
-///   product, so an evaluator never has to write (its posture is read-only).
+/// - `probe` → `demo_probe` (engine Tool, on the host, jailed to the app's one port): loads the
+///   launch page read-only and writes a page summary the plan seat reads (its container cannot reach
+///   the app). Structure only when the app's rows may not reach a model.
+/// - `plan` → `produce` (creator), gated `human_confirm`: THE PLAN GATE. The presenter script, the
+///   chapter list and the storyline AS DATA (`storyline.json`); the engine snapshots them when the
+///   step passes, and the gate shows that snapshot.
+/// - `record` → `demo_record` (engine Tool, on the host, jailed to the app's one port): records the
+///   APPROVED storyline, stitches the MP4 and writes the contact sheets. No seat runs here; the unit
+///   passes only on the engine's receipt of the take (the demo floor). A refusal (the host could not
+///   record) offers a retry; a take that failed goes back to `plan`.
 /// - `review` → `critique` (evaluator), gated `human_confirm`: THE REVIEW GATE. A seat other than
-///   the recorder's (evaluator ≠ creator) judges the sheets and reports one verdict per finding;
-///   `request_changes` rewinds to `record`, which re-records only the named chapter.
+///   the plan's judges the sheets; `request_changes` goes back to `plan`.
 ///
-/// The recorder is read-only against the app (the garden recorder refuses every non-GET request
-/// to the target unless the storyline's target is disposable), and synthetic data is labelled.
+/// The recorder is read-only against the app (a request policy in garden's `readonly.mjs`), and
+/// synthetic data is labelled.
 fn demo_preset() -> Vec<PlanStep> {
     let confirm = Some(GateSpec::HumanConfirm {
         unconditional: false,
     });
-    let files = |f: &[&str]| Some(f.iter().map(|s| s.to_string()).collect());
     vec![
-        PlanStep {
-            catalog: "produce".to_string(),
-            id: "plan".to_string(),
-            gate: confirm,
-            skill_ref: Some(DEMO_SKILL.to_string()),
-            instructions: Some(DEMO_PLAN_INSTRUCTIONS.to_string()),
-            required_deliverables: files(&["script.md", "chapters.json", "storyline.mjs"]),
-            ..PlanStep::default()
-        },
-        PlanStep {
-            catalog: "produce".to_string(),
-            id: "record".to_string(),
-            skill_ref: Some(DEMO_SKILL.to_string()),
-            instructions: Some(DEMO_RECORD_INSTRUCTIONS.to_string()),
-            required_deliverables: files(&[
-                "demo-video/demo.mp4",
-                "demo-video/chapters.md",
-                "demo-video/timings.json",
-                "demo-video/segments",
-                "review/chapters.png",
-                "review/joins.png",
-                "review/end.png",
-            ]),
-            depends_on: Some(vec!["plan".to_string()]),
-            ..PlanStep::default()
-        },
+        demo_probe_step(),
+        demo_plan_step(),
+        demo_record_step(None),
         PlanStep {
             catalog: "critique".to_string(),
             id: "review".to_string(),
@@ -848,41 +837,82 @@ fn demo_preset() -> Vec<PlanStep> {
     ]
 }
 
-/// The `plan` step's instructions. Every path is relative to the demo root the task names.
-pub const DEMO_PLAN_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `plan` action for \
-the app and audience the task names. Work in the demo root the task names and write exactly: \
-`script.md` (the presenter script from the skill's template: audience, pitch, run of show, case \
-bank, measured vs estimate labelled), `chapters.json` (a JSON array, one object per chapter: \
-{\"key\": \"NN-slug\", \"title\", \"blurb\", \"tags\": [..], \"resets\": [..]}) and \
-`storyline.mjs` (the record action's storyline: `title: \"demo\"`, `baseUrl` = the app URL, one \
-segment per chapter with the same keys). Rehearse against the running app READ-ONLY: navigate, \
-hover, scroll, open panels and type into fields, but never submit, launch, approve, delete, \
-create, cancel or save — show a control without pressing it. Say plainly in the script which \
-data is synthetic and which systems are simulated. Write nothing outside the demo root.";
+/// `demo-human-review` (DES-DEMO-RECORD-001 §3.7, operator decision 7.1 b): the Demo video of an app
+/// whose rows may not reach a model. No model review step: the person reviews the take at the record
+/// step's own gate. Crew picks it when the app's sources are not agent-queryable.
+fn demo_human_review_preset() -> Vec<PlanStep> {
+    vec![
+        demo_probe_step(),
+        demo_plan_step(),
+        demo_record_step(Some(GateSpec::HumanConfirm {
+            unconditional: false,
+        })),
+    ]
+}
 
-/// The `record` step's instructions.
-pub const DEMO_RECORD_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `record` action \
-on `storyline.mjs` in the demo root the task names: `wicked-garden run scripts/demo/record.mjs \
-<root>/storyline.mjs --out <root>/demo-video` (inside a crew run the launcher is \
-\"$WICKED_GARDEN_ROOT/scripts/wicked-garden\"). It records every missing segment, then stitches \
-`demo-video/demo.mp4` with chapters. The recorder is read-only against the app: it blocks every \
-non-GET request and fails the segment `side_effect_blocked`. When a \
-note asks to re-record one chapter, delete only `demo-video/segments/<key>/`, fix that segment \
-in the storyline if the note says why, and run record.mjs with that key alone. Then write the \
-review's contact sheets with the skill's contact_sheet.py: `--chapters --out \
-<root>/review/chapters.png`, `--joins --out <root>/review/joins.png` and `--end --out \
-<root>/review/end.png`, each on `demo-video/demo.mp4`. Write nothing outside the demo root.";
+fn demo_probe_step() -> PlanStep {
+    PlanStep {
+        catalog: crate::demo_record::PROBE_CATALOG_ID.to_string(),
+        id: "probe".to_string(),
+        ..PlanStep::default()
+    }
+}
+
+fn demo_plan_step() -> PlanStep {
+    PlanStep {
+        catalog: "produce".to_string(),
+        id: "plan".to_string(),
+        gate: Some(GateSpec::HumanConfirm {
+            unconditional: false,
+        }),
+        skill_ref: Some(DEMO_SKILL.to_string()),
+        instructions: Some(DEMO_PLAN_INSTRUCTIONS.to_string()),
+        required_deliverables: Some(
+            ["script.md", "chapters.json", "storyline.json"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+        ),
+        depends_on: Some(vec!["probe".to_string()]),
+        ..PlanStep::default()
+    }
+}
+
+fn demo_record_step(gate: Option<GateSpec>) -> PlanStep {
+    PlanStep {
+        catalog: crate::demo_record::RECORD_CATALOG_ID.to_string(),
+        id: "record".to_string(),
+        gate,
+        depends_on: Some(vec!["plan".to_string()]),
+        ..PlanStep::default()
+    }
+}
+
+/// The `plan` step's instructions. Every path is relative to the plan directory the task names.
+pub const DEMO_PLAN_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `plan` action for \
+the app and audience the task names, as its \"In a crew Demo video run\" section says. Your \
+container cannot reach the app: read the page summary in the demo root's `probe/` directory (the \
+engine loaded the app's launch page for you) and target only what it lists. Write exactly three \
+files in the plan directory the task names: `script.md` (the presenter script from the skill's \
+template: audience, pitch, run of show, measured vs estimate labelled, which data is synthetic), \
+`chapters.json` (a JSON array, one object per chapter: {\"key\": \"NN-slug\", \"title\", \
+\"blurb\", \"tags\": [..]}) and `storyline.json` (the storyline AS DATA, the skill's \
+`refs/storyline-json.md`: a `ready` target, one segment per chapter with the same keys in the same \
+order, steps from its closed list only, every `go` path under the app's launch path, plain text). \
+The engine records it on the host after the person approves it; the recording is read-only: show a \
+control, never press one that saves, launches, approves or deletes. Write nothing else anywhere.";
 
 /// The `review` step's instructions (an evaluator: it reads and judges, it writes nothing).
 pub const DEMO_REVIEW_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `review` action \
 on the recording in the demo root the task names: look at `review/chapters.png`, \
-`review/joins.png` and `review/end.png`, and ffprobe `demo-video/demo.mp4` for chapters, size \
-and codec. You judge work another seat recorded; change no file. Check every caption against \
-its picture, the joins, the held closing card, and that synthetic data is labelled. Report \
-every finding as `timestamp · chapter · what's wrong · verdict` (verdict: re-encode, \
-re-record, or fix-app), then end with one fenced ```json block: {\"verdict\": \"accept\" or \
-\"changes\", \"findings\": [{\"at\": \"m:ss\", \"chapter\": \"<key>\", \"issue\": \"..\", \
-\"verdict\": \"re-encode|re-record|fix-app\"}]}.";
+`review/joins.png` and `review/end.png`, and read `review/ffprobe.json` for the chapters, size \
+and codec (the engine probed `demo-video/demo.mp4` for you). You judge work the engine recorded \
+from another seat's plan; change no file. Check every caption against its picture, the joins, the \
+held closing card, and that synthetic data is labelled. Report every finding as `timestamp · \
+chapter · what's wrong · verdict` (verdict: re-encode, re-record, or fix-app), then end with one \
+fenced ```json block: {\"verdict\": \"accept\" or \"changes\", \"findings\": [{\"at\": \
+\"m:ss\", \"chapter\": \"<key>\", \"issue\": \"..\", \"verdict\": \
+\"re-encode|re-record|fix-app\"}]}.";
 
 /// `feature` (§11.2): clarify → `understand` (gate raised to `human_confirm`); design → `design`;
 /// build → `build`; adversarial-review → `review` (gate raised); test → `test`; review →
@@ -1385,6 +1415,45 @@ fn build_catalog() -> Vec<PhaseDef> {
             executor: tool(),
             ..entry("deliver", Build, Neutral, auto, Execution, None, false)
         },
+        PhaseDef {
+            // (DES-DEMO-RECORD-001) The read-only page probe the demo plan writes from: the engine's
+            // own fixed command, jailed to the app's one port (`demo_record` module).
+            executor: PhaseExecutor::Tool {
+                cmd: crate::demo_record::DEMO_PROBE_CMD
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            },
+            ..entry(
+                crate::demo_record::PROBE_CATALOG_ID,
+                Recon,
+                Neutral,
+                auto,
+                Value,
+                None,
+                false,
+            )
+        },
+        PhaseDef {
+            // (DES-DEMO-RECORD-001) The recorder: the engine's own fixed command on the host, jailed
+            // to the app's one port, recording the APPROVED storyline; its unit passes only on the
+            // engine's receipt of the take (the demo floor), so it carries no pin.
+            executor: PhaseExecutor::Tool {
+                cmd: crate::demo_record::DEMO_RECORD_CMD
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            },
+            ..entry(
+                crate::demo_record::RECORD_CATALOG_ID,
+                Build,
+                Neutral,
+                auto,
+                Value,
+                None,
+                false,
+            )
+        },
     ]
 }
 
@@ -1429,7 +1498,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_fifteen_entries_of_the_table() {
+    fn the_catalog_is_the_seventeen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -1476,6 +1545,8 @@ mod tests {
             ("domain_coverage", j("test"), j("evaluator"), hci.clone(), j("execution"), Some("9fddcc159580ed33"), false, j("agent"), None),
             ("run", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
             ("deliver", j("build"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
+            ("demo_probe", j("recon"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
+            ("demo_record", j("build"), j("neutral"), j("auto"), j("value"), None, false, j("tool"), None),
         ];
         assert_eq!(got, want);
         let ids: Vec<_> = catalog().iter().map(|e| e.id.as_str()).collect();
@@ -2076,14 +2147,52 @@ mod tests {
         }
     }
 
-    /// WT-C1: the recorder's write escape hatch is gone (garden WT-G1 deletes the variable), so the
-    /// demo `record` instruction no longer names it.
+    /// (DES-DEMO-RECORD-001) No seat records a demo: both demo presets record with the engine's
+    /// `demo_record` Tool after the plan gate, the plan writes `storyline.json` (data, never a
+    /// module), and only the model-reviewed preset carries a review step.
     #[test]
-    fn the_demo_record_instruction_does_not_name_the_deleted_env_var() {
+    fn the_demo_presets_record_on_the_host_from_data() {
+        for (name, want_review) in [("demo", true), ("demo-human-review", false)] {
+            let steps = builtin_presets()
+                .into_iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, s)| s)
+                .unwrap_or_else(|| panic!("{name} is a builtin preset"));
+            let ids: Vec<_> = steps
+                .iter()
+                .map(|s| (s.id.as_str(), s.catalog.as_str()))
+                .collect();
+            assert_eq!(
+                &ids[..3],
+                [
+                    ("probe", "demo_probe"),
+                    ("plan", "produce"),
+                    ("record", "demo_record")
+                ],
+                "{name}"
+            );
+            assert_eq!(ids.len() == 4, want_review, "{name}: {ids:?}");
+            let plan = &steps[1];
+            assert!(plan
+                .required_deliverables
+                .as_ref()
+                .unwrap()
+                .contains(&"storyline.json".to_string()));
+            assert!(
+                steps[2].required_deliverables.is_none(),
+                "the receipt is the record step's floor"
+            );
+            assert_eq!(
+                steps[2].gate.is_some(),
+                !want_review,
+                "{name}: the person reviews at record's gate"
+            );
+        }
         assert!(
-            !DEMO_RECORD_INSTRUCTIONS.contains("DEMO_ALLOW_WRITES"),
-            "{DEMO_RECORD_INSTRUCTIONS}"
+            DEMO_PLAN_INSTRUCTIONS.contains("storyline.json")
+                && !DEMO_PLAN_INSTRUCTIONS.contains("storyline.mjs")
         );
+        assert!(DEMO_REVIEW_INSTRUCTIONS.contains("ffprobe.json"));
     }
 
     /// (DES-CATALOG-002 §3.1) The read-only verbs: every Investigate, Analyze and Judge preset —

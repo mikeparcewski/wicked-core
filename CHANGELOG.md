@@ -14,6 +14,26 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A Demo video is recorded by the engine on the host, never by a seat (DES-DEMO-RECORD-001, core#1249).** The
+  `demo` preset's `record` step ran garden's recorder inside its seat's container, which cannot reach the person's
+  app (its loopback is its own) and has no ffmpeg or browser, so no demo reached its review gate. New catalog Tools
+  `demo_probe` and `demo_record` run garden's fixed `scripts/demo/demo-record.mjs` on the host under a new jail,
+  `NetworkPolicy::LoopbackPort` (`validator::port_jail`): writes only to the Tool's own directories under the demo
+  root and a private temp dir, network to exactly the app's one loopback port (outbound only: no bind, no other
+  port). macOS only (sandbox-exec); Linux (bwrap's `--unshare-net` hides the host's app) and Windows record nothing
+  and say why. The demo root is the run's evidence root, with crew's `launch.json` (the app's origin and launch
+  path, crew's target, whether its rows may reach a model); a launch whose write roots cover it is refused, and the
+  same admission runs again at dispatch. When the plan step passes, the engine snapshots its `storyline.json` and
+  `chapters.json` into `approved/<gen>/`, bound to the run; the recorder records only that snapshot. A take
+  rotates the previous one to `takes/<n>/`, is killed past 20 minutes or 2 GB, and its unit passes only on the
+  engine's receipt (`UnitEvidence::demo_take`: the verdict file plus a sha256 of every file it wrote) of a PASS
+  of the approved storyline with every file the plan implies. A take the host could not make is denied
+  `demo_refused` (the gate re-runs the Tool); a take that ran and failed is denied `demo_verdict` (send-back to
+  the plan), naming each failed chapter and its moment. Presets: `demo` is now probe → plan → record → review, and
+  `demo-human-review` (probe → plan → record, the person reviewing at the record step's gate) is for an app whose
+  rows may not reach a model. `wicked-garden` as a Tool command resolves through the admitted skills generation at
+  preflight too.
+
 - **A drafted document can be restyled (F8, e2e-1105).** The `interactive-draft` preset now tells the drafter to
   write every colour and font as a theme token with a fallback (`var(--wi-bg, #…)`, `var(--wi-text, #…)`, …) and
   never to declare `--wi-*` itself. Drafts used to hard-code every colour, so Slides → Style changed nothing; with
