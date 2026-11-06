@@ -9,10 +9,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use wicked_core::{
-    AmendScope, Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PhaseRole,
-    StepInput, StepOutput, StepRunner, StepStatus,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PhaseRole, StepInput,
+    StepOutput, StepRunner, StepStatus,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
+// The F30 tool-check tests are POSIX-only (their checks are shell scripts).
+#[cfg(unix)]
+use wicked_core::AmendScope;
 use wicked_council::{AgenticCli, CouncilTask};
 
 /// Arm the hermetic emit spool BEFORE main (pre-main is single-threaded, so no test thread can
@@ -325,6 +328,7 @@ fn a_failed_review_is_sent_back_to_the_creator_and_the_run_completes_on_the_seco
 /// (e2e F30) A creator then a Tool CHECK (qe-author-tests' `build` → `verify` shape). The check
 /// exits 1 until the creator's second pass writes `flag`; the triage judge rules `fail`. Records
 /// every `(ord, attempt)` a seat ran, and every triage call.
+#[cfg(unix)]
 struct FailingCheckSeat {
     /// The triage judge's ruling line (`DECISION: FAIL` unless a test says otherwise).
     ruling: &'static str,
@@ -332,6 +336,7 @@ struct FailingCheckSeat {
     handed: Arc<Mutex<Vec<(u32, u32)>>>,
     triaged: Arc<Mutex<u32>>,
 }
+#[cfg(unix)]
 impl StepRunner for FailingCheckSeat {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
         let output = if i.run_id.starts_with("triage-") {

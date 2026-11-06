@@ -637,6 +637,7 @@ mod tests {
     /// ([`pinned_judge_criterion_for`], the one call the judge block makes) resolves the run's
     /// REGISTERED repository from the operational store, reads its repo-local graph under the
     /// daemon's repo-graph root (from the store path, not a thread binding) and carries 66%.
+    #[cfg(unix)] // a git fixture, like the suite's other repo-registration tests
     #[test]
     fn a_governed_coverage_judge_is_told_the_repository_target() {
         use wicked_apps_core::spawn::HardenedCommand;
