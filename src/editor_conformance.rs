@@ -330,25 +330,139 @@ pub(crate) fn judge_file(path: &std::path::Path, attempt: u32) -> ConformanceRec
     }
 }
 
-/// Export `tree` (an object the run's git dir holds) into `dest`, a fresh directory: the bytes the
-/// cases run against are exactly the recorded tree, never the live worktree (a process still writing
-/// there, an ignored or scratch file the tree does not hold). Links stay links (garden refuses them).
+/// Export the run's snapshotted `tree` into `dest`, a fresh engine-owned directory: the bytes the cases run
+/// against are exactly the recorded tree, never the live worktree as it may be later (a process still writing
+/// there, an ignored or scratch file the tree does not hold).
+///
+/// No repository machinery that could run code or substitute content is used (codex, core review r2): the
+/// tree's ENTRIES are listed with `ls-tree` (no hook, no filter; replacement refs off), each regular file is
+/// copied from the worktree as raw bytes (no smudge filter, no eol conversion, no object read), a link entry is
+/// recreated as a link (garden refuses links in a pack), a submodule is skipped. Then every copied file's raw
+/// blob id is computed with `hash-object --no-filters` over the COPY and must equal the tree's entry: the export
+/// is the recorded tree byte for byte, or the export is refused.
 pub(crate) fn export_tree(
+    worktree: &std::path::Path,
     git_dir: &std::path::Path,
     tree: &str,
     dest: &std::path::Path,
-    index: &std::path::Path,
 ) -> Result<(), String> {
     std::fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    let env: [(&str, &std::path::Path); 3] = [
-        ("GIT_DIR", git_dir),
-        ("GIT_WORK_TREE", dest),
-        ("GIT_INDEX_FILE", index),
-    ];
-    crate::worktree_guard::git(dest, &["read-tree", tree], &env).map_err(|e| e.to_string())?;
-    crate::worktree_guard::git(dest, &["checkout-index", "--all", "--force"], &env)
-        .map_err(|e| e.to_string())?;
+    let no_replace = std::path::Path::new("1");
+    let env: [(&str, &std::path::Path); 2] =
+        [("GIT_DIR", git_dir), ("GIT_NO_REPLACE_OBJECTS", no_replace)];
+    let listing = crate::worktree_guard::git(
+        worktree,
+        &["ls-tree", "-r", "-z", "--full-tree", tree],
+        &env,
+    )
+    .map_err(|e| e.to_string())?;
+    let mut files: Vec<(String, String)> = Vec::new();
+    for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
+        let rec = String::from_utf8_lossy(rec);
+        let (meta, path) = rec
+            .split_once('\t')
+            .ok_or_else(|| format!("an unreadable tree entry: {rec}"))?;
+        let mut m = meta.split(' ');
+        let (mode, kind, id) = (m.next(), m.next(), m.next());
+        let (Some(mode), Some(kind), Some(id)) = (mode, kind, id) else {
+            return Err(format!("an unreadable tree entry: {rec}"));
+        };
+        if path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+            || path.starts_with('/')
+        {
+            return Err(format!("a tree entry with an unsafe path: {path}"));
+        }
+        if kind != "blob" {
+            continue; // a submodule (commit) is not part of the pack's bytes
+        }
+        let src = worktree.join(path);
+        let dst = dest.join(path);
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        if mode == "120000" {
+            #[cfg(unix)]
+            {
+                let target = std::fs::read_link(&src).map_err(|e| format!("{path}: {e}"))?;
+                std::os::unix::fs::symlink(target, &dst).map_err(|e| format!("{path}: {e}"))?;
+            }
+            continue;
+        }
+        let meta = std::fs::symlink_metadata(&src).map_err(|e| format!("{path}: {e}"))?;
+        if !meta.file_type().is_file() {
+            return Err(format!(
+                "{path} is no longer a regular file in the worktree"
+            ));
+        }
+        std::fs::copy(&src, &dst).map_err(|e| format!("{path}: {e}"))?;
+        #[cfg(unix)]
+        if mode == "100755" {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
+        }
+        files.push((path.to_string(), id.to_string()));
+    }
+    if files.is_empty() {
+        return Ok(());
+    }
+    // Every copy's raw blob id, in one call, over the COPY (what the cases will read).
+    let paths: String = files.iter().map(|(p, _)| format!("{p}\n")).collect();
+    let out = hash_paths(dest, paths.as_bytes(), &env)?;
+    let got: Vec<&str> = out.lines().collect();
+    if got.len() != files.len() {
+        return Err(
+            "the export could not be verified (hash-object answered for another number of files)"
+                .into(),
+        );
+    }
+    for ((path, want), got) in files.iter().zip(got) {
+        if got.trim() != want {
+            return Err(format!(
+                "{path} in the worktree is not the bytes of the recorded tree (it changed while it was exported)"
+            ));
+        }
+    }
     Ok(())
+}
+
+/// `git hash-object --no-filters --stdin-paths` over `paths` (newline-separated, relative to `cwd`).
+fn hash_paths(
+    cwd: &std::path::Path,
+    paths: &[u8],
+    env: &[(&str, &std::path::Path)],
+) -> Result<String, String> {
+    use std::io::Write;
+    use wicked_apps_core::spawn::HardenedCommand;
+    // spawn-audit: hardened — git plumbing hashing the engine's own export; reads no engine state.
+    let mut cmd = std::process::Command::new("git");
+    cmd.hardened()
+        .args(["hash-object", "--no-filters", "--stdin-paths"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (k, v) in env {
+        cmd.env(k, v);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not spawn git hash-object: {e}"))?;
+    child
+        .stdin
+        .take()
+        .ok_or("no stdin")?
+        .write_all(paths)
+        .map_err(|e| e.to_string())?;
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err(format!(
+            "git hash-object failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// The host inputs crew exports, resolved outside the jail: `(python, studio dist)`, each an
@@ -663,6 +777,59 @@ mod tests {
         let status = cmd.status().expect("the jail runs");
         let rec = judge_file(&out, 0);
         assert!(rec.passed(), "status {status:?}: {rec:?}");
+    }
+
+    /// The export is the recorded tree byte for byte: tracked and untracked-not-ignored files are copied
+    /// raw, an ignored file is not, a link stays a link; a worktree that no longer matches the tree is
+    /// refused; a replacement ref on a blob changes nothing (the bytes come from the worktree, verified).
+    #[cfg(unix)]
+    #[test]
+    fn the_export_is_the_recorded_tree_or_nothing() {
+        let base = std::env::temp_dir().join(format!("ec-export-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("p/editors")).unwrap();
+        let git = |args: &[&str]| {
+            // spawn-audit: test-only — a git fixture for the export under test.
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(repo.join("p/wicked-pack.json"), "{}").unwrap();
+        std::fs::write(repo.join("p/editors/index.html"), "<p>one</p>\r\n").unwrap();
+        std::fs::write(repo.join("ignored.txt"), "no").unwrap();
+        std::os::unix::fs::symlink("p/wicked-pack.json", repo.join("link")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        std::fs::write(repo.join("untracked.txt"), "kept").unwrap();
+        let snap = crate::worktree_guard::snapshot(&repo, &repo).unwrap();
+        let git_dir = std::path::PathBuf::from(snap.git_dir.clone().unwrap());
+        let dest = base.join("export");
+        export_tree(&repo, &git_dir, &snap.tree, &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("p/editors/index.html")).unwrap(),
+            b"<p>one</p>\r\n"
+        );
+        assert!(dest.join("untracked.txt").is_file());
+        assert!(!dest.join("ignored.txt").exists());
+        assert!(std::fs::symlink_metadata(dest.join("link"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        // The worktree moved on after the snapshot: the export refuses rather than test other bytes.
+        std::fs::write(repo.join("p/editors/index.html"), "<p>two</p>").unwrap();
+        let err = export_tree(&repo, &git_dir, &snap.tree, &base.join("export2")).unwrap_err();
+        assert!(err.contains("not the bytes of the recorded tree"), "{err}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(unix)]

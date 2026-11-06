@@ -4775,6 +4775,31 @@ mod tests {
             !run(&connect("localhost", crew_port)),
             "crew's port by name is refused"
         );
+        // A non-loopback address of THIS host, with a positive control: reachable outside the jail,
+        // refused inside it (a failed connect to a public address alone could just be an offline runner).
+        let lan_ip = std::net::UdpSocket::bind("0.0.0.0:0")
+            .and_then(|u| u.connect("1.1.1.1:80").map(|()| u))
+            .and_then(|u| u.local_addr())
+            .map(|a| a.ip())
+            .ok()
+            .filter(|ip| !ip.is_loopback() && !ip.is_unspecified());
+        match lan_ip.and_then(|ip| std::net::TcpListener::bind((ip, 0)).ok()) {
+            Some(lan) => {
+                let addr = lan.local_addr().unwrap();
+                assert!(
+                    std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(3))
+                        .is_ok(),
+                    "positive control: {addr} is reachable outside the jail"
+                );
+                assert!(
+                    !run(&connect(&addr.ip().to_string(), addr.port())),
+                    "a non-loopback address ({addr}) is refused inside the jail"
+                );
+            }
+            None => eprintln!(
+                "SKIP (non-loopback leg): no non-loopback address on this host to prove the refusal against"
+            ),
+        }
         assert!(!run(&connect("1.1.1.1", 80)), "a public address is refused");
         // macOS: a bind on another port is refused. (Linux: the jail's own namespace may bind
         // anything; nothing outside it can reach that port.)

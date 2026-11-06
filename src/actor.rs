@@ -13089,9 +13089,10 @@ struct ConformanceDispatch {
 /// (DES-EDITOR-CONFORMANCE-HOST) Run the `editor_conformance` Tool: garden's harness in engine mode,
 /// jailed to its own loopback port (`serve_jail`), cwd and writes in a private temp dir, a cleared
 /// environment plus the declared variables, killed past [`crate::editor_conformance::DEADLINE`]. The
-/// worktree is snapshotted into a tree id and that TREE is exported into the private temp dir: the
-/// cases run on exactly the recorded bytes, never the live worktree (nothing a process still running
-/// there, or an ignored or scratch file outside the tree, can put under them). The report is read from
+/// worktree is snapshotted into a tree id and that TREE is exported into the private temp dir, every
+/// file's raw blob id verified against the tree (`editor_conformance::export_tree`): the cases run on
+/// exactly the recorded bytes, never the live worktree (nothing a process still running there, or an
+/// ignored or scratch file outside the tree, can put under them). The report is read from
 /// the out file in the engine's temp dir and bound to that tree; the fold judges the unit from the
 /// returned record, never from the exit status.
 #[allow(clippy::too_many_arguments)]
@@ -13186,10 +13187,10 @@ fn run_conformance_tool(
     };
     let pack_tree = tmp.path().join("tree");
     if let Err(e) = ec::export_tree(
+        &worktree,
         std::path::Path::new(&git_dir),
         &snap.tree,
         &pack_tree,
-        &tmp.path().join("tree.idx"),
     ) {
         return refused(
             "engine_refused",

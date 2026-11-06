@@ -693,6 +693,46 @@ fn a_pi_executor_is_reviewed_in_a_fresh_isolated_session_and_the_verdict_binds()
     assert_eq!(Some(&a.session), r.unit.qe_review_session.as_ref());
 }
 
+/// (DES-EDITOR-CONFORMANCE-HOST) The isolated reviewer still sees nothing of the executor's context, except
+/// the engine's own editor conformance record (engine-labelled; no seat can run those cases), and its brief
+/// says to cite it. The record never replaces the reviewer's verdict: the QE PASS stays its own.
+#[test]
+fn the_reviewer_keeps_only_the_engines_conformance_record() {
+    let l = Ledger::new("run");
+    let mut input = input_for(qe_unit("pi", &l.root));
+    input.prior_outputs.push(PriorUnitOutput {
+        label: "[editor conformance record — unit 5]".into(),
+        output: "The engine ran the editor conformance cases itself on this host: PASSED".into(),
+    });
+    input.prior_outputs.push(PriorUnitOutput {
+        label: "[review checklist — unit 6]".into(),
+        output: "judge every item".into(),
+    });
+    let r = reviewer_input(&input, &seat("claude", BASIS_DISTINCT), "/l/ev", "n-1");
+    let labels: Vec<&str> = r.prior_outputs.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(labels, ["[editor conformance record — unit 5]"]);
+    assert!(
+        r.unit
+            .description
+            .contains("cite it for the conformance cases"),
+        "{}",
+        r.unit.description
+    );
+    assert!(r
+        .unit
+        .description
+        .contains("--phase review --evidence /l/ev"));
+    // Without a record: nothing at all, and no word about it.
+    let plain = reviewer_input(
+        &input_for(qe_unit("pi", &l.root)),
+        &seat("claude", BASIS_DISTINCT),
+        "/l/ev",
+        "n-1",
+    );
+    assert!(plain.prior_outputs.is_empty());
+    assert!(!plain.unit.description.contains("conformance"));
+}
+
 #[test]
 fn a_reviewer_fail_binds_as_fail() {
     let (got, _) = review_with(
