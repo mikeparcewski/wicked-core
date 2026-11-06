@@ -1570,3 +1570,64 @@ fn a_redo_answers_only_a_non_verdict_and_is_capped_at_two_per_tree() {
     .collect();
     assert_eq!(names, ["claude", "codex"]);
 }
+
+/// (F23, xreview) A redo never re-binds the QE run it retired, whatever its ledger metadata says
+/// (an executor that refreshes the old run's `created_at` and names it again is refused), and a
+/// redo recorded on an unknown tree still counts against the cap once the tree is known.
+#[test]
+fn a_redo_never_rebinds_the_retired_qe_run_and_an_unknown_tree_still_counts() {
+    let l = Ledger::new("retired");
+    let (old_id, old_dir) = l.evidence(RUN, &now_iso());
+    let mut r = record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude");
+    r.qe_run_id = Some(old_id.clone());
+    r.evidence_dir = Some(old_dir.to_string_lossy().into_owned());
+    let mut u = parked(r, &l.root);
+    redo(&mut u);
+    assert_eq!(u.qe_redos[0].qe_run_id.as_deref(), Some(old_id.as_str()));
+    u.qe_reviewer_seats = vec![seat("codex", BASIS_DISTINCT)];
+    let scripted = Arc::new(Scripted {
+        ledger: l.root.clone(),
+        qe_run: old_id.clone(),
+        answers: vec![("codex", "pass")],
+        seen: Mutex::new(Vec::new()),
+    });
+    let runner: Arc<dyn StepRunner> = scripted.clone();
+    let got = run(
+        &runner,
+        &input_for(u.clone()),
+        &executor_output(&old_dir.to_string_lossy()),
+        0,
+        &|_: &str| {},
+    )
+    .unwrap();
+    assert_eq!(got.outcome, OUTCOME_INVALID, "{got:?}");
+    assert!(
+        got.reason.contains("a redo of the QE check retired"),
+        "{}",
+        got.reason
+    );
+    assert!(got.verdict.is_none());
+    assert!(
+        scripted.seen.lock().unwrap().is_empty(),
+        "no reviewer ran on the retired run"
+    );
+
+    // Unknown tree on the record, known tree later: both redos still count.
+    let mut v = parked(
+        record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"),
+        &l.root,
+    );
+    v.qe_review.as_mut().unwrap().tree = None;
+    redo(&mut v);
+    redo_unknown_then_known(&mut v);
+    assert!(redo_offer(&v)
+        .unwrap_err()
+        .contains("already redone 2 times"));
+}
+
+fn redo_unknown_then_known(v: &mut WorkUnit) {
+    v.qe_review = Some(record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "codex"));
+    assert_eq!(redo_offer(v), Ok(0), "the unknown-tree redo counts on t1");
+    redo(v);
+    v.qe_review = Some(record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"));
+}

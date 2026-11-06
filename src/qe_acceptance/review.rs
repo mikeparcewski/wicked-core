@@ -97,12 +97,22 @@ pub(crate) fn non_verdict(unit: &WorkUnit) -> Option<&QeReview> {
     matches.then_some(r)
 }
 
-/// (F23) How many redos this unit already took on `tree` (`None` = an unknown tree counts every one).
+/// (F23) Whether a redo record counts for `tree`: the same tree, or either side unknown (an unknown
+/// tree is never proof of different work, so it counts against the cap).
+fn redo_on(r: &crate::domain::QeRedo, tree: Option<&str>) -> bool {
+    tree.is_none() || r.tree.is_none() || r.tree.as_deref() == tree
+}
+
+/// (F23) How many redos this unit already took on `tree` ([`redo_on`]).
 pub(crate) fn redos_on(unit: &WorkUnit, tree: Option<&str>) -> usize {
+    unit.qe_redos.iter().filter(|r| redo_on(r, tree)).count()
+}
+
+/// (F23) Whether `id` is a QE run a redo retired on this unit: its executor never binds it again.
+pub(crate) fn retired_by_redo(unit: &WorkUnit, id: &str) -> bool {
     unit.qe_redos
         .iter()
-        .filter(|r| tree.is_none() || r.tree.as_deref() == tree)
-        .count()
+        .any(|r| r.qe_run_id.as_deref() == Some(id))
 }
 
 /// (F23) Whether the gate of `unit` takes "redo the QE check": its record is no verdict
@@ -146,6 +156,7 @@ pub(crate) fn redo_record(unit: &WorkUnit, by: &str, at: i64) -> Option<crate::d
         tree: r.tree.clone(),
         from_attempt: unit.last_attempt.unwrap_or(0),
         outcome: r.outcome.clone(),
+        qe_run_id: r.qe_run_id.clone(),
         seats,
         // What the reviewer said it could not run, when the record names it; else the whole reason
         // (a binding failure, no reviewer seat).
@@ -172,7 +183,7 @@ pub(crate) fn prefer_fresh(
     let tried = |k: &str| {
         unit.qe_redos
             .iter()
-            .filter(|r| tree.is_none() || r.tree.as_deref() == tree)
+            .filter(|r| redo_on(r, tree))
             .any(|r| r.seats.iter().any(|s| s == k))
     };
     let mut out: Vec<QeReviewerSeat> = Vec::with_capacity(seats.len());
@@ -197,7 +208,7 @@ pub(crate) fn prefer_fresh(
 /// on. One short line (it rides the unit prompt); the reviewer never sees it.
 pub(crate) fn redo_note(unit: &WorkUnit) -> String {
     let tree = unit.worktree_baseline.as_ref().map(|b| b.tree.as_str());
-    let Some(last) = unit.qe_redos.last().filter(|r| r.tree.as_deref() == tree) else {
+    let Some(last) = unit.qe_redos.last().filter(|r| redo_on(r, tree)) else {
         return String::new();
     };
     format!(
@@ -1036,6 +1047,15 @@ pub(crate) fn run(
             return Some(review);
         }
     };
+    // (F23) A redo binds a NEW QE run: the run whose record it redoes is never reviewed again,
+    // whatever its ledger metadata says.
+    if resume_dir(&input.unit).is_none() && retired_by_redo(&input.unit, &id) {
+        review.reason = format!(
+            "the QE evidence could not be bound: QE run {id} is the run a redo of the QE check \
+             retired; the redo takes its evidence again in a new QE run"
+        );
+        return Some(review);
+    }
     let dir_s = dir.to_string_lossy().into_owned();
     review.evidence_dir = Some(dir_s.clone());
     review.qe_run_id = Some(id.clone());

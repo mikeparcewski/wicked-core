@@ -28047,6 +28047,8 @@ mod request_changes_tests {
         v.qe_ledger_root = Some("/l/.wicked-qe".into());
         v.repo_checks_floor = true;
         put_node(store, v.to_node()).unwrap();
+        let gate = crate::interaction::open_gate(run_id, 4, None, "the QE gate", "escalation", 1);
+        put_node(store, gate.to_node()).unwrap();
     }
 
     fn qe_record(outcome: &str, verdict: Option<&str>) -> crate::domain::QeReview {
@@ -28154,6 +28156,16 @@ mod request_changes_tests {
             assert!(evs
                 .iter()
                 .any(|e| matches!(e, CoreEvent::UnitDispatched { ord: 4, .. })));
+            // The durable answer says what was asked, and nothing is the operator's words.
+            let answered = crate::interaction::list_interactions(
+                &store,
+                Some(&run_id),
+                Some(crate::interaction::InteractionStatus::Answered),
+            )
+            .unwrap();
+            let answer = answered[0].answer.as_deref().unwrap_or_default();
+            assert!(answer.contains("\"action\":\"retry_qe\""), "{answer}");
+            assert!(v.operator_rulings.is_empty(), "{:?}", v.operator_rulings);
             // The re-dispatch's own QE decision (every QE dispatch scores it) stays required: the
             // redo never skips or decides it.
             assert!(evs.iter().all(|e| match e {

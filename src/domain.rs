@@ -1640,6 +1640,10 @@ pub struct QeRedo {
     pub from_attempt: u32,
     /// The redone record's outcome (`inconclusive` | `unavailable` | `invalid`).
     pub outcome: String,
+    /// The QE (ledger) run the redone record bound, if any: retired, so a redo's executor can never
+    /// name it again (the redo binds a NEW QE run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_run_id: Option<String>,
     /// The seats that record's reviewer turns ran on: the next dispatch tries them last in their
     /// basis tier, so a seat that gave no verdict is not the first one asked again.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]

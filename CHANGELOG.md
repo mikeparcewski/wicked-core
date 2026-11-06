@@ -21,11 +21,13 @@ Two release tracks share this file, newest entry first regardless of track:
   run is not resumed, so the earlier record is never re-bound) and a new isolated reviewer session judges it. A seat
   that gave no verdict on that tree is tried last within its tier (distinct, then executor seat, then reduced), and
   who may review is unchanged, so an author of the work never does unless the run is reduced assurance. A redo is
-  never a verdict. No operator judgment is recorded, the run's QE decision stays required, and only the new
-  reviewer's bound PASS counts the step (deny-dominates). The cap is 2 redos per QE step and tree, so at most three
-  reviews of one tree; a new tree starts over. At the cap, or with no reviewer seat to run on, the action is refused
-  with the reason, and the gate prompt says so. The prompt leads with the redo and names what the reviewer could not
-  run. Approve-as-your-own-judgment, `skip_qe`, request changes and reject are unchanged. Each redo is recorded on the
+  never a verdict. No operator judgment is recorded, the run's QE decision stays required (the redone dispatch is not
+  re-scored into a waiver on that tree), and only the new reviewer's bound PASS counts the step (deny-dominates). The
+  redo binds a new QE run: the run it retired is refused if an executor names it again. The cap is 2 redos per QE
+  step and tree (a redo on an unknown tree counts too); a new tree starts over. At the cap the gate prompt says so
+  and the action is refused with the reason; with no reviewer seat to run on, the action is refused at the answer,
+  naming why. The prompt leads with the redo and names what the reviewer could not run. The plain retry at a record
+  that bound no verdict ("confirm to retry the phase") is unchanged and is not counted against the cap. Approve-as-your-own-judgment, `skip_qe`, request changes and reject are unchanged. Each redo is recorded on the
   unit (`qe_redos`: tree, attempt, outcome, the seats that gave no verdict, the reason, who, when). The napi door
   takes the token. crew's gate route and crew-api-types still need `retry_qe` before a client can send it.
 
