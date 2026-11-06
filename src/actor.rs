@@ -20859,6 +20859,123 @@ mod substance_gate_tests {
         );
     }
 
+    /// F16 (e2e-1105), through the REAL fold: a chat turn on codex's container seat (the
+    /// `os_sandbox` carrier, no hook) calls a registered stdio MCP tool through the broker; the
+    /// broker records the first-use ask claim, and nothing else is in the log. The unit must not
+    /// be denied: before the fix the fold read the broker's claim as a hook claim with no
+    /// hook-fired sentinel and denied the turn (core#34), which parked it red as `boundary_deny`.
+    #[test]
+    fn a_container_chat_turn_with_a_brokered_stdio_mcp_call_is_not_denied() {
+        let run_id = format!("f16-chat-turn-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, PhaseRole::Creator);
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        let log = crate::gate_hook::decisions_path_for(&run_id, 0);
+        let phase = crate::scope::unit_phase(1);
+        crate::gate_hook::write_os_sandbox_marker(
+            &log,
+            &phase,
+            &[std::path::PathBuf::from("/w/sandbox")],
+            "docker",
+        )
+        .unwrap();
+        // The broker, as crew's `/mcp/call` drives it with the seat's token.
+        let db = crate::gate_hook::gov_run_dir(&run_id).join("policy.db");
+        {
+            let mut policy = open_store(Some(&db.to_string_lossy())).unwrap();
+            crate::mcp_gate::seed_mcp_defaults(&mut policy).unwrap();
+        }
+        let token = crate::mcp_gate::McpToken::mint();
+        let _binding = token.bind(crate::mcp_gate::McpUnit {
+            run_id: run_id.clone(),
+            attempt: 0,
+            ord: 1,
+            scope: format!("wicked-agent/{run_id}/shared"),
+            phase: phase.clone(),
+            phase_id: String::new(),
+            catalog: String::new(),
+            role: PhaseRole::Creator,
+            posture: crate::write_posture::WritePosture::ReadOnly,
+            seat: "codex".to_string(),
+            mode: crate::mcp_gate::McpMode::Balanced,
+            decisions_path: log.clone(),
+            db_path: db.to_string_lossy().into_owned(),
+            estate: Default::default(),
+            apps: None,
+        });
+        let verdict = crate::mcp_gate::evaluate_mcp_call_json(
+            &serde_json::json!({
+                "token": token.value(),
+                "call": {
+                    "server": "echo-e2e",
+                    "tool": "echo",
+                    "args": {"text": "hello"},
+                    "annotations": {"readOnlyHint": true},
+                    "registered": true,
+                    "kind": "mcp-stdio",
+                    "carrier": "shim",
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(verdict.contains(r#""decision":"ask""#), "{verdict}");
+
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let out = StepOutput {
+            run_id: run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: "a".repeat(260),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: vec!["mcp:echo-e2e/echo".into()],
+            governed: true,
+        };
+        let applied = apply_step_result(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let unit = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
+        assert!(
+            unit.denial.is_none() && unit.denial_reason.is_none(),
+            "a brokered MCP call on a hook-free seat is not a suppressed hook: {:?}",
+            unit.denial
+        );
+        assert!(
+            matches!(applied, StepApplied::Finished),
+            "the one-unit turn completes: phase {:?}, run {:?}",
+            unit.phase_status,
+            session.status
+        );
+        assert_eq!(
+            session.status,
+            SessionStatus::Completed,
+            "{:?}",
+            unit.phase_status
+        );
+    }
+
     // ── DES-L1 PR-1A (D-9; core#488 / F-RC1-131): the evaluator's OWN verdict gates ──────────────
 
     /// `gateEvaluated.evaluator_verdict` of the one gate in `evs` — `Some(None)` = emitted as null.
