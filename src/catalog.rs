@@ -1732,6 +1732,7 @@ printf '{"name":"m","version":"1.0.0","scripts":{"test":"node --test"}}\n' > pac
 mkdir -p test lib tests
 printf 'exports.add=(a,b)=>a+b;\nexports.clamp=(x,lo,hi)=>Math.min(Math.max(x,lo),hi);\n' > lib/m.js
 printf "const test=require('node:test');const assert=require('node:assert');const m=require('../lib/m.js');\ntest('add',()=>assert.equal(m.add(1,2),3));\ntest('red-on-main-1',()=>assert.equal(m.add(1,1),3));\ntest('red-on-main-2',()=>assert.equal(m.add(2,2),5));\n" > test/m.test.js
+echo '// unused' > lib/extra.js
 git add -A && git commit -qm base
 git rev-parse HEAD > ../base.txt
 echo '# plan' > tests/PLAN-clamp.md
@@ -1751,6 +1752,7 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             ("a forged summary line", forged, true, false),
             ("product code changed too", product, true, false),
             ("a base swapped through refs/replace", replaced, true, false),
+            ("a product file deleted", "rm lib/extra.js\n", true, false),
         ]
         .into_iter()
         .enumerate()
@@ -1812,6 +1814,7 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                     3 => "head_failed_passed=\"unread\"",
                     4 => "the run changed files that are not tests (lib/m.js)",
                     5 => "base_failed_passed=\"2 1\"",
+                    6 => "the run changed files that are not tests (lib/extra.js)",
                     _ => "class=produced-test-failure",
                 };
                 assert!(text.contains(why), "{case}: {text}");
