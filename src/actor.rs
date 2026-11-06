@@ -11725,11 +11725,32 @@ fn dispatch_unit(
         // rulings on it and on the creator it reviews, and the latest floor record — so a later
         // round judges the same bar the earlier rounds did instead of re-deriving it.
         if unit.tool_cmd.is_none() {
+            // (DES-EDITOR-CONFORMANCE-HOST) The tree under review now, read only when an earlier unit
+            // carries an editor conformance record: a record for any other tree is not evidence for it.
+            let current_tree = units
+                .iter()
+                .any(|u| u.ord < unit.ord && u.editor_conformance.is_some())
+                .then(|| {
+                    let wd = session.workdir.as_deref()?;
+                    let root = session
+                        .repo_ref
+                        .as_deref()
+                        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())?
+                        .root_path;
+                    crate::worktree_guard::snapshot(
+                        std::path::Path::new(wd),
+                        std::path::Path::new(&root),
+                    )
+                    .ok()
+                    .map(|s| s.tree)
+                })
+                .flatten();
             for (ord, label, output) in crate::review_context::evaluator_brief(
                 &session.problem,
                 &session.intent_amendments,
                 &units,
                 unit,
+                current_tree.as_deref(),
             ) {
                 context_items.push(crate::event::InjectedContext::new(
                     ord,
@@ -13068,9 +13089,11 @@ struct ConformanceDispatch {
 /// (DES-EDITOR-CONFORMANCE-HOST) Run the `editor_conformance` Tool: garden's harness in engine mode,
 /// jailed to its own loopback port (`serve_jail`), cwd and writes in a private temp dir, a cleared
 /// environment plus the declared variables, killed past [`crate::editor_conformance::DEADLINE`]. The
-/// report is read from the out file in the engine's temp dir and bound to the worktree's tree id
-/// taken before and after; the fold judges the unit from the returned record, never from the exit
-/// status.
+/// worktree is snapshotted into a tree id and that TREE is exported into the private temp dir: the
+/// cases run on exactly the recorded bytes, never the live worktree (nothing a process still running
+/// there, or an ignored or scratch file outside the tree, can put under them). The report is read from
+/// the out file in the engine's temp dir and bound to that tree; the fold judges the unit from the
+/// returned record, never from the exit status.
 #[allow(clippy::too_many_arguments)]
 fn run_conformance_tool(
     cmd: &[String],
@@ -13104,11 +13127,6 @@ fn run_conformance_tool(
         );
     };
     let worktree = std::path::PathBuf::from(wt);
-    let tree_of = || {
-        crate::worktree_guard::snapshot(&worktree, std::path::Path::new(repo))
-            .map(|s| s.tree)
-            .map_err(|e| e.to_string())
-    };
     let garden_root = match garden {
         Ok(r) => r,
         Err(why) => {
@@ -13142,14 +13160,20 @@ fn run_conformance_tool(
     if let Some(r) = stop() {
         return refused("engine_refused", format!("stopped before it began ({r})"));
     }
-    let before = match tree_of() {
-        Ok(t) => t,
+    let snap = match crate::worktree_guard::snapshot(&worktree, std::path::Path::new(repo)) {
+        Ok(s) => s,
         Err(e) => {
             return refused(
                 "engine_refused",
-                format!("the worktree's tree could not be read before the run: {e}"),
+                format!("the worktree's tree could not be read: {e}"),
             )
         }
+    };
+    let Some(git_dir) = snap.git_dir.clone() else {
+        return refused(
+            "engine_refused",
+            "the worktree snapshot names no git directory to export its tree from".into(),
+        );
     };
     let tmp = match crate::repo_checks::PrivateTmp::create() {
         Ok(t) => t,
@@ -13160,6 +13184,21 @@ fn run_conformance_tool(
             )
         }
     };
+    let pack_tree = tmp.path().join("tree");
+    if let Err(e) = ec::export_tree(
+        std::path::Path::new(&git_dir),
+        &snap.tree,
+        &pack_tree,
+        &tmp.path().join("tree.idx"),
+    ) {
+        return refused(
+            "engine_refused",
+            format!(
+                "the tree {} could not be exported for the cases: {e}",
+                snap.tree
+            ),
+        );
+    }
     let port = match ec::free_port() {
         Ok(p) => p,
         Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
@@ -13191,7 +13230,7 @@ fn run_conformance_tool(
         .collect();
     env.extend(ec::host_passthrough_env());
     env.extend(ec::tool_env(
-        &d.run_id, d.ord, &worktree, port, &out_file, &python, &dist, &kind,
+        &d.run_id, d.ord, &pack_tree, port, &out_file, &python, &dist, &kind,
     ));
     if let Some(groot) = garden_root {
         env.push((
@@ -13242,28 +13281,10 @@ fn run_conformance_tool(
             ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why),
         );
     }
-    let mut rec = ec::judge_report(ec::read_report(&out_file).as_deref(), attempt);
+    let mut rec = ec::judge_file(&out_file, attempt);
     drop(tmp);
-    match tree_of() {
-        Ok(after) if after == before => rec.tree = Some(before),
-        Ok(after) => {
-            rec = ec::ConformanceRecord::refused(
-                attempt,
-                "tree_changed",
-                format!(
-                    "the worktree changed while the cases ran (tree {before} before, {after} after): \
-                     the report is about no one tree"
-                ),
-            );
-        }
-        Err(e) => {
-            rec = ec::ConformanceRecord::refused(
-                attempt,
-                "engine_refused",
-                format!("the worktree's tree could not be read after the run: {e}"),
-            );
-        }
-    }
+    // The cases ran on the export of exactly this tree.
+    rec.tree = Some(snap.tree);
     rec.jail = Some(kind);
     // The verdict is the fold's (from the record); a command that ran to its end is Ok here, so a
     // failing run is never retried by the failure ladder as a broken command.

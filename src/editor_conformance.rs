@@ -61,8 +61,8 @@ pub const STUDIO_DIST_ENV: &str = "WICKED_EDITOR_CONFORMANCE_STUDIO_DIST";
 
 /// The longest one conformance run may take before the engine kills it.
 pub(crate) const DEADLINE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
-/// The largest report the engine reads.
-const REPORT_MAX: u64 = 1024 * 1024;
+/// The largest report the engine reads (garden bounds every string in an engine report; this is a backstop).
+const REPORT_MAX: u64 = 8 * 1024 * 1024;
 
 /// The causes garden's report gives that are a verdict on the pack (its author fixes it). Every
 /// other cause kept the cases from running.
@@ -305,13 +305,50 @@ fn missing_summary(editors: &[EditorConformance]) -> String {
         .join("; ")
 }
 
-/// Read the report the Tool wrote (no link followed, at most [`REPORT_MAX`] bytes).
-pub(crate) fn read_report(path: &std::path::Path) -> Option<String> {
-    let meta = std::fs::symlink_metadata(path).ok()?;
-    if !meta.file_type().is_file() || meta.len() > REPORT_MAX {
-        return None;
+/// Read the report the Tool wrote (no link followed, at most [`REPORT_MAX`] bytes): `Ok(None)` when it
+/// wrote none, `Err` when it is not one the engine reads (too large, not a plain file).
+pub(crate) fn read_report(path: &std::path::Path) -> Result<Option<String>, String> {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(None);
+    };
+    if !meta.file_type().is_file() {
+        return Err("the report is not a plain file".into());
     }
-    std::fs::read_to_string(path).ok()
+    if meta.len() > REPORT_MAX {
+        return Err(format!("the report is over {REPORT_MAX} bytes"));
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| format!("the report could not be read: {e}"))
+}
+
+/// Judge the report file the Tool wrote.
+pub(crate) fn judge_file(path: &std::path::Path, attempt: u32) -> ConformanceRecord {
+    match read_report(path) {
+        Ok(raw) => judge_report(raw.as_deref(), attempt),
+        Err(why) => ConformanceRecord::refused(attempt, "bad_report", why),
+    }
+}
+
+/// Export `tree` (an object the run's git dir holds) into `dest`, a fresh directory: the bytes the
+/// cases run against are exactly the recorded tree, never the live worktree (a process still writing
+/// there, an ignored or scratch file the tree does not hold). Links stay links (garden refuses them).
+pub(crate) fn export_tree(
+    git_dir: &std::path::Path,
+    tree: &str,
+    dest: &std::path::Path,
+    index: &std::path::Path,
+) -> Result<(), String> {
+    std::fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
+    let env: [(&str, &std::path::Path); 3] = [
+        ("GIT_DIR", git_dir),
+        ("GIT_WORK_TREE", dest),
+        ("GIT_INDEX_FILE", index),
+    ];
+    crate::worktree_guard::git(dest, &["read-tree", tree], &env).map_err(|e| e.to_string())?;
+    crate::worktree_guard::git(dest, &["checkout-index", "--all", "--force"], &env)
+        .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 /// The host inputs crew exports, resolved outside the jail: `(python, studio dist)`, each an
@@ -396,7 +433,14 @@ pub(crate) fn free_port() -> std::io::Result<u16> {
 }
 
 /// The record as a reviewer reads it: what the engine ran, where, on which tree, and what it found.
-pub(crate) fn brief_block(ord: u32, after: Option<u32>, r: &ConformanceRecord) -> String {
+/// `current` is the tree under review now: a PASS on any other tree (or when the current one could not
+/// be read) is not evidence for it.
+pub(crate) fn brief_block(
+    ord: u32,
+    after: Option<u32>,
+    r: &ConformanceRecord,
+    current: Option<&str>,
+) -> String {
     let tree = r
         .tree
         .as_deref()
@@ -426,7 +470,14 @@ pub(crate) fn brief_block(ord: u32, after: Option<u32>, r: &ConformanceRecord) -
     let head = format!(
         "The engine ran the editor conformance cases itself on this host{after}{jail} (unit {ord}{tree}): "
     );
+    let stale = r.passed() && (current.is_none() || r.tree.as_deref() != current);
     let body = match r.outcome.as_str() {
+        OUTCOME_PASS if stale => format!(
+            "PASSED, but on another tree than the one under review ({}): the work changed after this \
+             run, so conformance is UNVERIFIED for this tree. A conformance item is a FAIL until the \
+             engine runs the cases again (a send-back to the creator re-runs them).",
+            current.unwrap_or("the current tree could not be read")
+        ),
         OUTCOME_PASS => format!(
             "PASSED — every required case for every editor: {editors}. This is the conformance \
              evidence for this tree: cite it for any conformance item. Do not run conformance.py in \
@@ -543,12 +594,18 @@ mod tests {
         let mut r = judge_report(Some(&report(e, true, None)), 1);
         r.tree = Some("t1".into());
         r.jail = Some("sandbox-exec".into());
-        let b = brief_block(6, Some(5), &r);
+        let b = brief_block(6, Some(5), &r, Some("t1"));
         assert!(b.contains("after unit 5"), "{b}");
         assert!(b.contains("tree t1") && b.contains("PASSED"), "{b}");
         assert!(b.contains("Do not run conformance.py in your seat"), "{b}");
+        assert!(!b.contains("UNVERIFIED"), "{b}");
+        // A PASS on another tree, or when the current tree is unknown, is not evidence for this one.
+        for current in [Some("t2"), None] {
+            let b = brief_block(6, Some(5), &r, current);
+            assert!(b.contains("UNVERIFIED") && b.contains("is a FAIL"), "{b}");
+        }
         let refused = ConformanceRecord::refused(0, "runtime_missing", "x");
-        assert!(brief_block(6, None, &refused).contains("UNVERIFIED"));
+        assert!(brief_block(6, None, &refused, Some("t1")).contains("UNVERIFIED"));
     }
 
     #[test]
@@ -604,9 +661,8 @@ mod tests {
             "sandbox-exec",
         ));
         let status = cmd.status().expect("the jail runs");
-        let report = read_report(&out);
-        let rec = judge_report(report.as_deref(), 0);
-        assert!(rec.passed(), "status {status:?}: {rec:?} {report:?}");
+        let rec = judge_file(&out, 0);
+        assert!(rec.passed(), "status {status:?}: {rec:?}");
     }
 
     #[cfg(unix)]
@@ -616,8 +672,16 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         std::fs::write(d.join("real.json"), "{}").unwrap();
         std::os::unix::fs::symlink(d.join("real.json"), d.join("report.json")).unwrap();
-        assert!(read_report(&d.join("report.json")).is_none());
-        assert_eq!(read_report(&d.join("real.json")).as_deref(), Some("{}"));
+        assert!(read_report(&d.join("report.json")).is_err());
+        assert_eq!(
+            judge_file(&d.join("report.json"), 0).cause.as_deref(),
+            Some("bad_report")
+        );
+        assert_eq!(
+            read_report(&d.join("real.json")).unwrap().as_deref(),
+            Some("{}")
+        );
+        assert_eq!(read_report(&d.join("absent.json")).unwrap(), None);
         let _ = std::fs::remove_dir_all(d);
     }
 }

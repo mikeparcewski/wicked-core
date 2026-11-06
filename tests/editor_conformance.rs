@@ -4,7 +4,7 @@
 //! run the conformance harness and no seat has a headless browser. The engine now runs it on the
 //! host, as the `editor_conformance` Tool, and the review cites the engine's record.
 //!
-//! A plan `conformance → test` on a registered repo dispatches the catalog's fixed command (a stub
+//! A plan `build → conformance → test` on a registered repo dispatches the catalog's fixed command (a stub
 //! `wicked-garden` FIRST on `PATH`) in the serve jail with the declared variables; the editor
 //! conformance floor decides the unit from the report the stub writes to the engine's out file:
 //!
@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, PlanSteps, RepoSpec, SandboxLevel,
-    StepInput, StepOutput, StepRunner, StepStatus, TeamConfig, TEAM_OUTBOX_FILE,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PlanSteps, RepoSpec,
+    SandboxLevel, StepInput, StepOutput, StepRunner, StepStatus, TeamConfig, TEAM_OUTBOX_FILE,
 };
 use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
@@ -63,6 +63,7 @@ fn arm() {
     let script = format!(
         "#!/bin/sh\n\
          echo \"ARGV $*\"\n\
+         for f in acme-x/wicked-pack.json built.txt ignored.html; do if [ -e \"$WICKED_EDITOR_PACK_ROOT/$f\" ]; then echo \"HAS $f\"; fi; done\n\
          env | sed 's/^/ENV /'\n\
          mode=$(cat '{root}/mode-'\"$WICKED_RUN_ID\" 2>/dev/null || echo PASS)\n\
          case \"$mode\" in\n\
@@ -123,9 +124,30 @@ fn seen() -> &'static Seen {
 }
 
 /// The `test` evaluator's seat: records its context and passes. No other unit runs a worker turn.
+/// The seats: `build` (the creator) writes a file and an ignored one into the worktree; `test` records
+/// its context and passes.
 struct Reviewer;
 impl StepRunner for Reviewer {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
+        // The agent judge (the creator's gate) answers in its own contract.
+        if i.unit.session_id == "validator" {
+            return StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "PASS\nthe work is there\nPASS".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            };
+        }
+        if i.unit.id.ends_with(":build") {
+            let wd = i.workdir.as_ref().expect("a repo-bound run has a worktree");
+            std::fs::write(wd.join("built.txt"), format!("attempt {}", i.attempt)).unwrap();
+            std::fs::write(wd.join("ignored.html"), "never exported").unwrap();
+        }
         if i.unit.id.ends_with(":test") {
             seen().lock().unwrap().insert(
                 i.run_id.clone(),
@@ -139,7 +161,11 @@ impl StepRunner for Reviewer {
             run_id: i.run_id.clone(),
             unit_ix: i.unit_ix,
             attempt: i.attempt,
-            output: "ITEM 1: PASS — the engine's conformance record\nVERDICT: PASS".into(),
+            output: if i.unit.id.ends_with(":build") {
+                "Built the editor pack.".into()
+            } else {
+                "ITEM 1: PASS — the engine's conformance record\nVERDICT: PASS".into()
+            },
             status: StepStatus::Ok,
             usage: None,
             files: Vec::new(),
@@ -197,6 +223,7 @@ fn git_repo(name: &str) -> PathBuf {
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
     git(&["config", "commit.gpgsign", "false"]);
+    std::fs::write(repo.join(".gitignore"), "ignored.html\n").unwrap();
     std::fs::create_dir_all(repo.join("acme-x/editors/acme-x")).unwrap();
     std::fs::write(
         repo.join("acme-x/wicked-pack.json"),
@@ -216,6 +243,7 @@ fn git_repo(name: &str) -> PathBuf {
 struct Run {
     sid: String,
     core: Core,
+    rx: std::sync::mpsc::Receiver<CoreEvent>,
     events: Vec<CoreEvent>,
 }
 
@@ -244,7 +272,8 @@ fn run(name: &str, mode: &str) -> Run {
     // A declared touch set keeps the floor from adding steps around the two under test.
     let plan: PlanSteps = serde_json::from_value(json!({
         "steps": [
-            {"catalog": "editor_conformance", "id": "conformance"},
+            {"catalog": "produce", "id": "build"},
+            {"catalog": "editor_conformance", "id": "conformance", "depends_on": ["build"]},
             {"catalog": "critique", "id": "test", "depends_on": ["conformance"]}
         ],
         "touch": ["acme-x/editors/acme-x/index.html"]
@@ -276,33 +305,114 @@ fn run(name: &str, mode: &str) -> Run {
         qe_acceptance: Default::default(),
     })
     .expect("the conformance plan launches");
-    let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(ev) => {
-                let done = match &ev {
-                    CoreEvent::SessionCompleted { session } => *session == sid,
-                    CoreEvent::SessionFailed { session, .. } => *session == sid,
-                    CoreEvent::AwaitingHuman { session, .. } => *session == sid,
-                    _ => false,
-                };
-                events.push(ev);
-                if done {
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
+    let mut r = Run {
+        sid,
+        core,
+        rx,
+        events: Vec::new(),
+    };
+    r.until_stopped();
+    // A repo-bound plan with a creator scores high on an unindexed repo: approve its plan gate.
+    for _ in 0..3 {
+        let plan_gate = r.events.iter().rev().find_map(|e| match e {
+            CoreEvent::AwaitingHuman { gate_kind, .. } => Some(gate_kind == "plan_approval"),
+            CoreEvent::SessionCompleted { .. } | CoreEvent::GateEscalated { .. } => Some(false),
+            _ => None,
+        });
+        if plan_gate != Some(true) {
+            break;
         }
+        r.answer(HumanDecision::Approve {
+            amend: None,
+            amend_scope: Default::default(),
+        });
     }
-    Run { sid, core, events }
+    r
 }
 
-/// macOS (sandbox-exec) confines the harness to one port here; elsewhere the host may have no such
-/// jail (bwrap missing or unprivileged namespaces off), and the step must refuse instead.
-fn serve_jailed() -> bool {
-    cfg!(target_os = "macos") && wicked_core::sandbox_availability().0 == SandboxLevel::Sandboxed
+impl Run {
+    /// Collect events until the run completes, fails or pauses.
+    fn until_stopped(&mut self) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(ev) => {
+                    let done = match &ev {
+                        CoreEvent::SessionCompleted { session } => *session == self.sid,
+                        CoreEvent::SessionFailed { session, .. } => *session == self.sid,
+                        CoreEvent::AwaitingHuman { session, .. } => *session == self.sid,
+                        _ => false,
+                    };
+                    self.events.push(ev);
+                    if done {
+                        return;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Answer the gate, then collect until the run stops again.
+    fn answer(&mut self, d: HumanDecision) {
+        self.core
+            .confirm_gate(&self.sid, d)
+            .expect("the gate takes the answer");
+        self.until_stopped();
+    }
+
+    /// How many times the plan's step `step` was dispatched (the floor may add steps before it).
+    fn dispatches_of(&self, step: &str) -> usize {
+        let ord = self
+            .events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitPlanned {
+                    ord, description, ..
+                } if description.starts_with(&format!("{step} — ")) => Some(*ord),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no step {step} planned"));
+        self.dispatches(ord)
+    }
+
+    /// How many times unit `ord` was dispatched.
+    fn dispatches(&self, ord: u32) -> usize {
+        self.events
+            .iter()
+            .filter(|e| {
+                matches!(e, CoreEvent::UnitDispatched { session, ord: o, .. } if *session == self.sid && *o == ord)
+            })
+            .count()
+    }
+}
+
+/// The launcher that confines the harness to one port on this platform.
+fn jail_name() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "sandbox-exec"
+    } else {
+        "bwrap"
+    }
+}
+
+/// Whether this host refused the step for want of a jail (Windows, or Linux without a usable bwrap):
+/// the one condition under which these tests stop early. The refusal itself is asserted.
+fn refused_unjailed(r: &Run) -> bool {
+    match escalation(&r.events) {
+        Some((summary, source)) if summary.contains("unjailed_host") => {
+            assert_eq!(source, "editor_conformance_refused", "{summary}");
+            assert!(
+                !(cfg!(target_os = "macos")
+                    && wicked_core::sandbox_availability().0 == SandboxLevel::Sandboxed),
+                "a macOS host with sandbox-exec must run the step: {summary}"
+            );
+            eprintln!("SKIP: no serve jail on this host; the step refused: {summary}");
+            true
+        }
+        _ => false,
+    }
 }
 
 fn types(events: &[CoreEvent]) -> Vec<String> {
@@ -333,14 +443,8 @@ fn completed(events: &[CoreEvent]) -> bool {
 #[test]
 fn a_passing_host_run_completes_and_the_review_cites_the_engines_record() {
     let r = run("pass", "PASS");
-    if !serve_jailed() {
-        // No jail here: the step refuses (never runs unjailed), or the host's bwrap jail ran it.
-        if let Some((summary, source)) = escalation(&r.events) {
-            assert_eq!(source, "editor_conformance_refused", "{summary}");
-            assert!(summary.contains("unjailed_host"), "{summary}");
-            eprintln!("SKIP: no serve jail on this host; the step refused: {summary}");
-            return;
-        }
+    if refused_unjailed(&r) {
+        return;
     }
     assert!(completed(&r.events), "{:?}", types(&r.events));
     assert!(escalation(&r.events).is_none());
@@ -359,12 +463,17 @@ fn a_passing_host_run_completes_and_the_review_cites_the_engines_record() {
     };
     assert_eq!(
         get("WICKED_EDITOR_CONFORMANCE_JAIL").as_deref(),
-        Some("sandbox-exec")
+        Some(jail_name())
     );
+    // The cases ran on an export of the worktree's TREE: the pack and the build's file are there, the
+    // ignored file is not, and it is not the live worktree.
+    let root = get("WICKED_EDITOR_PACK_ROOT").unwrap();
+    assert!(!root.contains("wicked-worktrees"), "{root}");
     assert!(
-        get("WICKED_EDITOR_PACK_ROOT").is_some_and(|p| p.contains(&r.sid)),
+        out.contains("HAS acme-x/wicked-pack.json") && out.contains("HAS built.txt"),
         "{out}"
     );
+    assert!(!out.contains("HAS ignored.html"), "{out}");
     let port: u16 = get("WG_EDITOR_CONFORMANCE_PORT").unwrap().parse().unwrap();
     assert!(port >= 1024);
     assert_eq!(
@@ -398,7 +507,10 @@ fn a_passing_host_run_completes_and_the_review_cites_the_engines_record() {
         .iter()
         .find(|(l, _)| l.starts_with("[editor conformance record"))
         .unwrap_or_else(|| panic!("no conformance record in the review's context: {ctx:?}"));
-    assert_eq!(label, "[editor conformance record — unit 1]");
+    assert!(
+        label.starts_with("[editor conformance record — unit "),
+        "{label}"
+    );
     assert!(text.contains("PASSED"), "{text}");
     assert!(
         text.contains("acme-x 0.1.0 (entry sha256 ab12; cases 0-6, 8-16)"),
@@ -421,10 +533,6 @@ fn a_passing_host_run_completes_and_the_review_cites_the_engines_record() {
 
 #[test]
 fn a_failed_case_is_a_verdict_and_a_host_that_cannot_run_is_a_retry() {
-    if !serve_jailed() {
-        eprintln!("SKIP: no serve jail on this host");
-        return;
-    }
     for (mode, source, says) in [
         (
             "FAIL",
@@ -434,7 +542,10 @@ fn a_failed_case_is_a_verdict_and_a_host_that_cannot_run_is_a_retry() {
         ("REFUSE", "editor_conformance_refused", "no_browser"),
         ("NONE", "editor_conformance_refused", "no_report"),
     ] {
-        let r = run(&format!("m-{}", mode.to_lowercase()), mode);
+        let mut r = run(&format!("m-{}", mode.to_lowercase()), mode);
+        if refused_unjailed(&r) {
+            return;
+        }
         let (summary, got) = escalation(&r.events)
             .unwrap_or_else(|| panic!("{mode}: must escalate: {:?}", types(&r.events)));
         assert_eq!(got, source, "{mode}: {summary}");
@@ -443,6 +554,47 @@ fn a_failed_case_is_a_verdict_and_a_host_that_cannot_run_is_a_retry() {
         assert!(
             seen().lock().unwrap().get(&r.sid).is_none(),
             "{mode}: the review never starts on a tree that did not pass"
+        );
+        assert_eq!(
+            (r.dispatches_of("build"), r.dispatches_of("conformance")),
+            (1, 1),
+            "{mode}"
+        );
+        // The host (or the pack) is fixed; the gate's answer decides what runs again.
+        std::fs::write(mode_file(&r.sid), "PASS").unwrap();
+        if mode == "FAIL" {
+            // A verdict on the pack: the send-back re-runs the creator, then the cases on the new tree.
+            r.answer(HumanDecision::RequestChanges {
+                note: Some("fix case 14".into()),
+            });
+            assert_eq!(
+                (r.dispatches_of("build"), r.dispatches_of("conformance")),
+                (2, 2),
+                "{:?}",
+                types(&r.events)
+            );
+        } else {
+            // The host could not run them: retry re-runs the Tool only, never the creator.
+            r.answer(HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            });
+            assert_eq!(
+                (r.dispatches_of("build"), r.dispatches_of("conformance")),
+                (1, 2),
+                "{:?}",
+                types(&r.events)
+            );
+        }
+        assert!(completed(&r.events), "{mode}: {:?}", types(&r.events));
+        let ctx = seen().lock().unwrap().get(&r.sid).cloned().unwrap();
+        let (_, text) = ctx
+            .iter()
+            .find(|(l, _)| l.starts_with("[editor conformance record"))
+            .unwrap();
+        assert!(
+            text.contains("PASSED") && !text.contains("UNVERIFIED"),
+            "{mode}: {text}"
         );
     }
 }
