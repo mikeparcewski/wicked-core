@@ -2343,6 +2343,20 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.30** — 2026-11-06 — patch release on main 773687f, carrying 2 PRs since 0.15.29: #1287 and #1291.
+  - **A disputed steering rule goes to a bounded rule council (#1287, DES-RULE-CHECK-001 rev 2, Part A).** When the
+    engine's rule judge and the review seat disagree on one rule at a review or QE gate, a three-seat council of
+    seats distinct from every party rules on it. Anything short of a ruling is the new rule status `disputed`, which
+    holds like `unchecked` and takes `retry_rules` / `skip_rules`. Rule receipt rows gain `origin`, `judgeIds`,
+    `evidenceComplete`, `reviewer` and `council`, so a skin that lists rule statuses should expect `disputed` and the
+    new fields.
+  - **Lockfile:** #1291 re-stamped the 0.15.29 platform lock entries.
+  - **Binding docs:** `confirmGate`'s doc comment (`index.d.ts` and `lib.rs`) now says that `retry_rules` and
+    `skip_rules` apply wherever a rule layer is in the unit's denial record, `review_adjudication` included, and
+    that `skip_rules` takes unchecked or disputed rules but never a broken one; it said `rules_unchecked` gates only.
+  - No binding method, `confirmGate` argument or `LaunchSpec` field is added. The seat and floor Dockerfiles, the seat
+    package pins, the base image and the gate-hook protocol are unchanged since 0.15.29, so the seat and floor image
+    tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.29** — 2026-11-05 — patch release on main eaea6a2, carrying 2 PRs since 0.15.28: #1283 and #1284.
   - **The catalog by verb (#1284, DES-CATALOG-002 Lane A).** Gate rubrics as data (`parity`, `cited-findings`,
     `fidelity-to-source`) and 16 new presets ship in the bundled engine. A plan-gate answer may name the gate it

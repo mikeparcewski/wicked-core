@@ -1386,10 +1386,13 @@ impl Core {
     /// decision, and it is recorded on the run plus an `intentAmended` event. It is the only arm
     /// that can descope a run mid-flight; refused at a plan or team gate, and with empty text.
     ///
-    /// (DES-RULE-CHECK-001 S2, additive.) At a `rules_unchecked` gate (a steering rule no judge
-    /// ruled on): `retry_rules` (`approve=true`, no `amend`) re-runs the rule check on the same work,
-    /// and `skip_rules` (`approve=true`, `amend` = JSON `[{"id", "reason"}]`) skips unchecked rules,
-    /// each with its reason, then re-runs it. The step does not run again; refused at any other gate.
+    /// (DES-RULE-CHECK-001 S2 + rev 2 A.4, additive.) Wherever a rule layer (`rules_unchecked`
+    /// or `rule_check`) is in the unit's denial record, as the winning denial or behind it (a
+    /// reviewer's FAIL, `review_adjudication` included): `retry_rules` (`approve=true`, no
+    /// `amend`) re-runs the rule check on the same work, and `skip_rules` (`approve=true`,
+    /// `amend` = JSON `[{"id", "reason"}]`) skips unchecked or disputed rules (never a broken
+    /// one), each with its reason, then re-runs it. The step does not run again; refused when no
+    /// rule layer holds the unit.
     ///
     /// (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the
     /// edited plan as JSON (`approve=true`, `action` omitted or `edit_plan`). The engine accepts it
