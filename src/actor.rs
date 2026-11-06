@@ -13089,10 +13089,10 @@ struct ConformanceDispatch {
 /// (DES-EDITOR-CONFORMANCE-HOST) Run the `editor_conformance` Tool: garden's harness in engine mode,
 /// jailed to its own loopback port (`serve_jail`), cwd and writes in a private temp dir, a cleared
 /// environment plus the declared variables, killed past [`crate::editor_conformance::DEADLINE`]. The
-/// worktree is snapshotted into a tree id and that TREE is exported into the private temp dir, every
-/// file's raw blob id verified against the tree (`editor_conformance::export_tree`): the cases run on
-/// exactly the recorded bytes, never the live worktree (nothing a process still running there, or an
-/// ignored or scratch file outside the tree, can put under them). The report is read from
+/// worktree is snapshotted into a tree id and that TREE is checked out by the verify floor's own guarded
+/// checkout (`repo_checks::checkout_guarded_tree`): the cases run on exactly the recorded tree, never the
+/// live worktree (nothing a process still running there, or an ignored or scratch file outside the tree,
+/// can put under them). The report is read from
 /// the out file in the engine's temp dir and bound to that tree; the fold judges the unit from the
 /// returned record, never from the exit status.
 #[allow(clippy::too_many_arguments)]
@@ -13185,21 +13185,27 @@ fn run_conformance_tool(
             )
         }
     };
-    let pack_tree = tmp.path().join("tree");
-    if let Err(e) = ec::export_tree(
+    // The verify floor's own guarded checkout of exactly that tree (hooks off, no filter driver, blobs
+    // written by the engine through a held directory, outside the seat's write boundary): the same
+    // mechanism the repository's checks run on. Dropped (and removed) when this function returns.
+    let checkout = match crate::repo_checks::checkout_guarded_tree(
         &worktree,
         std::path::Path::new(&git_dir),
         &snap.tree,
-        &pack_tree,
+        &format!("editor-conformance-{}", d.ord),
     ) {
-        return refused(
-            "engine_refused",
-            format!(
-                "the tree {} could not be exported for the cases: {e}",
-                snap.tree
-            ),
-        );
-    }
+        Ok(c) => c,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!(
+                    "the tree {} could not be checked out for the cases: {e}",
+                    snap.tree
+                ),
+            )
+        }
+    };
+    let pack_tree = checkout.dir.clone();
     let port = match ec::free_port() {
         Ok(p) => p,
         Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
@@ -13284,6 +13290,7 @@ fn run_conformance_tool(
     }
     let mut rec = ec::judge_file(&out_file, attempt);
     drop(tmp);
+    drop(checkout);
     // The cases ran on the export of exactly this tree.
     rec.tree = Some(snap.tree);
     rec.jail = Some(kind);

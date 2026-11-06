@@ -33,8 +33,9 @@ Two release tracks share this file, newest entry first regardless of track:
   - Inputs: crew's private Playwright interpreter and its studio dist come from the daemon variables
     `WICKED_EDITOR_CONFORMANCE_PYTHON` and `WICKED_EDITOR_CONFORMANCE_STUDIO_DIST`. Nothing is installed at dispatch.
   - The record: the engine reads the report from its own temp dir. It applies crew's required-case rule (0-6 and
-    8-12, plus 13-16 for a protocol-2 editor). The cases run on an export of the worktree's tree id into the engine's
-    temp dir, never on the live worktree, so the record is about exactly that tree. It keeps the result as
+    8-12, plus 13-16 for a protocol-2 editor). The cases run on the verify floor's own guarded checkout of the
+    worktree's tree id (`repo_checks::checkout_guarded_tree`: hooks off, no filter driver), never on the live
+    worktree, so the record is about exactly that tree. It keeps the result as
     `WorkUnit::editor_conformance`. A reviewer handed a record for another tree than the one under review sees it
     marked UNVERIFIED.
   - Outcomes: a failed case or an invalid pack is a verdict (`editor_conformance_failed`), sent back to `build`. A run

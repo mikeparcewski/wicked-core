@@ -330,182 +330,6 @@ pub(crate) fn judge_file(path: &std::path::Path, attempt: u32) -> ConformanceRec
     }
 }
 
-/// Export the run's snapshotted `tree` into `dest`, a fresh engine-owned directory: the bytes the cases run
-/// against are exactly the recorded tree, never the live worktree as it may be later (a process still writing
-/// there, an ignored or scratch file the tree does not hold).
-///
-/// Only object plumbing that runs no code and converts nothing is used (codex, core review r2/r3): the tree's
-/// entries are listed with `ls-tree -z` and each blob is read with `cat-file --batch`, both with replacement
-/// refs off; no hook, filter, eol conversion or checkout. Every blob's bytes are hashed by the engine and must
-/// name the entry's object id (a planted object file cannot stand in for the recorded bytes). Paths are taken
-/// as raw bytes; one that could leave `dest` refuses the export. A link entry is recreated as a link (garden
-/// refuses links in a pack); a submodule is skipped.
-pub(crate) fn export_tree(
-    worktree: &std::path::Path,
-    git_dir: &std::path::Path,
-    tree: &str,
-    dest: &std::path::Path,
-) -> Result<(), String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("{}: {e}", dest.display()))?;
-    let no_replace = std::path::Path::new("1");
-    let env: [(&str, &std::path::Path); 2] =
-        [("GIT_DIR", git_dir), ("GIT_NO_REPLACE_OBJECTS", no_replace)];
-    let listing = crate::worktree_guard::git(
-        worktree,
-        &["ls-tree", "-r", "-z", "--full-tree", tree],
-        &env,
-    )
-    .map_err(|e| e.to_string())?;
-    // (mode, object id, raw path)
-    let mut blobs: Vec<(String, String, Vec<u8>)> = Vec::new();
-    for rec in listing.split(|b| *b == 0).filter(|r| !r.is_empty()) {
-        let tab = rec
-            .iter()
-            .position(|b| *b == b'\t')
-            .ok_or("an unreadable tree entry")?;
-        let meta = String::from_utf8_lossy(&rec[..tab]);
-        let path = rec[tab + 1..].to_vec();
-        let mut m = meta.split(' ');
-        let (Some(mode), Some(kind), Some(id)) = (m.next(), m.next(), m.next()) else {
-            return Err(format!("an unreadable tree entry: {meta}"));
-        };
-        if kind == "blob" {
-            blobs.push((mode.to_string(), id.to_string(), path));
-        }
-    }
-    let ids: String = blobs.iter().map(|(_, id, _)| format!("{id}\n")).collect();
-    let batch = cat_file_batch(worktree, ids.into_bytes(), &env)?;
-    let mut at = 0usize;
-    for (mode, id, path) in &blobs {
-        // `<id> blob <size>\n<bytes>\n`
-        let nl = batch[at..]
-            .iter()
-            .position(|b| *b == b'\n')
-            .ok_or("cat-file answered short")?;
-        let head = String::from_utf8_lossy(&batch[at..at + nl]).to_string();
-        let mut h = head.split(' ');
-        let (Some(got), Some("blob"), Some(size)) = (h.next(), h.next(), h.next()) else {
-            return Err(format!("cat-file answered {head:?} for {id}"));
-        };
-        let size: usize = size
-            .parse()
-            .map_err(|_| format!("cat-file answered {head:?}"))?;
-        let start = at + nl + 1;
-        let end = start + size;
-        if got != id || end > batch.len() {
-            return Err(format!("cat-file answered {head:?} for {id}"));
-        }
-        let bytes = &batch[start..end];
-        at = end + 1;
-        if blob_id(bytes, id.len()) != *id {
-            return Err(format!(
-                "the repository's object {id} does not hold the bytes its id names: the recorded tree cannot be exported"
-            ));
-        }
-        let rel = safe_rel_path(path)?;
-        let dst = dest.join(&rel);
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-        }
-        if mode == "120000" {
-            #[cfg(unix)]
-            {
-                use std::os::unix::ffi::OsStrExt;
-                std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(bytes), &dst)
-                    .map_err(|e| format!("{}: {e}", rel.display()))?;
-            }
-            continue;
-        }
-        std::fs::write(&dst, bytes).map_err(|e| format!("{}: {e}", rel.display()))?;
-        #[cfg(unix)]
-        if mode == "100755" {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&dst, std::fs::Permissions::from_mode(0o755));
-        }
-    }
-    Ok(())
-}
-
-/// A tree path as a relative path under the export: raw bytes on unix; any empty, `.` or `..` component or
-/// a leading `/` refuses (it could leave the export).
-fn safe_rel_path(path: &[u8]) -> Result<std::path::PathBuf, String> {
-    let shown = String::from_utf8_lossy(path).into_owned();
-    if path.is_empty()
-        || path[0] == b'/'
-        || path
-            .split(|b| *b == b'/')
-            .any(|c| c.is_empty() || c == b"." || c == b"..")
-    {
-        return Err(format!("a tree entry with an unsafe path: {shown:?}"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        Ok(std::path::PathBuf::from(std::ffi::OsStr::from_bytes(path)))
-    }
-    #[cfg(not(unix))]
-    {
-        Ok(std::path::PathBuf::from(shown))
-    }
-}
-
-/// The git object id of a blob holding `bytes`: SHA-1 for a 40-hex id, SHA-256 for a 64-hex one.
-fn blob_id(bytes: &[u8], id_len: usize) -> String {
-    let header = format!("blob {}\0", bytes.len());
-    let hex = |d: &[u8]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
-    if id_len == 64 {
-        use sha2::Digest;
-        let mut h = sha2::Sha256::new();
-        h.update(header.as_bytes());
-        h.update(bytes);
-        hex(&h.finalize())
-    } else {
-        use sha1::Digest;
-        let mut h = sha1::Sha1::new();
-        h.update(header.as_bytes());
-        h.update(bytes);
-        hex(&h.finalize())
-    }
-}
-
-/// `git cat-file --batch` over `ids` (newline-separated object ids): the raw objects, read while the ids are
-/// written (a writer thread: neither side can fill a pipe and wait on the other).
-fn cat_file_batch(
-    cwd: &std::path::Path,
-    ids: Vec<u8>,
-    env: &[(&str, &std::path::Path)],
-) -> Result<Vec<u8>, String> {
-    use std::io::Write;
-    use wicked_apps_core::spawn::HardenedCommand;
-    // spawn-audit: hardened — git object plumbing over the run's own repository; reads no engine state.
-    let mut cmd = std::process::Command::new("git");
-    cmd.hardened()
-        .args(["cat-file", "--batch"])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    for (k, v) in env {
-        cmd.env(k, v);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not spawn git cat-file: {e}"))?;
-    let mut stdin = child.stdin.take().ok_or("no stdin")?;
-    let writer = std::thread::spawn(move || {
-        let _ = stdin.write_all(&ids);
-    });
-    let out = child.wait_with_output().map_err(|e| e.to_string())?;
-    let _ = writer.join();
-    if !out.status.success() {
-        return Err(format!(
-            "git cat-file failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    Ok(out.stdout)
-}
-
 /// The host inputs crew exports, resolved outside the jail: `(python, studio dist)`, each an
 /// absolute existing path, or the refusal `(cause, reason)`.
 pub(crate) fn host_inputs() -> Result<(std::path::PathBuf, std::path::PathBuf), (String, String)> {
@@ -832,19 +656,18 @@ mod tests {
         assert!(rec.passed(), "status {status:?}: {rec:?}");
     }
 
-    /// The export is the recorded tree byte for byte, read from the repository's objects: tracked and
-    /// untracked-not-ignored files are there, an ignored one is not, a link stays a link, text normalization
-    /// is the tree's own (never a refusal), a later worktree edit changes nothing, and a replacement ref on a
-    /// blob is ignored.
+    /// The cases run on the floor's own guarded checkout of the recorded tree (`repo_checks::
+    /// checkout_guarded_tree`): tracked and untracked-not-ignored files are there, an ignored one is not, and
+    /// a later worktree edit changes nothing.
     #[cfg(unix)]
     #[test]
-    fn the_export_is_the_recorded_tree() {
+    fn the_cases_run_on_the_floors_checkout_of_the_recorded_tree() {
         let base = std::env::temp_dir().join(format!("ec-export-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join("p/editors")).unwrap();
         let git = |args: &[&str]| {
-            // spawn-audit: test-only — a git fixture for the export under test.
+            // spawn-audit: test-only — a git fixture for the checkout under test.
             let out = std::process::Command::new("git")
                 .arg("-C")
                 .arg(&repo)
@@ -852,61 +675,30 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(out.status.success(), "git {args:?}: {out:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
         };
         git(&["init", "-q"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
         std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
-        std::fs::write(repo.join(".gitattributes"), "*.md text\n").unwrap();
         std::fs::write(repo.join("p/wicked-pack.json"), "{}").unwrap();
         std::fs::write(repo.join("p/editors/index.html"), "<p>one</p>").unwrap();
-        std::fs::write(repo.join("notes.md"), "crlf\r\nline\r\n").unwrap();
         std::fs::write(repo.join("ignored.txt"), "no").unwrap();
-        std::os::unix::fs::symlink("p/wicked-pack.json", repo.join("link")).unwrap();
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
         std::fs::write(repo.join("untracked.txt"), "kept").unwrap();
         let snap = crate::worktree_guard::snapshot(&repo, &repo).unwrap();
         let git_dir = std::path::PathBuf::from(snap.git_dir.clone().unwrap());
-        // A replacement ref for the entry's blob, and a later worktree edit: neither reaches the export.
-        let blob = git(&["rev-parse", "HEAD:p/editors/index.html"]);
-        std::fs::write(repo.join("evil.html"), "<script>x</script>").unwrap();
-        let evil = git(&["hash-object", "-w", "evil.html"]);
-        git(&["replace", &blob, &evil]);
         std::fs::write(repo.join("p/editors/index.html"), "<p>two</p>").unwrap();
-        let dest = base.join("export");
-        export_tree(&repo, &git_dir, &snap.tree, &dest).unwrap();
+        let co = crate::repo_checks::checkout_guarded_tree(&repo, &git_dir, &snap.tree, "ec-test")
+            .unwrap();
         assert_eq!(
-            std::fs::read_to_string(dest.join("p/editors/index.html")).unwrap(),
+            std::fs::read_to_string(co.dir.join("p/editors/index.html")).unwrap(),
             "<p>one</p>"
         );
-        assert_eq!(
-            std::fs::read_to_string(dest.join("notes.md")).unwrap(),
-            "crlf\nline\n",
-            "the tree's own normalized bytes"
-        );
-        assert!(dest.join("untracked.txt").is_file());
-        assert!(!dest.join("ignored.txt").exists());
-        assert!(!dest.join("evil.html").exists());
-        assert!(std::fs::symlink_metadata(dest.join("link"))
-            .unwrap()
-            .file_type()
-            .is_symlink());
+        assert!(co.dir.join("untracked.txt").is_file());
+        assert!(!co.dir.join("ignored.txt").exists());
+        drop(co);
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn an_unsafe_tree_path_refuses_the_export() {
-        for bad in [&b"../x"[..], b"/etc/x", b"a//b", b"a/./b", b""] {
-            assert!(safe_rel_path(bad).is_err(), "{bad:?}");
-        }
-        assert!(safe_rel_path(b"a/\"q\nb").is_ok());
-        assert_eq!(
-            blob_id(b"", 40),
-            "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
-            "git's empty blob"
-        );
     }
 
     #[cfg(unix)]
