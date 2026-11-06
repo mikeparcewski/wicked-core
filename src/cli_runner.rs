@@ -5326,6 +5326,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         qe_review,
         bench_reprobes,
         rule_check,
+        // An agent unit is never a demo Tool.
+        demo_take: None,
     };
     (output, agent_verdict, evidence)
 }

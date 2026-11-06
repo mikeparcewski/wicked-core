@@ -1434,6 +1434,18 @@ pub(crate) fn run(
                         home.as_deref(),
                     )
                     .map_err(|e| anyhow::anyhow!(e))?;
+                    // (DES-DEMO-RECORD-001) A Demo video needs its demo root and launch manifest,
+                    // and no seat write root over the Tools' directories: refused with NO session.
+                    if crate::demo_record::launch_is_demo(
+                        spec.workflow.as_deref(),
+                        spec.plan.as_ref(),
+                    ) {
+                        crate::demo_record::validate_demo_launch(
+                            spec.evidence_root.as_deref(),
+                            &spec.extra_write_roots,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                    }
                     // (core#1216) The orchestrator's voice block: bounded, refused with NO
                     // session persisted.
                     crate::power::validate_voice(spec.voice.as_deref())?;
@@ -4995,6 +5007,14 @@ pub(crate) fn launch_run_inner(
         // (WT-C2) The evidence root: same judgement, same synchronous refusal.
         crate::walkthrough::validate_evidence_root(spec.evidence_root.as_deref(), home.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?;
+        // (DES-DEMO-RECORD-001) Same demo admission as the interactive path.
+        if crate::demo_record::launch_is_demo(spec.workflow.as_deref(), spec.plan.as_ref()) {
+            crate::demo_record::validate_demo_launch(
+                spec.evidence_root.as_deref(),
+                &spec.extra_write_roots,
+            )
+            .map_err(|e| anyhow::anyhow!(e))?;
+        }
         // (core#1216) The orchestrator's voice block: same synchronous refusal.
         crate::power::validate_voice(spec.voice.as_deref())?;
     }
@@ -6155,6 +6175,17 @@ fn apply_step_result(
     // (crew#1311) Whether this unit is the run's last, read off the live unit list (the substance
     // floor's `answer_only` arm never rests on the stored flag alone).
     let is_last_unit = output.unit_ix + 1 == units.len();
+    // (DES-DEMO-RECORD-001 §3.3) A creator unit a later `demo_record` records: its plan is
+    // snapshotted for the person's gate when it passes its floors.
+    let feeds_demo_record = units.get(output.unit_ix).is_some_and(|me| {
+        let my_step = me.id.strip_prefix(&format!("{run_id}:")).unwrap_or(&me.id);
+        me.role == crate::workflow::PhaseRole::Creator
+            && units.iter().any(|u| {
+                u.ord > me.ord
+                    && u.catalog.as_deref() == Some(crate::demo_record::RECORD_CATALOG)
+                    && u.depends_on.iter().any(|d| d == my_step)
+            })
+    });
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
@@ -7687,6 +7718,68 @@ fn apply_step_result(
         return Ok(StepApplied::Paused);
     }
 
+    // ── DEMO FLOOR (DES-DEMO-RECORD-001 §3.5) ──────────────────────────────────────────────────
+    // A demo Tool's unit passes only on its receipt: the take the worker thread read right after
+    // the Tool exited. A refusal (the host could not record) is a command result the gate can
+    // retry; a take that ran and is not PASS is a verdict, sent back to the plan.
+    if crate::demo_record::is_demo_catalog(unit.catalog.as_deref()) {
+        let catalog = unit.catalog.clone().unwrap_or_default();
+        let approved = session
+            .evidence_root
+            .as_deref()
+            .and_then(|r| {
+                crate::demo_record::current_approved(std::path::Path::new(r), &run_id, None).ok()
+            })
+            .map(|(a, _)| a);
+        let judged =
+            crate::demo_record::judge(&catalog, evidence.demo_take.as_ref(), approved.as_ref());
+        let denial = match judged {
+            crate::demo_record::Judgement::Pass => None,
+            crate::demo_record::Judgement::Refused(why) => {
+                Some((crate::demo_record::DENIAL_REFUSED, why))
+            }
+            crate::demo_record::Judgement::Verdict(why) => {
+                Some((crate::demo_record::DENIAL_VERDICT, why))
+            }
+        };
+        if let Some((source, why)) = denial {
+            let why = format!("{catalog}: {why}");
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new(source, why.clone()));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    // The engine's own command ran; its take was judged. Never a seat's failure.
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -7775,6 +7868,69 @@ fn apply_step_result(
                 note,
             )?;
             return Ok(StepApplied::Paused);
+        }
+    }
+
+    // (DES-DEMO-RECORD-001 §3.3) The plan a later `demo_record` records is snapshotted NOW, into the
+    // engine's own `approved/<gen>/`: the person's gate shows that snapshot and the recorder reads
+    // only it, so what records is what was approved. A plan that cannot be snapshotted is denied
+    // like a missing deliverable.
+    if feeds_demo_record {
+        if let Some(root) = session.evidence_root.clone() {
+            let my_step = unit
+                .id
+                .strip_prefix(&format!("{run_id}:"))
+                .unwrap_or(&unit.id)
+                .to_string();
+            // The same admission as at dispatch, BEFORE the engine writes anything under the root.
+            let snap =
+                crate::demo_record::validate_demo_session(&session, &run_id).and_then(|()| {
+                    crate::demo_record::snapshot_plan(
+                        std::path::Path::new(&root),
+                        &run_id,
+                        &my_step,
+                    )
+                });
+            if let Err(e) = snap {
+                let why = format!("the demo plan could not be snapshotted for approval: {e}");
+                unit.status = crate::domain::UnitStatus::Rejected;
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(crate::domain::UnitDenial::new("demo_snapshot", why.clone()));
+                put_node(store, unit.to_node())?;
+                persist_rejected_transcript(store, &session, unit, &output.output);
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: why,
+                        failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                    },
+                );
+                let phase = crate::scope::unit_phase(ord);
+                let _ = crate::gate_hook::fold_input_denial(
+                    store,
+                    &run_id,
+                    output.attempt,
+                    &phase,
+                    true,
+                );
+                let note = denial_gate_note(session.human_confirm);
+                escalate_denied_unit(
+                    store,
+                    subscribers,
+                    self_tx,
+                    &mut session,
+                    unit,
+                    output.attempt,
+                    false,
+                    !output.output.trim().is_empty(),
+                    false,
+                    note,
+                )?;
+                return Ok(StepApplied::Paused);
+            }
         }
     }
 
@@ -11859,10 +12015,14 @@ fn dispatch_unit(
                 )
             })
             .flatten();
+        // (DES-DEMO-RECORD-001) A demo Tool (`demo_probe`, `demo_record`): its demo root, launch
+        // manifest and approved snapshot, resolved here; it runs jailed on the worker thread below.
+        let demo = crate::demo_record::is_demo_catalog(unit.catalog.as_deref())
+            .then(|| crate::demo_record::DemoDispatch::resolve(run_id, &session, unit, &units));
         // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
         // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
         // snapshotted off-thread below (the repository root is the only store read it needs).
-        let run_env = record.is_none().then(|| ToolRunEnv {
+        let run_env = (record.is_none() && demo.is_none()).then(|| ToolRunEnv {
             run_id: run_id.to_string(),
             ord: unit.ord,
             consent_choice: unit.consent_choice.clone(),
@@ -11966,6 +12126,7 @@ fn dispatch_unit(
             // a later agent unit discovered the missing skill. Same ladder, same refusal shape
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
+            let mut demo_take: Option<crate::demo_record::DemoTake> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
@@ -12030,6 +12191,34 @@ fn dispatch_unit(
                             &on_done,
                         );
                         killed = k;
+                        (o, st)
+                    } else if let Some(d) = &demo {
+                        // The generation the run was admitted against, else the ladder's; a
+                        // ladder that FAILED is a refusal (never an unadmitted garden on PATH).
+                        let garden: Result<Option<std::path::PathBuf>, String> =
+                            match admitted.as_ref() {
+                                Some(g) => Ok(Some(g.root.clone())),
+                                None => match crate::skills_snapshot::resolve_ladder() {
+                                    Ok(crate::skills_snapshot::Ladder::Root(g)) => Ok(Some(g.root)),
+                                    Ok(crate::skills_snapshot::Ladder::Absent) => Ok(None),
+                                    Ok(crate::skills_snapshot::Ladder::Failed(why)) => Err(why),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                            };
+                        let (o, st, k, take) = run_demo_tool(
+                            &cmd,
+                            d,
+                            garden
+                                .as_ref()
+                                .map(Option::as_deref)
+                                .map_err(String::as_str),
+                            &crate::validator::port_jail,
+                            &stop,
+                            &on_spawn,
+                            &on_done,
+                        );
+                        killed = k;
+                        demo_take = Some(take);
                         (o, st)
                     } else {
                         let emit_ev = |ev: CoreEvent| {
@@ -12198,6 +12387,7 @@ fn dispatch_unit(
                     qe_review: None,
                     bench_reprobes: Vec::new(),
                     rule_check: delivery_rule_check,
+                    demo_take,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -12497,6 +12687,255 @@ fn run_walkthrough_record(
     );
     drop(tmp);
     out
+}
+
+/// (DES-DEMO-RECORD-001 §3.4-§3.5) Run a demo Tool (`demo_probe`, `demo_record`): jailed to the app's
+/// one port, writing only its own directories under the demo root and a private temp dir, handed exactly
+/// the declared variables, killed past the take deadline or byte budget. Whatever happens, it returns a
+/// [`crate::demo_record::DemoTake`] read right after the Tool exited (or the engine's own refusal); the
+/// fold judges the unit from that, so the Tool's exit status is never the verdict.
+#[allow(clippy::too_many_arguments)]
+fn run_demo_tool(
+    cmd: &[String],
+    d: &crate::demo_record::DemoDispatch,
+    garden: Result<Option<&std::path::Path>, &str>,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::demo_record::DemoTake,
+) {
+    use crate::demo_record as dr;
+    use crate::workflow::StepStatus;
+    let refused = |cause: &str, why: String| {
+        if let Ok(root) = &d.root {
+            dr::write_refusal(root, &d.catalog, cause, &why);
+        }
+        (
+            format!("{}: recorded nothing: {cause}: {why}", d.catalog),
+            StepStatus::Ok,
+            None,
+            dr::DemoTake::refused(cause, why),
+        )
+    };
+    let root = match &d.root {
+        Ok(r) => r.clone(),
+        Err(why) => return refused("engine_refused", why.clone()),
+    };
+    let launch = match &d.launch {
+        Ok(l) => l.clone(),
+        Err(why) => return refused("engine_refused", why.clone()),
+    };
+    let port = match launch.port() {
+        Ok(p) => p,
+        Err(why) => return refused("engine_refused", why),
+    };
+    let storyline = match &d.approved {
+        None => None,
+        Some(Ok(dir)) => Some(dir.clone()),
+        Some(Err(why)) => return refused("engine_refused", why.clone()),
+    };
+    let garden_root = match garden {
+        Ok(r) => r,
+        Err(why) => {
+            return refused(
+                "engine_refused",
+                format!("the skills generation could not be resolved ({why}); the recorder never runs from an unadmitted garden"),
+            )
+        }
+    };
+    // The jail hides the credential directories; a garden that lives under one (the live plugin
+    // cache under `~/.claude`) cannot run in it. Say so, with the fix, instead of a silent miss.
+    if let Some(g) = garden_root {
+        let real = g.canonicalize().unwrap_or_else(|_| g.to_path_buf());
+        if let Some(mask) = crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+        {
+            return refused(
+                "engine_refused",
+                format!(
+                    "the skills generation lives under {}, which the recorder's jail hides: publish a \
+                     skills snapshot (WICKED_SKILLS_SNAPSHOT) for the daemon",
+                    mask.display()
+                ),
+            );
+        }
+    }
+    // A superseded or cancelled attempt touches nothing.
+    if let Some(r) = stop() {
+        return (
+            format!("{}: stopped before it began ({r})", d.catalog),
+            StepStatus::Ok,
+            None,
+            dr::DemoTake::refused("engine_refused", format!("stopped before it began ({r})")),
+        );
+    }
+    // A fresh attempt: the previous take moves to takes/<n>/; the previous probe is emptied (a verdict
+    // must be this attempt's, whatever garden does).
+    if d.catalog == dr::PROBE_CATALOG {
+        if let Err(why) = dr::clear_probe(&root) {
+            return refused(
+                "engine_refused",
+                format!("the previous probe could not be cleared: {why}"),
+            );
+        }
+    }
+    if d.catalog == dr::RECORD_CATALOG {
+        if let Err(why) = dr::rotate_take(&root) {
+            return refused(
+                "engine_refused",
+                format!("the previous take could not be set aside: {why}"),
+            );
+        }
+    }
+    let mut writable: Vec<std::path::PathBuf> = Vec::new();
+    for name in d.out_dirs() {
+        match dr::owned_dir(&root, name) {
+            Ok(p) => writable.push(p),
+            Err(why) => return refused("engine_refused", why),
+        }
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the recorder's private temp dir: {e}"),
+            )
+        }
+    };
+    let mut roots: Vec<&std::path::Path> = writable.iter().map(|p| p.as_path()).collect();
+    roots.push(tmp.path());
+    let launcher = jail(&roots, port);
+    if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
+        let cause = if cfg!(target_os = "linux") {
+            "no_port_scoped_jail"
+        } else {
+            "unjailed_host"
+        };
+        return refused(
+            cause,
+            format!(
+                "this host has no OS jail that opens exactly the app's port (sandbox level {}): a demo is \
+                 never recorded unjailed. It records on macOS (sandbox-exec); Linux needs a port map into \
+                 the jail, not built yet",
+                launcher.level.as_wire()
+            ),
+        );
+    }
+    let tmp_s = tmp.path().to_string_lossy().into_owned();
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|k| ((*k).to_string(), tmp_s.clone()))
+        .collect();
+    env.extend(dr::host_tool_env());
+    env.extend(dr::tool_env(
+        &d.run_id,
+        d.ord,
+        &root,
+        &launch,
+        storyline.as_deref(),
+    ));
+    let kind = launcher
+        .wrapper
+        .iter()
+        .filter_map(|a| std::path::Path::new(a).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .find(|n| n == "bwrap" || n == "sandbox-exec")
+        .unwrap_or_else(|| launcher.wrapper[0].clone());
+    env.push(("WICKED_DEMO_JAIL".to_string(), kind));
+    if let Some(groot) = garden_root {
+        env.push((
+            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+            groot.to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "PATH".to_string(),
+            crate::skills_snapshot::prepend_path_entry(
+                &groot.join(crate::skills_snapshot::SCRIPTS_DIR),
+                std::env::var_os("PATH").as_deref(),
+                crate::skills_snapshot::PATH_LIST_SEPARATOR,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        ));
+    }
+    // The take's own limits, decided outside the interpreter: the deadline, and the byte budget over
+    // everything it may write (polled at most every 5 s).
+    let started = std::time::Instant::now();
+    let last_size_check = std::cell::Cell::new(std::time::Instant::now());
+    let over = std::cell::Cell::new(None::<&'static str>);
+    let measured: Vec<std::path::PathBuf> = roots.iter().map(|p| p.to_path_buf()).collect();
+    let limited_stop = || -> Option<&'static str> {
+        if let Some(r) = stop() {
+            return Some(r);
+        }
+        if started.elapsed() > dr::TAKE_DEADLINE {
+            over.set(Some("deadline_exceeded"));
+            return Some("deadline_exceeded");
+        }
+        if last_size_check.get().elapsed() >= std::time::Duration::from_secs(5) {
+            last_size_check.set(std::time::Instant::now());
+            let dirs: Vec<&std::path::Path> = measured.iter().map(|p| p.as_path()).collect();
+            if dr::bytes_under(&dirs) > dr::TAKE_BYTE_BUDGET {
+                over.set(Some("budget_exceeded"));
+                return Some("budget_exceeded");
+            }
+        }
+        None
+    };
+    let cwd = tmp_s.clone();
+    let (out, status, killed) = run_tool_cmd_jailed(
+        cmd,
+        Some(&cwd),
+        &env,
+        Some(&launcher.wrapper),
+        &limited_stop,
+        on_spawn,
+        on_done,
+    );
+    // Once more at the end, whatever the poll last saw: a take that crossed the budget while
+    // stitching is never accepted (and its private temp counts until it is gone).
+    if over.get().is_none() && killed.is_none() {
+        let dirs: Vec<&std::path::Path> = measured.iter().map(|p| p.as_path()).collect();
+        if dr::bytes_under(&dirs) > dr::TAKE_BYTE_BUDGET {
+            over.set(Some("budget_exceeded"));
+        }
+    }
+    drop(tmp);
+    if let Some(cause) = over.get() {
+        let why = if cause == "deadline_exceeded" {
+            format!(
+                "the take ran past {} minutes and was stopped",
+                dr::TAKE_DEADLINE.as_secs() / 60
+            )
+        } else {
+            format!(
+                "the take wrote more than {} GB and was stopped",
+                dr::TAKE_BYTE_BUDGET >> 30
+            )
+        };
+        dr::write_refusal(&root, &d.catalog, cause, &why);
+        let mut take = dr::read_take(&root, &d.catalog);
+        take.overall = "INCONCLUSIVE".to_string();
+        take.cause = Some(cause.to_string());
+        take.reason = Some(why);
+        return (out, StepStatus::Ok, killed, take);
+    }
+    let take = dr::read_take(&root, &d.catalog);
+    // The verdict is the fold's (from the receipt); a command that ran to its end is Ok here, so a
+    // failing take is never retried by the failure ladder as a broken command.
+    let status = if killed.is_some() {
+        status
+    } else {
+        StepStatus::Ok
+    };
+    (out, status, killed, take)
 }
 
 /// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
@@ -17422,6 +17861,8 @@ fn rewind_to_creator_scoped(
         Some(d) => {
             matches!(d.source.as_str(), "worker_failure" | "turn_timeout")
                 || d.source == crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL
+                // (DES-DEMO-RECORD-001) The host could not record: retry the Tool.
+                || d.source == crate::demo_record::DENIAL_REFUSED
         }
         None => !cursor
             .denial_reason
@@ -29352,9 +29793,9 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            3,
-            "the substance gate, the deliverable floor and the dead-seat worker exit (core#461) \
-             each open the escalation gate"
+            5,
+            "the substance gate, the deliverable floor, the dead-seat worker exit (core#461), the \
+             demo floor and the demo plan snapshot (core#1249) each open the escalation gate"
         );
     }
 

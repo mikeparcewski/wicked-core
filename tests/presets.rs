@@ -616,7 +616,7 @@ fn f_presets_survive_a_restart() {
 }
 
 /// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
-const NO_MAPPING_ROW: [&str; 26] = [
+const NO_MAPPING_ROW: [&str; 27] = [
     "analyze",
     "analyze-codebase",
     "apps-publish",
@@ -624,6 +624,7 @@ const NO_MAPPING_ROW: [&str; 26] = [
     "compliance-review",
     "decide",
     "demo",
+    "demo-human-review",
     "docs",
     "editor-plugin",
     "investigate-incident",
@@ -670,6 +671,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "compliance-review",
             "decide",
             "demo",
+            "demo-human-review",
             "docs",
             "domain-extraction",
             "editor-plugin",
@@ -1344,13 +1346,19 @@ fn editor_plugin_preset_builds_protocol_2() {
     );
 }
 
-/// M9b (studio#373): a launch naming `demo` runs the built-in preset — the wicked-garden demo
-/// skill's plan → record → review, meant for the launch's one declared write root. `plan` and `review`
-/// are the plan gate and the review gate (`human_confirm`); `plan` and `record` are creators and
-/// `review` is an evaluator, so evaluator ≠ creator puts the reviewer on another seat; every
-/// deliverable is relative, so it resolves inside the demo root; nothing executes code.
+/// (DES-DEMO-RECORD-001, core#1249) `demo` launches probe → plan → record → review: the probe and
+/// the recorder are the engine's own Tools (no seat records), `plan` is the creator behind the plan
+/// gate, `review` an evaluator behind the review gate; the plan writes `storyline.json` into the
+/// run's only write root, `<demo root>/plan`. A demo launch without its demo root, or with a write
+/// root over the Tools' directories, is refused.
 #[test]
-fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
+fn m9b_demo_launches_probe_plan_record_review() {
+    if std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .is_none()
+    {
+        return; // a declared root needs a home to validate (core#640)
+    }
     let dir = tmp_dir("demo");
     let db = dir.join("estate.db").to_str().unwrap().to_string();
     let rig = spawn(&db);
@@ -1365,11 +1373,30 @@ fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
         (demo.scope.as_str(), demo.created_by.as_str()),
         ("global", "builtin")
     );
+    let root = dir.join("demo-root");
+    std::fs::create_dir_all(root.join("plan")).unwrap();
+    std::fs::write(
+        root.join("launch.json"),
+        r#"{"app_origin":"http://127.0.0.1:5173","launch_path":"/","target":{"kind":"loopback_app"},"live_data_to_models":true}"#,
+    )
+    .unwrap();
+    let root_s = root.to_string_lossy().into_owned();
+
+    // Refused: no demo root; a write root over the whole root.
+    let mut bare = spec("rdemo0", "demo", None);
+    bare.problem = "Make a demo".into();
+    assert!(rig.core.launch_run(bare).is_err(), "no demo root");
+    let mut wide = spec("rdemo1", "demo", None);
+    wide.problem = "Make a demo".into();
+    wide.evidence_root = Some(root_s.clone());
+    wide.extra_write_roots = vec![root_s.clone()];
+    let e = rig.core.launch_run(wide).unwrap_err().to_string();
+    assert!(e.contains("holds the demo root"), "{e}");
 
     let mut launch = spec("rdemo", "demo", None);
     launch.problem = "Make a demo of http://127.0.0.1:5173 for new users".into();
-    // No declared root here: the demo root is the launcher's (crew mints one per run), and a root
-    // needs $HOME to validate, which a Windows runner lacks. The steps are what this pins.
+    launch.evidence_root = Some(root_s.clone());
+    launch.extra_write_roots = vec![root.join("plan").to_string_lossy().into_owned()];
     rig.core.launch_run(launch).unwrap();
     let units = units_of(&rig.core, "rdemo");
     let hc = r#"{"human_confirm":{"unconditional":false}}"#;
@@ -1379,67 +1406,37 @@ fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
             .find(|u| u.id == format!("rdemo:{id}"))
             .unwrap_or_else(|| panic!("no `{id}` unit in {:?}", rows("rdemo", &units)))
     };
-    let (plan, record, review) = (got("plan"), got("record"), got("review"));
+    let (probe, plan, record, review) = (got("probe"), got("plan"), got("record"), got("review"));
     assert_eq!(row("rdemo", plan), r("plan", "build", "creator", hc, None));
-    assert_eq!(
-        row("rdemo", record),
-        r("record", "build", "creator", "auto", None)
-    );
     assert_eq!(
         row("rdemo", review),
         r("review", "review", "evaluator", hc, None)
     );
-    for u in [plan, record, review] {
+    for (u, cmd) in [(probe, "probe"), (record, "record")] {
         assert_eq!(
-            u.skill_ref.as_deref(),
-            Some("wicked-garden-demo"),
-            "{}",
+            u.tool_cmd.as_deref(),
+            Some(
+                &[
+                    "wicked-garden".to_string(),
+                    "run".to_string(),
+                    "scripts/demo/demo-record.mjs".to_string(),
+                    cmd.to_string()
+                ][..]
+            ),
+            "{} is the engine's own fixed command",
             u.id
         );
-        assert!(!u.executes_code, "{} changes no tree", u.id);
     }
-    assert!(
-        plan.ord < record.ord && record.ord < review.ord,
-        "plan, then record, then review"
-    );
+    assert!(probe.ord < plan.ord && plan.ord < record.ord && record.ord < review.ord);
     assert_eq!(
         plan.required_deliverables,
-        ["script.md", "chapters.json", "storyline.mjs"]
+        ["script.md", "chapters.json", "storyline.json"]
     );
-    assert!(record
-        .required_deliverables
-        .iter()
-        .any(|d| d == "demo-video/demo.mp4"));
-    assert!(record
-        .required_deliverables
-        .iter()
-        .any(|d| d == "review/chapters.png"));
     assert!(
-        review.required_deliverables.is_empty(),
-        "the reviewer writes nothing: its verdict is its output"
+        record.required_deliverables.is_empty(),
+        "the receipt is the record step's floor"
     );
-    let all = plan
-        .required_deliverables
-        .iter()
-        .chain(&record.required_deliverables);
-    for d in all {
-        assert!(
-            !std::path::Path::new(d).is_absolute() && !d.contains(".."),
-            "{d} resolves inside the demo root"
-        );
-    }
-    for (u, action) in [(plan, "`plan`"), (record, "`record`"), (review, "`review`")] {
-        assert!(
-            u.description.contains(action),
-            "{} names the skill's {action} action: {}",
-            u.id,
-            u.description
-        );
-    }
-    assert!(
-        record.description.contains("read-only"),
-        "the recorder is read-only against the app"
-    );
+    assert!(plan.description.contains("`plan`") && review.description.contains("`review`"));
     let view = rig
         .core
         .sessions_detail()
@@ -1459,11 +1456,46 @@ fn m9b_demo_launches_plan_record_review_on_the_demo_skill() {
 
 /// Arm the hermetic emit spool (core#311) before `main`.
 ///
-/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
-/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+/// Also puts a stub `wicked-garden` first on `PATH`: the demo presets' Tool steps name it, and the
+/// launch's tool preflight must find it (a CI runner has no garden installed). Nothing here runs it.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only touches the filesystem and
+/// process env vars via the std API — no allocator setup, no threads, no panics across the FFI
+/// boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+    let bin = std::env::temp_dir().join(format!("wicked-core-presets-bin-{}", std::process::id()));
+    if std::fs::create_dir_all(&bin).is_ok() {
+        let stub = bin.join(if cfg!(windows) {
+            "wicked-garden.cmd"
+        } else {
+            "wicked-garden"
+        });
+        if std::fs::write(
+            &stub,
+            if cfg!(windows) {
+                "@exit /b 0\r\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            },
+        )
+        .is_ok()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755));
+            }
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                std::env::set_var("PATH", joined);
+            }
+        }
+    }
 }
 
 /// DES-learn-workflow: a launch naming `learn` runs the built-in preset — scope gated, research and

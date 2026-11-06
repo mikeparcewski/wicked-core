@@ -401,6 +401,11 @@ pub struct UnitEvidence {
     /// change against the base).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_check: Option<crate::rule_check::RuleCheckReport>,
+    /// (DES-DEMO-RECORD-001 §3.5) A demo Tool's take as the worker thread read it right after the
+    /// Tool exited: its verdict file and a sha256 of every file it wrote. The fold passes the unit
+    /// only on this receipt (`demo_record::judge`). `None` for every other unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub demo_take: Option<crate::demo_record::DemoTake>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation
@@ -929,6 +934,21 @@ fn tool_binary_resolves(bin: &str) -> bool {
     let p = std::path::Path::new(bin);
     if p.components().count() > 1 || p.is_absolute() {
         return p.is_file();
+    }
+    // (DES-DEMO-RECORD-001) garden's launcher resolves where the Tool spawn finds it: the admitted skills
+    // generation's `scripts/` (prepended to the Tool's PATH), else PATH.
+    if bin == "wicked-garden" {
+        if let Ok(crate::skills_snapshot::Ladder::Root(g)) =
+            crate::skills_snapshot::resolve_ladder()
+        {
+            if g.root
+                .join(crate::skills_snapshot::SCRIPTS_DIR)
+                .join(bin)
+                .is_file()
+            {
+                return true;
+            }
+        }
     }
     crate::validator::find_on_path(bin).is_some()
 }
