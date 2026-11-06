@@ -558,6 +558,16 @@ pub enum HumanDecision {
     /// run, the gate and the delivery; only an UNCHECKED rule can be skipped (a broken rule
     /// denies, deny-dominates). Refused at every other gate.
     RecheckRules { skips: Vec<(String, String)> },
+    /// (F23) REDO THE QE CHECK of the run's QE unit whose isolated reviewer gave NO VERDICT on the
+    /// work (an INCONCLUSIVE record, no reviewer seat could run, or no verdict could be bound),
+    /// wire token [`RETRY_QE_ACTION`]: the QE unit runs again from FRESH evidence (the last QE run
+    /// is not resumed) and a new isolated reviewer session judges it, on a seat that gave no
+    /// verdict last only when no other reviewer seat of its basis can run. It is never a verdict:
+    /// the run's QE decision stays required, and only the new reviewer's bound PASS counts the unit
+    /// (deny-dominates). At most [`crate::qe_acceptance::review::QE_REDO_MAX`] per unit and tree.
+    /// Refused at every other gate, for a recorded FAIL (a verdict), and when no reviewer seat can
+    /// run now.
+    RetryQe,
 }
 
 /// (DES-CATALOG-002 §4.6, §11 Lane A) What the answer to a gate EXPECTS the open gate to be: the
@@ -580,6 +590,9 @@ pub const SKIP_QE_ACTION: &str = "skip_qe";
 /// The wire token of [`HumanDecision::Rejudge`].
 pub const REJUDGE_ACTION: &str = "rejudge";
 
+/// (F23) The wire token of [`HumanDecision::RetryQe`].
+pub const RETRY_QE_ACTION: &str = "retry_qe";
+
 /// The wire token of [`HumanDecision::OperatorJudgment`]. Its rationale rides the gate body's
 /// `amend`, like `amend_intent`'s text.
 pub const OPERATOR_JUDGMENT_ACTION: &str = "operator_judgment";
@@ -597,7 +610,7 @@ pub const INTENT_AMENDMENT_PREFIX: &str = " ||| APPROVED INTENT AMENDMENT (overr
 
 impl HumanDecision {
     /// (core#469 / core#467) The escalation arm a gate decision's wire `action` names — `extend` |
-    /// `targeted` | `accept_partial` | `accept_suggestion` | `rejudge` — or `None` for any other
+    /// `targeted` | `accept_partial` | `accept_suggestion` | `rejudge` | `retry_qe` — or `None` for any other
     /// token. The ONE parser every door (napi, bus) routes these tokens through.
     pub fn escalation_action(token: &str) -> Option<Self> {
         use crate::repo_checks::FloorRerunMode as Mode;
@@ -607,6 +620,7 @@ impl HumanDecision {
             "accept_partial" => Self::FloorRerun(Mode::AcceptPartial),
             "accept_suggestion" => Self::AcceptSuggestion,
             REJUDGE_ACTION => Self::Rejudge,
+            RETRY_QE_ACTION => Self::RetryQe,
             crate::rule_check::RETRY_ACTION => Self::RecheckRules { skips: Vec::new() },
             t if t.starts_with(crate::consent_plan::CHOICE_PREFIX)
                 && t.len() > crate::consent_plan::CHOICE_PREFIX.len() =>
@@ -2965,6 +2979,10 @@ mod escalation_action_tests {
         assert!(matches!(
             HumanDecision::escalation_action("rejudge"),
             Some(HumanDecision::Rejudge)
+        ));
+        assert!(matches!(
+            HumanDecision::escalation_action("retry_qe"),
+            Some(HumanDecision::RetryQe)
         ));
         for other in [
             "approve",

@@ -14,6 +14,23 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Redo the QE check when the isolated reviewer gave no verdict (e2e-1105 F23).** When the QE reviewer came back
+  INCONCLUSIVE (it could not run its checks), no reviewer seat could run, or no verdict could be bound, the only
+  clean way on was "approve as your own judgment", which turned an infrastructure miss into the person's verdict.
+  Such a gate now takes a new action, `retry_qe`: the QE step takes its evidence again from the start (the last QE
+  run is not resumed, so the earlier record is never re-bound) and a new isolated reviewer session judges it. A seat
+  that gave no verdict on that tree is tried last within its tier (distinct, then executor seat, then reduced), and
+  who may review is unchanged, so an author of the work never does unless the run is reduced assurance. A redo is
+  never a verdict. No operator judgment is recorded, the run's QE decision stays required (the redone dispatch is not
+  re-scored into a waiver on that tree), and only the new reviewer's bound PASS counts the step (deny-dominates). The
+  redo binds a new QE run: the run it retired is refused if an executor names it again. The cap is 2 redos per QE
+  step and tree (a redo on an unknown tree counts too); a new tree starts over. At the cap the gate prompt says so
+  and the action is refused with the reason; with no reviewer seat to run on, the action is refused at the answer,
+  naming why. The prompt leads with the redo and names what the reviewer could not run. The plain retry at a record
+  that bound no verdict ("confirm to retry the phase") is unchanged and is not counted against the cap. Approve-as-your-own-judgment, `skip_qe`, request changes and reject are unchanged. Each redo is recorded on the
+  unit (`qe_redos`: tree, attempt, outcome, the seats that gave no verdict, the reason, who, when). The napi door
+  takes the token. crew's gate route and crew-api-types still need `retry_qe` before a client can send it.
+
 - **A failing check in a package directory the change added is the change's own failure (e2e-1105 F24).** The base
   has nothing to compare there, so the floor used to class the failure "base red, cannot separate" and the gate card
   recommended the operator's floor override instead of Send back (W10 run 57bafff0, unit 7). The floor now reads the

@@ -68,6 +68,156 @@ pub(crate) fn is_qe_denial(d: &crate::domain::UnitDenial) -> bool {
     d.source == DENIAL_SOURCE_QE_REVIEW || could_not_judge(d)
 }
 
+/// (F23) The most "redo the QE check" answers ([`crate::workflow::HumanDecision::RetryQe`]) one QE
+/// unit takes on one tree: at most three isolated reviews of a tree. Each redo is a whole QE unit
+/// (fresh evidence and a new review session, minutes of seat time); a miss that survives two fresh
+/// sessions, and a fresh seat where the run has one, is not transient and needs a person (sign a
+/// seat in, fix the tool, judge it, or skip it with a reason).
+pub const QE_REDO_MAX: usize = 2;
+
+/// The longest reason a redo record keeps, and hands the executor as its note.
+const REDO_REASON_MAX: usize = 200;
+
+/// The words an INCONCLUSIVE record's reason names what could not run after ([`run`]).
+const INCONCLUSIVE_WHAT_LEAD: &str = "it could not run its checks: ";
+
+/// (F23) The unit's last reviewer record, when it is NO VERDICT on the work and is what denied the
+/// unit: INCONCLUSIVE (`qe_inconclusive`), no reviewer could run (`qe_reviewer_unavailable`), or a
+/// `qe_review` denial whose record bound no verdict (outcome `invalid`, no verdict). `None` for a
+/// recorded FAIL or PASS, a stale verdict, and a unit some other layer denied.
+pub(crate) fn non_verdict(unit: &WorkUnit) -> Option<&QeReview> {
+    let d = unit.denial.as_ref()?;
+    let r = unit.qe_review.as_ref()?;
+    let matches = match d.source.as_str() {
+        DENIAL_SOURCE_QE_INCONCLUSIVE => r.outcome == OUTCOME_INCONCLUSIVE,
+        DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE => r.outcome == OUTCOME_UNAVAILABLE,
+        DENIAL_SOURCE_QE_REVIEW => r.outcome == OUTCOME_INVALID && r.verdict.is_none(),
+        _ => false,
+    };
+    matches.then_some(r)
+}
+
+/// (F23) Whether a redo record counts for `tree`: the same tree, or either side unknown (an unknown
+/// tree is never proof of different work, so it counts against the cap).
+fn redo_on(r: &crate::domain::QeRedo, tree: Option<&str>) -> bool {
+    tree.is_none() || r.tree.is_none() || r.tree.as_deref() == tree
+}
+
+/// (F23) How many redos this unit already took on `tree` ([`redo_on`]).
+pub(crate) fn redos_on(unit: &WorkUnit, tree: Option<&str>) -> usize {
+    unit.qe_redos.iter().filter(|r| redo_on(r, tree)).count()
+}
+
+/// (F23) Whether `id` is a QE run a redo retired on this unit: its executor never binds it again.
+pub(crate) fn retired_by_redo(unit: &WorkUnit, id: &str) -> bool {
+    unit.qe_redos
+        .iter()
+        .any(|r| r.qe_run_id.as_deref() == Some(id))
+}
+
+/// (F23) Whether the gate of `unit` takes "redo the QE check": its record is no verdict
+/// ([`non_verdict`]), the run still requires QE acceptance, and fewer than [`QE_REDO_MAX`] redos ran
+/// on that record's tree. `Ok(redos left after this one)`, else why not, in words for the prompt.
+pub(crate) fn redo_offer(unit: &WorkUnit) -> Result<usize, String> {
+    let Some(r) = non_verdict(unit) else {
+        return Err("the QE reviewer's record is a verdict, or not what denied this step".into());
+    };
+    if !applies(unit) {
+        return Err("this run no longer requires QE acceptance".into());
+    }
+    let done = redos_on(unit, r.tree.as_deref());
+    if done >= QE_REDO_MAX {
+        return Err(format!(
+            "the QE check was already redone {done} times on this tree (the most is {QE_REDO_MAX})"
+        ));
+    }
+    Ok(QE_REDO_MAX - done - 1)
+}
+
+fn bounded_line(t: &str, max: usize) -> String {
+    let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if t.chars().count() <= max {
+        t
+    } else {
+        format!("{}…", t.chars().take(max).collect::<String>())
+    }
+}
+
+/// (F23) The redo record for `unit`'s non-verdict ([`non_verdict`]); `None` when it has none.
+pub(crate) fn redo_record(unit: &WorkUnit, by: &str, at: i64) -> Option<crate::domain::QeRedo> {
+    let r = non_verdict(unit)?;
+    let mut seats: Vec<String> = Vec::new();
+    for a in &r.attempts {
+        if !seats.contains(&a.seat) {
+            seats.push(a.seat.clone());
+        }
+    }
+    Some(crate::domain::QeRedo {
+        tree: r.tree.clone(),
+        from_attempt: unit.last_attempt.unwrap_or(0),
+        outcome: r.outcome.clone(),
+        qe_run_id: r.qe_run_id.clone(),
+        seats,
+        // What the reviewer said it could not run, when the record names it; else the whole reason
+        // (a binding failure, no reviewer seat).
+        reason: bounded_line(
+            r.reason
+                .split_once(INCONCLUSIVE_WHAT_LEAD)
+                .map_or(r.reason.as_str(), |(_, what)| what),
+            REDO_REASON_MAX,
+        ),
+        by: by.to_string(),
+        at,
+    })
+}
+
+/// (F23) The reviewer seats in the order this dispatch tries them: a seat whose record was a redone
+/// non-verdict on `tree` goes last WITHIN ITS BASIS TIER (distinct, executor seat, reduced), so a
+/// fresh seat is asked first when the run has one and the tiers keep their assurance order. Nothing
+/// is added or dropped: who may review stays [`candidates`]' decision alone.
+pub(crate) fn prefer_fresh(
+    seats: Vec<QeReviewerSeat>,
+    unit: &WorkUnit,
+    tree: Option<&str>,
+) -> Vec<QeReviewerSeat> {
+    let tried = |k: &str| {
+        unit.qe_redos
+            .iter()
+            .filter(|r| redo_on(r, tree))
+            .any(|r| r.seats.iter().any(|s| s == k))
+    };
+    let mut out: Vec<QeReviewerSeat> = Vec::with_capacity(seats.len());
+    let mut i = 0;
+    while i < seats.len() {
+        let basis = seats[i].basis.clone();
+        let tier: Vec<&QeReviewerSeat> =
+            seats[i..].iter().take_while(|c| c.basis == basis).collect();
+        i += tier.len();
+        out.extend(
+            tier.iter()
+                .filter(|c| !tried(&c.seat))
+                .map(|c| (*c).clone()),
+        );
+        out.extend(tier.iter().filter(|c| tried(&c.seat)).map(|c| (*c).clone()));
+    }
+    out
+}
+
+/// (F23) The executor's note on a redo: what the last isolated review could not judge, so the
+/// evidence it takes again covers it. Empty unless the unit's newest redo is on the tree it starts
+/// on. One short line (it rides the unit prompt); the reviewer never sees it.
+pub(crate) fn redo_note(unit: &WorkUnit) -> String {
+    let tree = unit.worktree_baseline.as_ref().map(|b| b.tree.as_str());
+    let Some(last) = unit.qe_redos.last().filter(|r| redo_on(r, tree)) else {
+        return String::new();
+    };
+    format!(
+        " This is QE redo {} of {QE_REDO_MAX}: the last isolated review gave no verdict ({}). Take          the evidence again from the start.",
+        redos_on(unit, tree),
+        bounded_line(&last.reason, REDO_REASON_MAX)
+    )
+}
+
 /// Whether this unit's attempt runs the engine's reviewer: the run's QE unit carrying its ledger
 /// root, with a `required` decision — and never the reviewer turn itself.
 pub(crate) fn applies(unit: &WorkUnit) -> bool {
@@ -897,6 +1047,15 @@ pub(crate) fn run(
             return Some(review);
         }
     };
+    // (F23) A redo binds a NEW QE run: the run whose record it redoes is never reviewed again,
+    // whatever its ledger metadata says and whatever run a later retry was told to resume.
+    if retired_by_redo(&input.unit, &id) {
+        review.reason = format!(
+            "the QE evidence could not be bound: QE run {id} is the run a redo of the QE check \
+             retired; the redo takes its evidence again in a new QE run"
+        );
+        return Some(review);
+    }
     let dir_s = dir.to_string_lossy().into_owned();
     review.evidence_dir = Some(dir_s.clone());
     review.qe_run_id = Some(id.clone());

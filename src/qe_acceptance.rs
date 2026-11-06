@@ -196,6 +196,12 @@ pub(crate) fn on_dispatch(
     if !is_qe_unit(unit) {
         return Dispatched::Unchanged;
     }
+    // (F23) A redo of the QE check keeps the decision it redoes: a required QE step whose reviewer
+    // gave no verdict on this tree is not re-scored into a waiver by its redo; only the new
+    // reviewer's bound PASS counts it.
+    if current.required() && review::redos_on(unit, baseline.map(|(t, _)| t)) > 0 {
+        return Dispatched::Unchanged;
+    }
     let decided = if floor_fix_pending(unit) {
         QeAcceptance {
             status: a::QE_REQUIRED.to_string(),
@@ -469,8 +475,9 @@ pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
         .unwrap_or_default();
     if review::applies(unit) {
         return format!(
-            "{}{floor}",
-            review::evidence_directive(skill, review::resume_dir(unit))
+            "{}{floor}{}",
+            review::evidence_directive(skill, review::resume_dir(unit)),
+            review::redo_note(unit)
         );
     }
     unit.qe_acceptance

@@ -1542,7 +1542,7 @@ impl Core {
                 (
                     Some(
                         a @ ("extend" | "targeted" | "accept_partial" | "accept_suggestion"
-                        | "rejudge" | "retry_rules"),
+                        | "rejudge" | "retry_rules" | "retry_qe"),
                     ),
                     true,
                 ) => {
@@ -1572,7 +1572,8 @@ impl Core {
                     Some(
                         a @ ("approve" | "reject" | "request_changes" | "extend" | "targeted"
                         | "accept_partial" | "accept_suggestion" | "amend_intent" | "rejudge"
-                        | "operator_judgment" | "skip_qe" | "retry_rules" | "skip_rules"),
+                        | "operator_judgment" | "skip_qe" | "retry_rules" | "skip_rules"
+                        | "retry_qe"),
                     ),
                     _,
                 ) => {
@@ -1580,14 +1581,15 @@ impl Core {
                         "action `{a}` disagrees with approve={approve} (request_changes and \
                          reject require approve=false; approve, extend, targeted, accept_partial, \
                          accept_suggestion, amend_intent, rejudge, operator_judgment, skip_qe, \
-                         retry_rules and skip_rules require approve=true)"
+                         retry_rules, skip_rules and retry_qe require approve=true)"
                     )))
                 }
                 (Some(other), _) => {
                     return Err(err(anyhow::anyhow!(
                         "unknown action `{other}` (expected approve | request_changes | reject | \
                          extend | targeted | accept_partial | accept_suggestion | amend_intent | \
-                         rejudge | operator_judgment | skip_qe)"
+                         rejudge | operator_judgment | skip_qe | retry_rules | skip_rules | \
+                         retry_qe)"
                     )))
                 }
             };

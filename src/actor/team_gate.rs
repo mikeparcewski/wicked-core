@@ -2147,6 +2147,7 @@ pub(super) fn answer_dispute_gate(
         | crate::workflow::HumanDecision::AmendIntent { .. }
         | crate::workflow::HumanDecision::ConsentChoice { .. }
         | crate::workflow::HumanDecision::Rejudge
+        | crate::workflow::HumanDecision::RetryQe
         | crate::workflow::HumanDecision::RecheckRules { .. }
         | crate::workflow::HumanDecision::OperatorJudgment { .. }
         | crate::workflow::HumanDecision::SkipQe { .. } => {

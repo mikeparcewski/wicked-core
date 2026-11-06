@@ -429,7 +429,8 @@ impl Campaign {
                     | HumanDecision::FloorRerun(_)
                     | HumanDecision::AcceptSuggestion
                     | HumanDecision::ConsentChoice { .. }
-                    | HumanDecision::Rejudge => None,
+                    | HumanDecision::Rejudge
+                    | HumanDecision::RetryQe => None,
                     // (DES-RULE-CHECK-001 S2) The skips' reasons are the record.
                     HumanDecision::RecheckRules { skips } => (!skips.is_empty()).then(|| {
                         skips

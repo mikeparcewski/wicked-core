@@ -661,3 +661,47 @@ fn the_qe_directive_carries_the_floors_evidence_on_its_own_tree() {
     qe.qe_acceptance = Some(q);
     assert!(!unit_directive(&qe, "wicked-garden:qe").contains(&note));
 }
+
+/// (F23, xreview) A redo of the QE check keeps the decision it redoes: the redone dispatch of a
+/// required QE step is not re-scored on that tree (a re-score could waive it with no reviewer
+/// PASS); on another tree, or with no redo, the dispatch scores as before.
+#[test]
+fn a_redo_dispatch_keeps_qe_required_on_its_tree() {
+    let mut s = session(requiring());
+    s.assurance.qe = Some(QeAcceptance {
+        status: a::QE_REQUIRED.into(),
+        basis: a::QE_BASIS_DIFF.into(),
+        score: Some(60),
+        threshold: 20,
+        reason: "required: score 60".into(),
+        reasons: Vec::new(),
+        ord: Some(3),
+        tree: Some("t1".into()),
+    });
+    let git = std::path::Path::new("/nonexistent/.git");
+    let mut u = qe_unit(3);
+    // No redo: the dispatch re-scores (here, to "no repository diff").
+    assert!(matches!(
+        on_dispatch(&s, &u, None, Some(("t1", git))),
+        Dispatched::Decided(_)
+    ));
+    u.qe_redos.push(crate::domain::QeRedo {
+        tree: Some("t1".into()),
+        from_attempt: 1,
+        outcome: "inconclusive".into(),
+        qe_run_id: None,
+        seats: vec!["codex".into()],
+        reason: "no sandbox tool".into(),
+        by: "mike".into(),
+        at: 1,
+    });
+    assert!(matches!(
+        on_dispatch(&s, &u, None, Some(("t1", git))),
+        Dispatched::Unchanged
+    ));
+    // Another tree is new work: it scores again.
+    assert!(matches!(
+        on_dispatch(&s, &u, None, Some(("t2", git))),
+        Dispatched::Decided(_)
+    ));
+}
