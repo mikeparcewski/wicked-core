@@ -2187,6 +2187,263 @@ mod tests {
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
+    /// F16 PROVING TEST (e2e-1105): a chat turn on a seat with no hook (codex in its container
+    /// seat arms the `os_sandbox` carrier; the ACP bridge is the other hook-free carrier) calls a
+    /// registered stdio MCP tool through the broker twice: the first call asks for first use, the
+    /// operator approves, the second runs. The broker's claims are the only claims in the log and
+    /// no hook ever ran, so there is no hook-fired sentinel. The fold must pass the unit: before
+    /// the fix it denied it "hook-fired sentinel missing" (core#34) and the turn parked red.
+    ///
+    /// The fence beside it: on a carrier that runs a hook (wrapped, relayed, or an unknown one held
+    /// to that rule) the same broker claims with no sentinel still deny, and on a hook-free carrier
+    /// a single non-broker claim with no sentinel still denies (a suppressed hook).
+    #[test]
+    fn brokered_stdio_claims_on_a_hook_free_carrier_pass_and_a_suppressed_hook_still_denies() {
+        use crate::gate_hook::{
+            append_annotated_claim_checked, decisions_path_for, fold_input_denial_with_activity,
+            gov_run_dir, write_armed_marker_for, write_os_sandbox_marker,
+            write_relayed_armed_marker, CARRIER_ACP, CARRIER_WRAPPED_CLI,
+        };
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let pid = std::process::id();
+        // The fixture's read tool, as crew's broker forwards it (the request's wire shape).
+        let echo = serde_json::json!({
+            "server": "echo-e2e",
+            "tool": "echo",
+            "args": {"text": "hello"},
+            "annotations": {"readOnlyHint": true},
+            "registered": true,
+            "kind": "mcp-stdio",
+            "carrier": CARRIER_SHIM,
+        });
+        // One chat turn: arm the unit's marker as its launcher does, bind a token to the unit, and
+        // make the two brokered calls through the JSON face crew's `/mcp/call` route uses.
+        let turn = |case: &str, arm: &dyn Fn(&std::path::Path)| -> String {
+            let run_id = format!("f16-{case}-{pid}-{tid}");
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let dpath = decisions_path_for(&run_id, 0);
+            arm(&dpath);
+            let db = gov_run_dir(&run_id).join("policy.db");
+            {
+                let mut store = open_store(Some(&db.to_string_lossy())).unwrap();
+                seed_mcp_defaults(&mut store).unwrap();
+            }
+            let mut u = unit(
+                WritePosture::ReadOnly,
+                PhaseRole::Evaluator,
+                "codex",
+                McpMode::Balanced,
+            );
+            u.run_id = run_id.clone();
+            u.phase = "unit-1".to_string();
+            u.ord = 1;
+            u.db_path = db.to_string_lossy().into_owned();
+            u.decisions_path = dpath.clone();
+            let token = McpToken::mint();
+            let _b = token.bind(u);
+            let ask = |call: &Value| -> Value {
+                let out = evaluate_mcp_call_json(
+                    &serde_json::json!({ "token": token.value, "call": call }).to_string(),
+                )
+                .unwrap();
+                serde_json::from_str(&out).unwrap()
+            };
+            assert_eq!(ask(&echo)["decision"], "ask", "first use asks");
+            {
+                let mut store = open_store(Some(&db.to_string_lossy())).unwrap();
+                approve(&mut store, FIRST_USE_LEDGER, "mcp:echo-e2e");
+            }
+            assert_eq!(ask(&echo)["decision"], "allow", "approved, it runs");
+            run_id
+        };
+        let fold = |run_id: &str| {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let d = fold_input_denial_with_activity(&mut store, run_id, 0, "unit-1", true, true)
+                .unwrap();
+            let _ = std::fs::remove_dir_all(gov_run_dir(run_id));
+            d
+        };
+        let roots = [std::path::PathBuf::from("/w/sandbox")];
+
+        // The F16 repro: codex in its container seat (`os_sandbox`, boundary `docker`), and the
+        // other hook-free carrier.
+        for (case, carrier) in [("docker", "docker"), ("seat-codex", "seat:codex")] {
+            let run_id = turn(case, &|p| {
+                write_os_sandbox_marker(p, "unit-1", &roots, carrier).unwrap()
+            });
+            assert_eq!(
+                fold(&run_id),
+                None,
+                "{case}: brokered calls are not hook claims"
+            );
+        }
+        let run_id = turn("acp", &|p| {
+            write_armed_marker_for(p, "unit-1", Some(CARRIER_ACP)).unwrap()
+        });
+        assert_eq!(
+            fold(&run_id),
+            None,
+            "acp: brokered calls are not hook claims"
+        );
+
+        // Fence 1: a carrier that runs a hook reaches the broker through a hooked tool call, so
+        // the broker's claims with no sentinel still mean the hook was suppressed.
+        type Arm<'a> = &'a dyn Fn(&std::path::Path);
+        let hooked: [(&str, Arm); 3] = [
+            ("wrapped", &|p| {
+                write_armed_marker_for(p, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap()
+            }),
+            ("relayed", &|p| {
+                write_relayed_armed_marker(p, "unit-1").unwrap()
+            }),
+            ("unknown", &|p| {
+                write_armed_marker_for(p, "unit-1", Some("some_future_carrier")).unwrap()
+            }),
+        ];
+        for (case, arm) in hooked {
+            let run_id = turn(case, arm);
+            let d = fold(&run_id).unwrap_or_else(|| panic!("{case}: a silent hook must deny"));
+            assert!(
+                d.reason.contains("hook-fired sentinel missing"),
+                "{case}: {}",
+                d.reason
+            );
+        }
+
+        // Fence 2: on a hook-free carrier, a claim the broker did not record (the hook's) with no
+        // sentinel is still a suppressed hook.
+        let run_id = turn("docker-hook-claim", &|p| {
+            write_os_sandbox_marker(p, "unit-1", &roots, "docker").unwrap()
+        });
+        let hook_claim = ConformanceClaim {
+            claim_id: "f16-hook".to_string(),
+            scope: "s".to_string(),
+            phase: "unit-1".to_string(),
+            policy_ids: vec![],
+            decision: Decision::Allow,
+            obligations: vec![],
+            evaluated_context_ref: "sha256:f16".to_string(),
+            criteria: String::new(),
+            evaluator_identity: "wicked-governance".to_string(),
+            evaluated_at: 1,
+        };
+        append_annotated_claim_checked(
+            &decisions_path_for(&run_id, 0).to_string_lossy(),
+            "unit-1",
+            "Bash",
+            &hook_claim,
+        )
+        .unwrap();
+        let d = fold(&run_id).expect("a hook claim with no sentinel still denies");
+        assert!(
+            d.reason.contains("hook-fired sentinel missing"),
+            "{}",
+            d.reason
+        );
+
+        // Fence 3: the carrier that exempts broker claims must be the one that armed the unit. A
+        // hook-free marker written AFTER the calls, or after a hooked marker, lifts nothing.
+        let run_id = turn("late-marker", &|p| {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap()
+        });
+        let late = decisions_path_for(&run_id, 0);
+        write_os_sandbox_marker(&late, "unit-1", &roots, "docker").unwrap();
+        let d = fold(&run_id).expect("broker claims ahead of the marker still need the hook");
+        assert!(
+            d.reason.contains("hook-fired sentinel missing"),
+            "{}",
+            d.reason
+        );
+        for case in ["wrapped-then-acp", "wrapped-then-os"] {
+            let run_id = turn(case, &|p| {
+                write_armed_marker_for(p, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap()
+            });
+            let log = decisions_path_for(&run_id, 0);
+            if case == "wrapped-then-acp" {
+                write_armed_marker_for(&log, "unit-1", Some(CARRIER_ACP)).unwrap();
+            } else {
+                write_os_sandbox_marker(&log, "unit-1", &roots, "docker").unwrap();
+            }
+            let d = fold(&run_id).unwrap_or_else(|| panic!("{case}: a hooked marker holds"));
+            assert!(
+                d.reason.contains("hook-fired sentinel missing"),
+                "{case}: {}",
+                d.reason
+            );
+        }
+
+        // …and with no claims at all, the #653 check reads the same "any hooked marker" signal: a
+        // wrapped marker then a hook-free one, tool calls made, nothing proves the hook ran.
+        let run_id = format!("f16-653-{pid}-{tid}");
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let log = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&log, "unit-1", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        write_os_sandbox_marker(&log, "unit-1", &roots, "docker").unwrap();
+        let d = fold(&run_id).expect("a hooked marker's #653 proof holds");
+        assert!(
+            d.reason.starts_with(crate::gate_hook::GOVERNANCE_UNPROVEN),
+            "{}",
+            d.reason
+        );
+
+        // A refused brokered call (a write tool under Gate by risk, the advisory `mcp-deny:`) as
+        // the only claim on a hook-free carrier: disclosed, not a suppressed hook.
+        let run_id = format!("f16-deny-{pid}-{tid}");
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0);
+        write_os_sandbox_marker(&dpath, "unit-1", &roots, "docker").unwrap();
+        let db = gov_run_dir(&run_id).join("policy.db");
+        {
+            let mut store = open_store(Some(&db.to_string_lossy())).unwrap();
+            seed_mcp_defaults(&mut store).unwrap();
+        }
+        let mut u = unit(
+            WritePosture::ReadOnly,
+            PhaseRole::Evaluator,
+            "codex",
+            McpMode::Balanced,
+        );
+        u.run_id = run_id.clone();
+        u.phase = "unit-1".to_string();
+        u.ord = 1;
+        u.db_path = db.to_string_lossy().into_owned();
+        u.decisions_path = dpath.clone();
+        let token = McpToken::mint();
+        let b = token.bind(u);
+        let mut write = echo.clone();
+        write["tool"] = "shout".into();
+        write["annotations"] = Value::Null;
+        let out = evaluate_mcp_call_json(
+            &serde_json::json!({ "token": token.value, "call": write }).to_string(),
+        )
+        .unwrap();
+        assert!(out.contains(r#""decision":"deny""#), "{out}");
+        drop(b);
+        assert_eq!(
+            fold(&run_id),
+            None,
+            "an advisory broker deny is not a hook claim"
+        );
+
+        // Mixed, on the ACP carrier: the bridge judged one CLI call (sentinel + its claim) and the
+        // broker judged the MCP calls. The sentinel covers the bridge's claim; the unit passes.
+        let run_id = turn("acp-mixed", &|p| {
+            write_armed_marker_for(p, "unit-1", Some(CARRIER_ACP)).unwrap();
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(p).unwrap();
+            f.write_all(b"{\"_wicked_hook_fired\":\"unit-1\"}\n")
+                .unwrap();
+        });
+        append_annotated_claim_checked(
+            &decisions_path_for(&run_id, 0).to_string_lossy(),
+            "unit-1",
+            "Bash",
+            &hook_claim,
+        )
+        .unwrap();
+        assert_eq!(fold(&run_id), None, "a fired hook covers its own claim");
+    }
+
     /// The wrapped carrier's arming: a governed unit's worker gets the token and the broker URL,
     /// the token resolves to THAT unit (posture, seat and mode read off the unit and the run) until
     /// the guards drop; an ungoverned unit or a daemon with no broker gets nothing.

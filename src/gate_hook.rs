@@ -5947,7 +5947,8 @@ pub(crate) const ESTATE_DENY_REMEDY: &str =
      every other graph write belong to repo onboarding, never to a governed unit";
 
 /// Append the hook-fired liveness sentinel for `phase` (see `evaluate_tool_call`): the proof the
-/// gate RAN for this phase, which `fold_input_denial` requires beside any claim. Creates the
+/// gate RAN for this phase, which `fold_input_denial` requires beside any claim the gate could
+/// have written (every claim but the MCP broker's on a hook-free carrier, F16). Creates the
 /// governance dir when absent (a standalone / test invocation). `Err` names what failed; the
 /// caller denies.
 fn write_hook_fired_sentinel(decisions_path: &str, phase: &str) -> Result<(), String> {
@@ -6608,15 +6609,23 @@ pub(crate) fn fold_input_denial_in(
     };
     let mut denial: Option<crate::domain::UnitDenial> = None;
     let mut saw_marker = false;
-    // The carrier THIS phase's armed marker names, read once (IG1-core-2). #653's no-hook deny is
-    // scoped to the wrapped carrier: the ACP carrier answers `session/request_permission`
-    // in-process and the OS-sandbox floor has no per-call channel, so neither runs a hook.
-    let mut carrier = ArmedCarrier::Wrapped;
     // core#988: the marker says the hook is relayed (a container seat), so a hook that never ran
     // is a hook whose calls never reached the relay.
     let mut relayed = false;
     let mut saw_hook_fired = false;
-    let mut has_claim_lines = false; // any ConformanceClaim present for `phase`
+    // Any ConformanceClaim present for `phase`, except the MCP broker's claims that follow the
+    // phase's armed marker.
+    let mut has_claim_lines = false;
+    // (F16) A claim the engine's MCP broker recorded for a brokered call (`/mcp/call`). It proves
+    // the broker ran, never that a hook ran.
+    let mut has_broker_claim_lines = false;
+    // Whether ANY of this phase's armed markers names a carrier that runs a hook (IG1-core-2).
+    // #653's no-hook deny is scoped to those carriers: the ACP carrier answers
+    // `session/request_permission` in-process and the OS-sandbox floor has no per-call channel, so
+    // neither runs a hook. (F16) Read across every marker, not the last one, so a later or
+    // conflicting hook-free marker never lifts the proof an earlier hooked one requires (both the
+    // core#34 and the #653 check below).
+    let mut any_hooked_marker = false;
     let mut pending_tool: Option<String> = None; // tool name from the last annotation (this phase)
     for line in raw.lines() {
         let line = line.trim();
@@ -6642,7 +6651,7 @@ pub(crate) fn fold_input_denial_in(
         if let Some(mp) = marker_phase(&v) {
             if mp == phase {
                 saw_marker = true;
-                carrier = ArmedCarrier::of_marker(&v);
+                any_hooked_marker |= ArmedCarrier::of_marker(&v).needs_hook_proof();
                 relayed = v.get(ARMED_HOOK_KEY).and_then(|x| x.as_str()) == Some(HOOK_RELAYED);
             }
             continue;
@@ -6678,7 +6687,13 @@ pub(crate) fn fold_input_denial_in(
             pending_tool = None;
             continue; // another unit's claim — folded when that unit finishes
         }
-        has_claim_lines = true;
+        // A broker claim ahead of this phase's first marker is not exempt: the launcher writes the
+        // marker before the CLI runs, so no brokered call of the unit can precede it.
+        if claim.evaluator_identity == crate::mcp_gate::MCP_EVALUATOR && saw_marker {
+            has_broker_claim_lines = true;
+        } else {
+            has_claim_lines = true;
+        }
         conform(store, &claim)?;
         // Each claim consumes the annotation immediately preceding it — allow or deny — so a tool
         // name can never skip forward past its own claim onto a later one.
@@ -6752,11 +6767,22 @@ pub(crate) fn fold_input_denial_in(
              (decisions log tampered or truncated)"
         )));
     }
-    // Hook-liveness check: if there are claim lines for this phase but no hook-fired sentinel, the
-    // hook process was suppressed while tool calls still executed — deny immediately. The sentinel is
-    // written BEFORE any claim evaluation in `run_gate_hook`, so its absence with claims present is
-    // impossible in normal operation and indicates hook bypass.
-    if governed && saw_marker && has_claim_lines && !saw_hook_fired && denial.is_none() {
+    // Hook-liveness check: if there are claim lines the gate could have written for this phase but
+    // no hook-fired sentinel, the hook process was suppressed while tool calls still executed —
+    // deny immediately. The sentinel is written BEFORE any claim evaluation in `run_gate_hook`, so
+    // its absence beside such claims is impossible in normal operation and indicates hook bypass.
+    // Any non-broker claim counts on EVERY carrier (a tamper signal even where no hook runs).
+    //
+    // (F16) The MCP broker records its own claims (`evaluate_mcp_call`, its output decision and
+    // REST-boundary record; evaluator `MCP_EVALUATOR`) from the daemon; the broker itself never
+    // writes a sentinel. On a carrier that runs no hook (the OS-sandbox floor; the in-process ACP
+    // bridge, which writes the sentinel only for the calls its CLI asks permission for) those
+    // claims can be the only ones in the log, so they prove nothing about a hook. On a carrier
+    // that runs one (wrapped, relayed, legacy carrier-less, or unknown), the seat reaches the
+    // broker through one of its own tool calls (the shim posting to `/mcp/call`), which fires the
+    // hook first, so a broker claim with no sentinel there still means a suppressed hook.
+    let hook_claim_lines = has_claim_lines || (has_broker_claim_lines && any_hooked_marker);
+    if governed && saw_marker && hook_claim_lines && !saw_hook_fired && denial.is_none() {
         denial = Some(fail_closed(format!(
             "input governance denied {phase} (fail-closed): hook-fired sentinel missing with \
              claim lines present — hook process may have been suppressed (core#34)"
@@ -6767,7 +6793,7 @@ pub(crate) fn fold_input_denial_in(
     // hook exactly this way, so "marker only" is not "a governed unit that made no tool calls".
     if governed
         && saw_marker
-        && carrier.needs_hook_proof()
+        && any_hooked_marker
         && tool_activity
         && !saw_hook_fired
         && denial.is_none()
