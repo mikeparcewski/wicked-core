@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The rule judge's answers are kept or explained, never read as silence (e2e-1105 F20, the judge half of F22).**
+  An answer the engine does not count used to become "the judge did not answer for it, in its batch or asked
+  alone". The row now says why, naming the seat: "the judge (pi) answered KEPT without citing a changed file by its
+  whole path (its cite: ...)", "the judge (codex) was unsure: ...", no verdict block, no line for the rule, no cite,
+  conflicting lines, a WAIVED that does not quote, a delivery KEPT that does not quote the pull request, or a cut
+  diff. The judge's words are one line, capped at 300 characters. A review prompt now lists the changed files (up
+  to 200, 8 KiB, fenced as untrusted data; a name with a control character is shown escaped, so its shown form never
+  counts as a cite) and states the bar: a KEPT names a listed file by its whole path, and a line count, a directory
+  or a bare file name does not count. The KEPT bar itself is unchanged. The asked-alone retry now tries the other
+  eligible seats before the one whose answer did not count (or that timed out); with 9 rules on 2 seats it used to
+  land on the same seat. Its prompt says which kind of miss it was, in the engine's words only. Deny-dominates: a miss
+  that carried a BROKEN (conflicting lines with one BROKEN, or a BROKEN with no cite) is not asked again, so no other
+  seat can answer it away; it holds for a person. Every miss stays unchecked (a hold), never KEPT. Cache keys are
+  unchanged.
+
 - **The rule judge reads the person's gate rulings (e2e-1105 F19, F1; operator decision Q1 = B).** A review's
   rule judge was told only the run's problem and its approved amendments, so a note at a gate ("learn-small-prs is
   waived for this plugin") reached the reviewer but never the judge, and a Retry with a note reused the cached
