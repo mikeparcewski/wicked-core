@@ -1611,6 +1611,34 @@ fn a_redo_never_rebinds_the_retired_qe_run_and_an_unknown_tree_still_counts() {
         scripted.seen.lock().unwrap().is_empty(),
         "no reviewer ran on the retired run"
     );
+    // …nor on a later plain retry that was told to resume a newer run B: naming retired A is
+    // still refused.
+    let (b_id, b_dir) = l.evidence(RUN, "2020-01-01T00:00:00.000Z");
+    let mut later = u.clone();
+    later.qe_review = Some(QeReview {
+        outcome: OUTCOME_INVALID.into(),
+        reason: "the reviewer on `codex` ended with no VERDICT line".into(),
+        evidence_dir: Some(b_dir.to_string_lossy().into_owned()),
+        qe_run_id: Some(b_id),
+        tree: Some("t1".into()),
+        verdict: None,
+        attempts: Vec::new(),
+    });
+    assert!(resume_dir(&later).is_some());
+    let got = run(
+        &runner,
+        &input_for(later),
+        &executor_output(&old_dir.to_string_lossy()),
+        0,
+        &|_: &str| {},
+    )
+    .unwrap();
+    assert!(
+        got.reason.contains("a redo of the QE check retired"),
+        "{}",
+        got.reason
+    );
+    assert!(scripted.seen.lock().unwrap().is_empty());
 
     // Unknown tree on the record, known tree later: both redos still count.
     let mut v = parked(

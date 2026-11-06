@@ -1048,8 +1048,8 @@ pub(crate) fn run(
         }
     };
     // (F23) A redo binds a NEW QE run: the run whose record it redoes is never reviewed again,
-    // whatever its ledger metadata says.
-    if resume_dir(&input.unit).is_none() && retired_by_redo(&input.unit, &id) {
+    // whatever its ledger metadata says and whatever run a later retry was told to resume.
+    if retired_by_redo(&input.unit, &id) {
         review.reason = format!(
             "the QE evidence could not be bound: QE run {id} is the run a redo of the QE check \
              retired; the redo takes its evidence again in a new QE run"
