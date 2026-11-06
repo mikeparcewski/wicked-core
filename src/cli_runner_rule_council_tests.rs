@@ -735,8 +735,10 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
         }
     });
     let port = ActorDisputeCouncil { tx };
-    let lock =
-        HostCouncilLock::acquire_until(&path, std::time::Instant::now()).expect("the slot is free");
+    // A few seconds, not zero: a child another test forks may hold the lock's open file for an
+    // instant before its exec closes it (the production wait retries until its deadline too).
+    let soon = || std::time::Instant::now() + Duration::from_secs(5);
+    let lock = HostCouncilLock::acquire_until(&path, soon()).expect("the slot is free");
     let past = std::time::Instant::now() - crate::rule_check::COUNCIL_REPLY_GRACE
         + Duration::from_millis(100);
     let req = DecisionRequest {
@@ -755,5 +757,5 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
         "still held by the council after the caller stopped waiting"
     );
     actor.join().unwrap();
-    assert!(HostCouncilLock::acquire_until(&path, std::time::Instant::now()).is_ok());
+    assert!(HostCouncilLock::acquire_until(&path, soon()).is_ok());
 }

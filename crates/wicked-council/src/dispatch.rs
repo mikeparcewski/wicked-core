@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wicked_apps_core::HardenedCommand;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 use crate::types::STDERR_CAPTURE_LIMIT;
 use crate::types::{
     AgenticCli, BallotCarrier, BallotContext, BallotFrame, BallotRun, Category, CouncilTask,
@@ -1651,7 +1651,8 @@ fn kill_process_tree(child: &mut std::process::Child) {
 /// readiness in std. If the budget expires the thread is abandoned rather than joined: it is
 /// blocked on a pipe whose writer we do not control, and joining it would reintroduce the exact
 /// unbounded wait this function exists to remove. It exits on its own once the last writer closes.
-#[cfg(test)]
+// Only its unix tests read a pipe this way now: host ballots drain through `BoundedReader`.
+#[cfg(all(test, unix))]
 fn drain_stderr(child: &mut std::process::Child, budget: Duration) -> String {
     let Some(mut pipe) = child.stderr.take() else {
         return String::new();
