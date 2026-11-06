@@ -6229,10 +6229,7 @@ pub(crate) fn checkout_guarded_tree(
     let parent = std::env::temp_dir().join("wicked-core-floor");
     std::fs::create_dir_all(&parent)
         .map_err(|e| format!("the floor checkout directory could not be created: {e}"))?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or_default();
+    let nonce = floor_checkout_nonce();
     let dir = parent.join(format!("{label}-{}-{nonce}", std::process::id()));
     let dir_s = dir.to_string_lossy().into_owned();
     let mut checkout = FloorCheckout {
@@ -6285,6 +6282,19 @@ pub(crate) fn checkout_guarded_tree(
     crate::worktree_guard::git(&dir, &["-c", &no_hooks, "read-tree", &commit], &[])
         .map_err(|e| format!("the floor checkout's index could not be set: {e}"))?;
     Ok(checkout)
+}
+
+/// A name part no two guarded checkouts of one process share: the clock alone is not (macOS reads it
+/// in microseconds, so two checkouts of the same label started together got the same dir, and one's
+/// cleanup deleted the other's conversion repository: `git/config` not found).
+fn floor_checkout_nonce() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{nanos}-{seq}")
 }
 
 /// What the export materialized for one tree entry — recorded at write time so the integrity
@@ -15622,5 +15632,17 @@ mod floor_pass_tests {
         // The slot is removed when the work returns: a later pass is not recorded into it.
         note_pass("lint", Tree::Head);
         assert!(now.lock().unwrap().describe().unwrap().contains("`test`"));
+    }
+}
+
+#[cfg(test)]
+mod floor_checkout_nonce_tests {
+    /// Two guarded checkouts started in the same instant of one process never share a dir name
+    /// (the macOS clock reads microseconds: the editor-conformance host cases collided on it).
+    #[test]
+    fn two_checkouts_in_one_instant_get_distinct_names() {
+        let names: std::collections::HashSet<String> =
+            (0..1000).map(|_| super::floor_checkout_nonce()).collect();
+        assert_eq!(names.len(), 1000);
     }
 }
