@@ -2364,6 +2364,25 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.31** — 2026-11-06 — patch release on main 0935c45, carrying 5 PRs since 0.15.30: #1294, #1298, #1299, #1300 and #1301.
+  - **A rule's machine check no longer refuses work the rule is not about (#1299, F11).** A machine obligation decides
+    its rule alone only where a step scope the rule's author wrote selects it; anywhere else a distinct judge first
+    rules whether the change is the work the rule speaks of. Studio's "Tests with every fix" starter no longer
+    refuses every new app by chat, and an untested bug fix still denies.
+  - **A brokered MCP call on a hook-free seat is not a suppressed hook (#1300, F16).** The MCP broker's own claim in a
+    unit's decisions log counts toward the hook-fired check (core#34) only when the phase's marker names a carrier
+    that runs a hook, so a chat turn on a container (`os_sandbox`) or ACP seat that calls a registered MCP tool
+    completes instead of being denied "hook-fired sentinel missing". Any other claim without a sentinel still denies.
+  - **A deliver rule check that cannot run names each deferred rule (#1298, e2e-1105 F4c).** With no pull request
+    text, or no readable rules, every rule deferred to delivery gets an `unchecked` row with an evidence key, so the
+    person can skip it with a reason or re-check it instead of looping on "Re-check the rules".
+  - **A drafted document can be restyled (#1301, F8).** The `interactive-draft` preset tells the drafter to write every
+    colour and font as a theme token with a fallback (`var(--wi-bg, #…)`, …) and never to declare `--wi-*` itself, so
+    the theme wicked-interactive supplies re-colours every slide or page.
+  - **Lockfile:** #1294 re-stamped the 0.15.30 platform lock entries.
+  - No binding method, `confirmGate` argument or `LaunchSpec` field is added. The seat and floor Dockerfiles, the seat
+    package pins, the base image and the gate-hook protocol are unchanged since 0.15.30, so the seat and floor image
+    tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.30** — 2026-11-06 — patch release on main 773687f, carrying 2 PRs since 0.15.29: #1287 and #1291.
   - **A disputed steering rule goes to a bounded rule council (#1287, DES-RULE-CHECK-001 rev 2, Part A).** When the
     engine's rule judge and the review seat disagree on one rule at a review or QE gate, a three-seat council of
