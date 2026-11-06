@@ -511,6 +511,18 @@ pub(crate) fn evaluator_brief(
         "- [floor record] is the engine's own run of the repository's checks on the tree under \
          review: cite it; do not report the floor results as unavailable.",
     );
+    // (DES-EDITOR-CONFORMANCE-HOST) The editor conformance cases are the engine's to run, on the host.
+    let from = creator.map_or(0, |c| c.ord);
+    if units
+        .iter()
+        .any(|u| u.ord < ord && u.ord >= from && u.editor_conformance.is_some())
+    {
+        c.push_str(
+            "\n- [editor conformance record] is the engine's own run of the editor conformance cases \
+             on this host: cite it for any conformance item. Never run conformance.py in your seat \
+             (no seat has a headless browser), and its absence there is not a finding.",
+        );
+    }
     out.push((ord, format!("[review checklist — unit {ord}]"), c));
 
     // 2. Its own prior verdicts.
@@ -589,6 +601,21 @@ pub(crate) fn evaluator_brief(
                 if report.passed { "PASSED" } else { "FAILED" },
                 report.summary()
             ),
+        ));
+    }
+
+    // 5. (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The engine's own editor conformance run on the tree
+    // under review — the latest record from the creator on (a send-back clears older ones).
+    if let Some((co, rec)) = units
+        .iter()
+        .filter(|u| u.ord < ord && u.ord >= from)
+        .filter_map(|u| u.editor_conformance.as_ref().map(|r| (u.ord, r)))
+        .max_by_key(|(o, _)| *o)
+    {
+        out.push((
+            co,
+            format!("{} — unit {co}]", crate::editor_conformance::RECORD_LABEL),
+            crate::editor_conformance::brief_block(co, creator.map(|c| c.ord), rec),
         ));
     }
     out

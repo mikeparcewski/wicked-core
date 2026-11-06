@@ -20,6 +20,29 @@ Two release tracks share this file, newest entry first regardless of track:
   instead of returning INCONCLUSIVE. The seat image tag is a content hash of the Dockerfile, so each seat image is
   rebuilt on its next use.
 
+- **An editor-plugin run's conformance cases are run by the engine on the host, and the review cites its record (e2e
+  F18, DES-EDITOR-CONFORMANCE-HOST).** The `editor-plugin` preset's `test` step told the review seat to run garden's
+  conformance harness, and no seat has a headless browser. The harness exited 3 on every attempt, so the review could
+  never pass. A new catalog Tool, `editor_conformance`, now sits between `build` and `test`. It runs garden's fixed
+  `scripts/editor/conformance.py --engine` on the host under a new jail, `NetworkPolicy::LoopbackServe`
+  (`validator::serve_jail`): writes only to a private temp dir, and network only on ONE loopback port, the harness's
+  own origin (bind, inbound, outbound). Studio's host page comes from crew's studio dist, never from the daemon, so
+  crew's API cannot be reached from the browser running the seat-written editor.
+  - Jail support: macOS (sandbox-exec) and Linux (bwrap's own network namespace). Windows has no jail and refuses
+    with `unjailed_host`.
+  - Inputs: crew's private Playwright interpreter and its studio dist come from the daemon variables
+    `WICKED_EDITOR_CONFORMANCE_PYTHON` and `WICKED_EDITOR_CONFORMANCE_STUDIO_DIST`. Nothing is installed at dispatch.
+  - The record: the engine reads the report from its own temp dir. It applies crew's required-case rule (0-6 and
+    8-12, plus 13-16 for a protocol-2 editor) and binds the report to the worktree's tree id taken before and after
+    the run. It keeps the result as `WorkUnit::editor_conformance`.
+  - Outcomes: a failed case or an invalid pack is a verdict (`editor_conformance_failed`), sent back to `build`. A run
+    that could not happen is a refusal (`editor_conformance_refused`), which the gate retries. The review never
+    starts on a tree that did not pass.
+  - The review: the `test` evaluator's brief and the isolated QE reviewer's input carry
+    `[editor conformance record — unit N]`, with the rule never to run the harness in the seat. The `build` and
+    `test` instructions no longer ask for it.
+  - The record is a fact the review cites plus a hard gate on its own step. It is not the run's QE attributed PASS;
+    QE acceptance stays a separate judgment of the editor's behaviour.
 - **A Demo video is recorded by the engine on the host, never by a seat (DES-DEMO-RECORD-001, core#1249).** The
   `demo` preset's `record` step ran garden's recorder inside its seat's container, which cannot reach the person's
   app (its loopback is its own) and has no ffmpeg or browser, so no demo reached its review gate. New catalog Tools

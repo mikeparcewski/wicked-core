@@ -1248,7 +1248,7 @@ fn m12_mcp_server_launches_the_preset_with_its_skills_gates_and_consent() {
 
 /// X3 (operator ruling 2026-10-10): a launch naming `editor-plugin` runs the built-in preset — scope
 /// and design gated, build on the creator with the editor-scaffold skill, test on the evaluator role
-/// (the catalog's test entry) running the conformance harness, security-review keeping the platform
+/// (the catalog's test entry) citing the engine's conformance record (the `conformance` Tool before it), security-review keeping the platform
 /// specialist and its raised gate, install-plan and install as Tool `run` steps with install gated
 /// `consent_before` on its dry run. The PA's `pa-scope` comes first.
 #[test]
@@ -1266,6 +1266,7 @@ fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
         "scope",
         "design",
         "build",
+        "conformance",
         "test",
         "security-review",
         "install-plan",
@@ -1285,6 +1286,7 @@ fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
             r("scope", "recon", "neutral", h, None),
             r("design", "recon", "neutral", h, None),
             r("build", "build", "creator", "auto", f),
+            r("conformance", "test", "neutral", "auto", None),
             r("test", "test", "evaluator", v, f),
             r("security-review", "review", "evaluator", h, f),
             r("install-plan", "build", "neutral", "auto", None),
@@ -1311,6 +1313,63 @@ fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
     );
     let install = units.iter().find(|u| u.id == "redit:install").unwrap();
     assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
+    // (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The engine's own conformance Tool sits between build and
+    // test, with the catalog's fixed command; test reviews after it.
+    let conformance = units.iter().find(|u| u.id == "redit:conformance").unwrap();
+    assert_eq!(conformance.catalog.as_deref(), Some("editor_conformance"));
+    assert_eq!(
+        conformance.tool_cmd.as_deref(),
+        Some(
+            &wicked_core::editor_conformance::CONFORMANCE_CMD
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()[..]
+        )
+    );
+    assert_eq!(conformance.depends_on, vec!["build".to_string()]);
+    let test = units.iter().find(|u| u.id == "redit:test").unwrap();
+    assert_eq!(test.depends_on, vec!["conformance".to_string()]);
+}
+
+/// (DES-EDITOR-CONFORMANCE-HOST, e2e F18) No seat of the editor-plugin workflow is told to run the
+/// conformance harness itself (no seat has a headless browser, so a review that demanded it could
+/// never pass): build hands off to the engine's run, test cites the engine's record.
+#[test]
+fn editor_plugin_seats_never_run_the_conformance_harness() {
+    let preset: serde_json::Value =
+        serde_json::from_str(include_str!("../src/presets/editor-plugin.json")).unwrap();
+    let steps = preset["steps"].as_array().unwrap();
+    let ids: Vec<&str> = steps.iter().map(|s| s["id"].as_str().unwrap()).collect();
+    let at = |id: &str| ids.iter().position(|i| *i == id).unwrap();
+    assert!(
+        at("build") < at("conformance") && at("conformance") < at("test"),
+        "{ids:?}"
+    );
+    let conformance = &steps[at("conformance")];
+    assert_eq!(conformance["catalog"], "editor_conformance");
+    assert!(
+        conformance.get("instructions").is_none(),
+        "a Tool step needs no seat text"
+    );
+    for s in steps {
+        let text = s["instructions"].as_str().unwrap_or("");
+        assert!(
+            !text.contains("conformance.py --pack")
+                && !text.contains("harness against the delivered tree yourself"),
+            "{} still tells its seat to run the harness: {text}",
+            s["id"]
+        );
+    }
+    let test = steps[at("test")]["instructions"].as_str().unwrap();
+    assert!(
+        test.contains("[editor conformance record]") && test.contains("Do not run"),
+        "{test}"
+    );
+    let build = steps[at("build")]["instructions"].as_str().unwrap();
+    assert!(
+        build.contains("The engine runs the editor conformance cases"),
+        "{build}"
+    );
 }
 
 /// DES-EDITOR-PLUGIN-CONTRACT-001: the editor-plugin builder builds protocol 2 — the design names `protocol [1, 2]`

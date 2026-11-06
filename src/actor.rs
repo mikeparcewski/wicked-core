@@ -7780,6 +7780,77 @@ fn apply_step_result(
         }
     }
 
+    // ── EDITOR CONFORMANCE FLOOR (DES-EDITOR-CONFORMANCE-HOST, e2e F18) ─────────────────────────
+    // The engine's own conformance run on the host: its record rides the unit (the reviewers cite
+    // it), and it is a hard gate. A failed case (or an invalid pack) is a verdict on the creator's
+    // work, sent back to it; a run that could not happen is a command result the gate retries. A
+    // unit with no record (it never reached the worker's read) is refused, never passed.
+    if unit.catalog.as_deref() == Some(crate::editor_conformance::CATALOG) {
+        use crate::editor_conformance as ec;
+        let rec = evidence.editor_conformance.clone().unwrap_or_else(|| {
+            ec::ConformanceRecord::refused(
+                output.attempt,
+                "engine_refused",
+                "the conformance step returned no record",
+            )
+        });
+        unit.editor_conformance = Some(rec.clone());
+        let denial = match rec.outcome.as_str() {
+            _ if rec.passed() => None,
+            ec::OUTCOME_FAIL => Some((
+                ec::DENIAL_FAILED,
+                format!(
+                    "the editor failed its conformance cases on this host: {}",
+                    rec.reason.as_deref().unwrap_or("a required case failed")
+                ),
+            )),
+            _ => Some((
+                ec::DENIAL_REFUSED,
+                format!(
+                    "the conformance cases could not run on this host ({}): {}",
+                    rec.cause.as_deref().unwrap_or("refused"),
+                    rec.reason.as_deref().unwrap_or("")
+                ),
+            )),
+        };
+        if let Some((source, why)) = denial {
+            let why = format!("{}: {why}", ec::CATALOG);
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new(source, why.clone()));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    // The engine's own command ran; its report was judged. Never a seat's failure.
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -12019,30 +12090,44 @@ fn dispatch_unit(
         // manifest and approved snapshot, resolved here; it runs jailed on the worker thread below.
         let demo = crate::demo_record::is_demo_catalog(unit.catalog.as_deref())
             .then(|| crate::demo_record::DemoDispatch::resolve(run_id, &session, unit, &units));
-        // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
-        // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
-        // snapshotted off-thread below (the repository root is the only store read it needs).
-        let run_env = (record.is_none() && demo.is_none()).then(|| ToolRunEnv {
-            run_id: run_id.to_string(),
-            ord: unit.ord,
-            consent_choice: unit.consent_choice.clone(),
-            // (domain-graph-3) A loop's command learns which pass it decides after, and the
-            // operator's choice when it re-runs from its ask.
-            repeat: unit.repeat_from.is_some().then(|| {
-                (
-                    unit.repeat_passes.saturating_add(1),
-                    unit.repeat_choice.clone(),
-                )
-            }),
-            evidence_root: session.evidence_root.clone(),
-            tree_from: session.workdir.clone().zip(
-                session
+        // (DES-EDITOR-CONFORMANCE-HOST) The editor conformance Tool: the run's worktree and the
+        // repository it was cut from (its tree id is taken before and after the run, off-thread).
+        let conformance = (unit.catalog.as_deref() == Some(crate::editor_conformance::CATALOG))
+            .then(|| ConformanceDispatch {
+                run_id: run_id.to_string(),
+                ord: unit.ord,
+                worktree: session.workdir.clone(),
+                repo_root: session
                     .repo_ref
                     .as_deref()
                     .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
                     .map(|r| r.root_path),
-            ),
-        });
+            });
+        // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
+        // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
+        // snapshotted off-thread below (the repository root is the only store read it needs).
+        let run_env =
+            (record.is_none() && demo.is_none() && conformance.is_none()).then(|| ToolRunEnv {
+                run_id: run_id.to_string(),
+                ord: unit.ord,
+                consent_choice: unit.consent_choice.clone(),
+                // (domain-graph-3) A loop's command learns which pass it decides after, and the
+                // operator's choice when it re-runs from its ask.
+                repeat: unit.repeat_from.is_some().then(|| {
+                    (
+                        unit.repeat_passes.saturating_add(1),
+                        unit.repeat_choice.clone(),
+                    )
+                }),
+                evidence_root: session.evidence_root.clone(),
+                tree_from: session.workdir.clone().zip(
+                    session
+                        .repo_ref
+                        .as_deref()
+                        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                        .map(|r| r.root_path),
+                ),
+            });
         // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
         // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown flip it:
         // `tombstone_run` + `advance_launch_seq` inside `cancel_run` (covers all cancel callers),
@@ -12127,6 +12212,7 @@ fn dispatch_unit(
             // (`skills_refusal`), nothing executed; off the actor thread like the command itself.
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
             let mut demo_take: Option<crate::demo_record::DemoTake> = None;
+            let mut conformance_rec: Option<crate::editor_conformance::ConformanceRecord> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
@@ -12219,6 +12305,35 @@ fn dispatch_unit(
                         );
                         killed = k;
                         demo_take = Some(take);
+                        (o, st)
+                    } else if let Some(c) = &conformance {
+                        // The generation the run was admitted against, else the ladder's; a
+                        // ladder that FAILED is a refusal (never an unadmitted garden on PATH).
+                        let garden: Result<Option<std::path::PathBuf>, String> =
+                            match admitted.as_ref() {
+                                Some(g) => Ok(Some(g.root.clone())),
+                                None => match crate::skills_snapshot::resolve_ladder() {
+                                    Ok(crate::skills_snapshot::Ladder::Root(g)) => Ok(Some(g.root)),
+                                    Ok(crate::skills_snapshot::Ladder::Absent) => Ok(None),
+                                    Ok(crate::skills_snapshot::Ladder::Failed(why)) => Err(why),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                            };
+                        let (o, st, k, rec) = run_conformance_tool(
+                            &cmd,
+                            c,
+                            garden
+                                .as_ref()
+                                .map(Option::as_deref)
+                                .map_err(String::as_str),
+                            attempt,
+                            &crate::validator::serve_jail,
+                            &stop,
+                            &on_spawn,
+                            &on_done,
+                        );
+                        killed = k;
+                        conformance_rec = Some(rec);
                         (o, st)
                     } else {
                         let emit_ev = |ev: CoreEvent| {
@@ -12388,6 +12503,7 @@ fn dispatch_unit(
                     bench_reprobes: Vec::new(),
                     rule_check: delivery_rule_check,
                     demo_take,
+                    editor_conformance: conformance_rec,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -12936,6 +13052,227 @@ fn run_demo_tool(
         StepStatus::Ok
     };
     (out, status, killed, take)
+}
+
+/// (DES-EDITOR-CONFORMANCE-HOST) What the actor resolves for one `editor_conformance` dispatch.
+#[derive(Debug, Clone)]
+struct ConformanceDispatch {
+    run_id: String,
+    ord: u32,
+    /// The run's worktree (the pack is the ONE editor pack under it).
+    worktree: Option<String>,
+    /// The registered repository's root (its git dir pins the tree snapshot).
+    repo_root: Option<String>,
+}
+
+/// (DES-EDITOR-CONFORMANCE-HOST) Run the `editor_conformance` Tool: garden's harness in engine mode,
+/// jailed to its own loopback port (`serve_jail`), cwd and writes in a private temp dir, a cleared
+/// environment plus the declared variables, killed past [`crate::editor_conformance::DEADLINE`]. The
+/// report is read from the out file in the engine's temp dir and bound to the worktree's tree id
+/// taken before and after; the fold judges the unit from the returned record, never from the exit
+/// status.
+#[allow(clippy::too_many_arguments)]
+fn run_conformance_tool(
+    cmd: &[String],
+    d: &ConformanceDispatch,
+    garden: Result<Option<&std::path::Path>, &str>,
+    attempt: u32,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::editor_conformance::ConformanceRecord,
+) {
+    use crate::editor_conformance as ec;
+    use crate::workflow::StepStatus;
+    let refused = |cause: &str, why: String| {
+        (
+            format!("{}: ran nothing: {cause}: {why}", ec::CATALOG),
+            StepStatus::Ok,
+            None,
+            ec::ConformanceRecord::refused(attempt, cause, why),
+        )
+    };
+    let (Some(wt), Some(repo)) = (d.worktree.as_deref(), d.repo_root.as_deref()) else {
+        return refused(
+            "engine_refused",
+            "the run has no worktree in a registered repository to find the editor pack in".into(),
+        );
+    };
+    let worktree = std::path::PathBuf::from(wt);
+    let tree_of = || {
+        crate::worktree_guard::snapshot(&worktree, std::path::Path::new(repo))
+            .map(|s| s.tree)
+            .map_err(|e| e.to_string())
+    };
+    let garden_root = match garden {
+        Ok(r) => r,
+        Err(why) => {
+            return refused(
+                "engine_refused",
+                format!("the skills generation could not be resolved ({why}); the harness never runs from an unadmitted garden"),
+            )
+        }
+    };
+    // The jail hides the credential directories; a garden that lives under one cannot run in it.
+    if let Some(g) = garden_root {
+        let real = g.canonicalize().unwrap_or_else(|_| g.to_path_buf());
+        if let Some(mask) = crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+        {
+            return refused(
+                "engine_refused",
+                format!(
+                    "the skills generation lives under {}, which the harness's jail hides: publish a \
+                     skills snapshot (WICKED_SKILLS_SNAPSHOT) for the daemon",
+                    mask.display()
+                ),
+            );
+        }
+    }
+    let (python, dist) = match ec::host_inputs() {
+        Ok(x) => x,
+        Err((cause, why)) => return refused(&cause, why),
+    };
+    if let Some(r) = stop() {
+        return refused("engine_refused", format!("stopped before it began ({r})"));
+    }
+    let before = match tree_of() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the worktree's tree could not be read before the run: {e}"),
+            )
+        }
+    };
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the harness's private temp dir: {e}"),
+            )
+        }
+    };
+    let port = match ec::free_port() {
+        Ok(p) => p,
+        Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
+    };
+    let launcher = jail(&[tmp.path()], port);
+    if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
+        return refused(
+            "unjailed_host",
+            format!(
+                "this host has no OS jail that confines the harness to its own loopback port (sandbox \
+                 level {}): a seat-written editor never runs in a browser on the host unjailed. It runs \
+                 on macOS (sandbox-exec) and Linux (bwrap)",
+                launcher.level.as_wire()
+            ),
+        );
+    }
+    let kind = launcher
+        .wrapper
+        .iter()
+        .filter_map(|a| std::path::Path::new(a).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .find(|n| n == "bwrap" || n == "sandbox-exec")
+        .unwrap_or_else(|| launcher.wrapper[0].clone());
+    let out_file = tmp.path().join("report.json");
+    let tmp_s = tmp.path().to_string_lossy().into_owned();
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|k| ((*k).to_string(), tmp_s.clone()))
+        .collect();
+    env.extend(ec::host_passthrough_env());
+    env.extend(ec::tool_env(
+        &d.run_id, d.ord, &worktree, port, &out_file, &python, &dist, &kind,
+    ));
+    if let Some(groot) = garden_root {
+        env.push((
+            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+            groot.to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "PATH".to_string(),
+            crate::skills_snapshot::prepend_path_entry(
+                &groot.join(crate::skills_snapshot::SCRIPTS_DIR),
+                std::env::var_os("PATH").as_deref(),
+                crate::skills_snapshot::PATH_LIST_SEPARATOR,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        ));
+    }
+    let started = std::time::Instant::now();
+    let over = std::cell::Cell::new(false);
+    let limited_stop = || -> Option<&'static str> {
+        if let Some(r) = stop() {
+            return Some(r);
+        }
+        if started.elapsed() > ec::DEADLINE {
+            over.set(true);
+            return Some("deadline_exceeded");
+        }
+        None
+    };
+    let (out, status, killed) = run_tool_cmd_jailed(
+        cmd,
+        Some(&tmp_s),
+        &env,
+        Some(&launcher.wrapper),
+        &limited_stop,
+        on_spawn,
+        on_done,
+    );
+    if over.get() {
+        let why = format!(
+            "the conformance run went past {} minutes and was stopped",
+            ec::DEADLINE.as_secs() / 60
+        );
+        return (
+            out,
+            StepStatus::Ok,
+            killed,
+            ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why),
+        );
+    }
+    let mut rec = ec::judge_report(ec::read_report(&out_file).as_deref(), attempt);
+    drop(tmp);
+    match tree_of() {
+        Ok(after) if after == before => rec.tree = Some(before),
+        Ok(after) => {
+            rec = ec::ConformanceRecord::refused(
+                attempt,
+                "tree_changed",
+                format!(
+                    "the worktree changed while the cases ran (tree {before} before, {after} after): \
+                     the report is about no one tree"
+                ),
+            );
+        }
+        Err(e) => {
+            rec = ec::ConformanceRecord::refused(
+                attempt,
+                "engine_refused",
+                format!("the worktree's tree could not be read after the run: {e}"),
+            );
+        }
+    }
+    rec.jail = Some(kind);
+    // The verdict is the fold's (from the record); a command that ran to its end is Ok here, so a
+    // failing run is never retried by the failure ladder as a broken command.
+    let status = if killed.is_some() {
+        status
+    } else {
+        StepStatus::Ok
+    };
+    (out, status, killed, rec)
 }
 
 /// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
@@ -17863,6 +18200,8 @@ fn rewind_to_creator_scoped(
                 || d.source == crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL
                 // (DES-DEMO-RECORD-001) The host could not record: retry the Tool.
                 || d.source == crate::demo_record::DENIAL_REFUSED
+                // (DES-EDITOR-CONFORMANCE-HOST) The cases could not run here: retry the Tool.
+                || d.source == crate::editor_conformance::DENIAL_REFUSED
         }
         None => !cursor
             .denial_reason
@@ -17973,6 +18312,8 @@ fn rewind_to_creator_scoped(
         u.worktree_mutation = None;
         u.denial = None;
         u.denial_reason = None;
+        // (DES-EDITOR-CONFORMANCE-HOST) A record judged the tree before this rework: never cited again.
+        u.editor_conformance = None;
         // A rework runs the seat: a re-judge left armed (its attempt never folded) is void.
         u.requested_rejudge = None;
         if ix == target_ix {
