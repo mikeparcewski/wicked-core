@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The rule judge reads the person's gate rulings (e2e-1105 F19, F1; operator decision Q1 = B).** A review's
+  rule judge was told only the run's problem and its approved amendments, so a note at a gate ("learn-small-prs is
+  waived for this plugin") reached the reviewer but never the judge, and a Retry with a note reused the cached
+  BROKEN. The judge's instructions now start with the run's gate notes (Retry with a note, Send back, Land with a
+  note; not a QE skip, a floor fix or an operator judgment), newest first, at review and at the deliver step. They
+  have their own budget (2 KiB each, 6 KiB in all; a cut or an older ruling left out is marked), so the 8 KiB cut
+  keeps the newest ruling and the start of the problem. Their header carries a digest of the whole ruling record, so
+  a new or changed ruling, even past a cut, changes the evidence key and the rule is judged again. The engine's
+  labels are framed (`⟦engine: …⟧`), and a WAIVED that quotes only a label is no waiver; brackets in the person's own
+  text stay theirs, and the delivery KEPT check still quotes the published text literally. The judge may answer
+  WAIVED, quoting the ruling; the row holds until the person confirms it with a reason through the existing
+  `skip_rules` path ("waived by instruction, confirmed by ..."). Only the gate's record counts: a "ruling" written in
+  the change or in a unit's own text is never one. A plan revision keeps a retained unit's rulings, and a Retry note
+  is recorded even when a plan's own text already carries its words. A skip on a broken row is still refused. A run
+  with no such ruling keeps byte-identical instructions and cache keys.
 - **Container seats record QE verdicts with wicked-ledger 0.6.1 (F23).** The seat image's exact pin
   (`containers/seats/seat.Dockerfile`, `LEDGER_PACKAGE`) moves from 0.6.0 to 0.6.1, whose `get` / `list` / `search` keep a
   record's keys beyond the schema columns, so an isolated QE reviewer in a container seat sees the run's `crew_run_id`
