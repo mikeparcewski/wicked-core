@@ -768,6 +768,27 @@ pub struct BallotContext {
     pub prior_tally: Vec<(String, u32)>,
     /// Runoff only: anonymized dissent arguments (top risks cited by non-winning votes).
     pub dissent_arguments: Vec<String>,
+    /// (DES-RULE-CHECK-001 rev 2) What the ballot is for: a routing pick (every team council,
+    /// byte-unchanged) or a disputed steering-rule verdict (nonce-framed, bounded).
+    pub frame: BallotFrame,
+    /// The council's ABSOLUTE deadline, when it has one: no ballot starts after it, and a
+    /// ballot's budget is never longer than the time left before it.
+    pub deadline: Option<std::time::Instant>,
+    /// The most bytes this ballot's whole rendered prompt may hold; a ballot over it is never
+    /// sent (it rides one argv argument).
+    pub prompt_budget: Option<usize>,
+}
+
+/// (DES-RULE-CHECK-001 rev 2) The kind of question a ballot asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BallotFrame {
+    /// The routing scaffold (`dispatch::render_ballot`), unchanged: team councils.
+    #[default]
+    Routing,
+    /// One disputed steering-rule verdict: the answer counts only inside a fresh
+    /// `BEGIN BALLOT <nonce>` … `END BALLOT <nonce>` block (`dispatch::parse_vote_framed`),
+    /// every retained field and the captured output are bounded.
+    Dispute,
 }
 
 /// The legacy plain-scaffold context: no seat, first ballot, no approval bar. `ballot`
@@ -780,6 +801,9 @@ impl Default for BallotContext {
             approval_threshold: 0.0,
             prior_tally: Vec::new(),
             dissent_arguments: Vec::new(),
+            frame: BallotFrame::Routing,
+            deadline: None,
+            prompt_budget: None,
         }
     }
 }
@@ -832,6 +856,12 @@ pub enum SeatFailureKind {
     /// dispatch on bench expiry), never a `--version` probe: a binary that prints its version is
     /// alive, not ready.
     Benched,
+    /// (DES-RULE-CHECK-001 rev 2) The rendered ballot is larger than its prompt budget, so it was
+    /// never sent. Not the seat's failure: its health is untouched.
+    PromptTooLarge,
+    /// (DES-RULE-CHECK-001 rev 2) The council's absolute deadline had passed (or no permit came
+    /// before it), so the ballot never started. Not the seat's failure: its health is untouched.
+    DeadlinePassed,
 }
 
 impl SeatFailureKind {
@@ -849,6 +879,8 @@ impl SeatFailureKind {
             SeatFailureKind::Unreported => "unreported",
             SeatFailureKind::Panicked => "panicked",
             SeatFailureKind::Benched => "benched",
+            SeatFailureKind::PromptTooLarge => "prompt_too_large",
+            SeatFailureKind::DeadlinePassed => "deadline_passed",
         }
     }
 }

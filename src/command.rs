@@ -434,6 +434,25 @@ pub(crate) enum Command {
         clis: Vec<wicked_council::AgenticCli>,
         reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
     },
+    /// (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run's unit `ord`, durably, before
+    /// it starts; replies `false` once the run has spent its budget.
+    ReserveRuleCouncil {
+        run_id: String,
+        ord: u32,
+        reply: std::sync::mpsc::Sender<anyhow::Result<bool>>,
+    },
+    /// (DES-RULE-CHECK-001 rev 2) Convene a RULE council on one disputed steering-rule verdict:
+    /// three seats or none, the dispute ballot frame, one absolute `deadline`. `lock` is the host's
+    /// rule-council slot, taken by the unit's worker thread before this was sent: the council
+    /// thread drops it after its last ballot, never earlier (a caller that stops waiting does not
+    /// release it). The team councils' `ConveneDecision` is untouched.
+    ConveneRuleCouncil {
+        req: crate::decision::DecisionRequest,
+        clis: Vec<wicked_council::AgenticCli>,
+        deadline: std::time::Instant,
+        lock: crate::cli_runner::HostCouncilLock,
+        reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
+    },
     RegisterWorkflow {
         json: String,
         reply: std::sync::mpsc::Sender<anyhow::Result<String>>, // returns the workflow id

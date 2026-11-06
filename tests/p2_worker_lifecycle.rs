@@ -153,6 +153,8 @@ mod tests {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            rule_councils: 0,
+            rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),
             read_view: None,

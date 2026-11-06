@@ -170,6 +170,7 @@ fn run_on(
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         judge,
         machine,
@@ -492,6 +493,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         &judge,
         &NoMachine,
@@ -598,6 +600,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         &judge,
         &NoMachine,
@@ -635,6 +638,7 @@ fn the_delivery_keeps_the_worst_row_per_rule() {
         judge: None,
         rule_key: String::new(),
         evidence_key: None,
+        ..Default::default()
     };
     let a = [row("A", RuleStatus::Kept), row("B", RuleStatus::Skipped)];
     let b = [
@@ -932,6 +936,7 @@ fn run_told(
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         judge,
         &NoMachine,
@@ -1154,6 +1159,7 @@ fn changed_instructions_check_the_rule_again() {
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         &judge,
         &NoMachine,
@@ -1207,6 +1213,7 @@ fn a_guidance_pack_rule_is_a_fact_row_and_asks_no_judge() {
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
+            settled: &[],
         },
         &judge,
         &NoMachine,
@@ -1259,6 +1266,7 @@ fn run_stage(
             stage,
             deliver_tokens,
             deferred,
+            settled: &[],
         },
         judge,
         &NoMachine,
@@ -1412,6 +1420,7 @@ fn the_delivery_verdict_replaces_the_reviews_deferral() {
         judge: None,
         rule_key: String::new(),
         evidence_key: None,
+        ..Default::default()
     };
     let out = aggregate([
         &[row(RuleStatus::Deferred)][..],
@@ -1419,3 +1428,6 @@ fn the_delivery_verdict_replaces_the_reviews_deferral() {
     ]);
     assert_eq!(out[0].status, RuleStatus::NotApplicable);
 }
+
+#[path = "rule_council_tests.rs"]
+mod council;

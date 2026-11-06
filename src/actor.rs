@@ -3188,6 +3188,60 @@ pub(crate) fn run(
                     let _ = reply.send(result);
                 });
             }
+            // (DES-RULE-CHECK-001 rev 2) Charge one rule council to the run, durably, before it
+            // starts: refused once the run's units have spent `RUN_COUNCILS` between them.
+            Command::ReserveRuleCouncil { run_id, ord, reply } => {
+                let _ = reply.send(reserve_rule_council(&mut store, &run_id, ord));
+            }
+            // (DES-RULE-CHECK-001 rev 2) A rule council: the same narrowing and carrier as a
+            // decision council, in the dispute frame (three seats or none, framed ballots, one
+            // absolute deadline). The host slot rides into the council thread and is dropped there
+            // after the last ballot.
+            Command::ConveneRuleCouncil {
+                req,
+                clis,
+                deadline,
+                lock,
+                reply,
+            } => {
+                let session = crate::domain::get_session(&store, &req.session_id)
+                    .ok()
+                    .flatten();
+                let clis =
+                    council_roster(session.as_ref(), clis, in_process_governance().is_some());
+                let pick = crate::decision::CouncilPick::from_env();
+                let (disp, ballots_in) = ballot_dispatcher(
+                    &dispatcher,
+                    &runner,
+                    crate::container_floor::container_mode(),
+                );
+                let op_home = operational_home.clone();
+                let relay = council_event_relay(self_tx.clone());
+                std::thread::spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        crate::decision::convene_decision_with(
+                            &req,
+                            &clis,
+                            &disp,
+                            Some(relay),
+                            op_home.as_deref(),
+                            pick,
+                            crate::decision::DecisionFrame::Dispute {
+                                deadline,
+                                prompt_budget: crate::rule_check::PROMPT_BUDGET,
+                            },
+                        )
+                        .map(|mut v| {
+                            v.ballots_in = ballots_in.map(str::to_string);
+                            v
+                        })
+                    }))
+                    .unwrap_or_else(|_| Err(anyhow::anyhow!("rule council thread panicked")));
+                    // The last ballot has returned: the host slot is free.
+                    drop(lock);
+                    let _ = reply.send(result);
+                });
+            }
             // ── Presets (DES-TEAMING-002 §8.4, seam C2) ──
             Command::PutPreset { spec, reply } => {
                 let now = crate::interaction::now_millis();
@@ -4528,6 +4582,28 @@ fn council_roster(
                     .any(|k| wicked_apps_core::spawn::seat_cli_key(k) == c.key)
         })
         .collect()
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.6) Charge one rule council to `run_id`'s unit `ord`, durably:
+/// `false` (nothing charged) once the run's units have spent [`crate::rule_check::RUN_COUNCILS`]
+/// between them, across every gate, attempt, send-back and re-check.
+fn reserve_rule_council(
+    store: &mut dyn GraphStore,
+    run_id: &str,
+    ord: u32,
+) -> anyhow::Result<bool> {
+    let mut units = crate::domain::session_units(&*store, run_id)?;
+    let spent: u32 = units.iter().map(|u| u.rule_councils).sum();
+    if spent >= crate::rule_check::RUN_COUNCILS {
+        return Ok(false);
+    }
+    let unit = units
+        .iter_mut()
+        .find(|u| u.ord == ord)
+        .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit {ord}"))?;
+    unit.rule_councils += 1;
+    put_node(store, unit.to_node())?;
+    Ok(true)
 }
 
 /// (C5 follow-up) The dispatcher a decision council's ballots go through, and where they run.
@@ -8255,7 +8331,10 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
             .iter()
             .flat_map(|d| d.rule_ids.iter().map(String::as_str))
             .collect();
-        return Some(format!("broken or unchecked ({})", ids.join(", ")));
+        return Some(format!(
+            "broken, unchecked or disputed ({})",
+            ids.join(", ")
+        ));
     }
     if unit.denials_behind.is_none() {
         let rc = unit.rule_check.as_ref()?;
@@ -8268,12 +8347,16 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                     crate::rule_check::RuleStatus::Broken
                         | crate::rule_check::RuleStatus::Unchecked
                         | crate::rule_check::RuleStatus::Waived
+                        | crate::rule_check::RuleStatus::Disputed
                 )
             })
             .map(|r| r.rule_id.as_str())
             .collect();
         if !open.is_empty() {
-            return Some(format!("broken or unchecked ({})", open.join(", ")));
+            return Some(format!(
+                "broken, unchecked or disputed ({})",
+                open.join(", ")
+            ));
         }
     }
     None
@@ -11205,6 +11288,26 @@ fn dispatch_unit(
             } else {
                 Vec::new()
             };
+        // (DES-RULE-CHECK-001 rev 2) A review unit's rule check reuses the council rulings of
+        // the run's other gates (on an equal rule and evidence key only).
+        if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
+            let all = crate::domain::session_units(&*store, run_id)?;
+            stamped.rule_settled = all
+                .iter()
+                .filter(|u| u.ord != unit.ord)
+                .flat_map(|u| u.rule_check.iter().flat_map(|rc| rc.rows.iter()))
+                .filter(|r| {
+                    r.origin == Some(crate::rule_check::RuleOrigin::Council)
+                        && matches!(
+                            r.status,
+                            crate::rule_check::RuleStatus::Kept
+                                | crate::rule_check::RuleStatus::Broken
+                                | crate::rule_check::RuleStatus::NotApplicable
+                        )
+                })
+                .cloned()
+                .collect();
+        }
         // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
         stamped.rule_instructions = (unit.role == crate::workflow::PhaseRole::Evaluator
             && unit.tool_cmd.is_none())
@@ -11222,6 +11325,7 @@ fn dispatch_unit(
             || unit.rule_steps != stamped.rule_steps
             || unit.rule_instructions != stamped.rule_instructions
             || unit.rule_deliver_tokens != stamped.rule_deliver_tokens
+            || unit.rule_settled != stamped.rule_settled
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -12179,6 +12283,10 @@ fn dispatch_unit(
             author_binaries.as_deref(),
             exec_bus.as_deref(),
             team_runner.as_ref(),
+            Some(&crate::cli_runner::CouncilCtx {
+                council: &crate::cli_runner::ActorDisputeCouncil { tx: tx.clone() },
+                lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
+            }),
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
@@ -14790,16 +14898,19 @@ pub(crate) fn confirm_gate_expecting(
             }
         }
         match &decision {
+            // (DES-RULE-CHECK-001 rev 2, A.4) …and, while a steering rule of the unit is held,
+            // its rule actions: a dispute behind a third FAIL can still be re-checked or
+            // skipped (`rules_recheck_request` refuses them otherwise).
             crate::workflow::HumanDecision::FloorRerun(_)
             | crate::workflow::HumanDecision::AcceptSuggestion
             | crate::workflow::HumanDecision::AmendIntent { .. }
             | crate::workflow::HumanDecision::Rejudge
-            | crate::workflow::HumanDecision::RecheckRules { .. }
                 if adjudication_open =>
             {
                 anyhow::bail!(
                     "a review_adjudication gate takes approve (land with carried items), request \
-                     changes (one more round) or reject (stop)"
+                     changes (one more round) or reject (stop), and the rule actions while a \
+                     steering rule is held"
                 );
             }
             crate::workflow::HumanDecision::RequestChanges { .. } => {
@@ -15964,16 +16075,28 @@ fn rules_recheck_request(
         .get(session.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
     let source = cursor.denial.as_ref().map(|d| d.source.as_str());
+    // (DES-RULE-CHECK-001 rev 2, A.4) Wherever a rule layer is in the unit's denial record — the
+    // winning denial or any layer behind it — not only when `rules_unchecked` won the ranking: a
+    // disputed rule behind a reviewer's FAIL can be re-checked or skipped.
+    let rule_layer_held = cursor
+        .denial
+        .iter()
+        .chain(cursor.denials_behind.iter().flatten())
+        .any(|d| {
+            d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+                || d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+        });
     if session.status != SessionStatus::AwaitingHuman
         || cursor.status != crate::domain::UnitStatus::Rejected
-        || source != Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED)
+        || !rule_layer_held
     {
         anyhow::bail!(
-            "`{}` / `{}` answer the gate of a unit held because some steering rule was unchecked \
-             (denial source `{}`); unit {} is {:?}, denied by `{}`",
+            "`{}` / `{}` answer the gate of a unit whose steering-rule check holds or denies it \
+             (a `{}` or `{}` layer in its denial record); unit {} is {:?}, denied by `{}`",
             crate::rule_check::RETRY_ACTION,
             crate::rule_check::SKIP_ACTION,
             crate::rule_check::DENIAL_SOURCE_UNCHECKED,
+            crate::rule_check::DENIAL_SOURCE_BROKEN,
             cursor.ord,
             cursor.status,
             source.unwrap_or("nothing")
@@ -16008,11 +16131,12 @@ fn rules_recheck_request(
                     r.status,
                     crate::rule_check::RuleStatus::Unchecked
                         | crate::rule_check::RuleStatus::Waived
+                        | crate::rule_check::RuleStatus::Disputed
                 )
         }) else {
             anyhow::bail!(
-                "rule `{id}` is not an unchecked rule of unit {} — only a rule no judge ruled on \
-                 can be skipped (a broken rule denies the gate)",
+                "rule `{id}` is not an unchecked rule (nor a disputed one) of unit {} — only a \
+                 rule no judge or council ruled on can be skipped (a broken rule denies the gate)",
                 cursor.ord
             );
         };
@@ -17343,6 +17467,12 @@ fn rewind_to_creator_scoped(
     let amendment = match &note {
         Some(n) => format!("{findings}\n{n}"),
         None => findings.clone(),
+    };
+    // (DES-RULE-CHECK-001 rev 2, Q2) A rule the reviewer called BROKEN and a council KEPT: the
+    // reviewer's FAIL still sent the work back, and the rework brief says what the council ruled.
+    let amendment = match crate::rule_check::council_kept_notes(cursor.rule_check.as_ref()) {
+        Some(ruled) => format!("{amendment}\n{ruled}"),
+        None => amendment,
     };
     // (core#432 F-3R2-024) An evaluator-found fix gets a lane to land: when the reviewing seat
     // wrote a change the guard set aside (restored the creator's tree, pinned the edit), a plain
@@ -25468,6 +25598,7 @@ mod request_changes_tests {
             judge: None,
             rule_key: "k".into(),
             evidence_key: Some(format!("ek-{id}")),
+            ..Default::default()
         };
         let report = crate::rule_check::RuleCheckReport {
             rows: vec![
@@ -25511,6 +25642,110 @@ mod request_changes_tests {
             uuid::Uuid::nil(),
             false,
         )
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2, A.7.5, codex r1) The run's rule-council budget is charged
+    /// durably, per council, before it starts — across every unit of the run — and refused once
+    /// six are spent: no superseded attempt or lost result can spend the budget twice.
+    #[test]
+    fn the_run_budget_charges_each_council_durably_and_stops_at_six() {
+        let run_id = format!("rules-budget-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let ords: Vec<u32> = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .iter()
+            .map(|u| u.ord)
+            .collect();
+        for k in 0..crate::rule_check::RUN_COUNCILS {
+            // Two gates of the run share one budget.
+            let ord = ords[(k as usize) % 2 + 1];
+            assert!(
+                reserve_rule_council(&mut store, &run_id, ord).unwrap(),
+                "council {k}"
+            );
+        }
+        assert!(!reserve_rule_council(&mut store, &run_id, ords[1]).unwrap());
+        let spent: u32 = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .iter()
+            .map(|u| u.rule_councils)
+            .sum();
+        assert_eq!(
+            spent,
+            crate::rule_check::RUN_COUNCILS,
+            "persisted, and nothing past the cap"
+        );
+    }
+
+    /// (DES-RULE-CHECK-001 rev 2, A.7.10) A DISPUTED rule behind a reviewer's FAIL — at an ordinary
+    /// gate and at the third FAIL's `review_adjudication` — still takes the rule actions: a skip
+    /// lands for that rule only, and the re-check is armed; a skip of a BROKEN rule is refused and
+    /// the gate stays open. (Before: refused unless `rules_unchecked` won the ranking, and always
+    /// refused at `review_adjudication`.)
+    #[test]
+    fn a_disputed_rule_behind_a_fail_takes_the_rule_actions_even_at_adjudication() {
+        let mut subs = crate::event_log::EventSink::default();
+        for (sent_back, gate) in [
+            (1, "escalation"),
+            (2, crate::review_context::REVIEW_ADJUDICATION_GATE),
+        ] {
+            let run_id = format!("rules-disputed-fail-{sent_back}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let _ =
+                fold_verify_after_send_backs(&mut store, &mut subs, &run_id, sent_back, THIRD_FAIL);
+            assert_eq!(open_gate_kind(&store, &run_id).as_deref(), Some(gate));
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            let v = &mut units[3];
+            assert_ne!(
+                v.denial.as_ref().map(|d| d.source.as_str()),
+                Some(crate::rule_check::DENIAL_SOURCE_UNCHECKED),
+                "the reviewer's FAIL names the gate"
+            );
+            let row = |id: &str, status| crate::rule_check::RuleVerdict {
+                rule_id: id.into(),
+                status,
+                how: crate::rule_check::RuleHow::Council,
+                reason: "r".into(),
+                rule_key: "k".into(),
+                evidence_key: Some(format!("ek-{id}")),
+                origin: Some(crate::rule_check::RuleOrigin::Judge),
+                ..Default::default()
+            };
+            let report = crate::rule_check::RuleCheckReport {
+                rows: vec![
+                    row("R1", crate::rule_check::RuleStatus::Disputed),
+                    row("R9", crate::rule_check::RuleStatus::Broken),
+                ],
+                ..Default::default()
+            };
+            v.denials_behind = Some(vec![report.denial().unwrap(), report.hold().unwrap()]);
+            v.rule_check = Some(report);
+            put_node(&mut store, v.to_node()).unwrap();
+            let err = recheck(&mut store, &run_id, &[("R9", "it is fine")])
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("not an unchecked rule (nor a disputed one)"),
+                "{err}"
+            );
+            assert_eq!(
+                open_gate_kind(&store, &run_id).as_deref(),
+                Some(gate),
+                "still open"
+            );
+            recheck(
+                &mut store,
+                &run_id,
+                &[("R1", "the reviewer misread the hunk")],
+            )
+            .expect("a disputed rule behind a FAIL can be skipped");
+            let v = &crate::domain::session_units(&store, &run_id).unwrap()[3];
+            assert_eq!(v.rule_skips.len(), 1);
+            assert_eq!(v.rule_skips[0].rule_id, "R1");
+            assert_eq!(v.rule_skips[0].evidence_key, "ek-R1");
+            assert!(v.requested_rejudge.is_some(), "the re-check is armed");
+        }
     }
 
     /// (DES-RULE-CHECK-001 S2) `skip_rules` lands each skip with its reason, who and the evidence

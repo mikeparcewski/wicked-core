@@ -33,6 +33,23 @@ Two release tracks share this file, newest entry first regardless of track:
   for a fresh approval, and dispatches nothing; while it is re-planning nothing is approvable, and a failed
   re-plan (or a restart) re-opens the old revision with the failure recorded.
 
+- **A disputed steering rule goes to a bounded rule council (DES-RULE-CHECK-001 rev 2, Part A).** When the
+  engine's rule judge and the review seat disagree on one rule at a review or QE gate (exactly one says BROKEN),
+  that rule is put to a three-seat council drawn from seats distinct from every party (the creators and authors,
+  launch-excluded seats, the judge that ruled, the reviewer as it launched), by key and by identity; only seats
+  whose launched executable is their declared, shipped CLI sit. The ballot is nonce-framed, its fields bounded, and
+  a ruling stands only on consensus of the votes that pass the bars (a KEPT names a changed file; a NOT APPLICABLE
+  quotes the rule's own words and contradicts no fact the match established; a KEPT resting on the person's
+  instruction is a waiver). Anything short of a ruling is the new `disputed` status, which holds like `unchecked`
+  and takes `retry_rules` / `skip_rules` wherever a rule layer is in the unit's denial record, including at
+  `review_adjudication`. Bounds: 3 councils per gate attempt, 6 per run (charged durably before each starts), one
+  rule council at a time per host (a lock under `/tmp`; none where it cannot be taken), one 300 s deadline per
+  council that the slot, the seat permits and every ballot are measured against. Receipt rows gain `origin` (kept
+  through the cache), `judgeIds`, `evidenceComplete`, `reviewer` and `council`; the rework brief names a rule a
+  council kept over the reviewer. Team councils are unchanged, except that a host ballot now drains both pipes
+  under its deadline on every exit (a descendant holding the pipe after a clean exit no longer hangs it) and
+  keeps at most 8 MiB of output.
+
 - **A rule whose subject is the delivery is deferred at review and QE, and checked at the deliver step (SWAP 6).**
   `learn-linked-issue` (the PR description) was unchecked at review and QE and held every job twice. A rule carrying
   `obligations: ["evidence:delivery"]` (rule data, nothing the creator writes) is now `deferred` at review and QE

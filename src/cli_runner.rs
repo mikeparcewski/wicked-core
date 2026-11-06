@@ -843,6 +843,9 @@ fn rule_judge_seats(
                     }
                 }
             }
+            // (DES-RULE-CHECK-001 rev 2, A.3) A launch-excluded seat is excluded by identity too:
+            // an alias of it running the same binary is the same seat.
+            ids.extend(excluded_identities(exclude_seats, registry));
             let excluded: Vec<&str> = creators
                 .iter()
                 .chain(exclude_seats)
@@ -868,6 +871,670 @@ fn rule_judge_seats(
             });
             (keys, why)
         }
+    }
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.3) Every identity the `exclude_seats` keys may execute: each one's
+/// registry record (by key, then by its cli key), and the key itself.
+fn excluded_identities(
+    exclude_seats: &[String],
+    registry: &[crate::AgenticCli],
+) -> std::collections::BTreeSet<String> {
+    let mut ids = std::collections::BTreeSet::new();
+    for k in exclude_seats {
+        let cli = wicked_apps_core::spawn::seat_cli_key(k);
+        if let Some(c) = registry
+            .iter()
+            .find(|c| &c.key == k)
+            .or_else(|| registry.iter().find(|c| c.key == cli))
+        {
+            ids.extend(record_identities(c));
+        }
+        ids.insert(crate::validator::normalize_identity(k));
+    }
+    ids
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.3) Whether a seat's identity can be verified: the first executable
+/// its invocation launches IS its declared `binary` (or its ACP carrier's CLI) AND that is one of
+/// the CLIs the engine ships ([`shipped_identities`]). A launcher script, a shell or `env`, or a
+/// record that merely declares its own wrapper as its binary is not seen through (codex r1), so it
+/// cannot be shown distinct from anyone.
+fn launches_its_own_binary(c: &crate::AgenticCli, launched: &str) -> bool {
+    if launched.is_empty() || !shipped_identities().contains(launched) {
+        return false;
+    }
+    let carrier = c.acp.as_ref().map(|a| {
+        let b = crate::validator::normalize_identity(&a.binary);
+        b.strip_suffix("-agent-acp")
+            .or_else(|| b.strip_suffix("-acp"))
+            .unwrap_or(&b)
+            .to_string()
+    });
+    crate::validator::normalize_identity(&c.binary) == launched
+        || carrier.as_deref() == Some(launched)
+}
+
+/// The identities of the CLIs the engine ships (each built-in record's binary and its ACP carrier's
+/// CLI): the only identities a rule council can verify.
+fn shipped_identities() -> &'static std::collections::BTreeSet<String> {
+    static SHIPPED: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    SHIPPED.get_or_init(|| {
+        wicked_council::registry::builtin()
+            .iter()
+            .flat_map(record_identities)
+            .filter(|i| !i.is_empty())
+            .collect()
+    })
+}
+
+/// The council port of the settle step: production sends [`crate::command::Command::ConveneRuleCouncil`]
+/// to the actor ([`ActorDisputeCouncil`]); tests inject a fake. The host slot (`lock`) is MOVED in:
+/// the council drops it only after its last ballot, whether or not the caller is still waiting.
+pub(crate) trait DisputeCouncil: Sync {
+    /// Charge one rule council to the run, DURABLY, before it starts: `Ok(true)` when the run had
+    /// one left of its [`crate::rule_check::RUN_COUNCILS`] (now spent, whatever becomes of this
+    /// attempt), `Ok(false)` when it had none.
+    fn reserve(&self, run_id: &str, ord: u32) -> Result<bool, String>;
+    fn convene(
+        &self,
+        req: crate::decision::DecisionRequest,
+        clis: Vec<crate::AgenticCli>,
+        lock: HostCouncilLock,
+        deadline: std::time::Instant,
+    ) -> DisputeOutcome;
+}
+
+/// What a rule council came back with.
+#[derive(Debug)]
+pub(crate) enum DisputeOutcome {
+    Ruled(crate::decision::DecisionVerdict),
+    Failed(String),
+    /// No answer by the deadline plus [`crate::rule_check::COUNCIL_REPLY_GRACE`]: the late result
+    /// is dropped.
+    TimedOut,
+}
+
+/// The production rule council: the engine's council machinery over the actor's channel
+/// (`Command::ConveneRuleCouncil`), with a wait bounded by the council's own deadline.
+pub(crate) struct ActorDisputeCouncil {
+    pub tx: std::sync::mpsc::Sender<crate::command::Command>,
+}
+
+impl DisputeCouncil for ActorDisputeCouncil {
+    fn reserve(&self, run_id: &str, ord: u32) -> Result<bool, String> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.tx
+            .send(crate::command::Command::ReserveRuleCouncil {
+                run_id: run_id.to_string(),
+                ord,
+                reply,
+            })
+            .map_err(|_| "the engine stopped".to_string())?;
+        match rx.recv_timeout(Duration::from_secs(30)) {
+            Ok(r) => r.map_err(|e| format!("{e:#}")),
+            Err(_) => Err("the engine did not answer the council reservation".into()),
+        }
+    }
+
+    fn convene(
+        &self,
+        req: crate::decision::DecisionRequest,
+        clis: Vec<crate::AgenticCli>,
+        lock: HostCouncilLock,
+        deadline: std::time::Instant,
+    ) -> DisputeOutcome {
+        let (reply, rx) = std::sync::mpsc::channel();
+        if self
+            .tx
+            .send(crate::command::Command::ConveneRuleCouncil {
+                req,
+                clis,
+                deadline,
+                lock,
+                reply,
+            })
+            .is_err()
+        {
+            return DisputeOutcome::Failed("the engine stopped".into());
+        }
+        let wait = (deadline + crate::rule_check::COUNCIL_REPLY_GRACE)
+            .saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(wait) {
+            Ok(Ok(v)) => DisputeOutcome::Ruled(v),
+            Ok(Err(e)) => DisputeOutcome::Failed(format!("{e:#}")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => DisputeOutcome::TimedOut,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                DisputeOutcome::Failed("the engine dropped the council reply".into())
+            }
+        }
+    }
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.6) The host-wide rule-council slot: an advisory lock on a FIXED
+/// absolute path every daemon on the host shares (`/tmp`, never the per-user `$TMPDIR`; on Windows
+/// `%ProgramData%`), so one rule council runs at a time on the host. A host where the lock cannot
+/// be established convenes NO rule council (codex r1: a per-process fallback would let two daemons
+/// run councils at once) — the dispute holds. Released when dropped (the file closes).
+pub(crate) struct HostCouncilLock {
+    _file: std::fs::File,
+}
+
+/// Why the host slot was not taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SlotRefused {
+    /// Another rule council held it until the deadline.
+    Busy,
+    /// The lock file could not be opened or locked: no host-wide exclusion can be shown.
+    Unavailable(String),
+}
+
+impl HostCouncilLock {
+    /// The host lock's path.
+    pub(crate) fn host_path() -> std::path::PathBuf {
+        if cfg!(windows) {
+            std::env::var_os("ProgramData")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
+                .join("wicked-rule-council.lock")
+        } else {
+            std::path::PathBuf::from("/tmp/wicked-rule-council.lock")
+        }
+    }
+
+    /// Take the slot at `path`, waiting no later than `deadline`.
+    pub(crate) fn acquire_until(
+        path: &std::path::Path,
+        deadline: std::time::Instant,
+    ) -> Result<HostCouncilLock, SlotRefused> {
+        // (codex r2) Never follow a link and never block on a special file (a FIFO planted at the
+        // path would hang this worker thread before any deadline): open non-blocking, no-follow,
+        // and accept only a regular file.
+        let open = |write: bool| {
+            let mut o = std::fs::OpenOptions::new();
+            o.read(true);
+            if write {
+                o.write(true).create(true).truncate(false);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+            }
+            o.open(path)
+        };
+        let file = open(true)
+            // Another user's file on a shared /tmp: a read-only handle locks as well.
+            .or_else(|_| open(false))
+            .map_err(|e| SlotRefused::Unavailable(format!("{}: {e}", path.display())))?;
+        match file.metadata() {
+            Ok(m) if m.is_file() => {}
+            Ok(_) => {
+                return Err(SlotRefused::Unavailable(format!(
+                    "{} is not a regular file",
+                    path.display()
+                )))
+            }
+            Err(e) => return Err(SlotRefused::Unavailable(format!("{}: {e}", path.display()))),
+        }
+        loop {
+            match file.try_lock() {
+                Ok(()) => return Ok(HostCouncilLock { _file: file }),
+                Err(std::fs::TryLockError::WouldBlock) => {}
+                Err(std::fs::TryLockError::Error(e)) => {
+                    return Err(SlotRefused::Unavailable(format!("{}: {e}", path.display())))
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SlotRefused::Busy);
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+/// What the settle step may use: the council (and its run budget) and the host slot's path.
+pub(crate) struct CouncilCtx<'a> {
+    pub council: &'a dyn DisputeCouncil,
+    pub lock_path: &'a std::path::Path,
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.3) The seats a rule council may draw for a dispute, each party
+/// excluded BY KEY AND BY IDENTITY, with no fallback in any mode: the work's creators and
+/// `authored_by` (with every binary they ran), every `exclude_seats` key (resolved), the rule judge
+/// that ruled the row (`judge_ids`, recorded when it ruled), and the reviewer (its launched
+/// identities). Only a seat whose launched executable IS its declared binary or carrier sits. An
+/// identity that cannot be established is `identity_unknown`; fewer than three seats left is
+/// `seats_benched` — no council is convened either way.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rule_council_seats(
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    exclude_seats: &[String],
+    authored_by: &[String],
+    authored_binaries: &[String],
+    judge: (Option<&str>, &[String]),
+    reviewer: (Option<&str>, Option<&str>),
+    recorded: Option<&[crate::rule_check::RulePosition]>,
+    registry: &[crate::AgenticCli],
+) -> Result<Vec<crate::AgenticCli>, String> {
+    let unknown = |why: &str| Err(format!("identity_unknown: {why}"));
+    // A carried dispute's parties are the seats that READ it, as they launched then (recorded on
+    // the readings): a seat key that now launches something else must not readmit them.
+    if let Some(r) = recorded {
+        if let Some(p) = r.iter().find(|p| p.ids.is_empty()) {
+            return unknown(&format!(
+                "the {} `{}` this dispute was recorded with has no recorded identity",
+                p.by, p.seat
+            ));
+        }
+    }
+    // (codex r2) A launch-excluded seat is a party only by its identity: one whose record cannot
+    // be found, or whose launch cannot be verified, cannot be shown absent from the council.
+    for k in exclude_seats {
+        let cli = wicked_apps_core::spawn::seat_cli_key(k);
+        match registry
+            .iter()
+            .find(|c| &c.key == k)
+            .or_else(|| registry.iter().find(|c| c.key == cli))
+        {
+            Some(c) if launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)) => {
+            }
+            _ => {
+                return unknown(&format!(
+                    "the launch-excluded seat `{k}` cannot be verified"
+                ))
+            }
+        }
+    }
+    if creators.is_empty() {
+        return unknown("the work's creators are not known");
+    }
+    let Some(bins) = creator_bins else {
+        return unknown("a creator of this work has no recorded binary");
+    };
+    // Every binary an author ran must be a CLI the engine can name: a creator launched through a
+    // wrapper could be running any CLI underneath (codex r1).
+    if let Some(b) = bins
+        .iter()
+        .chain(authored_binaries)
+        .map(|b| crate::validator::normalize_identity(b))
+        .find(|b| !shipped_identities().contains(b))
+    {
+        return unknown(&format!(
+            "an author of this work ran `{b}`, which is no shipped CLI"
+        ));
+    }
+    let (judge_key, judge_ids) = judge;
+    if judge_ids.is_empty() {
+        return unknown("the rule judge's identity was not recorded when it ruled");
+    }
+    let Some(rev_key) = reviewer.0.filter(|k| !k.is_empty()) else {
+        return unknown("the reviewer's seat is not recorded");
+    };
+    // The reviewer's ACTUAL launch (an `assigned_invocation` overrides its record): its first
+    // executable must be a registered CLI's declared binary or carrier — that CLI is then a party
+    // too. Anything else (a launcher script) cannot be seen through: no council.
+    let rev_launched = launched_identity(rev_key, reviewer.1.map(str::to_string));
+    let Some(rev_ran) = registry
+        .iter()
+        .find(|c| launches_its_own_binary(c, &rev_launched))
+    else {
+        return unknown(&format!(
+            "the reviewer `{rev_key}` ran `{rev_launched}`, which is no shipped CLI"
+        ));
+    };
+    let mut ids: std::collections::BTreeSet<String> = bins
+        .iter()
+        .chain(authored_binaries)
+        .map(|b| crate::validator::normalize_identity(b))
+        .collect();
+    for k in creators.iter().chain(authored_by) {
+        match registry.iter().find(|c| &c.key == k) {
+            Some(c) => ids.extend(record_identities(c)),
+            None => {
+                ids.insert(crate::validator::normalize_identity(k));
+            }
+        }
+    }
+    ids.extend(excluded_identities(exclude_seats, registry));
+    ids.extend(judge_ids.iter().cloned());
+    ids.extend(launched_identities(rev_key, reviewer.1.map(str::to_string)));
+    ids.extend(record_identities(rev_ran));
+    for p in recorded.unwrap_or_default() {
+        ids.extend(p.ids.iter().cloned());
+    }
+    ids.remove("");
+    let mut keys: Vec<&str> = Vec::new();
+    for k in creators
+        .iter()
+        .chain(authored_by)
+        .chain(exclude_seats)
+        .map(String::as_str)
+        .chain(judge_key)
+        .chain([rev_key, rev_ran.key.as_str()])
+        .chain(recorded.unwrap_or_default().iter().map(|p| p.seat.as_str()))
+    {
+        keys.push(k);
+        keys.push(wicked_apps_core::spawn::seat_cli_key(k));
+    }
+    let seats: Vec<crate::AgenticCli> = registry
+        .iter()
+        .filter(|c| {
+            c.enabled_for_council
+                && !keys.contains(&c.key.as_str())
+                && !keys.contains(&wicked_apps_core::spawn::seat_cli_key(&c.key))
+                && launches_its_own_binary(c, &invocation_identity(&c.headless_invocation))
+                && record_identities(c).iter().all(|i| !ids.contains(i))
+        })
+        .cloned()
+        .collect();
+    if seats.len() < crate::decision::RULE_COUNCIL_SIZE {
+        return Err(format!(
+            "seats_benched: {} seat(s) distinct from every party, a rule council needs {}",
+            seats.len(),
+            crate::decision::RULE_COUNCIL_SIZE
+        ));
+    }
+    Ok(seats)
+}
+
+/// Every identity the reviewer of `input` may have executed, as it launched (its
+/// `assigned_invocation` overrides its record): empty when its launch cannot be verified.
+fn reviewer_identities(input: &StepInput, registry: &[crate::AgenticCli]) -> Vec<String> {
+    let Some(key) = input.unit.assigned_cli.as_deref().filter(|k| !k.is_empty()) else {
+        return Vec::new();
+    };
+    let inv = input.unit.assigned_invocation.clone();
+    let launched = launched_identity(key, inv.clone());
+    let Some(ran) = registry
+        .iter()
+        .find(|c| launches_its_own_binary(c, &launched))
+    else {
+        return Vec::new();
+    };
+    let mut ids = launched_identities(key, inv);
+    for i in record_identities(ran) {
+        if !ids.contains(&i) {
+            ids.push(i);
+        }
+    }
+    ids
+}
+
+/// (DES-RULE-CHECK-001 rev 2) The judge identities a fresh judge row records: its seat's every
+/// identity, or none when the seat cannot be verified (then no council can be shown distinct from
+/// it, and a dispute on the row is `identity_unknown`).
+fn stamp_judge_ids(report: &mut crate::rule_check::RuleCheckReport, pool: &[crate::AgenticCli]) {
+    for r in report
+        .rows
+        .iter_mut()
+        .filter(|r| r.how == crate::rule_check::RuleHow::Judge)
+    {
+        r.judge_ids = r
+            .judge
+            .as_deref()
+            .and_then(|j| pool.iter().find(|c| c.key == j))
+            .filter(|c| launches_its_own_binary(c, &invocation_identity(&c.headless_invocation)))
+            .map(record_identities)
+            .unwrap_or_default();
+    }
+}
+
+/// (DES-RULE-CHECK-001 rev 2, A.1-A.6) The settle step: read the reviewer's own rule positions from
+/// its whole output, record them on every row, and put each DISPUTED judge reading (exactly one side
+/// says BROKEN) to a rule council — at most [`crate::rule_check::ATTEMPT_COUNCILS`] this attempt, one
+/// at a time, within the run's [`crate::rule_check::RUN_COUNCILS`], each inside one absolute
+/// deadline that the host slot, the seat permits and every ballot are measured against. A ruling
+/// stands only on consensus of the votes that pass the bars; anything short of one is `disputed`
+/// and holds. A reviewer capture the runner cut holds every judge row it could have disputed.
+#[allow(clippy::too_many_arguments)]
+fn settle_rule_disputes(
+    report: &mut crate::rule_check::RuleCheckReport,
+    input: &StepInput,
+    reviewer_output: &str,
+    rules: &[wicked_governance::ConformanceRule],
+    facts: &wicked_governance::JobFacts,
+    change: &crate::rule_check::Change,
+    floor_text: Option<&str>,
+    instructions: Option<&str>,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    registry: &[crate::AgenticCli],
+    council: Option<&CouncilCtx<'_>>,
+    emit_delta: &DeltaSink,
+) {
+    use crate::rule_check::{
+        disputed_row, positions_of, Answer, RuleCouncil, RuleOrigin, RulePosition, RuleStatus,
+        RuleVerdict, BY_REVIEWER,
+    };
+    let reviewer_seat = input.unit.assigned_cli.clone().unwrap_or_default();
+    let ids: Vec<&str> = report.rows.iter().map(|r| r.rule_id.as_str()).collect();
+    let positions = crate::rule_check::seat_positions(reviewer_output, &ids);
+    for r in report.rows.iter_mut() {
+        r.reviewer = positions.by_id.get(&r.rule_id).map(|a| RulePosition {
+            by: BY_REVIEWER.into(),
+            seat: reviewer_seat.clone(),
+            status: a.status,
+            cite: a.cite.clone(),
+            ids: Vec::new(),
+        });
+    }
+    if positions.cut {
+        let cut = Answer {
+            status: RuleStatus::Unchecked,
+            cite: "its output was cut".into(),
+        };
+        for r in report.rows.iter_mut().filter(|r| {
+            r.origin == Some(RuleOrigin::Judge)
+                && r.blocking != Some(false)
+                && matches!(r.status, RuleStatus::Kept | RuleStatus::NotApplicable)
+        }) {
+            let pos = positions_of(r, &reviewer_seat, &cut);
+            *r = disputed_row(
+                r,
+                RuleCouncil {
+                    positions: pos,
+                    reason: Some(
+                        "incomplete_evidence: the reviewer's output was cut, so its rule positions \
+                         can't be read whole"
+                            .into(),
+                    ),
+                    ..Default::default()
+                },
+            );
+        }
+        return;
+    }
+    let paths: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
+    // The disputes to settle: this attempt's (judge vs this reviewer), then those carried open from
+    // the last attempt on the same evidence (on their recorded readings: the dispute stands until a
+    // council settles it or the person skips it, whatever this reviewer wrote).
+    // The reviewer as it launched this attempt: recorded on each reading it gives a dispute, so a
+    // carried dispute keeps it out of a later council whatever its seat key launches then.
+    let reviewer_ids = reviewer_identities(input, registry);
+    let mut work: Vec<(usize, RuleVerdict, Vec<RulePosition>, bool)> = Vec::new();
+    for i in crate::rule_check::disputes(report, &positions) {
+        let row = report.rows[i].clone();
+        if let Some(reading) = positions.by_id.get(&row.rule_id) {
+            let mut pos = positions_of(&row, &reviewer_seat, reading);
+            if let Some(p) = pos.iter_mut().find(|p| p.by == BY_REVIEWER) {
+                p.ids = reviewer_ids.clone();
+            }
+            work.push((i, row, pos, false));
+        }
+    }
+    for i in crate::rule_check::carried(report) {
+        let carried = &report.rows[i];
+        if let (Some(base), Some(c)) = (
+            crate::rule_check::judge_reading(carried),
+            carried.council.as_ref(),
+        ) {
+            work.push((i, base, c.positions.clone(), true));
+        }
+    }
+    for (i, row, pos, was_carried) in work {
+        let hold = |why: String| {
+            disputed_row(
+                &row,
+                RuleCouncil {
+                    positions: pos.clone(),
+                    reason: Some(why),
+                    ..Default::default()
+                },
+            )
+        };
+        let Some(ctx) = council else {
+            report.rows[i] = hold("error: this path convenes no rule council".into());
+            continue;
+        };
+        if report.councils >= crate::rule_check::ATTEMPT_COUNCILS {
+            report.rows[i] = hold(format!(
+                "cap: this gate attempt has convened its {} rule councils",
+                crate::rule_check::ATTEMPT_COUNCILS
+            ));
+            continue;
+        }
+        if row.evidence_complete != Some(true) {
+            report.rows[i] = hold(
+                "incomplete_evidence: the rule judge saw only part of the change, and partial \
+                 evidence cannot settle a rule"
+                    .into(),
+            );
+            continue;
+        }
+        let Some(rule) = rules.iter().find(|r| r.id == row.rule_id) else {
+            report.rows[i] = hold("error: the rule is no longer in force as it was judged".into());
+            continue;
+        };
+        let seats = match rule_council_seats(
+            creators,
+            creator_bins,
+            &input.unit.exclude_seats,
+            &input.unit.authored_by,
+            &input.unit.authored_binaries,
+            (row.judge.as_deref(), &row.judge_ids),
+            (
+                input.unit.assigned_cli.as_deref(),
+                input.unit.assigned_invocation.as_deref(),
+            ),
+            was_carried.then_some(pos.as_slice()),
+            registry,
+        ) {
+            Ok(s) => s,
+            Err(why) => {
+                report.rows[i] = hold(why);
+                continue;
+            }
+        };
+        // One absolute deadline from here: the host slot is taken on THIS thread (the unit's own
+        // worker) before any council thread or envelope copy exists.
+        let deadline = std::time::Instant::now() + crate::rule_check::COUNCIL_DEADLINE;
+        let lock = match HostCouncilLock::acquire_until(ctx.lock_path, deadline) {
+            Ok(l) => l,
+            Err(SlotRefused::Busy) => {
+                report.rows[i] = hold(
+                    "timeout: the host's rule-council slot did not come free before the deadline"
+                        .into(),
+                );
+                continue;
+            }
+            Err(SlotRefused::Unavailable(why)) => {
+                report.rows[i] = hold(format!(
+                    "error: the host's rule-council slot cannot be established ({why}), so no \
+                     council can be shown to be the only one running"
+                ));
+                continue;
+            }
+        };
+        let m = wicked_governance::match_rules(&[wicked_governance::MatchRule::from(rule)], facts)
+            .into_iter()
+            .next();
+        let note = m
+            .as_ref()
+            .map(|m| crate::rule_check::match_note(m, crate::rule_check::CheckStage::Review))
+            .unwrap_or_default();
+        let evidence = crate::rule_check::Evidence::of_change(&row, change, floor_text);
+        let Some(req) = crate::rule_check::dispute_request(
+            &input.run_id,
+            input.unit.ord,
+            rule,
+            &note,
+            &evidence,
+            instructions,
+            &pos,
+        ) else {
+            drop(lock);
+            report.rows[i] = hold(
+                "incomplete_evidence: the judge's evidence does not fit a council ballot whole"
+                    .into(),
+            );
+            continue;
+        };
+        // Charged to the run durably BEFORE it starts: a council whose attempt is superseded or
+        // whose result never folds is still spent.
+        match ctx.council.reserve(&input.run_id, input.unit.ord) {
+            Ok(true) => {}
+            Ok(false) => {
+                drop(lock);
+                report.rows[i] = hold(format!(
+                    "cap: the run has spent its {} rule councils",
+                    crate::rule_check::RUN_COUNCILS
+                ));
+                continue;
+            }
+            Err(e) => {
+                drop(lock);
+                report.rows[i] = hold(format!("error: {e}"));
+                continue;
+            }
+        }
+        report.councils += 1;
+        let outcome = with_floor_heartbeat(
+            emit_delta,
+            &format!(
+                "rule council: settling {} ({} seats)",
+                row.rule_id,
+                crate::decision::RULE_COUNCIL_SIZE
+            ),
+            Duration::from_secs(60),
+            || ctx.council.convene(req, seats, lock, deadline),
+        );
+        // The rule's own words an N/A must quote: its statement and criteria, never the header
+        // the engine writes around them (`RULE <id> (<severity>, …)`).
+        let rule_words = format!("{}\n{}", rule.statement, rule.criteria);
+        let bars = crate::rule_check::VoteBars {
+            paths: &paths,
+            rule_text: &rule_words,
+            established: m.as_ref().is_some_and(crate::rule_check::established),
+            instructions,
+        };
+        report.rows[i] = match outcome {
+            DisputeOutcome::Ruled(v) => crate::rule_check::settle(&row, pos.clone(), &v, &bars),
+            DisputeOutcome::TimedOut => hold(format!(
+                "timeout: the council gave no answer within {} s",
+                (crate::rule_check::COUNCIL_DEADLINE + crate::rule_check::COUNCIL_REPLY_GRACE)
+                    .as_secs()
+            )),
+            DisputeOutcome::Failed(e) => hold(format!("error: {e}")),
+        };
+        let r = &report.rows[i];
+        engine_note(
+            emit_delta,
+            &format!(
+                "rule council: {} {}",
+                r.rule_id,
+                match r.status {
+                    RuleStatus::Disputed => format!("disputed ({})", r.reason),
+                    s => format!(
+                        "{} (settled by council {})",
+                        s.as_wire(),
+                        r.council.as_ref().map(|c| c.tally()).unwrap_or_default()
+                    ),
+                }
+            ),
+        );
     }
 }
 
@@ -974,6 +1641,7 @@ pub(crate) fn delivery_rule_check(
             stage: crate::rule_check::CheckStage::Delivery,
             deliver_tokens: &ctx.deliver_tokens,
             deferred: &ctx.deferred,
+            settled: &[],
         },
         &judge,
         &NoMachineHere,
@@ -1200,6 +1868,7 @@ fn decide_tests_on_base(
 /// they ran) drawn from the run's pool. The creator's transcript is never handed to the judge.
 /// `None` when there is nothing to check (no base, no change); a store that cannot be read is a
 /// report whose note says so and whose rows are empty — the fold holds on it.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn run_rule_check(
     input: &StepInput,
@@ -1210,6 +1879,39 @@ fn run_rule_check(
     floor: Option<&crate::repo_checks::RepoChecksReport>,
     runner: &dyn StepRunner,
     emit_delta: &DeltaSink,
+) -> Option<crate::rule_check::RuleCheckReport> {
+    run_rule_check_with(
+        input,
+        creators,
+        creator_bins,
+        pool,
+        registry,
+        floor,
+        runner,
+        emit_delta,
+        None,
+    )
+}
+
+/// What the settle step reads: the reviewer's whole output, and the council it may convene
+/// (`None`: no council on this path, so a dispute holds).
+pub(crate) struct Settle<'a> {
+    pub reviewer_output: &'a str,
+    pub council: Option<&'a CouncilCtx<'a>>,
+}
+
+/// [`run_rule_check`], then (DES-RULE-CHECK-001 rev 2) the settle step on the reviewer's output.
+#[allow(clippy::too_many_arguments)]
+fn run_rule_check_with(
+    input: &StepInput,
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    pool: &[crate::AgenticCli],
+    registry: &[crate::AgenticCli],
+    floor: Option<&crate::repo_checks::RepoChecksReport>,
+    runner: &dyn StepRunner,
+    emit_delta: &DeltaSink,
+    settle: Option<Settle<'_>>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
@@ -1306,7 +2008,7 @@ fn run_rule_check(
         seats: pool,
         runner,
     };
-    let report = with_floor_heartbeat(
+    let mut report = with_floor_heartbeat(
         emit_delta,
         "rule check: judging the steering rules",
         FLOOR_HEARTBEAT_EVERY,
@@ -1327,6 +2029,7 @@ fn run_rule_check(
                     stage: crate::rule_check::CheckStage::Review,
                     deliver_tokens: &input.unit.rule_deliver_tokens,
                     deferred: &[],
+                    settled: &input.unit.rule_settled,
                 },
                 &judge,
                 &FloorMachine {
@@ -1340,6 +2043,24 @@ fn run_rule_check(
             )
         },
     );
+    stamp_judge_ids(&mut report, pool);
+    if let Some(st) = settle {
+        settle_rule_disputes(
+            &mut report,
+            input,
+            st.reviewer_output,
+            &rules,
+            &facts,
+            &change,
+            floor_text.as_deref(),
+            Some(instructions.as_str()).filter(|t| !t.is_empty()),
+            creators,
+            creator_bins,
+            registry,
+            st.council,
+            emit_delta,
+        );
+    }
     engine_note(
         emit_delta,
         &format!(
@@ -1375,6 +2096,7 @@ pub(crate) fn run_unit_and_judge(
     author_binaries: Option<&[String]>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
+    rule_council: Option<&CouncilCtx<'_>>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -1409,6 +2131,7 @@ pub(crate) fn run_unit_and_judge(
             author_binaries,
             // (PRODUCT-WORKS J4) Re-probe the run's due quota benches before the judge reads them.
             reprobe: !run_roster.is_empty(),
+            rule_council,
         },
         exec_bus,
         team,
@@ -1737,6 +2460,7 @@ fn run_unit_and_judge_with_launches(
             work_authors,
             author_binaries,
             reprobe: false,
+            rule_council: None,
         },
         None,
         None,
@@ -1774,6 +2498,7 @@ fn run_unit_and_judge_reprobing(
             work_authors: &[],
             author_binaries: Some(&[]),
             reprobe: true,
+            rule_council: None,
         },
         None,
         None,
@@ -2236,6 +2961,9 @@ pub(crate) struct JudgeFallbackCtx<'a> {
     /// that fell due while the worker ran is asked too ([`reprobe_due_benches`]). The outcomes ride
     /// [`crate::workflow::UnitEvidence::bench_reprobes`]. `false` (the default): no probe.
     pub reprobe: bool,
+    /// (DES-RULE-CHECK-001 rev 2) The rule council a disputed rule goes to; `None` (the bus path,
+    /// tests): a dispute holds.
+    pub rule_council: Option<&'a CouncilCtx<'a>>,
 }
 
 /// (codex r1 on the fallback) The parties a FALLBACK judge must be distinct from: the judge's own
@@ -4434,7 +5162,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // verdict from a seat distinct from the work's creators. Before the guard's final comparison,
     // so a tree changed while the rules were judged is caught like any other mutation.
     let rule_check = if rule_check_applies(input, &output) {
-        run_rule_check(
+        run_rule_check_with(
             input,
             &creators,
             if creators.is_empty() {
@@ -4447,6 +5175,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
             repo_checks.as_ref(),
             &**runner,
             emit_delta,
+            Some(Settle {
+                reviewer_output: &output.output,
+                council: fallback.rule_council,
+            }),
         )
     } else {
         None
@@ -5342,6 +6074,10 @@ fn run_cli_runner(
                     Some(db.path()),
                     // T5: the SAME attempt-runner seam as the in-process worker.
                     team.as_ref(),
+                    // (DES-RULE-CHECK-001 rev 2) No roster, bench or authors on this path: its
+                    // rule check cannot establish creators, so it convenes no council (a dispute
+                    // holds) — fail-closed.
+                    None,
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),

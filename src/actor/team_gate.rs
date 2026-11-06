@@ -3598,6 +3598,15 @@ pub(super) fn apply_held_revision(
 /// state (a rewound review re-runs at its own next attempt, never a reused key) — and only its
 /// ord moves (with that ord's dispatch history as its attempt floor). Nothing before the cursor
 /// changes. Nothing is written if planning fails.
+/// (DES-RULE-CHECK-001 rev 2, codex r2) The steering-rule state a retained unit keeps through a
+/// plan revision: its last rule check (an open dispute stays open on the same evidence), the
+/// person's skips, and the rule councils its attempts spent (the run's budget never refunds).
+pub(super) fn carry_rule_state(k: &mut crate::domain::WorkUnit, o: &crate::domain::WorkUnit) {
+    k.rule_check = o.rule_check.clone();
+    k.rule_skips = o.rule_skips.clone();
+    k.rule_councils = o.rule_councils;
+}
+
 pub(super) fn revise_units(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -3720,6 +3729,9 @@ pub(super) fn revise_units(
                 // run state too — kept while the step still decides the same loop, else reset.
                 // …and what an earlier pass deferred to delivery, whatever else changed (codex r3).
                 k.carried_deferred = o.carried_deferred.clone();
+                // (DES-RULE-CHECK-001 rev 2, codex r2) …and its steering-rule record: an open
+                // dispute, the person's skips, and the rule councils its attempts spent.
+                carry_rule_state(&mut k, o);
                 if k.repeat_from == o.repeat_from {
                     k.repeat_passes = o.repeat_passes;
                     k.repeat_choice = o.repeat_choice.clone();
@@ -3729,6 +3741,11 @@ pub(super) fn revise_units(
             }
             None => {
                 u.last_attempt = floor;
+                // A same-id step planned fresh for different work keeps nothing of the old
+                // unit's rule check, but the rule councils it spent stay spent.
+                if let Some(o) = old.iter().find(|o| o.id == u.id) {
+                    u.rule_councils = o.rule_councils;
+                }
                 fresh.push(u);
                 fresh_dists.push(d);
             }
@@ -3813,3 +3830,37 @@ mod propose_tests;
 #[cfg(test)]
 #[path = "testing_rules_tests.rs"]
 mod testing_rules_tests;
+
+#[cfg(test)]
+mod rule_state_tests {
+    /// (DES-RULE-CHECK-001 rev 2, codex r2) A plan revision that keeps a reviewed unit keeps its
+    /// open dispute, the person's skips and the councils it spent: without it, a revision after a
+    /// send-back erased a recorded BROKEN reading and refunded the run's council budget.
+    #[test]
+    fn a_revision_keeps_an_open_dispute_its_skips_and_its_spent_councils() {
+        let mut old = crate::domain::WorkUnit::pending("r:review", "r", 3, "review");
+        old.rule_check = Some(crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                rule_id: "R1".into(),
+                status: crate::rule_check::RuleStatus::Disputed,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        old.rule_skips = vec![crate::rule_check::RuleSkip {
+            rule_id: "R2".into(),
+            reason: "the person decided".into(),
+            by: "op".into(),
+            at: 1,
+            rule_key: "k".into(),
+            evidence_key: "e".into(),
+            instruction: None,
+        }];
+        old.rule_councils = 4;
+        let mut kept = crate::domain::WorkUnit::pending("r:review", "r", 3, "review, revised");
+        super::carry_rule_state(&mut kept, &old);
+        assert_eq!(kept.rule_check, old.rule_check);
+        assert_eq!(kept.rule_skips, old.rule_skips);
+        assert_eq!(kept.rule_councils, 4);
+    }
+}

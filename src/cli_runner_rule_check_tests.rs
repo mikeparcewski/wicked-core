@@ -723,3 +723,6 @@ fn the_deliver_step_checks_a_deferred_rule_against_the_published_text() {
     );
     assert!(!out.exists(), "the hand-back file is removed once read");
 }
+
+#[path = "cli_runner_rule_council_tests.rs"]
+mod council;
