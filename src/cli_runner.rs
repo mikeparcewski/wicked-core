@@ -4874,7 +4874,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
             };
             // (core#799) The judge is told the pinned floor decides the criterion's
             // deterministic half — it runs after the judge, so the judge never sees its result.
-            let judge_criterion = crate::validator::pinned_judge_criterion(v);
+            // (e2e F29) The coverage judge is also told the minimum the engine applies to THIS
+            // run (the repository's own target when the person set or lowered it).
+            let judge_criterion =
+                crate::domain_extraction::pinned_judge_criterion_for(v, input.governance.as_ref());
             // BUS PATH: only over a bus exec mediation ARMED for this unit (`gate_eval_bus_db`; never
             // process env — DES-TEAMING-002 T0), publish a gate-evaluation request and
             // wait for the governed evaluator daemon to respond (no subprocess, no dangerous flags,

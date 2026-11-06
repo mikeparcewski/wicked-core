@@ -667,4 +667,18 @@ fn a_generic_tool_phase_is_handed_the_run_variables() {
         tree.len() >= 40 && tree.chars().all(|c| c.is_ascii_hexdigit()),
         "a tree id: {env}"
     );
+    // (e2e F30) The commit the engine minted the worktree from rides as WICKED_RUN_BASE, so a check
+    // comparing against the base reads the engine's record, not refs a worker can move.
+    let minted = events
+        .iter()
+        .find_map(|e| match e {
+            CoreEvent::RunBaseResolved { base_commit, .. } => Some(base_commit.clone()),
+            _ => None,
+        })
+        .expect("runBaseResolved");
+    assert_eq!(
+        var("WICKED_RUN_BASE").as_deref(),
+        Some(minted.as_str()),
+        "{env}"
+    );
 }
