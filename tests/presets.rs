@@ -1456,11 +1456,46 @@ fn m9b_demo_launches_probe_plan_record_review() {
 
 /// Arm the hermetic emit spool (core#311) before `main`.
 ///
-/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
-/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+/// Also puts a stub `wicked-garden` first on `PATH`: the demo presets' Tool steps name it, and the
+/// launch's tool preflight must find it (a CI runner has no garden installed). Nothing here runs it.
+///
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only touches the filesystem and
+/// process env vars via the std API — no allocator setup, no threads, no panics across the FFI
+/// boundary.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
     wicked_apps_core::emit::hermetic_test_spool();
+    let bin = std::env::temp_dir().join(format!("wicked-core-presets-bin-{}", std::process::id()));
+    if std::fs::create_dir_all(&bin).is_ok() {
+        let stub = bin.join(if cfg!(windows) {
+            "wicked-garden.cmd"
+        } else {
+            "wicked-garden"
+        });
+        if std::fs::write(
+            &stub,
+            if cfg!(windows) {
+                "@exit /b 0\r\n"
+            } else {
+                "#!/bin/sh\nexit 0\n"
+            },
+        )
+        .is_ok()
+        {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755));
+            }
+            let mut paths = vec![bin];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                std::env::set_var("PATH", joined);
+            }
+        }
+    }
 }
 
 /// DES-learn-workflow: a launch naming `learn` runs the built-in preset — scope gated, research and
