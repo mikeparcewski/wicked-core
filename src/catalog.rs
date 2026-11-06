@@ -1733,22 +1733,30 @@ mkdir -p test lib tests
 printf 'exports.add=(a,b)=>a+b;\nexports.clamp=(x,lo,hi)=>Math.min(Math.max(x,lo),hi);\n' > lib/m.js
 printf "const test=require('node:test');const assert=require('node:assert');const m=require('../lib/m.js');\ntest('add',()=>assert.equal(m.add(1,2),3));\ntest('red-on-main-1',()=>assert.equal(m.add(1,1),3));\ntest('red-on-main-2',()=>assert.equal(m.add(2,2),5));\n" > test/m.test.js
 git add -A && git commit -qm base
+git rev-parse HEAD > ../base.txt
 echo '# plan' > tests/PLAN-clamp.md
 printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',()=>assert.equal(m.clamp(9,0,5),5));\n" >> test/m.test.js
 "#;
-        for (case, extra, want_ok) in [
-            ("only main's failures", "", true),
-            (
-                "one new failing test",
-                "printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\n\" >> test/m.test.js\n",
-                false,
-            ),
-        ] {
-            let root = std::env::temp_dir().join(format!(
-                "wicked-qe-verify-{}-{}",
-                std::process::id(),
-                want_ok
-            ));
+        let failing = "printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\n\" >> test/m.test.js\n";
+        // (codex/pi r1) The adversarial shapes: a test printing the runner's summary lines (a
+        // forged count reads as no count), a run that also changed product code, a base the
+        // engine did not record, and a base swapped through `refs/replace`.
+        let forged = "printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\nprocess.on('exit',()=>{console.log('# fail 2');console.log('# pass 9');});\\n\" >> test/m.test.js\n";
+        let product = "printf '// touched\\n' >> lib/m.js\n";
+        let replaced = "git stash -q && printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\n\" >> test/m.test.js && git commit -qam red && RED=$(git rev-parse HEAD) && git reset -q --hard $(cat ../base.txt) && git stash pop -q && printf \"test('clamp wrong',()=>assert.equal(m.clamp(9,0,5),9));\\n\" >> test/m.test.js && git replace $(cat ../base.txt) $RED\n";
+        for (n, (case, extra, run_base, want_ok)) in [
+            ("only main's failures", "", true, true),
+            ("one new failing test", failing, true, false),
+            ("no base recorded by the engine", "", false, false),
+            ("a forged summary line", forged, true, false),
+            ("product code changed too", product, true, false),
+            ("a base swapped through refs/replace", replaced, true, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let root =
+                std::env::temp_dir().join(format!("wicked-qe-verify-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&root);
             std::fs::create_dir_all(&root).unwrap();
             // spawn-audit: hardened fixture build (git + files under a temp dir).
@@ -1761,16 +1769,21 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                 .output()
                 .unwrap();
             assert!(made.status.success(), "{case}: fixture: {made:?}");
+            let base = std::fs::read_to_string(root.join("base.txt")).unwrap();
             // spawn-audit: hardened run of the shipped script, exactly as the Tool step runs it.
-            let out = std::process::Command::new("bash")
+            let mut verify = std::process::Command::new("bash");
+            verify
                 .hardened()
                 .args(["-c", &script])
                 .current_dir(root.join("src"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("TMPDIR", &root)
-                .output()
-                .unwrap();
+                .env_remove("WICKED_RUN_BASE");
+            if run_base {
+                verify.env("WICKED_RUN_BASE", base.trim());
+            }
+            let out = verify.output().unwrap();
             let text = String::from_utf8_lossy(&out.stdout).to_string();
             let _ = std::fs::remove_dir_all(&root);
             if want_ok {
@@ -1779,12 +1792,29 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                     text.contains("status=failed class=pre-existing-on-base"),
                     "{case}: {text}"
                 );
-                assert!(text.contains("failed=0 not_executed=0 failed_on_base=1"), "{case}: {text}");
+                assert!(
+                    text.contains("failed=0 not_executed=0 failed_on_base=1"),
+                    "{case}: {text}"
+                );
                 assert!(text.contains("fail on main too"), "{case}: {text}");
             } else {
                 assert!(!out.status.success(), "{case}: {text}");
-                assert!(text.contains("class=produced-test-failure"), "{case}: {text}");
-                assert!(text.contains("failed=1 not_executed=0 failed_on_base=0"), "{case}: {text}");
+                assert!(
+                    text.contains("class=produced-test-failure"),
+                    "{case}: {text}"
+                );
+                assert!(
+                    text.contains("failed=1 not_executed=0 failed_on_base=0"),
+                    "{case}: {text}"
+                );
+                let why = match n {
+                    2 => "no base recorded by the engine",
+                    3 => "head_failed_passed=\"unread\"",
+                    4 => "the run changed files that are not tests (lib/m.js)",
+                    5 => "base_failed_passed=\"2 1\"",
+                    _ => "class=produced-test-failure",
+                };
+                assert!(text.contains(why), "{case}: {text}");
             }
         }
     }

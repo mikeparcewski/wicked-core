@@ -26,14 +26,19 @@ Two release tracks share this file, newest entry first regardless of track:
   (the repository's target), not the daemon-wide one. Runs already parked keep the validator they were planned with.
 - **A test file that is red on main no longer fails qe-author-tests' verify (e2e F30).** The verify step ran each
   produced test file and counted any non-zero exit, so tests added to a file that already fails on main failed the
-  run. A produced file that fails is now run again on the run's base: when the base copy fails too, with at least as
-  many failing tests and no more passing ones (and no fewer tests in all), the file is `class=pre-existing-on-base`,
-  counted in a new `failed_on_base=` summary field and not against the run. Anything else, including counts the
-  runner did not print, is the run's own failure, as before; exit codes excuse, the printed counts can only deny. The
-  suite check takes the same count tightening. The base is the commit the engine recorded for the run
-  (`WICKED_RUN_BASE`, now handed to every generic Tool step), not one derived from refs a worker in the worktree can
-  move. The review step is told to fail a `pre-existing-on-base` file when any failing test is not failing on main or
-  any added test fails. Known tie, covered by that review: in one file, a new failing test plus a fixed main failure.
+  run. A produced file that fails is now run again on the run's base, and it is `class=pre-existing-on-base` (counted
+  in a new `failed_on_base=` summary field, not against the run) only when all of these hold: the base is the commit
+  the engine recorded for the run (`WICKED_RUN_BASE`, now handed to every generic Tool step; git replacement refs are
+  ignored), the run changed no file other than tests, test fixtures and the plan, the base copy fails too, both runs
+  print exactly one readable runner summary, and head has no more failing tests, more passing ones and no fewer
+  tests in all than the base. Anything else, including a summary line printed twice (a test can print one), is the
+  run's own failure, as before. The suite check excuses a shared failure only on readable counts with head no worse
+  and no non-test change (it used to excuse on exit codes alone); without a recorded base it still derives one as
+  before. The base runs see the head's installed dependencies (`node_modules`, `.venv`, up to the worktree root).
+  The review step is told to fail a `pre-existing-on-base` file when any failing test is not failing on main or any
+  added test fails. Known limits, covered by that review and the deliver floor: in one file, a new failing test plus
+  a fixed main failure tie the counts; a test that prints a forged summary and then kills its runner before the real
+  one is read as that forged summary.
 - **A failed check parks instead of ending the run (e2e F30).** When a Tool step (a check such as verify) exits
   non-zero and the failure judge rules `fail`, the run now parks at the triage gate ("Unit N failed and triage
   escalated") instead of ending FAILED: approve runs the check again, request changes sends the work back to the step

@@ -283,12 +283,32 @@ pub(crate) fn applied_min_coverage(graph_db: Option<&str>) -> Result<(u8, MinSou
 /// store (read-only) names the run's repository, and its graph is the repo-local one — the same
 /// resolution as `actor::repo_code_graph_db`, never the project graph (a sibling repository's
 /// target must not set this one's bar). `None` when the unit carries no repository or no graph.
+///
+/// The graph root comes from the operational store's own path
+/// ([`crate::code_graph::repo_graph_root_for_store`]), not the calling thread's bound state home:
+/// the judge runs on a runner thread, where the actor's binding is not set.
 fn floor_graph_for(gov: &crate::workflow::GovernanceContext) -> Option<String> {
     let repo_id = gov.repo_id.as_deref()?;
     let store = wicked_apps_core::open_store_ro(Some(&gov.db_path)).ok()?;
     let repo = crate::repo::get_repo(&store, repo_id).ok().flatten()?;
-    let path = crate::code_graph::existing_code_graph(std::path::Path::new(&repo.root_path))?;
-    Some(path.to_string_lossy().into_owned())
+    let root = crate::code_graph::repo_graph_root_for_store(&gov.db_path)?;
+    let path = crate::code_graph::repo_graph_db_at(&root, std::path::Path::new(&repo.root_path));
+    path.is_file().then(|| path.to_string_lossy().into_owned())
+}
+
+/// (e2e F29) The criterion a PINNED validator's agent judge applies:
+/// [`crate::validator::pinned_judge_criterion`], plus, for the coverage validator, the minimum the
+/// engine applies to this run ([`coverage_judge_note`]). The one call the judge block makes, so the
+/// note cannot be dropped from one path (bus or inline) and not the other.
+pub(crate) fn pinned_judge_criterion_for(
+    v: &DeterministicValidator,
+    gov: Option<&crate::workflow::GovernanceContext>,
+) -> String {
+    let base = crate::validator::pinned_judge_criterion(v);
+    match coverage_judge_note(v, gov) {
+        Some(note) => format!("{base}\n\n{note}"),
+        None => base,
+    }
 }
 
 /// (e2e F29) What the pinned coverage judge is told about the minimum, beside
@@ -610,6 +630,106 @@ mod tests {
         assert!(c.contains("the repository's own target"), "{c}");
         assert!(c.contains("written in the work does not"), "{c}");
         assert!(c.contains("resolved > 0"), "{c}");
+    }
+
+    /// (e2e F29, codex r1) The production path: a governed unit's judge criterion
+    /// ([`pinned_judge_criterion_for`], the one call the judge block makes) resolves the run's
+    /// REGISTERED repository from the operational store, reads its repo-local graph under the
+    /// daemon's repo-graph root (from the store path, not a thread binding) and carries 66%.
+    #[test]
+    fn a_governed_coverage_judge_is_told_the_repository_target() {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let dir = std::env::temp_dir().join(format!("wicked-domainext-gov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::write(repo.join("README.md"), "x\n").unwrap();
+        for args in [
+            &["init", "-q", "-b", "main", "."][..],
+            &[
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "add",
+                "-A",
+            ],
+            &[
+                "-c",
+                "user.email=t@example.invalid",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "init",
+            ],
+        ] {
+            // spawn-audit: hardened git fixture (a throwaway repo under a temp dir).
+            let ok = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&repo)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(ok.success(), "git {args:?}");
+        }
+        let db = dir.join("core.db").to_string_lossy().into_owned();
+        let entry = {
+            let mut store = wicked_apps_core::open_store(Some(&db)).unwrap();
+            crate::repo::register_repo(
+                &mut store,
+                crate::repo::RepoSpec {
+                    name: "tiny-math".into(),
+                    root_path: repo.to_string_lossy().into_owned(),
+                    registered_at: 0,
+                },
+            )
+            .unwrap()
+        };
+        let graph = crate::code_graph::repo_graph_db_at(
+            &crate::code_graph::repo_graph_root_for_store(&db).expect("a graph root"),
+            std::path::Path::new(&entry.root_path),
+        );
+        std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
+        {
+            let mut g = wicked_apps_core::open_store(Some(graph.to_str().unwrap())).unwrap();
+            wicked_governance::set_repo_min_coverage_pct(&mut g, Some(66)).unwrap();
+        }
+        let gov = |repo_id: Option<String>| crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: db.clone(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: None,
+            repo_id,
+            apps: None,
+        };
+        let v = coverage_eq_one_validator();
+        let c = pinned_judge_criterion_for(&v, Some(&gov(Some(entry.id.clone()))));
+        assert!(c.starts_with(COVERAGE_CRITERION), "{c}");
+        assert!(c.contains("to 66% (the repository's own target)"), "{c}");
+        assert!(!c.contains("80%"), "{c}");
+        // No repository on the unit: the note says so, with no number.
+        let blind = pinned_judge_criterion_for(&v, Some(&gov(None)));
+        assert!(blind.contains("could not be read for this note"), "{blind}");
+        // Any other pinned validator: the criterion is exactly the floor contract, no note.
+        let other = DeterministicValidator {
+            criterion: "lint passes".into(),
+            script: "true".into(),
+            approved: true,
+        };
+        assert_eq!(
+            pinned_judge_criterion_for(&other, Some(&gov(Some(entry.id)))),
+            crate::validator::pinned_judge_criterion(&other)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// (e2e F29) The judge is told the minimum the engine APPLIES: the repository's own target read

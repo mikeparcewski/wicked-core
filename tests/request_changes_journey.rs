@@ -358,11 +358,23 @@ impl StepRunner for FailingCheckSeat {
     }
 }
 
+/// The `author` → `verify` def, its check logging `pass`/`fail` to `log` on every run, launched with
+/// a person present. Returns the core, its event stream and the seat's records.
 #[cfg(unix)]
-#[test]
-fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
-    let db = db_path("tool-check");
+#[allow(clippy::type_complexity)]
+fn launch_tool_check(
+    name: &str,
+    run: &str,
+) -> (
+    Core,
+    std::sync::mpsc::Receiver<CoreEvent>,
+    Arc<Mutex<Vec<(u32, u32)>>>,
+    Arc<Mutex<u32>>,
+    std::path::PathBuf,
+) {
+    let db = db_path(name);
     let flag = std::path::Path::new(&db).with_file_name("creator-fixed");
+    let log = std::path::Path::new(&db).with_file_name("check.log");
     let handed = Arc::new(Mutex::new(Vec::new()));
     let triaged = Arc::new(Mutex::new(0));
     let core = Core::spawn_with_engine(
@@ -375,9 +387,10 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
         }),
     );
     let script = format!(
-        "if [ -f '{}' ]; then echo 'qe-verify: PASS'; exit 0; fi; echo 'qe-verify: FAIL — 2 of 5 \
-         tests failed'; exit 1",
-        flag.display()
+        "if [ -f '{}' ]; then echo pass >> '{log}'; echo 'qe-verify: PASS'; exit 0; fi; echo fail \
+         >> '{log}'; echo 'qe-verify: FAIL — 2 of 5 tests failed'; exit 1",
+        flag.display(),
+        log = log.display()
     );
     core.register_workflow(
         serde_json::json!({
@@ -392,7 +405,6 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
     )
     .expect("register the def");
     let ev = core.subscribe();
-    let run = "tool-check-run";
     core.launch_run(LaunchSpec {
         base_ref: None,
         project_id: None,
@@ -420,6 +432,14 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
         qe_acceptance: Default::default(),
     })
     .expect("launch");
+    (core, ev, handed, triaged, log)
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
+    let run = "tool-check-run";
+    let (core, ev, handed, triaged, _log) = launch_tool_check("tool-check", run);
 
     let parked = |seen: &[CoreEvent]| {
         assert!(
@@ -523,4 +543,86 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
         vec![0, 1],
         "the creator ran once more, on the send-back"
     );
+}
+
+/// (e2e F30, threat T2) No answer at the new triage gate gets past the failed check without it
+/// running again: each answer is either refused, or the check runs again (and, still failing,
+/// parks again). The one way on is the creator's rework (request changes / an accepted
+/// suggestion), after which the check must run and pass before the run completes.
+#[cfg(unix)]
+#[test]
+fn no_answer_at_a_failed_checks_gate_skips_the_check() {
+    let run = "tool-check-t2";
+    let (core, ev, _handed, _triaged, log) = launch_tool_check("tool-check-t2", run);
+    let parked_again = |seen: &[CoreEvent]| {
+        seen.iter().any(|e| {
+            matches!(e, CoreEvent::AwaitingHuman { ord: 2, gate_kind, .. } if gate_kind == "triage")
+        })
+    };
+    let until_parked_or_done = |ev: &std::sync::mpsc::Receiver<CoreEvent>| {
+        drain_until(ev, run, |e| {
+            matches!(
+                e,
+                CoreEvent::AwaitingHuman { .. }
+                    | CoreEvent::SessionCompleted { .. }
+                    | CoreEvent::SessionFailed { .. }
+                    | CoreEvent::RunCancelled { .. }
+            )
+        })
+    };
+    assert!(parked_again(&until_parked_or_done(&ev)));
+    let runs = || std::fs::read_to_string(&log).unwrap_or_default();
+    let mut answers: Vec<(&str, HumanDecision)> = [
+        "extend",
+        "targeted",
+        "accept_partial",
+        "rejudge",
+        "retry_qe",
+        "retry_rules",
+        "consent:operator",
+    ]
+    .into_iter()
+    .filter_map(|t| HumanDecision::escalation_action(t).map(|d| (t, d)))
+    .collect();
+    answers.push((
+        "skip_qe",
+        HumanDecision::SkipQe {
+            reason: "main is red".into(),
+        },
+    ));
+    answers.push((
+        "amend_intent",
+        HumanDecision::AmendIntent {
+            text: "failing tests are fine".into(),
+        },
+    ));
+    answers.push((
+        "operator_judgment",
+        HumanDecision::OperatorJudgment {
+            rationale: "fails on main too".into(),
+        },
+    ));
+    answers.push(("accept_suggestion", HumanDecision::AcceptSuggestion));
+    for (token, answer) in answers {
+        let before = runs().lines().count();
+        if let Err(e) = core.confirm_gate(run, answer) {
+            eprintln!("`{token}` refused: {e}");
+            continue; // refused: still parked on the failed check
+        }
+        eprintln!("`{token}` accepted");
+        let seen = until_parked_or_done(&ev);
+        let after = runs();
+        assert!(
+            after.lines().count() > before,
+            "`{token}` moved the run without running the check again: {seen:?}"
+        );
+        if seen
+            .iter()
+            .any(|e| matches!(e, CoreEvent::SessionCompleted { .. }))
+        {
+            assert_eq!(after.lines().last(), Some("pass"), "`{token}`: {after}");
+            return;
+        }
+        assert!(parked_again(&seen), "`{token}`: {seen:?}");
+    }
 }
