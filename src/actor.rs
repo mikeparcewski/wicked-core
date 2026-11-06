@@ -7728,7 +7728,7 @@ fn apply_step_result(
             .evidence_root
             .as_deref()
             .and_then(|r| {
-                crate::demo_record::current_approved(std::path::Path::new(r), &run_id).ok()
+                crate::demo_record::current_approved(std::path::Path::new(r), &run_id, None).ok()
             })
             .map(|(a, _)| a);
         let judged =
@@ -7877,8 +7877,21 @@ fn apply_step_result(
     // like a missing deliverable.
     if feeds_demo_record {
         if let Some(root) = session.evidence_root.clone() {
-            if let Err(e) = crate::demo_record::snapshot_plan(std::path::Path::new(&root), &run_id)
-            {
+            let my_step = unit
+                .id
+                .strip_prefix(&format!("{run_id}:"))
+                .unwrap_or(&unit.id)
+                .to_string();
+            // The same admission as at dispatch, BEFORE the engine writes anything under the root.
+            let snap =
+                crate::demo_record::validate_demo_session(&session, &run_id).and_then(|()| {
+                    crate::demo_record::snapshot_plan(
+                        std::path::Path::new(&root),
+                        &run_id,
+                        &my_step,
+                    )
+                });
+            if let Err(e) = snap {
                 let why = format!("the demo plan could not be snapshotted for approval: {e}");
                 unit.status = crate::domain::UnitStatus::Rejected;
                 unit.denial_reason = Some(why.clone());
@@ -12005,7 +12018,7 @@ fn dispatch_unit(
         // (DES-DEMO-RECORD-001) A demo Tool (`demo_probe`, `demo_record`): its demo root, launch
         // manifest and approved snapshot, resolved here; it runs jailed on the worker thread below.
         let demo = crate::demo_record::is_demo_catalog(unit.catalog.as_deref())
-            .then(|| crate::demo_record::DemoDispatch::resolve(run_id, &session, unit));
+            .then(|| crate::demo_record::DemoDispatch::resolve(run_id, &session, unit, &units));
         // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
         // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
         // snapshotted off-thread below (the repository root is the only store read it needs).
@@ -12753,8 +12766,25 @@ fn run_demo_tool(
             );
         }
     }
-    // A fresh take: the previous one moves to takes/<n>/ (the probe's directory is the probe's own:
-    // garden empties it).
+    // A superseded or cancelled attempt touches nothing.
+    if let Some(r) = stop() {
+        return (
+            format!("{}: stopped before it began ({r})", d.catalog),
+            StepStatus::Ok,
+            None,
+            dr::DemoTake::refused("engine_refused", format!("stopped before it began ({r})")),
+        );
+    }
+    // A fresh attempt: the previous take moves to takes/<n>/; the previous probe is emptied (a verdict
+    // must be this attempt's, whatever garden does).
+    if d.catalog == dr::PROBE_CATALOG {
+        if let Err(why) = dr::clear_probe(&root) {
+            return refused(
+                "engine_refused",
+                format!("the previous probe could not be cleared: {why}"),
+            );
+        }
+    }
     if d.catalog == dr::RECORD_CATALOG {
         if let Err(why) = dr::rotate_take(&root) {
             return refused(

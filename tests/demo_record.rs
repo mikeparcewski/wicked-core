@@ -1,7 +1,8 @@
-//! (DES-DEMO-RECORD-001, core#1249) The `demo_record` Tool through the REAL engine: a plan naming it,
-//! launched with a demo root (`evidence_root` + crew's `launch.json`), dispatches the catalog's fixed
-//! command (a stub `wicked-garden` on `PATH`) inside the one-port jail with the declared variables, and
-//! the demo floor decides the unit from the engine's receipt of the take.
+//! (DES-DEMO-RECORD-001, core#1249) The demo lifecycle through the REAL engine: a plan step (a stub
+//! runner writes the seat's `storyline.json` into the run's only write root, `<root>/plan`) stops at its
+//! plan gate with the engine's snapshot in `approved/`; after the person approves, `demo_record`
+//! dispatches the catalog's fixed command (a stub `wicked-garden` on `PATH`) inside the one-port jail
+//! with the declared variables, and the demo floor decides the unit from the engine's receipt.
 //!
 //! - A PASS take of the approved storyline, with every file it implies, completes the run.
 //! - A take that ran and failed (`left_app`) escalates as a verdict (`demo_verdict`).
@@ -20,10 +21,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 use wicked_core::{
-    Core, CoreEvent, EntityMode, HumanConfirm, LaunchSpec, PlanSteps, StepInput, StepOutput,
-    StepRunner, TeamConfig, TEAM_OUTBOX_FILE,
+    Core, CoreEvent, EntityMode, HumanConfirm, HumanDecision, LaunchSpec, PlanSteps, StepInput,
+    StepOutput, StepRunner, StepStatus, TeamConfig, TEAM_OUTBOX_FILE,
 };
-use wicked_council::types::{Confidence, Dispatcher, Vote};
+use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 fn fixture_root() -> PathBuf {
@@ -92,21 +93,67 @@ impl Dispatcher for NoBallots {
     }
 }
 
-struct NoTurns;
-impl StepRunner for NoTurns {
+/// The seat of the `plan` step: writes the storyline and chapters into the run's plan directory (the
+/// test's demo root, found from the run id), as a seat would. No other unit runs a worker turn.
+struct PlanWriter;
+impl StepRunner for PlanWriter {
     fn run_unit(&self, i: &StepInput) -> StepOutput {
-        panic!("a tool-only plan ran a worker turn: {}", i.unit.id);
+        if i.unit.id.ends_with(":plan") {
+            let name = i.run_id.strip_prefix("demo-").expect("a test run id");
+            let plan = fixture_root().join(name).join("demo").join("plan");
+            std::fs::write(plan.join("storyline.json"), STORY).unwrap();
+            std::fs::write(plan.join("chapters.json"), CHAPTERS).unwrap();
+        }
+        StepOutput {
+            run_id: i.run_id.clone(),
+            unit_ix: i.unit_ix,
+            attempt: i.attempt,
+            // The plan writes its files; any unit the floor adds around it (a recon step, a critique of the
+            // plan) answers with a passing verdict.
+            output: if i.unit.id.ends_with(":plan") {
+                "Wrote script.md, chapters.json and storyline.json for the two chapters.".into()
+            } else {
+                "Read the plan; nothing blocks it.\nVERDICT: PASS".into()
+            },
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
-    use sha2::Digest;
-    format!("{:x}", sha2::Sha256::digest(bytes))
+const STORY: &[u8] = br#"{"title":"t","segments":[{"key":"01-a"},{"key":"02-b"}]}"#;
+const CHAPTERS: &[u8] = br#"[{"key":"01-a"},{"key":"02-b"}]"#;
+
+fn cli(key: &str) -> AgenticCli {
+    AgenticCli {
+        key: key.into(),
+        display_name: key.into(),
+        binary: "unused".into(),
+        headless_invocation: "unused {PROMPT}".into(),
+        category: Category::default(),
+        input_mode: InputMode::default(),
+        version_probe: vec![],
+        trust_flags: vec![],
+        alt_binaries: vec![],
+        confidence: Confidence::default(),
+        enabled_for_council: true,
+        seat_eligible_for_work: true,
+        acp: None,
+        capabilities: None,
+        login_invocation: None,
+        logout_invocation: None,
+        governance_class: None,
+        credential: None,
+        free_tier: None,
+        health: None,
+    }
 }
 
-/// A demo root as crew's route leaves it, plus an approved snapshot (the engine writes it when the
-/// plan step passes; a record-only plan has none, so the test lays it down).
-fn demo_root(base: &Path, mode: &str, run: &str) -> PathBuf {
+/// A demo root as crew's route leaves it: `plan/` (the only write root), the manifest, the stub's mode.
+fn demo_root(base: &Path, mode: &str) -> PathBuf {
     let root = base.join("demo");
     std::fs::create_dir_all(root.join("plan")).unwrap();
     std::fs::write(
@@ -114,21 +161,6 @@ fn demo_root(base: &Path, mode: &str, run: &str) -> PathBuf {
         json!({"app_origin": "http://127.0.0.1:7721", "launch_path": "/apps/esc",
                "target": {"kind": "crew_app", "id": "esc"}, "live_data_to_models": true})
         .to_string(),
-    )
-    .unwrap();
-    let story = br#"{"title":"t","segments":[{"key":"01-a"},{"key":"02-b"}]}"#;
-    let gen = root.join("approved").join("1");
-    std::fs::create_dir_all(&gen).unwrap();
-    std::fs::write(gen.join("storyline.json"), story).unwrap();
-    std::fs::write(
-        gen.join("chapters.json"),
-        br#"[{"key":"01-a"},{"key":"02-b"}]"#,
-    )
-    .unwrap();
-    std::fs::write(
-        root.join("approved").join("current.json"),
-        json!({"gen": 1, "run": run, "storyline_sha": sha256(story), "chapter_keys": ["01-a", "02-b"], "intro": false})
-            .to_string(),
     )
     .unwrap();
     std::fs::write(root.join("mode"), mode).unwrap();
@@ -140,12 +172,41 @@ struct Run {
     root: PathBuf,
 }
 
-fn run(name: &str, mode: &str, plant: bool) -> Run {
+fn wait_for(
+    rx: &std::sync::mpsc::Receiver<CoreEvent>,
+    sid: &str,
+    events: &mut Vec<CoreEvent>,
+    secs: u64,
+) {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < deadline {
+        match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(ev) => {
+                let done = match &ev {
+                    CoreEvent::SessionCompleted { session } => *session == sid,
+                    CoreEvent::SessionFailed { session, .. } => *session == sid,
+                    CoreEvent::AwaitingHuman { session, .. } => *session == sid,
+                    _ => false,
+                };
+                events.push(ev);
+                if done {
+                    return;
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(_) => return,
+        }
+    }
+}
+
+/// Launch `plan (gated) → record`, let the plan step write, check the snapshot at the plan gate, edit the
+/// plan afterwards (it must not matter), approve, and collect events until the run completes or stops
+/// again. `gated: false` launches the plan step with no gate.
+fn run_with(name: &str, mode: &str, plant: bool, gated: bool) -> Run {
     let base = fixture_root().join(name);
     let _ = std::fs::remove_dir_all(&base);
     std::fs::create_dir_all(&base).unwrap();
-    let sid = format!("demo-{name}");
-    let root = demo_root(&base, mode, &sid);
+    let root = demo_root(&base, mode);
     if plant {
         std::fs::create_dir_all(root.join("demo-video")).unwrap();
         std::fs::write(root.join("demo-video/demo.mp4"), b"planted").unwrap();
@@ -153,18 +214,29 @@ fn run(name: &str, mode: &str, plant: bool) -> Run {
     let core = Core::spawn_with_engine_team(
         base.join("estate.db").to_string_lossy().into_owned(),
         Arc::new(NoBallots),
-        Arc::new(NoTurns),
+        Arc::new(PlanWriter),
         TeamConfig::new(None, Some(base.join(TEAM_OUTBOX_FILE)))
             .with_final_pass_budget(Duration::from_millis(300)),
     );
     let rx = core.subscribe();
+    let sid = format!("demo-{name}");
+    let gate = if gated {
+        json!({"human_confirm": {"unconditional": false}})
+    } else {
+        json!("auto")
+    };
+    // A declared touch set (the plan directory's files) scores the plan low, so no floor step joins it.
     let plan: PlanSteps = serde_json::from_value(json!({
-        "steps": [{"catalog": "demo_record", "id": "record"}]
+        "steps": [
+            {"catalog": "produce", "id": "plan", "gate": gate},
+            {"catalog": "demo_record", "id": "record", "depends_on": ["plan"]}
+        ],
+        "touch": ["plan/storyline.json", "plan/chapters.json"]
     }))
     .unwrap();
     core.launch_run(LaunchSpec {
         problem: "make a demo".into(),
-        clis: Vec::new(),
+        clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
         session_id: sid.clone(),
         human_confirm: HumanConfirm::None,
@@ -189,26 +261,53 @@ fn run(name: &str, mode: &str, plant: bool) -> Run {
     })
     .expect("the demo plan launches");
     let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(120);
-    while Instant::now() < deadline {
-        match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(ev) => {
-                let done = match &ev {
-                    CoreEvent::SessionCompleted { session } => *session == sid,
-                    CoreEvent::SessionFailed { session, .. } => *session == sid,
-                    CoreEvent::AwaitingHuman { session, .. } => *session == sid,
-                    _ => false,
-                };
-                events.push(ev);
-                if done {
-                    break;
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(_) => break,
+    // Any plan-approval gate first (a team plan may hold), then the plan gate.
+    for _ in 0..4 {
+        wait_for(&rx, &sid, &mut events, 60);
+        let at_plan_gate = root.join("approved/current.json").exists();
+        let stopped = events.iter().rev().find_map(|e| match e {
+            CoreEvent::AwaitingHuman { session, .. } if *session == sid => Some(true),
+            CoreEvent::SessionCompleted { session } if *session == sid => Some(false),
+            CoreEvent::GateEscalated { .. } => Some(false),
+            _ => None,
+        });
+        if stopped != Some(true) || escalation(&events).is_some() {
+            break;
+        }
+        if at_plan_gate {
+            // The snapshot is the plan as written then, bound to this run and step; an edit now is ignored.
+            let cur: serde_json::Value = serde_json::from_str(
+                &std::fs::read_to_string(root.join("approved/current.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                (cur["run"].as_str(), cur["step"].as_str()),
+                (Some(sid.as_str()), Some("plan"))
+            );
+            std::fs::write(
+                root.join("plan/storyline.json"),
+                br#"{"title":"edited after the gate"}"#,
+            )
+            .unwrap();
+        }
+        core.confirm_gate(
+            &sid,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: Default::default(),
+            },
+        )
+        .expect("approve");
+        if at_plan_gate {
+            wait_for(&rx, &sid, &mut events, 120);
+            break;
         }
     }
     Run { events, root }
+}
+
+fn run(name: &str, mode: &str, plant: bool) -> Run {
+    run_with(name, mode, plant, true)
 }
 
 /// macOS is the one host with a port-scoped jail (sandbox-exec); elsewhere nothing records.
@@ -267,6 +366,11 @@ fn a_passing_take_completes_and_the_recorder_got_exactly_the_declared_env() {
     assert_eq!(
         get("WICKED_DEMO_STORYLINE").map(PathBuf::from),
         Some(r.root.join("approved").join("1"))
+    );
+    // The recorder got the APPROVED storyline, not the edit made after the gate.
+    assert_eq!(
+        std::fs::read(r.root.join("approved/1/storyline.json")).unwrap(),
+        STORY
     );
     let allowed = [
         "WICKED_RUN_ID",
@@ -353,72 +457,19 @@ fn a_host_with_no_port_scoped_jail_records_nothing() {
     );
 }
 
-/// A record step cannot consume another run's approval: the snapshot names the run it belongs to.
+/// A record step records only a storyline a person approved: a plan step with no gate is refused.
 #[test]
-fn another_runs_approval_is_never_recorded() {
+fn a_plan_with_no_gate_is_never_recorded() {
     if !port_jailed() {
         eprintln!("SKIP: no port-scoped jail on this host");
         return;
     }
-    let base = fixture_root().join("foreign");
-    let _ = std::fs::remove_dir_all(&base);
-    std::fs::create_dir_all(&base).unwrap();
-    // The approval below names another run; this launch reuses the root.
-    let root = demo_root(&base, "PASS", "some-other-run");
-    let core = Core::spawn_with_engine_team(
-        base.join("estate.db").to_string_lossy().into_owned(),
-        Arc::new(NoBallots),
-        Arc::new(NoTurns),
-        TeamConfig::new(None, Some(base.join(TEAM_OUTBOX_FILE)))
-            .with_final_pass_budget(Duration::from_millis(300)),
-    );
-    let rx = core.subscribe();
-    let plan: PlanSteps =
-        serde_json::from_value(json!({"steps": [{"catalog": "demo_record", "id": "record"}]}))
-            .unwrap();
-    let sid = "demo-foreign".to_string();
-    core.launch_run(LaunchSpec {
-        problem: "make a demo".into(),
-        clis: Vec::new(),
-        entity_mode: EntityMode::Shared,
-        session_id: sid.clone(),
-        human_confirm: HumanConfirm::None,
-        auto_deliver: false,
-        repo_ref: None,
-        base_ref: None,
-        workflow: None,
-        project_id: None,
-        extra_write_roots: vec![root.join("plan").to_string_lossy().into_owned()],
-        extra_read_roots: Vec::new(),
-        project_graph: None,
-        plan: Some(plan),
-        deliver_step: None,
-        exclude_seats: Vec::new(),
-        evidence_root: Some(root.to_string_lossy().into_owned()),
-        primary: None,
-        reduced_assurance: false,
-        power: false,
-        voice: None,
-        deliverables: Vec::new(),
-        qe_acceptance: Default::default(),
-    })
-    .unwrap();
-    let mut events = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
-        if let Ok(ev) = rx.recv_timeout(Duration::from_millis(500)) {
-            let stop = matches!(&ev, CoreEvent::AwaitingHuman { session, .. } | CoreEvent::SessionCompleted { session } if *session == sid);
-            events.push(ev);
-            if stop {
-                break;
-            }
-        }
-    }
-    let (summary, source) = escalation(&events).expect("refused");
+    let r = run_with("ungated", "PASS", false, false);
+    let (summary, source) = escalation(&r.events).expect("refused");
     assert_eq!(source, "demo_refused", "{summary}");
-    assert!(summary.contains("not this run's"), "{summary}");
+    assert!(summary.contains("no plan gate"), "{summary}");
     assert!(
-        !root.join("demo-video/env.txt").exists(),
+        !r.root.join("demo-video/env.txt").exists(),
         "the recorder never ran"
     );
 }

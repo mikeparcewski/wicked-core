@@ -301,6 +301,9 @@ pub(crate) struct Approved {
     /// The run whose plan step this snapshot is (a snapshot is never another run's approval).
     #[serde(default)]
     pub(crate) run: String,
+    /// The plan step it snapshots: a record step records only the plan it depends on.
+    #[serde(default)]
+    pub(crate) step: String,
     /// sha256 of `storyline.json` as approved.
     pub(crate) storyline_sha: String,
     /// The chapter keys of `chapters.json`, in order (the files a take must produce follow from them).
@@ -316,23 +319,50 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 /// Read a plan file the seat wrote: a small regular file, never through a link.
 fn read_plan_file(dir: &Path, name: &str) -> Result<Vec<u8>, String> {
+    use std::io::Read;
     let f = dir.join(name);
-    let m = std::fs::symlink_metadata(&f).map_err(|e| format!("the plan has no {name}: {e}"))?;
+    // Opened without following a link and without blocking on a special file; the OPENED file is the one
+    // checked and read, at most one byte past the cap.
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(not(unix))]
+    {
+        let m =
+            std::fs::symlink_metadata(&f).map_err(|e| format!("the plan has no {name}: {e}"))?;
+        if m.file_type().is_symlink() {
+            return Err(format!("the plan's {name} is not a regular file"));
+        }
+    }
+    let file = opts
+        .open(&f)
+        .map_err(|e| format!("the plan's {name} cannot be opened as a regular file: {e}"))?;
+    let m = file
+        .metadata()
+        .map_err(|e| format!("the plan's {name}: {e}"))?;
     if !m.is_file() {
         return Err(format!("the plan's {name} is not a regular file"));
     }
-    if m.len() > PLAN_FILE_MAX {
+    let mut bytes = Vec::new();
+    file.take(PLAN_FILE_MAX + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("the plan's {name}: {e}"))?;
+    if bytes.len() as u64 > PLAN_FILE_MAX {
         return Err(format!(
             "the plan's {name} is larger than {PLAN_FILE_MAX} bytes"
         ));
     }
-    std::fs::read(&f).map_err(|e| format!("the plan's {name}: {e}"))
+    Ok(bytes)
 }
 
 /// (When the `plan` unit is done) Copy the plan's storyline and chapters into a new
 /// `approved/<gen>/` and point `approved/current.json` at it. The person's gate shows this snapshot
 /// and the recorder reads only it, so what records is what was approved.
-pub(crate) fn snapshot_plan(root: &Path, run_id: &str) -> Result<Approved, String> {
+pub(crate) fn snapshot_plan(root: &Path, run_id: &str, step: &str) -> Result<Approved, String> {
     let plan = root.join(PLAN_DIR);
     let story = read_plan_file(&plan, PLAN_FILES[0])?;
     let chapters = read_plan_file(&plan, PLAN_FILES[1])?;
@@ -363,23 +393,35 @@ pub(crate) fn snapshot_plan(root: &Path, run_id: &str) -> Result<Approved, Strin
     let a = Approved {
         gen,
         run: run_id.to_string(),
+        step: step.to_string(),
         storyline_sha: sha256_hex(&story),
         chapter_keys,
         intro,
     };
+    // A fresh file, never through a link planted at its name, then renamed over the pointer.
     let tmp = approved.join(format!(".{CURRENT_FILE}.{}", std::process::id()));
-    std::fs::write(
-        &tmp,
-        serde_json::to_vec_pretty(&a).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+    {
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        f.write_all(&serde_json::to_vec_pretty(&a).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
+    }
     std::fs::rename(&tmp, approved.join(CURRENT_FILE)).map_err(|e| e.to_string())?;
     Ok(a)
 }
 
 /// The current approved snapshot of `run_id`, when there is one. Every path is the engine's own and
 /// checked: no linked `approved/`, no linked `current.json`, no linked generation.
-pub(crate) fn current_approved(root: &Path, run_id: &str) -> Result<(Approved, PathBuf), String> {
+pub(crate) fn current_approved(
+    root: &Path,
+    run_id: &str,
+    step: Option<&str>,
+) -> Result<(Approved, PathBuf), String> {
     let approved = root.join(APPROVED_DIR);
     crate::walkthrough::check_proof_root(&approved)?;
     let cur = approved.join(CURRENT_FILE);
@@ -397,6 +439,14 @@ pub(crate) fn current_approved(root: &Path, run_id: &str) -> Result<(Approved, P
              approved",
             a.run
         ));
+    }
+    if let Some(step) = step {
+        if a.step != step {
+            return Err(format!(
+                "the approved snapshot is step {:?}'s, not {step:?}'s, the plan this record depends on",
+                a.step
+            ));
+        }
     }
     let dir = approved.join(a.gen.to_string());
     crate::walkthrough::check_proof_root(&dir)?;
@@ -807,6 +857,52 @@ pub(crate) fn host_tool_env() -> Vec<(String, String)> {
     env
 }
 
+/// The plan step a `demo_record` unit records: the ONE creator it depends on, which must stop at a
+/// human gate (the person approves what records). `Err` otherwise.
+pub(crate) fn plan_dependency(
+    run_id: &str,
+    unit: &crate::domain::WorkUnit,
+    units: &[crate::domain::WorkUnit],
+) -> Result<String, String> {
+    let prefix = format!("{run_id}:");
+    let creators: Vec<&crate::domain::WorkUnit> = units
+        .iter()
+        .filter(|u| u.ord < unit.ord && u.role == crate::workflow::PhaseRole::Creator)
+        .filter(|u| {
+            let step = u.id.strip_prefix(&prefix).unwrap_or(&u.id);
+            unit.depends_on.iter().any(|d| d == step)
+        })
+        .collect();
+    let [plan] = creators.as_slice() else {
+        return Err(format!(
+            "a demo_record step must depend on exactly one plan step (a creator); this one names {}",
+            creators.len()
+        ));
+    };
+    if !matches!(plan.gate, crate::workflow::GateSpec::HumanConfirm { .. }) {
+        return Err(
+            "the plan this record depends on has no plan gate: a demo records only a storyline a \
+             person approved"
+                .to_string(),
+        );
+    }
+    Ok(plan
+        .id
+        .strip_prefix(&prefix)
+        .unwrap_or(&plan.id)
+        .to_string())
+}
+
+/// Empty the probe's directory before a probe (a verdict must be THIS attempt's, whatever garden does).
+pub(crate) fn clear_probe(root: &Path) -> Result<(), String> {
+    let dir = owned_dir(root, PROBE_DIR)?;
+    for e in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let e = e.map_err(|e| e.to_string())?;
+        remove_tree(&e.path()).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 /// Everything the actor resolves (on its own thread, with the session) for one demo Tool dispatch.
 #[derive(Debug, Clone)]
 pub(crate) struct DemoDispatch {
@@ -825,6 +921,7 @@ impl DemoDispatch {
         run_id: &str,
         session: &crate::domain::AgentSession,
         unit: &crate::domain::WorkUnit,
+        units: &[crate::domain::WorkUnit],
     ) -> Self {
         let catalog = unit.catalog.clone().unwrap_or_default();
         let root = session
@@ -836,8 +933,9 @@ impl DemoDispatch {
         let root = root.and_then(|r| validate_demo_session(session, run_id).map(|()| r));
         let launch = root.clone().and_then(|r| read_launch(&r));
         let approved = (catalog == RECORD_CATALOG).then(|| {
+            let step = plan_dependency(run_id, unit, units)?;
             root.clone()
-                .and_then(|r| current_approved(&r, run_id).map(|(_, d)| d))
+                .and_then(|r| current_approved(&r, run_id, Some(&step)).map(|(_, d)| d))
         });
         Self {
             catalog,
@@ -912,6 +1010,7 @@ mod tests {
         Approved {
             gen: 1,
             run: "r".into(),
+            step: "plan".into(),
             storyline_sha: "abc".into(),
             chapter_keys: keys.iter().map(|s| s.to_string()).collect(),
             intro: false,
@@ -1015,14 +1114,14 @@ mod tests {
             br#"[{"key":"01-a"},{"key":"02-b"}]"#,
         )
         .unwrap();
-        let a = snapshot_plan(&root, "run-a").unwrap();
+        let a = snapshot_plan(&root, "run-a", "plan").unwrap();
         assert_eq!((a.gen, a.intro), (1, true));
         assert_eq!(a.chapter_keys, ["01-a", "02-b"]);
         // The seat edits the plan afterwards: the snapshot does not move.
         std::fs::write(root.join("plan/storyline.json"), b"{}").unwrap();
-        let (cur, dir) = current_approved(&root, "run-a").unwrap();
+        let (cur, dir) = current_approved(&root, "run-a", Some("plan")).unwrap();
         // Another run never records this run's approval.
-        assert!(current_approved(&root, "run-b")
+        assert!(current_approved(&root, "run-b", Some("plan"))
             .unwrap_err()
             .contains("not this run's"));
         assert_eq!(cur, a);
@@ -1030,15 +1129,15 @@ mod tests {
             std::fs::read(dir.join("storyline.json")).unwrap(),
             br#"{"intro":{"title":"x","ms":1500}}"#
         );
-        assert_eq!(snapshot_plan(&root, "run-a").unwrap().gen, 2);
+        assert_eq!(snapshot_plan(&root, "run-a", "plan").unwrap().gen, 2);
         // A linked plan file is refused.
         #[cfg(unix)]
         {
             std::fs::remove_file(root.join("plan/chapters.json")).unwrap();
             std::os::unix::fs::symlink("/etc/hosts", root.join("plan/chapters.json")).unwrap();
-            assert!(snapshot_plan(&root, "run-a")
+            assert!(snapshot_plan(&root, "run-a", "plan")
                 .unwrap_err()
-                .contains("not a regular file"));
+                .contains("regular file"));
         }
         for i in 0..4 {
             owned_dir(&root, VIDEO_DIR).unwrap();
