@@ -102,7 +102,14 @@ requirements: the host records whatever is stated for them as unconfirmed, never
 requirement, so they are not a reason to fail the page; judge the page on its product-code \
 units, and PASS a page that has none. An extracted rule (kind `Rule`: a Salesforce Flow, a cloud \
 policy) is product behaviour whatever its file's extension, outside test and fixture files: \
-judge it like code. You judge work another seat did; change no file. List each problem as `ITEM \
+judge it like code. A page's change should hold only this run's own files \
+(`.wicked/domain/worklist.json`, `.wicked/domain/rules.json`, `.wicked/domain/apply-report.json`, \
+`coverage-report.json`): when it does, a break that the repository's existing code already had is \
+not this page's to keep, so a rule it breaks is `RULE <id>: N/A — pre-existing: <file:line> is not \
+in this change`, never an ITEM or a FAIL (wicked-core#1339); a rule the page's own files break \
+(in the rules file, say) is judged as usual. When the change touches any other file, list that \
+file as a problem and judge the rules against it as usual. You judge work another seat did; \
+change no file. List each problem as `ITEM \
 n: FAIL — <symbol> — <why>` (for a missed rule, `missed: <the rule its source shows>`). Judge \
 the PAGE: a weak or code-describing statement is a problem you list, and the host records every \
 statement under its confidence threshold as a risk, never as a validated requirement. End with \
@@ -593,6 +600,37 @@ mod tests {
     /// The page review agrees with the denominator (core#1233, codex r3 on #1234): tests and
     /// data files are not product requirements, an extracted rule in a data-extension file is,
     /// and a page that leaves most sourced product units empty is not passed.
+    /// wicked-core#1339 (run 92749083): a page whose change holds only its own files leaves a break
+    /// that existing code already had as N/A pre-existing, never an ITEM or a FAIL; its own files
+    /// and any other file are judged as usual. Falsifier: drop the sentence and the page reviewer
+    /// fails a mapping page on the repository's existing JSDoc.
+    #[test]
+    fn the_page_review_judges_the_page_not_the_code_it_did_not_touch() {
+        let r = RULES_REVIEW_INSTRUCTIONS
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        for f in [
+            WORKLIST_REL,
+            RULES_REL,
+            ".wicked/domain/apply-report.json",
+            COVERAGE_REPORT_FILE,
+        ] {
+            assert!(r.contains(&format!("`{f}`")), "{f}");
+        }
+        assert!(r.contains("`RULE <id>: N/A — pre-existing: <file:line> is not in this change`, never an ITEM or a FAIL"), "{r}");
+        assert!(
+            r.contains(
+                "a rule the page's own files break (in the rules file, say) is judged as usual"
+            ),
+            "{r}"
+        );
+        assert!(
+            r.contains("When the change touches any other file, list that file as a problem"),
+            "{r}"
+        );
+    }
+
     #[test]
     fn the_page_review_matches_what_the_minimum_counts() {
         let r = RULES_REVIEW_INSTRUCTIONS;
