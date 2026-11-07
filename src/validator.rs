@@ -7144,6 +7144,7 @@ mod worker_sandbox_tests {
             NetworkPolicy::Allow,
             NetworkPolicy::Deny,
             NetworkPolicy::LoopbackOnly,
+            NetworkPolicy::Isolated,
         ] {
             for pty in [PtyPolicy::Deny, PtyPolicy::Own] {
                 let p = macos_sandbox_profile_for_roots(&[root.as_path()], network, pty).unwrap();

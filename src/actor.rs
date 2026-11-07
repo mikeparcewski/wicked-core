@@ -13712,7 +13712,8 @@ fn run_draft_render_tool(
             ));
         }
     }
-    if after.as_deref().ok() != rec.sha256.as_deref() {
+    // Only a count is withdrawn for a change; a print that already failed keeps its own cause.
+    if rec.measured() && after.as_deref().ok() != rec.sha256.as_deref() {
         rec = not(
             rec,
             "draft_changed",
