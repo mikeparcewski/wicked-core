@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Editor conformance requires cases 7 and 18 (program S9).** `CASES` grows from 12 to 14 ids to match garden's
+  `CASES_V1` (wicked-garden#1424) and crew's `CONFORMANCE_CASES` (wicked-crew#1399): `7-edit` (the editor saves
+  through its own UI: a visible control marked `data-wicked-save` makes exactly one version) after `6-forwarding`,
+  and `18-shows` (it reads and shows the content it is handed, and re-reads on a new version) after `12-hash-pinned`.
+  A report that did not run one of them is refused `cases_not_run`, naming it. The review's conformance record says
+  `cases 0-12, 18` (`0-16, 18` for protocol 2), and the `editor-plugin` preset's build step names the save marker and
+  its test step cites the new range.
+
 - **The run's context block reaches every agent the run spawns (program context-block-core).** A person's own Goal,
   Approach and Constraints for a job, set whole by `Core::set_run_context` (napi `setRunContext`, capability
   `supportsRunContext()`), are kept on the session (`run_context`, so a restart keeps them), never drained, and put at

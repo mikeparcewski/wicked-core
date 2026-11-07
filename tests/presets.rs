@@ -1396,11 +1396,13 @@ fn editor_plugin_preset_builds_protocol_2() {
     );
     assert!(!design.contains("protocol [1],"), "{design}");
     assert!(
-        build.contains("protocol-2 plumbing") && !build.contains("wicked.editor/1"),
+        build.contains("protocol-2 plumbing")
+            && !build.contains("wicked.editor/1")
+            && build.contains("data-wicked-save"),
         "{build}"
     );
     assert!(
-        test.contains("0-6 and 8-16") && !test.contains("8-12"),
+        test.contains("0-16 and 18") && !test.contains("8-16") && !test.contains("case 7 and"),
         "{test}"
     );
 }

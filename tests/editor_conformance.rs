@@ -44,7 +44,7 @@ fn mode_file(run: &str) -> PathBuf {
     fixture_root().join(format!("mode-{run}"))
 }
 
-const PASS_CASES: &str = r#"{"0-manifest":{"ok":true},"1-handshake":{"ok":true},"2-sizes":{"ok":true},"3-no-network":{"ok":true},"4-permissions":{"ok":true},"5-typing":{"ok":true},"6-forwarding":{"ok":true},"8-strict-input":{"ok":true},"9-liveness":{"ok":true},"10-keyboard":{"ok":true},"11-theme":{"ok":true},"12-hash-pinned":{"ok":true},"13-surfaces":{"ok":true},"14-card":{"ok":true},"15-options":{"ok":true},"16-full":{"ok":true}}"#;
+const PASS_CASES: &str = r#"{"0-manifest":{"ok":true},"1-handshake":{"ok":true},"2-sizes":{"ok":true},"3-no-network":{"ok":true},"4-permissions":{"ok":true},"5-typing":{"ok":true},"6-forwarding":{"ok":true},"7-edit":{"ok":true},"8-strict-input":{"ok":true},"9-liveness":{"ok":true},"10-keyboard":{"ok":true},"11-theme":{"ok":true},"12-hash-pinned":{"ok":true},"13-surfaces":{"ok":true},"14-card":{"ok":true},"15-options":{"ok":true},"16-full":{"ok":true},"18-shows":{"ok":true}}"#;
 
 /// Pre-main (single-threaded): the hermetic emit spool, a stub `wicked-garden` first on `PATH`, and
 /// the two daemon variables crew exports (an interpreter file and a studio dist with index.html).
@@ -516,7 +516,7 @@ fn a_passing_host_run_completes_and_the_review_cites_the_engines_record() {
     );
     assert!(text.contains("PASSED"), "{text}");
     assert!(
-        text.contains("acme-x 0.1.0 (entry sha256 ab12; cases 0-6, 8-16)"),
+        text.contains("acme-x 0.1.0 (entry sha256 ab12; cases 0-16, 18)"),
         "{text}"
     );
     assert!(
