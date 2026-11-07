@@ -4318,14 +4318,15 @@ impl WrappedCliStepRunner {
                     );
                 }
             }
-            // F-079 (core#441): every seat handed a delivery — pi, copilot, opencode, claude —
-            // also gets the launcher environment of THAT generation: `WICKED_GARDEN_ROOT=<root>`
+            // F-079 (core#441): every seat handed a delivery — pi, copilot, opencode, claude,
+            // codex, and a launcher-only one (agy) — also gets the launcher environment of THAT generation: `WICKED_GARDEN_ROOT=<root>`
             // (garden's `wicked-garden` launcher resolves its root from it first, so a skill's
             // `wicked-garden run …` never falls back to an npm package of another version) and
             // `<root>/scripts` at the front of `PATH` (where garden ships the shim). Both derive
             // from the same pinned `SkillsDelivery` root, both are read-only paths inside the
-            // fence's allowed slot; a seat handed nothing (agy) is handed neither. (codex's
-            // commands keep the PATH only because its shell is pinned non-login, `codex_shell_pins`.)
+            // fence's allowed slot; a seat handed nothing (`SkillsDelivery::None`) is handed
+            // neither. (codex's commands keep that PATH only because its shell is pinned
+            // non-login, `codex_shell_pins`.)
             for (k, v) in delivery.launcher_env(std::env::var_os("PATH").as_deref()) {
                 cmd.env(k, v);
             }
@@ -17522,20 +17523,29 @@ tail -c 1500 /work/claude.out
         let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
         let wt = home.join("wt");
         std::fs::create_dir_all(&wt).unwrap();
-        let launch = |seat: &str, executes_code: bool| -> Vec<String> {
-            let argv_file = wt.join(format!("argv-{seat}-{executes_code}.txt"));
+        // (seat, template tail, read-only unit): the default unguarded template (the pin is
+        // appended after the prompt, as every engine `-c` is), a guarded one (`--` before the
+        // prompt: the pin must sit before it), and a real no-code unit (guarded tree, not a
+        // creator), whose `-c` allowlist strips every other override.
+        let launch = |seat: &str, tail: &str, read_only: bool| -> Vec<String> {
+            let argv_file = wt.join(format!("argv-{seat}-{}-{read_only}.txt", tail.len()));
             let _ = std::fs::remove_file(&argv_file);
             let bin = fake_recorder(&home.join("bin"), seat, &argv_file);
             let mut u = WorkUnit::pending(format!("s:{seat}"), "s", 1, "map the domain");
             u.assigned_cli = Some(seat.to_string());
             u.skill_ref = Some("wicked-garden-domain".to_string());
-            u.executes_code = executes_code;
-            u.assigned_invocation = Some(match seat {
-                "codex" => format!("{} exec --skip-git-repo-check {{PROMPT}}", bin.display()),
-                _ => format!("{} -p {{PROMPT}}", bin.display()),
-            });
+            if read_only {
+                u.executes_code = false;
+                u.worktree_guarded = true;
+                assert_eq!(
+                    crate::write_posture::WritePosture::of(&u, false),
+                    crate::write_posture::WritePosture::ReadOnly,
+                    "precondition: a read-only unit"
+                );
+            }
+            u.assigned_invocation = Some(format!("{} {tail}", bin.display()));
             let input = StepInput {
-                run_id: format!("run-login-{seat}-{executes_code}"),
+                run_id: format!("run-login-{seat}-{}-{read_only}", tail.len()),
                 unit_ix: 0,
                 attempt: 0,
                 unit: u,
@@ -17559,20 +17569,32 @@ tail -c 1500 /work/claude.out
         };
         let pin = ["-c".to_string(), "allow_login_shell=false".to_string()];
         let scripts = snapshot.join("scripts").to_string_lossy().into_owned();
-        for executes_code in [true, false] {
-            let argv = launch("codex", executes_code);
+        for (tail, guarded, read_only) in [
+            ("exec --skip-git-repo-check {PROMPT}", false, false),
+            ("exec {PROMPT}", true, false),
+            ("exec --skip-git-repo-check {PROMPT}", false, true),
+        ] {
+            let argv = launch("codex", tail, read_only);
             let args: Vec<&String> = argv.iter().take_while(|l| !l.starts_with("ENV ")).collect();
             let at = args
                 .windows(2)
                 .position(|w| *w[0] == pin[0] && *w[1] == pin[1])
                 .unwrap_or_else(|| {
                     panic!(
-                        "executes_code={executes_code}: codex must be pinned non-login: {argv:?}"
+                        "{tail} (read-only {read_only}): codex must be pinned non-login: {argv:?}"
                     )
                 });
             assert_eq!(args[0].as_str(), "exec", "{argv:?}");
-            if let Some(guard) = args.iter().position(|a| a.as_str() == "--") {
+            let guard = args.iter().position(|a| a.as_str() == "--");
+            assert_eq!(guard.is_some(), guarded, "{tail}: {argv:?}");
+            if let Some(guard) = guard {
                 assert!(at < guard, "the pin stays in exec's option scope: {argv:?}");
+            }
+            if read_only {
+                assert!(
+                    args.iter().any(|a| a.as_str() == "notify=[]"),
+                    "the no-code rewrite ran (its host-write pins are on): {argv:?}"
+                );
             }
             let path = argv
                 .iter()
@@ -17584,13 +17606,41 @@ tail -c 1500 /work/claude.out
             );
         }
         for seat in ["claude", "pi"] {
-            let argv = launch(seat, true);
+            let argv = launch(seat, "-p {PROMPT}", false);
             assert!(
                 !argv.iter().any(|a| a == "allow_login_shell=false"),
                 "{seat} gets no codex config: {argv:?}"
             );
         }
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// codex-seat-path: a resumed codex turn (`crate::headless::inject_session`) keeps the
+    /// non-login pin in `exec`'s options, before `resume <id>`, with the prompt intact after `--`.
+    #[test]
+    fn codex_shell_pin_survives_a_resumed_turn() {
+        let mut argv = build_argv("codex exec {PROMPT}", "map the domain", &[]);
+        apply_seat_posture(&mut argv, &codex_shell_pins());
+        let id = crate::headless::inject_session(
+            wicked_apps_core::spawn::SeatCli::Codex,
+            &mut argv,
+            Some("thread-1"),
+            None,
+        );
+        assert_eq!(id.as_deref(), Some("thread-1"));
+        assert_eq!(
+            argv,
+            [
+                "codex",
+                "exec",
+                "-c",
+                "allow_login_shell=false",
+                "resume",
+                "thread-1",
+                "--",
+                "map the domain"
+            ]
+        );
     }
 
     /// Design v3.2 — skills reach a non-Claude seat ONLY through its per-launch, wicked-owned
