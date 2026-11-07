@@ -13414,6 +13414,7 @@ mod tests {
                 "review-change/review",
                 "review-change/semantic",
                 "risk-analysis/risks",
+                "run-cost/check",
                 "scaffold/security",
                 "scaffold/test",
                 "security-review/review",

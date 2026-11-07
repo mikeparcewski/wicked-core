@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The `run-cost` preset and the crew-tool channel (program CS6, core half).** "What would 40 bug fixes a month cost?"
+  runs `facts` (`run`, a Tool: crew's fixed `wicked-crew insights-facts`, which prints crew's run facts: the window, the
+  scope, what is left out, the population rules, every workflow group's wall time and spend percentiles, and the runs),
+  then `model` (`understand`: the cost model from those facts only, the comparable group named as an assumption, the
+  population stated, every number cited by fact id or formula), then `check` (`critique`, rubric `fidelity-to-source`,
+  on a seat other than the model's, a FAIL held for a person). No creator, no deliver, no QE acceptance. Built-in list
+  entry and descriptor ("Model run cost"). **Crew-tool channel:** a Tool unit is armed with its unit's capability token
+  when it is an Apps run's (as before) or, in a `run-cost` run (`team_plan.preset`), exactly the `wicked-crew
+  insights-facts` command; nothing else is (`actor::crew_tool_channel`). The crew half (the facts route and the
+  command) is wicked-crew's.
+
 - **The engine measures a draft's page count (program G12, engine half).** A draft with a page budget had no measured
   page count anywhere in its run: the review seat was told to print it, no seat has a browser, and the review stalled.
   The `interactive-draft` preset is now `draft → measure-pages → critique`: `measure-pages` is the new catalog Tool

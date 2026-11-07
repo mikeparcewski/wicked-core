@@ -12510,11 +12510,12 @@ fn dispatch_unit(
         let run_for_child = run_id.to_string();
         let run_for_reg = run_id.to_string();
         let my_seq = launch_seq;
-        // (DES-APPS-001 §9.2, K0) A Tool unit of an Apps run is crew's fixed command (`wicked-crew
-        // apps-check`, `apps-produce`): `wicked-crew` resolves through `WICKED_CREW_BIN` when crew
-        // set it, and the command carries the unit's capability token so crew's route knows which
-        // run, unit and attempt is asking. The guards live until the command exits.
-        let apps_tool = crate::apps::run_preset(&session).is_some();
+        // (DES-APPS-001 §9.2, K0; CS6) A crew Tool unit — every Tool of an Apps run (`wicked-crew
+        // apps-check`, `apps-produce`) and a `run-cost` run's facts command — is crew's fixed
+        // command: `wicked-crew` resolves through `WICKED_CREW_BIN` when crew set it, and the
+        // command carries the unit's capability token so crew's route knows which run, unit and
+        // attempt is asking ([`crew_tool_channel`]). The guards live until the command exits.
+        let apps_tool = crew_tool_channel(&session, unit);
         let apps_channel = apps_tool
             .then(|| crate::mcp_gate::arm_tool_unit_channel(&input))
             .flatten();
@@ -12585,9 +12586,9 @@ fn dispatch_unit(
             let mut render_rec: Option<crate::draft_render::DraftRenderRecord> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
-                // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
+                // (DES-APPS-001 K0; CS6) A crew Tool without its unit token never spawns.
                 _ if apps_unarmed => (
-                    "wicked-core: refused: an Apps run's Tool command runs only with its unit's \
+                    "wicked-core: refused: crew's Tool command runs only with its unit's \
                      capability token, and none could be armed (no input governance or no broker \
                      URL on this daemon)"
                         .to_string(),
@@ -14088,6 +14089,81 @@ fn tool_garden_root(
             Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
             _ => None,
         },
+    }
+}
+
+/// (CS6) The built-in preset whose facts step is a crew Tool ([`crew_tool_channel`]).
+pub(crate) const RUN_COST_PRESET: &str = "run-cost";
+/// (CS6) `run-cost`'s facts command, exactly as `src/presets/run-cost.json` names it.
+pub(crate) const RUN_COST_FACTS_CMD: [&str; 2] = [crate::apps::CREW_BIN, "insights-facts"];
+
+/// (DES-APPS-001 K0; DES-CATALOG-002 CS6) The crew-tool channel: whether `unit`, a Tool unit of
+/// `session`, is armed with its capability token (`WICKED_MCP_TOKEN`, with `WICKED_CREW_URL`) so
+/// crew's route can tell which run, unit and attempt asks. A CLOSED list:
+/// - every Tool unit of an Apps run (`apps-turn`, `apps-publish`: [`crate::apps::run_preset`],
+///   from the session's contract);
+/// - in a `run-cost` run (the preset its launch named, the engine's own record
+///   `team_plan.preset`), ONLY the unit whose command is exactly [`RUN_COST_FACTS_CMD`]: the token
+///   reaches crew's own binary and nothing else, and crew's route serves it only to the `facts`
+///   step of a `run-cost` run.
+///
+/// Every other Tool runs without a token, as before.
+pub(crate) fn crew_tool_channel(session: &AgentSession, unit: &crate::domain::WorkUnit) -> bool {
+    let Some(cmd) = unit.tool_cmd.as_deref() else {
+        return false;
+    };
+    if crate::apps::run_preset(session).is_some() {
+        return true;
+    }
+    session.team_plan.as_ref().and_then(|p| p.preset.as_deref()) == Some(RUN_COST_PRESET)
+        && cmd.iter().map(String::as_str).eq(RUN_COST_FACTS_CMD)
+}
+
+#[cfg(test)]
+mod crew_tool_channel_tests {
+    use super::*;
+
+    fn session(preset: Option<&str>, apps: Option<&str>) -> AgentSession {
+        let mut s = super::worker_code_graph_tests::session_at("r", SessionStatus::Executing);
+        s.team_plan = preset.map(|p| crate::plan_gate::TeamPlanState {
+            preset: Some(p.to_string()),
+            ..Default::default()
+        });
+        s.assurance.apps = apps.map(|p| crate::apps::AppsContract {
+            preset: p.to_string(),
+        });
+        s
+    }
+
+    fn tool(cmd: Option<&[&str]>) -> crate::domain::WorkUnit {
+        let mut u = crate::domain::WorkUnit::pending("r:facts", "r", 1, "facts");
+        u.tool_cmd = cmd.map(|c| c.iter().map(|x| x.to_string()).collect());
+        u
+    }
+
+    /// (CS6) The run-cost facts Tool is armed (before CS6 only an Apps run's Tools were, so crew's
+    /// `POST /insights/facts` could never learn which run asked); nothing else new is.
+    #[test]
+    fn the_channel_arms_apps_tools_and_only_run_costs_facts_command() {
+        let facts = tool(Some(&RUN_COST_FACTS_CMD));
+        let other = tool(Some(&["wicked-crew", "apps-check"]));
+        let shell = tool(Some(&["sh", "-c", "wicked-crew insights-facts"]));
+        let agent = tool(None);
+        let run_cost = session(Some(RUN_COST_PRESET), None);
+        assert!(crew_tool_channel(&run_cost, &facts));
+        assert!(!crew_tool_channel(&run_cost, &other));
+        assert!(!crew_tool_channel(&run_cost, &shell));
+        assert!(!crew_tool_channel(&run_cost, &agent));
+        // The facts command in any other run, or a run that named no preset: no token.
+        assert!(!crew_tool_channel(&session(Some("bug"), None), &facts));
+        assert!(!crew_tool_channel(&session(None, None), &facts));
+        // Apps runs: every Tool unit, as before; never an agent unit.
+        for p in [crate::apps::APPS_TURN, crate::apps::APPS_PUBLISH] {
+            let apps = session(Some(p), Some(p));
+            assert!(crew_tool_channel(&apps, &other), "{p}");
+            assert!(crew_tool_channel(&apps, &shell), "{p}");
+            assert!(!crew_tool_channel(&apps, &agent), "{p}");
+        }
     }
 }
 
