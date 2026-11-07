@@ -5829,6 +5829,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         // An agent unit is never a demo Tool.
         demo_take: None,
         editor_conformance: None,
+        draft_render: None,
     };
     (output, agent_verdict, evidence)
 }

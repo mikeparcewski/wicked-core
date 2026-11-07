@@ -3616,6 +3616,7 @@ mod tests {
             rule_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,
+            draft_render: None,
             rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),

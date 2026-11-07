@@ -45,16 +45,19 @@ pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer
 /// ([`crate::plan`]'s `code_work_step`).
 pub const DOMAIN_COVERAGE_SKILL: &str = "wicked-garden-domain-coverage";
 
-/// The eighteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
+/// The nineteen catalog ids, in the §8.3 table's order (the two walkthrough entries, WT-C1, sit
 /// after `test`; the two demo Tools, DES-DEMO-RECORD-001, then the editor conformance Tool,
-/// DES-EDITOR-CONFORMANCE-HOST, close the table).
-pub const CATALOG_IDS: [&str; 18] = [
+/// DES-EDITOR-CONFORMANCE-HOST, close the table). The draft render Tool (PLAN G12) sits right after
+/// `produce`, its pipeline slot: the plan floor inserts a floor type at its catalog-order position
+/// (`plan::floor_fill`), so a floor-ADDED `critique` lands after the render, never before it.
+pub const CATALOG_IDS: [&str; 19] = [
     "understand",
     "test_plan",
     "design",
     "architecture",
     "build",
     "produce",
+    crate::draft_render::CATALOG_ID,
     "test",
     WALKTHROUGH_PLAN,
     WALKTHROUGH_REVIEW,
@@ -85,7 +88,7 @@ pub const WALKTHROUGH_RECORD_CMD: [&str; 4] = [
     "record",
 ];
 
-/// The phase catalog: eighteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
+/// The phase catalog: nineteen entries, in [`CATALOG_IDS`] order. Built once; the slice is static.
 pub fn catalog() -> &'static [PhaseDef] {
     static CATALOG: OnceLock<Vec<PhaseDef>> = OnceLock::new();
     CATALOG.get_or_init(build_catalog)
@@ -1356,6 +1359,25 @@ fn build_catalog() -> Vec<PhaseDef> {
         entry("build", Build, Creator, auto, Execution, floor(), true),
         entry("produce", Build, Creator, auto, Value, None, false),
         PhaseDef {
+            // (PLAN G12) The draft's page count: the engine's own fixed command on the host, in a
+            // no-network jail. Its record is a fact the reviewer cites, never a gate, so no pin.
+            executor: PhaseExecutor::Tool {
+                cmd: crate::draft_render::RENDER_CMD
+                    .iter()
+                    .map(|a| a.to_string())
+                    .collect(),
+            },
+            ..entry(
+                crate::draft_render::CATALOG_ID,
+                Test,
+                Neutral,
+                auto,
+                Execution,
+                None,
+                false,
+            )
+        },
+        PhaseDef {
             // The one entry that declares re-verified evidence: its pin is what re-verifies it.
             verified_evidence: true,
             ..entry(
@@ -1540,7 +1562,7 @@ mod tests {
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
-    fn the_catalog_is_the_eighteen_entries_of_the_table() {
+    fn the_catalog_is_the_nineteen_entries_of_the_table() {
         let got: Vec<_> = catalog()
             .iter()
             .map(|e| {
@@ -1568,6 +1590,7 @@ mod tests {
             ("architecture", j("recon"), j("neutral"), j("auto"), j("strategy"), None, false, j("agent"), None),
             ("build", j("build"), j("creator"), j("auto"), j("execution"), f, true, j("agent"), None),
             ("produce", j("build"), j("creator"), j("auto"), j("value"), None, false, j("agent"), None),
+            ("draft_render", j("test"), j("neutral"), j("auto"), j("execution"), None, false, j("tool"), None),
             ("test", j("test"), j("evaluator"), hci.clone(), j("execution"), f, false, j("agent"), None),
             ("walkthrough_plan", j("test"), j("evaluator"), j("auto"), j("execution"), Some("1aa3f15487018f68"), false, j("agent"), Some("wicked-garden-demo")),
             ("walkthrough_review", j("test"), j("neutral"), j("auto"), j("execution"), Some("cd95e6e0acdb4d8b"), false, j("tool"), None),

@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The engine measures a draft's page count (program G12, engine half).** A draft with a page budget had no measured
+  page count anywhere in its run: the review seat was told to print it, no seat has a browser, and the review stalled.
+  The `interactive-draft` preset is now `draft → measure-pages → critique`: `measure-pages` is the new catalog Tool
+  `draft_render` (stage test, neutral, auto; its catalog slot is right after `produce`, so a floor-added critique
+  follows it). It reads the draft the creator declared (the launch's deliverable, opened beneath its declared root with
+  no link followed), hashes those bytes, and runs garden's `page_count.py --render --json` on it in a new no-network jail
+  (`validator::render_jail`: no loopback, no unix socket, writes only to its private temp dir), with the browser the
+  daemon names in `WICKED_CHROME` (crew's managed `chrome-headless-shell`). The record (`WorkUnit.draft_render`:
+  `outcome` measured/not_measured, `cause`, `file`, `sha256` of the raw bytes, `pages` only when measured, the
+  structural `estimate`, `renderer`, `profile`, `counter`, `jail`) is a fact, never a gate: no renderer, no garden, no
+  jail, a failed print or a draft that changed during the print are recorded as `not_measured` with their cause, and
+  the run goes on. The critique is handed `[draft render record — unit N]` against the draft's sha256 now, and the
+  rule never to render in the seat; an unmeasured or stale count makes a page-budget item DEFERRED, never a count.
+  A send-back to the draft clears the record and re-measures; a re-plan keeps the step. Launch preflight exempts its
+  exact command. Crew's floor reuses a measured record when its own sha256 and the profile match.
+
 - **Review and QE acceptance are handed the requirements a change touches (operator rulings 2026-11-06).** Every
   evaluator unit and the QE reviewer get an engine record, `[requirements this change touches — engine record]`,
   built on the host from the run repository's requirements map. It sits beside the work as evidence, never in the
@@ -25,6 +41,7 @@ Two release tracks share this file, newest entry first regardless of track:
   from an unrecorded one, is labelled STALE ("context to check against the code, never proof"). No map, nothing
   touched, or a failed read means no record; the record is never a gate. The QE reviewer keeps it, alongside the
   editor conformance record, and its brief says how to weigh it.
+
 - **The `sourced-report` preset (program CS3, core half).** A read-only workflow behind the Research, Competitive,
   Due diligence, Analyze documents, Critique and Estimate cards: `gather` (team, `understand`) runs garden's learn skill
   in Report mode, starting with `report_check.py preflight` (a lens that needs documents stops when none are staged)

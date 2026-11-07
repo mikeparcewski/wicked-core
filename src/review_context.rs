@@ -445,11 +445,19 @@ pub(crate) fn evaluator_brief(
     units: &[WorkUnit],
     unit: &WorkUnit,
     current_tree: Option<&str>,
+    current_draft: Option<&str>,
 ) -> Vec<(u32, String, String)> {
     let ord = unit.ord;
     let mut out = Vec::new();
     let round = unit.review_rounds.len() + 1;
     let creator = crate::pipeline::most_recent_prior_creator(units, ord);
+    // (PLAN G12) The latest draft render record between the creator this unit reviews and this unit:
+    // one from before that creator measured an older draft and is not handed.
+    let render = units
+        .iter()
+        .filter(|u| u.ord < ord && u.ord > creator.map_or(0, |c| c.ord))
+        .filter_map(|u| u.draft_render.as_ref().map(|r| (u.ord, r)))
+        .max_by_key(|(o, _)| *o);
 
     // 1. The checklist and the answer contract.
     let items = done_when_items(intent);
@@ -522,6 +530,10 @@ pub(crate) fn evaluator_brief(
              on this host: cite it for any conformance item. Never run conformance.py in your seat \
              (no seat has a headless browser), and its absence there is not a finding.",
         );
+    }
+    // (PLAN G12) The draft's page count is the engine's to measure, on the host.
+    if render.is_some() {
+        c.push_str(crate::draft_render::NO_SEAT_RENDER_RULE);
     }
     out.push((ord, format!("[review checklist — unit {ord}]"), c));
 
@@ -622,6 +634,16 @@ pub(crate) fn evaluator_brief(
                 rec,
                 current_tree,
             ),
+        ));
+    }
+
+    // 6. (PLAN G12) The engine's own print of the draft, judged against the draft under review NOW
+    // (`current_draft`: the sha256 of the creator's deliverable at this unit's dispatch).
+    if let Some((ro, rec)) = render {
+        out.push((
+            ro,
+            format!("{} — unit {ro}]", crate::draft_render::RECORD_LABEL),
+            crate::draft_render::brief_block(ro, rec, current_draft),
         ));
     }
     out
@@ -749,6 +771,64 @@ mod tests {
         u
     }
 
+    /// (PLAN G12) The draft's reviewer is handed the engine's page count and the rule never to render in
+    /// the seat: measured on the bytes under review = the count; other bytes = NOT evidence, DEFERRED;
+    /// a record from before the creator it reviews (an older draft) is not handed at all.
+    #[test]
+    fn the_draft_render_record_is_handed_bound_to_the_draft_under_review() {
+        use crate::draft_render as dr;
+        use crate::workflow::PhaseRole;
+        let mut rec = dr::DraftRenderRecord::not_measured(0, "x", "y");
+        rec.outcome = dr::OUTCOME_MEASURED.into();
+        rec.cause = None;
+        rec.reason = None;
+        rec.pages = Some(2);
+        rec.sha256 = Some("s1".into());
+        rec.file = Some("/inbox/doc-v1.html".into());
+        let mut render = unit(2, PhaseRole::Neutral);
+        render.draft_render = Some(rec);
+        let eval = unit(3, PhaseRole::Evaluator);
+        let units = [unit(1, PhaseRole::Creator), render.clone(), eval.clone()];
+        let brief = evaluator_brief("draft it", &[], &units, &eval, None, Some("s1"));
+        let b = brief
+            .iter()
+            .find(|(_, l, _)| l == "[draft render record — unit 2]")
+            .expect("the record is handed");
+        assert!(
+            b.2.contains("2 printed pages") && b.2.contains("judge any page budget"),
+            "{}",
+            b.2
+        );
+        assert!(
+            brief[0].2.contains("Never run a renderer"),
+            "{}",
+            brief[0].2
+        );
+        let stale = evaluator_brief("draft it", &[], &units, &eval, None, Some("s2"));
+        let b = stale
+            .iter()
+            .find(|(_, l, _)| l.starts_with("[draft render record"))
+            .unwrap();
+        assert!(
+            b.2.contains("NOT evidence") && b.2.contains("DEFERRED"),
+            "{}",
+            b.2
+        );
+        // A creator re-ran after the render (unit 3 here): the old count is not handed.
+        let eval4 = unit(4, PhaseRole::Evaluator);
+        let units = [
+            unit(1, PhaseRole::Creator),
+            render,
+            unit(3, PhaseRole::Creator),
+            eval4.clone(),
+        ];
+        let later = evaluator_brief("draft it", &[], &units, &eval4, None, Some("s1"));
+        assert!(later
+            .iter()
+            .all(|(_, l, _)| !l.starts_with("[draft render record")));
+        assert!(!later[0].2.contains("Never run a renderer"));
+    }
+
     /// (DES-EDITOR-CONFORMANCE-HOST) The reviewer is handed the engine's conformance record and the rule
     /// never to run the harness; a PASS on another tree than the one under review (a change after it,
     /// by any unit) is labelled UNVERIFIED, never "the evidence for this tree".
@@ -768,7 +848,7 @@ mod tests {
         });
         let eval = unit(3, PhaseRole::Evaluator);
         let units = [unit(1, PhaseRole::Creator), conf, eval.clone()];
-        let brief = evaluator_brief("just do it", &[], &units, &eval, Some("t1"));
+        let brief = evaluator_brief("just do it", &[], &units, &eval, Some("t1"), None);
         let rec = brief
             .iter()
             .find(|(_, l, _)| l == "[editor conformance record — unit 2]")
@@ -779,7 +859,7 @@ mod tests {
             rec.2
         );
         assert!(brief[0].2.contains("Never run conformance.py in your seat"));
-        let stale = evaluator_brief("just do it", &[], &units, &eval, Some("t2"));
+        let stale = evaluator_brief("just do it", &[], &units, &eval, Some("t2"), None);
         let rec = stale
             .iter()
             .find(|(_, l, _)| l.starts_with("[editor conformance record"))
@@ -792,6 +872,7 @@ mod tests {
             &[unit(1, PhaseRole::Creator), eval.clone()],
             &eval,
             Some("t1"),
+            None,
         );
         assert!(plain
             .iter()
@@ -849,6 +930,7 @@ mod tests {
             &units,
             &eval,
             None,
+            None,
         );
         let labels: Vec<&str> = brief.iter().map(|(_, l, _)| l.as_str()).collect();
         assert_eq!(
@@ -898,6 +980,7 @@ mod tests {
             &[],
             &[before, unit(2, PhaseRole::Creator)],
             &fresh,
+            None,
             None,
         );
         assert_eq!(brief.len(), 1, "{brief:?}");
@@ -967,6 +1050,7 @@ mod tests {
             &units,
             &eval,
             None,
+            None,
         );
         let c = &brief[0].2;
         assert!(
@@ -1009,6 +1093,7 @@ mod tests {
             &units,
             &eval,
             None,
+            None,
         );
         let c = &plain[0].2;
         assert!(c.contains("The intent names no Done-when list"), "{c}");
@@ -1017,7 +1102,7 @@ mod tests {
             "{c}"
         );
         assert!(c.contains(DEFERRAL_RULE), "{c}");
-        let none = evaluator_brief("Done when:\n- a\n", &[], &units, &eval, None);
+        let none = evaluator_brief("Done when:\n- a\n", &[], &units, &eval, None, None);
         assert!(none[0].2.contains(DEFERRAL_RULE) && !none[0].2.contains("After delivery —"));
     }
 

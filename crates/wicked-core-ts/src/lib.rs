@@ -3304,7 +3304,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (DES-TEAMING-002 T8) `Core.catalog()`: the eighteen entries, in catalog order, each with
+    /// (DES-TEAMING-002 T8) `Core.catalog()`: the nineteen entries, in catalog order, each with
     /// the picker's keys.
     #[test]
     fn catalog_json_is_the_catalog_in_order() {

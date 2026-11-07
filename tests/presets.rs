@@ -722,6 +722,16 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             .unwrap_or_else(|e| panic!("{name}: {e}"));
         // (DES-CATALOG-002 §5.1) `migration` gains ONLY its parity steps over its mapping: verify
         // checks parity, and a final `parity` test checks it again after cleanup.
+        // (PLAN G12) `interactive-draft` gains ONLY its page-count step over its mapping: the engine
+        // prints the draft after it is written, before the review.
+        if name == "interactive-draft" {
+            want.push(PlanStep {
+                catalog: "draft_render".to_string(),
+                id: "measure-pages".to_string(),
+                depends_on: Some(vec!["draft".to_string()]),
+                ..PlanStep::default()
+            });
+        }
         if name == "migration" {
             let verify = want.iter_mut().find(|s| s.id == "verify").unwrap();
             verify.rubric = Some("parity".to_string());
@@ -1135,6 +1145,21 @@ fn m9_interactive_presets_launch_repo_less_with_the_draft_skill() {
             !ids.iter().any(|i| *i == "build" || *i == "security_review"),
             "{name}: a non-code run owes no build and no security_review: {ids:?}"
         );
+        // (PLAN G12) The draft's page count: the engine's Tool right after the draft, and the
+        // floor's review after it (so the review is handed the count).
+        if name == "interactive-draft" {
+            let at = |id: &str| ids.iter().position(|i| *i == id);
+            let (draft, measure) = (at("draft").unwrap(), at("measure-pages"));
+            assert_eq!(measure, Some(draft + 1), "{ids:?}");
+            let m = &units[draft + 1];
+            assert_eq!(m.catalog.as_deref(), Some("draft_render"), "{ids:?}");
+            assert!(m.tool_cmd.is_some() && m.skill_ref.is_none(), "{ids:?}");
+            let review = units
+                .iter()
+                .position(|u| u.catalog.as_deref() == Some("critique"))
+                .unwrap_or_else(|| panic!("a reviewed draft: {ids:?}"));
+            assert!(review > draft + 1, "the review follows the count: {ids:?}");
+        }
     }
 }
 

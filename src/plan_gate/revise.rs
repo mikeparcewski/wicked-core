@@ -754,11 +754,14 @@ pub(crate) fn revise(
 
 /// (DES-CATALOG-002 §2.4) A step of a held plan that is a CHECK: a send-back's re-plan keeps it,
 /// no looser. An evaluator entry (review, critique, test, security review, a judge), a step with a
-/// rubric, an authored gate, a validator pin, the walkthrough's recorder, or a step the floor added.
+/// rubric, an authored gate, a validator pin, the walkthrough's recorder, the draft render step, or a
+/// step the floor added.
 fn is_check_step(s: &PlanStep) -> bool {
     let entry = crate::catalog::catalog_entry(&s.catalog);
     entry.is_some_and(|e| e.role == crate::workflow::PhaseRole::Evaluator)
         || s.catalog == crate::catalog::WALKTHROUGH_REVIEW
+        // (PLAN G12) The draft's page count, which the review after it cites.
+        || s.catalog == crate::draft_render::CATALOG_ID
         || s.rubric.is_some()
         || s.gate.is_some()
         || matches!(s.validator_pin, Some(Some(_)))
