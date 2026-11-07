@@ -553,6 +553,12 @@ enum NetworkPolicy {
     /// macOS: the deny plus three rules for that port; Linux bwrap: `--unshare-net` (the namespace's own
     /// `lo` holds only what the jail starts) plus the same AF_UNIX seccomp program as `LoopbackOnly`.
     LoopbackServe(u16),
+    /// (PLAN G12, `draft_render`) No network of any kind, and writes ONLY to the caller's roots. The
+    /// draft renderer prints a seat-written page with a headless browser: no loopback (the crew daemon
+    /// listens there), no unix socket, and none of the system-temp write carve-out [`Self::Deny`] keeps
+    /// for validators. macOS: `(deny network*)` (it covers unix sockets) and no temp carve-out; Linux
+    /// bwrap: `--unshare-net` plus the AF_UNIX seccomp program of the loopback jails.
+    Isolated,
 }
 
 /// Whether the jail may allocate pseudo-terminals. Only the repo-checks floor asks for `Own`: a
@@ -916,6 +922,14 @@ pub(crate) fn serve_jail(write_roots: &[&Path], port: u16) -> SandboxLauncher {
     )
 }
 
+/// (PLAN G12) The jail the `draft_render` Tool runs in: writes only under `write_roots` (no system-temp
+/// carve-out), no network at all (no loopback, no unix socket), the curated secret dirs unreadable.
+/// `Sandboxed` on macOS (sandbox-exec) and Linux (bwrap + the AF_UNIX seccomp program); elsewhere the
+/// caller gets a non-`Sandboxed` level and renders nothing.
+pub(crate) fn render_jail(write_roots: &[&Path]) -> SandboxLauncher {
+    detect_sandbox_launcher_for_roots(write_roots, NetworkPolicy::Isolated, PtyPolicy::Deny)
+}
+
 /// [`detect_sandbox_launcher_for_roots`] with the secret dirs to mask handed in — the seam the
 /// Linux regression test uses (a home lacking some of the six) without touching the process env.
 /// (core#703) The seccomp program the loopback-only jail loads: every way to reach a pathname
@@ -1152,7 +1166,9 @@ fn launcher_for_roots_masking(
             // for the next jail).
             if matches!(
                 network,
-                NetworkPolicy::LoopbackOnly | NetworkPolicy::LoopbackServe(_)
+                NetworkPolicy::LoopbackOnly
+                    | NetworkPolicy::LoopbackServe(_)
+                    | NetworkPolicy::Isolated
             ) {
                 // Fail CLOSED (codex r1): a loopback jail that cannot load its program is no jail
                 // at all — the caller treats a non-`Sandboxed` launcher as "cannot jail".
@@ -4592,6 +4608,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// (PLAN G12) The draft renderer's jail: no network rule admits anything (no loopback, no unix
+    /// socket), writes are denied outside the root, and unlike `Deny` there is NO system-temp write
+    /// carve-out. On a host with sandbox-exec, a write to the system temp dir from inside the jail is
+    /// refused while one in the root lands.
+    #[test]
+    fn the_render_jail_denies_all_network_and_every_write_outside_its_root() {
+        let base = std::env::temp_dir().join(format!("wicked-render-jail-{}", std::process::id()));
+        let root = base.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let carve = std::env::temp_dir()
+            .canonicalize()
+            .map(|t| format!("(allow file-write* (subpath {}))", sbpl_quote(&t)));
+        let p = macos_sandbox_profile_for_roots(
+            &[root.as_path()],
+            NetworkPolicy::Isolated,
+            PtyPolicy::Deny,
+        )
+        .unwrap();
+        assert!(p.contains("(deny network*)"), "{p}");
+        assert!(!p.contains("(allow network"), "{p}");
+        assert!(p.contains("(deny file-write*)"), "{p}");
+        if let Ok(carve) = &carve {
+            assert!(!p.contains(carve.as_str()), "no temp carve-out: {p}");
+            // The validators' Deny keeps its carve-out (unchanged).
+            let d = macos_sandbox_profile_for_roots(
+                &[root.as_path()],
+                NetworkPolicy::Deny,
+                PtyPolicy::Deny,
+            )
+            .unwrap();
+            assert!(d.contains(carve.as_str()), "{d}");
+        }
+        let jail = render_jail(&[root.as_path()]);
+        if cfg!(target_os = "macos") && jail.level == SandboxLevel::Sandboxed {
+            let outside = base.join("outside.txt");
+            let script = format!(
+                "echo y > ./in.txt || exit 11; echo x > '{}' 2>/dev/null && exit 10; exit 0",
+                outside.display()
+            );
+            let st = std::process::Command::new(&jail.wrapper[0])
+                .hardened()
+                .args(&jail.wrapper[1..])
+                .args(["/bin/sh", "-c", &script])
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert_eq!(st.code(), Some(0), "{st:?}");
+            assert!(root.join("in.txt").exists());
+            assert!(
+                !outside.exists(),
+                "a write beside the root, in the system temp dir, is refused"
+            );
+        }
+        if cfg!(target_os = "linux") && jail.level == SandboxLevel::Sandboxed {
+            assert!(
+                jail.wrapper.iter().any(|a| a == "--seccomp"),
+                "the AF_UNIX program rides the render jail: {:?}",
+                jail.wrapper
+            );
+            assert!(jail.wrapper.iter().any(|a| a == "--unshare-net"));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// (DES-DEMO-RECORD-001 §3.4) bwrap cannot scope a jail to one HOST port (`--unshare-net` gives
     /// it its own loopback), so on a host whose only jail is bwrap the port jail is never
     /// `Sandboxed`: the demo recorder then records nothing and says why.
@@ -7065,6 +7145,7 @@ mod worker_sandbox_tests {
             NetworkPolicy::Allow,
             NetworkPolicy::Deny,
             NetworkPolicy::LoopbackOnly,
+            NetworkPolicy::Isolated,
         ] {
             for pty in [PtyPolicy::Deny, PtyPolicy::Own] {
                 let p = macos_sandbox_profile_for_roots(&[root.as_path()], network, pty).unwrap();

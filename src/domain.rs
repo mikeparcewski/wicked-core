@@ -1567,6 +1567,12 @@ pub struct WorkUnit {
     /// `None` on every other unit, and cleared when a send-back resets the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_conformance: Option<crate::editor_conformance::ConformanceRecord>,
+    /// (PLAN G12) A `draft_render` unit's record of its last attempt: the draft it read (declared path,
+    /// sha256 of those bytes) and its printed page count, or why it was not measured. The draft's
+    /// reviewer cites it and crew's floor reuses it. `None` on every other unit, and cleared when a
+    /// send-back resets the unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1916,6 +1922,7 @@ impl WorkUnit {
             rule_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,
+            draft_render: None,
             rule_settled: Vec::new(),
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),

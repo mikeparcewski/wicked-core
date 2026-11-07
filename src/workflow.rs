@@ -410,6 +410,10 @@ pub struct UnitEvidence {
     /// it right after the Tool exited (bound to the tree before and after). `None` for every other unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_conformance: Option<crate::editor_conformance::ConformanceRecord>,
+    /// (PLAN G12) A `draft_render` Tool's record as the worker thread made it (the bytes it read, hashed,
+    /// and what the counter printed). `None` for every other unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation
@@ -906,6 +910,16 @@ pub fn preflight_tool_phases(def: &WorkflowDef) -> anyhow::Result<()> {
     let mut missing: Vec<String> = Vec::new();
     for phase in &def.phases {
         if let PhaseExecutor::Tool { cmd } = &phase.executor {
+            // (PLAN G12) The draft render step is a fact, never a gate: a host with no garden still
+            // launches the draft, and the step records `no_garden` instead of refusing the launch.
+            // Exempt on its exact fixed command only (no other garden Tool).
+            if cmd
+                .iter()
+                .map(String::as_str)
+                .eq(crate::draft_render::RENDER_CMD)
+            {
+                continue;
+            }
             match cmd.first() {
                 None => missing.push(format!("phase '{}' has an empty tool cmd", phase.id)),
                 Some(bin) if !tool_binary_resolves(bin) => missing.push(format!(
@@ -1957,6 +1971,31 @@ mod workflow_def_tests {
             err.contains("definitely-not-a-real-binary-xyzzy"),
             "names the missing tool, got: {err}"
         );
+    }
+
+    /// (PLAN G12) The draft render step never refuses a launch (it records `no_garden` itself); every
+    /// other Tool is still preflighted.
+    #[test]
+    fn preflight_exempts_only_the_draft_render_command() {
+        let render: Vec<String> = crate::draft_render::RENDER_CMD
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let def = WorkflowDef {
+            base_skill_ref: None,
+            id: "drafty".to_string(),
+            phases: vec![
+                PhaseDef::new("measure-pages", StageKind::Test)
+                    .executor(PhaseExecutor::Tool { cmd: render }),
+                PhaseDef::new("other", StageKind::Recon).executor(PhaseExecutor::Tool {
+                    cmd: vec!["definitely-not-a-real-binary-xyzzy".to_string()],
+                }),
+            ],
+            required_instruments: None,
+        };
+        let err = preflight_tool_phases(&def).unwrap_err().to_string();
+        assert!(err.contains("'other'"), "{err}");
+        assert!(!err.contains("measure-pages"), "{err}");
     }
 
     #[test]

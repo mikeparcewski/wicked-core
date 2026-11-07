@@ -8014,6 +8014,20 @@ fn apply_step_result(
         }
     }
 
+    // ── DRAFT RENDER (PLAN G12) ───────────────────────────────────────────────────────────────
+    // The engine's own print of the draft: its record rides the unit (the draft's reviewer cites it,
+    // crew's floor reuses it). A FACT, never a gate: no measurement outcome denies the unit, and a
+    // unit with no record (it never reached the worker's read) records that, not a count.
+    if unit.catalog.as_deref() == Some(crate::draft_render::CATALOG_ID) {
+        unit.draft_render = Some(evidence.draft_render.clone().unwrap_or_else(|| {
+            crate::draft_render::DraftRenderRecord::not_measured(
+                output.attempt,
+                "engine_refused",
+                "the render step returned no record",
+            )
+        }));
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -11971,12 +11985,33 @@ fn dispatch_unit(
                     .map(|s| s.tree)
                 })
                 .flatten();
+            // (PLAN G12) The draft under review now, read only when a render record sits between
+            // the creator this unit reviews and this unit: its sha256 is what the record must match.
+            let current_draft = pipeline::most_recent_prior_creator(&units, unit.ord)
+                .filter(|c| {
+                    units
+                        .iter()
+                        .any(|u| u.ord > c.ord && u.ord < unit.ord && u.draft_render.is_some())
+                })
+                .and_then(|c| {
+                    let cwd = session
+                        .workdir
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(run_id));
+                    crate::draft_render::current_sha256(
+                        &c.required_deliverables,
+                        &cwd,
+                        &session.extra_write_roots,
+                    )
+                });
             for (ord, label, output) in crate::review_context::evaluator_brief(
                 &session.problem,
                 &session.intent_amendments,
                 &units,
                 unit,
                 current_tree.as_deref(),
+                current_draft.as_deref(),
             ) {
                 context_items.push(crate::event::InjectedContext::new(
                     ord,
@@ -12416,32 +12451,52 @@ fn dispatch_unit(
                     .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
                     .map(|r| r.root_path),
             });
+        // (PLAN G12) The draft render Tool: the most recent creator's declared deliverables and where
+        // they resolve (the unit cwd and the launch's write roots); read and hashed off-thread.
+        let render =
+            (unit.catalog.as_deref() == Some(crate::draft_render::CATALOG_ID)).then(|| {
+                let producer = pipeline::most_recent_prior_creator(&units, unit.ord);
+                RenderDispatch {
+                    producer: producer.map(|c| c.ord),
+                    declared: producer
+                        .map(|c| c.required_deliverables.clone())
+                        .unwrap_or_default(),
+                    cwd: session
+                        .workdir
+                        .clone()
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(run_id)),
+                    write_roots: session.extra_write_roots.clone(),
+                }
+            });
         // core#776: every OTHER Tool unit is handed the run variables too — the id and ordinal
         // here, the run's evidence root when the launcher minted one, and the worktree's tree id,
         // snapshotted off-thread below (the repository root is the only store read it needs).
         let run_env =
-            (record.is_none() && demo.is_none() && conformance.is_none()).then(|| ToolRunEnv {
-                run_id: run_id.to_string(),
-                ord: unit.ord,
-                consent_choice: unit.consent_choice.clone(),
-                // (domain-graph-3) A loop's command learns which pass it decides after, and the
-                // operator's choice when it re-runs from its ask.
-                repeat: unit.repeat_from.is_some().then(|| {
-                    (
-                        unit.repeat_passes.saturating_add(1),
-                        unit.repeat_choice.clone(),
-                    )
-                }),
-                evidence_root: session.evidence_root.clone(),
-                base_commit: session.base_commit.clone(),
-                tree_from: session.workdir.clone().zip(
-                    session
-                        .repo_ref
-                        .as_deref()
-                        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-                        .map(|r| r.root_path),
-                ),
-            });
+            (record.is_none() && demo.is_none() && conformance.is_none() && render.is_none()).then(
+                || ToolRunEnv {
+                    run_id: run_id.to_string(),
+                    ord: unit.ord,
+                    consent_choice: unit.consent_choice.clone(),
+                    // (domain-graph-3) A loop's command learns which pass it decides after, and the
+                    // operator's choice when it re-runs from its ask.
+                    repeat: unit.repeat_from.is_some().then(|| {
+                        (
+                            unit.repeat_passes.saturating_add(1),
+                            unit.repeat_choice.clone(),
+                        )
+                    }),
+                    evidence_root: session.evidence_root.clone(),
+                    base_commit: session.base_commit.clone(),
+                    tree_from: session.workdir.clone().zip(
+                        session
+                            .repo_ref
+                            .as_deref()
+                            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+                            .map(|r| r.root_path),
+                    ),
+                },
+            );
         // core#500 (F-BM-008): the child's STOP predicate — the run's launch identity, read the
         // way the ACP/wrapped carriers read their tokens. Cancel, supersede and shutdown flip it:
         // `tombstone_run` + `advance_launch_seq` inside `cancel_run` (covers all cancel callers),
@@ -12527,6 +12582,7 @@ fn dispatch_unit(
             let mut lift_checks: Option<crate::repo_checks::RepoChecksReport> = None;
             let mut demo_take: Option<crate::demo_record::DemoTake> = None;
             let mut conformance_rec: Option<crate::editor_conformance::ConformanceRecord> = None;
+            let mut render_rec: Option<crate::draft_render::DraftRenderRecord> = None;
             let mut lift_verified_tree: Option<String> = None;
             let (output_str, status) = match crate::skills_snapshot::admit_plan(&input) {
                 // (DES-APPS-001 K0) An Apps Tool without its unit token never spawns.
@@ -12649,6 +12705,35 @@ fn dispatch_unit(
                         killed = k;
                         conformance_rec = Some(rec);
                         (o, st)
+                    } else if let Some(r) = &render {
+                        // (PLAN G12) The garden generation as for the conformance Tool; any failure to
+                        // resolve one is `no_garden` (a fact, never a refusal of the run).
+                        let garden: Result<Option<std::path::PathBuf>, String> =
+                            match admitted.as_ref() {
+                                Some(g) => Ok(Some(g.root.clone())),
+                                None => match crate::skills_snapshot::resolve_ladder() {
+                                    Ok(crate::skills_snapshot::Ladder::Root(g)) => Ok(Some(g.root)),
+                                    Ok(crate::skills_snapshot::Ladder::Absent) => Ok(None),
+                                    Ok(crate::skills_snapshot::Ladder::Failed(why)) => Err(why),
+                                    Err(e) => Err(e.to_string()),
+                                },
+                            };
+                        let (o, st, k, rec) = run_draft_render_tool(
+                            &cmd,
+                            r,
+                            garden
+                                .as_ref()
+                                .map(Option::as_deref)
+                                .map_err(String::as_str),
+                            attempt,
+                            &crate::validator::render_jail,
+                            &stop,
+                            &on_spawn,
+                            &on_done,
+                        );
+                        killed = k;
+                        render_rec = Some(rec);
+                        (o, st)
                     } else {
                         let emit_ev = |ev: CoreEvent| {
                             let _ = tx.send(crate::command::Command::EmitEvent(ev));
@@ -12747,6 +12832,18 @@ fn dispatch_unit(
                         }
                     }
                 }
+                // (PLAN G12) The render step is a fact, never a gate: a skills generation it could not
+                // be admitted against is "not measured", the unit is not failed for it.
+                Err(e) if render.is_some() => {
+                    let rec = crate::draft_render::DraftRenderRecord::not_measured(
+                        attempt,
+                        "no_garden",
+                        format!("the skills generation could not be admitted: {e}"),
+                    );
+                    let line = rec.summary();
+                    render_rec = Some(rec);
+                    (line, crate::workflow::StepStatus::Ok)
+                }
                 Err(e) => {
                     let refused = crate::execute_wrapped::skills_refusal(&input, &e);
                     (refused.output, refused.status)
@@ -12818,6 +12915,7 @@ fn dispatch_unit(
                     rule_check: delivery_rule_check,
                     demo_take,
                     editor_conformance: conformance_rec,
+                    draft_render: render_rec,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -13366,6 +13464,346 @@ fn run_demo_tool(
         StepStatus::Ok
     };
     (out, status, killed, take)
+}
+
+/// (PLAN G12) What the actor resolves for one `draft_render` dispatch.
+#[derive(Debug, Clone)]
+struct RenderDispatch {
+    /// The ord of the most recent creator before the render unit (`None`: no creator ran).
+    producer: Option<u32>,
+    /// That creator's declared deliverables.
+    declared: Vec<String>,
+    /// The unit cwd (the worktree, else the per-run sandbox) and the launch's write roots: where a
+    /// declared deliverable may resolve (the deliverable floor's rule).
+    cwd: std::path::PathBuf,
+    write_roots: Vec<String>,
+}
+
+/// (PLAN G12) Run the `draft_render` Tool: read the draft (opened beneath its root, no link followed,
+/// capped), hash those bytes, and run garden's page counter on the draft at its own path in the
+/// no-network render jail (`validator::render_jail`), with a cleared environment plus the renderer, the
+/// garden root and the temp dir, killed past [`crate::draft_render::DEADLINE`]. The counter's stdout
+/// goes to a report file in the temp dir, which the engine judges; the draft is read again after the
+/// print, and a change between the reads measures nothing (`draft_changed`). Every outcome is `StepStatus::Ok`
+/// with its record (a fact, never a failed command); only a cancel keeps the Cancelled path.
+#[allow(clippy::too_many_arguments)]
+fn run_draft_render_tool(
+    cmd: &[String],
+    d: &RenderDispatch,
+    garden: Result<Option<&std::path::Path>, &str>,
+    attempt: u32,
+    jail: &dyn Fn(&[&std::path::Path]) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::draft_render::DraftRenderRecord,
+) {
+    use crate::draft_render as dr;
+    use crate::workflow::StepStatus;
+    let done = |rec: dr::DraftRenderRecord| (rec.summary(), StepStatus::Ok, None, rec);
+    let mut rec = dr::DraftRenderRecord::not_measured(attempt, "engine_refused", "");
+    rec.producer = d.producer;
+    let not = |mut rec: dr::DraftRenderRecord, cause: &str, why: String| {
+        rec.cause = Some(cause.to_string());
+        rec.reason = Some(why);
+        rec
+    };
+    if d.producer.is_none() {
+        return done(not(
+            rec,
+            "no_draft",
+            "no creator step ran before the render".into(),
+        ));
+    }
+    let draft = match dr::resolve_draft(&d.declared, &d.cwd, &d.write_roots) {
+        Ok(x) => x,
+        Err(why) => return done(not(rec, "no_draft", why)),
+    };
+    rec.file = Some(draft.declared.clone());
+    let bytes = match dr::read_draft(&draft) {
+        Ok(b) => b,
+        Err(why) => return done(not(rec, "no_draft", why)),
+    };
+    rec.sha256 = Some(dr::sha256_hex(&bytes));
+    rec.bytes = Some(bytes.len() as u64);
+    let chrome = match dr::renderer() {
+        Ok(c) => c,
+        Err((cause, why)) => return done(not(rec, &cause, why)),
+    };
+    // The admitted generation (else the ladder's); a ladder that found NO garden runs the fixed
+    // command from PATH, as the other host Tools do, and a PATH without it is `no_garden`.
+    let garden_root = match garden {
+        Ok(Some(g)) => Some(g.to_path_buf()),
+        Ok(None) if crate::validator::find_on_path(dr::RENDER_CMD[0]).is_some() => None,
+        Ok(None) => {
+            return done(not(
+                rec,
+                "no_garden",
+                "no wicked-garden on this daemon (no skills generation, none on PATH) to run the page \
+                 counter from"
+                    .into(),
+            ))
+        }
+        Err(why) => {
+            return done(not(
+                rec,
+                "no_garden",
+                format!("the skills generation could not be resolved ({why}); the counter never runs from an unadmitted garden"),
+            ))
+        }
+    };
+    // The jail hides the credential directories; a garden that lives under one cannot run in it.
+    let real_garden = garden_root
+        .as_ref()
+        .map(|g| g.canonicalize().unwrap_or_else(|_| g.clone()));
+    if let Some(mask) = real_garden.as_ref().and_then(|real_garden| {
+        crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real_garden.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+    }) {
+        return done(not(
+            rec,
+            "no_garden",
+            format!(
+                "the skills generation lives under {}, which the render jail hides: publish a skills \
+                 snapshot (WICKED_SKILLS_SNAPSHOT) for the daemon",
+                mask.display()
+            ),
+        ));
+    }
+    if let Some(r) = stop() {
+        return done(not(
+            rec,
+            "engine_refused",
+            format!("stopped before it began ({r})"),
+        ));
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return done(not(
+                rec,
+                "engine_refused",
+                format!("the render's private temp dir: {e}"),
+            ))
+        }
+    };
+    let launcher = jail(&[tmp.path()]);
+    if launcher.level != crate::validator::SandboxLevel::Sandboxed || launcher.wrapper.is_empty() {
+        return done(not(
+            rec,
+            "unjailed_host",
+            format!(
+                "this host has no OS jail that keeps the renderer off the network (sandbox level {}): \
+                 a seat-written page is never printed on the host unjailed. It runs on macOS \
+                 (sandbox-exec) and Linux (bwrap)",
+                launcher.level.as_wire()
+            ),
+        ));
+    }
+    let kind = launcher
+        .wrapper
+        .iter()
+        .filter_map(|a| std::path::Path::new(a).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .find(|n| n == "bwrap" || n == "sandbox-exec")
+        .unwrap_or_else(|| launcher.wrapper[0].clone());
+    let out_file = tmp.path().join("report.json");
+    let tmp_s = tmp.path().to_string_lossy().into_owned();
+    let mut env: Vec<(String, String)> = ["TMPDIR", "TMP", "TEMP"]
+        .iter()
+        .map(|k| ((*k).to_string(), tmp_s.clone()))
+        .collect();
+    if let Some(h) = std::env::var_os("HOME").filter(|v| std::path::Path::new(v).is_absolute()) {
+        env.push(("HOME".to_string(), h.to_string_lossy().into_owned()));
+    }
+    env.push((
+        dr::CHROME_ENV.to_string(),
+        chrome.to_string_lossy().into_owned(),
+    ));
+    if let Some(groot) = &garden_root {
+        env.push((
+            crate::skills_snapshot::GARDEN_ROOT_ENV.to_string(),
+            groot.to_string_lossy().into_owned(),
+        ));
+        env.push((
+            "PATH".to_string(),
+            crate::skills_snapshot::prepend_path_entry(
+                &groot.join(crate::skills_snapshot::SCRIPTS_DIR),
+                std::env::var_os("PATH").as_deref(),
+                crate::skills_snapshot::PATH_LIST_SEPARATOR,
+            )
+            .to_string_lossy()
+            .into_owned(),
+        ));
+    }
+    // The counter's stdout (its JSON report) goes to the report file; stderr stays the Tool's output.
+    let mut argv: Vec<String> = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "out=$1; shift; exec \"$@\" >\"$out\"".into(),
+        "sh".into(),
+        out_file.to_string_lossy().into_owned(),
+    ];
+    argv.extend(cmd.iter().cloned());
+    argv.push(draft.real.to_string_lossy().into_owned());
+    let started = std::time::Instant::now();
+    let over = std::cell::Cell::new(false);
+    let limited_stop = || -> Option<&'static str> {
+        if let Some(r) = stop() {
+            return Some(r);
+        }
+        if started.elapsed() > dr::DEADLINE {
+            over.set(true);
+            return Some("deadline_exceeded");
+        }
+        None
+    };
+    let (tool_out, status, killed) = run_tool_cmd_jailed(
+        &argv,
+        Some(&tmp_s),
+        &env,
+        Some(&launcher.wrapper),
+        &limited_stop,
+        on_spawn,
+        on_done,
+    );
+    rec.jail = Some(kind);
+    if over.get() {
+        let rec = not(
+            rec,
+            "deadline_exceeded",
+            format!(
+                "the render went past {} s and was stopped",
+                dr::DEADLINE.as_secs()
+            ),
+        );
+        return (rec.summary(), StepStatus::Ok, killed, rec);
+    }
+    if killed.is_some() {
+        // A cancel or a supersede: the result is Stale at the fold's guards; keep the Cancelled path.
+        let rec = not(rec, "engine_refused", "the render was stopped".into());
+        return (rec.summary(), status, killed, rec);
+    }
+    // The draft was printed at its own path: the count binds the hashed bytes only if they are the
+    // bytes still there after the print.
+    let after = dr::read_draft(&draft).map(|b| dr::sha256_hex(&b));
+    let mut rec = dr::judge_report(
+        rec,
+        dr::read_report(&out_file),
+        status == StepStatus::Ok,
+        &chrome,
+    );
+    drop(tmp);
+    // A report the engine could not use: the command's last lines say why (the launcher's, the
+    // counter's; never the page's, which prints nothing there).
+    if rec.cause.as_deref() == Some("bad_report") {
+        let tail: Vec<&str> = tool_out.lines().filter(|l| !l.trim().is_empty()).collect();
+        let tail = tail[tail.len().saturating_sub(3)..].join(" | ");
+        if !tail.is_empty() {
+            rec.reason = Some(format!(
+                "{} ({})",
+                rec.reason.as_deref().unwrap_or(""),
+                tail.chars().take(400).collect::<String>()
+            ));
+        }
+    }
+    // Only a count is withdrawn for a change; a print that already failed keeps its own cause.
+    if rec.measured() && after.as_deref().ok() != rec.sha256.as_deref() {
+        rec = not(
+            rec,
+            "draft_changed",
+            "the draft changed while it was being printed; nothing was measured".into(),
+        );
+        rec.outcome = dr::OUTCOME_NOT_MEASURED.to_string();
+        rec.pages = None;
+        rec.renderer = None;
+        rec.profile = None;
+    }
+    if rec.measured() {
+        rec.counter = Some(
+            garden_root
+                .as_ref()
+                .map(|g| g.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "PATH".to_string()),
+        );
+    }
+    (rec.summary(), StepStatus::Ok, None, rec)
+}
+
+/// (PLAN G12) The render step against a REAL browser and garden, on this host. Ignored unless
+/// `WICKED_TEST_HEADLESS_SHELL` names a headless browser (Playwright's `chrome-headless-shell`) and
+/// `WICKED_TEST_GARDEN_ROOT` a wicked-garden checkout: a two-page draft is measured as 2 pages in the
+/// render jail, and its script's requests to a loopback listener never arrive.
+#[cfg(test)]
+mod draft_render_live {
+    use super::*;
+
+    #[test]
+    #[ignore = "needs WICKED_TEST_HEADLESS_SHELL and WICKED_TEST_GARDEN_ROOT"]
+    fn a_two_page_draft_is_measured_in_the_jail_and_reaches_no_listener() {
+        let (Some(shell), Some(garden)) = (
+            std::env::var_os("WICKED_TEST_HEADLESS_SHELL"),
+            std::env::var_os("WICKED_TEST_GARDEN_ROOT"),
+        ) else {
+            eprintln!("SKIP: no WICKED_TEST_HEADLESS_SHELL / WICKED_TEST_GARDEN_ROOT");
+            return;
+        };
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        l.set_nonblocking(true).unwrap();
+        let port = l.local_addr().unwrap().port();
+        let dir = std::env::temp_dir().join(format!("wc-dr-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let draft = dir.join("doc-v1.html");
+        let html = format!(
+            "<!doctype html><html><head><style>@page{{size:A4;margin:10mm}} \
+             .p{{page-break-after:always}}</style></head><body><div class=\"p\">One</div>\
+             <div>Two</div><img src=\"http://127.0.0.1:{port}/img\"><script>\
+             fetch('http://127.0.0.1:{port}/fetch').catch(function(){{}});</script></body></html>"
+        );
+        std::fs::write(&draft, &html).unwrap();
+        // SAFETY of the env write: this ignored test runs alone (`--ignored --exact`).
+        std::env::set_var(crate::draft_render::CHROME_ENV, &shell);
+        let d = RenderDispatch {
+            producer: Some(1),
+            declared: vec![draft.to_string_lossy().into_owned()],
+            cwd: dir.clone(),
+            write_roots: vec![dir.to_string_lossy().into_owned()],
+        };
+        let cmd: Vec<String> = crate::draft_render::RENDER_CMD
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        let (out, st, killed, rec) = run_draft_render_tool(
+            &cmd,
+            &d,
+            Ok(Some(std::path::Path::new(&garden))),
+            0,
+            &crate::validator::render_jail,
+            &|| None,
+            &|_| {},
+            &|_| {},
+        );
+        eprintln!("{out}\n{rec:#?}");
+        assert_eq!(st, crate::workflow::StepStatus::Ok);
+        assert!(killed.is_none());
+        assert!(rec.measured(), "{rec:?}");
+        assert_eq!(rec.pages, Some(2), "{rec:?}");
+        assert_eq!(
+            rec.sha256.as_deref(),
+            Some(crate::draft_render::sha256_hex(html.as_bytes()).as_str())
+        );
+        assert!(
+            matches!(l.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "the page reached the loopback listener from inside the jail"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
 
 /// (DES-EDITOR-CONFORMANCE-HOST) What the actor resolves for one `editor_conformance` dispatch.
@@ -18903,6 +19341,8 @@ fn rewind_to_creator_scoped(
         u.denial_reason = None;
         // (DES-EDITOR-CONFORMANCE-HOST) A record judged the tree before this rework: never cited again.
         u.editor_conformance = None;
+        // (PLAN G12) A page count measured the draft before this rework: never cited again.
+        u.draft_render = None;
         // A rework runs the seat: a re-judge left armed (its attempt never folded) is void.
         u.requested_rejudge = None;
         if ix == target_ix {
