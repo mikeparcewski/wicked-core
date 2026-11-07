@@ -3614,3 +3614,40 @@ fn a_keep_beside_a_keep_on_the_persons_instruction_conflicts() {
         assert_eq!(p.misses["R"], Miss::Conflicting { broken: false });
     }
 }
+
+/// e2e-1105 F38 (run 672b5c14): on a mapping run whose change holds only its own JSON files, the
+/// judges answered UNKNOWN for a JSDoc rule about the repository's existing exports ("src/math.js is
+/// not among the changed files"), because the prompt said to answer UNKNOWN whenever the evidence
+/// cannot show a rule kept. A review judge now rules on the change: untouched code is N/A, a break
+/// the code already had is N/A (pre-existing), and UNKNOWN is for what the change does touch.
+/// Delivery judges the published text and is not told this.
+#[test]
+fn a_review_judge_rules_on_the_change_and_keeps_unknown_for_what_it_touches() {
+    let r = rule(
+        "DEV-1",
+        "every exported function has a JSDoc block with @returns",
+    );
+    let batch = vec![(&r, "")];
+    let p = prompt_for(
+        &batch,
+        DIFF,
+        &[".wicked/domain/rules.json"],
+        None,
+        None,
+        "n1",
+        CheckStage::Review,
+    );
+    let flat = p.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("a rule about code (or other files) the change does not add, modify, delete or call into is N/A for it"), "{flat}");
+    assert!(
+        flat.contains("say \"pre-existing\" and name the file"),
+        "{flat}"
+    );
+    assert!(
+        flat.contains("Answer UNKNOWN only for a rule the change does touch"),
+        "{flat}"
+    );
+    assert!(flat.contains("If the change touches what the rule speaks of but the evidence cannot show the rule kept, answer UNKNOWN"), "{flat}");
+    let d = prompt_for(&batch, "title", &[], None, None, "n1", CheckStage::Delivery);
+    assert!(!d.contains("You rule on THIS change"), "{d}");
+}

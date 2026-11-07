@@ -2060,6 +2060,17 @@ fn run_rule_check_with(
         .as_deref()
         .map(crate::rule_check::instructions_of)
         .unwrap_or_default();
+    // (e2e-1105 F38) A re-judge runs no floor: the unit's last floor result on THIS tree stands
+    // (core#544), and it is the evidence the rows and the person's skips were keyed on. Without it
+    // the evidence key moved, a skip given on the same tree answered no row, and the rule was asked
+    // again. Only a result taken on this very tree (a known, equal tree id) is reused.
+    let floor = floor.or_else(|| {
+        input
+            .unit
+            .repo_checks
+            .as_ref()
+            .filter(|r| r.tree.is_some() && r.tree == change.tree)
+    });
     let floor_text = floor.map(crate::rule_check::floor_evidence);
     // (DES-RULE-CHECK-001 rev 2, Part B) What the pack rules are judged on beside the change: the
     // engine's own record of this step (process rules), and the creator steps' records (POL-2101's
