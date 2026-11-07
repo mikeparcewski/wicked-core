@@ -652,6 +652,7 @@ fn session_with(run_id: &str, status: SessionStatus) -> AgentSession {
         evidence_root: None,
         assurance: Default::default(),
         power: None,
+        run_context: None,
     }
 }
 

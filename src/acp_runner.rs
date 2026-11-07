@@ -1902,7 +1902,14 @@ impl crate::team::MonitorHost for RunnerHost {
                 .entry(pool_key.to_string())
                 .or_default()
                 .push(run_id.clone());
-            seat
+            (seat, book.runs.get(pool_key).cloned())
+        };
+        let (seat, parent) = seat;
+        // (program context-block-core) A member reviews for the run it joined: its turn carries
+        // that run's context block, framed for an evaluator.
+        let runner = match parent {
+            Some(parent) => crate::run_context::Stamping::wrap(runner, &parent, 0),
+            None => runner,
         };
         let out = member_turn(runner, &seat, &run_id, &prompt, budget, view_dir.as_deref());
         // The view goes with the turn (`MemberView`'s drop), after its seat has stopped.
@@ -3613,6 +3620,7 @@ mod tests {
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),
             read_view: None,
+            run_context: None,
         }
     }
 

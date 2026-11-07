@@ -267,6 +267,12 @@ pub struct AgentSession {
     /// serializes byte-identical.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub power: Option<crate::power::PowerState>,
+    /// (program context-block-core) The person's own Goal / Approach / Constraints for this job
+    /// ([`crate::run_context::RunContext`]), set whole by `set_run_context`, attached to every
+    /// seat prompt the engine builds for the run, never drained. `None` until crew first sets it;
+    /// skip-if-none keeps a session without one byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_context: Option<crate::run_context::RunContext>,
 }
 
 /// (EP-K3) A launch's `exclude_seats` as the session keeps it: trimmed, empties dropped, first-seen
@@ -1584,6 +1590,12 @@ pub struct WorkUnit {
     pub read_view: Option<std::path::PathBuf>,
     /// The final unit status: `pending` → `distributed` → `done` | `rejected`.
     pub status: UnitStatus,
+    /// (program context-block-core) The run's context block as THIS launch carries it: set by
+    /// [`crate::run_context::stamp`] right before a seat launches, rendered by the carrier
+    /// ([`crate::run_context::prefix`]). Never persisted and never on a wire (`serde(skip)`): the
+    /// session is the record, and a stored unit can never carry an older block into a launch.
+    #[serde(skip)]
+    pub run_context: Option<crate::run_context::SeatContext>,
 }
 
 /// (DES-QE-EVERY-SEAT §3.2) One seat the QE reviewer may run on, and why it qualifies.
@@ -1908,6 +1920,7 @@ impl WorkUnit {
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),
             read_view: None,
+            run_context: None,
         }
     }
 
@@ -2499,6 +2512,7 @@ mod tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 

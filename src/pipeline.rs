@@ -503,6 +503,7 @@ pub(crate) fn pre_distribute(
                 .and_then(|d| d.required_instruments.as_deref()),
             reduced_assurance,
         ),
+        run_context: None,
     };
     // (QE acceptance) The operator's word applies where the contract is BUILT. A session whose
     // launch stub already exists carries the stub's contract forward below (the word was applied
@@ -539,6 +540,9 @@ pub(crate) fn pre_distribute(
             session.team_plan = existing.team_plan;
             // (program DES-POWER-MODE) …and so is its power record.
             session.power = existing.power;
+            // (program context-block-core) …and so is the person's context block (a set can land
+            // while the launch waits for its worktree, or before a re-plan).
+            session.run_context = existing.run_context;
         }
     } else {
         put_node(store, session.to_node())?;
@@ -912,6 +916,13 @@ pub(crate) fn apply_distributions(
         }
     }
     pre.session.status = SessionStatus::Executing;
+    // (program context-block-core) `pre.session` is the snapshot distribution was handed; the
+    // person's context block may have been set since (the actor accepts a set while distribution
+    // runs off-thread): the record's block is kept, never the snapshot's.
+    // A failed read refuses the write (codex r2): never the snapshot over a block it cannot see.
+    if let Some(held) = crate::domain::get_session(&*store, &pre.session_id)? {
+        pre.session.run_context = held.run_context;
+    }
     put_node(store, pre.session.to_node())?;
     Ok(())
 }

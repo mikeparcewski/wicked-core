@@ -2875,6 +2875,26 @@ impl WrappedCliStepRunner {
 }
 
 impl WrappedCliStepRunner {
+    /// (program context-block-core) One launch ATTEMPT with the run's context block pinned: the
+    /// block this attempt is handed is resolved when it starts (`run_context::pin`; a recovery
+    /// attempt after a runtime wait resolves again), the prompt renders exactly it, and the seat's
+    /// echo of exactly it never leaves the carrier — before any refusal classifier or parser
+    /// downstream reads the answer.
+    fn exec_pinned(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
+        if input.unit.run_context.is_none() {
+            return self.exec(input, emit);
+        }
+        let mut pinned = input.clone();
+        let handed = crate::run_context::pin(&mut pinned.unit);
+        let mut out = self.exec(&pinned, emit);
+        if let Some(h) = handed {
+            if let Some(clean) = crate::run_context::strip_echo(&out.output, &[&h]) {
+                out.output = clean;
+            }
+        }
+        out
+    }
+
     /// Whether the launch `input` describes was cancelled: its run ended, the engine is shutting
     /// down, or a reassign superseded it — the same reading [`Self::register_token`] arms a fresh
     /// token from.
@@ -2895,7 +2915,7 @@ impl WrappedCliStepRunner {
     /// back; a runtime that stays down ends as the runner's infrastructure line, never as the
     /// seat's failure ([`crate::runtime_wait`]).
     fn exec_through_runtime_blips(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
-        let first = self.exec(input, emit);
+        let first = self.exec_pinned(input, emit);
         // A run's governed unit only: the engine's own judge / triage / ballot sessions keep their
         // own failure handling and budgets, and are never benched for a runtime fault (xreview on
         // #1129 — a judge rotation would otherwise wait a whole window per judge seat).
@@ -2968,7 +2988,7 @@ impl WrappedCliStepRunner {
                 elapsed: &elapsed,
                 notify: &mut notify,
             },
-            &mut || self.exec(input, emit),
+            &mut || self.exec_pinned(input, emit),
         )
     }
 }
@@ -3294,7 +3314,27 @@ impl WrappedCliStepRunner {
         // exactly as the ACP carrier sends it as text blocks — same preamble, same
         // `<label>\n<output>` blocks — so a wrapped reviewer/creator with `depends_on` sees the
         // work it depends on. Empty (no change) for a unit with no prior outputs.
-        let prompt = format!("{}{task}", prior_context_prefix(&input.prior_outputs));
+        //
+        // (program context-block-core) The run's context block LEADS (the person's own words frame
+        // the job; the brief's output contract still reads last). Empty when the launch was not
+        // stamped, so every other prompt is byte-identical.
+        let rendered = crate::run_context::render(&input.unit);
+        let context = rendered.as_ref().map_or("", |(_, t)| t.as_str());
+        let prompt = format!(
+            "{context}{}{task}",
+            prior_context_prefix(&input.prior_outputs)
+        );
+        // The prompt built for this launch carries the block (`runContextDelivered` names the
+        // seat and the version it was handed; a launch refused after this point never ran).
+        if let (Some(sc), Some((version, _))) = (input.unit.run_context.as_ref(), &rendered) {
+            self.emit_event(crate::event::CoreEvent::RunContextDelivered {
+                session: sc.run_id.clone(),
+                ord: sc.ord,
+                version: *version,
+                recipient_cli: input.unit.assigned_cli.clone().unwrap_or_default(),
+                recipient: crate::run_context::recipient(&input.unit).to_string(),
+            });
+        }
         let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
         let container = crate::container_floor::container_mode();
         // Ungoverned workers do not need ask discovery or configuration before spawning.
@@ -7883,6 +7923,15 @@ const MIN_USEFUL_LAYOUT: usize = 40;
 /// The PTY runner hands no skills snapshot (it is not one of the two spawn paths that carry one),
 /// so the directive resolves by convention alone; `form` still spells it for the session's CLI.
 pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<String, String> {
+    // (program context-block-core) The run's context block (up to 4,000 characters, multi-line)
+    // cannot ride one pty line; refuse rather than launch a seat without it.
+    if !crate::run_context::prefix(&input.unit).is_empty() {
+        return Err(format!(
+            "unit {} carries the run's context document, which a pty turn cannot carry (one line \
+             of at most {PTY_PROMPT_LIMIT} bytes); route this unit to the headless carrier",
+            input.unit.ord
+        ));
+    }
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
     let mut unit = author_directed(input);
     let mut plain = skill_prompt(&unit, None, form, None);
@@ -12314,6 +12363,123 @@ mod tests {
                 out.output
             );
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (program context-block-core) END-TO-END through `run_unit`: the carrier puts the run's
+    /// context block at the head of the prompt the seat binary receives — a worker unit reads the
+    /// worker framing, the engine's own judge the evaluator framing ahead of its authored verdict
+    /// contract — and an unstamped launch's prompt carries nothing of it.
+    #[cfg(unix)]
+    #[test]
+    fn the_seat_binary_receives_the_run_context_block_at_the_head_of_its_prompt() {
+        use crate::run_context::{publish, stamp, ContextAuthor, ContextSection, RunContext};
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let home = std::env::temp_dir().join(format!(
+            "wicked-rc-carrier-home-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = HomeGuard::pin(&home);
+        let _no_worker_home = VarGuard::unset(wicked_apps_core::spawn::WORKER_HOME_ENV);
+        let dir = home.join("wt");
+        std::fs::create_dir_all(&dir).unwrap();
+        // A seat that records the prompt it was handed AND echoes it back as its answer.
+        let codex = {
+            use std::os::unix::fs::PermissionsExt;
+            let p = dir.join("codex");
+            std::fs::write(
+                &p,
+                format!(
+                    "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nprintf '%s\\n' \"$*\"\necho \"VERDICT: FAIL\"\n",
+                    dir.join("handed.txt").display()
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let run = format!("rc-carrier-{}", std::process::id());
+        let person = ContextAuthor {
+            kind: "human".into(),
+            id: "local".into(),
+        };
+        publish(
+            &run,
+            Some(&RunContext {
+                version: 3,
+                sections: vec![ContextSection {
+                    id: "constraints".into(),
+                    text: "no new deps\nkeep the API".into(),
+                    author: person.clone(),
+                    version: 3,
+                }],
+                set_by: person,
+            }),
+        );
+        let launch = |mut u: WorkUnit, stamped: bool| {
+            u.assigned_cli = Some("codex".to_string());
+            u.assigned_invocation = Some(format!("{codex} exec {{PROMPT}}"));
+            if stamped {
+                stamp(&mut u, &run, 2);
+            }
+            let input = StepInput {
+                run_id: run.clone(),
+                unit_ix: 1,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Ok, "{}", out.output);
+            // The answer the engine reads: the seat's own lines, never its echo of the block.
+            assert!(
+                !out.output.contains("keep the API") && out.output.contains("VERDICT: FAIL"),
+                "the carrier strips the echo: {}",
+                out.output
+            );
+            std::fs::read_to_string(dir.join("handed.txt")).unwrap()
+        };
+        let worker = launch(
+            WorkUnit::pending(format!("{run}:build"), run.as_str(), 2, "add the sum"),
+            true,
+        );
+        let head = worker
+            .split_once("[context document v3:")
+            .map(|(a, _)| a)
+            .unwrap_or("");
+        assert!(
+            !head.contains("add the sum") && worker.contains("\u{2502}   keep the API"),
+            "the block leads the worker's prompt: {worker}"
+        );
+        assert!(!worker.contains("You evaluate"), "{worker}");
+        let mut judge = WorkUnit::pending("validator-agent", "validator", 1, "JUDGE THIS WORK");
+        judge.session_id = "validator".into();
+        let judged = launch(judge, true);
+        let at = judged
+            .find("[context document v3:")
+            .expect("the judge reads the block");
+        assert!(
+            judged[at..].contains("You evaluate") && judged.find("JUDGE THIS WORK") > Some(at),
+            "the judge reads the evaluator framing ahead of its own contract: {judged}"
+        );
+        let plain = launch(
+            WorkUnit::pending(format!("{run}:other"), run.as_str(), 3, "plain"),
+            false,
+        );
+        assert!(!plain.contains("context document"), "{plain}");
+        publish(&run, None);
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -251,6 +251,13 @@ export declare class Core {
    */
   static supportsPlanSendBack(): boolean
   /**
+   * (program context-block-core) Whether this addon takes a run's context block:
+   * `setRunContext`, the `runContextSet` / `runContextDelivered` events and the session's
+   * `run_context`. An older addon has no `setRunContext`, so crew keys on this static first and
+   * keeps its standing note without it.
+   */
+  static supportsRunContext(): boolean
+  /**
    * (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
    * `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
    * ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
@@ -1123,6 +1130,15 @@ export declare class Core {
    * warning. Fires [`CoreEvent::WorkerMessageInjected`] for each successful write.
    */
   injectWorkerMessage(runId: string, message: string, target: string): Promise<unknown>
+  /**
+   * (program context-block-core) Replace a run's context block WHOLE: `contextJson` is
+   * `{ version, sections: [{ id: "goal"|"approach"|"constraints", text, author: { kind: "human",
+   * id }, version }], set_by: { kind: "human"|"system", id } }`. Resolves to `{ version,
+   * accepted }` (an older or equal version is a no-op, `accepted: false`). Rejects with
+   * `bad_request:` (a section not a person's, oversize, blank, unknown; never clipped),
+   * `not_found:` or `conflict:` (the run has ended).
+   */
+  setRunContext(runId: string, contextJson: string): Promise<string>
   /**
    * (program DES-POWER-MODE) Flip a run's power switch. Resolves to the run's power state as
    * JSON (`PowerState`, camelCase). Rejects with `not_found:` / `conflict:` / `refused:`.

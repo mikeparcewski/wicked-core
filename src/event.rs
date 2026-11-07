@@ -1292,6 +1292,27 @@ pub enum CoreEvent {
         /// `"all"` or the cli_key that was targeted.
         target: String,
     },
+    /// (program context-block-core) A person's context block was accepted for the run
+    /// (`set_run_context`): the version now in force, the section ids it carries (in order) and
+    /// its length in characters. Never the text.
+    RunContextSet {
+        session: String,
+        version: u64,
+        sections: Vec<String>,
+        chars: usize,
+    },
+    /// (program context-block-core) The prompt built for one seat carried the run's context block:
+    /// the unit it serves (`0` for a team member turn, which serves the team), the block version it
+    /// carried, the seat, and which seat it is (`unit` | `judge` | `triage` | `council` |
+    /// `team_member` | `qe` | `team_review` | `send_back`; a council names each seat drawn). A
+    /// launch refused after its prompt was built never ran. Never the text.
+    RunContextDelivered {
+        session: String,
+        ord: u32,
+        version: u64,
+        recipient_cli: String,
+        recipient: String,
+    },
     /// (program DES-POWER-MODE) The intake QE plan sized the run's rigor (`wicked.run.intake.planned`).
     PowerIntakePlanned {
         session: String,
@@ -2385,6 +2406,32 @@ impl CoreEvent {
                 "session": session,
                 "message": message,
                 "target": target,
+            }),
+            CoreEvent::RunContextSet {
+                session,
+                version,
+                sections,
+                chars,
+            } => json!({
+                "type": "runContextSet",
+                "session": session,
+                "version": version,
+                "sections": sections,
+                "chars": chars,
+            }),
+            CoreEvent::RunContextDelivered {
+                session,
+                ord,
+                version,
+                recipient_cli,
+                recipient,
+            } => json!({
+                "type": "runContextDelivered",
+                "session": session,
+                "ord": ord,
+                "version": version,
+                "recipientCli": recipient_cli,
+                "recipient": recipient,
             }),
             CoreEvent::UnitReassigned {
                 session,

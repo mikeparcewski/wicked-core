@@ -119,6 +119,7 @@ mod repo_intel;
 mod review_context;
 pub mod rubric;
 mod rule_check;
+pub mod run_context;
 mod run_mirror;
 mod runtime_wait;
 pub mod tool_activity;
@@ -2179,6 +2180,29 @@ impl Core {
                 run_id: run_id.to_string(),
                 message: message.to_string(),
                 target,
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (program context-block-core) Replace `run_id`'s context block WHOLE: the person's own Goal /
+    /// Approach / Constraints, attached to every seat prompt the engine builds for the run from the
+    /// next launch on. Strictly increasing `version`: an older or equal one is a no-op answering
+    /// the version in force (`accepted: false`). Refused (`bad_request:`, nothing stored, never
+    /// clipped) when a section is not a person's, oversize, blank or unknown; `not_found:` for an
+    /// unknown run; `conflict:` once the run has ended. Durable with the session.
+    pub fn set_run_context(
+        &self,
+        run_id: &str,
+        ctx: run_context::RunContext,
+    ) -> anyhow::Result<run_context::RunContextAck> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::SetRunContext {
+                run_id: run_id.to_string(),
+                ctx,
                 reply,
             })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;

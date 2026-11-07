@@ -489,6 +489,12 @@ pub(crate) enum Command {
         run_id: String,
         error: anyhow::Error,
     },
+    /// (program context-block-core) Replace a run's context block whole (`Core::set_run_context`).
+    SetRunContext {
+        run_id: String,
+        ctx: crate::run_context::RunContext,
+        reply: Sender<anyhow::Result<crate::run_context::RunContextAck>>,
+    },
     /// Inject an operator message into one or all active PTY workers for a run.
     /// ACP-backed sessions (no PTY) are skipped with a warning logged to stderr.
     InjectWorkerMessage {
