@@ -216,6 +216,7 @@ fn run_steps(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -540,6 +541,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             instructions: None,
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -648,6 +650,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             instructions: None,
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -1282,6 +1285,7 @@ fn run_told(
             instructions: Some(TOUCH_NO_TEST),
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -1506,6 +1510,7 @@ fn changed_instructions_check_the_rule_again() {
             instructions: Some("A new instruction from the person."),
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -1682,6 +1687,7 @@ fn run_packs(
             instructions,
             engine_record: engine,
             creator_records: records,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],
@@ -1913,7 +1919,8 @@ fn b53_pol_2101_is_kept_only_when_substance_and_record_are_both_kept() {
             "{sub} / {rec}: the record calls"
         );
     }
-    // No step of the run wrote code before this gate: no record is due (the substance decides).
+    // No code-writing step is done before this gate (but the run's record does not show that no
+    // agent wrote code): no record is due, the substance decides.
     let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
     let r = run_packs(
         &rules,
@@ -2862,6 +2869,74 @@ fn a_process_kept_that_quotes_nothing_is_unchecked() {
     assert!(r.hold().is_none());
 }
 
+/// (crew#1394) A run where no agent wrote code before the gate (qe-author-tests with its author a
+/// Tool, as crew's e2e runs it) and so no judge seat can be drawn (the work's creators are not
+/// known): POL-2101 is N/A by fact and nothing holds. Control: the same seatless check with an
+/// agent creator's record in the run still holds POL-2101 unchecked (unknown creators, as
+/// designed).
+#[test]
+fn pol_2101_needs_no_judge_when_no_agent_wrote_code_and_holds_when_creators_are_unknown() {
+    let rules = [pack("POL-2101")];
+    let c = change();
+    let f = job_facts(&mcp_steps(), None, None, &c);
+    let judge = PackJudge::with(&[("*", "KEPT — src/add.rs")], &[], &[]);
+    let seatless = |records: &[CreatorRecord], no_agent_code: bool| {
+        check(
+            &CheckInput {
+                rules: &rules,
+                facts: &f,
+                change: &c,
+                floor: None,
+                prior: None,
+                skips: &[],
+                seats: &[],
+                no_seat: Some(
+                    "the work's creators are not known, so no judge can be shown distinct from them",
+                ),
+                base: "b0",
+                instructions: None,
+                engine_record: Some(ENGINE),
+                creator_records: Some(records),
+                no_agent_code,
+                stage: CheckStage::Review,
+                deliver_tokens: &[],
+                deferred: &[],
+                settled: &[],
+            },
+            &judge,
+            &NoMachine,
+        )
+    };
+    let r = seatless(&[], true);
+    let row = row_of(&r, "POL-2101");
+    assert_eq!(
+        (row.status, row.how),
+        (RuleStatus::NotApplicable, RuleHow::Fact),
+        "{row:?}"
+    );
+    assert_eq!(row.reason, NO_AGENT_WROTE_CODE);
+    assert!(r.denial().is_none() && r.hold().is_none(), "{r:?}");
+    // (codex r1) No record done before the gate is NOT that fact on its own (an agent writer may
+    // be this very attempt, or a loop's reset step): judged, and with no seat it holds.
+    let r = seatless(&[], false);
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::Unchecked,
+        "{r:?}"
+    );
+    assert!(r.hold().is_some());
+    let r = seatless(&record(REC_GOOD), false);
+    let row = row_of(&r, "POL-2101");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("creators are not known"),
+        "{}",
+        row.reason
+    );
+    assert!(r.hold().is_some());
+    assert!(judge.prompts.lock().unwrap().is_empty());
+}
+
 // ── SWAP 6: a rule whose subject only exists at delivery ────────────────────────────────────────
 
 fn linked_issue() -> ConformanceRule {
@@ -2897,6 +2972,7 @@ fn run_stage(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage,
             deliver_tokens,
             deferred,
@@ -3112,6 +3188,7 @@ fn run_seated(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
             deferred: &[],

@@ -1113,6 +1113,11 @@ pub struct CheckInput<'a> {
     /// (Part B) The records of the run's creator steps (POL-2101's record clause,
     /// [`EvidenceSubject::Record`]): `None` when they could not be read.
     pub creator_records: Option<&'a [CreatorRecord]>,
+    /// (crew#1394) The run's record shows, read whole, that no agent wrote code in it: its plan has
+    /// no agent code-writing step (at any status), no unit records an author, the run has no loop
+    /// (whose reset clears those records), and this attempt ran no floor fix. Then POL-2101, which binds agents writing code, has no subject. `false`
+    /// whenever that cannot be established.
+    pub no_agent_code: bool,
     /// What this check judges: the review's change, or the delivery's pull-request text.
     pub stage: CheckStage,
     /// The deliver step's selection tokens (stamped at dispatch): empty = the run has no deliver
@@ -2671,6 +2676,11 @@ struct Pending<'a> {
     subject: EvidenceSubject,
 }
 
+/// (crew#1394) Why POL-2101 is not applicable on a run whose record shows no agent wrote code.
+pub const NO_AGENT_WROTE_CODE: &str = "no agent wrote code in this run (its code-writing steps \
+                                       are the engine's own tool steps, or there are none), and \
+                                       the rule binds agents writing code";
+
 /// (Part B) Where POL-2101's record part waits for the engine to combine it with its substance.
 const RECORD_SLOT: &str = "\u{0}record";
 
@@ -2912,6 +2922,23 @@ pub fn check(
         let pack = crate::steering_packs::pack_overlay(rule)
             .map(|o| o.kind)
             .filter(|_| input.stage == CheckStage::Review);
+        // (crew#1394) POL-2101 binds AGENTS writing code ("agents do not substitute another …
+        // before writing code"). When the run's record shows no agent wrote code in it (the change
+        // is the engine's own Tool steps', or nobody's: `no_agent_code`), it has no subject: not
+        // applicable, by that fact, with no judge asked. Anything short of that is judged.
+        if pack == Some(PackKind::WorkWithRecord) && input.no_agent_code {
+            rows.insert(
+                rule.id.clone(),
+                row(
+                    RuleStatus::NotApplicable,
+                    RuleHow::Fact,
+                    NO_AGENT_WROTE_CODE.to_string(),
+                    None,
+                    None,
+                ),
+            );
+            continue;
+        }
         let ek = match pack {
             Some(PackKind::Process(_)) => digest(&[&process_key, &note]),
             Some(PackKind::WorkWithRecord) => {
@@ -3071,7 +3098,8 @@ pub fn check(
                         RuleStatus::Unchecked,
                         "the creator steps' records could not be read".into(),
                     )),
-                    // No step of this run wrote code before this gate: the clause has no subject.
+                    // No code-writing step is done before this gate: no record is due (the
+                    // substance part decides).
                     Some([]) => Some(decided(
                         RuleStatus::NotApplicable,
                         "no step of this run wrote code before this gate, so no record is due"

@@ -1657,6 +1657,7 @@ pub(crate) fn delivery_rule_check(
             instructions: Some(ctx.instructions.as_str()).filter(|t| !t.is_empty()),
             engine_record: None,
             creator_records: None,
+            no_agent_code: false,
             stage: crate::rule_check::CheckStage::Delivery,
             deliver_tokens: &ctx.deliver_tokens,
             deferred: &ctx.deferred,
@@ -2063,6 +2064,7 @@ fn run_rule_check_with(
                     instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
                     engine_record: Some(engine_record.as_str()),
                     creator_records: creator_records.as_deref(),
+                    no_agent_code: no_agent_wrote_code(&gov.db_path, &input.run_id, &input.unit),
                     stage: crate::rule_check::CheckStage::Review,
                     deliver_tokens: &input.unit.rule_deliver_tokens,
                     deferred: &[],
@@ -2240,6 +2242,66 @@ pub(crate) fn engine_record(
          and any history beyond what is shown here.\n",
     );
     s
+}
+
+/// (crew#1394) Whether the run's record shows, read whole and strictly, that no AGENT wrote code in
+/// it: no unit of the run (at any status or ord, this one included, so a loop's reset author still
+/// counts) is an agent code-writing step (a creator, or a phase declaring `executes_code`); no unit
+/// records an author (`authored_by`: dispatched builders, kept guarded edits, floor fixers, which
+/// the fold stamps); the run has no loop (a loop's reset clears those stamps); and this attempt
+/// runs no floor fix. Any unit node of the run that does not decode, or a store that cannot be
+/// read, is not that fact: `false`.
+pub(crate) fn no_agent_wrote_code(
+    db_path: &str,
+    run_id: &str,
+    unit: &crate::domain::WorkUnit,
+) -> bool {
+    use wicked_apps_core::{FromNode, GraphRead};
+    let floor_fix = unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .is_some_and(|r| r.fix.is_some());
+    let looped = unit.repeat_from.is_some() || unit.repeat_passes > 0;
+    if floor_fix || looped || !unit.authored_by.is_empty() {
+        return false;
+    }
+    let Ok(store) = wicked_apps_core::open_store_ro(Some(db_path)) else {
+        return false;
+    };
+    let query = wicked_apps_core::SymbolQuery {
+        kinds: vec![wicked_apps_core::NodeKind::Other(
+            wicked_apps_core::WORK_UNIT.to_string(),
+        )],
+        ..Default::default()
+    };
+    let Ok(nodes) = store.find_symbols(&query) else {
+        return false;
+    };
+    let mut any = false;
+    for n in &nodes {
+        let of_run = n.metadata.get("session_id").and_then(|v| v.as_str()) == Some(run_id)
+            || n.name.starts_with(&format!("{run_id}:"));
+        if !of_run {
+            continue;
+        }
+        let Ok(u) = crate::domain::WorkUnit::from_node(n) else {
+            return false;
+        };
+        if u.session_id != run_id {
+            continue;
+        }
+        any = true;
+        let writes = u.tool_cmd.is_none()
+            && (u.role == crate::workflow::PhaseRole::Creator || u.executes_code);
+        // (codex r2) A loop's reset clears the pass's author stamps (a floor fixer's included)
+        // without reverting the tree, so on a run with a loop no stamp is not that fact.
+        let looped = u.repeat_from.is_some() || u.repeat_passes > 0;
+        if writes || looped || !u.authored_by.is_empty() {
+            return false;
+        }
+    }
+    any
 }
 
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the
