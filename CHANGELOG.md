@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A skip at a re-check lands, and a review judge rules on the change (e2e-1105 F38).**
+  - **The skip.** On run 672b5c14's `domain_coverage` gate, "Confirm or skip DEV-TINYMATH-1" re-ran the judge and the
+    rule came back unchecked. A re-check is a re-judge: the seat does not run, and the floor is not re-run (its last
+    result on the same tree stands, core#544). But the rule check keyed every row on the floor result it was handed,
+    and the re-judge handed it none, so the evidence key moved and the person's skip, given on the same tree,
+    answered no row. The rule check now reuses the unit's last floor result when it was taken on this very tree
+    (equal snapshot tree ids). A critique gate, which has no floor, was never affected.
+  - **The judge.** The review judge's prompt said to answer UNKNOWN whenever the evidence cannot show a rule kept,
+    so the judges held a JSDoc rule about the repository's existing exports on a mapping run that changed only its
+    own JSON files. A review judge now rules on THIS change (`rule_check::CHANGE_SCOPE_RULE`):
+    - a rule about code the change does not add, modify, delete or call into is N/A;
+    - a break the code already had is N/A (pre-existing);
+    - UNKNOWN is kept for a rule the change does touch.
+
+    wicked-core#1347 had changed only the page reviewer's instructions (and garden's E7), not the judge's.
+
 - **A mapping run never delivers (wicked-core#1338).** `domain-extraction` runs launched from a repository (crew's
   default, studio's Generate it wizard, a chat's `/` Map the domain) carried a deliver step, and the plan's `extract`
   step (`produce`) counts as a creator, so the run ended with a **Deliver** it could not pass. There was nothing to

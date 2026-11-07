@@ -2396,3 +2396,87 @@ fn the_engine_record_carries_the_engines_facts_and_no_creator_prose() {
 
 #[path = "cli_runner_rule_council_tests.rs"]
 mod council;
+
+/// e2e-1105 F38 (run 672b5c14, unit 9 `domain_coverage`): a person skipped an unchecked rule with
+/// a reason, and the re-check (a re-judge: the seat does not run, and the floor's last result on
+/// the same tree stands, core#544) asked the rule again. The rows had been keyed on the attempt's
+/// floor result; the re-judge passed none, so the evidence key moved and the skip answered no
+/// row. The floor result that stands for this tree is the same evidence: the skip lands.
+#[test]
+fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
+    use crate::rule_check::RuleStatus;
+    let (repo, base, db) = fixture("rejudge-skip");
+    let mut input = review_input(&repo, &base, &db);
+    let git_dir = repo.join(".git");
+    input.unit.worktree_baseline = Some(
+        serde_json::from_value(serde_json::json!({
+            "head": base, "tree": "t", "taken_at_ms": 1,
+            "git_dir": git_dir.to_string_lossy()
+        }))
+        .expect("baseline"),
+    );
+    let tree = crate::rule_check::worktree_diff(&repo, Some(&git_dir), &base)
+        .unwrap()
+        .tree
+        .expect("the engine's snapshot tree");
+    let mut floor = report_of(serde_json::json!([run_of("test", 0)]));
+    floor.passed = true;
+    floor.tree = Some(tree.clone());
+    let pool = vec![seat("codex")];
+    let sink = |_: &str| {};
+    let judge = |input: &StepInput, floor: Option<&crate::repo_checks::RepoChecksReport>| {
+        let runner = Recording(Mutex::new(Vec::new()));
+        run_rule_check(
+            input,
+            &["claude".into()],
+            Some(&[]),
+            &pool,
+            &pool,
+            floor,
+            &runner,
+            &sink,
+        )
+        .expect("a report")
+    };
+    // The attempt that ran the seat and the floor: R2 is unchecked (the judge never answers it).
+    let first = judge(&input, Some(&floor));
+    let r2 = first
+        .rows
+        .iter()
+        .find(|r| r.rule_id == "R2")
+        .unwrap()
+        .clone();
+    assert_eq!(r2.status, RuleStatus::Unchecked, "{first:?}");
+    // The person skips it with a reason; the re-judge runs no floor, and the unit carries the
+    // floor's result on this (unchanged) tree.
+    input.unit.repo_checks = Some(floor.clone());
+    input.unit.rule_check = Some(first.clone());
+    input.unit.rule_skips = vec![crate::rule_check::RuleSkip {
+        rule_id: "R2".into(),
+        reason: "a mapping run changes no source".into(),
+        by: "local (human)".into(),
+        at: 1,
+        rule_key: r2.rule_key.clone(),
+        evidence_key: r2.evidence_key.clone().expect("an evidence key"),
+        instruction: None,
+    }];
+    let again = judge(&input, None);
+    let row = again.rows.iter().find(|r| r.rule_id == "R2").unwrap();
+    assert_eq!(row.status, RuleStatus::Skipped, "{again:?}");
+    assert!(
+        row.reason.contains("a mapping run changes no source"),
+        "{}",
+        row.reason
+    );
+    assert!(
+        again.hold().is_none() && again.denial().is_none(),
+        "{again:?}"
+    );
+    // A floor result from another tree is not this tree's evidence: never reused.
+    let mut other = floor.clone();
+    other.tree = Some("0".repeat(40));
+    input.unit.repo_checks = Some(other);
+    let moved = judge(&input, None);
+    let row = moved.rows.iter().find(|r| r.rule_id == "R2").unwrap();
+    assert_ne!(row.status, RuleStatus::Skipped, "{moved:?}");
+}
