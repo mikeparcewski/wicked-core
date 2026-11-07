@@ -1118,8 +1118,9 @@ pub const CODE_MISMATCH_ANN: &str = "code_mismatch";
 /// The value a restatement writes over an earlier mismatch: the code meets the requirement.
 pub const CODE_MEETS: &str = "code meets it";
 
-/// The live code mismatch on `node`: its newest [`CODE_MISMATCH_ANN`] (by `ts`; of equal ones, the
-/// last the store returns), unless that is blank or [`CODE_MEETS`]; `None` otherwise.
+/// The live code mismatch on `node`: its newest NON-BLANK [`CODE_MISMATCH_ANN`] (by `ts`; of equal
+/// ones, the last the store returns); `None` when there is none or it reads [`CODE_MEETS`]. A blank
+/// value never clears a finding.
 pub fn code_mismatch_of(
     store: &dyn GraphRead,
     node: &wicked_apps_core::SymbolId,

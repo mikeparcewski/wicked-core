@@ -17,7 +17,7 @@ Two release tracks share this file, newest entry first regardless of track:
 - **Requirements read: code mismatches, code age and the minimum in force (operator rulings 2026-11-06).** Each
   listed row's verdict carries `code_mismatch` (string or null): the extractor stated the requirement the code is
   meant to meet and found the code does not meet it. The row still counts as a real requirement; the mismatch is a
-  finding beside it, read live from the store: the newest `code_mismatch` annotation, unless it is
+  finding beside it, read live from the store: the newest non-blank `code_mismatch` annotation, unless it is
   `"code meets it"`, which the extractor writes over an earlier mismatch when the unit is restated as met. A build records the commit its code graph was indexed at (`code_commit`), and
   `requirements_graph_for_repo` returns `code: { built_from: { commit, at, basis }, head, commits_behind }`,
   counted with git in the REGISTERED checkout (HEAD resolved once; `null`, never 0, for a commit that is not a

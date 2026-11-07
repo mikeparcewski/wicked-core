@@ -488,8 +488,19 @@ fn code_drift(root: &str, commit: &str, basis: &str) -> serde_json::Value {
     // expression such as `HEAD`, or an abbreviation an all-hex branch name could shadow, codex r2),
     // and only when it names a commit the checkout holds.
     let full_id = matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit());
-    let full = (full_id && ok(&["cat-file", "-t", commit]).as_deref() == Some("commit"))
-        .then(|| commit.to_ascii_lowercase());
+    // It must resolve to exactly itself: a 64-hex branch name in a SHA-1 repository resolves to
+    // some other object (codex r3), and an abbreviation never matches.
+    let lower = commit.to_ascii_lowercase();
+    let full = (full_id
+        && ok(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{lower}^{{commit}}"),
+        ])
+        .as_deref()
+            == Some(lower.as_str()))
+    .then_some(lower);
     let at = full
         .as_deref()
         .and_then(|c| ok(&["show", "-s", "--format=%cI", c]));
@@ -2243,7 +2254,14 @@ mod tests {
         assert!(git(p, &["commit", "-qm", "side"]).unwrap().0);
         let side = git(p, &["rev-parse", "HEAD"]).unwrap().1;
         assert!(git(p, &["checkout", "-q", "-"]).unwrap().0);
-        for (commit, dated) in [(side.as_str(), true), (&side[..12], false), ("HEAD", false)] {
+        let wide = "a".repeat(64);
+        assert!(git(p, &["branch", &wide]).unwrap().0);
+        for (commit, dated) in [
+            (side.as_str(), true),
+            (&side[..12], false),
+            ("HEAD", false),
+            (wide.as_str(), false),
+        ] {
             {
                 let mut repo_store =
                     wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
