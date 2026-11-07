@@ -824,8 +824,14 @@ fn with_deliver(plan: &PlanSteps, deliver: Option<&PlanStep>) -> Result<PlanStep
 /// ([`revise::revise`], floor-filled with the run's deliver command) follows it too. The run keeps
 /// its deliver step on [`TeamPlanState::deliver_step`], so a later rev that adds a creator step
 /// (an ask continued in Build) delivers.
+///
+/// (wicked-core#1338) A mapping plan ([`PlanSteps::maps_only`]: its only creator is the domain
+/// extractor's `produce` step) takes none either: it writes only its own `.wicked/domain/` files and
+/// the store, so a deliver unit could only fail (nothing to push, the repository's own checks run on
+/// a base whose defects the map records, a local repository with no origin). The run keeps the
+/// launch's deliver step, so a revision that adds a build step delivers.
 fn delivered<'a>(plan: &PlanSteps, deliver: Option<&'a PlanStep>) -> Option<&'a PlanStep> {
-    deliver.filter(|_| plan.has_creator())
+    deliver.filter(|_| plan.has_creator() && !plan.maps_only())
 }
 
 /// The step a delivering run's `deliver` goes before (see [`with_deliver`]): the plan's final
@@ -1015,7 +1021,9 @@ pub(crate) fn decide(
             Err(e) => (plan, Some(format!("{e:#}"))),
         },
     };
-    let deliver = deliver_cmd(delivered(&plan, prior.deliver_step.as_ref()));
+    // The floor gets the run's deliver command whenever the plan has a creator: it decides itself
+    // whether a mapping plan delivers (only when it adds a creator, wicked-core#1338).
+    let deliver = deliver_cmd(prior.deliver_step.as_ref().filter(|_| plan.has_creator()));
     let proposal_id = ev::mint_proposal_id(run_id, &proposal.by, &proposal.source);
     let base_rev = (prior.accepted_rev > 0).then_some(prior.accepted_rev);
     let events = vec![
@@ -1059,7 +1067,9 @@ pub(crate) fn decide(
             .is_some_and(|s| s.critical),
         destructive,
         &crate::review_scale::floor_for(max_score, destructive).band,
-        deliver.is_some(),
+        // The rules read whether the PLAN delivers (codex r3 on #1338): a mapping plan does not,
+        // though the floor holds the run's command in case it adds work.
+        delivered(&plan, prior.deliver_step.as_ref()).is_some(),
     );
     let read = rules.eval(&context)?;
     // The obligation ratchet: every held rule the run has fired, plus this proposal's.
@@ -2203,6 +2213,108 @@ mod tests {
         ]}));
         let d3 = launch_decide(&run, &prior, &HumanConfirm::None, &NoRules);
         assert_eq!(decided_ids(&d3), ["fmt"]);
+    }
+
+    /// wicked-core#1338: the mapping preset (its one creator is the domain extractor's `produce`)
+    /// takes no deliver step on a delivering run, at the lowest band or the highest, so it ends at
+    /// its last step; the run keeps its deliver step, so a revision that adds a build delivers.
+    #[test]
+    fn a_mapping_plan_of_a_delivering_run_gets_no_deliver_step() {
+        let prior = TeamPlanState {
+            deliver_step: Some(deliver_step_for_test()),
+            ..TeamPlanState::default()
+        };
+        let map = PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..PlanSteps::default()
+        };
+        assert!(map.maps_only());
+        for touch in [
+            json!(["README.md"]),
+            json!(["src/a.rs", "src/b.rs", "src/c.rs"]),
+        ] {
+            let mut p = map.clone();
+            p.touch = serde_json::from_value(touch).unwrap();
+            let d = launch_decide(&p, &prior, &HumanConfirm::None, &NoRules);
+            let ids = decided_ids(&d);
+            assert!(!ids.iter().any(|i| i == "deliver"), "{ids:?}");
+            assert_eq!(
+                d.state.deliver_step, prior.deliver_step,
+                "kept for a later rev"
+            );
+        }
+        // codex r3: the rules read a plan that delivers nothing.
+        let rules = Fixed::new(RulesEval::default(), false);
+        launch_decide(&map, &prior, &HumanConfirm::None, &rules);
+        assert_eq!(rules.asked.borrow()[0]["deliver"], json!(false));
+        // A plan that also builds is not a mapping plan: it delivers.
+        let mut build = map.clone();
+        build.steps.push(PlanStep {
+            catalog: "build".into(),
+            id: "fix".into(),
+            depends_on: Some(vec!["domain-graph".into()]),
+            ..PlanStep::default()
+        });
+        build.touch = Some(vec!["src/math.js".into()]);
+        assert!(!build.maps_only());
+        let d = launch_decide(&build, &prior, &HumanConfirm::None, &NoRules);
+        assert_eq!(
+            decided_ids(&d).last().map(String::as_str),
+            Some("deliver"),
+            "{:?}",
+            decided_ids(&d)
+        );
+        // A produce step that runs another skill is ordinary work: it delivers.
+        let mut other = map.clone();
+        for s in other.steps.iter_mut().filter(|s| s.catalog == "produce") {
+            s.skill_ref = Some("wicked-garden-engineering".into());
+        }
+        assert!(!other.maps_only());
+        // codex r2/r3: a coverage step with another skill, no skill, or its own instructions is
+        // not the judge as shipped: the plan delivers.
+        for (skill, instructions) in [
+            (Some("wicked-garden-engineering"), None),
+            (None, None),
+            (Some(crate::catalog::DOMAIN_COVERAGE_SKILL), Some("fix src")),
+        ] {
+            let mut custom = map.clone();
+            for s in custom
+                .steps
+                .iter_mut()
+                .filter(|s| s.catalog == "domain_coverage")
+            {
+                s.skill_ref = skill.map(str::to_string);
+                s.instructions = instructions.map(str::to_string);
+            }
+            assert!(!custom.maps_only(), "{skill:?} {instructions:?}");
+            let d = launch_decide(&custom, &prior, &HumanConfirm::None, &NoRules);
+            assert_eq!(decided_ids(&d).last().map(String::as_str), Some("deliver"));
+        }
+        // codex r2: a Tool that raises executes_code makes the plan code work (the floor adds a
+        // build): it delivers.
+        let mut tool = map.clone();
+        for s in tool.steps.iter_mut().filter(|s| s.id == "extract-prepare") {
+            s.executes_code = Some(true);
+        }
+        assert!(!tool.maps_only());
+        let d = launch_decide(&tool, &prior, &HumanConfirm::None, &NoRules);
+        let ids = decided_ids(&d);
+        assert_eq!(ids.last().map(String::as_str), Some("deliver"), "{ids:?}");
+        // codex r2: the coverage judge alone is not a mapping plan.
+        let alone = PlanSteps {
+            steps: map
+                .steps
+                .iter()
+                .filter(|s| s.catalog == "domain_coverage")
+                .cloned()
+                .map(|mut s| {
+                    s.depends_on = None;
+                    s
+                })
+                .collect(),
+            ..PlanSteps::default()
+        };
+        assert!(!alone.maps_only());
     }
 
     /// WT-C3 (§4.12 B5): the rules are read against the ENGINE-derived context — `kinds` from

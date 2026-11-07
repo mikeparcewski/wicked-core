@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A mapping run never delivers (wicked-core#1338).** `domain-extraction` runs launched from a repository (crew's
+  default, studio's Generate it wizard, a chat's `/` Map the domain) carried a deliver step, and the plan's `extract`
+  step (`produce`) counts as a creator, so the run ended with a **Deliver** it could not pass. There was nothing to
+  push, the deliver floor ran the repository's own checks (red on the defects the map records as code mismatches),
+  and a local repository has no origin. Only Stop ended the run. A plan whose only creator steps are the domain
+  extractor's `produce` (`PlanSteps::maps_only`; DES-CATALOG-002 Q17) now takes no deliver step, neither from the
+  launch nor from the band floor, so the run ends at its last step (the domain-graph approval). The run keeps the
+  launch's deliver step, so a revision that adds a build step delivers as before.
+
 - **The `run-cost` preset and the crew-tool channel (program CS6, core half).** "What would 40 bug fixes a month cost?"
   runs `facts` (`run`, a Tool: crew's fixed `wicked-crew insights-facts`, which prints crew's run facts: the window, the
   scope, what is left out, the population rules, every workflow group's wall time and spend percentiles, and the runs),
