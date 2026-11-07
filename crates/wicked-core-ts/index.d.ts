@@ -423,9 +423,12 @@ export declare class Core {
    * token. Safe whether the run is executing or paused.
    */
   cancelRun(runId: string): Promise<string>
-  /** The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}` (JSON). */
+  /**
+   * The unit a bound MCP token belongs to: `{runId, ord, attempt, seat, timeoutSecs}`; rejects
+   * `invalid_token: …`. Records and emits nothing (crew queues asks per run before opening).
+   */
   askUnit(token: string): Promise<string>
-  /** Open an operator question with `{token, question, choices?, recommended?}`. */
+  /** Open an operator question with `{token, question, choices?, recommended?, multi?: {min?, max?}}`. */
   openAsk(requestJson: string): Promise<string>
   /** Close an unanswered question (`timeout` or `teardown`); false if already resolved. */
   closeAsk(elicitationId: string, reason: string): Promise<boolean>
@@ -558,7 +561,9 @@ export declare class Core {
   /**
    * The presets a launch in `projectId` sees (null ⇒ the global set), sorted by name, as a JSON
    * array of `Preset` objects: every global preset (built-ins included, `created_by: "builtin"`),
-   * with a project row replacing the global row of the same name.
+   * with a project row replacing the global row of the same name. (DES-CHAT-FIRST-001 C2) A
+   * built-in row also carries `title`, `summary` and `use_when` (2–4 phrases); a saved preset
+   * carries none of the three keys, and an older engine never sends them.
    */
   listPresets(projectId?: string | undefined | null): Promise<string>
   /**
@@ -976,6 +981,17 @@ export declare class Core {
    */
   static listMcpTools(requestJson: string): Promise<string>
   /**
+   * (DES-RULE-CHECK-001, S1) Which in-force rules a job is checked against. `args_json` is `{ rules:
+   * [ConformanceRule…], job: { workflow?, steps?: [{ tokens, kind? }], kinds?, project?, languages?, frameworks?,
+   * layers?, diff? } }`; resolves to `{ matches: [{ rule_id, status: "applies"|"may_apply"|"not_applicable", facts:
+   * [{ kind, detail }] }] }`: one match per rule, none dropped, in reading order. "not_applicable" is only ever a
+   * recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
+   * judge per call; another project; a facet or trigger the
+   * job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
+   * `bad_request: …`. Static, like `evaluateMcpCall`.
+   */
+  static matchRules(argsJson: string): Promise<string>
+  /**
    * (crew#1337) Judge ONE brokered MCP call for the token's unit with the SAME evaluation
    * `evaluateMcpCall` runs, WITH its arguments (an argument-triggered rule fires), and record
    * NOTHING. `request_json` is `{ token, call: { server, tool, args?, annotations?,
@@ -986,19 +1002,6 @@ export declare class Core {
    * `evaluateMcpCall`.
    */
   static judgeMcpCall(requestJson: string): Promise<string>
-  /**
-   * (DES-RULE-CHECK-001, S1) Which in-force rules a job is checked against. `args_json` is `{ rules:
-   * [ConformanceRule…], job: { workflow?, steps?: [{ tokens, kind? }], kinds?, project?, languages?, frameworks?,
-   * layers?, diff? } }`; resolves to `{ matches: [{ rule_id, status: "applies"|"may_apply"|"not_applicable", facts:
-   * [{ kind, detail }] }] }`: one match per rule, none dropped, in reading order. "not_applicable" is only ever a
-   * recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
-   * judge per call; another project; a facet or trigger the
-   * job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
-   * `bad_request: …`. Static, like `evaluateMcpCall`. (DES-RULE-CHECK-001) `job.repo` (the job's repository
-   * id or name) and `job.paths` (changed files): a rule whose `statement` or `source_ref` document names
-   * the repository, or whose statement names a changed file, applies — so send each rule's `statement`.
-   */
-  static matchRules(argsJson: string): Promise<string>
   /**
    * (core#1018) The estate relay's scope for a token: crew's broker relays a container seat's
    * `mcp:estate/<tool>` calls to the host's estate and scopes them by this. `request_json` is
@@ -1073,8 +1076,12 @@ export declare class Core {
    * ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
    * of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
    * recomputed from the store's own counts against the configured minimum. Resolves to a JSON
-   * string `{ "graph": <domain-model document | null>, "coverage": {...} }`; `graph` is null until
-   * a build reached the minimum. An unknown `repo_ref` REJECTS.
+   * string `{ "graph": <domain-model document | null>, "coverage": {...}, "build": { generation,
+   * coverage } | null, "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" |
+   * "not_product" | "unindexed" } } } | null }`: `graph` is the last build (null until a build
+   * reached the minimum), `coverage` the store now, `build` the label that build persisted, `rows`
+   * the engine's verdict on each listed row that recorded its unit (same pass as `coverage`). An
+   * unknown `repo_ref` REJECTS.
    */
   getRequirementsGraphForRepo(repoRef: string): Promise<string>
   /**

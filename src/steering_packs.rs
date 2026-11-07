@@ -336,6 +336,13 @@ mod tests {
                 .kind,
             PackKind::Process(PackParty::Engine)
         );
+        // (crew#1394, pi) The no-agent-code fact is POL-2101's: it is the only record-split rule.
+        let split: Vec<&str> = rules
+            .iter()
+            .filter(|r| pack_overlay(r).unwrap().kind == PackKind::WorkWithRecord)
+            .map(|r| r.id.as_str())
+            .collect();
+        assert_eq!(split, ["POL-2101"]);
         let mut edited = logging.clone();
         edited.statement.push_str(" Also every server.");
         assert!(

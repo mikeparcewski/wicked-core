@@ -1660,6 +1660,201 @@ fn the_creator_record_set_is_every_done_code_writing_step_before_the_gate() {
     assert!(creator_records(&dir.join("missing/none.db").to_string_lossy(), "s", 7).is_err());
 }
 
+/// (crew#1394) A qe-author-tests run as crew's e2e runs it: the author is an engine Tool step that
+/// writes the tests (role neutral, `executes_code`), so no agent wrote code and the work's
+/// creators are not known (no judge seat). Read from the seeded store, POL-2101 is N/A by fact
+/// and the review gate does not hold. Control: with the author an agent creator (its creators
+/// still unrecorded), POL-2101 stays unchecked and holds, as designed.
+#[test]
+fn a_qe_author_tests_run_with_a_tool_author_passes_review_and_unknown_creators_still_hold() {
+    use crate::rule_check::{RuleHow, RuleStatus};
+    use crate::workflow::PhaseRole;
+    for tool_author in [true, false] {
+        let tag = if tool_author {
+            "qeat-tool"
+        } else {
+            "qeat-agent"
+        };
+        let dir = std::env::temp_dir().join(format!("rule-check-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let repo = dir.join("repo");
+        std::fs::create_dir_all(repo.join("e2e")).unwrap();
+        git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("README.md"), "app\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-qm", "base"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        std::fs::write(repo.join("e2e/launch.spec.mjs"), "console.log('ok')\n").unwrap();
+        let db = dir.join("store.db").to_string_lossy().into_owned();
+        let _ = wicked_apps_core::emit::hermetic_test_spool();
+        // As crew launches its def (no catalog ids on the units): the review step's own id is
+        // what selects POL-2101 (`applies_to: [build, review]`).
+        let unit = |ord: u32, id: &str, _catalog: &str, role: PhaseRole| {
+            let mut u = crate::domain::WorkUnit::pending(format!("s:{id}"), "s", ord, id);
+            u.role = role;
+            u
+        };
+        let recon = unit(1, "recon", "understand", PhaseRole::Neutral);
+        let mut author = unit(2, "author", "build", PhaseRole::Creator);
+        if tool_author {
+            author.role = PhaseRole::Neutral;
+            author.tool_cmd = Some(vec!["bash".into(), "-lc".into(), "write".into()]);
+        }
+        author.executes_code = true;
+        let mut verify = unit(3, "verify", "run", PhaseRole::Neutral);
+        verify.tool_cmd = Some(vec!["bash".into()]);
+        let review = unit(4, "review", "review", PhaseRole::Evaluator);
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+            assert_eq!(
+                crate::steering_packs::seed_shipped_packs(&mut store).unwrap(),
+                12
+            );
+            put_creator_record(&mut store, &recon, "recon notes");
+            put_creator_record(
+                &mut store,
+                &author,
+                "author stand-in: wrote e2e/launch.spec.mjs",
+            );
+            put_creator_record(&mut store, &verify, "QE-VERIFY-SUMMARY: produced=1");
+        }
+        let mut input = review_input(&repo, &base, &db);
+        input.unit.ord = 4;
+        input.unit.rule_steps =
+            crate::rule_check::steps_of(&[recon.clone(), author.clone(), verify, review]);
+        let runner = Recording(Mutex::new(Vec::new()));
+        let pool = vec![seat("claude"), seat("codex")];
+        let sink = |_: &str| {};
+        // The actor found no agent author: `work_authors` is empty, so no judge seat.
+        let report = run_rule_check(&input, &[], None, &pool, &pool, None, &runner, &sink)
+            .expect("a report");
+        let pol = report
+            .rows
+            .iter()
+            .find(|r| r.rule_id == "POL-2101")
+            .expect("POL-2101 is in force at the review step");
+        if tool_author {
+            assert_eq!(
+                (pol.status, pol.how),
+                (RuleStatus::NotApplicable, RuleHow::Fact),
+                "{pol:?}"
+            );
+            assert!(
+                report.denial().is_none() && report.hold().is_none(),
+                "review passes: {report:?}"
+            );
+        } else {
+            assert_eq!(pol.status, RuleStatus::Unchecked, "{pol:?}");
+            assert!(report.hold().is_some(), "{report:?}");
+        }
+        assert!(
+            runner.0.lock().unwrap().is_empty(),
+            "no judge seat was drawn"
+        );
+    }
+}
+
+/// (crew#1394, codex r1) "No agent wrote code" is read from the run's whole record, strictly: a run
+/// whose only code-writing step is an engine Tool is that fact; an agent writer anywhere in the
+/// plan (a loop's author reset to pending included), a stamped author (a floor fixer on a reviewer,
+/// say), a loop anywhere in the run, a floor fix in this attempt, an undecodable unit of the run, a
+/// run with no units or a store that cannot be read is not.
+#[test]
+fn no_agent_wrote_code_is_read_strictly_from_the_whole_run() {
+    use crate::workflow::PhaseRole;
+    let dir = std::env::temp_dir().join(format!("rule-check-naw-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let unit = |run: &str, ord: u32, id: &str, role: PhaseRole| {
+        let mut u = crate::domain::WorkUnit::pending(format!("{run}:{id}"), run, ord, id);
+        u.role = role;
+        u
+    };
+    let tool = |run: &str| {
+        let mut a = unit(run, 2, "author", PhaseRole::Neutral);
+        a.tool_cmd = Some(vec!["bash".into()]);
+        a.executes_code = true;
+        a
+    };
+    let review = |run: &str| unit(run, 3, "review", PhaseRole::Evaluator);
+    let store_of = |name: &str, units: &[crate::domain::WorkUnit]| {
+        let db = dir
+            .join(format!("{name}.db"))
+            .to_string_lossy()
+            .into_owned();
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        for u in units {
+            crate::domain::put_node(&mut store, wicked_apps_core::ToNode::to_node(u)).unwrap();
+        }
+        (db, store)
+    };
+    // A Tool author only: the fact.
+    let (db, _s) = store_of(
+        "tool",
+        &[
+            unit("t", 1, "recon", PhaseRole::Neutral),
+            tool("t"),
+            review("t"),
+        ],
+    );
+    assert!(no_agent_wrote_code(&db, "t", &review("t")));
+    // An agent author anywhere in the plan, even reset to pending by a loop: not the fact.
+    let mut author = unit("l", 2, "author", PhaseRole::Creator);
+    author.status = crate::domain::UnitStatus::Pending;
+    let (db, _s) = store_of("loop", &[author, review("l")]);
+    assert!(!no_agent_wrote_code(&db, "l", &review("l")));
+    let mut coder = unit("c", 3, "review", PhaseRole::Evaluator);
+    coder.executes_code = true;
+    let (db, _s) = store_of("coder", &[tool("c"), coder.clone()]);
+    assert!(
+        !no_agent_wrote_code(&db, "c", &coder),
+        "the gate's own unit writes code"
+    );
+    // A stamped author (a floor fixer on an earlier reviewer): not the fact.
+    let mut fixed = unit("f", 1, "check", PhaseRole::Evaluator);
+    fixed.authored_by = vec!["codex".into()];
+    let (db, _s) = store_of("fixer", &[fixed, tool("f"), review("f")]);
+    assert!(!no_agent_wrote_code(&db, "f", &review("f")));
+    // (codex r2) A loop anywhere in the run (its reset clears a floor fixer's stamp): not the fact.
+    let mut back = tool("r");
+    back.ord = 4;
+    back.id = "r:loop".into();
+    back.repeat_from = Some("author".into());
+    let (db, _s) = store_of("looped", &[tool("r"), review("r"), back]);
+    assert!(!no_agent_wrote_code(&db, "r", &review("r")));
+    // A floor fix in this attempt: not the fact.
+    let (db, _s) = store_of("fixnow", &[tool("n"), review("n")]);
+    let mut now = review("n");
+    let mut floor = report_of(serde_json::json!([]));
+    floor.requested_rerun = Some(crate::repo_checks::FloorRerun {
+        mode: crate::repo_checks::FloorRerunMode::FloorFix,
+        waive: Vec::new(),
+        output: String::new(),
+        fix: Some(crate::repo_checks::FloorFix {
+            note: "fix the lint".into(),
+            seat: "codex".into(),
+        }),
+    });
+    now.repo_checks = Some(floor);
+    assert!(!no_agent_wrote_code(&db, "n", &now));
+    // An undecodable unit of the run: not the fact.
+    let (db, mut store) = store_of("bad", &[tool("b"), review("b")]);
+    let mut bad = wicked_apps_core::ToNode::to_node(&unit("b", 4, "odd", PhaseRole::Neutral));
+    bad.metadata
+        .insert("role".into(), serde_json::Value::from(42));
+    crate::domain::put_node(&mut store, bad).unwrap();
+    assert!(!no_agent_wrote_code(&db, "b", &review("b")));
+    // No units at all, or no store: not the fact.
+    let (db, _s) = store_of("empty", &[]);
+    assert!(!no_agent_wrote_code(&db, "e", &review("e")));
+    assert!(!no_agent_wrote_code(
+        &dir.join("missing/none.db").to_string_lossy(),
+        "t",
+        &review("t")
+    ));
+}
+
 /// (Part B, B.2) The engine record a process rule is judged on: what the engine recorded (round,
 /// send-backs against the cap, the handed-on review context, the floor's runs, the reviewer's
 /// output) and never a creator's output, even one handed to the reviewer.
