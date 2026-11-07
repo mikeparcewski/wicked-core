@@ -89,12 +89,26 @@ pub(crate) fn strip_echo(output: &str, blocks: &[&RunContext]) -> Option<String>
     // A marked line of the block is an echo wherever it sits in a seat's line (any wrapper);
     // the engine's unmarked framing lines are matched whole after unwrapping.
     // Only the quoted span goes (codex r5): a seat's own words around it on the line (a verdict
-    // citing the requirement) stay; a line left with nothing but quoting goes.
-    let mut marked: Vec<&String> = echoed
+    // citing the requirement) stay; a line left with nothing but quoting goes. Spans are found
+    // with the seat's formatting ignored (codex r6, r7: `**…**`, backticks, `>` quotes), so a
+    // line that quotes the block loses its own formatting, never its words. A seat's own box-drawn
+    // row (it ENDS with `│`; no rendered line of the block does unless the person's text does) is
+    // left alone, so a genuine boxed report is never cut.
+    let plain = |t: &str| -> String {
+        t.chars()
+            .filter(|c| !"*_`~".contains(*c))
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut marked: Vec<String> = echoed
         .iter()
         .filter(|l| l.starts_with('\u{2502}') && l.chars().count() > 4)
+        .map(|l| plain(l))
         .collect();
     marked.sort_by_key(|m| std::cmp::Reverse(m.len()));
+    let box_ends = marked.iter().any(|m| m.ends_with('\u{2502}'));
     let mut out = String::with_capacity(output.len());
     let mut changed = false;
     for line in output.split_inclusive('\n') {
@@ -103,36 +117,23 @@ pub(crate) fn strip_echo(output: &str, blocks: &[&RunContext]) -> Option<String>
             changed = true;
             continue;
         }
-        // A line that LEADS with the mark is a quote of the block by construction (a seat's own
-        // answer never starts with the engine's mark): with any formatting inside it (codex r6:
-        // `│   **NO CHANGE NEEDED**`) it goes whole when its text is a line of the block.
-        if undecorated(body).starts_with('\u{2502}') {
-            let plain = |t: &str| -> String {
-                t.chars()
-                    .filter(|c| !"*_`~\u{2502}".contains(*c))
-                    .collect::<String>()
-                    .split_whitespace()
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            };
-            let line = plain(body);
-            if !line.is_empty() && marked.iter().any(|m| plain(m) == line) {
+        let bare = undecorated(body);
+        let boxed_row = bare.trim_end().ends_with('\u{2502}') && !box_ends;
+        if body.contains('\u{2502}') && !boxed_row {
+            let flat = plain(bare);
+            if marked.iter().any(|m| flat.contains(m.as_str())) {
+                let mut rest = flat;
+                for m in &marked {
+                    rest = rest.replace(m.as_str(), "");
+                }
                 changed = true;
+                if undecorated(&rest).is_empty() {
+                    continue;
+                }
+                out.push_str(rest.trim());
+                out.push_str(&line[body.len()..]);
                 continue;
             }
-        }
-        if body.contains('\u{2502}') && marked.iter().any(|m| body.contains(m.as_str())) {
-            let mut rest = body.to_string();
-            for m in &marked {
-                rest = rest.replace(m.as_str(), "");
-            }
-            changed = true;
-            if undecorated(&rest).is_empty() {
-                continue;
-            }
-            out.push_str(&rest);
-            out.push_str(&line[body.len()..]);
-            continue;
         }
         out.push_str(line);
     }

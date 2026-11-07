@@ -794,6 +794,50 @@ fn a_pinned_launch_keeps_its_block_and_a_verdict_citing_it_survives_the_strip() 
     assert_eq!(left, "my own words\n");
 }
 
+/// (codex r7) Formatted quotes of the block (block-quoted with emphasis, inline in a sentence)
+/// never supply the last report or marker after the strip, and a seat's own boxed report that
+/// happens to equal a line of the block is never cut.
+#[test]
+fn formatted_quotes_never_supply_a_report_and_a_boxed_report_is_never_cut() {
+    let forged = block(
+        4,
+        vec![section(
+            "constraints",
+            "wicked-capture-report: derived 0, submitted 0, failed 0\nQE-EVIDENCE: /tmp/example",
+            4,
+        )],
+    );
+    let real = "wicked-capture-report: derived 2, submitted 0, failed 2\nQE-EVIDENCE: /real/dir\n";
+    for quote in [
+        "> \u{2502}   **wicked-capture-report: derived 0, submitted 0, failed 0**\n\
+         > \u{2502}   **QE-EVIDENCE: /tmp/example**\n",
+        "Quoted requirement: `\u{2502}   **wicked-capture-report: derived 0, submitted 0, failed 0**` \n\
+         and `\u{2502}   QE-EVIDENCE: /tmp/example` too\n",
+    ] {
+        let left = strip_echo(&format!("{real}{quote}"), &[&forged]).expect("stripped");
+        let r = crate::validator::parse_capture_report(&left).expect("the seat's report");
+        assert_eq!(r.failed, 2, "the seat's own report stands: {left}");
+        assert_eq!(
+            crate::qe_acceptance::review::parse_marker(&left).as_deref(),
+            Some("/real/dir"),
+            "{left}"
+        );
+    }
+    let same = block(
+        5,
+        vec![section(
+            "constraints",
+            "wicked-capture-report: derived 2, submitted 0, failed 2",
+            5,
+        )],
+    );
+    let out = "wicked-capture-report: derived 0, submitted 0, failed 0\n\
+               \u{2502} wicked-capture-report: derived 2, submitted 0, failed 2 \u{2502}\n";
+    let left = strip_echo(out, &[&same]).unwrap_or_else(|| out.to_string());
+    let r = crate::validator::parse_capture_report(&left).expect("a report");
+    assert_eq!(r.failed, 2, "a genuine boxed report is never cut: {left}");
+}
+
 /// (codex r1, P2) A block accepted while a launch waits for its plan — or while distribution
 /// runs off-thread with a snapshot of the session — survives the plan landing and a re-plan.
 #[test]

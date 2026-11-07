@@ -4234,7 +4234,14 @@ mod tests {
                 recipient: s(),
             },
             "runContextDelivered",
-            &["type", "session", "ord", "version", "recipientCli", "recipient"],
+            &[
+                "type",
+                "session",
+                "ord",
+                "version",
+                "recipientCli",
+                "recipient",
+            ],
         );
         check(
             CoreEvent::AssumptionRecorded {
