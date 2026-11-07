@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Requirements read: code mismatches, code age and the minimum in force (operator rulings 2026-11-06).** Each
+  listed row's verdict carries `code_mismatch` (string or null): the extractor stated the requirement the code is
+  meant to meet and found the code does not meet it. The row still counts as a real requirement; the mismatch is a
+  finding beside it, read live from the store: the newest non-blank `code_mismatch` annotation, unless it is
+  `"code meets it"`, which the extractor writes over an earlier mismatch when the unit is restated as met. A build records the commit its code graph was indexed at (`code_commit`), and
+  `requirements_graph_for_repo` returns `code: { built_from: { commit, at, basis }, head, commits_behind }`,
+  counted with git in the REGISTERED checkout (HEAD resolved once; `null`, never 0, for a commit that is not a
+  hex object name, not held, not an ancestor of HEAD, in a shallow checkout, or when git does not answer within
+  2 s), plus `target: { repo, daemon }`: the repository's own minimum (if set) and the daemon-wide one, read once
+  with the minimum the coverage applies. `build` gains `code_commit`.
+- **D8 no longer leaves a repository's graph rooted in a removed run worktree.** Indexing a run's worktree into the
+  repository's graph recorded the worktree as the graph's root; once the run ended, freshness reads measured the
+  graph against a directory that was gone (wicked-crew's graph reported files "deleted" that the checkout holds).
+  The root is now put back to the registered checkout after the index. `wicked-apps-core` re-exports
+  `GraphStoreMutExt`.
 - **The coverage judge honours a lowered minimum (e2e F29).** After the person answered "Lower the minimum" (the
   repository's own target, 66% in run 1ec395da), the coverage step's deterministic floor passed, but its pinned
   judge rejected twice: the criterion it was given hard-coded "default 80%" and a no-store branch it cannot see, and

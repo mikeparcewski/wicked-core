@@ -75,7 +75,9 @@ pub use wicked_estate_core::{
     SymbolQuery,
 };
 
-pub use wicked_estate_store::{SqliteStore, WalCheckpointStats};
+// `GraphStoreMutExt`: the meta key/value surface (e.g. the graph's recorded `indexed_root`), which the
+// engine writes after it indexes a run's worktree into a repository's graph.
+pub use wicked_estate_store::{GraphStoreMutExt, SqliteStore, WalCheckpointStats};
 
 // The Postgres backend is compiled only under the `postgres` feature (it pulls in sqlx + tokio).
 // It implements the SAME sync `GraphRead`/`GraphWrite` (hence `GraphStore`) surface as SqliteStore

@@ -1108,6 +1108,31 @@ const BUSINESS_RULE_ANN: &str = "business_rule";
 /// A custom `risk` annotation type — a risk-flagged placeholder: accounted in the `coverage` ledger
 /// and kept in the graph as a `review` requirement, but never counted toward the minimum.
 const RISK_ANN: &str = "risk";
+/// A `code_mismatch` annotation (operator ruling 2026-11-06): the extractor stated the requirement the
+/// code is meant to meet AND found the code does not meet it (e.g. a sum that skips the first element).
+/// The requirement still counts as real; the mismatch is a finding beside it, read per row
+/// ([`ListedRow::code_mismatch`]). The extractor writes it BEFORE the rule (so a failed write leaves
+/// the unit unresolved and asked again), under its own key; a later restatement the code meets
+/// replaces it, on that key, with [`CODE_MEETS`] (estate's CLI has no annotation delete).
+pub const CODE_MISMATCH_ANN: &str = "code_mismatch";
+/// The value a restatement writes over an earlier mismatch: the code meets the requirement.
+pub const CODE_MEETS: &str = "code meets it";
+
+/// The live code mismatch on `node`: its newest NON-BLANK [`CODE_MISMATCH_ANN`] (by `ts`; of equal
+/// ones, the last the store returns); `None` when there is none or it reads [`CODE_MEETS`]. A blank
+/// value never clears a finding.
+pub fn code_mismatch_of(
+    store: &dyn GraphRead,
+    node: &wicked_apps_core::SymbolId,
+) -> anyhow::Result<Option<String>> {
+    Ok(store
+        .annotations(node)?
+        .into_iter()
+        .filter(|a| a.r#type == CODE_MISMATCH_ANN && !a.value.trim().is_empty())
+        .max_by_key(|a| a.ts)
+        .map(|a| a.value.trim().to_string())
+        .filter(|v| v != CODE_MEETS))
+}
 /// Confidence stamped on a synthesized fallback rule for a behavior-bearing node that produced no
 /// real business rule (the schema's `business_rules` `minItems:1` invariant + `domain_graph.py`'s
 /// defensive fallback). Mid-range: it is a review item, neither asserted nor refuted.
@@ -1688,6 +1713,16 @@ pub fn persist_domain_model_expecting(
     record
         .metadata
         .insert("req_high".to_string(), serde_json::to_value(&high)?);
+    // The code this build was made from (P1, operator ruling 2026-11-06): the store's indexed commit now.
+    if let Some(commit) = store
+        .repo_info()?
+        .and_then(|i| i.commit)
+        .filter(|c| !c.is_empty())
+    {
+        record
+            .metadata
+            .insert("code_commit".to_string(), serde_json::json!(commit));
+    }
     nodes.push(record);
 
     // Atomic: the nodes and their edges land together or not at all. Without the batch, an
@@ -1758,6 +1793,9 @@ struct BuildRecord {
     generation: u64,
     metadata: Option<serde_json::Value>,
     req_high: std::collections::BTreeMap<String, u32>,
+    /// The commit the code graph was indexed at when this build was written (`None` on a build from
+    /// before the record carried it): what "built from code N commits old" counts from.
+    code_commit: Option<String>,
 }
 
 fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
@@ -1778,6 +1816,12 @@ fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
             .get("req_high")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
             .unwrap_or_default(),
+        code_commit: node
+            .metadata
+            .get("code_commit")
+            .and_then(|v| v.as_str())
+            .filter(|c| !c.is_empty())
+            .map(str::to_string),
     })
 }
 
@@ -2068,6 +2112,9 @@ pub fn label_domain_graph(
 pub struct DomainGraphBuild {
     pub generation: u64,
     pub coverage: Option<serde_json::Value>,
+    /// The commit the code graph was indexed at when this build was written; `None` on a build from
+    /// before the record carried it.
+    pub code_commit: Option<String>,
 }
 
 /// [`load_domain_graph`] as the build wrote it (its own `metadata.coverage`), with the build it read:
@@ -2104,7 +2151,7 @@ pub fn load_domain_graph_with_units(
 }
 
 /// The engine's verdict on one listed requirement, from the pass that counts the header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ListedRow {
     /// The unit resolves (a validated requirement, or a business rule at or above the resolve
     /// threshold), as `classify_node` decides it. On a counted row this is exactly whether it is one of
@@ -2113,6 +2160,10 @@ pub struct ListedRow {
     pub real: bool,
     /// Why the share leaves the row out, or `None` when it counts it.
     pub uncounted: Option<Uncounted>,
+    /// The code does not meet this requirement, and how ([`code_mismatch_of`]), read live from the
+    /// store; `None` when no extractor found a mismatch. A finding beside the row, never a reason to
+    /// stop counting it.
+    pub code_mismatch: Option<String>,
 }
 
 /// The engine's verdict on each listed requirement that recorded its code unit, by domain then
@@ -2149,6 +2200,7 @@ pub fn recompute_front_half_coverage_for_rows(
             UnitClass::Counted { real } => ListedRow {
                 real,
                 uncounted: None,
+                code_mismatch: code_mismatch_of(store, &node.symbol)?,
             },
             // Not counted: still say whether a rule was stated there, by the same classifier.
             UnitClass::Uncounted(why) => {
@@ -2157,6 +2209,7 @@ pub fn recompute_front_half_coverage_for_rows(
                 ListedRow {
                     real: matches!(bucket, Bucket::Resolved(_)),
                     uncounted: Some(why),
+                    code_mismatch: code_mismatch_of(store, &node.symbol)?,
                 }
             }
         };
@@ -2166,9 +2219,10 @@ pub fn recompute_front_half_coverage_for_rows(
     let mut out = ListedRows::new();
     for (domain, reqs) in units {
         for (req, sym) in reqs {
-            let row = seen.get(sym.as_str()).copied().unwrap_or(ListedRow {
+            let row = seen.get(sym.as_str()).cloned().unwrap_or(ListedRow {
                 real: false,
                 uncounted: Some(Uncounted::Unindexed),
+                code_mismatch: None,
             });
             out.entry(domain.clone())
                 .or_default()
@@ -2272,6 +2326,7 @@ fn load_domain_graph_once(store: &dyn GraphRead) -> anyhow::Result<Loaded> {
     let build = DomainGraphBuild {
         generation: record.generation,
         coverage: metadata.get("coverage").filter(|v| !v.is_null()).cloned(),
+        code_commit: record.code_commit.clone(),
     };
     Ok(Loaded::Graph(Some((
         json!({ "metadata": metadata, "domains": out_domains }),
@@ -3059,6 +3114,95 @@ mod tests {
 
         fn store() -> SqliteStore {
             SqliteStore::in_memory().unwrap()
+        }
+
+        /// Operator ruling 2026-11-06 (P2): a code mismatch is the newest `code_mismatch` stamped no
+        /// earlier than the newest business rule; a later restatement with none supersedes it, and
+        /// a blank one is no finding.
+        #[test]
+        fn a_code_mismatch_is_read_and_a_later_restatement_supersedes_it() {
+            let mut s = store();
+            let sum = node(&mut s, "sum", NodeKind::Function, "src/math.js");
+            let at = |ty: &str, key: &str, value: &str, ts: i64| {
+                let mut a = Annotation::new(ty, key, value).with_confidence(0.9);
+                a.ts = ts;
+                a
+            };
+            assert_eq!(code_mismatch_of(&s, &sum.symbol).unwrap(), None);
+            // The extractor writes the mismatch first, then the rule (a later second).
+            s.annotate(
+                &sum.symbol,
+                at(
+                    CODE_MISMATCH_ANN,
+                    "R:mismatch",
+                    " skips the first element ",
+                    100,
+                ),
+            )
+            .unwrap();
+            s.annotate(
+                &sum.symbol,
+                at(BUSINESS_RULE_ANN, "R", "sum adds every element", 101),
+            )
+            .unwrap();
+            assert_eq!(
+                code_mismatch_of(&s, &sum.symbol).unwrap().as_deref(),
+                Some("skips the first element"),
+                "a finding beside its (newer) rule"
+            );
+            // Restated once the code was fixed: CODE_MEETS replaces it on the same key, in the
+            // same second even.
+            s.annotate(
+                &sum.symbol,
+                at(CODE_MISMATCH_ANN, "R:mismatch", CODE_MEETS, 101),
+            )
+            .unwrap();
+            assert_eq!(code_mismatch_of(&s, &sum.symbol).unwrap(), None);
+            let mean = node(&mut s, "mean", NodeKind::Function, "src/math.js");
+            s.annotate(&mean.symbol, at(CODE_MISMATCH_ANN, "R:mismatch", "  ", 300))
+                .unwrap();
+            assert_eq!(
+                code_mismatch_of(&s, &mean.symbol).unwrap(),
+                None,
+                "blank is none"
+            );
+            // codex r2: a newer blank never hides an older real finding.
+            s.annotate(
+                &mean.symbol,
+                at(CODE_MISMATCH_ANN, "Q:mismatch", "inherits the skip", 250),
+            )
+            .unwrap();
+            assert_eq!(
+                code_mismatch_of(&s, &mean.symbol).unwrap().as_deref(),
+                Some("inherits the skip")
+            );
+        }
+
+        /// P1: a build records the commit its code graph was indexed at, and the read returns it.
+        #[test]
+        fn a_build_records_the_code_commit_it_was_made_from() {
+            let mut s = store();
+            s.set_repo_info(&wicked_estate_core::RepoInfo {
+                commit: Some("8cc32aa".into()),
+                branch: Some("main".into()),
+                remote: None,
+                dirty: false,
+            })
+            .unwrap();
+            let model = DomainModel {
+                metadata: Metadata {
+                    schema_version: "1.1.0".into(),
+                    migration_mode: "functional".into(),
+                    source: Some("estate-graph".into()),
+                    coverage: None,
+                },
+                domains: Default::default(),
+            };
+            persist_domain_model(&mut s, &model).unwrap();
+            assert_eq!(
+                read_build_record(&s).unwrap().code_commit.as_deref(),
+                Some("8cc32aa")
+            );
         }
         fn node(store: &mut SqliteStore, name: &str, kind: NodeKind, file: &str) -> Node {
             // A SOURCE node carries a source-scheme symbol — real extractors mint per-language schemes
@@ -4214,7 +4358,11 @@ mod tests {
                 ),
                 (2, 1, 1)
             );
-            let v = |real, uncounted| ListedRow { real, uncounted };
+            let v = |real, uncounted| ListedRow {
+                real,
+                uncounted,
+                code_mismatch: None,
+            };
             let want: ListedRows = [(
                 "src".to_string(),
                 [
@@ -4252,7 +4400,7 @@ mod tests {
             );
             assert_eq!(
                 serde_json::to_value(&rows).unwrap()["src"]["REQ-900"],
-                serde_json::json!({ "real": true, "uncounted": "not_product" })
+                serde_json::json!({ "real": true, "uncounted": "not_product", "code_mismatch": null })
             );
             assert!(s.get_node(&run.symbol).unwrap().is_some());
         }
