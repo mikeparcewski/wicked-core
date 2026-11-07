@@ -1012,19 +1012,15 @@ fn record_registered_root(db: &Path, repo: &Path, worktree: &Path) {
     }
 }
 
-/// `path` absolute with symlinks resolved, spelled as estate records a root: a drive-letter path on
-/// Windows, never the verbatim `\\?\` form; as given when it cannot be resolved.
+/// `path` absolute with symlinks resolved (as estate records a root), or as given when it cannot
+/// be resolved. On Windows the verbatim form canonicalize returns is kept: it always names this
+/// exact directory, where a stripped spelling may not (a trailing dot, a reserved name, a long path;
+/// codex r2).
 fn canonical_path_string(path: &Path) -> String {
-    let s = std::fs::canonicalize(path)
+    std::fs::canonicalize(path)
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
-        .into_owned();
-    // As estate's `dunce` does: drop the verbatim prefix only where the plain spelling means the
-    // same path (a drive path under MAX_PATH); keep it otherwise.
-    match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC") && rest.len() < 260 => rest.to_string(),
-        _ => s,
-    }
+        .into_owned()
 }
 
 /// garden#1370: why a run whose steps read code out of the repo graph (`graph_required`: the

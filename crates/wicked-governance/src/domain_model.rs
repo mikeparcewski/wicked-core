@@ -1127,10 +1127,10 @@ pub fn code_mismatch_of(
     Ok(store
         .annotations(node)?
         .into_iter()
-        .filter(|a| a.r#type == CODE_MISMATCH_ANN)
+        .filter(|a| a.r#type == CODE_MISMATCH_ANN && !a.value.trim().is_empty())
         .max_by_key(|a| a.ts)
         .map(|a| a.value.trim().to_string())
-        .filter(|v| !v.is_empty() && v != CODE_MEETS))
+        .filter(|v| v != CODE_MEETS))
 }
 /// Confidence stamped on a synthesized fallback rule for a behavior-bearing node that produced no
 /// real business rule (the schema's `business_rules` `minItems:1` invariant + `domain_graph.py`'s
@@ -3164,6 +3164,16 @@ mod tests {
                 code_mismatch_of(&s, &mean.symbol).unwrap(),
                 None,
                 "blank is none"
+            );
+            // codex r2: a newer blank never hides an older real finding.
+            s.annotate(
+                &mean.symbol,
+                at(CODE_MISMATCH_ANN, "Q:mismatch", "inherits the skip", 250),
+            )
+            .unwrap();
+            assert_eq!(
+                code_mismatch_of(&s, &mean.symbol).unwrap().as_deref(),
+                Some("inherits the skip")
             );
         }
 

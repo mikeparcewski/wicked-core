@@ -484,19 +484,12 @@ fn code_drift(root: &str, commit: &str, basis: &str) -> serde_json::Value {
     let deadline = std::time::Instant::now() + DRIFT_GIT_BUDGET;
     let ok = |args: &[&str]| git_bounded(root, args, deadline);
     let head = ok(&["rev-parse", "--verify", "--quiet", "HEAD^{commit}"]);
-    // Only a plain hex object name ever reaches git (a store value is data, never an option or a
-    // revision expression such as `HEAD`), resolved once to its full id.
-    let hex = (4..=64).contains(&commit.len()) && commit.bytes().all(|b| b.is_ascii_hexdigit());
-    let full = hex
-        .then(|| {
-            ok(&[
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("{commit}^{{commit}}"),
-            ])
-        })
-        .flatten();
+    // Only a FULL object id ever reaches git (a store value is data: never an option, a revision
+    // expression such as `HEAD`, or an abbreviation an all-hex branch name could shadow, codex r2),
+    // and only when it names a commit the checkout holds.
+    let full_id = matches!(commit.len(), 40 | 64) && commit.bytes().all(|b| b.is_ascii_hexdigit());
+    let full = (full_id && ok(&["cat-file", "-t", commit]).as_deref() == Some("commit"))
+        .then(|| commit.to_ascii_lowercase());
     let at = full
         .as_deref()
         .and_then(|c| ok(&["show", "-s", "--format=%cI", c]));
@@ -2250,7 +2243,7 @@ mod tests {
         assert!(git(p, &["commit", "-qm", "side"]).unwrap().0);
         let side = git(p, &["rev-parse", "HEAD"]).unwrap().1;
         assert!(git(p, &["checkout", "-q", "-"]).unwrap().0);
-        for (commit, dated) in [(side.as_str(), true), ("HEAD", false)] {
+        for (commit, dated) in [(side.as_str(), true), (&side[..12], false), ("HEAD", false)] {
             {
                 let mut repo_store =
                     wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
