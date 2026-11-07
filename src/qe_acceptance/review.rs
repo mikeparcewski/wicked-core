@@ -323,11 +323,30 @@ pub(crate) fn reviewer_input(
     let engine_records: Vec<_> = input
         .prior_outputs
         .iter()
-        .filter(|p| p.label.starts_with(crate::editor_conformance::RECORD_LABEL))
+        .filter(|p| {
+            p.label.starts_with(crate::editor_conformance::RECORD_LABEL)
+                || p.label.starts_with(crate::repo::REQUIREMENTS_RECORD_LABEL)
+        })
         .cloned()
         .collect();
     let mut unit = reviewer_unit(&input.unit, seat, dir, Some(nonce));
-    if !engine_records.is_empty() {
+    // Operator ruling 2026-11-06: the engine's requirements record (what the change touches, known
+    // code mismatches, how old the map is) is evidence the reviewer weighs, never a verdict.
+    if engine_records
+        .iter()
+        .any(|p| p.label.starts_with(crate::repo::REQUIREMENTS_RECORD_LABEL))
+    {
+        unit.description.push_str(
+            " The [requirements this change touches] record beside this brief is the engine's own \
+             reading of the repository's requirements map: judge whether the tests show the change \
+             keeps each requirement (or that the work says why it changes it). It describes the code \
+             before this change, and a map it marks STALE is context to check, never proof.",
+        );
+    }
+    if engine_records
+        .iter()
+        .any(|p| p.label.starts_with(crate::editor_conformance::RECORD_LABEL))
+    {
         unit.description.push_str(
             " The [editor conformance record] beside this brief is the engine's own run of the \
              editor conformance cases on this host, not part of the evidence directory: cite it for \

@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Review and QE acceptance are handed the requirements a change touches (operator rulings 2026-11-06).** Every
+  evaluator unit and the QE reviewer get an engine record, `[requirements this change touches — engine record]`,
+  built on the host from the run repository's requirements map. It sits beside the work as evidence, never in the
+  person's context block. It lists each requirement satisfied by code in a file the run touched (uncommitted or on
+  the run branch), up to 20 with "+N more", within 4 KiB. Each line has its statement, the code it names, and any
+  known code mismatch ("code doesn't meet it: ..."). The record never presents the map as current: it says the
+  requirements describe the code BEFORE this change, and a map built from any commit other than the run's base, or
+  from an unrecorded one, is labelled STALE ("context to check against the code, never proof"). No map, nothing
+  touched, or a failed read means no record; the record is never a gate. The QE reviewer keeps it, alongside the
+  editor conformance record, and its brief says how to weigh it.
 - **The `sourced-report` preset (program CS3, core half).** A read-only workflow behind the Research, Competitive,
   Due diligence, Analyze documents, Critique and Estimate cards: `gather` (team, `understand`) runs garden's learn skill
   in Report mode, starting with `report_check.py preflight` (a lens that needs documents stops when none are staged)
