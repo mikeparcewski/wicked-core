@@ -1,0 +1,38 @@
+{
+ "steps": [
+  {
+   "catalog": "run",
+   "id": "facts",
+   "gate_type": "execution",
+   "instructions": "crew's run-cost facts: the engine runs crew's fixed command with this unit's token, and crew answers from its own run store (no agent code runs, nothing is written). Its output is the record the model and the check cite: the window, the scope, what is left out, the population rules, every workflow group's lines (G ids) and the runs newest first (R ids).",
+   "executor": {
+    "type": "tool",
+    "cmd": [
+     "wicked-crew",
+     "insights-facts"
+    ]
+   }
+  },
+  {
+   "catalog": "understand",
+   "id": "model",
+   "depends_on": [
+    "facts"
+   ],
+   "instructions": "Build the cost model from the facts step's output only (the RUN-COST FACTS block crew printed; never your memory, never another run list). 1. Read the question for the volume and period (e.g. 40 bug fixes a month) and pick the ONE comparable group whose workflow fits it; name the pick as assumption A1 with its group id. If no group fits, or it has no runs, say so and stop. 2. State the population from the facts: how many terminal runs of which workflow (the group line), the window's dates, the scope line, what was left out (the left out line), how many passed, failed and cancelled, how many runs the wall time rests on (n, unmeasured) and how many fully priced runs the spend rests on (the pricing line). 3. Per run: wall time p50, p75 and p90 and spend p50, p75 and p90 from the group lines. 4. For the volume: each per-run figure times the volume, with the formula written out (40 x G1.spend.p50 = ...). Every number cites its fact id as the facts print it (<group>.<line>.<key>: G1.wall.p75, G1.spend.p50, G1.pricing.full; a run as its R id) or is arithmetic over cited values as printed. Name every assumption (A1..An): the group, the volume read from the question, monthly = volume x per run, the spend basis (fully priced runs; partly priced runs are a lower bound; unpriced, none and unknown runs have no spend). With no fully priced run, say spend is unknown and model wall time only. A rate card the job staged under records/ (optional) may set a rate: cite its file and page or quote. Write the report as Population, Per run, For the volume, Assumptions, Not covered. READ-ONLY: create, edit or delete no file in any repository and commit nothing."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "rubric": "fidelity-to-source",
+   "depends_on": [
+    "facts",
+    "model"
+   ],
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "instructions": "Re-check the cost model against the facts step's output yourself, as the independent evaluator; if you built this model, say so and give no VERDICT line. The source of every number is that RUN-COST FACTS block (no repository file), except a rate the model took from a rate card the job staged under records/, whose source is that file: for each number find the fact id it cites in the facts and confirm the value as printed, open a cited rate card at its page or quote and confirm the rate, or redo its arithmetic from the cited values. Confirm the population statement matches the facts (the group line's count, workflow and outcomes, the window dates, the scope and left out lines, the wall n and the fully priced count) and that the group picked fits the question. A number with no fact, a wrong value, a wrong formula or a population the facts do not support is a finding. Output the checked report with every claim that does not hold removed and listed under ## Did not hold at the check, then the findings, then the counts (checked, held, did not hold). Change nothing: create, edit or delete no file and commit nothing. Last line VERDICT: PASS only when every number holds; otherwise VERDICT: FAIL."
+  }
+ ]
+}

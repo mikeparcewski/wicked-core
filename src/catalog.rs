@@ -169,7 +169,8 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them), and the
 /// workflow-catalog gap fills `docs`, `validate-docs`, `test-plan` and `test-analysis` (new workflows as
 /// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row), the
-/// read-only `sourced-report` (CS3: a cited report re-checked at its source), and the
+/// read-only `sourced-report` (CS3: a cited report re-checked at its source), `run-cost` (CS6: crew's
+/// run facts through its fixed `wicked-crew insights-facts` Tool, a cost model, re-checked), and the
 /// Apps presets `apps-turn` and `apps-publish` (DES-APPS-001 K0; fixed plans, [`crate::apps`]). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -287,6 +288,10 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
         (
             "risk-analysis",
             catalog_preset(include_str!("presets/risk-analysis.json"), "risk-analysis"),
+        ),
+        (
+            "run-cost",
+            catalog_preset(include_str!("presets/run-cost.json"), "run-cost"),
         ),
         (
             "scaffold",
@@ -681,6 +686,15 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             &[
                 "what could go wrong with this change",
                 "assess the risk of touching this code",
+            ],
+        ),
+        "run-cost" => (
+            "Model run cost",
+            "What a volume of work would cost to run, from your own comparable runs, every number traced.",
+            &[
+                "what would 40 bug fixes a month cost",
+                "how much will these runs cost",
+                "budget for agent runs",
             ],
         ),
         "scaffold" => (
@@ -2657,6 +2671,106 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             assert_eq!(deny(&stdin), None, "{id}: the stdin floor run is admitted");
             assert!(deny(&saved).is_some(), "{id}: a saved packet is refused");
         }
+    }
+
+    /// (CS6) Model run cost: crew's run facts through its FIXED Tool (no agent code), then the cost
+    /// model (an `understand` step, so a report gatherer), then a fidelity check held for a person on
+    /// FAIL. No creator, no deliver, no QE acceptance, and floor fill adds nothing even at the top
+    /// band on a delivering run. The check keeps off the model's seat.
+    #[test]
+    fn run_cost_is_a_crew_facts_tool_a_model_and_a_held_fidelity_check() {
+        use crate::workflow::{GateCond, GateSpec};
+        let steps = builtin_preset("run-cost").expect("a built-in");
+        let plan = crate::plan::PlanSteps {
+            steps: steps.clone(),
+            ..Default::default()
+        };
+        assert!(!plan.has_creator());
+        let def = composed("run-cost");
+        let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["facts", "model", "check"]);
+        let (facts, model, check) = (&def.phases[0], &def.phases[1], &def.phases[2]);
+        assert_eq!(facts.catalog.as_deref(), Some("run"));
+        assert_eq!(
+            facts.executor,
+            PhaseExecutor::Tool {
+                cmd: vec![crate::apps::CREW_BIN.into(), "insights-facts".into()]
+            }
+        );
+        assert_eq!(model.catalog.as_deref(), Some("understand"));
+        assert!(!is_tool_entry(model) && !model.executes_code);
+        assert_eq!(check.catalog.as_deref(), Some("critique"));
+        assert_eq!(
+            check.rubric.as_deref(),
+            Some(crate::rubric::FIDELITY_TO_SOURCE)
+        );
+        assert_eq!(
+            check.gate,
+            GateSpec::HumanConfirmIf(GateCond::VerdictNotPass)
+        );
+        for p in &def.phases {
+            assert_ne!(p.role, PhaseRole::Creator, "{}", p.id);
+            assert_ne!(p.catalog.as_deref(), Some("deliver"), "{}", p.id);
+        }
+        let step = |id: &str| steps.iter().find(|s| s.id == id).unwrap();
+        assert_eq!(
+            step("model").depends_on.as_deref(),
+            Some(&["facts".to_string()][..])
+        );
+        assert_eq!(
+            step("check").depends_on.as_deref(),
+            Some(&["facts".to_string(), "model".to_string()][..])
+        );
+        let text = |id: &str| step(id).instructions.clone().unwrap_or_default();
+        assert!(text("model").contains("facts step's output only"));
+        assert!(text("model").contains("Every number cites its fact id"));
+        assert!(text("check").ends_with("otherwise VERDICT: FAIL."));
+        let deliver = ["wicked-crew".to_string(), "deliver".to_string()];
+        let filled = crate::plan::floor_fill(
+            catalog(),
+            &plan,
+            crate::plan::FloorInput {
+                score: 100,
+                destructive: true,
+                human_confirm: &crate::domain::HumanConfirm::None,
+                deliver: Some(&deliver),
+                obligations: &[],
+                ran: &[],
+                requires_evaluator: true,
+                requires_qe: true,
+                power_absorbs: &[],
+            },
+        )
+        .expect("floor fill");
+        assert_eq!(
+            filled.steps.steps.len(),
+            steps.len(),
+            "the floor adds nothing"
+        );
+        assert!(filled.floor.is_empty());
+        assert_eq!(builtin_preset_instruments("run-cost"), None);
+        assert!(builtin_preset_descriptor("run-cost").is_some());
+        // The check's authors: the model seat (a report gatherer under fidelity-to-source); the
+        // facts Tool has no seat.
+        let units = crate::plan::plan_from_def(&def, "what would 40 bug fixes a month cost?", "rc");
+        assert_eq!(
+            units[0].tool_cmd.as_deref(),
+            Some(
+                &[
+                    crate::apps::CREW_BIN.to_string(),
+                    "insights-facts".to_string()
+                ][..]
+            )
+        );
+        let mut model_u = units[1].clone();
+        model_u.assigned_cli = Some("a".into());
+        model_u.worktree_guarded = true;
+        let mut check_u = units[2].clone();
+        check_u.assigned_cli = Some("b".into());
+        assert!(crate::pipeline::is_report_gatherer(&model_u));
+        let ord = check_u.ord;
+        let authors = crate::pipeline::work_authors(&[units[0].clone(), model_u, check_u], ord);
+        assert_eq!(authors, ["a"]);
     }
 
     /// (DES-CATALOG-002 §5.1) QE acceptance is required by exactly the application-changing
