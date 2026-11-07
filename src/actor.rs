@@ -11987,6 +11987,55 @@ fn dispatch_unit(
             }
         }
     }
+    // Operator ruling 2026-11-06: a reviewer and QE acceptance are handed the requirements the change
+    // touches, with any known code mismatch and how the map relates to this run's base (a map from
+    // another commit is labelled stale, and every map describes the code BEFORE the change). The
+    // engine's own record from the repository's map, beside the work as evidence: never the
+    // person's context block, never a gate. Nothing to hand (no map, nothing touched, a failed read)
+    // is no record.
+    if unit.tool_cmd.is_none()
+        && (unit.role == crate::workflow::PhaseRole::Evaluator
+            || crate::qe_acceptance::review::applies(unit))
+    {
+        if let (Some(repo_ref), Some(wd), Some(base), Some(snap)) = (
+            session.repo_ref.as_deref(),
+            session.workdir.as_deref(),
+            session.base_commit.as_deref(),
+            unit.worktree_baseline.as_ref(),
+        ) {
+            // The files the work under review changed: the tree this dispatch snapshotted (pinned
+            // git dir, fresh index) against the run's immutable base, never the worktree's live
+            // index or branch list (codex r1).
+            let read =
+                crate::worktree_guard::paths_since_commit(std::path::Path::new(wd), snap, base)
+                    .and_then(|files| {
+                        crate::repo::requirements_evidence(&*store, repo_ref, &files, Some(base))
+                    });
+            match read {
+                Ok(Some(text)) => {
+                    let label = format!(
+                        "{} — engine record]",
+                        crate::repo::REQUIREMENTS_RECORD_LABEL
+                    );
+                    context_items.push(crate::event::InjectedContext::new(
+                        unit.ord,
+                        label.clone(),
+                        text.len(),
+                    ));
+                    prior_outputs.push(PriorUnitOutput {
+                        label,
+                        output: text,
+                    });
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(
+                    run = %session.id,
+                    ord = unit.ord,
+                    "the requirements record for the reviewer could not be read: {e}"
+                ),
+            }
+        }
+    }
     // DES-TEAMING-002 §8.8 (T6): the PA's review of a member's step — the member's output as
     // prior context, and the one line the PA answers with. The review is team evidence; the
     // member's step already passed its own gate.

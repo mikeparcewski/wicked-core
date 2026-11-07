@@ -1118,6 +1118,94 @@ pub const CODE_MISMATCH_ANN: &str = "code_mismatch";
 /// The value a restatement writes over an earlier mismatch: the code meets the requirement.
 pub const CODE_MEETS: &str = "code meets it";
 
+/// A requirement satisfied by code a change touches ([`touched_requirements`]): what the reviewer
+/// and QE are handed (operator ruling 2026-11-06).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct TouchedRequirement {
+    /// `<domain>::<REQ-id>`, the key the requirements page shows.
+    pub key: String,
+    pub title: String,
+    /// The requirement's first stated rule (empty when the build stated none).
+    pub statement: String,
+    /// The touched code that satisfies it, as `file#name`.
+    pub code: String,
+    /// The live code mismatch on THAT code ([`code_mismatch_of`]).
+    pub code_mismatch: Option<String>,
+    /// Counted as a real requirement when the build was made (`status: active`); a placeholder else.
+    pub real: bool,
+}
+
+/// The requirements that `code` (the code nodes in the files a change touches) satisfies, through
+/// their `SatisfiedBy` edges, each with the mismatch read on the code it links: sorted by key, one
+/// entry per requirement. Cost follows the touched code, never the size of the map.
+pub fn touched_requirements(
+    store: &dyn GraphRead,
+    code: &[wicked_apps_core::Node],
+) -> anyhow::Result<Vec<TouchedRequirement>> {
+    use wicked_apps_core::EdgeKind;
+    use wicked_estate_core::Direction;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for c in code {
+        for e in store.neighbors(&c.symbol, Direction::Dependents)? {
+            // One entry per requirement AND touched code (codex r2): a requirement two touched
+            // units satisfy is listed with each, so neither one's mismatch is lost.
+            if e.kind != EdgeKind::SatisfiedBy
+                || e.target != c.symbol
+                || !seen.insert((e.source.clone(), c.symbol.clone()))
+            {
+                continue;
+            }
+            let Some(n) = store.get_node(&e.source)? else {
+                continue;
+            };
+            let Some(id) = n.location.file.strip_prefix("requirement/") else {
+                continue;
+            };
+            let Some((domain, req)) = id.rsplit_once('/') else {
+                continue;
+            };
+            let md = &n.metadata;
+            let statement = md
+                .get(REQUIREMENT_DOC_KEY)
+                .and_then(|d| d.get("business_rules"))
+                .and_then(|r| r.as_array())
+                .and_then(|r| r.first())
+                .and_then(|r| r.get("statement"))
+                .and_then(|s| s.as_str())
+                .or_else(|| md.get("description").and_then(|d| d.as_str()))
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(TouchedRequirement {
+                key: format!("{domain}::{req}"),
+                title: n.name.clone(),
+                real: md.get("status").and_then(|s| s.as_str()) == Some("active")
+                    && !statement.starts_with("[RISK]"),
+                statement,
+                code: format!("{}#{}", c.location.file, c.name),
+                code_mismatch: code_mismatch_of(store, &c.symbol)?,
+            });
+        }
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.code.cmp(&b.code)));
+    Ok(out)
+}
+
+/// The store's current requirements build: its generation (0 = none) and the commit it was made from.
+/// Read before and after a multi-step read, it says whether a build landed in between.
+pub fn build_identity(store: &dyn GraphRead) -> anyhow::Result<(u64, Option<String>)> {
+    let r = read_build_record(store)?;
+    Ok((r.generation, r.code_commit))
+}
+
+/// The commit the store's current requirements build was made from (`None`: nothing built, or a
+/// build from before the record carried it).
+pub fn build_code_commit(store: &dyn GraphRead) -> anyhow::Result<Option<String>> {
+    Ok(read_build_record(store)?.code_commit)
+}
+
 /// The live code mismatch on `node`: its newest NON-BLANK [`CODE_MISMATCH_ANN`] (by `ts`; of equal
 /// ones, the last the store returns); `None` when there is none or it reads [`CODE_MEETS`]. A blank
 /// value never clears a finding.

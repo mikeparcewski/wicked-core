@@ -1660,3 +1660,30 @@ fn redo_unknown_then_known(v: &mut WorkUnit) {
     redo(v);
     v.qe_review = Some(record(OUTCOME_INCONCLUSIVE, Some("FAIL"), "claude"));
 }
+
+/// Operator ruling 2026-11-06: the reviewer also keeps the engine's requirements record (the requirements the change
+/// touches, known code mismatches, how old the map is), and its brief says how to weigh it: never as proof.
+#[test]
+fn the_reviewer_keeps_the_engines_requirements_record() {
+    let l = Ledger::new("run");
+    let mut input = input_for(qe_unit("pi", &l.root));
+    input.prior_outputs.push(PriorUnitOutput {
+        label: "[requirements this change touches — engine record]".into(),
+        output: "Map: STALE ...\n- src::REQ-003 (src/math.js#sum): sum adds every element".into(),
+    });
+    input.prior_outputs.push(PriorUnitOutput {
+        label: "[review checklist — unit 6]".into(),
+        output: "judge every item".into(),
+    });
+    let r = reviewer_input(&input, &seat("claude", BASIS_DISTINCT), "/l/ev", "n-1");
+    let labels: Vec<&str> = r.prior_outputs.iter().map(|p| p.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["[requirements this change touches — engine record]"]
+    );
+    assert!(
+        r.unit.description.contains("never proof") && !r.unit.description.contains("conformance"),
+        "{}",
+        r.unit.description
+    );
+}
