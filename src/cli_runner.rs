@@ -819,9 +819,14 @@ fn rule_judge_seats(
     authored_binaries: &[String],
     pool: &[crate::AgenticCli],
     registry: &[crate::AgenticCli],
+    no_agent_creator: bool,
 ) -> (Vec<String>, Option<String>) {
+    // (coordinator decision 2026-11-06) A run whose record shows no agent creator at all
+    // ([`no_agent_wrote_code`]): evaluator ≠ creator holds vacuously, so any eligible seat may judge
+    // (the launch exclusions and this unit's own authors still apply).
+    let creator_bins = creator_bins.or(no_agent_creator.then_some(&[][..]));
     match creator_bins {
-        _ if creators.is_empty() => (
+        _ if creators.is_empty() && !no_agent_creator => (
             Vec::new(),
             Some("the work's creators are not known, so no judge can be shown distinct from them".into()),
         ),
@@ -863,11 +868,15 @@ fn rule_judge_seats(
                 .map(|c| c.key.clone())
                 .collect();
             let why = keys.is_empty().then(|| {
-                format!(
-                    "no signed-in judge seat distinct from the work's creators [{}] on the run's \
-                     roster",
-                    creators.join(", ")
-                )
+                if creators.is_empty() {
+                    "no signed-in judge seat on the run's roster".to_string()
+                } else {
+                    format!(
+                        "no signed-in judge seat distinct from the work's creators [{}] on the \
+                         run's roster",
+                        creators.join(", ")
+                    )
+                }
             });
             (keys, why)
         }
@@ -1118,6 +1127,7 @@ pub(crate) fn rule_council_seats(
     reviewer: (Option<&str>, Option<&str>),
     recorded: Option<&[crate::rule_check::RulePosition]>,
     registry: &[crate::AgenticCli],
+    no_agent_creator: bool,
 ) -> Result<Vec<crate::AgenticCli>, String> {
     let unknown = |why: &str| Err(format!("identity_unknown: {why}"));
     // A carried dispute's parties are the seats that READ it, as they launched then (recorded on
@@ -1148,10 +1158,11 @@ pub(crate) fn rule_council_seats(
             }
         }
     }
-    if creators.is_empty() {
+    // (coordinator decision 2026-11-06) No agent creator at all: no seat is the creator.
+    if creators.is_empty() && !no_agent_creator {
         return unknown("the work's creators are not known");
     }
-    let Some(bins) = creator_bins else {
+    let Some(bins) = creator_bins.or(no_agent_creator.then_some(&[][..])) else {
         return unknown("a creator of this work has no recorded binary");
     };
     // Every binary an author ran must be a CLI the engine can name: a creator launched through a
@@ -1304,6 +1315,7 @@ fn settle_rule_disputes(
     registry: &[crate::AgenticCli],
     council: Option<&CouncilCtx<'_>>,
     emit_delta: &DeltaSink,
+    no_agent_creator: bool,
 ) {
     use crate::rule_check::{
         disputed_row, positions_of, Answer, RuleCouncil, RuleOrigin, RulePosition, RuleStatus,
@@ -1421,6 +1433,7 @@ fn settle_rule_disputes(
             ),
             was_carried.then_some(pos.as_slice()),
             registry,
+            no_agent_creator,
         ) {
             Ok(s) => s,
             Err(why) => {
@@ -1636,6 +1649,7 @@ pub(crate) fn delivery_rule_check(
         &[],
         &ctx.pool,
         &ctx.registry,
+        false,
     );
     let facts =
         crate::rule_check::job_facts(&[], ctx.project.as_deref(), ctx.repo.as_deref(), &change);
@@ -1666,6 +1680,9 @@ pub(crate) fn delivery_rule_check(
         &judge,
         &NoMachineHere,
     );
+    // (codex r2) No engine marker on a delivery: a model's copy of its words is scrubbed.
+    let mut report = report;
+    render_any_seat_marker(&mut report, false);
     Some(report)
 }
 
@@ -1988,6 +2005,13 @@ fn run_rule_check_with(
     if rules.is_empty() {
         return None;
     }
+    // (crew#1394) Whether the run's record shows no agent wrote code in it, read strictly.
+    let no_agent_code = no_agent_wrote_code(&gov.db_path, &input.run_id, &input.unit);
+    // (coordinator decision 2026-11-06) …and no agent authored the work this gate reads (no
+    // creator, no gatherer): evaluator ≠ creator holds vacuously, so any eligible seat may judge.
+    let no_agent_creator = creators.is_empty()
+        && no_agent_code
+        && no_agent_creator_of(&gov.db_path, &input.run_id, &input.unit);
     // Evaluator ≠ creator, no fallback: a seat is a judge only when neither its key nor any
     // binary it may execute (quote-aware, `record_identities`) is a creator's — the creators'
     // registry records and every binary they actually ran.
@@ -1999,7 +2023,30 @@ fn run_rule_check_with(
         &input.unit.authored_binaries,
         pool,
         registry,
+        no_agent_creator,
     );
+    // (codex r1, r2) A cached judicial verdict (the unit's own last rows, or a council ruling from
+    // another gate) is reused only when fresh selection would still seat every party to it.
+    let exclusions = JudgeExclusions::of(
+        creators,
+        creator_bins,
+        &input.unit.exclude_seats,
+        &input.unit.authored_by,
+        &input.unit.authored_binaries,
+        registry,
+        no_agent_creator,
+    );
+    let prior = input.unit.rule_check.clone().map(|mut p| {
+        p.rows.retain(|r| exclusions.may_reuse(r, registry));
+        p
+    });
+    let settled: Vec<crate::rule_check::RuleVerdict> = input
+        .unit
+        .rule_settled
+        .iter()
+        .filter(|r| exclusions.may_reuse(r, registry))
+        .cloned()
+        .collect();
     let facts = crate::rule_check::job_facts(
         &input.unit.rule_steps,
         gov.project_id.as_deref(),
@@ -2056,7 +2103,7 @@ fn run_rule_check_with(
                     facts: &facts,
                     change: &change,
                     floor: floor_text.as_deref(),
-                    prior: input.unit.rule_check.as_ref(),
+                    prior: prior.as_ref(),
                     skips: &input.unit.rule_skips,
                     seats: &seats,
                     no_seat: no_seat.as_deref(),
@@ -2064,11 +2111,11 @@ fn run_rule_check_with(
                     instructions: Some(instructions.as_str()).filter(|t| !t.is_empty()),
                     engine_record: Some(engine_record.as_str()),
                     creator_records: creator_records.as_deref(),
-                    no_agent_code: no_agent_wrote_code(&gov.db_path, &input.run_id, &input.unit),
+                    no_agent_code,
                     stage: crate::rule_check::CheckStage::Review,
                     deliver_tokens: &input.unit.rule_deliver_tokens,
                     deferred: &[],
-                    settled: &input.unit.rule_settled,
+                    settled: &settled,
                 },
                 &judge,
                 &FloorMachine {
@@ -2098,6 +2145,15 @@ fn run_rule_check_with(
             registry,
             st.council,
             emit_delta,
+            no_agent_creator,
+        );
+    }
+    // (coordinator decision 2026-11-06) The receipt says why a seat that would otherwise have been
+    // excluded may judge: every row a judge or council ruled on this draw carries it.
+    if render_any_seat_marker(&mut report, no_agent_creator) > 0 {
+        engine_note(
+            emit_delta,
+            &format!("rule check: {}", crate::rule_check::ANY_SEAT_MAY_JUDGE),
         );
     }
     engine_note(
@@ -2244,6 +2300,142 @@ pub(crate) fn engine_record(
     s
 }
 
+/// (coordinator decision 2026-11-06, codex r1) The receipt's "why any seat could judge", rendered
+/// from this attempt's provenance only: every row's reason and cite first lose a marker an earlier
+/// attempt added and any model-written copy of the reserved words; then, on a run with no agent
+/// creator, every row a judge or council ruled gets the engine-framed marker once. Returns how many
+/// rows it marked.
+pub(crate) fn render_any_seat_marker(
+    report: &mut crate::rule_check::RuleCheckReport,
+    no_agent_creator: bool,
+) -> usize {
+    use crate::rule_check::{RuleOrigin, ANY_SEAT_MAY_JUDGE};
+    let framed = any_seat_marker();
+    let scrub = |t: &str| {
+        t.replace(&format!(" {framed}"), "")
+            .replace(&framed, "")
+            .replace(ANY_SEAT_MAY_JUDGE, "[engine-reserved words removed]")
+    };
+    let mut marked = 0;
+    for r in report.rows.iter_mut() {
+        r.reason = scrub(&r.reason);
+        r.cite = r.cite.as_deref().map(scrub);
+        if no_agent_creator && matches!(r.origin, Some(RuleOrigin::Judge | RuleOrigin::Council)) {
+            r.reason = format!("{} {framed}", r.reason);
+            marked += 1;
+        }
+    }
+    marked
+}
+
+/// The engine-framed marker a row carries on a run with no agent creator.
+pub(crate) fn any_seat_marker() -> String {
+    format!(
+        "{}{}{}",
+        crate::rule_check::FRAME_OPEN,
+        crate::rule_check::ANY_SEAT_MAY_JUDGE,
+        crate::rule_check::FRAME_CLOSE
+    )
+}
+
+/// (codex r1, r2) What fresh rule-judge selection excludes (the creators, this unit's authors and
+/// launch exclusions, by key and by every identity their records and recorded binaries name), and
+/// whether the work's authorship is known at all: the bar a CACHED judicial verdict must still meet.
+struct JudgeExclusions {
+    keys: std::collections::BTreeSet<String>,
+    ids: std::collections::BTreeSet<String>,
+    /// Creators known with their binaries, or no agent creator at all. Otherwise no cached judge
+    /// or council verdict can be shown distinct from the work's authors.
+    provenance_known: bool,
+}
+
+impl JudgeExclusions {
+    #[allow(clippy::too_many_arguments)]
+    fn of(
+        creators: &[String],
+        creator_bins: Option<&[String]>,
+        exclude_seats: &[String],
+        authored_by: &[String],
+        authored_binaries: &[String],
+        registry: &[crate::AgenticCli],
+        no_agent_creator: bool,
+    ) -> Self {
+        let mut ids: std::collections::BTreeSet<String> = creator_bins
+            .unwrap_or_default()
+            .iter()
+            .chain(authored_binaries)
+            .map(|b| crate::validator::normalize_identity(b))
+            .collect();
+        for k in creators.iter().chain(authored_by) {
+            match registry.iter().find(|c| &c.key == k) {
+                Some(c) => ids.extend(record_identities(c)),
+                None => {
+                    ids.insert(crate::validator::normalize_identity(k));
+                }
+            }
+        }
+        ids.extend(excluded_identities(exclude_seats, registry));
+        JudgeExclusions {
+            keys: creators
+                .iter()
+                .chain(exclude_seats)
+                .chain(authored_by)
+                .cloned()
+                .collect(),
+            ids,
+            provenance_known: no_agent_creator || (!creators.is_empty() && creator_bins.is_some()),
+        }
+    }
+
+    /// Whether a seat (its key, and the identities it was recorded with) is still eligible.
+    fn seat_ok(&self, key: &str, recorded: &[String], registry: &[crate::AgenticCli]) -> bool {
+        let norm = |i: &String| crate::validator::normalize_identity(i);
+        !self.keys.contains(key)
+            && recorded.iter().all(|i| !self.ids.contains(&norm(i)))
+            && registry
+                .iter()
+                .filter(|c| c.key == key)
+                .flat_map(record_identities)
+                .all(|i| !self.ids.contains(&i))
+    }
+
+    /// Whether a cached row may be reused: a fact, machine or operator row always; a judge's or
+    /// council's ruling only when the work's authorship is known and its judge and every council
+    /// voter would still be seated.
+    fn may_reuse(
+        &self,
+        r: &crate::rule_check::RuleVerdict,
+        registry: &[crate::AgenticCli],
+    ) -> bool {
+        use crate::rule_check::{RuleHow, RuleOrigin};
+        // (codex r3) A row recorded before `origin` is classed by `how`, as `rule_check::reuse` does.
+        let judicial = matches!(r.origin, Some(RuleOrigin::Judge | RuleOrigin::Council))
+            || matches!(r.how, RuleHow::Judge | RuleHow::Council)
+            || r.council.is_some();
+        // (codex r4) An open dispute is never dropped: it holds until a council or the person
+        // settles it, and its re-settlement draws fresh seats under these same exclusions.
+        if !judicial || r.status == crate::rule_check::RuleStatus::Disputed {
+            return true;
+        }
+        if !self.provenance_known {
+            return false;
+        }
+        // (codex r4) A judge whose identity can be established neither from its recorded ids nor
+        // from a registry record cannot be shown distinct: ruled again.
+        let Some(j) = r.judge.as_deref() else {
+            return false;
+        };
+        (!r.judge_ids.is_empty() || registry.iter().any(|c| c.key == j))
+            && self.seat_ok(j, &r.judge_ids, registry)
+            && r.council.as_ref().is_none_or(|c| {
+                // (codex r3) A voter the registry no longer names cannot be shown eligible.
+                c.votes.iter().all(|v| {
+                    registry.iter().any(|x| x.key == v.seat) && self.seat_ok(&v.seat, &[], registry)
+                })
+            })
+    }
+}
+
 /// (crew#1394) Whether the run's record shows, read whole and strictly, that no AGENT wrote code in
 /// it: no unit of the run (at any status or ord, this one included, so a loop's reset author still
 /// counts) is an agent code-writing step (a creator, or a phase declaring `executes_code`); no unit
@@ -2256,52 +2448,84 @@ pub(crate) fn no_agent_wrote_code(
     run_id: &str,
     unit: &crate::domain::WorkUnit,
 ) -> bool {
+    run_units_strict(db_path, run_id).is_some_and(|units| no_agent_code_in(&units, unit))
+}
+
+/// Every unit of `run_id`, read strictly: `None` when the store cannot be read or a unit node of the
+/// run does not decode (never a silently shorter list).
+fn run_units_strict(db_path: &str, run_id: &str) -> Option<Vec<crate::domain::WorkUnit>> {
     use wicked_apps_core::{FromNode, GraphRead};
-    let floor_fix = unit
-        .repo_checks
-        .as_ref()
-        .and_then(|r| r.requested_rerun.as_ref())
-        .is_some_and(|r| r.fix.is_some());
-    let looped = unit.repeat_from.is_some() || unit.repeat_passes > 0;
-    if floor_fix || looped || !unit.authored_by.is_empty() {
-        return false;
-    }
-    let Ok(store) = wicked_apps_core::open_store_ro(Some(db_path)) else {
-        return false;
-    };
+    let store = wicked_apps_core::open_store_ro(Some(db_path)).ok()?;
     let query = wicked_apps_core::SymbolQuery {
         kinds: vec![wicked_apps_core::NodeKind::Other(
             wicked_apps_core::WORK_UNIT.to_string(),
         )],
         ..Default::default()
     };
-    let Ok(nodes) = store.find_symbols(&query) else {
-        return false;
-    };
-    let mut any = false;
-    for n in &nodes {
+    let mut out = Vec::new();
+    for n in &store.find_symbols(&query).ok()? {
         let of_run = n.metadata.get("session_id").and_then(|v| v.as_str()) == Some(run_id)
             || n.name.starts_with(&format!("{run_id}:"));
         if !of_run {
             continue;
         }
-        let Ok(u) = crate::domain::WorkUnit::from_node(n) else {
-            return false;
-        };
-        if u.session_id != run_id {
-            continue;
+        let u = crate::domain::WorkUnit::from_node(n).ok()?;
+        if u.session_id == run_id {
+            out.push(u);
         }
-        any = true;
+    }
+    Some(out)
+}
+
+/// [`no_agent_wrote_code`] on the run's units, read strictly.
+fn no_agent_code_in(units: &[crate::domain::WorkUnit], unit: &crate::domain::WorkUnit) -> bool {
+    let floor_fix = unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .is_some_and(|r| r.fix.is_some());
+    let looped = unit.repeat_from.is_some() || unit.repeat_passes > 0;
+    if floor_fix || looped || !unit.authored_by.is_empty() || units.is_empty() {
+        return false;
+    }
+    units.iter().all(|u| {
         let writes = u.tool_cmd.is_none()
             && (u.role == crate::workflow::PhaseRole::Creator || u.executes_code);
         // (codex r2) A loop's reset clears the pass's author stamps (a floor fixer's included)
         // without reverting the tree, so on a run with a loop no stamp is not that fact.
         let looped = u.repeat_from.is_some() || u.repeat_passes > 0;
-        if writes || looped || !u.authored_by.is_empty() {
-            return false;
-        }
-    }
-    any
+        !(writes || looped || !u.authored_by.is_empty())
+    })
+}
+
+/// (coordinator decision 2026-11-06, codex r1) Whether no agent authored anything the gate `unit`
+/// reads, read strictly from the run's units: no earlier agent unit that authors work, gathers a
+/// report, or records an author or a gatherer. An agent author whose seat is not recorded is
+/// UNKNOWN, never absent: only a run with no such unit at all qualifies.
+fn no_agent_author_in(units: &[crate::domain::WorkUnit], unit: &crate::domain::WorkUnit) -> bool {
+    // (codex r3) A report's gatherer is an author only of the report a gatherer-excluding rubric
+    // rechecks (`pipeline::report_gatherer_seats`), as `work_authors` counts it.
+    let gatherers_count = crate::rubric::excludes_gatherers(unit.rubric.as_deref());
+    !units.iter().any(|u| {
+        u.ord < unit.ord
+            && u.tool_cmd.is_none()
+            && (crate::pipeline::authors_work(u)
+                || !u.authored_by.is_empty()
+                || (gatherers_count
+                    && (crate::pipeline::is_report_gatherer(u) || !u.gathered_by.is_empty())))
+    })
+}
+
+/// (coordinator decision 2026-11-06) Whether the gate `unit` reads work no agent authored: the run's
+/// record, read strictly, shows no agent wrote code ([`no_agent_wrote_code`]) and no agent authored
+/// anything before it ([`no_agent_author_in`]). Then evaluator ≠ creator holds vacuously.
+pub(crate) fn no_agent_creator_of(
+    db_path: &str,
+    run_id: &str,
+    unit: &crate::domain::WorkUnit,
+) -> bool {
+    run_units_strict(db_path, run_id)
+        .is_some_and(|units| no_agent_code_in(&units, unit) && no_agent_author_in(&units, unit))
 }
 
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the

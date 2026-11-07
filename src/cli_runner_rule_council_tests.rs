@@ -332,6 +332,7 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
             (Some("codex"), Some(rev_inv)),
             None,
             reg,
+            false,
         )
     };
     let claude = ["claude".to_string()];
@@ -363,6 +364,7 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
         (Some("codex"), Some("codex -p {PROMPT}")),
         None,
         &reg,
+        false,
     )
     .unwrap_err();
     assert!(err.starts_with("identity_unknown"), "{err}");
@@ -378,6 +380,7 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
             (Some("codex"), Some("codex -p {PROMPT}")),
             None,
             &reg,
+            false,
         )
         .unwrap_err();
         assert!(err.starts_with("identity_unknown"), "{excluded}: {err}");
@@ -400,6 +403,7 @@ fn no_party_and_no_unverifiable_seat_sits_on_a_rule_council() {
         (Some("codex"), Some("codex -p {PROMPT}")),
         Some(&unrecorded),
         &reg,
+        false,
     )
     .unwrap_err();
     assert!(err.starts_with("identity_unknown"), "{err}");
