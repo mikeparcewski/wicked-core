@@ -17,7 +17,7 @@
 //!   out file, and two daemon variables crew exports at boot: [`PYTHON_ENV`] (its private Playwright
 //!   venv's interpreter) and [`STUDIO_DIST_ENV`] (its studio dist). Nothing is installed at dispatch.
 //! - **The record** ([`ConformanceRecord`]): the engine reads the report from the out file in its own
-//!   temp dir, applies crew's required-case rule (cases 0-6 and 8-12 for every editor, plus 13-16
+//!   temp dir, applies crew's required-case rule (cases 0-12 and 18 for every editor, plus 13-16
 //!   when its `protocol` lists 2, crew `editors/pack-install.ts` `requiredCases`), and binds it to the
 //!   worktree's tree id taken before and after the run (a tree that changed while it ran is refused).
 //!
@@ -25,7 +25,9 @@
 //!
 //! The record is a FACT the review cites, and a hard gate on its own unit. It is NOT the run's QE
 //! attributed PASS: QE acceptance stays a separate judgment of the editor's behaviour (conformance
-//! covers the host contract; case 7 and what the editor does are out of its reach).
+//! covers the host contract, and cases 7 and 18 check that the editor saves through its own UI and
+//! shows the content it is handed, on the conformance host's page and deck samples; whether what it
+//! does is right for its design is still out of its reach).
 //!
 //! - PASS: the unit is Done; the evaluator brief ([`crate::review_context::evaluator_brief`]) and the
 //!   isolated QE reviewer's input carry [`brief_block`] as `[editor conformance record — unit N]`.
@@ -69,7 +71,7 @@ const REPORT_MAX: u64 = 8 * 1024 * 1024;
 pub(crate) const VERDICT_CAUSES: &[&str] = &["case_failed", "pack_invalid"];
 
 /// The cases every editor must pass (crew `CONFORMANCE_CASES`).
-pub(crate) const CASES: [&str; 12] = [
+pub(crate) const CASES: [&str; 14] = [
     "0-manifest",
     "1-handshake",
     "2-sizes",
@@ -77,11 +79,13 @@ pub(crate) const CASES: [&str; 12] = [
     "4-permissions",
     "5-typing",
     "6-forwarding",
+    "7-edit",
     "8-strict-input",
     "9-liveness",
     "10-keyboard",
     "11-theme",
     "12-hash-pinned",
+    "18-shows",
 ];
 /// The protocol-2 cases an editor whose `protocol` lists 2 must also pass (crew `CONFORMANCE_CASES_V2`).
 pub(crate) const CASES_V2: [&str; 4] = ["13-surfaces", "14-card", "15-options", "16-full"];
@@ -450,9 +454,9 @@ pub(crate) fn brief_block(
         .iter()
         .map(|e| {
             let p = if e.protocol.contains(&2) {
-                "cases 0-6, 8-16"
+                "cases 0-16, 18"
             } else {
-                "cases 0-6, 8-12"
+                "cases 0-12, 18"
             };
             format!("{} {} (entry sha256 {}; {p})", e.id, e.version, e.sha256)
         })
@@ -533,6 +537,41 @@ mod tests {
         assert!(judge_report(Some(&report(v1, true, None)), 0).passed());
     }
 
+    /// (S9, garden#1424 / crew#1399) Every editor must pass 7-edit (it saves through its own UI) and
+    /// 18-shows (it shows the content it is handed). A report from a harness that did not run one
+    /// of them is refused as `cases_not_run`, naming it, never passed.
+    #[test]
+    fn a_report_without_7_edit_or_18_shows_is_refused() {
+        for protocol in [vec![1], vec![1, 2]] {
+            for dropped in [&["7-edit"][..], &["18-shows"], &["7-edit", "18-shows"]] {
+                let ran: Vec<&str> = required_cases(&protocol)
+                    .into_iter()
+                    .filter(|c| !dropped.contains(c))
+                    .collect();
+                let e = serde_json::json!([{"id": "acme-x", "protocol": protocol,
+                    "cases": cases(&ran, &[])}]);
+                let r = judge_report(Some(&report(e, true, None)), 0);
+                assert_eq!(
+                    (r.outcome.as_str(), r.cause.as_deref()),
+                    (OUTCOME_REFUSED, Some("cases_not_run")),
+                    "{protocol:?} without {dropped:?}: {r:?}"
+                );
+                assert_eq!(r.editors[0].missing, dropped, "{protocol:?}");
+                for d in dropped {
+                    assert!(r.reason.as_deref().unwrap_or("").contains(d), "{r:?}");
+                }
+            }
+            // Run and failed is a verdict on the pack, like any required case.
+            for failing in ["7-edit", "18-shows"] {
+                let e = serde_json::json!([{"id": "acme-x", "protocol": protocol,
+                    "cases": cases(&required_cases(&protocol), &[failing])}]);
+                let r = judge_report(Some(&report(e, false, Some("case_failed"))), 0);
+                assert_eq!(r.outcome, OUTCOME_FAIL, "{protocol:?} {failing}: {r:?}");
+                assert_eq!(r.editors[0].failed, [failing], "{protocol:?}");
+            }
+        }
+    }
+
     #[test]
     fn a_failed_case_is_a_verdict_even_when_the_report_says_ok() {
         let e = serde_json::json!([{"id": "acme-x", "protocol": [1, 2], "cases": cases(&all_v2(), &["14-card"])}]);
@@ -605,7 +644,7 @@ mod tests {
         assert_eq!(
             CASES.join(","),
             "0-manifest,1-handshake,2-sizes,3-no-network,4-permissions,5-typing,6-forwarding,\
-             8-strict-input,9-liveness,10-keyboard,11-theme,12-hash-pinned"
+             7-edit,8-strict-input,9-liveness,10-keyboard,11-theme,12-hash-pinned,18-shows"
         );
         assert_eq!(CASES_V2.join(","), "13-surfaces,14-card,15-options,16-full");
     }
