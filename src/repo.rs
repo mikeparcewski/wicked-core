@@ -557,10 +557,9 @@ pub(crate) fn requirements_evidence(
     let store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
     // The build is read before and after the rows (codex r2): a build that lands in between leaves
     // the record out rather than pairing one build's rows with another's label.
+    // Generation 0 is a graph persisted before the build record existed (or none at all): its
+    // requirements are still listed, labelled as a map with no recorded commit (codex r3).
     let (generation, built) = wicked_governance::build_identity(&store)?;
-    if generation == 0 {
-        return Ok(None);
-    }
     // Only the touched files' code is read (an indexed lookup per file, bounded), never the whole
     // map: this runs inside a dispatch (pi r1).
     let mut code = Vec::new();
@@ -569,7 +568,7 @@ pub(crate) fn requirements_evidence(
     }
     let touched = wicked_governance::touched_requirements(&store, &code)?;
     let cut = files.len() > REQUIREMENTS_RECORD_FILES;
-    if touched.is_empty() && !cut {
+    if touched.is_empty() && (!cut || generation == 0) {
         return Ok(None);
     }
     let short = |c: &str| c.chars().take(7).collect::<String>();
@@ -2518,6 +2517,22 @@ mod tests {
         assert!(
             cut.contains("only the first 200 of the 201 touched files were read"),
             "{cut}"
+        );
+        // A graph persisted before the build record (generation 0) is still listed, as a map with
+        // no recorded commit (codex r3).
+        {
+            let mut s = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            s.begin_batch().unwrap();
+            s.remove_file("requirements-graph/build").unwrap();
+            s.commit_batch().unwrap();
+        }
+        let legacy = requirements_evidence(&daemon, &entry.id, &files, Some(&base))
+            .unwrap()
+            .unwrap();
+        assert!(legacy.contains("recorded no commit"), "{legacy}");
+        assert!(
+            legacy.contains("src::REQ-003") && legacy.contains("code doesn't meet it"),
+            "{legacy}"
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&state_home);
