@@ -11997,16 +11997,21 @@ fn dispatch_unit(
         && (unit.role == crate::workflow::PhaseRole::Evaluator
             || crate::qe_acceptance::review::applies(unit))
     {
-        if let (Some(repo_ref), Some(wd)) =
-            (session.repo_ref.as_deref(), session.workdir.as_deref())
-        {
-            let files = worktree_contribution_files(wd);
-            match crate::repo::requirements_evidence(
-                &*store,
-                repo_ref,
-                &files,
-                session.base_commit.as_deref(),
-            ) {
+        if let (Some(repo_ref), Some(wd), Some(base), Some(snap)) = (
+            session.repo_ref.as_deref(),
+            session.workdir.as_deref(),
+            session.base_commit.as_deref(),
+            unit.worktree_baseline.as_ref(),
+        ) {
+            // The files the work under review changed: the tree this dispatch snapshotted (pinned
+            // git dir, fresh index) against the run's immutable base, never the worktree's live
+            // index or branch list (codex r1).
+            let read =
+                crate::worktree_guard::paths_since_commit(std::path::Path::new(wd), snap, base)
+                    .and_then(|files| {
+                        crate::repo::requirements_evidence(&*store, repo_ref, &files, Some(base))
+                    });
+            match read {
                 Ok(Some(text)) => {
                     let label = format!(
                         "{} — engine record]",

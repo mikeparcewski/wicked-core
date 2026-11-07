@@ -524,6 +524,41 @@ pub(crate) fn changed_since(
     )?))
 }
 
+/// The repo-relative paths the snapshot `snap` (its content tree) changed since `commit` (the run's
+/// base), through the snapshot's PINNED git dir: an object read over two trees, so neither the
+/// worktree's own `.git` file, its index (an `assume-unchanged` bit), nor any other branch can hide
+/// a path. Renames list both sides (`--no-renames`); `-z` keeps every path byte-exact.
+pub(crate) fn paths_since_commit(
+    worktree: &Path,
+    snap: &WorktreeSnapshot,
+    commit: &str,
+) -> anyhow::Result<Vec<String>> {
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        anyhow::bail!("the run base {commit:?} is not a full commit id");
+    }
+    let git_dir = snap
+        .git_dir
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("the snapshot carries no pinned git dir"))?;
+    let raw = git(
+        worktree,
+        &[
+            "diff-tree",
+            "-r",
+            "-z",
+            "--name-status",
+            "--no-renames",
+            commit,
+            &snap.tree,
+        ],
+        &[("GIT_DIR", Path::new(git_dir)), ("GIT_WORK_TREE", worktree)],
+    )?;
+    Ok(parse_name_status_z(&raw)
+        .into_iter()
+        .map(|c| c.path)
+        .collect())
+}
+
 /// (TR-W1b) Cut `changed` at [`CHANGED_PATHS_CAP`]: the kept paths and whether any were cut.
 pub(crate) fn capped(mut changed: Vec<ChangedPath>) -> (Vec<ChangedPath>, bool) {
     let truncated = changed.len() > CHANGED_PATHS_CAP;
@@ -1423,6 +1458,44 @@ mod tests {
         std::fs::write(wt.join("src/a.ts"), "export const a = 'rewritten again';\n").unwrap();
         let m = compare(&wt, &before).unwrap().expect("still a mutation");
         assert!(m.changed.iter().any(|c| c.path == "src/a.ts"));
+    }
+
+    /// Operator ruling 2026-11-06 (codex r1 on the requirements record): the files a change touched
+    /// are its snapshot tree against the run base through the pinned git dir. A rename lists both
+    /// sides, an `assume-unchanged` bit hides nothing, a branch elsewhere changes nothing, and an
+    /// unusual name comes back byte-exact.
+    #[test]
+    fn paths_since_commit_lists_every_touched_path_against_the_run_base() {
+        let wt = creator_worktree("since-base");
+        let repo = repo_of(&wt);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        run_git(
+            &wt,
+            &["mv", "config/settings.local.json", "config/moved.json"],
+        );
+        run_git(&wt, &["update-index", "--assume-unchanged", "src/a.ts"]);
+        std::fs::write(wt.join("caf\u{e9}.ts"), "x\n").unwrap();
+        // Another local branch at the worktree's HEAD hides nothing.
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "work"]);
+        run_git(&repo, &["branch", "review-snapshot", "wicked/since-base"]);
+        let snap = snapshot(&wt, &repo).unwrap();
+        let mut got = paths_since_commit(&wt, &snap, &base).unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            [
+                "caf\u{e9}.ts",
+                "config/moved.json",
+                "config/settings.local.json",
+                "src/a.ts",
+                "src/b.ts"
+            ]
+        );
+        assert!(
+            paths_since_commit(&wt, &snap, "HEAD").is_err(),
+            "a run base is a full id"
+        );
     }
 
     /// Adversarial review on #414 (CRITICAL, reproduced with in-worktree writes only): rewrite the

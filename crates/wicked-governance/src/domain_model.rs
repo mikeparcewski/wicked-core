@@ -1118,8 +1118,8 @@ pub const CODE_MISMATCH_ANN: &str = "code_mismatch";
 /// The value a restatement writes over an earlier mismatch: the code meets the requirement.
 pub const CODE_MEETS: &str = "code meets it";
 
-/// A requirement satisfied by code in a file a change touches ([`touched_requirements`]): what the
-/// reviewer and QE are handed (operator ruling 2026-11-06).
+/// A requirement satisfied by code a change touches ([`touched_requirements`]): what the reviewer
+/// and QE are handed (operator ruling 2026-11-06).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct TouchedRequirement {
     /// `<domain>::<REQ-id>`, the key the requirements page shows.
@@ -1127,78 +1127,65 @@ pub struct TouchedRequirement {
     pub title: String,
     /// The requirement's first stated rule (empty when the build stated none).
     pub statement: String,
-    /// The `file#name` code that satisfies it, in a touched file.
+    /// The touched code that satisfies it, as `file#name`.
     pub code: String,
-    /// The live code mismatch on that code ([`code_mismatch_of`]).
+    /// The live code mismatch on THAT code ([`code_mismatch_of`]).
     pub code_mismatch: Option<String>,
     /// Counted as a real requirement when the build was made (`status: active`); a placeholder else.
     pub real: bool,
 }
 
-/// The listed requirements whose code (`legacy_components`, `file#name`) is in one of `files`
-/// (repo-relative paths), sorted by key. Read-only; a build with no requirement nodes answers empty.
+/// The requirements that `code` (the code nodes in the files a change touches) satisfies, through
+/// their `SatisfiedBy` edges, each with the mismatch read on the code it links: sorted by key, one
+/// entry per requirement. Cost follows the touched code, never the size of the map.
 pub fn touched_requirements(
     store: &dyn GraphRead,
-    files: &[String],
+    code: &[wicked_apps_core::Node],
 ) -> anyhow::Result<Vec<TouchedRequirement>> {
-    use wicked_apps_core::{NodeKind, SymbolQuery};
-    let wanted: std::collections::HashSet<&str> = files.iter().map(String::as_str).collect();
-    if wanted.is_empty() {
-        return Ok(Vec::new());
-    }
-    let nodes = store.find_symbols(&SymbolQuery {
-        kinds: vec![NodeKind::Other("requirement".to_string())],
-        ..Default::default()
-    })?;
+    use wicked_apps_core::EdgeKind;
+    use wicked_estate_core::Direction;
+    let mut seen = std::collections::HashSet::new();
     let mut out = Vec::new();
-    for n in nodes {
-        let md = &n.metadata;
-        let doc = md.get(REQUIREMENT_DOC_KEY);
-        let comps: Vec<String> = doc
-            .and_then(|d| d.get("legacy_components"))
-            .or_else(|| md.get("legacy_components"))
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter_map(|c| c.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let Some(code) = comps
-            .into_iter()
-            .find(|c| c.rsplit_once('#').is_some_and(|(f, _)| wanted.contains(f)))
-        else {
-            continue;
-        };
-        let Some(id) = n.location.file.strip_prefix("requirement/") else {
-            continue;
-        };
-        let Some((domain, req)) = id.rsplit_once('/') else {
-            continue;
-        };
-        let statement = doc
-            .and_then(|d| d.get("business_rules"))
-            .and_then(|r| r.as_array())
-            .and_then(|r| r.first())
-            .and_then(|r| r.get("statement"))
-            .and_then(|s| s.as_str())
-            .or_else(|| md.get("description").and_then(|d| d.as_str()))
-            .unwrap_or("")
-            .trim()
-            .to_string();
-        let mismatch = match md.get("code_symbol").and_then(|c| c.as_str()) {
-            Some(sym) => code_mismatch_of(store, &wicked_apps_core::SymbolId::from(sym))?,
-            None => None,
-        };
-        out.push(TouchedRequirement {
-            key: format!("{domain}::{req}"),
-            title: n.name.clone(),
-            real: md.get("status").and_then(|s| s.as_str()) == Some("active")
-                && !statement.starts_with("[RISK]"),
-            statement,
-            code,
-            code_mismatch: mismatch,
-        });
+    for c in code {
+        for e in store.neighbors(&c.symbol, Direction::Dependents)? {
+            if e.kind != EdgeKind::SatisfiedBy
+                || e.target != c.symbol
+                || !seen.insert(e.source.clone())
+            {
+                continue;
+            }
+            let Some(n) = store.get_node(&e.source)? else {
+                continue;
+            };
+            let Some(id) = n.location.file.strip_prefix("requirement/") else {
+                continue;
+            };
+            let Some((domain, req)) = id.rsplit_once('/') else {
+                continue;
+            };
+            let md = &n.metadata;
+            let statement = md
+                .get(REQUIREMENT_DOC_KEY)
+                .and_then(|d| d.get("business_rules"))
+                .and_then(|r| r.as_array())
+                .and_then(|r| r.first())
+                .and_then(|r| r.get("statement"))
+                .and_then(|s| s.as_str())
+                .or_else(|| md.get("description").and_then(|d| d.as_str()))
+                .unwrap_or("")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            out.push(TouchedRequirement {
+                key: format!("{domain}::{req}"),
+                title: n.name.clone(),
+                real: md.get("status").and_then(|s| s.as_str()) == Some("active")
+                    && !statement.starts_with("[RISK]"),
+                statement,
+                code: format!("{}#{}", c.location.file, c.name),
+                code_mismatch: code_mismatch_of(store, &c.symbol)?,
+            });
+        }
     }
     out.sort_by(|a, b| a.key.cmp(&b.key));
     Ok(out)
