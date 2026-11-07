@@ -411,7 +411,8 @@ pub fn requirements_graph_for_repo(
     // state, not an error. (A store that exists but cannot be read still errors below.)
     if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
         return Ok(serde_json::json!({
-            "graph": null, "coverage": null, "build": null, "rows": null,
+            "graph": null, "coverage": null, "build": null, "rows": null, "code": null,
+            "target": null,
         }));
     }
     let repo_store = wicked_apps_core::open_store_ro(Some(repo.code_graph_db.as_str()))?;
@@ -439,9 +440,58 @@ pub fn requirements_graph_for_repo(
         }
         None => (None, None, None),
     };
+    // P1/P3 (operator rulings 2026-11-06): how old the code behind the listed build is, counted
+    // against the REGISTERED checkout (never the graph's recorded root, which a run's worktree index
+    // may have left pointing at a removed worktree), and which minimum is in force and why.
+    let built_from = build
+        .as_ref()
+        .and_then(|b| b.code_commit.clone())
+        .map(|c| (c, "build"))
+        .or_else(|| {
+            build.as_ref()?;
+            repo_store
+                .repo_info()
+                .ok()
+                .flatten()
+                .and_then(|i| i.commit)
+                .filter(|c| !c.is_empty())
+                .map(|c| (c, "index"))
+        });
+    let code = built_from.map(|(commit, basis)| code_drift(&repo.root_path, &commit, basis));
+    let target = serde_json::json!({
+        "repo": wicked_governance::repo_min_coverage_pct(&repo_store)?,
+        "daemon": wicked_governance::min_coverage_pct_from_env().ok(),
+    });
     Ok(serde_json::json!({
-        "graph": graph, "coverage": coverage, "build": build, "rows": rows,
+        "graph": graph, "coverage": coverage, "build": build, "rows": rows, "code": code,
+        "target": target,
     }))
+}
+
+/// `{ built_from: { commit, at, basis }, head, commits_behind }` for a build made from `commit`, read
+/// with git in the registered checkout `root`: `at` is the commit's date, `head` the checkout's HEAD,
+/// `commits_behind` the commits on HEAD since `commit`. A commit the checkout does not hold (or a git
+/// that cannot answer) leaves `at` and `commits_behind` null: unknown, never 0. `basis` says where the
+/// commit came from: `"build"` (recorded by the build) or `"index"` (an older build that recorded
+/// none: the store's indexed commit now).
+fn code_drift(root: &str, commit: &str, basis: &str) -> serde_json::Value {
+    let ok = |args: &[&str]| match git(root, args) {
+        Ok((true, out, _)) if !out.is_empty() => Some(out),
+        _ => None,
+    };
+    let known = ok(&["cat-file", "-t", &format!("{commit}^{{commit}}")]).is_some();
+    let at = known
+        .then(|| ok(&["show", "-s", "--format=%cI", commit]))
+        .flatten();
+    let behind = known
+        .then(|| ok(&["rev-list", "--count", &format!("{commit}..HEAD")]))
+        .flatten()
+        .and_then(|n| n.parse::<u64>().ok());
+    serde_json::json!({
+        "built_from": { "commit": commit, "at": at, "basis": basis },
+        "head": ok(&["rev-parse", "HEAD"]),
+        "commits_behind": behind,
+    })
 }
 
 /// A summary of ONE registered repo's code graph — node counts by kind — read over that repo's OWN
@@ -2033,6 +2083,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_home);
     }
 
+    fn empty_model() -> wicked_governance::DomainModel {
+        wicked_governance::DomainModel {
+            metadata: wicked_governance::DomainMetadata {
+                schema_version: "1.1.0".into(),
+                migration_mode: "functional".into(),
+                source: Some("estate-graph".into()),
+                coverage: None,
+            },
+            domains: Default::default(),
+        }
+    }
+
+    /// Operator rulings 2026-11-06 (P1, P3): the read says how old the code behind the listed build
+    /// is, counted in the REGISTERED checkout, and which minimum is in force (the repository's own
+    /// target, else the daemon-wide one).
+    #[test]
+    fn requirements_graph_for_repo_reports_code_drift_and_the_minimum_in_force() {
+        use wicked_apps_core::GraphWrite;
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("reqdrift");
+        let p = root.to_str().unwrap();
+        let state_home = scratch_state_home("reqdrift");
+        let daemon_path = state_home.join("daemon-store.db");
+        let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Req drift".into(),
+                root_path: p.into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let db = daemon_path.to_str().unwrap();
+        let base = git(p, &["rev-parse", "HEAD"]).unwrap().1;
+        std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            repo_store
+                .set_repo_info(&wicked_estate_core::RepoInfo {
+                    commit: Some(base.clone()),
+                    ..Default::default()
+                })
+                .unwrap();
+            wicked_governance::persist_domain_model(&mut repo_store, &empty_model()).unwrap();
+        }
+        let current = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(current["code"]["built_from"]["commit"], base.as_str());
+        assert_eq!(current["code"]["built_from"]["basis"], "build");
+        assert_eq!(current["code"]["commits_behind"], 0);
+        assert!(current["code"]["built_from"]["at"].is_string());
+        assert_eq!(
+            current["target"],
+            serde_json::json!({ "repo": null, "daemon": 80 })
+        );
+        // The checkout moves on two commits: the map is now two commits old.
+        for i in 0..2 {
+            std::fs::write(root.join("README.md"), format!("change {i}\n")).unwrap();
+            assert!(git(p, &["commit", "-qam", "change"]).unwrap().0);
+        }
+        // The repository's own target, lowered at a budget ask, is the one in force.
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            wicked_governance::set_repo_min_coverage_pct(&mut repo_store, Some(66)).unwrap();
+        }
+        let moved = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(moved["code"]["commits_behind"], 2, "{}", moved["code"]);
+        assert_eq!(
+            moved["target"],
+            serde_json::json!({ "repo": 66, "daemon": 80 })
+        );
+        assert_eq!(moved["coverage"]["min_pct"], 66);
+        // A commit the checkout does not hold: unknown, never 0.
+        {
+            let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+            repo_store
+                .set_repo_info(&wicked_estate_core::RepoInfo {
+                    commit: Some("0123456789abcdef0123456789abcdef01234567".into()),
+                    ..Default::default()
+                })
+                .unwrap();
+            wicked_governance::persist_domain_model(&mut repo_store, &empty_model()).unwrap();
+        }
+        let unknown = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert_eq!(unknown["code"]["commits_behind"], serde_json::Value::Null);
+        assert_eq!(unknown["code"]["built_from"]["at"], serde_json::Value::Null);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&state_home);
+    }
+
     /// Operator ruling 2026-10-31: the requirements graph is read from the repo's own estate store.
     /// A repo registered but never indexed is the unbuilt state (graph and coverage null), not an
     /// error (codex on core#1223); a built graph reads back with its live label; an unknown repo
@@ -2064,7 +2207,10 @@ mod tests {
         let unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
         assert_eq!(
             unbuilt,
-            serde_json::json!({ "graph": null, "coverage": null, "build": null, "rows": null })
+            serde_json::json!({
+                "graph": null, "coverage": null, "build": null, "rows": null, "code": null,
+                "target": null,
+            })
         );
 
         std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
@@ -2095,7 +2241,7 @@ mod tests {
         );
         assert_eq!(
             built["build"],
-            serde_json::json!({ "generation": 1, "coverage": null }),
+            serde_json::json!({ "generation": 1, "coverage": null, "code_commit": null }),
             "the read names the build it listed (this one persisted no label)"
         );
 

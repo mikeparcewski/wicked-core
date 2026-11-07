@@ -978,7 +978,42 @@ fn index_at_base_with(
     if !status.success() {
         return Err(format!("the indexer failed ({status})"));
     }
+    record_registered_root(&db, repo, worktree);
     Ok(BaseIndex::Indexed)
+}
+
+/// P1 (operator ruling 2026-11-06): the indexer records the root it read (`indexed_root`), which for
+/// D8 is the run's WORKTREE. The worktree is removed when the run ends, and every later freshness
+/// read then measured the graph against a directory that no longer exists (wicked-crew's graph called
+/// files "deleted" that the checkout holds). The worktree is the base tree OF the registered
+/// checkout, so the graph's root is put back to that checkout. Only a root that names this worktree
+/// is rewritten; a failure leaves the graph as the indexer wrote it (the content is right either way).
+fn record_registered_root(db: &Path, repo: &Path, worktree: &Path) {
+    use wicked_apps_core::GraphStoreMutExt;
+    let Ok(mut store) = open_store(Some(&db.to_string_lossy())) else {
+        return;
+    };
+    let Some(recorded) = store.meta_get_key("indexed_root") else {
+        return;
+    };
+    let names_worktree =
+        recorded == worktree.to_string_lossy() || recorded == canonical_path_string(worktree);
+    if names_worktree {
+        store.meta_set_key("indexed_root", &canonical_path_string(repo));
+    }
+}
+
+/// `path` absolute with symlinks resolved, spelled as estate records a root: a drive-letter path on
+/// Windows, never the verbatim `\\?\` form; as given when it cannot be resolved.
+fn canonical_path_string(path: &Path) -> String {
+    let s = std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    match s.strip_prefix(r"\\?\") {
+        Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+        _ => s,
+    }
 }
 
 /// garden#1370: why a run whose steps read code out of the repo graph (`graph_required`: the
@@ -1241,6 +1276,12 @@ mod tests {
         // graph indexed at the base over `--db` and records its argv.
         let fresh = dir.join("fresh.db");
         graph_at(&fresh, BASE);
+        // The real indexer records the root it read: the worktree (P1).
+        {
+            use wicked_apps_core::GraphStoreMutExt;
+            let mut g = open_store(Some(&fresh.to_string_lossy())).unwrap();
+            g.meta_set_key("indexed_root", &canonical_path_string(&wt));
+        }
         let argv = dir.join("argv");
         let indexer = script(
             "indexer",
@@ -1259,6 +1300,15 @@ mod tests {
             format!("index {} --db {}", wt.display(), db.display())
         );
         assert_eq!(age(&db, BASE), crate::review_scale::GraphAge::Current);
+        // P1: the graph's root is the registered checkout again, not the run's worktree.
+        {
+            use wicked_apps_core::GraphStoreMutExt;
+            let g = open_store(Some(&db.to_string_lossy())).unwrap();
+            assert_eq!(
+                g.meta_get_key("indexed_root"),
+                Some(canonical_path_string(&repo))
+            );
+        }
 
         // Current: nothing runs.
         assert_eq!(run(&never, 5), Ok(BaseIndex::Current));
