@@ -23,6 +23,17 @@ Two release tracks share this file, newest entry first regardless of track:
   launch nor from the band floor, so the run ends at its last step (the domain-graph approval). The run keeps the
   launch's deliver step, so a revision that adds a build step delivers as before.
 
+- **A mapping page's reviewer judges the page, not the code it did not touch (wicked-core#1339).** A domain-extraction
+  page review (run 92749083) was held as "disputed" on a JSDoc steering rule. The rule judge said N/A (the change held
+  only the rules file), but the page reviewer called the rule BROKEN, citing the repository's existing functions.
+  With two eligible seats no council could rule, so the person had to answer three gates. The page review's
+  instructions (`RULES_REVIEW_INSTRUCTIONS`) now name the files a page writes (its worklist, rules file and apply
+  report, and the coverage report). When the change holds only those, a break that the repository's existing code
+  already had is `RULE <id>: N/A — pre-existing: …`, never an ITEM or a FAIL. A rule the page's own files break is
+  judged as usual, and any other file the change touches is listed as a problem. Garden's governed-worker E7 says the
+  same for every evaluator. The rule check itself is unchanged and deny-dominates: a reviewer's BROKEN against the
+  judge's N/A still goes to a council, because the engine cannot tell from a cite whether a break predates the change.
+
 - **The `run-cost` preset and the crew-tool channel (program CS6, core half).** "What would 40 bug fixes a month cost?"
   runs `facts` (`run`, a Tool: crew's fixed `wicked-crew insights-facts`, which prints crew's run facts: the window, the
   scope, what is left out, the population rules, every workflow group's wall time and spend percentiles, and the runs),
