@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A codex seat finds the bare `wicked-garden` launcher.** A codex seat is handed `<snapshot>/scripts` at the front of
+  `PATH`, but codex (0.162) runs the model's commands in a login shell by default, and the seat image's `/etc/profile`
+  sets `PATH` for a non-root user to a fixed list. So a bare `wicked-garden run …` failed with "command not found" in
+  codex chats (graph grounding said the launcher was missing), while claude and pi seats ran it. Every codex launch now
+  carries `-c allow_login_shell=false`, applied after the no-code posture so a read-only unit keeps it too. codex then
+  also stops offering the model a login shell. Its commands inherit the seat's environment, as claude's and pi's do.
+
 - **A skip at a re-check lands, and a review judge rules on the change (e2e-1105 F38).**
   - **The skip.** On run 672b5c14's `domain_coverage` gate, "Confirm or skip DEV-TINYMATH-1" re-ran the judge and the
     rule came back unchecked. A re-check is a re-judge: the seat does not run, and the floor is not re-run (its last
