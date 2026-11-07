@@ -472,6 +472,42 @@ impl PlanSteps {
         self.steps.iter().any(|s| is_creator_step(catalog, s))
     }
 
+    /// (wicked-core#1338; DES-CATALOG-002 Q17) A MAPPING plan: it has the mapping step (a `produce`
+    /// that runs the domain extractor, [`crate::domain_extraction::EXTRACTOR_SKILL`], with no
+    /// authored instructions: it states rules into the run's own `.wicked/domain/` files and the
+    /// repository's store), every other creator is the `domain_coverage` judge as shipped (it runs
+    /// code only to write its own report), and no step does code work ([`code_work_step`]). Such a
+    /// plan has nothing to deliver, so it takes no `deliver` step, from the launch or the floor,
+    /// unless the floor adds a creator to it ([`floor_fill`]). A plan with any other creator
+    /// delivers as before.
+    pub fn maps_only(&self) -> bool {
+        self.maps_only_in(crate::catalog::catalog())
+    }
+
+    /// [`Self::maps_only`] against `catalog`.
+    pub fn maps_only_in(&self, catalog: &[crate::workflow::PhaseDef]) -> bool {
+        let mapping = |s: &PlanStep| {
+            s.catalog == "produce"
+                && s.skill_ref.as_deref() == Some(crate::domain_extraction::EXTRACTOR_SKILL)
+                && s.instructions.is_none()
+        };
+        // The coverage judge as shipped (codex r2): any other skill or authored instructions make
+        // it code work, which delivers.
+        let judge = |s: &PlanStep| {
+            s.catalog == "domain_coverage"
+                && s.skill_ref.as_deref() == Some(crate::catalog::DOMAIN_COVERAGE_SKILL)
+                && s.instructions.is_none()
+                && !code_work_step(catalog, s)
+        };
+        self.steps.iter().any(mapping)
+            && !self.steps.iter().any(|s| code_work_step(catalog, s))
+            && self
+                .steps
+                .iter()
+                .filter(|s| is_creator_step(catalog, s))
+                .all(|s| mapping(s) || judge(s))
+    }
+
     /// (core#649 option A) The plan has a creator step, EVERY creator step declares
     /// `writes_nothing: true`, and it has no `run` step: no step of it changes the run's tree, so
     /// an empty scope is an honest answer. A `run` step is an arbitrary Tool command that the diff
@@ -1734,6 +1770,22 @@ pub fn floor_fill(
     }
     let mut floor = band_floor.clone();
     floor.extend(policy_floor.iter().map(|(t, _)| t.clone()));
+    // wicked-core#1338: a mapping plan delivers nothing, decided on the plan the floor leaves: the
+    // floor's `deliver` goes only while the floor adds no creator to it (codex r2: a floor-added
+    // `build` or `produce` is work to hand over).
+    if plan.maps_only_in(catalog) {
+        // The planner's one creator predicate (codex r3): a role, or a non-Tool entry that runs code.
+        let adds_creator = floor.iter().any(|t| {
+            let added = PlanStep {
+                catalog: t.clone(),
+                ..PlanStep::default()
+            };
+            is_creator_step(catalog, &added) && !plan.steps.iter().any(|s| &s.catalog == t)
+        });
+        if !adds_creator {
+            floor.retain(|t| t != "deliver");
+        }
+    }
     // Both halves are in catalog order; the union is too (a stable sort keeps the band's own
     // order, whose `produce` / `critique` substitutions sit in their catalog slots).
     floor.sort_by_key(|t| order(t));

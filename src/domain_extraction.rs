@@ -79,6 +79,11 @@ pub const RULES_REL: &str = ".wicked/domain/rules.json";
 /// incomplete domain model and failed every run of a large repository (rig run 7588cff1 on
 /// wicked-crew, 8,109 behaviours). Completeness is the coverage step's question, against the
 /// configured minimum; this review judges the rules that were stated.
+/// The skill the mapping preset's one creator step (`extract`, a `produce`) runs: it states rules
+/// into the run's own `.wicked/domain/` files, never a change to the repository (wicked-core#1338,
+/// [`crate::plan::PlanSteps::maps_only`]).
+pub const EXTRACTOR_SKILL: &str = "wicked-garden-domain-extractor";
+
 pub const RULES_REVIEW_INSTRUCTIONS: &str =
     "Review the rules the extract step stated in `.wicked/domain/rules.json` against the units of \
 `.wicked/domain/worklist.json`. This run maps the repository one page at a time: the worklist is \

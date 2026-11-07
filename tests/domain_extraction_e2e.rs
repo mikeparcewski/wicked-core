@@ -522,7 +522,17 @@ fn launch(core: &Core, run_id: &str, repo_ref: &str) {
         extra_read_roots: Vec::new(),
         project_graph: None,
         plan: None,
-        deliver_step: None,
+        // wicked-core#1338: crew's repo-scoped launches (and studio's wizard) send a deliver step.
+        // A mapping run never delivers, so the engine drops it: were it kept, this step (a command
+        // that fails) would be the run's last unit and the run could not complete.
+        deliver_step: Some(
+            serde_json::from_value(serde_json::json!({
+                "catalog": "deliver",
+                "id": "deliver",
+                "executor": {"type": "tool", "cmd": ["false"]}
+            }))
+            .expect("a deliver step"),
+        ),
         exclude_seats: Vec::new(),
         evidence_root: None,
         primary: None,
@@ -823,6 +833,23 @@ fn a_governed_run_produces_coverage_and_requirements_graph() {
     .expect("approve the domain-graph gate");
     wait_status(&core, "run-happy", SessionStatus::Completed)
         .expect("approving the final gate completes the governed run");
+    // wicked-core#1338: the launch's deliver step was dropped, so no unit delivers.
+    let done = core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == "run-happy")
+        .unwrap();
+    assert!(
+        done.units
+            .iter()
+            .all(|u| u.catalog.as_deref() != Some("deliver")),
+        "a mapping run has no deliver unit: {:?}",
+        done.units
+            .iter()
+            .map(|u| u.catalog.clone())
+            .collect::<Vec<_>>()
+    );
 }
 
 // --- TEST 2: a policy violation in a phase's output denies the phase ---

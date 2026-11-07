@@ -1291,7 +1291,7 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
             ..step("run", EXTRACT_PREPARE_STEP, Some("analyze"))
         },
         PlanStep {
-            skill_ref: Some("wicked-garden-domain-extractor".to_string()),
+            skill_ref: Some(crate::domain_extraction::EXTRACTOR_SKILL.to_string()),
             ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
         },
         // The page's own review (a `critique`, so the floor adds no generic one that judges a page
