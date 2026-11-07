@@ -165,7 +165,8 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// `interactive-draft` and `interactive-edit` (M9), `mcp-server` (M12), `editor-plugin` (X3), `learn` (DES-learn-workflow), `qe-author-tests` (M10) and `demo` (M9b,
 /// which replaces `interactive-demo` and `interactive-demo-reauthor` rather than mapping them), and the
 /// workflow-catalog gap fills `docs`, `validate-docs`, `test-plan` and `test-analysis` (new workflows as
-/// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row), and the
+/// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row), the
+/// read-only `sourced-report` (CS3: a cited report re-checked at its source), and the
 /// Apps presets `apps-turn` and `apps-publish` (DES-APPS-001 K0; fixed plans, [`crate::apps`]). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -293,6 +294,13 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
             catalog_preset(
                 include_str!("presets/security-review.json"),
                 "security-review",
+            ),
+        ),
+        (
+            "sourced-report",
+            catalog_preset(
+                include_str!("presets/sourced-report.json"),
+                "sourced-report",
             ),
         ),
         ("steering-author", steering_author_preset()),
@@ -686,6 +694,16 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             &[
                 "review this code for security issues",
                 "check our attack surface",
+            ],
+        ),
+        "sourced-report" => (
+            "Sourced report",
+            "A report from cited sources, every claim re-checked at its source by a seat that did not gather it, changing nothing.",
+            &[
+                "research a question with cited sources",
+                "compare products or vendors",
+                "due diligence or analysis of documents",
+                "critique a proposal, or estimate and price a scope",
             ],
         ),
         "suite-health" => (
@@ -1098,8 +1116,8 @@ fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
 /// plan over existing catalog entries and garden skills, judged by a rubric ([`crate::rubric`]) on
 /// its check step. The read-only ones (Investigate, Analyze, Judge: `investigate-incident`,
 /// `reconstruct`, `analyze-codebase`, `map-requirements`, `review-change`, `risk-analysis`,
-/// `security-review`, `privacy-review`, `compliance-review`, `decide`) and `plan` (its plan is the
-/// reply) have no creator, no Tool and no code step, so they never write and never deliver;
+/// `security-review`, `privacy-review`, `compliance-review`, `decide`, `sourced-report`) and `plan`
+/// (its plan is the reply) have no creator, no Tool and no code step, so they never write and never deliver;
 /// `refactor`, `release`, `scaffold`, `modernize` and `suite-health` change the repo.
 fn catalog_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)
@@ -2118,6 +2136,8 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             ("investigate-incident", "trace"),
             ("learn", "research"),
             ("mcp-server", "source-discovery"),
+            // (CS3) the sourced report's gatherers: every member reads, none writes.
+            ("sourced-report", "gather"),
         ]
         .iter()
         .map(|(a, b)| (a.to_string(), b.to_string()))
@@ -2357,7 +2377,7 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
 
     /// (DES-CATALOG-002 §3.1) The read-only verbs: every Investigate, Analyze and Judge preset —
     /// and Plan it, whose plan is its reply (a report, never a change).
-    const READ_ONLY_PRESETS: [&str; 12] = [
+    const READ_ONLY_PRESETS: [&str; 13] = [
         "plan",
         "investigate-incident",
         "reconstruct",
@@ -2370,6 +2390,7 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         "privacy-review",
         "compliance-review",
         "decide",
+        "sourced-report",
     ];
 
     /// (DES-CATALOG-002 §11 Lane A) Every Investigate, Analyze and Judge preset composes with no
@@ -2406,11 +2427,13 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             }
             let last = def.phases.last().unwrap();
             assert_eq!(last.catalog.as_deref(), Some("critique"), "{name}");
-            assert_eq!(
-                last.rubric.as_deref(),
-                Some(crate::rubric::CITED_FINDINGS),
-                "{name}"
-            );
+            // (CS3) a sourced report's check re-checks every claim at its source.
+            let want = if name == "sourced-report" {
+                crate::rubric::FIDELITY_TO_SOURCE
+            } else {
+                crate::rubric::CITED_FINDINGS
+            };
+            assert_eq!(last.rubric.as_deref(), Some(want), "{name}");
             // validate-docs keeps its own (no gate on `verify`, §5.2); every new one holds a FAIL.
             let gate = if name == "validate-docs" {
                 GateSpec::Auto
@@ -2455,6 +2478,162 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         assert!(!domain
             .iter()
             .any(|s| s.catalog == "deliver" || s.catalog == "build"));
+    }
+
+    /// (CS3) The sourced report's check keeps off every seat that gathered or synthesized it: both
+    /// `understand` steps are report gatherers (neither is the PA's `scope`), so under the
+    /// fidelity-to-source rubric every gather member's seat and the synthesize seat are authors of
+    /// the work the check judges.
+    #[test]
+    fn sourced_report_check_excludes_both_gatherers() {
+        let def = composed("sourced-report");
+        let ids: Vec<&str> = def.phases.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(ids, ["gather", "synthesize", "check"]);
+        let unit = |ord: u32, p: &crate::workflow::PhaseDef, seat: &str| {
+            let mut u = crate::domain::WorkUnit::pending(format!("s:{}", p.id), "s", ord, &p.id);
+            u.catalog = p.catalog.clone();
+            u.rubric = p.rubric.clone();
+            u.role = p.role;
+            u.owner = p.owner;
+            u.executes_code = p.executes_code;
+            let read = p.catalog.as_deref() == Some("understand");
+            u.stage = if read {
+                StageKind::Recon
+            } else {
+                StageKind::Review
+            };
+            // A read step the worktree guard held (as dispatch does for a read-only unit): its
+            // own seat authors nothing by dispatch, so only the report rule can count it.
+            u.worktree_guarded = read;
+            u.assigned_cli = Some(seat.into());
+            u
+        };
+        // gather is a team step: members on seats a and b, each stamped at dispatch.
+        let mut gather = unit(1, &def.phases[0], "a");
+        gather.gathered_by = vec!["a".into(), "b".into()];
+        let synthesize = unit(2, &def.phases[1], "c");
+        let check = unit(3, &def.phases[2], "d");
+        for read in [&gather, &synthesize] {
+            assert!(crate::pipeline::is_report_gatherer(read), "{}", read.id);
+            assert!(!crate::pipeline::authors_by_dispatch(read), "{}", read.id);
+        }
+        assert_eq!(
+            check.rubric.as_deref(),
+            Some(crate::rubric::FIDELITY_TO_SOURCE)
+        );
+        assert!(crate::rubric::excludes_gatherers(check.rubric.as_deref()));
+        let units = [gather.clone(), synthesize.clone(), check.clone()];
+        let mut authors = crate::pipeline::work_authors(&units, 3);
+        authors.sort();
+        assert_eq!(authors, ["a", "b", "c"]);
+        // Without the rubric the read steps author nothing: the exclusion is the report rule's.
+        let mut plain = check;
+        plain.rubric = None;
+        assert!(crate::pipeline::work_authors(&[gather, synthesize, plain], 3).is_empty());
+    }
+
+    /// (CS3) The sourced report runs garden's Report mode: gather runs the preflight and reads the
+    /// web only through the job's web source (no web: it records why and goes on), synthesize runs
+    /// the mechanical floor, and check is the learn skill's fidelity action ending in the VERDICT
+    /// rule, after both.
+    #[test]
+    fn sourced_report_steps_name_the_garden_report_mode() {
+        let steps = builtin_preset("sourced-report").expect("a built-in");
+        let step = |id: &str| {
+            steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap_or_else(|| panic!("no `{id}` step"))
+        };
+        let text = |id: &str| step(id).instructions.clone().unwrap_or_default();
+        let (gather, synthesize, check) = (text("gather"), text("synthesize"), text("check"));
+        assert!(gather.contains("report_check.py preflight"), "{gather}");
+        assert!(gather.contains("web source"), "{gather}");
+        assert!(
+            gather.contains("not-picked") && gather.contains("unavailable"),
+            "{gather}"
+        );
+        assert!(gather.contains("Never answer from memory"), "{gather}");
+        assert!(synthesize.contains("report_check.py check"), "{synthesize}");
+        assert!(check.contains("report_check.py check"), "{check}");
+        assert!(
+            check.ends_with("otherwise VERDICT: FAIL.")
+                && check.contains("VERDICT: PASS only when"),
+            "{check}"
+        );
+        for id in ["gather", "synthesize", "check"] {
+            assert_eq!(
+                step(id).skill_ref.as_deref(),
+                Some("wicked-garden-learn"),
+                "{id}"
+            );
+            assert!(
+                text(id).contains("$WICKED_GARDEN_ROOT/scripts/wicked-garden"),
+                "{id}"
+            );
+        }
+        assert_eq!(step("gather").owner, Some(StepOwner::Team));
+        assert_eq!(
+            step("check").depends_on.as_deref(),
+            Some(&["gather".to_string(), "synthesize".to_string()][..])
+        );
+        assert!(builtin_preset_descriptor("sourced-report").is_some());
+        // The composed check carries the rubric's change-nothing contract after the step's text.
+        let def = composed("sourced-report");
+        let composed_check = def
+            .phases
+            .iter()
+            .find(|p| p.id == "check")
+            .and_then(|p| p.instructions.clone())
+            .unwrap_or_default();
+        let floor = composed_check.find("--packet -").expect("the floor run");
+        let rubric = composed_check
+            .find("FIDELITY TO SOURCE (independent recheck):")
+            .expect("the rubric's contract");
+        assert!(floor < rubric, "{composed_check}");
+    }
+
+    /// (CS3, review r2) synthesize and check are read-only units, and a run with no repository
+    /// mints them no notes root, so they have NO place to write: both run the floor on the packet
+    /// through stdin (a quoted heredoc into `cat`, piped to the checker), which the read-only
+    /// fence admits, never by saving a packet file, which it refuses.
+    #[test]
+    fn sourced_report_runs_its_floor_through_stdin_on_a_read_only_seat() {
+        use crate::write_posture::WritePosture;
+        let def = composed("sourced-report");
+        let units = crate::plan::plan_from_def(&def, "Lens: research. Who sells X?", "rs");
+        let wt = std::path::Path::new("/wt");
+        let packet = r#"{"claims":[{"id":"C1","text":"A > B, and tee time; rm -rf / is quoted","sources":["S1"]}]}"#;
+        let stdin = format!(
+            "cat <<'PACKET' | \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run \
+             scripts/learn/report_check.py check --packet - --records /records\n{packet}\nPACKET"
+        );
+        let saved = format!("cat > /notes/packet.json <<'PACKET'\n{packet}\nPACKET");
+        for id in ["synthesize", "check"] {
+            let u = units
+                .iter()
+                .find(|u| u.phase_id() == Some(id))
+                .unwrap_or_else(|| panic!("no `{id}` unit"));
+            let text = u.instructions.clone().unwrap_or_default();
+            assert!(
+                text.contains("cat <<'PACKET' |") && text.contains("check --packet -"),
+                "{id}: {text}"
+            );
+            assert!(!text.contains("packet.json"), "{id}: {text}");
+            let posture = WritePosture::of(u, false);
+            assert_eq!(posture, WritePosture::ReadOnly, "{id}");
+            // Unbound: no notes root, so nothing is admitted.
+            assert!(
+                crate::write_posture::unit_admitted_roots(posture, u, &[]).is_empty(),
+                "{id}"
+            );
+            let deny = |cmd: &str| {
+                let ctx = serde_json::json!({ "command": cmd });
+                crate::gate_hook::phase_scope_denial(false, posture, &ctx, "Bash", wt, None, &[])
+            };
+            assert_eq!(deny(&stdin), None, "{id}: the stdin floor run is admitted");
+            assert!(deny(&saved).is_some(), "{id}: a saved packet is refused");
+        }
     }
 
     /// (DES-CATALOG-002 §5.1) QE acceptance is required by exactly the application-changing
@@ -2524,6 +2703,10 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         );
         assert_eq!(rubrics("test-plan"), p(&[("check", "cited-findings")]));
         assert_eq!(rubrics("docs"), p(&[("check", "fidelity-to-source")]));
+        assert_eq!(
+            rubrics("sourced-report"),
+            p(&[("check", "fidelity-to-source")])
+        );
         assert!(rubrics("scaffold").is_empty());
         // J4/J6: feature, bug, mcp-server and editor-plugin carry no rubric.
         for name in ["feature", "bug", "mcp-server", "editor-plugin"] {

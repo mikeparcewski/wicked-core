@@ -1,0 +1,34 @@
+{
+ "steps": [
+  {
+   "catalog": "understand",
+   "id": "gather",
+   "owner": "team",
+   "skill_ref": "wicked-garden-learn",
+   "instructions": "Follow the wicked-garden-learn skill's research action in REPORT MODE (its Report mode section and refs/report-claims.md); the brief's Lens line names the lens (no line: research). FIRST run the preflight: \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/report_check.py preflight --lens <lens> --records records/ and paste its JSON and exit code; exit 3 means this lens needs documents and none were staged: stop with its reason. Put the absolute documents path it prints (records) in your output for the later steps. Read only this job's sources: the documents under records/, the repository in scope, the project sources your tools list, the text the brief itself carries, and the web ONLY through the job's web source (its search and fetch tools; never curl or another fetcher). Paste each fetch result's receipt (its URL and fetched_at) verbatim in your output. If those tools are not in your list the web is not-picked; if a call is refused or the source is not installed it is unavailable: record which, with the reason, and go on with the rest. Record every source in the source log as you read it (a fetched page: url, title, observed_at = the receipt's fetched_at; a staged file: file, page, the exact quote; a repository file: path, line, the exact quote; a source call: source, tool, the read-only args verbatim, observed_at), and draft candidate claims, each tied to its source ids. Stop only when no document, repository, picked source, web or brief text is readable, and say what was missing. Never answer from memory. READ-ONLY: create, edit or delete no file in any repository, commit nothing, and run no command that writes there; scratch goes in your notes folder."
+  },
+  {
+   "catalog": "understand",
+   "id": "synthesize",
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "gather"
+   ],
+   "instructions": "Follow the wicked-garden-learn skill's synthesize action in REPORT MODE and the lens ref the brief's Lens line names (refs/report-<lens>.md). Merge the gatherers' source logs into one, renumbered S1..Sn (one record per page, per quote and per call); number the claims C1..Cn, each citing the source ids it rests on; write the report in the lens's shape, every factual sentence citing its claim ids and ending with ## Sources. Run the floor on the packet (refs/report-claims.md) through stdin, writing no file (a run with no repository has no notes folder), with absolute paths: cat <<'PACKET' | \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/report_check.py check --packet - --records <the documents path gather printed> --repo <the repository root, when a code source is cited>, then the packet's JSON, then a line PACKET (leave out --records only when no documents were staged); fix every finding except a quote-not-found-in-pdf-text you confirmed on the pdf page (name it as an extraction loss), and paste the final JSON and exit code. Put the full packet in your output as one json block, with the fetch receipts gather pasted. READ-ONLY: create, edit or delete no file in any repository and commit nothing."
+  },
+  {
+   "catalog": "critique",
+   "id": "check",
+   "rubric": "fidelity-to-source",
+   "skill_ref": "wicked-garden-learn",
+   "depends_on": [
+    "gather",
+    "synthesize"
+   ],
+   "gate": {
+    "human_confirm_if": "verdict_not_pass"
+   },
+   "instructions": "Follow the wicked-garden-learn skill's fidelity action (refs/report-check.md) as the independent evaluator; if you gathered or synthesized any of this report, say so and give no VERDICT line. Run the floor yourself on synthesize's packet (its json block, verbatim) through stdin, writing no file, with absolute paths: cat <<'PACKET' | \"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/learn/report_check.py check --packet - --records <the documents path gather printed> --repo <the repository root, when a code source is cited>, then the packet's JSON, then a line PACKET (leave out --records only when no documents were staged); paste its JSON and exit code. Match every web record to a fetch receipt gather pasted (same URL, observed_at = fetched_at); a record with no receipt is a finding. Then re-check EVERY claim at its source yourself: re-fetch each URL through the job's web source, open each file at its page and each repository file at its line and find the quote, re-call each source's tool with the record's args, read-only. A claim holds, does not hold, or is unverified. Output the checked report with every claim that does not hold or is unverified removed and listed under ## Did not hold at the check, then the findings citing claim and source ids, then the counts (checked, held, did not hold, unverified, the floor's exit code). Change nothing: create, edit or delete no file in any repository and commit nothing. Last line VERDICT: PASS only when the floor is clean (apart from extraction losses you confirmed on the pdf page) and every claim holds; otherwise VERDICT: FAIL."
+  }
+ ]
+}

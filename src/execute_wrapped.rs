@@ -13417,6 +13417,7 @@ mod tests {
                 "scaffold/security",
                 "scaffold/test",
                 "security-review/review",
+                "sourced-report/check",
                 "suite-health/review",
                 "suite-health/verify",
                 "test-analysis/verify",
