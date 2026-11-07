@@ -524,6 +524,9 @@ pub(crate) fn changed_since(
     )?))
 }
 
+/// How long [`paths_since_commit`]'s object read may take.
+const PATHS_SINCE_BUDGET: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The repo-relative paths the snapshot `snap` (its content tree) changed since `commit` (the run's
 /// base), through the snapshot's PINNED git dir: an object read over two trees, so neither the
 /// worktree's own `.git` file, its index (an `assume-unchanged` bit), nor any other branch can hide
@@ -540,9 +543,11 @@ pub(crate) fn paths_since_commit(
         .git_dir
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("the snapshot carries no pinned git dir"))?;
-    let raw = git(
-        worktree,
-        &[
+    // Bounded, and never a lazy fetch of a missing object in a partial clone: this runs inside a
+    // dispatch on the single writer (codex r2).
+    let mut child = Command::new("git")
+        .hardened()
+        .args([
             "diff-tree",
             "-r",
             "-z",
@@ -550,9 +555,45 @@ pub(crate) fn paths_since_commit(
             "--no-renames",
             commit,
             &snap.tree,
-        ],
-        &[("GIT_DIR", Path::new(git_dir)), ("GIT_WORK_TREE", worktree)],
-    )?;
+        ])
+        .current_dir(worktree)
+        .env("GIT_DIR", git_dir)
+        .env("GIT_WORK_TREE", worktree)
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + PATHS_SINCE_BUDGET;
+    let mut out = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git diff-tree has no stdout"))?;
+    let reader = std::thread::spawn(move || {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        let _ = out.read_to_end(&mut buf);
+        buf
+    });
+    let raw = loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let raw = reader.join().unwrap_or_default();
+                if !status.success() {
+                    anyhow::bail!("git diff-tree {commit} {} failed ({status})", snap.tree);
+                }
+                break raw;
+            }
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader.join();
+                anyhow::bail!("git diff-tree exceeded {}s", PATHS_SINCE_BUDGET.as_secs());
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
     Ok(parse_name_status_z(&raw)
         .into_iter()
         .map(|c| c.path)

@@ -1148,9 +1148,11 @@ pub fn touched_requirements(
     let mut out = Vec::new();
     for c in code {
         for e in store.neighbors(&c.symbol, Direction::Dependents)? {
+            // One entry per requirement AND touched code (codex r2): a requirement two touched
+            // units satisfy is listed with each, so neither one's mismatch is lost.
             if e.kind != EdgeKind::SatisfiedBy
                 || e.target != c.symbol
-                || !seen.insert(e.source.clone())
+                || !seen.insert((e.source.clone(), c.symbol.clone()))
             {
                 continue;
             }
@@ -1187,8 +1189,15 @@ pub fn touched_requirements(
             });
         }
     }
-    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.code.cmp(&b.code)));
     Ok(out)
+}
+
+/// The store's current requirements build: its generation (0 = none) and the commit it was made from.
+/// Read before and after a multi-step read, it says whether a build landed in between.
+pub fn build_identity(store: &dyn GraphRead) -> anyhow::Result<(u64, Option<String>)> {
+    let r = read_build_record(store)?;
+    Ok((r.generation, r.code_commit))
 }
 
 /// The commit the store's current requirements build was made from (`None`: nothing built, or a
