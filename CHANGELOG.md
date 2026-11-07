@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The `sourced-report` preset (program CS3, core half).** A read-only workflow behind the Research, Competitive,
+  Due diligence, Analyze documents, Critique and Estimate cards: `gather` (team, `understand`) runs garden's learn skill
+  in Report mode, starting with `report_check.py preflight` (a lens that needs documents stops when none are staged)
+  and reading the web only through the job's web source (no web: it records `not-picked` or `unavailable` and goes on);
+  `synthesize` (`understand`) writes the cited packet and runs `report_check.py check` on it through stdin (a
+  read-only seat on a run with no repository has nowhere to write a file); `check`
+  (`critique`, rubric `fidelity-to-source`, the learn skill's fidelity action) re-checks every claim at its source on
+  a seat that neither gathered nor synthesized it, and a FAIL is held for a person. No creator, no Tool, no deliver,
+  no QE acceptance. Built-in list entry and descriptor ("Sourced report"). The garden half is wicked-garden#1428.
+
 - **Editor conformance requires cases 7 and 18 (program S9).** `CASES` grows from 12 to 14 ids to match garden's
   `CASES_V1` (wicked-garden#1424) and crew's `CONFORMANCE_CASES` (wicked-crew#1399): `7-edit` (the editor saves
   through its own UI: a visible control marked `data-wicked-save` makes exactly one version) after `6-forwarding`,
