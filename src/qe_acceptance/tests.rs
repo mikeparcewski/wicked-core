@@ -39,6 +39,7 @@ fn session(assurance: RunAssurance) -> AgentSession {
         evidence_root: None,
         assurance,
         power: None,
+        run_context: None,
     }
 }
 

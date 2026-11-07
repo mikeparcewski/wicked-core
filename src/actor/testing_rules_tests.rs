@@ -66,6 +66,7 @@ fn session(run: &str) -> AgentSession {
         evidence_root: None,
         assurance: Default::default(),
         power: None,
+        run_context: None,
     }
 }
 

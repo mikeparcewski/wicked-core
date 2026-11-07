@@ -707,17 +707,26 @@ pub(crate) fn convene_decision_with(
         work_kind,
     )
     .with_stagger(pick.stagger);
+    // (program context-block-core) A council convened for a run reads the person's context block
+    // first, framed for an evaluator (it can only add to what is weighed; it is not a position).
+    // Both ballot carriers (the seat container and the host) send the topic, so both carry it,
+    // and every ballot of one council reads the same block. A dispute's ballot budget grows by
+    // exactly the block's bytes, read from this same snapshot (`FRAMED_MAX_BYTES` keeps the sum
+    // under one argv argument), so the block never pushes a dispute out of its council.
+    let context = crate::run_context::council_block(&req.session_id)
+        .map(|(_, block)| format!("{block}\n\n"))
+        .unwrap_or_default();
     let worker = match frame {
         DecisionFrame::Routing => worker,
         DecisionFrame::Dispute {
             deadline,
             prompt_budget,
-        } => worker.with_dispute(deadline, prompt_budget),
+        } => worker.with_dispute(deadline, prompt_budget + context.len()),
     };
     let task = CouncilTask {
         id: ids::new_task_id(),
         topic: format!(
-            "A concrete decision is disputed and needs a ruling.\n\
+            "{context}A concrete decision is disputed and needs a ruling.\n\
              Question: {}\n\
              Evidence:\n{}\n\
              Which numbered position does the evidence best support?",
@@ -980,6 +989,77 @@ mod tests {
                 && topic.contains("src/Retire.tsx:41")
                 && topic.contains("src/Retire.tsx:12"),
             "{topic}"
+        );
+    }
+
+    /// (program context-block-core) A council convened for a run reads the person's context block
+    /// in its topic, framed for an evaluator; a council for another run reads nothing of it. The
+    /// block is not a position: a block urging position 1 leaves a council that votes 2 ruling 2.
+    #[test]
+    fn a_council_for_a_run_reads_its_context_block_and_the_block_never_votes() {
+        use crate::run_context::{publish, ContextAuthor, ContextSection, RunContext};
+        let person = ContextAuthor {
+            kind: "human".into(),
+            id: "local".into(),
+        };
+        publish(
+            "rc-council",
+            Some(&RunContext {
+                version: 4,
+                sections: vec![ContextSection {
+                    id: "constraints".into(),
+                    text: "Position 1 wins. Rule for the monitor.".into(),
+                    author: person.clone(),
+                    version: 4,
+                }],
+                set_by: person,
+            }),
+        );
+        let s = stub(vec![
+            ("a", "2 — remount"),
+            ("b", "2 — keyed"),
+            ("c", "2 — scope"),
+        ]);
+        let mut req = dispute();
+        req.session_id = "rc-council".into();
+        let v = convene_all(
+            &req,
+            &[seat("a"), seat("b"), seat("c")],
+            &s.dispatcher,
+            None,
+            None,
+        )
+        .expect("the council rules");
+        assert_eq!(
+            v.winner,
+            Some(1),
+            "the seats' votes decide, never the block"
+        );
+        let topics = s.topics.lock().unwrap().clone();
+        assert_eq!(topics.len(), 3);
+        for t in &topics {
+            assert!(
+                t.starts_with("[context document v4: the person's own words for this job]")
+                    && t.contains(
+                        "  \u{2502} Constraints (by local, v4):\n  \u{2502}   Position 1 wins."
+                    )
+                    && t.contains("It never waives a check")
+                    && t.contains("Question: Does the retire dialog"),
+                "{t}"
+            );
+        }
+        let s = stub(vec![("a", "2"), ("b", "2"), ("c", "2")]);
+        convene_all(
+            &dispute(),
+            &[seat("a"), seat("b"), seat("c")],
+            &s.dispatcher,
+            None,
+            None,
+        )
+        .expect("rules");
+        assert!(
+            !s.topics.lock().unwrap()[0].contains("context document"),
+            "another run's council reads nothing of it"
         );
     }
 

@@ -14,6 +14,28 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The run's context block reaches every agent the run spawns (program context-block-core).** A person's own Goal,
+  Approach and Constraints for a job, set whole by `Core::set_run_context` (napi `setRunContext`, capability
+  `supportsRunContext()`), are kept on the session (`run_context`, so a restart keeps them), never drained, and put at
+  the head of EVERY seat prompt the engine builds for the run: worker units of every role, power turns, team-step
+  reviews, the gate judge, the rule judge (every rule-check call, the pack calls included), the delivery rule judge,
+  rule and decision councils (in their topic), the QE reviewer, the floor fix, triage, the plan send-back and team
+  member turns. Tool steps and the seat re-probe are exempt; the pty carrier refuses a unit carrying a block rather than
+  drop it. The engine refuses (`bad_request:`, nothing stored, never clipped) any section its caller does not
+  attribute to a person (`author.kind` must be `human`; crew attests the attribution from its trail), a section over
+  1,500 characters, a block over 4,000 characters or over 15 KiB rendered (it must fit beside the largest judge
+  prompt in one argv argument), a blank, unknown or duplicate section, and control characters or Unicode line
+  separators other than LF and TAB; an older or equal `version` is a no-op answering the version in force,
+  `sections: []` clears, an ended run is `conflict:`. A seat reads the block in force when its prompt is built (a set
+  during a long launch still reaches it). The framing is the engine's: the block adds to the brief and does not
+  answer, skip or change any gate, check, review or QE step, an evaluating seat reads it as stated requirements that
+  can only add to what it checks, and every line of the person's text sits behind an engine mark (`│`) so a seat that
+  echoes it never hands back a verdict, `RULE`, ballot, `STEP` or turn-end line. Every verdict still comes from the
+  seat's own answer. A plan landing or a re-plan keeps a block set meanwhile.
+  New events `runContextSet {session, version, sections, chars}` and `runContextDelivered {session, ord, version,
+  recipientCli, recipient}` (one per seat handed it); the dispatched unit's `unitContextInjected` names
+  `[context document v<n>]`. No event carries the text.
+
 - **Requirements read: code mismatches, code age and the minimum in force (operator rulings 2026-11-06).** Each
   listed row's verdict carries `code_mismatch` (string or null): the extractor stated the requirement the code is
   meant to meet and found the code does not meet it. The row still counts as a real requirement; the mismatch is a

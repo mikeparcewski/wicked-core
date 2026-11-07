@@ -4197,6 +4197,10 @@ fn run_unit_and_judge_on(
     Option<crate::validator::AgentVerdict>,
     crate::workflow::UnitEvidence,
 ) {
+    // (program context-block-core) THE choke point: every seat this unit launches — the unit, its
+    // power turns, its judges, its rule judge, its QE reviewer, its floor fix — carries the run's
+    // context block in force at its launch (`run_context::Stamping`).
+    let runner = &crate::run_context::Stamping::wrap(runner.clone(), &input.run_id, input.unit.ord);
     // (power-speed-2) The scope the unit's early floor runs in: it is joined where the floor's
     // result is read, and in any case before this returns.
     std::thread::scope(|scope| {

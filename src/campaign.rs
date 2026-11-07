@@ -2397,6 +2397,7 @@ mod tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         put_node(
@@ -2568,6 +2569,7 @@ mod tests {
                 evidence_root: None,
                 assurance: Default::default(),
                 power: None,
+                run_context: None,
             };
             put_node(&mut store, session.to_node()).unwrap();
             put_node(

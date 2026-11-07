@@ -932,6 +932,25 @@ pub(crate) fn run(
              def, but `chat` and `onboarding` have none and are refused until a boot seeds them"
         );
     }
+    // (program context-block-core) Publish every live run's context block from its session BEFORE
+    // anything can dispatch, drain or supervise: a restarted engine builds no seat of a run
+    // without the person's words (dispatch, councils, triage and the send-back re-prime too).
+    match crate::domain::all_sessions(&store) {
+        Err(e) => eprintln!(
+            "wicked-core: boot could not read the sessions to publish their context blocks \
+             (each run's next dispatch publishes its own): {e:#}"
+        ),
+        Ok(sessions) => {
+            for s in sessions.iter().filter(|s| {
+                !matches!(
+                    s.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                )
+            }) {
+                crate::run_context::publish(&s.id, s.run_context.as_ref());
+            }
+        }
+    }
     // DES-TEAMING-002 P1 boot reconcile, BEFORE anything can dispatch or drain: a live team run
     // with no acknowledged `path.started` is tombstoned and then set `transport: none`; a run
     // caught mid-fact re-opens its `team_transport` pause. Only then does the publisher drain the
@@ -1729,6 +1748,7 @@ pub(crate) fn run(
                         // Typed, so the bus bridge drops a request that will never launch
                         // instead of retrying it forever.
                         .map_err(|e| anyhow::Error::new(crate::assurance::QeOverrideRefused(e)))?,
+                        run_context: None,
                     };
                     // ONE batch: the launch record and (when filed) its membership commit together
                     // — a crash between "run exists" and "run is in the project" cannot happen.
@@ -3167,6 +3187,8 @@ pub(crate) fn run(
                     .flatten();
                 let clis =
                     council_roster(session.as_ref(), clis, in_process_governance().is_some());
+                // (program context-block-core) The council's topic carries the run's block.
+                let context_tx = council_context_primed(session.as_ref(), &self_tx);
                 // The system setting (size, stagger) and a fresh seed, read per council.
                 let pick = crate::decision::CouncilPick::from_env();
                 // (core#590 S5) The ballots are slow subprocess turns: run them off the actor
@@ -3197,6 +3219,7 @@ pub(crate) fn run(
                         })
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("decision council thread panicked")));
+                    council_context_delivered(context_tx, &req, &result);
                     let _ = reply.send(result);
                 });
             }
@@ -3221,6 +3244,9 @@ pub(crate) fn run(
                     .flatten();
                 let clis =
                     council_roster(session.as_ref(), clis, in_process_governance().is_some());
+                // (program context-block-core) The topic carries the run's block (its ballot budget
+                // grows by the block's bytes in `decision::convene_decision_with`).
+                let context_tx = council_context_primed(session.as_ref(), &self_tx);
                 let pick = crate::decision::CouncilPick::from_env();
                 let (disp, ballots_in) = ballot_dispatcher(
                     &dispatcher,
@@ -3249,6 +3275,7 @@ pub(crate) fn run(
                         })
                     }))
                     .unwrap_or_else(|_| Err(anyhow::anyhow!("rule council thread panicked")));
+                    council_context_delivered(context_tx, &req, &result);
                     // The last ballot has returned: the host slot is free.
                     drop(lock);
                     let _ = reply.send(result);
@@ -4245,6 +4272,9 @@ pub(crate) fn run(
                                 .team
                                 .clone()
                                 .filter(|t| t.is_teamed() && t.pending.is_none())?;
+                            // (program context-block-core) The supervisor may replay member turns
+                            // before any dispatch: the run's block is published first.
+                            crate::run_context::publish(&s.id, s.run_context.as_ref());
                             Some(crate::team::publish::LiveTeamRun {
                                 run_id: s.id,
                                 status: s.status,
@@ -4331,6 +4361,9 @@ pub(crate) fn run(
                     }
                 }
                 emit(&mut subscribers, *event);
+            }
+            Command::SetRunContext { run_id, ctx, reply } => {
+                let _ = reply.send(set_run_context(&mut store, &mut subscribers, &run_id, ctx));
             }
             Command::SetPowerMode {
                 run_id,
@@ -4641,6 +4674,55 @@ fn council_roster(
 /// (DES-RULE-CHECK-001 rev 2, A.6) Charge one rule council to `run_id`'s unit `ord`, durably:
 /// `false` (nothing charged) once the run's units have spent [`crate::rule_check::RUN_COUNCILS`]
 /// between them, across every gate, attempt, send-back and re-check.
+/// (program context-block-core) Replace `run_id`'s context block whole: checked in the ENGINE
+/// (only a person's words, bounded, never clipped — `run_context::validate`), persisted on the
+/// session, published for the run's seats, and announced (`runContextSet`, no text). An older or
+/// equal version is a no-op answering the version in force.
+fn set_run_context(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    ctx: crate::run_context::RunContext,
+) -> anyhow::Result<crate::run_context::RunContextAck> {
+    let mut session = crate::domain::get_session(&*store, run_id)?
+        .ok_or_else(|| anyhow::anyhow!("not_found: run {run_id}"))?;
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) {
+        anyhow::bail!("conflict: run {run_id} has ended; its context block can no longer change");
+    }
+    // An older or equal version is a no-op whatever it carries (codex r2): the contract answers
+    // the version in force before anything else is read.
+    if let Some(held) = &session.run_context {
+        if ctx.version <= held.version {
+            return Ok(crate::run_context::RunContextAck {
+                version: held.version,
+                accepted: false,
+            });
+        }
+    }
+    let ctx = crate::run_context::validate(ctx)?;
+    let ack = crate::run_context::RunContextAck {
+        version: ctx.version,
+        accepted: true,
+    };
+    let (sections, chars) = (ctx.section_ids(), ctx.chars());
+    session.run_context = Some(ctx);
+    put_node(store, session.to_node())?;
+    crate::run_context::publish(run_id, session.run_context.as_ref());
+    emit(
+        subscribers,
+        CoreEvent::RunContextSet {
+            session: run_id.to_string(),
+            version: ack.version,
+            sections,
+            chars,
+        },
+    );
+    Ok(ack)
+}
+
 fn reserve_rule_council(
     store: &mut dyn GraphStore,
     run_id: &str,
@@ -4658,6 +4740,39 @@ fn reserve_rule_council(
     unit.rule_councils += 1;
     put_node(store, unit.to_node())?;
     Ok(true)
+}
+
+/// (program context-block-core) Publish the council's run block from its session (a restarted
+/// engine re-primes here) and hand back the emit channel when a block is in force — `None` when the
+/// council belongs to no run or the run has none.
+fn council_context_primed(
+    session: Option<&AgentSession>,
+    self_tx: &Sender<Command>,
+) -> Option<(Sender<Command>, u64)> {
+    let s = session?;
+    crate::run_context::publish(&s.id, s.run_context.as_ref());
+    crate::run_context::current(&s.id).map(|c| (self_tx.clone(), c.version))
+}
+
+/// (program context-block-core) One `runContextDelivered` per seat the council seated: each was
+/// handed a topic carrying the block.
+fn council_context_delivered(
+    context: Option<(Sender<Command>, u64)>,
+    req: &crate::decision::DecisionRequest,
+    result: &anyhow::Result<crate::decision::DecisionVerdict>,
+) {
+    let (Some((tx, version)), Ok(v)) = (context, result) else {
+        return;
+    };
+    for seat in &v.seats {
+        let _ = tx.send(Command::EmitEvent(CoreEvent::RunContextDelivered {
+            session: req.session_id.clone(),
+            ord: req.ord,
+            version,
+            recipient_cli: seat.clone(),
+            recipient: "council".to_string(),
+        }));
+    }
 }
 
 /// (C5 follow-up) The dispatcher a decision council's ballots go through, and where they run.
@@ -7296,7 +7411,9 @@ fn apply_step_result(
                         .map(|c| c.headless_invocation)
                 });
                 let tx = self_tx.clone();
-                let runner2 = runner.clone();
+                // (program context-block-core) The triage judge reads the run's context block.
+                crate::run_context::publish(&run_id, session.run_context.as_ref());
+                let runner2 = crate::run_context::Stamping::wrap(runner.clone(), &run_id, unit.ord);
                 let run_id2 = run_id.clone();
                 let unit_ix2 = output.unit_ix;
                 let attempt2 = output.attempt;
@@ -11937,7 +12054,25 @@ fn dispatch_unit(
     // (EVT-007) Emit UnitContextInjected when prior outputs are being injected — a cross-CLI carry-over
     // or a declared `depends_on` handoff (FINDING-024). Before that fix this fired only on multi-CLI
     // runs, so its ABSENCE was the observable that proved every single-CLI phase ran context-free.
-    if !context_items.is_empty() {
+    // (program context-block-core) The run's context block, durable on the session: published
+    // for this unit's seats BEFORE any of them is built (a restarted engine re-primes here), and
+    // named on the unit's context event. The carrier renders it (not a prior output: never clipped,
+    // never read as an earlier phase's work).
+    crate::run_context::publish(run_id, session.run_context.as_ref());
+    let run_context_item = (unit.tool_cmd.is_none())
+        .then(|| crate::run_context::current(run_id))
+        .flatten()
+        .map(|ctx| {
+            let framed = crate::run_context::frame(&ctx, crate::run_context::evaluates(unit));
+            let mut item = crate::event::InjectedContext::new(
+                unit.ord,
+                crate::run_context::injected_label(ctx.version),
+                framed.len(),
+            );
+            item.deliver(&framed, 1);
+            item
+        });
+    if !context_items.is_empty() || run_context_item.is_some() {
         // (core#554) Each item reports what the worker RECEIVES, after the carriers' shared clip
         // (`clip_prior_output`, sized by the block count) — the items and the outputs are pushed
         // in lockstep above, so they pair by index.
@@ -11946,6 +12081,7 @@ fn dispatch_unit(
         for (item, p) in context_items.iter_mut().zip(&prior_outputs) {
             item.deliver(&p.output, count);
         }
+        context_items.extend(run_context_item);
         emit(
             subscribers,
             CoreEvent::UnitContextInjected {
@@ -12158,7 +12294,8 @@ fn dispatch_unit(
                     exclude_seats: unit.exclude_seats.clone(),
                     pool,
                     registry,
-                    runner: runner.clone(),
+                    // (program context-block-core) The delivery-stage rule judge reads the block.
+                    runner: crate::run_context::Stamping::wrap(runner.clone(), run_id, unit.ord),
                     prior: unit.rule_check.clone(),
                     skips: unit.rule_skips.clone(),
                     instructions: crate::rule_check::instructions_of(&words),
@@ -14993,6 +15130,8 @@ fn start_send_back(
         team.open_gate = None;
     }
     put_node(store, session.to_node())?;
+    crate::run_context::publish(run_id, session.run_context.as_ref());
+    let send_back_ord = ord;
     let prompt = crate::plan_gate::send_back_prompt(&pending, &done, &note);
     // A lead that never answers cannot hold the run: past the bound the send-back fails (the held
     // rev re-opens), and a late answer finds its token gone.
@@ -15044,8 +15183,11 @@ fn start_send_back(
             launch_seq: 0,
             required_skills: Vec::new(),
         };
+        // (program context-block-core) The lead re-plans with the person's context block, and
+        // its answer is read without its echo of it.
+        let stamped = crate::run_context::Stamping::wrap(runner.clone(), &rid, send_back_ord);
         let out =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runner.run_unit(&input)));
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stamped.run_unit(&input)));
         runner.on_run_complete(&one_shot);
         let result = match out {
             Ok(o) if o.status == crate::workflow::StepStatus::Ok => Ok(o.output),
@@ -19400,6 +19542,7 @@ mod sessions_detail_fold_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 
@@ -19500,6 +19643,7 @@ mod gate_pause_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
     fn unit(ord: u32, gate: GateSpec, status: UnitStatus) -> WorkUnit {
@@ -19824,6 +19968,7 @@ mod terminal_gate_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One APPROVED terminal unit whose OWN gate is `terminal_gate`.
@@ -20123,6 +20268,7 @@ retry the deliver phase";
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(
@@ -20862,6 +21008,7 @@ mod substance_gate_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -22838,6 +22985,7 @@ mod request_changes_tests {
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -22920,6 +23068,7 @@ mod request_changes_tests {
             // (core#850) One seat: its review rides the creator's seat by the explicit opt-in.
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let phases = [
@@ -24286,6 +24435,7 @@ mod request_changes_tests {
             evidence_root: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         for (ix, (phase, role)) in [
@@ -24433,6 +24583,7 @@ mod request_changes_tests {
             evidence_root: None,
             assurance: crate::assurance::RunAssurance::new(None, true),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         for (ix, (phase, role)) in [
@@ -25123,6 +25274,7 @@ mod request_changes_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         s.assurance.floor_overrides = overrides
             .into_iter()
@@ -28694,6 +28846,7 @@ mod code_evidence_floor_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:build"), run_id, 1, "build the feature");
@@ -29297,6 +29450,7 @@ mod deliverable_floor_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -29825,6 +29979,7 @@ mod seat_failover_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
     }
@@ -31025,6 +31180,7 @@ mod def_gate_disclosure_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("d:u1", "d", 1, "clarify the problem");
@@ -31138,6 +31294,7 @@ mod def_gate_disclosure_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending("d:u1", "d", 1, "the verdict phase");
@@ -31241,6 +31398,7 @@ mod def_gate_disclosure_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u1 = WorkUnit::pending("rl:u1", "rl", 1, "build the feature");
@@ -31602,6 +31760,7 @@ mod terminal_worktree_reap_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         (root, wt)
@@ -32108,6 +32267,7 @@ mod terminal_worktree_reap_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         let term_session = AgentSession {
             id: "s-term".into(),
@@ -32286,6 +32446,7 @@ mod worker_code_graph_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 
@@ -32728,6 +32889,7 @@ mod project_graph_binding_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 
@@ -33482,6 +33644,7 @@ mod phase_boundary_governance_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         // One unit at ord=1 (phase "unit-1").
@@ -33951,6 +34114,7 @@ mod turn_timeout_vs_cancel_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "work");
@@ -34737,6 +34901,7 @@ mod turn_timeout_vs_cancel_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "work");
@@ -34803,6 +34968,7 @@ mod turn_timeout_vs_cancel_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         let archived = AgentSession {
             id: "s-archived".into(),
@@ -34887,6 +35053,7 @@ mod turn_timeout_vs_cancel_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         assert_eq!(eligible_roster_keys(&session), vec!["a", "b", "c"]);
         assert!(crate::domain::bench_seat(
@@ -35802,6 +35969,7 @@ mod dead_seat_park_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let u = WorkUnit::pending(format!("{run_id}:u1"), run_id, 1, "build the feature");
@@ -35950,6 +36118,7 @@ mod plan_gate_confirm_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut u1 = WorkUnit::pending("r:understand", "r", 1, "understand the problem");
@@ -36335,6 +36504,7 @@ mod catalog_alias_governance_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(&mut store, session.to_node()).unwrap();
         let mut u = WorkUnit::pending(format!("r:{phase_id}"), "r", 1, "a unit");
@@ -36461,6 +36631,7 @@ mod consent_plan_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         };
         put_node(store, session.to_node()).unwrap();
         let mut plan = WorkUnit::pending(format!("{run_id}:install-plan"), run_id, 1, "plan");
@@ -36750,6 +36921,7 @@ mod work_author_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 
@@ -36965,6 +37137,7 @@ mod council_ballot_tests {
             evidence_root: None,
             assurance: Default::default(),
             power: None,
+            run_context: None,
         }
     }
 

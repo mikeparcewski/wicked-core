@@ -534,6 +534,7 @@ mod tests {
                 assurance: Default::default(),
                 intent_amendments: vec![],
                 power: None,
+                run_context: None,
             };
             // Seed before the actor starts; never open a second writer beside it.
             {

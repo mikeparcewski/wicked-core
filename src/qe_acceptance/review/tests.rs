@@ -47,6 +47,7 @@ fn session(clis: &[&str], reduced: bool) -> AgentSession {
         evidence_root: None,
         assurance: RunAssurance::new(Some(&declared), reduced),
         power: None,
+        run_context: None,
     }
 }
 

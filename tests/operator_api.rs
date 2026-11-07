@@ -146,6 +146,7 @@ mod tests {
             rule_instructions: None,
             rule_deliver_tokens: Vec::new(),
             read_view: None,
+            run_context: None,
         }
     }
 

@@ -1099,6 +1099,15 @@ impl Core {
         true
     }
 
+    /// (program context-block-core) Whether this addon takes a run's context block:
+    /// `setRunContext`, the `runContextSet` / `runContextDelivered` events and the session's
+    /// `run_context`. An older addon has no `setRunContext`, so crew keys on this static first and
+    /// keeps its standing note without it.
+    #[napi]
+    pub fn supports_run_context() -> bool {
+        true
+    }
+
     /// (program DES-POWER-MODE) Whether this addon runs power mode: `LaunchOptions.power`,
     /// `setPowerMode`, `raiseRigor`, `answerPowerPause` and the power events. An older addon
     /// ignores `power` (napi drops an undeclared field), so a launcher keys on this first.
@@ -2998,6 +3007,23 @@ impl Core {
         })
     }
 
+    /// (program context-block-core) Replace a run's context block WHOLE: `contextJson` is
+    /// `{ version, sections: [{ id: "goal"|"approach"|"constraints", text, author: { kind: "human",
+    /// id }, version }], set_by: { kind: "human"|"system", id } }`. Resolves to `{ version,
+    /// accepted }` (an older or equal version is a no-op, `accepted: false`). Rejects with
+    /// `bad_request:` (a section not a person's, oversize, blank, unknown; never clipped),
+    /// `not_found:` or `conflict:` (the run has ended).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn set_run_context(&self, run_id: String, context_json: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let ctx: wicked_core::run_context::RunContext = serde_json::from_str(&context_json)
+                .map_err(|e| err(format!("bad_request: the run context is not readable: {e}")))?;
+            let ack = core.set_run_context(&run_id, ctx).map_err(err)?;
+            serde_json::to_string(&ack).map_err(err)
+        })
+    }
+
     /// (program DES-POWER-MODE) Flip a run's power switch. Resolves to the run's power state as
     /// JSON (`PowerState`, camelCase). Rejects with `not_found:` / `conflict:` / `refused:`.
     #[napi(ts_return_type = "Promise<string>")]
@@ -4188,6 +4214,27 @@ mod tests {
             },
             "workerMessageInjected",
             &["type", "session", "message", "target"],
+        );
+        check(
+            CoreEvent::RunContextSet {
+                session: s(),
+                version: 2,
+                sections: vec!["goal".into()],
+                chars: 3,
+            },
+            "runContextSet",
+            &["type", "session", "version", "sections", "chars"],
+        );
+        check(
+            CoreEvent::RunContextDelivered {
+                session: s(),
+                ord: 1,
+                version: 2,
+                recipient_cli: s(),
+                recipient: s(),
+            },
+            "runContextDelivered",
+            &["type", "session", "ord", "version", "recipientCli", "recipient"],
         );
         check(
             CoreEvent::AssumptionRecorded {
