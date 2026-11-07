@@ -1111,28 +1111,26 @@ const RISK_ANN: &str = "risk";
 /// A `code_mismatch` annotation (operator ruling 2026-11-06): the extractor stated the requirement the
 /// code is meant to meet AND found the code does not meet it (e.g. a sum that skips the first element).
 /// The requirement still counts as real; the mismatch is a finding beside it, read per row
-/// ([`ListedRow::code_mismatch`]). A node's mismatch is its newest `code_mismatch` annotation stamped
-/// no earlier than its newest `business_rule`: a later restatement with no mismatch supersedes it
-/// (estate has no annotation delete on the CLI the extractor writes through).
+/// ([`ListedRow::code_mismatch`]). The extractor writes it BEFORE the rule (so a failed write leaves
+/// the unit unresolved and asked again), under its own key; a later restatement the code meets
+/// replaces it, on that key, with [`CODE_MEETS`] (estate's CLI has no annotation delete).
 pub const CODE_MISMATCH_ANN: &str = "code_mismatch";
+/// The value a restatement writes over an earlier mismatch: the code meets the requirement.
+pub const CODE_MEETS: &str = "code meets it";
 
-/// The live code mismatch on `node` ([`CODE_MISMATCH_ANN`]), or `None`.
+/// The live code mismatch on `node`: its newest [`CODE_MISMATCH_ANN`] (by `ts`; of equal ones, the
+/// last the store returns), unless that is blank or [`CODE_MEETS`]; `None` otherwise.
 pub fn code_mismatch_of(
     store: &dyn GraphRead,
     node: &wicked_apps_core::SymbolId,
 ) -> anyhow::Result<Option<String>> {
-    let anns = store.annotations(node)?;
-    let newest_rule = anns
-        .iter()
-        .filter(|a| a.r#type == BUSINESS_RULE_ANN)
-        .map(|a| a.ts)
-        .max();
-    Ok(anns
-        .iter()
-        .filter(|a| a.r#type == CODE_MISMATCH_ANN && !a.value.trim().is_empty())
-        .filter(|a| newest_rule.is_none_or(|t| a.ts >= t))
+    Ok(store
+        .annotations(node)?
+        .into_iter()
+        .filter(|a| a.r#type == CODE_MISMATCH_ANN)
         .max_by_key(|a| a.ts)
-        .map(|a| a.value.trim().to_string()))
+        .map(|a| a.value.trim().to_string())
+        .filter(|v| !v.is_empty() && v != CODE_MEETS))
 }
 /// Confidence stamped on a synthesized fallback rule for a behavior-bearing node that produced no
 /// real business rule (the schema's `business_rules` `minItems:1` invariant + `domain_graph.py`'s
@@ -3130,36 +3128,37 @@ mod tests {
                 a
             };
             assert_eq!(code_mismatch_of(&s, &sum.symbol).unwrap(), None);
-            s.annotate(
-                &sum.symbol,
-                at(BUSINESS_RULE_ANN, "RULE-a", "sum adds every element", 100),
-            )
-            .unwrap();
+            // The extractor writes the mismatch first, then the rule (a later second).
             s.annotate(
                 &sum.symbol,
                 at(
                     CODE_MISMATCH_ANN,
-                    "RULE-a",
+                    "R:mismatch",
                     " skips the first element ",
                     100,
                 ),
             )
             .unwrap();
+            s.annotate(
+                &sum.symbol,
+                at(BUSINESS_RULE_ANN, "R", "sum adds every element", 101),
+            )
+            .unwrap();
             assert_eq!(
                 code_mismatch_of(&s, &sum.symbol).unwrap().as_deref(),
                 Some("skips the first element"),
-                "stated with its rule: a finding"
+                "a finding beside its (newer) rule"
             );
-            // Restated later (the code was fixed): the older mismatch no longer stands.
+            // Restated once the code was fixed: CODE_MEETS replaces it on the same key, in the
+            // same second even.
             s.annotate(
                 &sum.symbol,
-                at(BUSINESS_RULE_ANN, "RULE-b", "sum adds every element", 200),
+                at(CODE_MISMATCH_ANN, "R:mismatch", CODE_MEETS, 101),
             )
             .unwrap();
             assert_eq!(code_mismatch_of(&s, &sum.symbol).unwrap(), None);
-            // A mismatch with no rule at all is still read (a node whose rule was never lifted).
             let mean = node(&mut s, "mean", NodeKind::Function, "src/math.js");
-            s.annotate(&mean.symbol, at(CODE_MISMATCH_ANN, "RULE-c", "  ", 300))
+            s.annotate(&mean.symbol, at(CODE_MISMATCH_ANN, "R:mismatch", "  ", 300))
                 .unwrap();
             assert_eq!(
                 code_mismatch_of(&s, &mean.symbol).unwrap(),

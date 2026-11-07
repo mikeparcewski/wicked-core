@@ -990,16 +990,25 @@ fn index_at_base_with(
 /// is rewritten; a failure leaves the graph as the indexer wrote it (the content is right either way).
 fn record_registered_root(db: &Path, repo: &Path, worktree: &Path) {
     use wicked_apps_core::GraphStoreMutExt;
-    let Ok(mut store) = open_store(Some(&db.to_string_lossy())) else {
-        return;
+    let warn = |why: String| tracing::warn!(db = %db.display(), "D8 left the graph's root at the run worktree: {why}");
+    let mut store = match open_store(Some(&db.to_string_lossy())) {
+        Ok(s) => s,
+        Err(e) => return warn(format!("the graph could not be opened: {e}")),
     };
     let Some(recorded) = store.meta_get_key("indexed_root") else {
         return;
     };
-    let names_worktree =
-        recorded == worktree.to_string_lossy() || recorded == canonical_path_string(worktree);
-    if names_worktree {
-        store.meta_set_key("indexed_root", &canonical_path_string(repo));
+    // Compared as paths on disk (the worktree still exists here), so any spelling estate chose
+    // for it matches (codex r1: a verbatim Windows form).
+    let same = |a: &Path, b: &Path| match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(x), Ok(y)) => x == y,
+        _ => a == b,
+    };
+    if !same(Path::new(&recorded), worktree) {
+        return;
+    }
+    if let Err(e) = store.meta_set("indexed_root", &canonical_path_string(repo)) {
+        warn(format!("the root could not be written: {e}"));
     }
 }
 
@@ -1010,8 +1019,10 @@ fn canonical_path_string(path: &Path) -> String {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .into_owned();
+    // As estate's `dunce` does: drop the verbatim prefix only where the plain spelling means the
+    // same path (a drive path under MAX_PATH); keep it otherwise.
     match s.strip_prefix(r"\\?\") {
-        Some(rest) if !rest.starts_with("UNC") => rest.to_string(),
+        Some(rest) if !rest.starts_with("UNC") && rest.len() < 260 => rest.to_string(),
         _ => s,
     }
 }
