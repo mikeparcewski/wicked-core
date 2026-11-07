@@ -3618,6 +3618,14 @@ impl WrappedCliStepRunner {
             AskSeatConfig::default()
         };
         apply_seat_posture(&mut argv, &ask_config.flags);
+        // A codex seat's commands run in a NON-login shell, as claude's and pi's do: codex's
+        // `exec_command` defaults to a login shell, whose `/etc/profile` (the Debian seat image's)
+        // resets PATH outright, so the `<snapshot>/scripts` entry the carrier hands (the bare
+        // `wicked-garden` launcher) never reached the model's commands. Applied after the no-code
+        // posture, whose `-c` allowlist would otherwise drop it on a read-only unit.
+        if seat_cli == wicked_apps_core::spawn::SeatCli::Codex {
+            apply_seat_posture(&mut argv, &codex_shell_pins());
+        }
         if input.governance.is_some() && !ask_enabled {
             eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
@@ -4316,7 +4324,8 @@ impl WrappedCliStepRunner {
             // `wicked-garden run …` never falls back to an npm package of another version) and
             // `<root>/scripts` at the front of `PATH` (where garden ships the shim). Both derive
             // from the same pinned `SkillsDelivery` root, both are read-only paths inside the
-            // fence's allowed slot; a seat handed nothing (codex, agy) is handed neither.
+            // fence's allowed slot; a seat handed nothing (agy) is handed neither. (codex's
+            // commands keep the PATH only because its shell is pinned non-login, `codex_shell_pins`.)
             for (k, v) in delivery.launcher_env(std::env::var_os("PATH").as_deref()) {
                 cmd.env(k, v);
             }
@@ -6751,6 +6760,16 @@ pub(crate) fn apply_no_code_posture(
     }
     apply_seat_posture(argv, &flags);
     Ok(p.lever)
+}
+
+/// The `-c` pin that keeps a codex seat's command shell from being a login shell
+/// (`allow_login_shell=false`; codex then also drops `login` from its `exec_command` schema, so
+/// the model is never offered one). A login shell sources the image's `/etc/profile`, which on
+/// the Debian seat image sets PATH for a non-root user to a fixed list, dropping every entry the
+/// carrier handed (measured on @openai/codex 0.162.1 in the seat image: a bare `wicked-garden`
+/// was "command not found" with the pin off and resolved from `<snapshot>/scripts` with it on).
+fn codex_shell_pins() -> Vec<String> {
+    vec!["-c".to_string(), "allow_login_shell=false".to_string()]
 }
 
 /// The `-c` pins that switch off the writes codex makes OUTSIDE its command sandbox: the
@@ -17474,6 +17493,103 @@ tail -c 1500 /work/claude.out
         assert_eq!(deny_rules(Some(&gen7)), blanket);
         std::fs::remove_dir_all(skills.join("scratch")).unwrap();
         assert_eq!(fence_check(&gen7), Ok(()));
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// codex-seat-path (e2e-1105 R7): a codex seat handed the skills launcher gets
+    /// `<snapshot>/scripts` at the front of PATH, but codex 0.162 runs the model's commands in a
+    /// LOGIN shell by default, and the seat image's `/etc/profile` resets PATH, so a bare
+    /// `wicked-garden` was "command not found" in codex (claude and pi run non-login shells). Every
+    /// codex launch through the real `run_unit` (a writable unit, and a no-code one whose `-c`
+    /// allowlist strips other overrides) carries `-c allow_login_shell=false` in `exec`'s option
+    /// scope, next to the launcher PATH it protects. Other seats get no such flag.
+    #[cfg(unix)]
+    #[test]
+    fn codex_seat_commands_run_in_a_non_login_shell_so_the_launcher_path_survives() {
+        use crate::skills_snapshot::test_support::{scratch, snapshot_root_with};
+        let _guard = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = scratch("codex-login-shell");
+        let _home = HomeGuard::pin(&home);
+        let _worker = VarGuard::set(
+            wicked_apps_core::spawn::WORKER_HOME_ENV,
+            &home.join("worker"),
+        );
+        let snapshot = snapshot_root_with(
+            &crate::skills_snapshot::test_support::gen_dir(&home.join(".wicked-crew"), "4"),
+            "4",
+            &[("domain", "wicked-garden-domain", true, &[])],
+        );
+        let _snap = VarGuard::set(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV, &snapshot);
+        let wt = home.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let launch = |seat: &str, executes_code: bool| -> Vec<String> {
+            let argv_file = wt.join(format!("argv-{seat}-{executes_code}.txt"));
+            let _ = std::fs::remove_file(&argv_file);
+            let bin = fake_recorder(&home.join("bin"), seat, &argv_file);
+            let mut u = WorkUnit::pending(format!("s:{seat}"), "s", 1, "map the domain");
+            u.assigned_cli = Some(seat.to_string());
+            u.skill_ref = Some("wicked-garden-domain".to_string());
+            u.executes_code = executes_code;
+            u.assigned_invocation = Some(match seat {
+                "codex" => format!("{} exec --skip-git-repo-check {{PROMPT}}", bin.display()),
+                _ => format!("{} -p {{PROMPT}}", bin.display()),
+            });
+            let input = StepInput {
+                run_id: format!("run-login-{seat}-{executes_code}"),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-x".to_string(),
+                entity_mode: crate::scope::EntityMode::Isolated,
+                workdir: Some(wt.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let out = WrappedCliStepRunner::default().run_unit(&input);
+            assert_eq!(out.status, StepStatus::Ok, "{seat}: {}", out.output);
+            std::fs::read_to_string(&argv_file)
+                .unwrap_or_else(|e| panic!("{seat} was launched: {e}"))
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let pin = ["-c".to_string(), "allow_login_shell=false".to_string()];
+        let scripts = snapshot.join("scripts").to_string_lossy().into_owned();
+        for executes_code in [true, false] {
+            let argv = launch("codex", executes_code);
+            let args: Vec<&String> = argv.iter().take_while(|l| !l.starts_with("ENV ")).collect();
+            let at = args
+                .windows(2)
+                .position(|w| *w[0] == pin[0] && *w[1] == pin[1])
+                .unwrap_or_else(|| {
+                    panic!(
+                        "executes_code={executes_code}: codex must be pinned non-login: {argv:?}"
+                    )
+                });
+            assert_eq!(args[0].as_str(), "exec", "{argv:?}");
+            if let Some(guard) = args.iter().position(|a| a.as_str() == "--") {
+                assert!(at < guard, "the pin stays in exec's option scope: {argv:?}");
+            }
+            let path = argv
+                .iter()
+                .find_map(|l| l.strip_prefix("ENV PATH="))
+                .expect("the recorder writes PATH");
+            assert!(
+                path.split(':').next() == Some(scripts.as_str()),
+                "the PATH the pin protects starts at the launcher: {path}"
+            );
+        }
+        for seat in ["claude", "pi"] {
+            let argv = launch(seat, true);
+            assert!(
+                !argv.iter().any(|a| a == "allow_login_shell=false"),
+                "{seat} gets no codex config: {argv:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&home);
     }
 
