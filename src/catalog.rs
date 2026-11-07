@@ -1795,7 +1795,8 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                     "{case}: {text}"
                 );
                 assert!(
-                    text.contains("failed=0 not_executed=0 failed_on_base=1"),
+                    text.contains("failed=0 not_executed=0 plan=")
+                        && text.contains("checks_failed=0 failed_on_base=1"),
                     "{case}: {text}"
                 );
                 assert!(text.contains("fail on main too"), "{case}: {text}");
@@ -1806,7 +1807,8 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                     "{case}: {text}"
                 );
                 assert!(
-                    text.contains("failed=1 not_executed=0 failed_on_base=0"),
+                    text.contains("failed=1 not_executed=0 plan=")
+                        && text.contains("failed_on_base=0"),
                     "{case}: {text}"
                 );
                 let why = match n {
