@@ -2676,6 +2676,10 @@ struct Pending<'a> {
     subject: EvidenceSubject,
 }
 
+/// (coordinator decision 2026-11-06) Why any eligible seat may judge a run with no agent creator: a
+/// judged row on such a run carries it on the receipt.
+pub const ANY_SEAT_MAY_JUDGE: &str = "no agent wrote this change: any seat may judge";
+
 /// (crew#1394) Why POL-2101 is not applicable on a run whose record shows no agent wrote code.
 pub const NO_AGENT_WROTE_CODE: &str = "no agent wrote code in this run (its code-writing steps \
                                        are the engine's own tool steps, or there are none), and \

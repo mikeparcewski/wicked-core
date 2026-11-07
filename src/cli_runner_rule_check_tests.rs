@@ -1746,11 +1746,13 @@ fn a_qe_author_tests_run_with_a_tool_author_passes_review_and_unknown_creators_s
         } else {
             assert_eq!(pol.status, RuleStatus::Unchecked, "{pol:?}");
             assert!(report.hold().is_some(), "{report:?}");
+            // Unknown creators: no judge seat is drawn. (With no agent creator at all, any seat
+            // may judge: `a_run_with_no_agent_creator_draws_any_seat_and_the_receipt_says_why`.)
+            assert!(
+                runner.0.lock().unwrap().is_empty(),
+                "no judge seat was drawn"
+            );
         }
-        assert!(
-            runner.0.lock().unwrap().is_empty(),
-            "no judge seat was drawn"
-        );
     }
 }
 
@@ -1853,6 +1855,502 @@ fn no_agent_wrote_code_is_read_strictly_from_the_whole_run() {
         "t",
         &review("t")
     ));
+}
+
+/// A repo with one change and a store holding the seeded packs and learn-small-prs (no units).
+fn seeded_change(tag: &str) -> (std::path::PathBuf, String, String) {
+    let dir = std::env::temp_dir().join(format!("rule-check-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let repo = dir.join("repo");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("README.md"), "app\n").unwrap();
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("src/app.ts"), "export const x = 1;\n").unwrap();
+    let db = dir.join("store.db").to_string_lossy().into_owned();
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+    crate::steering_packs::seed_shipped_packs(&mut store).unwrap();
+    wicked_governance::register_rule(
+        &mut store,
+        &wicked_governance::ConformanceRule {
+            id: "learn-small-prs".into(),
+            rule_type: wicked_governance::RuleType::Pattern,
+            statement: "A change stays small: about 400 changed lines at most.".into(),
+            severity: wicked_governance::ConfSeverity::Warn,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    (repo, base, db)
+}
+
+/// A read-only agent step as the planner makes one (`executes_code: false`): a guarded Recon step,
+/// which authors nothing (`pipeline::is_guarded_read_step`).
+fn read_step(mut u: crate::domain::WorkUnit) -> crate::domain::WorkUnit {
+    u.stage = crate::domain::StageKind::Recon;
+    u.worktree_guarded = true;
+    u
+}
+
+/// A judge on any seat: the stub's framed N/A for every asked rule; records the seats asked.
+struct AnySeatJudge(Mutex<Vec<String>>);
+
+impl StepRunner for AnySeatJudge {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        self.0
+            .lock()
+            .unwrap()
+            .push(input.unit.assigned_cli.clone().unwrap_or_default());
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: crate::rule_check::stub_rule_verdicts(&input.unit.description)
+                .unwrap_or_default(),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// (coordinator decision 2026-11-06) A run with NO agent creator (its code-writing step an engine
+/// Tool, no gatherer, nothing authored): evaluator ≠ creator holds vacuously, so the rule judge draws
+/// any eligible seat, and every judged row says why on the receipt. Before, no seat could be drawn
+/// ("the work's creators are not known") and MCPS and learn-small-prs held the gate. Controls: an
+/// agent creator's seat is still excluded, and unknown creators (an agent creator whose seat is
+/// unrecorded) still hold.
+#[test]
+fn a_run_with_no_agent_creator_draws_any_seat_and_the_receipt_says_why() {
+    use crate::rule_check::{RuleHow, RuleStatus, ANY_SEAT_MAY_JUDGE};
+    use crate::workflow::PhaseRole;
+    let unit = |ord: u32, id: &str, role: PhaseRole| {
+        let mut u = crate::domain::WorkUnit::pending(format!("s:{id}"), "s", ord, id);
+        u.role = role;
+        u
+    };
+    let pool = vec![seat("claude"), seat("codex")];
+    let sink = |_: &str| {};
+    // `scope` selects MCPS (applies_to: scope, …); learn-small-prs may apply everywhere.
+    for case in ["tool", "agent-known", "agent-unknown"] {
+        let (repo, base, db) = seeded_change(&format!("anyseat-{case}"));
+        let scope = read_step(unit(1, "scope", PhaseRole::Neutral));
+        let mut author = unit(2, "author", PhaseRole::Creator);
+        author.executes_code = true;
+        match case {
+            "tool" => author.tool_cmd = Some(vec!["bash".into()]),
+            "agent-known" => author.authored_by = vec!["claude".into()],
+            _ => {}
+        }
+        let review = unit(3, "review", PhaseRole::Evaluator);
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+            put_creator_record(&mut store, &scope, "scope notes");
+            let mut a = author.clone();
+            a.status = crate::domain::UnitStatus::Done;
+            crate::domain::put_node(&mut store, wicked_apps_core::ToNode::to_node(&a)).unwrap();
+        }
+        let mut input = review_input(&repo, &base, &db);
+        input.unit.ord = 3;
+        input.unit.rule_steps = crate::rule_check::steps_of(&[scope, author, review]);
+        let creators: Vec<String> = if case == "agent-known" {
+            vec!["claude".into()]
+        } else {
+            Vec::new()
+        };
+        let judge = AnySeatJudge(Mutex::new(Vec::new()));
+        let report = run_rule_check(
+            &input,
+            &creators,
+            Some(&[]),
+            &pool,
+            &pool,
+            None,
+            &judge,
+            &sink,
+        )
+        .expect("a report");
+        let row = |id: &str| {
+            report
+                .rows
+                .iter()
+                .find(|r| r.rule_id == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("{case}: a {id} row: {report:?}"))
+        };
+        let learn = row("learn-small-prs");
+        let mcps = row("MCPS-1003");
+        match case {
+            "tool" => {
+                assert!(
+                    report.hold().is_none(),
+                    "no hold for want of a seat: {report:?}"
+                );
+                for r in [&learn, &mcps] {
+                    assert_eq!(r.how, RuleHow::Judge, "{r:?}");
+                    assert!(r.reason.contains(ANY_SEAT_MAY_JUDGE), "{}", r.reason);
+                }
+                let asked = judge.0.lock().unwrap().clone();
+                assert!(!asked.is_empty(), "a judge was drawn");
+            }
+            "agent-known" => {
+                assert!(report.hold().is_none(), "{report:?}");
+                assert_eq!(
+                    learn.judge.as_deref(),
+                    Some("codex"),
+                    "the creator is excluded"
+                );
+                assert!(!learn.reason.contains(ANY_SEAT_MAY_JUDGE));
+                assert!(judge.0.lock().unwrap().iter().all(|s| s != "claude"));
+            }
+            _ => {
+                assert_eq!(learn.status, RuleStatus::Unchecked, "{learn:?}");
+                assert!(
+                    learn.reason.contains("creators are not known"),
+                    "{}",
+                    learn.reason
+                );
+                assert!(report.hold().is_some());
+                assert!(judge.0.lock().unwrap().is_empty());
+            }
+        }
+    }
+}
+
+/// (coordinator decision 2026-11-06, evidence) compliance-review, privacy-review, security-review
+/// and review-change, built from their preset files: their review step's `cited-findings` rubric
+/// makes the scope/diff gatherer's seat an author of the report it checks
+/// (`pipeline::report_gatherer_seats`), so the work's creators ARE known: the rule judge excludes
+/// that seat and draws another, and no rule holds for want of a seat. (Pins the shape: not the
+/// no-agent-creator path.)
+#[test]
+fn the_review_presets_draw_a_judge_distinct_from_their_gatherer() {
+    use crate::rule_check::RuleStatus;
+    for (name, json) in [
+        (
+            "compliance-review",
+            include_str!("presets/compliance-review.json"),
+        ),
+        (
+            "privacy-review",
+            include_str!("presets/privacy-review.json"),
+        ),
+        (
+            "security-review",
+            include_str!("presets/security-review.json"),
+        ),
+        ("review-change", include_str!("presets/review-change.json")),
+    ] {
+        let plan: crate::plan::PlanSteps = serde_json::from_str(json).unwrap();
+        let (repo, base, db) = seeded_change(&format!("preset-{name}"));
+        let mut units: Vec<crate::domain::WorkUnit> = Vec::new();
+        for (i, step) in plan.steps.iter().enumerate() {
+            let mut u = crate::domain::WorkUnit::pending(
+                format!("s:{}", step.id),
+                "s",
+                i as u32 + 1,
+                &step.id,
+            );
+            u.catalog = Some(step.catalog.clone());
+            u.rubric = step.rubric.clone();
+            u.role = crate::catalog::catalog_entry(&step.catalog)
+                .map(|e| e.role)
+                .unwrap_or_default();
+            u.assigned_cli = Some("claude".into());
+            units.push(u);
+        }
+        let review_ix = units
+            .iter()
+            .position(|u| u.role == crate::workflow::PhaseRole::Evaluator)
+            .expect("a review step");
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+            for u in &units[..review_ix] {
+                put_creator_record(&mut store, u, "findings");
+            }
+        }
+        let review = units[review_ix].clone();
+        let mut done = units.clone();
+        for u in done.iter_mut().take(review_ix) {
+            u.status = crate::domain::UnitStatus::Done;
+        }
+        let creators = crate::pipeline::work_authors(&done, review.ord);
+        let bins = crate::pipeline::work_author_binaries(&done, review.ord);
+        assert_eq!(
+            creators,
+            ["claude"],
+            "{name}: the gatherer is the report's author"
+        );
+        let mut input = review_input(&repo, &base, &db);
+        input.unit = review.clone();
+        input.unit.run_base_commit = Some(base.clone());
+        input.unit.rule_steps = crate::rule_check::steps_of(&done);
+        let pool = vec![seat("claude"), seat("codex")];
+        let judge = AnySeatJudge(Mutex::new(Vec::new()));
+        let sink = |_: &str| {};
+        let report = run_rule_check(
+            &input,
+            &creators,
+            bins.as_deref(),
+            &pool,
+            &pool,
+            None,
+            &judge,
+            &sink,
+        )
+        .expect("a report");
+        assert!(
+            report
+                .rows
+                .iter()
+                .all(|r| r.status != RuleStatus::Unchecked || r.reported_only()),
+            "{name}: {report:?}"
+        );
+        assert!(report.hold().is_none(), "{name}: {report:?}");
+        assert!(
+            judge.0.lock().unwrap().iter().all(|s| s == "codex"),
+            "{name}"
+        );
+    }
+}
+
+/// A judge whose every answer cites the engine's reserved words (as a model could).
+struct MarkerEchoJudge;
+
+impl StepRunner for MarkerEchoJudge {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let out = crate::rule_check::stub_rule_verdicts(&input.unit.description)
+            .unwrap_or_default()
+            .replace(
+                "a stub runner judged nothing",
+                crate::rule_check::ANY_SEAT_MAY_JUDGE,
+            );
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: out,
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// (codex r1 on the any-seat change) The exception and its receipt marker rest on the engine's own
+/// record, never on a missing one or a model's words: (1) a report gatherer whose seat was never
+/// recorded is an UNKNOWN author, so the gate holds; (2) a row a seat judged under the exception is
+/// not reused once that seat is an author, and loses the marker; (3) a judge citing the reserved
+/// words on a run WITH a creator never yields the engine's marker.
+#[test]
+fn the_any_seat_exception_rests_on_the_engines_record_only() {
+    use crate::workflow::PhaseRole;
+    let framed = any_seat_marker();
+    let unit = |ord: u32, id: &str, role: PhaseRole| {
+        let mut u = crate::domain::WorkUnit::pending(format!("s:{id}"), "s", ord, id);
+        u.role = role;
+        u
+    };
+    let pool = vec![seat("claude"), seat("codex")];
+    let sink = |_: &str| {};
+    let setup = |tag: &str, gatherer: bool| {
+        let (repo, base, db) = seeded_change(tag);
+        let mut scope = read_step(unit(1, "scope", PhaseRole::Neutral));
+        if gatherer {
+            scope.catalog = Some("understand".into());
+        }
+        let mut author = unit(2, "author", PhaseRole::Neutral);
+        author.tool_cmd = Some(vec!["bash".into()]);
+        author.executes_code = true;
+        let mut review = unit(3, "review", PhaseRole::Evaluator);
+        if gatherer {
+            review.rubric = Some("cited-findings".into());
+        }
+        {
+            let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+            for u in [&scope, &author] {
+                put_creator_record(&mut store, u, "done");
+            }
+        }
+        let mut input = review_input(&repo, &base, &db);
+        input.unit.ord = 3;
+        input.unit.rubric = review.rubric.clone();
+        input.unit.rule_steps = crate::rule_check::steps_of(&[scope, author, review]);
+        input
+    };
+    let learn = |r: &crate::rule_check::RuleCheckReport| {
+        r.rows
+            .iter()
+            .find(|x| x.rule_id == "learn-small-prs")
+            .cloned()
+            .expect("a learn-small-prs row")
+    };
+    // (codex r3) A gatherer counts only for a gate whose rubric rechecks gatherers: before an
+    // ordinary review (no rubric) it authored nothing that gate reads, so any seat may judge.
+    let mut plain = setup("anyseat-gatherer-plain", true);
+    plain.unit.rubric = None;
+    let judge = AnySeatJudge(Mutex::new(Vec::new()));
+    let r = run_rule_check(&plain, &[], Some(&[]), &pool, &pool, None, &judge, &sink).unwrap();
+    assert!(r.hold().is_none(), "{r:?}");
+    assert!(learn(&r).reason.contains(&framed), "{r:?}");
+    // (1) An unrecorded report gatherer: unknown, so no seat and the gate holds.
+    let input = setup("anyseat-gatherer", true);
+    let judge = AnySeatJudge(Mutex::new(Vec::new()));
+    let r = run_rule_check(&input, &[], Some(&[]), &pool, &pool, None, &judge, &sink).unwrap();
+    assert!(r.hold().is_some(), "{r:?}");
+    assert!(learn(&r).reason.contains("creators are not known"), "{r:?}");
+    assert!(judge.0.lock().unwrap().is_empty());
+    // (2) Judged under the exception, then its judge becomes an author: re-judged, unmarked.
+    let mut input = setup("anyseat-cache", false);
+    let judge = AnySeatJudge(Mutex::new(Vec::new()));
+    let first = run_rule_check(&input, &[], Some(&[]), &pool, &pool, None, &judge, &sink).unwrap();
+    let was = learn(&first);
+    assert!(was.reason.contains(&framed), "{was:?}");
+    let seat_was = was.judge.clone().expect("judged");
+    input.unit.rule_check = Some(first.clone());
+    let now_author = vec![seat_was.clone()];
+    let second = run_rule_check(
+        &input,
+        &now_author,
+        Some(&[]),
+        &pool,
+        &pool,
+        None,
+        &judge,
+        &sink,
+    )
+    .unwrap();
+    let again = learn(&second);
+    assert_ne!(again.judge.as_deref(), Some(seat_was.as_str()), "{again:?}");
+    assert_ne!(again.how, crate::rule_check::RuleHow::Cache, "{again:?}");
+    assert!(
+        second.rows.iter().all(|r| !r.reason.contains(&framed)),
+        "{second:?}"
+    );
+    // (3) A judge citing the reserved words on a run with a creator: no engine marker.
+    let input = setup("anyseat-echo", false);
+    let r = run_rule_check(
+        &input,
+        &["claude".to_string()],
+        Some(&[]),
+        &pool,
+        &pool,
+        None,
+        &MarkerEchoJudge,
+        &sink,
+    )
+    .unwrap();
+    let row = learn(&r);
+    assert!(!row.reason.contains(&framed), "{row:?}");
+    assert!(
+        !row.reason.contains(crate::rule_check::ANY_SEAT_MAY_JUDGE),
+        "{row:?}"
+    );
+    assert!(
+        row.reason.contains("[engine-reserved words removed]"),
+        "{row:?}"
+    );
+}
+
+/// (codex r2 on the any-seat change) A CACHED judicial verdict (the unit's own last rows or a council
+/// ruling carried from another gate) meets the bar fresh selection would: (1) its judge is not now
+/// excluded by key or by identity (a launch-excluded alias running the same binary); (2) every
+/// council voter is still eligible; (3) with the work's authorship unknown, no judge or council
+/// verdict is reused at all, while a fact row still is.
+#[test]
+fn a_cached_judicial_verdict_meets_the_fresh_selection_bar() {
+    use crate::rule_check::{RuleCouncil, RuleOrigin, RuleVerdict, RuleVote};
+    let mut alias = seat("helper");
+    alias.binary = "claude".into();
+    alias.headless_invocation = "claude -p {PROMPT}".into();
+    let registry = vec![seat("claude"), seat("codex"), seat("pi"), alias];
+    let judged = |judge: &str| RuleVerdict {
+        rule_id: "R1".into(),
+        origin: Some(RuleOrigin::Judge),
+        judge: Some(judge.into()),
+        judge_ids: vec![judge.into()],
+        ..Default::default()
+    };
+    let fact = RuleVerdict {
+        rule_id: "R2".into(),
+        origin: Some(RuleOrigin::Fact),
+        ..Default::default()
+    };
+    let known = |creators: &[&str], excluded: &[&str]| {
+        let c: Vec<String> = creators.iter().map(|s| s.to_string()).collect();
+        let e: Vec<String> = excluded.iter().map(|s| s.to_string()).collect();
+        JudgeExclusions::of(&c, Some(&[]), &e, &[], &[], &registry, c.is_empty())
+    };
+    // A distinct judge is reused; a judge that is now a creator is not.
+    assert!(known(&["claude"], &[]).may_reuse(&judged("codex"), &registry));
+    assert!(!known(&["codex"], &[]).may_reuse(&judged("codex"), &registry));
+    // (1) A launch-excluded alias that runs the judge's binary excludes it by identity.
+    assert!(!known(&["pi"], &["helper"]).may_reuse(&judged("claude"), &registry));
+    // (2) A council ruling whose voter is now a creator is not reused.
+    let mut council = judged("codex");
+    council.origin = Some(RuleOrigin::Council);
+    council.council = Some(RuleCouncil {
+        votes: vec![
+            RuleVote {
+                seat: "pi".into(),
+                counted: true,
+                ..Default::default()
+            },
+            RuleVote {
+                seat: "claude".into(),
+                counted: true,
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+    assert!(known(&["copilot"], &[]).may_reuse(&council, &registry));
+    assert!(!known(&["claude"], &[]).may_reuse(&council, &registry));
+    // (3) Unknown authorship (no creators, not the no-agent case): no judicial reuse; a fact is.
+    let unknown = JudgeExclusions::of(&[], Some(&[]), &[], &[], &[], &registry, false);
+    assert!(!unknown.may_reuse(&judged("codex"), &registry));
+    assert!(unknown.may_reuse(&fact, &registry));
+    let unrecorded = JudgeExclusions::of(
+        &["claude".to_string()],
+        None,
+        &[],
+        &[],
+        &[],
+        &registry,
+        false,
+    );
+    assert!(!unrecorded.may_reuse(&judged("codex"), &registry));
+    // With no agent creator at all, a distinct judge is reused.
+    assert!(known(&[], &[]).may_reuse(&judged("codex"), &registry));
+    // (codex r3) A row recorded before `origin` is judged by its `how`.
+    let legacy = RuleVerdict {
+        origin: None,
+        how: crate::rule_check::RuleHow::Judge,
+        ..judged("codex")
+    };
+    assert!(!known(&["codex"], &[]).may_reuse(&legacy, &registry));
+    assert!(!unknown.may_reuse(&legacy, &registry));
+    // (codex r3) A council voter the registry no longer names cannot be shown eligible.
+    let mut gone = council.clone();
+    gone.council.as_mut().unwrap().votes[0].seat = "retired".into();
+    assert!(!known(&["copilot"], &[]).may_reuse(&gone, &registry));
+    // (codex r4) …but an open dispute is never dropped (it still holds), whatever its voters.
+    let mut open = gone.clone();
+    open.status = crate::rule_check::RuleStatus::Disputed;
+    assert!(known(&["copilot"], &[]).may_reuse(&open, &registry));
+    // (codex r4) A legacy judge with no recorded identity and no registry record: ruled again.
+    let ghost = RuleVerdict {
+        judge_ids: Vec::new(),
+        ..judged("ghost")
+    };
+    assert!(!known(&["copilot"], &[]).may_reuse(&ghost, &registry));
 }
 
 /// (Part B, B.2) The engine record a process rule is judged on: what the engine recorded (round,
