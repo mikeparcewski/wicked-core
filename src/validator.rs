@@ -4648,6 +4648,7 @@ mod tests {
                 outside.display()
             );
             let st = std::process::Command::new(&jail.wrapper[0])
+                .hardened()
                 .args(&jail.wrapper[1..])
                 .args(["/bin/sh", "-c", &script])
                 .current_dir(&root)
