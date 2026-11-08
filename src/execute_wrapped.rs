@@ -1561,7 +1561,7 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 /// launch-independent half), and the half that file omits by design — the state-home rules, which
 /// ACP sessions carry per session — rides the claude seat's own argv as `--disallowedTools`
 /// ([`ballot_deny_rules`]). Together they are the same rule set a worker launch carries
-/// ([`deny_rules`] with no snapshot); a council-first ballot used to run with no fence at all. How
+/// ([`deny_rules`] with no snapshot) minus the unit-only web tools ([`DENIED_UNIT_TOOLS`]); a council-first ballot used to run with no fence at all. How
 /// live that fence is for seat votes is exactly as live as that unmeasured sentence turns out to
 /// be. The real boundary belongs in the
 /// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
@@ -2204,9 +2204,10 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
 /// follow-up, review on core#436). ACP sessions carry these rules per session (`deny_rules` —
 /// registry or blanket); a ballot has no session, so the distributor puts the BLANKET `Read` +
 /// `Edit` over every state-home candidate (the default `~/.wicked-crew` and the engine's own
-/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list is
-/// the same set [`deny_rules`] produces for a snapshot-less worker launch — one generator, three
-/// carriers. `Err` names an unspellable directory (fail closed, as everywhere in this module).
+/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list ∪
+/// [`DENIED_UNIT_TOOLS`] is the same set [`deny_rules`] produces for a snapshot-less worker launch
+/// — one generator, three carriers; the web tools are the one unit-only addition (a ballot is not
+/// a unit). `Err` names an unspellable directory (fail closed, as everywhere in this module).
 pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
     let mut rules: Vec<String> = Vec::new();
     for dir in state_home_candidates(operational_home) {
@@ -15558,6 +15559,11 @@ mod tests {
             gather.contains("Never use your CLI's own web search or fetch tools"),
             "{gather}"
         );
+        // The source's registered name need not be `web` (crew lists `mcp:<name>/…`).
+        assert!(
+            gather.contains("exactly as the list shows them"),
+            "{gather}"
+        );
         let check = step("check");
         assert!(
             check.contains(&format!("{shim} call mcp:web/fetch --args")),
@@ -15863,7 +15869,13 @@ mod tests {
         union.sort();
         union.dedup();
         // The unit-only web tools (e2e-1105 CJ3) are the one per-unit addition: chat sessions
-        // and ballots are not units.
+        // (the shared file) and ballots are not units, so neither carries them.
+        for tool in DENIED_UNIT_TOOLS {
+            assert!(
+                !union.iter().any(|r| r == tool),
+                "shared or ballot denies {tool}"
+            );
+        }
         union.extend(DENIED_UNIT_TOOLS.iter().map(|s| s.to_string()));
         union.sort();
         union.dedup();
