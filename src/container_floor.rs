@@ -502,11 +502,42 @@ pub(crate) fn runtime_down_now() -> bool {
     }
 }
 
-/// Whether `rt`'s engine answers `version` now.
+/// One `version` attempt's bound. A loaded laptop (1-min load 50-80, e2e-1105 09:02Z) made the
+/// docker CLI miss the old single 15 s bound while `docker version` answered by hand every time.
+const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Attempts before the runtime reads down: it is down only after this many CONSECUTIVE failures.
+/// A runtime that is really down fails each attempt at once (the CLI cannot reach its socket), so
+/// the retries cost about [`VERSION_PROBE_PAUSE`] each; only a slow host pays the longer bound.
+const VERSION_PROBE_ATTEMPTS: u32 = 3;
+/// The short pause between two attempts.
+const VERSION_PROBE_PAUSE: Duration = Duration::from_secs(2);
+
+/// Whether `rt`'s engine answers `version` now: up to [`VERSION_PROBE_ATTEMPTS`] tries, each bound
+/// by [`VERSION_PROBE_TIMEOUT`], a short pause between them. One slow or failed answer never makes
+/// the runtime read down (and so never fails a step with `container_runtime_down`): an honest wait
+/// beats a false outage.
 fn runtime_answers(rt: &Runtime) -> bool {
-    let mut probe = rt.cmd();
-    probe.args(["version", "--format", "{{.Server.Version}}"]);
-    output_within(probe, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| o.status.success())
+    runtime_answers_within(
+        rt,
+        VERSION_PROBE_TIMEOUT,
+        VERSION_PROBE_ATTEMPTS,
+        VERSION_PROBE_PAUSE,
+    )
+}
+
+/// [`runtime_answers`] with its bound, attempts and pause explicit (tests use short ones).
+fn runtime_answers_within(rt: &Runtime, bound: Duration, attempts: u32, pause: Duration) -> bool {
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            std::thread::sleep(pause);
+        }
+        let mut probe = rt.cmd();
+        probe.args(["version", "--format", "{{.Server.Version}}"]);
+        if output_within(probe, rt.bound(bound)).is_some_and(|o| o.status.success()) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The first runtime candidate whose engine answers `version`, probed (uncached).
@@ -4098,6 +4129,71 @@ mod agy_tests;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// A runtime stub whose first `answer_on - 1` calls stall past the bound, then answers:
+    /// a loaded host's docker CLI (e2e-1105 09:02Z). Counts its calls in `calls`.
+    fn slow_runtime(dir: &Path, answer_on: u32) -> (PathBuf, PathBuf) {
+        let cli = dir.join("docker");
+        let calls = dir.join("calls");
+        crate::test_env::install_stub(
+            &cli,
+            &format!(
+                "#!/bin/sh\nn=$(($(cat '{c}' 2>/dev/null || echo 0) + 1))\necho $n > '{c}'\n\
+                 if [ \"$n\" -lt {answer_on} ]; then sleep 5; fi\necho 29.5.3\n",
+                c = calls.display()
+            ),
+        );
+        (cli, calls)
+    }
+
+    /// One slow `version` answer no longer reads as a down runtime: the probe retries after a
+    /// short pause and the second attempt answers. Fails on a single-attempt probe.
+    #[test]
+    fn a_slow_runtime_is_not_down_after_one_slow_answer() {
+        let dir = c4_temp();
+        let (cli, calls) = slow_runtime(&dir, 2);
+        let rt = Runtime::stalling(cli);
+        assert!(runtime_answers_within(
+            &rt,
+            Duration::from_millis(1500),
+            3,
+            Duration::from_millis(50)
+        ));
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().trim(), "2");
+    }
+
+    /// Down only after consecutive failures: a runtime that never answers is tried every time,
+    /// then reads down.
+    #[test]
+    fn a_runtime_reads_down_only_after_every_attempt_failed() {
+        let dir = c4_temp();
+        let cli = dir.join("docker");
+        let calls = dir.join("calls");
+        crate::test_env::install_stub(
+            &cli,
+            &format!(
+                "#!/bin/sh\necho x >> '{c}'\necho 'Cannot connect to the Docker daemon' >&2\nexit 1\n",
+                c = calls.display()
+            ),
+        );
+        let rt = Runtime::stalling(cli);
+        assert!(!runtime_answers_within(
+            &rt,
+            Duration::from_secs(5),
+            3,
+            Duration::from_millis(10)
+        ));
+        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
+    }
+
+    /// The production policy: more than one attempt, a bound longer than the old single 15 s.
+    #[test]
+    fn the_version_probe_retries_with_a_patient_bound() {
+        let attempts = VERSION_PROBE_ATTEMPTS;
+        assert!(attempts >= 2, "{attempts}");
+        assert!(VERSION_PROBE_TIMEOUT > Duration::from_secs(15));
+        assert!(VERSION_PROBE_PAUSE <= Duration::from_secs(5));
+    }
 
     /// A runtime stub that logs its argv and answers `image inspect` only for the tags a `build`
     /// made (or `present` names).
