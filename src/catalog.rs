@@ -170,7 +170,8 @@ pub fn is_tool_entry(entry: &PhaseDef) -> bool {
 /// workflow-catalog gap fills `docs`, `validate-docs`, `test-plan` and `test-analysis` (new workflows as
 /// data over existing catalog entries and garden skills, `src/presets/<name>.json`; no §11.2 row), the
 /// read-only `sourced-report` (CS3: a cited report re-checked at its source), `run-cost` (CS6: crew's
-/// run facts through its fixed `wicked-crew insights-facts` Tool, a cost model, re-checked), and the
+/// run facts through its fixed `wicked-crew insights-facts` Tool, a cost model, re-checked),
+/// `interactive-draft-sourced` (CS5: `interactive-draft` plus a fidelity-to-source check on `records/`), and the
 /// Apps presets `apps-turn` and `apps-publish` (DES-APPS-001 K0; fixed plans, [`crate::apps`]). Every other consumer's preset is added by its migration seam (§14 M1–M10),
 /// which also deletes the def it replaces.
 pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
@@ -227,6 +228,10 @@ pub fn builtin_presets() -> Vec<(&'static str, Vec<PlanStep>)> {
                 include_str!("presets/interactive-draft.json"),
                 "interactive-draft",
             ),
+        ),
+        (
+            "interactive-draft-sourced",
+            interactive_draft_sourced_preset(),
         ),
         (
             "interactive-edit",
@@ -500,6 +505,14 @@ pub fn builtin_preset_descriptor(name: &str) -> Option<PresetDescriptor> {
             &[
                 "write a new doc, spec or proposal",
                 "turn notes into a first draft",
+            ],
+        ),
+        "interactive-draft-sourced" => (
+            "Draft a document from sources",
+            "Write a new document from uploaded or named documents, every statement re-checked at its source before it lands.",
+            &[
+                "answer an RFP, RFI or questionnaire from your materials",
+                "condense or re-aim a document for another audience",
             ],
         ),
         "interactive-edit" => (
@@ -1118,6 +1131,28 @@ fn interactive_preset(json: &str, name: &str) -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps = serde_json::from_str(json)
         .unwrap_or_else(|e| panic!("src/presets/{name}.json is a valid plan: {e}"));
     plan.steps
+}
+
+/// `interactive-draft-sourced` (CS5): `interactive-draft`'s steps built in Rust (never a JSON
+/// copy), plus one appended `critique` step (`check`, rubric [`crate::rubric::FIDELITY_TO_SOURCE`])
+/// that re-checks every statement of the draft against the run's `records/` and holds at a human
+/// gate when its verdict is not PASS.
+fn interactive_draft_sourced_preset() -> Vec<PlanStep> {
+    let mut steps = interactive_preset(
+        include_str!("presets/interactive-draft.json"),
+        "interactive-draft",
+    );
+    let check: PlanStep = serde_json::from_value(serde_json::json!({
+        "id": "check",
+        "catalog": "critique",
+        "rubric": crate::rubric::FIDELITY_TO_SOURCE,
+        "depends_on": ["draft"],
+        "gate": { "human_confirm_if": "verdict_not_pass" },
+        "instructions": "Re-check every statement of the draft against the run's records/; drop nothing yourself; VERDICT last."
+    }))
+    .expect("the interactive-draft-sourced check step is a valid plan step");
+    steps.push(check);
+    steps
 }
 
 /// The Apps presets (DES-APPS-001 §9.2-§9.3, K0) as data (`src/presets/apps-turn.json`,
@@ -2773,6 +2808,111 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         assert_eq!(authors, ["a"]);
     }
 
+    /// (CS5) `interactive-draft-sourced` is `interactive-draft`'s steps in order and equal, built
+    /// in Rust, plus one trailing `check` step on `critique` with the `fidelity-to-source` rubric
+    /// and `human_confirm_if: verdict_not_pass` depending on `draft`.
+    #[test]
+    fn interactive_draft_sourced_is_interactive_draft_plus_one_trailing_fidelity_check_step() {
+        let base = builtin_preset("interactive-draft").expect("interactive-draft is a built-in");
+        let sourced = builtin_preset("interactive-draft-sourced")
+            .expect("interactive-draft-sourced is a built-in");
+        assert_eq!(sourced.len(), base.len() + 1);
+        assert_eq!(&sourced[..base.len()], &base[..]);
+
+        let check = sourced.last().unwrap();
+        assert_eq!(
+            serde_json::to_value(check).unwrap(),
+            serde_json::json!({
+                "id": "check",
+                "catalog": "critique",
+                "rubric": crate::rubric::FIDELITY_TO_SOURCE,
+                "depends_on": ["draft"],
+                "gate": { "human_confirm_if": "verdict_not_pass" },
+                "instructions": "Re-check every statement of the draft against the run's records/; drop nothing yourself; VERDICT last."
+            })
+        );
+        assert_eq!(
+            builtin_preset_descriptor("interactive-draft-sourced"),
+            Some(PresetDescriptor {
+                title: "Draft a document from sources",
+                summary: "Write a new document from uploaded or named documents, every statement re-checked at its source before it lands.",
+                use_when: &[
+                    "answer an RFP, RFI or questionnaire from your materials",
+                    "condense or re-aim a document for another audience",
+                ],
+            })
+        );
+        assert_eq!(
+            builtin_preset_instruments("interactive-draft-sourced"),
+            None
+        );
+    }
+
+    /// (CS5) Composing `interactive-draft-sourced` yields a `check` phase carrying the
+    /// `fidelity-to-source` rubric, on the evaluator role (not the creator), depending on `draft`,
+    /// and gated `human_confirm_if: verdict_not_pass`.
+    #[test]
+    fn interactive_draft_sourced_composes_check_as_a_held_fidelity_evaluator_on_draft() {
+        let def = composed("interactive-draft-sourced");
+        let draft = &def.phases[0];
+        assert_eq!(draft.id, "draft");
+        assert_eq!(draft.role, PhaseRole::Creator);
+
+        let check = def.phases.last().unwrap();
+        assert_eq!(check.id, "check");
+        assert_eq!(check.catalog.as_deref(), Some("critique"));
+        assert_eq!(
+            check.rubric.as_deref(),
+            Some(crate::rubric::FIDELITY_TO_SOURCE)
+        );
+        assert_eq!(check.role, PhaseRole::Evaluator);
+        assert_ne!(check.role, PhaseRole::Creator);
+        assert_eq!(check.depends_on, ["draft"]);
+        assert_eq!(
+            check.gate,
+            GateSpec::HumanConfirmIf(GateCond::VerdictNotPass)
+        );
+        assert!(!check.executes_code && !is_tool_entry(check));
+        let text = check.instructions.as_deref().unwrap_or_default();
+        assert!(
+            text.starts_with(
+                "Re-check every statement of the draft against the run's records/; drop nothing yourself; VERDICT last. FIDELITY TO SOURCE (independent recheck):"
+            ),
+            "{text}"
+        );
+    }
+
+    /// (CS5, Q9 guard) `interactive-draft` composes byte-for-byte as before with no `check` step,
+    /// and `interactive-draft-sourced` differs from it only by the appended `check` phase.
+    #[test]
+    fn interactive_draft_composes_unchanged_without_check_while_sourced_adds_only_check() {
+        let base_steps =
+            builtin_preset("interactive-draft").expect("interactive-draft is a built-in");
+        assert_eq!(
+            base_steps.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            ["draft", "measure-pages"],
+            "Q9: no check step on interactive-draft"
+        );
+        assert!(base_steps.iter().all(|s| s.id != "check"));
+
+        let plain = composed("interactive-draft");
+        assert_eq!(
+            plain
+                .phases
+                .iter()
+                .map(|p| p.id.as_str())
+                .collect::<Vec<_>>(),
+            ["draft", "measure-pages"],
+            "Q9: no check phase on interactive-draft"
+        );
+        assert!(plain.phases.iter().all(|p| p.id != "check"));
+
+        let sourced = composed("interactive-draft-sourced");
+        assert_eq!(sourced.phases.len(), plain.phases.len() + 1);
+        assert_eq!(&sourced.phases[..plain.phases.len()], &plain.phases[..]);
+        assert_eq!(sourced.phases.last().unwrap().id, "check");
+    }
+
     /// (DES-CATALOG-002 §5.1) QE acceptance is required by exactly the application-changing
     /// presets: today's five, the Apps publish, and the catalog's refactor, release, scaffold and
     /// modernize. Every other built-in runs on the defaults.
@@ -2844,6 +2984,11 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             rubrics("sourced-report"),
             p(&[("check", "fidelity-to-source")])
         );
+        assert_eq!(
+            rubrics("interactive-draft-sourced"),
+            p(&[("check", "fidelity-to-source")])
+        );
+        assert!(rubrics("interactive-draft").is_empty());
         assert!(rubrics("scaffold").is_empty());
         // J4/J6: feature, bug, mcp-server and editor-plugin carry no rubric.
         for name in ["feature", "bug", "mcp-server", "editor-plugin"] {

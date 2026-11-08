@@ -616,7 +616,7 @@ fn f_presets_survive_a_restart() {
 }
 
 /// The built-ins that are new workflows, not migrated consumers: no §11.2 row pins them.
-const NO_MAPPING_ROW: [&str; 29] = [
+const NO_MAPPING_ROW: [&str; 30] = [
     "analyze",
     "analyze-codebase",
     "apps-publish",
@@ -627,6 +627,7 @@ const NO_MAPPING_ROW: [&str; 29] = [
     "demo-human-review",
     "docs",
     "editor-plugin",
+    "interactive-draft-sourced",
     "investigate-incident",
     "learn",
     "map-requirements",
@@ -680,6 +681,7 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
             "feature",
             "interactive-chat",
             "interactive-draft",
+            "interactive-draft-sourced",
             "interactive-edit",
             "investigate-incident",
             "learn",
