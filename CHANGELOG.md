@@ -31,6 +31,7 @@ Two release tracks share this file, newest entry first regardless of track:
     host floor.
   - Wire: new frame `skillUsed {session, ord, attempt, cli, signal, skill, via, how, script, gen, source}`;
     `skillsSnapshotHanded` gains `lever` and `skills` (the names that lever delivered; not mirrored to the bus).
+
 - Run plugins use install-ledger topic grants with deny dominance, require conformance cases r0-r5, and follow a phase plugin branch in the editor-plugin preset.
 
 - **A codex seat finds the bare `wicked-garden` launcher.** A codex seat is handed `<snapshot>/scripts` at the front of

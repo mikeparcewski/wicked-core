@@ -3,6 +3,9 @@
 //! non-reading programs, missing scripts, failed calls, browse, dedupe across relaunches, the frame
 //! rate limit and clip, privacy) and the directed / handed halves.
 
+// The POSIX shell cases run on Unix only; their helpers are unused on Windows.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -240,6 +243,8 @@ fn claude_bash_running_a_garden_script_is_ran_with_no_arguments_kept() {
     assert!(json.contains("\"skill\":null"));
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn a_nested_shell_is_read_inside() {
     let (snap, _b) = fixture();
@@ -275,6 +280,8 @@ fn codex_cmd(a: &mut CodexJsonl, id: &str, cmd: &str, exit: i64) {
     );
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn codex_shell_read_of_its_home_skill_file_is_opened_and_a_listing_is_not() {
     let (snap, base) = fixture();
@@ -342,6 +349,8 @@ fn codex_running_a_garden_script_is_ran_even_when_it_exits_nonzero() {
 }
 
 /// The live frame's target is clipped at 160 characters; usage reads the whole path.
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn a_path_longer_than_the_frame_clip_is_still_opened() {
     let (snap, base) = fixture();
@@ -479,6 +488,8 @@ fn agy_view_file_opens_and_run_command_runs() {
 
 // ── guards ─────────────────────────────────────────────────────────────────────────────────────
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn paths_that_are_not_a_handed_skill_file_being_read_are_not_opens() {
     let (snap, _b) = fixture();
@@ -530,6 +541,8 @@ fn paths_that_are_not_a_handed_skill_file_being_read_are_not_opens() {
     assert_eq!(signals(&seen), vec![pair("opened", "wicked-garden-domain")]);
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn only_a_real_launch_of_a_snapshot_script_is_ran() {
     let (snap, _b) = fixture();
@@ -576,6 +589,8 @@ fn only_a_real_launch_of_a_snapshot_script_is_ran() {
     );
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn one_command_naming_more_than_three_skills_is_browsed_not_opened() {
     let (snap, _b) = fixture();
@@ -723,6 +738,8 @@ fn an_open_past_the_frame_rate_limit_is_still_recorded() {
     assert_eq!(signals(&seen), vec![pair("opened", "wicked-garden-domain")]);
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn no_emitted_record_carries_a_host_path_or_an_argument() {
     let (snap, base) = fixture();
@@ -892,6 +909,8 @@ fn handed_names_follow_the_lever() {
 
 // ── review r2: shell structure ─────────────────────────────────────────────────────────────────
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn shell_boundaries_quotes_and_comments_are_the_shells() {
     let (snap, _b) = fixture();
@@ -912,6 +931,8 @@ fn shell_boundaries_quotes_and_comments_are_the_shells() {
     }
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn only_reading_programs_open_and_every_named_file_counts_toward_browse() {
     let (snap, _b) = fixture();
@@ -939,6 +960,8 @@ fn only_reading_programs_open_and_every_named_file_counts_toward_browse() {
     assert!(!signals(&seen).iter().any(|(s, _)| s == "opened"));
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn interpreter_forms_and_assignments() {
     let (snap, _b) = fixture();
@@ -1005,6 +1028,8 @@ fn a_huge_call_id_is_held_bounded_and_still_matched() {
 
 // ── review r3 ──────────────────────────────────────────────────────────────────────────────────
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn reads_inside_shell_control_flow_count() {
     let (snap, _b) = fixture();
@@ -1024,6 +1049,8 @@ fn reads_inside_shell_control_flow_count() {
     }
 }
 
+// A POSIX shell line: a Windows host path in one is itself a run of escapes, so these run on Unix.
+#[cfg(unix)]
 #[test]
 fn a_scripts_own_help_argument_is_still_a_run() {
     let (snap, _b) = fixture();
