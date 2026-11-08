@@ -2158,6 +2158,8 @@ fn run_rule_check_with(
             emit_delta,
             no_agent_creator,
         );
+        // (e2e-1105 CJ9) A council ruling changes a row's status: its waiver mark follows it.
+        report.mark_waivable(&rules);
     }
     // (coordinator decision 2026-11-06) The receipt says why a seat that would otherwise have been
     // excluded may judge: every row a judge or council ruled on this draw carries it.

@@ -9398,11 +9398,38 @@ fn denial_gate_prompt(
             )
         }
         // (DES-RULE-CHECK-001 S2) A broken steering rule: send it back, run it again, or stop.
-        CLASS_RULE_BROKEN => format!(
-            "Unit {ord} BROKE steering rule(s): {}. Request changes to send it back for rework, \
-             approve to run the step again, or reject to cancel the run{note}",
-            reason_head(reason)
-        ),
+        // (e2e-1105 CJ9) …and a broken warning (severity warn/info) can be skipped with a reason.
+        CLASS_RULE_BROKEN => {
+            let waivable: Vec<&str> = unit
+                .rule_check
+                .iter()
+                .flat_map(|r| r.rows.iter())
+                .filter(|r| {
+                    r.status == crate::rule_check::RuleStatus::Broken && r.waivable == Some(true)
+                })
+                .map(|r| r.rule_id.as_str())
+                .collect();
+            let lead = if waivable.is_empty() {
+                "Request".to_string()
+            } else {
+                let (is, it) = if waivable.len() == 1 {
+                    ("is a warning", "it")
+                } else {
+                    ("are warnings", "them")
+                };
+                format!(
+                    "{} {is}: skip {it} with a written reason (action `{}`: labelled on the run, \
+                     the gate and the delivery), or request",
+                    waivable.join(", "),
+                    crate::rule_check::SKIP_ACTION
+                )
+            };
+            format!(
+                "Unit {ord} BROKE steering rule(s): {}. {lead} changes to send it back for \
+                 rework, approve to run the step again, or reject to cancel the run{note}",
+                reason_head(reason)
+            )
+        }
         // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
         "rules_unchecked" => format!(
             "Unit {ord}'s steering rules are UNCHECKED or waived by your instruction — {}. The \
@@ -18005,18 +18032,23 @@ fn rules_recheck_request(
         if reason.trim().is_empty() {
             anyhow::bail!("skip of rule `{id}` needs a written reason");
         }
+        // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
+        // may waive with a reason; a broken error/critical rule is reworked.
         let Some(row) = rows.iter().find(|r| {
             &r.rule_id == id
-                && matches!(
+                && (matches!(
                     r.status,
                     crate::rule_check::RuleStatus::Unchecked
                         | crate::rule_check::RuleStatus::Waived
                         | crate::rule_check::RuleStatus::Disputed
-                )
+                ) || (r.status == crate::rule_check::RuleStatus::Broken
+                    && r.waivable == Some(true)))
         }) else {
             anyhow::bail!(
-                "rule `{id}` is not an unchecked rule (nor a disputed one) of unit {} — only a \
-                 rule no judge or council ruled on can be skipped (a broken rule denies the gate)",
+                "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
+                 of unit {} — only a rule no judge or council ruled on, or a broken rule of \
+                 severity warn or info, can be skipped (a broken error or critical rule denies the \
+                 gate)",
                 cursor.ord
             );
         };
@@ -27900,7 +27932,7 @@ mod request_changes_tests {
                 .unwrap_err()
                 .to_string();
             assert!(
-                err.contains("not an unchecked rule (nor a disputed one)"),
+                err.contains("not an unchecked rule (nor a disputed one, nor a broken warning)"),
                 "{err}"
             );
             assert_eq!(
@@ -28094,7 +28126,10 @@ mod request_changes_tests {
         let err = recheck(&mut store, &run_id, &[("R9", "it is fine")])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("a broken rule denies the gate"), "{err}");
+        assert!(
+            err.contains("a broken error or critical rule denies"),
+            "{err}"
+        );
         assert_eq!(open_gate_kind(&store, &run_id), gate_kind, "still open");
         recheck(
             &mut store,
@@ -28113,6 +28148,71 @@ mod request_changes_tests {
         );
         assert_eq!(skip.reason, "the plugin is one file by design");
         assert_eq!(skip.evidence_key, "ek-learn-small-prs");
+    }
+
+    /// (e2e-1105 CJ9) A broken warning (`waivable`, as the check marks a warn/info rule) is
+    /// skipped with a written reason at its `rule_check` gate; a broken rule that is not waivable
+    /// (error/critical) is still refused and the gate stays open.
+    #[test]
+    fn skip_rules_waives_a_broken_warning_with_a_reason_and_refuses_a_broken_error() {
+        let run_id = format!("rules-waivable-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let row = |id: &str, waivable: Option<bool>| crate::rule_check::RuleVerdict {
+            rule_id: id.into(),
+            status: crate::rule_check::RuleStatus::Broken,
+            how: crate::rule_check::RuleHow::Judge,
+            reason: "names no issue it closes".into(),
+            cite: Some("names no issue it closes".into()),
+            rule_key: "k".into(),
+            evidence_key: Some(format!("ek-{id}")),
+            origin: Some(crate::rule_check::RuleOrigin::Judge),
+            waivable,
+            ..Default::default()
+        };
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![row("learn-linked-issue", Some(true)), row("ERR-1", None)],
+            ..Default::default()
+        };
+        let u = &mut units[2];
+        u.denial = report.denial();
+        u.denials_behind = None;
+        u.rule_check = Some(report);
+        put_node(&mut store, u.to_node()).unwrap();
+        let gate_kind = open_gate_kind(&store, &run_id);
+        let err = recheck(&mut store, &run_id, &[("ERR-1", "it is fine")])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("a broken error or critical rule denies"),
+            "{err}"
+        );
+        assert_eq!(open_gate_kind(&store, &run_id), gate_kind, "still open");
+        let err = recheck(&mut store, &run_id, &[("learn-linked-issue", " ")])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("written reason"), "{err}");
+        recheck(
+            &mut store,
+            &run_id,
+            &[(
+                "learn-linked-issue",
+                "started from words: no issue to close",
+            )],
+        )
+        .expect("a broken warning is waived with a reason");
+        let fix = &crate::domain::session_units(&store, &run_id).unwrap()[2];
+        assert_eq!(fix.rule_skips.len(), 1);
+        let skip = &fix.rule_skips[0];
+        assert_eq!(skip.rule_id, "learn-linked-issue");
+        assert_eq!(skip.reason, "started from words: no issue to close");
+        assert_eq!(skip.evidence_key, "ek-learn-linked-issue");
+        assert!(skip.instruction.is_none());
+        assert!(
+            fix.requested_rejudge.is_some(),
+            "the check runs again on the same work"
+        );
     }
 
     /// (DES-RULE-CHECK-001 S2) `skip_rules` lands each skip with its reason, who and the evidence
