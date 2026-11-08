@@ -1401,6 +1401,47 @@ fn editor_plugin_seats_never_run_the_conformance_harness() {
     );
 }
 
+#[test]
+fn editor_plugin_preset_branches_for_phase_plugins() {
+    let preset: serde_json::Value =
+        serde_json::from_str(include_str!("../src/presets/editor-plugin.json")).unwrap();
+    for id in [
+        "scope",
+        "design",
+        "build",
+        "test",
+        "security-review",
+        "install-plan",
+        "install",
+    ] {
+        let step = preset["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["id"] == id)
+            .unwrap();
+        let text = step["instructions"].as_str().unwrap();
+        let branch = text
+            .split_once("If the brief says `Kind: phase plugin.`:")
+            .unwrap_or_else(|| panic!("{id} has no phase plugin branch"))
+            .1;
+        for required in [
+            "protocol 3",
+            "plugins[]",
+            "observe[]",
+            "why",
+            "install consent grants exactly those topics",
+            "panels[]",
+            "run.details",
+            "r0-r5",
+            "skills/editor-scaffold/refs/run-plugin.md",
+            "scripts/editor/scaffold.py --kind run-plugin",
+        ] {
+            assert!(branch.contains(required), "{id} lacks {required}");
+        }
+    }
+}
+
 /// DES-EDITOR-PLUGIN-CONTRACT-001: the editor-plugin builder builds protocol 2 — the design names `protocol [1, 2]`
 /// and the surfaces declaration, the build scaffolds on the template's protocol-2 plumbing, and the test judges the
 /// protocol-2 conformance cases (13-16) too. Nothing in it still asks for a protocol-1-only editor.

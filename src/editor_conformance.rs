@@ -18,8 +18,8 @@
 //!   venv's interpreter) and [`STUDIO_DIST_ENV`] (its studio dist). Nothing is installed at dispatch.
 //! - **The record** ([`ConformanceRecord`]): the engine reads the report from the out file in its own
 //!   temp dir, applies crew's required-case rule (cases 0-12 and 18 for every editor, plus 13-16
-//!   when its `protocol` lists 2, crew `editors/pack-install.ts` `requiredCases`), and binds it to the
-//!   worktree's tree id taken before and after the run (a tree that changed while it ran is refused).
+//!   when its `protocol` lists 2, and r0-r5 for every run plugin, crew `editors/pack-install.ts`),
+//!   and binds it to the worktree's tree id taken before and after the run (a changed tree is refused).
 //!
 //! ## How it counts (coordinator ruling 1, 2026-11-06)
 //!
@@ -90,6 +90,16 @@ pub(crate) const CASES: [&str; 14] = [
 /// The protocol-2 cases an editor whose `protocol` lists 2 must also pass (crew `CONFORMANCE_CASES_V2`).
 pub(crate) const CASES_V2: [&str; 4] = ["13-surfaces", "14-card", "15-options", "16-full"];
 
+/// The cases every run plugin must pass (CONTRACT-CS7 C5, garden and crew `RUN_PLUGIN_CASES`).
+pub const RUN_PLUGIN_CASES: [&str; 6] = [
+    "r0-manifest",
+    "r1-handshake",
+    "r2-no-network",
+    "r3-topics",
+    "r4-replay",
+    "r5-hash-pinned",
+];
+
 /// The label prefix of the record block in a reviewer's context.
 pub(crate) const RECORD_LABEL: &str = "[editor conformance record";
 
@@ -135,6 +145,8 @@ pub struct ConformanceRecord {
     pub jail: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub editors: Vec<EditorConformance>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub plugins: Vec<EditorConformance>,
     pub attempt: u32,
 }
 
@@ -147,6 +159,7 @@ impl ConformanceRecord {
             tree: None,
             jail: None,
             editors: Vec::new(),
+            plugins: Vec::new(),
             attempt,
         }
     }
@@ -187,45 +200,53 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
     };
     let s = |v: &serde_json::Value, k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
     let mut editors = Vec::new();
-    for e in report
-        .get("editors")
-        .and_then(|e| e.as_array())
-        .into_iter()
-        .flatten()
-    {
-        let protocol: Vec<u64> = match e.get("protocol") {
-            Some(serde_json::Value::Array(a)) => a.iter().filter_map(|p| p.as_u64()).collect(),
-            Some(p) => p.as_u64().into_iter().collect(),
-            None => Vec::new(),
-        };
-        let cases = e.get("cases").and_then(|c| c.as_object());
-        let mut failed = Vec::new();
-        let mut missing = Vec::new();
-        for case in required_cases(&protocol) {
-            match cases.and_then(|c| c.get(case)) {
-                None => missing.push(case.to_string()),
-                Some(c) if c.get("ok").and_then(|o| o.as_bool()) == Some(true) => {}
-                Some(_) => failed.push(case.to_string()),
-            }
-        }
-        // A case the harness ran beyond the required set and failed (e.g. 17) is still a failure.
-        if let Some(c) = cases {
-            for (k, v) in c {
-                if v.get("ok").and_then(|o| o.as_bool()) != Some(true)
-                    && !failed.iter().any(|f| f == k)
-                {
-                    failed.push(k.clone());
+    let mut plugins = Vec::new();
+    for (field, rows) in [("editors", &mut editors), ("plugins", &mut plugins)] {
+        for e in report
+            .get(field)
+            .and_then(|e| e.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let protocol: Vec<u64> = match e.get("protocol") {
+                Some(serde_json::Value::Array(a)) => a.iter().filter_map(|p| p.as_u64()).collect(),
+                Some(p) => p.as_u64().into_iter().collect(),
+                None => Vec::new(),
+            };
+            let cases = e.get("cases").and_then(|c| c.as_object());
+            let mut failed = Vec::new();
+            let mut missing = Vec::new();
+            let required = if field == "plugins" {
+                RUN_PLUGIN_CASES.to_vec()
+            } else {
+                required_cases(&protocol)
+            };
+            for case in required {
+                match cases.and_then(|c| c.get(case)) {
+                    None => missing.push(case.to_string()),
+                    Some(c) if c.get("ok").and_then(|o| o.as_bool()) == Some(true) => {}
+                    Some(_) => failed.push(case.to_string()),
                 }
             }
+            // A case the harness ran beyond the required set and failed (e.g. 17) is still a failure.
+            if let Some(c) = cases {
+                for (k, v) in c {
+                    if v.get("ok").and_then(|o| o.as_bool()) != Some(true)
+                        && !failed.iter().any(|f| f == k)
+                    {
+                        failed.push(k.clone());
+                    }
+                }
+            }
+            rows.push(EditorConformance {
+                id: s(e, "id").unwrap_or_default(),
+                version: s(e, "version").unwrap_or_default(),
+                sha256: s(e, "sha256").unwrap_or_default(),
+                protocol,
+                failed,
+                missing,
+            });
         }
-        editors.push(EditorConformance {
-            id: s(e, "id").unwrap_or_default(),
-            version: s(e, "version").unwrap_or_default(),
-            sha256: s(e, "sha256").unwrap_or_default(),
-            protocol,
-            failed,
-            missing,
-        });
     }
     let ok = report.get("ok").and_then(|o| o.as_bool()) == Some(true);
     let cause = s(&report, "cause");
@@ -237,23 +258,25 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
         tree: None,
         jail: None,
         editors: editors.clone(),
+        plugins: plugins.clone(),
         attempt,
     };
-    let any_failed = editors.iter().any(|e| !e.failed.is_empty());
-    let any_missing = editors.iter().any(|e| !e.missing.is_empty());
+    let rows: Vec<_> = editors.iter().chain(&plugins).cloned().collect();
+    let any_failed = rows.iter().any(|e| !e.failed.is_empty());
+    let any_missing = rows.iter().any(|e| !e.missing.is_empty());
+    if rows.is_empty() && (ok || cause.is_none()) {
+        return base(
+            OUTCOME_FAIL,
+            Some("pack_invalid".into()),
+            Some("the report names no editor or plugin".into()),
+        );
+    }
     if ok {
-        if editors.is_empty() {
-            return base(
-                OUTCOME_REFUSED,
-                Some("no_editors".into()),
-                Some("the report passed but names no editor".into()),
-            );
-        }
         if any_failed {
             return base(
                 OUTCOME_FAIL,
                 Some("case_failed".into()),
-                Some(failed_summary(&editors)),
+                Some(failed_summary(&rows)),
             );
         }
         if any_missing {
@@ -264,7 +287,7 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
                 Some(format!(
                     "the conformance host did not run every required case ({}); crew refuses such an \
                      install too",
-                    missing_summary(&editors)
+                    missing_summary(&rows)
                 )),
             );
         }
@@ -273,7 +296,7 @@ pub(crate) fn judge_report(raw: Option<&str>, attempt: u32) -> ConformanceRecord
     match cause.as_deref() {
         Some(c) if VERDICT_CAUSES.contains(&c) => {
             let reason = if any_failed {
-                failed_summary(&editors)
+                failed_summary(&rows)
             } else {
                 error.unwrap_or_else(|| c.to_string())
             };
@@ -460,8 +483,19 @@ pub(crate) fn brief_block(
             };
             format!("{} {} (entry sha256 {}; {p})", e.id, e.version, e.sha256)
         })
+        .chain(r.plugins.iter().map(|p| {
+            format!(
+                "{} {} (entry sha256 {}; cases r0-r5)",
+                p.id, p.version, p.sha256
+            )
+        }))
         .collect::<Vec<_>>()
         .join("; ");
+    let entries = if r.plugins.is_empty() {
+        "editor"
+    } else {
+        "editor or plugin"
+    };
     let head = format!(
         "The engine ran the editor conformance cases itself on this host{after}{jail} (unit {ord}{tree}): "
     );
@@ -474,7 +508,7 @@ pub(crate) fn brief_block(
             current.unwrap_or("the current tree could not be read")
         ),
         OUTCOME_PASS => format!(
-            "PASSED — every required case for every editor: {editors}. This is the conformance \
+            "PASSED — every required case for every {entries}: {editors}. This is the conformance \
              evidence for this tree: cite it for any conformance item. Do not run conformance.py in \
              your seat (no seat has a headless browser; an in-seat exit 3 is not a finding)."
         ),
@@ -517,6 +551,80 @@ mod tests {
 
     fn all_v2() -> Vec<&'static str> {
         required_cases(&[1, 2])
+    }
+
+    #[test]
+    fn plugin_reports_require_run_cases_and_record_the_build() {
+        assert_eq!(
+            RUN_PLUGIN_CASES.join(","),
+            "r0-manifest,r1-handshake,r2-no-network,r3-topics,r4-replay,r5-hash-pinned"
+        );
+        let mut v = serde_json::json!({"ok": true, "plugins": [{"id": "acme-phase", "version": "1.2.3", "sha256": "ab12", "protocol": [3], "ok": true,
+            "cases": cases(&RUN_PLUGIN_CASES, &[])}]});
+        let mut r = judge_report(Some(&v.to_string()), 2);
+        assert!(r.passed(), "{r:?}");
+        assert!(r.editors.is_empty());
+        assert_eq!(
+            r.plugins,
+            [EditorConformance {
+                id: "acme-phase".into(),
+                version: "1.2.3".into(),
+                sha256: "ab12".into(),
+                protocol: vec![3],
+                failed: vec![],
+                missing: vec![]
+            }]
+        );
+        r.tree = Some("t1".into());
+        let brief = brief_block(6, Some(5), &r, Some("t1"));
+        assert!(
+            brief.contains("acme-phase 1.2.3 (entry sha256 ab12; cases r0-r5)"),
+            "{brief}"
+        );
+        v["plugins"][0]["cases"]
+            .as_object_mut()
+            .unwrap()
+            .remove("r3-topics");
+        let r = judge_report(Some(&v.to_string()), 2);
+        assert_eq!(r.outcome, OUTCOME_REFUSED);
+        assert_eq!(r.cause.as_deref(), Some("cases_not_run"));
+        assert_eq!(r.plugins[0].missing, ["r3-topics"]);
+        assert!(r.reason.unwrap().contains("acme-phase: r3-topics not run"));
+        v["plugins"][0]["cases"]["r3-topics"] = serde_json::json!({"ok": false});
+        for ok in [true, false] {
+            v["ok"] = ok.into();
+            v["cause"] = "case_failed".into();
+            let r = judge_report(Some(&v.to_string()), 2);
+            assert_eq!(r.outcome, OUTCOME_FAIL);
+            assert_eq!(r.plugins[0].failed, ["r3-topics"]);
+            assert_eq!(r.reason.as_deref(), Some("acme-phase: r3-topics failed"));
+        }
+        v["plugins"][0]["cases"] = cases(&RUN_PLUGIN_CASES, &[]);
+        v["ok"] = true.into();
+        v["editors"] = serde_json::json!([{"id": "acme-editor", "protocol": [1, 2], "cases": cases(&all_v2(), &[])}]);
+        assert!(judge_report(Some(&v.to_string()), 0).passed());
+        v["editors"][0]["cases"]["14-card"] = serde_json::json!({"ok": false});
+        let r = judge_report(Some(&v.to_string()), 0);
+        assert_eq!(r.outcome, OUTCOME_FAIL);
+        assert_eq!(r.editors[0].failed, ["14-card"]);
+        assert!(r.plugins[0].failed.is_empty());
+    }
+
+    #[test]
+    fn empty_packs_are_invalid_and_old_records_still_parse() {
+        for raw in [
+            r#"{"ok":true}"#,
+            r#"{"ok":true,"editors":[],"plugins":[]}"#,
+            r#"{"ok":false,"editors":[],"plugins":[]}"#,
+        ] {
+            let r = judge_report(Some(raw), 0);
+            assert_eq!(r.outcome, OUTCOME_FAIL);
+            assert_eq!(r.cause.as_deref(), Some("pack_invalid"));
+        }
+        let old = r#"{"outcome":"pass","editors":[{"id":"acme-x"}],"attempt":0}"#;
+        let r: ConformanceRecord = serde_json::from_str(old).unwrap();
+        assert!(r.plugins.is_empty());
+        assert!(serde_json::to_value(&r).unwrap().get("plugins").is_none());
     }
 
     #[test]
@@ -602,17 +710,20 @@ mod tests {
             0,
         );
         assert_eq!(r.outcome, OUTCOME_FAIL);
-        // No report, garbage, an ok report naming no editor, a failure with no cause: refusals.
+        // No report, garbage and a failure with no cause are refusals; an empty pack is invalid.
         assert_eq!(judge_report(None, 0).outcome, OUTCOME_REFUSED);
         assert_eq!(judge_report(Some("not json"), 0).outcome, OUTCOME_REFUSED);
         assert_eq!(
             judge_report(Some(&report(serde_json::json!([]), true, None)), 0).outcome,
-            OUTCOME_REFUSED
+            OUTCOME_FAIL
         );
         assert_eq!(
-            judge_report(Some(&report(serde_json::json!([]), false, None)), 0)
-                .cause
-                .as_deref(),
+            judge_report(
+                Some(&report(serde_json::json!([{"id": "acme-x"}]), false, None)),
+                0
+            )
+            .cause
+            .as_deref(),
             Some("no_cause")
         );
     }

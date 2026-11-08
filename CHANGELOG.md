@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- Run plugins use install-ledger topic grants with deny dominance, require conformance cases r0-r5, and follow a phase plugin branch in the editor-plugin preset.
+
 - **A codex seat finds the bare `wicked-garden` launcher.** A codex seat is handed `<snapshot>/scripts` at the front of
   `PATH`, but codex (0.162) runs the model's commands in a login shell by default, and the seat image's `/etc/profile`
   sets `PATH` for a non-root user to a fixed list. So a bare `wicked-garden run …` failed with "command not found" in
