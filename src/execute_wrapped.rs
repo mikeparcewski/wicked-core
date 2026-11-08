@@ -15563,6 +15563,18 @@ mod tests {
             check.contains(&format!("{shim} call mcp:web/fetch --args")),
             "the check re-fetches through the web source: {check}"
         );
+        // The learn workflow's research reads the web source first too: a claude unit no longer
+        // has its own web tools to fall back on.
+        let research = crate::catalog::builtin_preset("learn")
+            .expect("a built-in")
+            .into_iter()
+            .find(|s| s.id == "research")
+            .and_then(|s| s.instructions)
+            .expect("learn's research step");
+        assert!(
+            research.contains(&format!("{shim} call mcp:web/fetch --args")),
+            "{research}"
+        );
     }
 
     /// core#657 (F-11): a wrapped claude worker loads NO ambient MCP server — not a repository

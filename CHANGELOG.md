@@ -21,7 +21,9 @@ Two release tracks share this file, newest entry first regardless of track:
   `--disallowedTools` argv and the settings file's `permissions.deny`), on every unit, not only one with a picked
   source: core does not hold the pick, and a unit without the web picked has no sanctioned web read. Chat sessions
   and council ballots are not units and are unchanged. The sourced report's gather and check directives now name
-  how to reach the source: list the tools with the garden MCP shim, then call `mcp:web/search` and `mcp:web/fetch`.
+  how to reach the source: list the tools with the garden MCP shim, then call `mcp:web/search` and `mcp:web/fetch`. The
+  learn workflow's research step reads the web source first too, and falls back to a seat's own web tools or curl only
+  when the source is not listed (a claude unit has none now).
 
 - **The engine records which skills each seat uses (operator ask: learn which skills can be turned off).** Every
   wrapped adapter (claude, codex, pi, opencode, agy) reads its seat's tool calls for skill use before the live frames'
