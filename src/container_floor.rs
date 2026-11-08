@@ -505,39 +505,60 @@ pub(crate) fn runtime_down_now() -> bool {
 /// One `version` attempt's bound. A loaded laptop (1-min load 50-80, e2e-1105 09:02Z) made the
 /// docker CLI miss the old single 15 s bound while `docker version` answered by hand every time.
 const VERSION_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Attempts before the runtime reads down: it is down only after this many CONSECUTIVE failures.
-/// A runtime that is really down fails each attempt at once (the CLI cannot reach its socket), so
-/// the retries cost about [`VERSION_PROBE_PAUSE`] each; only a slow host pays the longer bound.
-const VERSION_PROBE_ATTEMPTS: u32 = 3;
-/// The short pause between two attempts.
-const VERSION_PROBE_PAUSE: Duration = Duration::from_secs(2);
+/// Attempts of one runtime operation before it counts as failed: the runtime is down only after
+/// this many CONSECUTIVE failures ([`with_retries`]).
+pub(crate) const RUNTIME_ATTEMPTS: u32 = 3;
+/// The short pause between two attempts. A runtime that is really down fails each attempt at once
+/// (the CLI cannot reach its socket), so it reads down about a second later than before; only a
+/// slow host pays the longer bound, and it waits instead of failing a step.
+pub(crate) const RUNTIME_RETRY_PAUSE: Duration = Duration::from_millis(500);
 
-/// Whether `rt`'s engine answers `version` now: up to [`VERSION_PROBE_ATTEMPTS`] tries, each bound
-/// by [`VERSION_PROBE_TIMEOUT`], a short pause between them. One slow or failed answer never makes
-/// the runtime read down (and so never fails a step with `container_runtime_down`): an honest wait
-/// beats a false outage.
-fn runtime_answers(rt: &Runtime) -> bool {
-    runtime_answers_within(
-        rt,
-        VERSION_PROBE_TIMEOUT,
-        VERSION_PROBE_ATTEMPTS,
-        VERSION_PROBE_PAUSE,
+/// Run one runtime operation up to `attempts` times (at least once), pausing `pause` between
+/// attempts, and answer its first success or its LAST error: one slow or failed answer from a
+/// loaded host is never the operation's outcome on its own.
+pub(crate) fn with_retries<T>(
+    attempts: u32,
+    pause: Duration,
+    sleep: &mut dyn FnMut(Duration),
+    op: &mut dyn FnMut() -> Result<T, String>,
+) -> Result<T, String> {
+    let mut last = Err(String::new());
+    for attempt in 0..attempts.max(1) {
+        if attempt > 0 {
+            sleep(pause);
+        }
+        last = op();
+        if last.is_ok() {
+            return last;
+        }
+    }
+    last
+}
+
+/// [`with_retries`] with the production attempts and pause, sleeping the thread.
+pub(crate) fn retrying<T>(op: &mut dyn FnMut() -> Result<T, String>) -> Result<T, String> {
+    with_retries(
+        RUNTIME_ATTEMPTS,
+        RUNTIME_RETRY_PAUSE,
+        &mut |d| std::thread::sleep(d),
+        op,
     )
 }
 
-/// [`runtime_answers`] with its bound, attempts and pause explicit (tests use short ones).
-fn runtime_answers_within(rt: &Runtime, bound: Duration, attempts: u32, pause: Duration) -> bool {
-    for attempt in 0..attempts.max(1) {
-        if attempt > 0 {
-            std::thread::sleep(pause);
-        }
+/// Whether `rt`'s engine answers `version` now: up to [`RUNTIME_ATTEMPTS`] tries, each bound by
+/// [`VERSION_PROBE_TIMEOUT`] ([`retrying`]). One slow or failed answer never makes the runtime read
+/// down, and so never fails a step with `container_runtime_down`: an honest wait beats a false
+/// outage.
+fn runtime_answers(rt: &Runtime) -> bool {
+    retrying(&mut || {
         let mut probe = rt.cmd();
         probe.args(["version", "--format", "{{.Server.Version}}"]);
-        if output_within(probe, rt.bound(bound)).is_some_and(|o| o.status.success()) {
-            return true;
+        match output_within(probe, rt.bound(VERSION_PROBE_TIMEOUT)) {
+            Some(o) if o.status.success() => Ok(()),
+            _ => Err(String::new()),
         }
-    }
-    false
+    })
+    .is_ok()
 }
 
 /// The first runtime candidate whose engine answers `version`, probed (uncached).
@@ -1158,23 +1179,31 @@ pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, St
     if offline_seats() {
         return Ok("none".into());
     }
-    let mut create = rt.cmd();
-    create.args([
-        "network",
-        "create",
-        "--internal",
-        "--label",
-        &format!("{SEAT_LABEL}=1"),
-        name,
-    ]);
-    match output_within(create, rt.bound(PROBE_TIMEOUT)) {
-        Some(o) if o.status.success() => Ok(name.to_string()),
-        Some(o) => Err(format!(
-            "could not create the seat network `{name}`: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        None => Err(format!("creating the seat network `{name}` timed out")),
-    }
+    // Retried (e2e-1105 09:02Z): one slow answer on a loaded host was `container_runtime_down` for
+    // the seat, and a judge went unchecked. A create that timed out may have landed: the retry then
+    // reads "already exists" for this unit's own network name, which is the success it looks like.
+    retrying(&mut || {
+        let mut create = rt.cmd();
+        create.args([
+            "network",
+            "create",
+            "--internal",
+            "--label",
+            &format!("{SEAT_LABEL}=1"),
+            name,
+        ]);
+        match output_within(create, rt.bound(PROBE_TIMEOUT)) {
+            Some(o) if o.status.success() => Ok(name.to_string()),
+            Some(o) if String::from_utf8_lossy(&o.stderr).contains("already exists") => {
+                Ok(name.to_string())
+            }
+            Some(o) => Err(format!(
+                "could not create the seat network `{name}`: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            )),
+            None => Err(format!("creating the seat network `{name}` timed out")),
+        }
+    })
 }
 
 /// One mount of the container's filesystem, rendered as a `--mount` value.
@@ -4130,69 +4159,70 @@ mod agy_tests;
 mod tests {
     use super::*;
 
-    /// A runtime stub whose first `answer_on - 1` calls stall past the bound, then answers:
-    /// a loaded host's docker CLI (e2e-1105 09:02Z). Counts its calls in `calls`.
-    fn slow_runtime(dir: &Path, answer_on: u32) -> (PathBuf, PathBuf) {
+    /// One failed (or slow) attempt is not the outcome: the second attempt answers, after one
+    /// short pause. A single-attempt probe read this runtime down (e2e-1105 09:02Z).
+    #[test]
+    fn one_slow_runtime_answer_is_retried_not_final() {
+        let mut calls = 0;
+        let mut pauses = Vec::new();
+        let got = with_retries(
+            3,
+            Duration::from_millis(500),
+            &mut |d| pauses.push(d),
+            &mut || {
+                calls += 1;
+                if calls == 1 {
+                    Err("`docker version` did not answer".to_string())
+                } else {
+                    Ok("29.5.3")
+                }
+            },
+        );
+        assert_eq!(got, Ok("29.5.3"));
+        assert_eq!(calls, 2);
+        assert_eq!(pauses, vec![Duration::from_millis(500)]);
+    }
+
+    /// Down only after consecutive failures: every attempt is made, and the last error stands.
+    #[test]
+    fn a_runtime_fails_only_after_every_attempt_failed() {
+        let mut calls = 0;
+        let got: Result<(), String> = with_retries(3, Duration::ZERO, &mut |_| {}, &mut || {
+            calls += 1;
+            Err(format!("attempt {calls}"))
+        });
+        assert_eq!(got, Err("attempt 3".to_string()));
+        assert_eq!(calls, 3);
+    }
+
+    /// The production policy: retried, with a bound longer than the old single 15 s and a short
+    /// pause (a real outage still reads down within about a second more).
+    #[test]
+    fn the_runtime_probe_retries_with_a_patient_bound() {
+        let attempts = RUNTIME_ATTEMPTS;
+        assert!(attempts >= 2, "{attempts}");
+        assert!(VERSION_PROBE_TIMEOUT > Duration::from_secs(15));
+        assert!(RUNTIME_RETRY_PAUSE <= Duration::from_secs(2));
+    }
+
+    /// A slow fake runtime through the PRODUCTION probe: its first `version` fails (the loaded
+    /// host's miss), its second answers. `runtime_answers` reads it up; the old single attempt
+    /// read it down.
+    #[test]
+    fn the_production_probe_reads_a_slow_runtime_up() {
+        let dir = c4_temp();
         let cli = dir.join("docker");
         let calls = dir.join("calls");
         crate::test_env::install_stub(
             &cli,
             &format!(
                 "#!/bin/sh\nn=$(($(cat '{c}' 2>/dev/null || echo 0) + 1))\necho $n > '{c}'\n\
-                 if [ \"$n\" -lt {answer_on} ]; then sleep 5; fi\necho 29.5.3\n",
+                 [ \"$n\" -ge 2 ] || exit 1\necho 29.5.3\n",
                 c = calls.display()
             ),
         );
-        (cli, calls)
-    }
-
-    /// One slow `version` answer no longer reads as a down runtime: the probe retries after a
-    /// short pause and the second attempt answers. Fails on a single-attempt probe.
-    #[test]
-    fn a_slow_runtime_is_not_down_after_one_slow_answer() {
-        let dir = c4_temp();
-        let (cli, calls) = slow_runtime(&dir, 2);
-        let rt = Runtime::stalling(cli);
-        assert!(runtime_answers_within(
-            &rt,
-            Duration::from_millis(1500),
-            3,
-            Duration::from_millis(50)
-        ));
+        assert!(runtime_answers(&Runtime::answering(cli)));
         assert_eq!(std::fs::read_to_string(&calls).unwrap().trim(), "2");
-    }
-
-    /// Down only after consecutive failures: a runtime that never answers is tried every time,
-    /// then reads down.
-    #[test]
-    fn a_runtime_reads_down_only_after_every_attempt_failed() {
-        let dir = c4_temp();
-        let cli = dir.join("docker");
-        let calls = dir.join("calls");
-        crate::test_env::install_stub(
-            &cli,
-            &format!(
-                "#!/bin/sh\necho x >> '{c}'\necho 'Cannot connect to the Docker daemon' >&2\nexit 1\n",
-                c = calls.display()
-            ),
-        );
-        let rt = Runtime::stalling(cli);
-        assert!(!runtime_answers_within(
-            &rt,
-            Duration::from_secs(5),
-            3,
-            Duration::from_millis(10)
-        ));
-        assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
-    }
-
-    /// The production policy: more than one attempt, a bound longer than the old single 15 s.
-    #[test]
-    fn the_version_probe_retries_with_a_patient_bound() {
-        let attempts = VERSION_PROBE_ATTEMPTS;
-        assert!(attempts >= 2, "{attempts}");
-        assert!(VERSION_PROBE_TIMEOUT > Duration::from_secs(15));
-        assert!(VERSION_PROBE_PAUSE <= Duration::from_secs(5));
     }
 
     /// A runtime stub that logs its argv and answers `image inspect` only for the tags a `build`

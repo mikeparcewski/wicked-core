@@ -1171,15 +1171,18 @@ impl ChecksFloor {
             }
         }
         let rt = crate::container_floor::runtime().map_err(|e| no(e.describe().to_string()))?;
-        let server = rt_run(
-            &rt,
-            &[
-                "version",
-                "--format",
-                "{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}",
-            ],
-            PROBE,
-        )
+        // Retried (e2e-1105 09:02Z): one slow answer on a loaded host refused the whole floor.
+        let server = crate::container_floor::retrying(&mut || {
+            rt_run(
+                &rt,
+                &[
+                    "version",
+                    "--format",
+                    "{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}",
+                ],
+                PROBE,
+            )
+        })
         .map_err(no)?;
         let platform = server.split(' ').next().unwrap_or("").to_string();
         if !platform.starts_with("linux/") {
