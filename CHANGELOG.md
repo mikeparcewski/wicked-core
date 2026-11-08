@@ -2683,6 +2683,19 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.33** — 2026-11-08 — patch release on main b798ec4, carrying 3 PRs since 0.15.32: #1359, #1360 and #1361.
+  - **A Research job reads the web through the web source you picked (#1360, e2e-1105 CJ3/CJ12).** A claude unit used
+    its own web tools instead: in the seat container WebFetch is refused, and WebSearch answers from the model
+    provider, around the job's source. So the source got no call and the report had no fetched page. Every claude
+    unit launch now denies those two tools, and the sourced report's gather
+    and check (and the learn workflow's research step) say how to reach the web source's search and fetch.
+  - **A Review a change reviewer's "reject" is its result, not a failed step (#1361, CJ13).** The `review-change`
+    review closes with a recommendation (approve, approve with conditions, reject) and its verdict judges the review
+    itself, so a well-founded reject no longer holds the run at an escalation before the semantic check and judge.
+  - **Lockfile:** #1359 re-stamped the 0.15.32 platform lock entries.
+  - No binding method, `confirmGate` argument or `LaunchSpec` field is added. The seat and floor Dockerfiles, the seat
+    package pins, the base image and the gate-hook protocol are unchanged since 0.15.32, so the seat and floor image
+    tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.32** — 2026-11-08 — release on main 02975a3, carrying 29 PRs since 0.15.31: #1303, #1304, #1307,
   #1308, #1309, #1311, #1312, #1315, #1317, #1321, #1323, #1324, #1325, #1327, #1328, #1330, #1331, #1332, #1333,
   #1341, #1347, #1348, #1349, #1350, #1351, #1352, #1353, #1354 and #1355. Most have their own entry earlier in this
