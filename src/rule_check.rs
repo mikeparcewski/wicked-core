@@ -52,7 +52,8 @@
 //!   re-review after a send-back rechecks only what changed.
 //! * **Outcome.** Any `broken` row (but a process rule's) denies the gate ([`DENIAL_SOURCE_BROKEN`], naming each rule and
 //!   its cite); any `unchecked` row holds it ([`DENIAL_SOURCE_UNCHECKED`]). The person can retry
-//!   ([`RETRY_ACTION`]) or skip an unchecked rule with a reason ([`SKIP_ACTION`]); a skip is a
+//!   ([`RETRY_ACTION`]) or skip an unchecked rule, or a broken warning (`waivable`), with a
+//!   reason ([`SKIP_ACTION`]); a skip is a
 //!   `skipped` row labelled with the reason on the gate receipt and the delivery.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -310,10 +311,17 @@ pub struct RuleVerdict {
     /// The council a dispute on it went to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub council: Option<RuleCouncil>,
+    /// (e2e-1105 CJ9) `true` on a BROKEN row of a rule the person may waive (severity `warn` or
+    /// `info`, not a process rule): the gate's `skip_rules` takes it with a written reason, so a
+    /// warning that cannot be met (a pull request with no issue to name) never strands the run.
+    /// A broken `error` / `critical` rule is reworked. Absent elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub waivable: Option<bool>,
 }
 
-/// A person's skip of an unchecked rule (gate action [`SKIP_ACTION`]): it applies while the
-/// rule's evidence is the one it was skipped on. At delivery it answers the rule as it is whatever
+/// A person's skip of an unchecked rule, or of a broken warning (`waivable`; e2e-1105 CJ9) (gate
+/// action [`SKIP_ACTION`]): it applies while the rule's content (its key, which carries its
+/// severity) and evidence are the ones it was skipped on. At delivery it answers the rule as it is whatever
 /// the re-composed text (codex r2), except a skip given on a row with no evidence
 /// ([`no_evidence_key`]), which answers only such rows (e2e-1105 F4c).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +467,27 @@ impl RuleCheckReport {
             ));
         }
         s
+    }
+
+    /// (e2e-1105 CJ9) Marks each row `waivable` from its final status: a broken warning (severity
+    /// `warn` / `info`, not a process row) is the person's to skip with a reason; a broken `error`
+    /// / `critical` rule is reworked, and every other row carries no mark. Re-derived at the end of
+    /// every check and again after a council settles a dispute, so a reused or settled row follows
+    /// its rule's severity and status now.
+    pub fn mark_waivable(&mut self, rules: &[ConformanceRule]) {
+        for r in self.rows.iter_mut() {
+            r.waivable = (r.status == RuleStatus::Broken
+                && !r.reported_only()
+                && rules.iter().any(|rule| {
+                    rule.id == r.rule_id
+                        && matches!(
+                            rule.severity,
+                            wicked_governance::ConfSeverity::Warn
+                                | wicked_governance::ConfSeverity::Info
+                        )
+                }))
+            .then_some(true);
+        }
     }
 
     /// The deny a broken rule casts: every broken rule with its cite.
@@ -3357,6 +3386,7 @@ pub fn check(
             }
         }
     }
+    report.mark_waivable(input.rules);
     report.elapsed_ms = started.elapsed().as_millis() as u64;
     report
 }

@@ -591,6 +591,136 @@ fn a_skip_answers_exactly_the_rule_and_evidence_it_was_given_on() {
     assert_eq!(again.rows[0].status, RuleStatus::Unchecked);
 }
 
+/// (e2e-1105 CJ9) A broken warning (severity warn or info) is the person's to waive: its row says
+/// `waivable`, and a skip with a reason makes it `skipped` on the same work, labelled with the
+/// reason. A broken error or critical rule is not waivable (it is reworked).
+#[test]
+fn a_broken_warning_is_waivable_and_a_skip_with_a_reason_lands_it() {
+    let mut err = rule("ERR", "e");
+    err.severity = ConfSeverity::Error;
+    let mut crit = rule("CRIT", "c");
+    crit.severity = ConfSeverity::Critical;
+    let mut info = rule("INFO", "i");
+    info.severity = ConfSeverity::Info;
+    let rules = [rule("WARN", "w"), info, err, crit, rule("KEEP", "k")];
+    let judge = Fake::new(&[
+        ("WARN", "BROKEN — src/add.rs:1 names no issue it closes"),
+        ("INFO", "BROKEN — src/add.rs:1 i"),
+        ("ERR", "BROKEN — src/add.rs:1 e"),
+        ("CRIT", "BROKEN — src/add.rs:1 c"),
+        ("KEEP", "KEPT — src/add.rs:1"),
+    ]);
+    let first = run(&rules, &judge, None);
+    let by =
+        |r: &RuleCheckReport, id: &str| r.rows.iter().find(|x| x.rule_id == id).cloned().unwrap();
+    assert_eq!(by(&first, "WARN").status, RuleStatus::Broken);
+    assert_eq!(by(&first, "WARN").waivable, Some(true));
+    assert_eq!(by(&first, "INFO").waivable, Some(true));
+    assert_eq!(by(&first, "ERR").waivable, None);
+    assert_eq!(by(&first, "CRIT").waivable, None);
+    assert_eq!(
+        by(&first, "KEEP").waivable,
+        None,
+        "only a broken row is waivable"
+    );
+    let skips = [
+        skip_of(
+            &by(&first, "WARN"),
+            "started from words: there is no issue to close",
+        ),
+        skip_of(&by(&first, "INFO"), "a note only"),
+    ];
+    let r = run_on(&rules, &change(), &judge, &NoMachine, Some(&first), &skips);
+    let warn = by(&r, "WARN");
+    assert_eq!(warn.status, RuleStatus::Skipped);
+    assert_eq!(warn.how, RuleHow::Operator);
+    assert!(warn.reason.contains("no issue to close"), "{}", warn.reason);
+    assert_eq!(warn.waivable, None);
+    let d = r.denial().expect("the error and critical rules still deny");
+    let mut denied = d.rule_ids.clone();
+    denied.sort();
+    assert_eq!(denied, ["CRIT", "ERR"]);
+    // A reused verdict (the same rule and evidence: no judge call) is re-derived too: a prior row
+    // from an older engine (no mark) gains it, a wrong mark on an error rule is cleared.
+    let mut older = first.clone();
+    for r in older.rows.iter_mut() {
+        r.waivable = (r.rule_id == "ERR").then_some(true);
+    }
+    let calls = judge.calls.load(Ordering::SeqCst);
+    let reused = run_on(&rules, &change(), &judge, &NoMachine, Some(&older), &[]);
+    assert_eq!(
+        judge.calls.load(Ordering::SeqCst),
+        calls,
+        "every verdict reused"
+    );
+    assert_eq!(by(&reused, "WARN").waivable, Some(true));
+    assert_eq!(by(&reused, "ERR").waivable, None);
+    // The skip never carries to a rule raised to error: its content key changed, so it is judged
+    // again, broken, not waivable, and it denies.
+    let mut raised = rules.clone();
+    raised[0].severity = ConfSeverity::Error;
+    let r = run_on(&raised, &change(), &judge, &NoMachine, Some(&first), &skips);
+    let warn = by(&r, "WARN");
+    assert_eq!(warn.status, RuleStatus::Broken);
+    assert_eq!(warn.waivable, None);
+    assert!(r.denial().unwrap().rule_ids.contains(&"WARN".to_string()));
+}
+
+/// (e2e-1105 CJ9, codex review) The mark follows the row's FINAL status: a council that settles
+/// a dispute broken gets it re-derived, one that settles it kept loses it; on the wire it is
+/// `true` or absent, never `null` or `false`, and a row from an older engine reads as unmarked.
+#[test]
+fn the_waiver_mark_follows_a_settled_status_and_is_true_or_absent_on_the_wire() {
+    let mut err = rule("ERR", "e");
+    err.severity = ConfSeverity::Error;
+    let rules = [rule("WARN", "w"), err];
+    let mut report = RuleCheckReport {
+        rows: vec![
+            RuleVerdict {
+                rule_id: "WARN".into(),
+                status: RuleStatus::Disputed,
+                ..Default::default()
+            },
+            RuleVerdict {
+                rule_id: "ERR".into(),
+                status: RuleStatus::Broken,
+                waivable: Some(true),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    report.mark_waivable(&rules);
+    assert_eq!(
+        report.rows[0].waivable, None,
+        "a dispute is not a broken row"
+    );
+    assert_eq!(
+        report.rows[1].waivable, None,
+        "an error rule is never waivable"
+    );
+    // The council settles the dispute broken: the mark follows.
+    report.rows[0].status = RuleStatus::Broken;
+    report.mark_waivable(&rules);
+    assert_eq!(report.rows[0].waivable, Some(true));
+    let wire = serde_json::to_value(&report.rows).unwrap();
+    assert_eq!(wire[0]["waivable"], serde_json::json!(true));
+    assert!(
+        wire[1].get("waivable").is_none(),
+        "absent, never null: {}",
+        wire[1]
+    );
+    // Settled kept: the mark goes.
+    report.rows[0].status = RuleStatus::Kept;
+    report.mark_waivable(&rules);
+    assert_eq!(report.rows[0].waivable, None);
+    let old: RuleVerdict = serde_json::from_value(
+        serde_json::json!({"ruleId": "WARN", "status": "broken", "how": "judge", "reason": "r"}),
+    )
+    .unwrap();
+    assert_eq!(old.waivable, None);
+}
+
 #[test]
 fn a_re_review_with_the_same_evidence_reuses_every_verdict_and_calls_no_judge() {
     let rules = [rule("A", "a"), rule("B", "b")];

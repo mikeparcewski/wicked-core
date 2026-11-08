@@ -409,8 +409,9 @@ export declare class Core {
    * or `rule_check`) is in the unit's denial record, as the winning denial or behind it (a
    * reviewer's FAIL, `review_adjudication` included): `retry_rules` (`approve=true`, no
    * `amend`) re-runs the rule check on the same work, and `skip_rules` (`approve=true`,
-   * `amend` = JSON `[{"id", "reason"}]`) skips unchecked or disputed rules (never a broken
-   * one), each with its reason, then re-runs it. The step does not run again; refused when no
+   * `amend` = JSON `[{"id", "reason"}]`) skips unchecked or disputed rules, or a broken
+   * warning the receipt marks `waivable` (never a broken error or critical rule), each with
+   * its reason, then re-runs it. The step does not run again; refused when no
    * rule layer holds the unit.
    *
    * (DES-TEAMING-002 T3, additive.) `planJson` answers a `plan_approval` gate WITH AN EDIT: the

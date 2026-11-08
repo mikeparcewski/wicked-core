@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A broken warning can be skipped with a reason (e2e-1105 CJ9).** A `/plugin` job started from words, with no
+  issue, delivered its pull request and then held at the deliver step: the rule `learn-linked-issue` (severity warn,
+  "Every pull request names the issue it closes") was judged broken, and the gate refused `skip_rules` on any broken
+  row, so the only ways on were a rework that could not add an issue or stopping the run. A broken row of a rule with
+  severity `warn` or `info` (not a process rule) now carries `waivable: true` on the receipt, re-derived on every
+  check; the gate's `skip_rules` takes it with a written reason, and the row becomes `skipped`, labelled with the
+  reason on the run, the gate and the delivery. The skip answers only that rule's content (its key carries the
+  severity) and evidence. A broken `error` or `critical` rule is still reworked, and the escalation prompt names the
+  waivable rules and the skip.
 - **A claude unit reads the web only through the job's web source (e2e-1105 CJ3/CJ12).** A Research job picked the
   web, but its gather ran on claude, which used its own WebSearch and WebFetch: every fetch was refused in the seat
   container ("Unable to verify if domain … is safe to fetch"), the job's web source got no call, and the report

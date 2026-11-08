@@ -253,6 +253,13 @@ fn a_judge_reviewer_split_goes_to_one_council_and_its_ruling_decides() {
             }
             _ => assert!(r.denial().is_none() && r.hold().is_none(), "{r:?}"),
         }
+        // (e2e-1105 CJ9) R1 is a warning the judge broke (marked waivable by the check): the mark
+        // follows the council's ruling, kept by a broken ruling and dropped by a kept one.
+        assert_eq!(
+            r1.waivable,
+            (want == RuleStatus::Broken).then_some(true),
+            "{tag}"
+        );
         assert_eq!(
             row(&r, "R2").status,
             RuleStatus::NotApplicable,
