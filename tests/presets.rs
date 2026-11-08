@@ -1893,7 +1893,8 @@ fn review_change_verdict_judges_the_review_not_the_change() {
     }
     let semantic = text("semantic");
     assert!(
-        semantic.contains("a well-founded reject is a PASS, and the verdict never judges the change"),
+        semantic
+            .contains("a well-founded reject is a PASS, and the verdict never judges the change"),
         "semantic step: {semantic}"
     );
     for (id, s) in [("review", &review), ("semantic", &semantic)] {
