@@ -1861,3 +1861,43 @@ fn catalog_gap_presets_launch_and_plan_their_steps() {
         );
     }
 }
+
+/// (CJ13, fold 26) A review-change review's recommendation is its deliverable, not a failed step: a
+/// reviewer that correctly recommends `reject` wrote `VERDICT: FAIL`, and the run held at an
+/// escalation offering retry before the semantic check and the judge ran. The preset says the
+/// recommendation is a separate `RECOMMENDATION:` line and that the verdict judges the review itself,
+/// so approve, conditions and reject all complete the review.
+#[test]
+fn review_change_verdict_judges_the_review_not_the_change() {
+    let builtins = wicked_core::builtin_presets();
+    let steps = &builtins
+        .iter()
+        .find(|(n, _)| *n == "review-change")
+        .expect("review-change is built in")
+        .1;
+    let text = |id: &str| {
+        steps
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.instructions.clone())
+            .unwrap_or_else(|| panic!("review-change/{id} has instructions"))
+    };
+    let review = text("review");
+    for needle in [
+        "`RECOMMENDATION: approve`",
+        "`RECOMMENDATION: reject`",
+        "never its verdict: a reject is a review done properly",
+        "PASS when you read the whole change and every finding holds at file:line, whatever you recommend",
+    ] {
+        assert!(review.contains(needle), "review step lacks {needle:?}: {review}");
+    }
+    let semantic = text("semantic");
+    assert!(
+        semantic
+            .contains("a well-founded reject is a PASS, and the verdict never judges the change"),
+        "semantic step: {semantic}"
+    );
+    for (id, s) in [("review", &review), ("semantic", &semantic)] {
+        assert!(!s.contains('\n'), "{id}: single-line by pty contract");
+    }
+}

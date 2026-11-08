@@ -13,7 +13,7 @@
     "diff"
    ],
    "skill_ref": "wicked-garden-engineering",
-   "instructions": "Phase 2/3 REVIEW (engineering skill, review action): review the change for correctness, edge cases and error handling, security, performance, the tests that cover it, and whether it does what its description says. List each finding with its file:line and its severity, most harmful first, and close the findings with your recommendation: approve, approve with conditions (name them) or reject. Post nothing to the pull request: the report is the person's to share."
+   "instructions": "Phase 2/3 REVIEW (engineering skill, review action): review the change for correctness, edge cases and error handling, security, performance, the tests that cover it, and whether it does what its description says. List each finding with its file:line and its severity, most harmful first, then close with one line: `RECOMMENDATION: approve`, `RECOMMENDATION: approve with conditions: <the conditions>` or `RECOMMENDATION: reject`. The recommendation is the review's result, never its verdict: a reject is a review done properly. Your VERDICT judges the review itself: PASS when you read the whole change and every finding holds at file:line, whatever you recommend; FAIL only when the review is incomplete or a finding does not hold. Post nothing to the pull request: the report is the person's to share."
   },
   {
    "catalog": "critique",
@@ -27,7 +27,7 @@
     "review"
    ],
    "skill_ref": "wicked-garden-qe-semantic-reviewer",
-   "instructions": "Phase 3/3 SEMANTIC CHECK (semantic reviewer): check that the change means what it says: its description, its tests and its code agree, and nothing in it does what its names or comments do not say; then re-check the review's findings and its recommendation. List each finding with its file:line. Post nothing to the pull request. PASS only when every finding holds and the recommendation follows from them."
+   "instructions": "Phase 3/3 SEMANTIC CHECK (semantic reviewer): check that the change means what it says: its description, its tests and its code agree, and nothing in it does what its names or comments do not say; then re-check the review's findings and its recommendation. List each finding with its file:line. Post nothing to the pull request. PASS only when every finding holds and the recommendation follows from them, whatever it recommends: a well-founded reject is a PASS, and the verdict never judges the change."
   }
  ]
 }
