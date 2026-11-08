@@ -2692,6 +2692,15 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.34** — 2026-11-08 — patch release on main ca1b591, carrying 2 PRs since 0.15.33: #1364 and #1365.
+  - **A broken warning can be skipped with a reason (#1365, e2e-1105 CJ9).** A job with no issue that delivered its pull
+    request held at the deliver step on a broken `warn` rule (`learn-linked-issue`), with no way on but stopping. A
+    broken row of a `warn` or `info` rule now carries `waivable: true`, and the gate's skip takes it with a written
+    reason, labelled on the run, the gate and the delivery. A broken `error` or `critical` rule is still reworked.
+  - **Lockfile:** #1364 re-stamped the 0.15.33 platform lock entries.
+  - No binding method, `confirmGate` argument or `LaunchSpec` field is added (`confirmGate`'s doc now says a waivable
+    broken warning can be skipped). The seat and floor Dockerfiles, the seat package pins, the base image and the
+    gate-hook protocol are unchanged since 0.15.33, so the seat and floor image tags and gate protocol 3 are unchanged.
 - **core-ts 0.15.33** — 2026-11-08 — patch release on main b798ec4, carrying 3 PRs since 0.15.32: #1359, #1360 and #1361.
   - **A Research job reads the web through the web source you picked (#1360, e2e-1105 CJ3/CJ12).** A claude unit used
     its own web tools instead: in the seat container WebFetch is refused, and WebSearch answers from the model
