@@ -25,6 +25,10 @@ Two release tracks share this file, newest entry first regardless of track:
   learn workflow's research step reads the web source first too, and falls back to a seat's own web tools or curl only
   when the source is not listed (a claude unit has none now).
 
+- **Fixed: a review-change reviewer's "reject" is its result, not a failed step (CJ13).** The `review-change` preset's
+  review step closes with a `RECOMMENDATION:` line (approve, approve with conditions, reject) and its `VERDICT:` judges
+  the review itself (complete, every finding holds at file:line), whatever it recommends; the semantic check passes a
+  well-founded reject. A correct reject no longer holds the run at an escalation before the semantic check and judge.
 - **The engine records which skills each seat uses (operator ask: learn which skills can be turned off).** Every
   wrapped adapter (claude, codex, pi, opencode, agy) reads its seat's tool calls for skill use before the live frames'
   rate limit and 160-character clip, and emits one `skillUsed` frame per unit attempt, signal and skill or script
