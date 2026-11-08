@@ -1493,6 +1493,20 @@ const DENIED_BASH: &[&str] = &[
     "Bash(reboot:*)",
 ];
 
+/// The claude CLI's OWN web tools, denied on every claude UNIT launch (e2e-1105 CJ3/CJ12). A unit
+/// reads the web only through the job's web source (`mcp:web/search`, `mcp:web/fetch` through the
+/// broker, the garden MCP shim), which the operator's "Agents can query" switch and the job's
+/// source pick govern and which records every call. Claude's built-ins go around all three: in a
+/// seat container `WebFetch` is refused outright ("Unable to verify if domain … is safe to
+/// fetch": its domain check has no egress there) and `WebSearch` answers from the model provider,
+/// so a Research gather on claude came back with search snippets, no fetched page and zero calls
+/// to the job's source, while codex and pi seats used the source. Bare tool names, the rule form
+/// the CLI matches for a whole tool. Every unit, not only one with a source pick: core does not
+/// know the pick (crew holds it), and a unit with no picked web has no sanctioned web read at all.
+/// Not in the shared worker-home file or the council ballot: chat sessions and ballots are not
+/// units, and this rule is for units.
+pub(crate) const DENIED_UNIT_TOOLS: &[&str] = &["WebSearch", "WebFetch"];
+
 /// EVERY Bash verb the engine denies a seat: the unsalvageable machine-state verbs above plus the
 /// remote-write fence (F-7R2-012, [`crate::remote_write_fence::REMOTE_WRITE_BASH_RULES`] — `git
 /// push`, `gh pr create|merge|edit|comment`, `gh api`, `gh release`, …: delivery is the deliver
@@ -1547,7 +1561,7 @@ pub(crate) fn denied_bash_rules() -> impl Iterator<Item = &'static str> {
 /// launch-independent half), and the half that file omits by design — the state-home rules, which
 /// ACP sessions carry per session — rides the claude seat's own argv as `--disallowedTools`
 /// ([`ballot_deny_rules`]). Together they are the same rule set a worker launch carries
-/// ([`deny_rules`] with no snapshot); a council-first ballot used to run with no fence at all. How
+/// ([`deny_rules`] with no snapshot) minus the unit-only web tools ([`DENIED_UNIT_TOOLS`]); a council-first ballot used to run with no fence at all. How
 /// live that fence is for seat votes is exactly as live as that unmeasured sentence turns out to
 /// be. The real boundary belongs in the
 /// PreToolUse gate-hook, which already sees every call and can reject on the resolved path; this
@@ -2131,6 +2145,7 @@ pub(crate) fn deny_rules(
     }
     rules.extend(denied_home_file_rules()?);
     rules.extend(denied_bash_rules().map(|s| s.to_string()));
+    rules.extend(DENIED_UNIT_TOOLS.iter().map(|s| s.to_string()));
     Ok(rules)
 }
 
@@ -2189,9 +2204,10 @@ pub(crate) fn shared_deny_rules(operational_home: Option<&Path>) -> Result<Vec<S
 /// follow-up, review on core#436). ACP sessions carry these rules per session (`deny_rules` —
 /// registry or blanket); a ballot has no session, so the distributor puts the BLANKET `Read` +
 /// `Edit` over every state-home candidate (the default `~/.wicked-crew` and the engine's own
-/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list is
-/// the same set [`deny_rules`] produces for a snapshot-less worker launch — one generator, three
-/// carriers. `Err` names an unspellable directory (fail closed, as everywhere in this module).
+/// operational home) on the claude seat's argv (`--disallowedTools`). Shared file ∪ this list ∪
+/// [`DENIED_UNIT_TOOLS`] is the same set [`deny_rules`] produces for a snapshot-less worker launch
+/// — one generator, three carriers; the web tools are the one unit-only addition (a ballot is not
+/// a unit). `Err` names an unspellable directory (fail closed, as everywhere in this module).
 pub(crate) fn ballot_deny_rules(operational_home: Option<&Path>) -> Result<Vec<String>, String> {
     let mut rules: Vec<String> = Vec::new();
     for dir in state_home_candidates(operational_home) {
@@ -10517,6 +10533,11 @@ mod tests {
             "the Read/Edit fence is in the settings file: {deny:?}"
         );
         assert!(deny.contains(&"Bash(sudo:*)"), "{deny:?}");
+        // e2e-1105 CJ3: claude's own web tools are denied on the settings carrier too.
+        assert!(
+            deny.contains(&"WebSearch") && deny.contains(&"WebFetch"),
+            "{deny:?}"
+        );
         assert_eq!(
             json["disableAllHooks"],
             serde_json::Value::Bool(false),
@@ -15493,6 +15514,75 @@ mod tests {
         );
     }
 
+    /// e2e-1105 CJ3/CJ12: a Research job whose source pick was ["web"] ran its gather on claude,
+    /// which used its OWN WebSearch and WebFetch (every fetch refused in the seat container: "Unable
+    /// to verify if domain … is safe to fetch") and never called the job's web source, so the
+    /// report stopped with no URL. The gather unit's claude launch now denies both built-ins on the
+    /// argv carrier (the settings carrier is pinned in `arm_input_governance_writes_…`), and the
+    /// directive it carries names the web source's tools and how to reach them (the broker shim:
+    /// list, then `mcp:web/search` / `mcp:web/fetch`), so the seat is told which tool to use.
+    #[test]
+    fn a_claude_gather_unit_reads_the_web_only_through_the_jobs_web_source() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let step = |id: &str| {
+            crate::catalog::builtin_preset("sourced-report")
+                .expect("a built-in")
+                .into_iter()
+                .find(|s| s.id == id)
+                .and_then(|s| s.instructions)
+                .unwrap_or_else(|| panic!("no `{id}` step text"))
+        };
+        let gather = step("gather");
+        let inv = "claude -p {PROMPT}";
+        let mut argv = build_argv(inv, &gather, &[]);
+        super::inject_isolation_flags(&mut argv, inv, None, Some(&gather), None, None)
+            .expect("the launch builds");
+        let denied: Vec<&str> = flag_value(&argv, "--disallowedTools")
+            .expect("the engine's deny flag")
+            .split(',')
+            .collect();
+        for tool in ["WebSearch", "WebFetch"] {
+            assert!(
+                denied.contains(&tool),
+                "claude's own {tool} goes around the job's web source: {denied:?}"
+            );
+        }
+        let shim = "\"$WICKED_GARDEN_ROOT/scripts/wicked-garden\" run scripts/mcp/shim.py";
+        assert!(gather.contains(&format!("{shim} list")), "{gather}");
+        for subject in ["mcp:web/search", "mcp:web/fetch"] {
+            assert!(
+                gather.contains(&format!("{shim} call {subject} --args")),
+                "the gather directive names {subject}: {gather}"
+            );
+        }
+        assert!(
+            gather.contains("Never use your CLI's own web search or fetch tools"),
+            "{gather}"
+        );
+        // The source's registered name need not be `web` (crew lists `mcp:<name>/…`).
+        assert!(
+            gather.contains("exactly as the list shows them"),
+            "{gather}"
+        );
+        let check = step("check");
+        assert!(
+            check.contains(&format!("{shim} call mcp:web/fetch --args")),
+            "the check re-fetches through the web source: {check}"
+        );
+        // The learn workflow's research reads the web source first too: a claude unit no longer
+        // has its own web tools to fall back on.
+        let research = crate::catalog::builtin_preset("learn")
+            .expect("a built-in")
+            .into_iter()
+            .find(|s| s.id == "research")
+            .and_then(|s| s.instructions)
+            .expect("learn's research step");
+        assert!(
+            research.contains(&format!("{shim} call mcp:web/fetch --args")),
+            "{research}"
+        );
+    }
+
     /// core#657 (F-11): a wrapped claude worker loads NO ambient MCP server — not a repository
     /// `.mcp.json`, not a local- or user-scope entry of the worker home, not a claude.ai
     /// connector. `--strict-mcp-config` with NO `--mcp-config` (the empty MCP config) rides every
@@ -15778,12 +15868,23 @@ mod tests {
         union.extend(ballot.iter().cloned());
         union.sort();
         union.dedup();
+        // The unit-only web tools (e2e-1105 CJ3) are the one per-unit addition: chat sessions
+        // (the shared file) and ballots are not units, so neither carries them.
+        for tool in DENIED_UNIT_TOOLS {
+            assert!(
+                !union.iter().any(|r| r == tool),
+                "shared or ballot denies {tool}"
+            );
+        }
+        union.extend(DENIED_UNIT_TOOLS.iter().map(|s| s.to_string()));
+        union.sort();
+        union.dedup();
         let mut launch = super::deny_rules(None, Some(&op)).expect("launch fence");
         launch.sort();
         launch.dedup();
         assert_eq!(
             union, launch,
-            "shared file ∪ ballot argv == the snapshot-less worker launch fence"
+            "shared file ∪ ballot argv ∪ unit web tools == the snapshot-less worker launch fence"
         );
         // No operational home: the default state-home candidate alone.
         let default_only = super::ballot_deny_rules(None).expect("default candidate");
