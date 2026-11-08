@@ -6639,7 +6639,7 @@ mod tests {
     }
 
     /// (codex round 7) Fallback discovery tells ABSENCE from FAILURE: no cache, or no version-named
-    /// directory in it ⇒ `Ladder::Absent` and the "no installed" log; a highest version with a
+    /// directory in it ⇒ `Ladder::Absent` and the "holds no" absence log; a highest version with a
     /// malformed manifest, a SYMLINKED version candidate, or a cache that cannot be listed
     /// (permission denied) ⇒ `Ladder::Failed(reason)` with a `skills.fallback FAILED` log naming the
     /// reason — never read as absence. Through admission, a failed ladder refuses a skill-naming run
@@ -6689,7 +6689,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .all(|l| l.contains("no installed") && !l.contains("FAILED")),
+                .all(|l| l.contains("holds no") && !l.contains("FAILED")),
             "{lines:?}"
         );
         // Failed: the highest version's manifest is malformed.
