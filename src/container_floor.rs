@@ -1194,7 +1194,10 @@ pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, St
         ]);
         match output_within(create, rt.bound(PROBE_TIMEOUT)) {
             Some(o) if o.status.success() => Ok(name.to_string()),
-            Some(o) if String::from_utf8_lossy(&o.stderr).contains("already exists") => {
+            Some(o)
+                if String::from_utf8_lossy(&o.stderr).contains("already exists")
+                    && own_seat_network(rt, name) =>
+            {
                 Ok(name.to_string())
             }
             Some(o) => Err(format!(
@@ -1203,6 +1206,22 @@ pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, St
             )),
             None => Err(format!("creating the seat network `{name}` timed out")),
         }
+    })
+}
+
+/// Whether the network `name` that already exists is this engine's own seat network: internal and
+/// carrying the seat label (a create that timed out but landed). Anything else is never adopted.
+fn own_seat_network(rt: &Runtime, name: &str) -> bool {
+    let mut inspect = rt.cmd();
+    inspect.args([
+        "network",
+        "inspect",
+        "--format",
+        &format!("{{{{.Internal}}}} {{{{index .Labels \"{SEAT_LABEL}\"}}}}"),
+        name,
+    ]);
+    output_within(inspect, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| {
+        o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true 1"
     })
 }
 
