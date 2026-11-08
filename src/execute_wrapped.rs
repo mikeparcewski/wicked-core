@@ -13413,6 +13413,7 @@ mod tests {
                 "feature/adversarial-review",
                 "feature/review",
                 "feature/test",
+                "interactive-draft-sourced/check",
                 "investigate-incident/findings",
                 "learn/review",
                 "map-requirements/check",
