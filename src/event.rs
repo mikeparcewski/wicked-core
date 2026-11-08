@@ -882,6 +882,14 @@ pub enum CoreEvent {
         root: String,
         /// `"published"` (a crew snapshot) or `"live-cache"` (the installed plugin fallback).
         source: String,
+        /// The lever the skills rode (`claude_plugin` | `codex_skills_dir` | `pi_skill_flags` |
+        /// `opencode_config` | `copilot_add_dir`; `launcher_only` for a seat handed the launcher
+        /// and no skills, with an empty `skills` (not reported today: such a launch emits no
+        /// handoff); `none` for a tool-command unit's admission).
+        lever: String,
+        /// The frontmatter names that lever delivered to this seat (skill usage: what was handed
+        /// and can be judged unused). Empty for `none`.
+        skills: Vec<String>,
     },
     /// (F-036) An `executes_code: false` phase — an evaluator, a recon rung, a review — CHANGED
     /// the worktree it was working in. Emitted at the gate fold when the engine's own before/after
@@ -1395,6 +1403,26 @@ pub enum CoreEvent {
         target: Option<String>,
         ok: Option<bool>,
         duration_ms: Option<u64>,
+    },
+    /// A skill a seat was DIRECTED to, OPENED, BROWSED or whose script it RAN, one per (attempt,
+    /// signal, skill or script) (operator ask 2026-11-08: which skills are used, so the unused can
+    /// be turned off). `signal` is `directed` | `opened` | `browsed` | `ran`; `skill` is the
+    /// frontmatter name (`None` only on `ran`, which crew attributes through the generation's
+    /// index); `via` (`phase` | `base` | `qe`) only on `directed`; `how` (`skill_tool` | `read` |
+    /// `shell`) only on `opened`; `script` (snapshot-relative `scripts/<rel>`) only on `ran`. Names
+    /// only: never a host path, an argument or content. See [`crate::skill_use`].
+    SkillUsed {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
+        signal: String,
+        skill: Option<String>,
+        via: Option<String>,
+        how: Option<String>,
+        script: Option<String>,
+        gen: Option<String>,
+        source: String,
     },
     /// A seat's running token total for one unit attempt, live from its stream while it works
     /// (operator 2026-10-30: a live token and cost meter on a working chat turn or step). Claude's
@@ -2328,6 +2356,32 @@ impl CoreEvent {
                 "ok": ok,
                 "durationMs": duration_ms,
             }),
+            CoreEvent::SkillUsed {
+                session,
+                ord,
+                attempt,
+                cli,
+                signal,
+                skill,
+                via,
+                how,
+                script,
+                gen,
+                source,
+            } => json!({
+                "type": "skillUsed",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "signal": signal,
+                "skill": skill,
+                "via": via,
+                "how": how,
+                "script": script,
+                "gen": gen,
+                "source": source,
+            }),
             CoreEvent::UsageProgress {
                 session,
                 ord,
@@ -2909,6 +2963,8 @@ impl CoreEvent {
                 content_hash,
                 root,
                 source,
+                lever,
+                skills,
             } => json!({
                 "type": "skillsSnapshotHanded",
                 "session": session,
@@ -2920,6 +2976,8 @@ impl CoreEvent {
                 "contentHash": content_hash,
                 "root": root,
                 "source": source,
+                "lever": lever,
+                "skills": skills,
             }),
             CoreEvent::EvaluatorMutatedWorktree {
                 session,

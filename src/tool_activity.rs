@@ -125,6 +125,7 @@ fn shown() -> &'static Budget {
 
 /// Forget a run's call budget (its end).
 pub fn forget_run(run_id: &str) {
+    crate::skill_use::forget_run(run_id);
     shown()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -530,7 +531,7 @@ fn unwrap_shell(cmd: &str) -> String {
 /// POSIX shell word splitting, no expansion: single quotes are literal, double quotes take `\` before
 /// `"`, `\`, `$`, `` ` `` and a newline, a bare `\` escapes the next character. `None` on an
 /// unterminated quote or a trailing `\`.
-fn shell_words(s: &str) -> Option<Vec<String>> {
+pub(crate) fn shell_words(s: &str) -> Option<Vec<String>> {
     let mut out = Vec::new();
     let mut cur = String::new();
     let mut have = false;

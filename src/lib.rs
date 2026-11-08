@@ -123,6 +123,7 @@ mod rule_check;
 pub mod run_context;
 mod run_mirror;
 mod runtime_wait;
+mod skill_use;
 pub mod tool_activity;
 // S4 of #590: summoned by S2 (monitors) and S5 (teamed mode); unused until they land.
 #[allow(dead_code)]

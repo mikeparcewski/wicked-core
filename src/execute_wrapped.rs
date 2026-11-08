@@ -110,9 +110,20 @@ pub(crate) struct ClaudeStreamJson {
     /// Each assistant message's usage so far (`message.id` → fresh + cache input, output), summed
     /// into the live `usageProgress` total. A message's blocks repeat its usage; the newest wins.
     msg_usage: Vec<(String, u64, u64)>,
+    /// Skill usage read off the same calls (`skillUsed`), never rate-limited like the frames.
+    pub(crate) skill_use: Option<crate::skill_use::SkillUseSink>,
 }
 
 impl ClaudeStreamJson {
+    /// The adapter with its skill-usage recorder (none when `None`).
+    pub(crate) fn with_skill_use(
+        mut self,
+        skill_use: Option<crate::skill_use::SkillUseSink>,
+    ) -> Self {
+        self.skill_use = skill_use;
+        self
+    }
+
     /// The adapter with live per-tool frames sent to `activity` (none when `None`).
     pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
         Self {
@@ -169,6 +180,9 @@ impl OutputAdapter for ClaudeStreamJson {
         if let Some(a) = self.activity.as_mut() {
             a.close();
         }
+        if let Some(u) = self.skill_use.as_mut() {
+            u.close();
+        }
         AdapterOut::default()
     }
 
@@ -223,6 +237,17 @@ impl OutputAdapter for ClaudeStreamJson {
                                     if let Some(name) = block.get("name").and_then(|n| n.as_str()) {
                                         if !name.is_empty() {
                                             out.tools.push(name.to_string());
+                                        }
+                                        if let (Some(u), Some(id)) = (
+                                            self.skill_use.as_mut(),
+                                            block.get("id").and_then(|i| i.as_str()),
+                                        ) {
+                                            let none = serde_json::Value::Null;
+                                            u.started(
+                                                id,
+                                                name,
+                                                block.get("input").unwrap_or(&none),
+                                            );
                                         }
                                         if let (Some(a), Some(id)) = (
                                             self.activity.as_mut(),
@@ -301,17 +326,22 @@ impl OutputAdapter for ClaudeStreamJson {
             }
             // A `tool_result` answers a call: the live frame's finish (no readable output).
             Some("user") => {
-                if let (Some(a), Some(blocks)) = (
-                    self.activity.as_mut(),
-                    v.get("message")
-                        .and_then(|m| m.get("content"))
-                        .and_then(|c| c.as_array()),
-                ) {
+                if let Some(blocks) = v
+                    .get("message")
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_array())
+                {
                     for b in blocks {
                         if b.get("type").and_then(|t| t.as_str()) == Some("tool_result") {
                             if let Some(id) = b.get("tool_use_id").and_then(|i| i.as_str()) {
                                 let err = b.get("is_error").and_then(|e| e.as_bool()) == Some(true);
-                                a.finished(id, !err);
+                                if let Some(a) = self.activity.as_mut() {
+                                    a.finished(id, !err);
+                                }
+                                // Skill usage: a read counts once it succeeded.
+                                if let Some(u) = self.skill_use.as_mut() {
+                                    u.finished(id, !err);
+                                }
                             }
                         }
                     }
@@ -346,9 +376,20 @@ pub(crate) struct CodexJsonl {
     usage: Option<Usage>,
     /// Live per-tool frames from codex's own items (commands, file changes, MCP calls, searches).
     pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+    /// Skill usage read off the same items (`skillUsed`).
+    pub(crate) skill_use: Option<crate::skill_use::SkillUseSink>,
 }
 
 impl CodexJsonl {
+    /// The adapter with its skill-usage recorder (none when `None`).
+    pub(crate) fn with_skill_use(
+        mut self,
+        skill_use: Option<crate::skill_use::SkillUseSink>,
+    ) -> Self {
+        self.skill_use = skill_use;
+        self
+    }
+
     pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
         Self {
             activity,
@@ -373,10 +414,13 @@ impl OutputAdapter for CodexJsonl {
             };
         };
         let mut out = AdapterOut::default();
-        if let (Some(a), Some(call)) =
-            (self.activity.as_mut(), crate::tool_activity::codex_item(&v))
-        {
-            a.call(&call);
+        if let Some(call) = crate::tool_activity::codex_item(&v) {
+            if let Some(u) = self.skill_use.as_mut() {
+                u.call(&call);
+            }
+            if let Some(a) = self.activity.as_mut() {
+                a.call(&call);
+            }
         }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("item.completed") => {
@@ -445,6 +489,9 @@ impl OutputAdapter for CodexJsonl {
         if let Some(a) = self.activity.as_mut() {
             a.close();
         }
+        if let Some(u) = self.skill_use.as_mut() {
+            u.close();
+        }
         AdapterOut {
             text: self.last_message.take().into_iter().collect(),
             ..AdapterOut::default()
@@ -465,9 +512,20 @@ pub(crate) struct PiJson {
     usage: Option<Usage>,
     /// Live per-tool frames from pi's own `tool_execution_*` events.
     pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
+    /// Skill usage read off the same events (`skillUsed`).
+    pub(crate) skill_use: Option<crate::skill_use::SkillUseSink>,
 }
 
 impl PiJson {
+    /// The adapter with its skill-usage recorder (none when `None`).
+    pub(crate) fn with_skill_use(
+        mut self,
+        skill_use: Option<crate::skill_use::SkillUseSink>,
+    ) -> Self {
+        self.skill_use = skill_use;
+        self
+    }
+
     pub(crate) fn with_activity(activity: Option<crate::tool_activity::ToolActivitySink>) -> Self {
         Self {
             activity,
@@ -492,9 +550,13 @@ impl OutputAdapter for PiJson {
             };
         };
         let mut out = AdapterOut::default();
-        if let (Some(a), Some(call)) = (self.activity.as_mut(), crate::tool_activity::pi_event(&v))
-        {
-            a.call(&call);
+        if let Some(call) = crate::tool_activity::pi_event(&v) {
+            if let Some(u) = self.skill_use.as_mut() {
+                u.call(&call);
+            }
+            if let Some(a) = self.activity.as_mut() {
+                a.call(&call);
+            }
         }
         let msg = v.get("message");
         let is_assistant_end = v.get("type").and_then(|t| t.as_str()) == Some("message_end")
@@ -561,6 +623,9 @@ impl OutputAdapter for PiJson {
         if let Some(a) = self.activity.as_mut() {
             a.close();
         }
+        if let Some(u) = self.skill_use.as_mut() {
+            u.close();
+        }
         AdapterOut {
             text: self.last_message.take().into_iter().collect(),
             ..AdapterOut::default()
@@ -576,6 +641,66 @@ impl OutputAdapter for PiJson {
 #[derive(Default)]
 pub(crate) struct OpencodeJson {
     usage: Option<Usage>,
+    /// Skill usage read off its `tool_use` parts (`skillUsed`): its `skill` tool, `read`, `bash`.
+    pub(crate) skill_use: Option<crate::skill_use::SkillUseSink>,
+}
+
+impl OpencodeJson {
+    /// The adapter with its skill-usage recorder (none when `None`).
+    pub(crate) fn with_skill_use(skill_use: Option<crate::skill_use::SkillUseSink>) -> Self {
+        Self {
+            skill_use,
+            ..Self::default()
+        }
+    }
+}
+
+/// An opencode `tool_use` part's call in claude's tool words, for skill usage: its native
+/// `skill` tool (`name`), `read` (`filePath`), `bash` (`command`); `None` for anything else.
+pub(crate) fn opencode_skill_call(
+    tool: &str,
+    input: Option<&serde_json::Value>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let s = |k: &str| {
+        input
+            .and_then(|i| i.get(k))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string()
+    };
+    match tool {
+        "skill" => Some(("Skill", serde_json::json!({ "name": s("name") }))),
+        "read" => {
+            let p = if s("filePath").is_empty() {
+                s("path")
+            } else {
+                s("filePath")
+            };
+            Some(("Read", serde_json::json!({ "file_path": p })))
+        }
+        "bash" => Some(("Bash", serde_json::json!({ "command": s("command") }))),
+        _ => None,
+    }
+}
+
+/// An agy `DONE` tool step's call in claude's tool words, for skill usage, by its tool: a
+/// `view_file` reads its `AbsolutePath`; a `run_command` runs its `CommandLine`; nothing else.
+pub(crate) fn agy_skill_call(
+    tool: &str,
+    params: Option<&serde_json::Value>,
+) -> Option<(&'static str, serde_json::Value)> {
+    let s = |k: &str| {
+        params
+            .and_then(|p| p.get(k))
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.is_empty())
+            .map(str::to_string)
+    };
+    match tool {
+        "run_command" => s("CommandLine").map(|c| ("Bash", serde_json::json!({ "command": c }))),
+        "view_file" => s("AbsolutePath").map(|p| ("Read", serde_json::json!({ "file_path": p }))),
+        _ => None,
+    }
 }
 
 impl OutputAdapter for OpencodeJson {
@@ -614,6 +739,15 @@ impl OutputAdapter for OpencodeJson {
                     let state = part.get("state");
                     let completed = state.and_then(|s| s.get("status")).and_then(|s| s.as_str())
                         == Some("completed");
+                    let errored = state.and_then(|s| s.get("status")).and_then(|s| s.as_str())
+                        == Some("error");
+                    if let (true, Some(u), Some((t, input))) = (
+                        completed || errored,
+                        self.skill_use.as_mut(),
+                        opencode_skill_call(tool, state.and_then(|s| s.get("input"))),
+                    ) {
+                        u.completed(t, &input, completed);
+                    }
                     // Only a write that happened is a file used (a refused one is not).
                     if completed && matches!(tool, "write" | "edit") {
                         if let Some(path) = state
@@ -694,12 +828,24 @@ impl OutputAdapter for OpencodeJson {
 /// A line that is not JSON passes through as one text delta (fail-safe, never a panic).
 #[derive(Default)]
 pub(crate) struct AgyStreamJson {
+    /// Skill usage read off its `DONE` tool steps (`skillUsed`).
+    pub(crate) skill_use: Option<crate::skill_use::SkillUseSink>,
     streamed: String,
     /// The streamed fallback was cut at [`AGY_HELD_TEXT`].
     streamed_cut: bool,
     /// The `result`'s answer, and whether it was cut.
     response: Option<(String, bool)>,
     steps: Option<Usage>,
+}
+
+impl AgyStreamJson {
+    /// The adapter with its skill-usage recorder (none when `None`).
+    pub(crate) fn with_skill_use(skill_use: Option<crate::skill_use::SkillUseSink>) -> Self {
+        Self {
+            skill_use,
+            ..Self::default()
+        }
+    }
 }
 
 /// Append `t` to `s` within `cap` bytes, cut at a UTF-8 boundary: `true` when all of it fit.
@@ -792,6 +938,16 @@ impl OutputAdapter for AgyStreamJson {
                             out.tools.push(name.to_string());
                         }
                         let params = step.pointer("/tool_info/parameters");
+                        let tool = step
+                            .get("tool_name")
+                            .or_else(|| step.pointer("/tool_info/name"))
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("");
+                        if let (Some(u), Some((t, input))) =
+                            (self.skill_use.as_mut(), agy_skill_call(tool, params))
+                        {
+                            u.completed(t, &input, true);
+                        }
                         for key in ["TargetFile", "AbsolutePath"] {
                             if let Some(f) = params
                                 .and_then(|p| p.get(key))
@@ -3446,6 +3602,7 @@ impl WrappedCliStepRunner {
                     input.attempt,
                     "wrapped_cli",
                     &cli_key,
+                    &delivery,
                 ));
             }
         } else {
@@ -3602,8 +3759,14 @@ impl WrappedCliStepRunner {
                     input.attempt,
                     "wrapped_cli",
                     &cli_key,
+                    &delivery,
                 ));
             }
+        }
+
+        // Skill usage: the skills this launch's directive names (phase, base, QE), one event each.
+        for ev in crate::skill_use::directed_events(input, &cli_key, skills.as_ref()) {
+            self.emit_event(ev);
         }
 
         if ask_enabled {
@@ -3761,20 +3924,39 @@ impl WrappedCliStepRunner {
             // Every seat's live activity from its own stream (claude, codex, pi); a stream with no
             // tool events gets the heartbeat only (coordinator 2026-10-30, rig run 1d372696).
             let activity = || crate::tool_activity::ToolActivitySink::for_input(input, &cwd);
+            // Skill usage (`skillUsed`): read off the same stream, inside the roots THIS launch
+            // was handed (codex's populated home as the seat's env names it), sent on the
+            // runner's own channel.
+            let skill_paths = handed.map(|s| {
+                std::sync::Arc::new(crate::skill_use::SkillPaths::new(
+                    s,
+                    &delivery,
+                    seat_config.root(),
+                ))
+            });
+            let skill_use = || {
+                crate::skill_use::SkillUseSink::for_launch(
+                    input,
+                    &cli_key,
+                    handed,
+                    skill_paths.clone(),
+                    self.tx.clone(),
+                )
+            };
             let mut adapter: Box<dyn OutputAdapter> = if is_claude {
-                Box::new(ClaudeStreamJson::with_activity(activity()))
+                Box::new(ClaudeStreamJson::with_activity(activity()).with_skill_use(skill_use()))
             } else if codex_json {
-                Box::new(CodexJsonl::with_activity(activity()))
+                Box::new(CodexJsonl::with_activity(activity()).with_skill_use(skill_use()))
             } else if pi_json {
-                Box::new(PiJson::with_activity(activity()))
+                Box::new(PiJson::with_activity(activity()).with_skill_use(skill_use()))
             } else if container && opencode_json_mode(&binary, &argv) {
                 Box::new(QuietSeat {
-                    inner: Box::<OpencodeJson>::default(),
+                    inner: Box::new(OpencodeJson::with_skill_use(skill_use())),
                     activity: activity(),
                 })
             } else if agy_json {
                 Box::new(QuietSeat {
-                    inner: Box::<AgyStreamJson>::default(),
+                    inner: Box::new(AgyStreamJson::with_skill_use(skill_use())),
                     activity: activity(),
                 })
             } else {

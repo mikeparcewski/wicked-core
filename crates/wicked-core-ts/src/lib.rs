@@ -5098,6 +5098,8 @@ mod tests {
                 content_hash: Some("sha256:abc".to_string()),
                 root: s(),
                 source: "published".to_string(),
+                lever: "codex_skills_dir".to_string(),
+                skills: vec![s()],
             },
             "skillsSnapshotHanded",
             &[
@@ -5111,6 +5113,28 @@ mod tests {
                 "contentHash",
                 "root",
                 "source",
+                "lever",
+                "skills",
+            ],
+        );
+        check(
+            CoreEvent::SkillUsed {
+                session: s(),
+                ord: 2,
+                attempt: 0,
+                cli: s(),
+                signal: "opened".to_string(),
+                skill: Some(s()),
+                via: None,
+                how: Some("shell".to_string()),
+                script: None,
+                gen: Some("7".to_string()),
+                source: "published".to_string(),
+            },
+            "skillUsed",
+            &[
+                "type", "session", "ord", "attempt", "cli", "signal", "skill", "via", "how",
+                "script", "gen", "source",
             ],
         );
         // P2 decisions-full wave (EVT-001, EVT-012, EVT-013).

@@ -12610,6 +12610,7 @@ fn dispatch_unit(
                             attempt,
                             "tool_cmd",
                             "tool",
+                            &crate::skills_snapshot::SkillsDelivery::None,
                         )));
                     }
                     // core#431 (F-3R2-013): the deliver LIFT + RE-VERIFY runs BEFORE the push.
