@@ -2667,6 +2667,42 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.32** — 2026-11-08 — release on main 02975a3, carrying 29 PRs since 0.15.31: #1303, #1304, #1307,
+  #1308, #1309, #1311, #1312, #1315, #1317, #1321, #1323, #1324, #1325, #1327, #1328, #1330, #1331, #1332, #1333,
+  #1341, #1347, #1348, #1349, #1350, #1351, #1352, #1353, #1354 and #1355. Most have their own entry earlier in this
+  section; the highlights, and the entries the rest were missing:
+  - **New kinds of work.** `sourced-report` (a read-only report whose every claim is re-checked at its source, CS3),
+    `run-cost` (what a volume of jobs would cost, from crew's own run facts, CS6), and `interactive-draft-sourced`
+    (#1353, CS5): Respond and Rework drafts from the person's own documents, built from interactive-draft's steps
+    plus one fidelity-to-source check that holds at a human gate when it does not pass. interactive-draft is unchanged.
+  - **Third-party run plugins (#1351, CS7).** A run plugin asks to observe run topics, not editor permissions; each
+    topic is decided deny-dominates against the person's grants, and editor-plugin runs check run plugins with the
+    run conformance cases r0-r5.
+  - **Which skills a seat uses (#1352).** Every wrapped adapter records a `skillUsed` frame per attempt and skill:
+    directed, opened, browsed (one command naming more than 3 skills) or ran.
+  - **The person's context reaches every agent (#1325)**, Demo videos are recorded by the engine on the host (#1303),
+    review and QE get the requirements a change touches (#1331), and a draft's page count is measured (#1333).
+  - **The shipped guidance packs are judged, not recorded as N/A (#1317).** MCPS rules are judged on the change like
+    any rule (a BROKEN denies); POL-2101 is judged on the change and on the records of the code-writing steps before
+    the gate; the RVWL process rules are judged on the engine's record of the step and never block. A pack rule a
+    person edited gets no overlay, and pack rows read the person's gate rulings like every rule.
+  - **POL-2101 is N/A when no agent wrote code in the run (#1324),** read strictly from the run's record, with no judge.
+    **With no agent creator, any eligible seat may judge (#1328),** and every such row says "no agent wrote this
+    change: any seat may judge"; an author whose seat is unrecorded still refuses.
+  - **qe-author-tests stays inside crew's contract (#1323):** its review instruction is back under 600 bytes and
+    `QE-VERIFY-SUMMARY` puts `failed_on_base=` last.
+  - **First run reads plainly (#1354).** The built-in mode rules open with a plain sentence ("Balanced runs ask before
+    an MCP tool writes, until it is approved", "Ask-every-step runs ask before every MCP write", "Editor permissions
+    beyond the defaults ask until you allow them"); seeds insert only absent rules, so existing stores keep theirs. Under
+    crew, the boot line no longer says no wicked-garden is installed while crew is still seeding it.
+  - **A slow container runtime is not a down one (#1355).** The runtime probe, the checks floor's version call and the
+    seat network create each try up to 3 times, 500 ms apart, and fail only when every attempt failed; the runtime
+    probe's bound per attempt is now 30 s (the other two keep their own). A loaded host no longer gets
+    `container_runtime_down`.
+  - **Binding:** adds `Core.supportsRunContext()` and `setRunContext(runId, contextJson)`; `matchRules` is unchanged
+    (moved in the file). **Seat images:** `seat.Dockerfile` now installs wicked-ledger 0.6.1 (#1307), so every seat
+    image tag changes and is rebuilt on first use; the floor image tag is unchanged.
+  - **Lockfile:** #1304 re-stamped the 0.15.31 platform lock entries.
 - **core-ts 0.15.31** — 2026-11-06 — patch release on main 0935c45, carrying 5 PRs since 0.15.30: #1294, #1298, #1299, #1300 and #1301.
   - **A rule's machine check no longer refuses work the rule is not about (#1299, F11).** A machine obligation decides
     its rule alone only where a step scope the rule's author wrote selects it; anywhere else a distinct judge first
