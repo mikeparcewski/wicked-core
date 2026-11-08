@@ -844,6 +844,7 @@ mod tests {
             tree: Some("t1".into()),
             jail: Some("sandbox-exec".into()),
             editors: Vec::new(),
+            plugins: Vec::new(),
             attempt: 0,
         });
         let eval = unit(3, PhaseRole::Evaluator);

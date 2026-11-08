@@ -8,7 +8,7 @@
 //! `evaluateEditorGrants` binding; [`evaluate_editor_grants`] answers. Nothing is recorded: a grant
 //! decision is a read, re-derived on every settings or rule change.
 //!
-//! # The decision, per permission
+//! # The decision, per permission or topic
 //!
 //! 1. **Policy**: `select_any` over the subject tokens ([`subject_tokens`]: `editor`,
 //!    `editor:<id>`, `editor:<id>/<permission>`, `editor-perm:<permission>`, `project:<id>` when
@@ -21,6 +21,13 @@
 //! 3. **Defaults**: an `allow` rule that fired (the shipped `EDITOR-BUILTIN*` and
 //!    `EDITOR-OPEN-DEFAULTS` posture rules) allows.
 //! 4. Anything else **asks**.
+//!
+//! A run plugin asks for observe topics instead of editor permissions. Policy selects `plugin`,
+//! `plugin:<id>`, `plugin:<id>/observe:<topic>`, `plugin-topic:<topic>` and the project token, with
+//! the plugin's id, topic, sha256 and version in the context. Deny still dominates. Its ledger token
+//! is [`plugin_grant_token`]: `plugin:<id>@<version>#<sha256>/observe:<topic>`. No allow rule grants
+//! a topic: only the install consent's exact per-build token allows it; otherwise it asks. A plugin
+//! never carries the first-party origin token.
 //!
 //! First-party means a `wicked-*` id AND an entry hash the caller vouches is the one studio ships
 //! (`first_party: true`): a forged `wicked-` id with another hash gets no `editor-origin:first-party`
@@ -86,10 +93,24 @@ const SCOPE: &str = "wicked-editor/grants";
 const EDITOR_DEFAULTS_RULES: &str =
     include_str!("../governance/packs/editor-defaults/rules/editor-defaults.json");
 
+/// The kind of installed entry whose grants are being decided.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EditorGrantSubject {
+    #[default]
+    Editor,
+    Plugin,
+}
+
 /// One grants question: which of `permissions` may this editor use (for this project)?
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct EditorGrantRequest {
+    #[serde(default)]
+    pub subject: EditorGrantSubject,
+    /// The run topics a plugin asks to observe.
+    #[serde(default)]
+    pub observe: Vec<String>,
     /// The editor's id (`wicked-page`, `acme-notes`).
     pub editor_id: String,
     /// The editor's version, as its manifest states it.
@@ -164,19 +185,38 @@ pub fn grant_token(editor_id: &str, version: &str, sha256: &str, permission: &st
     format!("editor:{editor_id}@{version}#{sha256}/{permission}")
 }
 
+/// The ledger token that approves `topic` for exactly this plugin build.
+pub fn plugin_grant_token(id: &str, version: &str, sha256: &str, topic: &str) -> String {
+    format!("plugin:{id}@{version}#{sha256}/observe:{topic}")
+}
+
 /// Whether the request's id may carry the first-party origin token.
 fn first_party(req: &EditorGrantRequest) -> bool {
-    req.first_party && req.editor_id.starts_with("wicked-")
+    req.subject == EditorGrantSubject::Editor
+        && req.first_party
+        && req.editor_id.starts_with("wicked-")
 }
 
 /// The subject tokens one permission check selects rules by (§6.2).
 fn subject_tokens(req: &EditorGrantRequest, permission: &str) -> Vec<String> {
-    let mut t = vec![
-        "editor".to_string(),
-        format!("editor:{}", req.editor_id),
-        format!("editor:{}/{permission}", req.editor_id),
-        format!("editor-perm:{permission}"),
-    ];
+    let mut t = if req.subject == EditorGrantSubject::Plugin {
+        vec![
+            "plugin".to_string(),
+            format!("plugin:{}", req.editor_id),
+            format!("plugin:{}/{permission}", req.editor_id),
+            format!(
+                "plugin-topic:{}",
+                permission.strip_prefix("observe:").unwrap()
+            ),
+        ]
+    } else {
+        vec![
+            "editor".to_string(),
+            format!("editor:{}", req.editor_id),
+            format!("editor:{}/{permission}", req.editor_id),
+            format!("editor-perm:{permission}"),
+        ]
+    };
     if let Some(p) = &req.project {
         t.push(format!("project:{p}"));
     }
@@ -189,6 +229,20 @@ fn subject_tokens(req: &EditorGrantRequest, permission: &str) -> Vec<String> {
 /// The canonical context a rule's trigger reads. Keys are written in sorted order so a trigger
 /// spanning adjacent fields reads the same whatever the JSON map ordering.
 fn context(req: &EditorGrantRequest, permission: &str) -> Value {
+    if req.subject == EditorGrantSubject::Plugin {
+        return serde_json::json!({
+            "plugin": {
+                "id": req.editor_id,
+                "sha256": req.sha256,
+                "topic": permission.strip_prefix("observe:").unwrap(),
+                "version": req.version,
+            },
+            "project": req.project,
+            "scope": SCOPE,
+            "tool": format!("plugin:{}/{permission}", req.editor_id),
+            "work": format!("plugin:{}/{permission}", req.editor_id),
+        });
+    }
     serde_json::json!({
         "editor": {
             "first_party": first_party(req),
@@ -202,6 +256,26 @@ fn context(req: &EditorGrantRequest, permission: &str) -> Value {
         "tool": format!("editor:{}/{permission}", req.editor_id),
         "work": format!("editor:{}/{permission}", req.editor_id),
     })
+}
+
+/// Run topic patterns (CONTRACT-CS7 C2), not arbitrary bus topics.
+fn valid_topic(topic: &str) -> bool {
+    if topic.len() > 120 {
+        return false;
+    }
+    let parts: Vec<_> = topic.split('.').collect();
+    parts.len() >= 3
+        && parts[0] == "wicked"
+        && parts[1] == "run"
+        && parts[2..].iter().enumerate().all(|(i, part)| {
+            *part == "*"
+                || (*part == "**" && i == parts.len() - 3)
+                || (part.len() <= 41
+                    && part.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
+                    && part.bytes().all(|c| {
+                        c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'_' | b'-')
+                    }))
+        })
 }
 
 fn validate(req: &EditorGrantRequest) -> Result<(), EditorGrantError> {
@@ -225,12 +299,29 @@ fn validate(req: &EditorGrantRequest) -> Result<(), EditorGrantError> {
                 .to_string(),
         );
     }
-    if req.permissions.is_empty() {
-        return bad("permissions is empty".to_string());
-    }
-    for p in &req.permissions {
-        if !EDITOR_PERMISSIONS.contains(&p.as_str()) {
-            return bad(format!("unknown permission {p:?}"));
+    if req.subject == EditorGrantSubject::Plugin {
+        if !req.permissions.is_empty() {
+            return bad("a plugin must have empty permissions".to_string());
+        }
+        if req.observe.is_empty() || req.observe.len() > 16 {
+            return bad("observe must have 1-16 unique run topics".to_string());
+        }
+        for (i, topic) in req.observe.iter().enumerate() {
+            if !valid_topic(topic) || req.observe[..i].contains(topic) {
+                return bad(format!("invalid or duplicate observe topic {topic:?}"));
+            }
+        }
+    } else {
+        if !req.observe.is_empty() {
+            return bad("an editor must have empty observe".to_string());
+        }
+        if req.permissions.is_empty() {
+            return bad("permissions is empty".to_string());
+        }
+        for p in &req.permissions {
+            if !EDITOR_PERMISSIONS.contains(&p.as_str()) {
+                return bad(format!("unknown permission {p:?}"));
+            }
         }
     }
     if let Some(p) = &req.project {
@@ -277,8 +368,13 @@ pub fn evaluate_editor_grants(
     let ledger = rule_row(store, GRANTS_LEDGER)?
         .map(|r| r.excludes)
         .unwrap_or_default();
-    let mut grants = Vec::with_capacity(req.permissions.len());
-    for permission in &req.permissions {
+    let permissions = if req.subject == EditorGrantSubject::Plugin {
+        req.observe.iter().map(|t| format!("observe:{t}")).collect()
+    } else {
+        req.permissions.clone()
+    };
+    let mut grants = Vec::with_capacity(permissions.len());
+    for permission in &permissions {
         let tokens = subject_tokens(req, permission);
         let phases: Vec<&str> = tokens.iter().map(String::as_str).collect();
         let ctx = context(req, permission);
@@ -293,13 +389,24 @@ pub fn evaluate_editor_grants(
                 .cloned()
                 .collect()
         };
-        let token = grant_token(&req.editor_id, &req.version, &req.sha256, permission);
+        let token = if req.subject == EditorGrantSubject::Plugin {
+            plugin_grant_token(
+                &req.editor_id,
+                &req.version,
+                &req.sha256,
+                permission.strip_prefix("observe:").unwrap(),
+            )
+        } else {
+            grant_token(&req.editor_id, &req.version, &req.sha256, permission)
+        };
         let (decision, rule_ids) = if claim.decision == wicked_apps_core::Decision::Deny {
             ("deny", fired_with(wicked_governance::Effect::Deny))
         } else if ledger.contains(&token) {
             ("allow", vec![GRANTS_LEDGER.to_string()])
         } else {
-            let allows = if LEDGER_ONLY_PERMISSIONS.contains(&permission.as_str()) {
+            let allows = if req.subject == EditorGrantSubject::Plugin
+                || LEDGER_ONLY_PERMISSIONS.contains(&permission.as_str())
+            {
                 Vec::new()
             } else {
                 fired_with(wicked_governance::Effect::Allow)
@@ -408,6 +515,8 @@ mod tests {
 
     fn req(id: &str, perms: &[&str], first_party: bool) -> EditorGrantRequest {
         EditorGrantRequest {
+            subject: EditorGrantSubject::Editor,
+            observe: Vec::new(),
             editor_id: id.into(),
             version: "1.0.0".into(),
             sha256: SHA.into(),
@@ -430,6 +539,244 @@ mod tests {
         let mut rule = wicked_governance::ConformanceRule::from_node(&node).unwrap();
         rule.excludes.push(token.to_string());
         store.upsert_nodes(&[rule.to_node()]).unwrap();
+    }
+
+    fn plugin(topics: &[&str]) -> EditorGrantRequest {
+        let mut r = req("acme-phase", &[], true);
+        r.subject = EditorGrantSubject::Plugin;
+        r.observe = topics.iter().map(|t| t.to_string()).collect();
+        r
+    }
+
+    #[test]
+    fn plugin_topics_require_exact_install_tokens_and_deny_dominates() {
+        let mut store = seeded();
+        let mut r = plugin(&[
+            "wicked.run.unit.*",
+            "wicked.run.usage.reported",
+            "wicked.run.**",
+        ]);
+        r.project = Some("kestrel".into());
+        let got = evaluate_editor_grants(&store, &r, 1).unwrap();
+        assert!(!got.first_party);
+        assert!(got
+            .grants
+            .iter()
+            .all(|g| g.decision == "ask" && g.rule_ids.is_empty()));
+        assert_eq!(got.grants[0].permission, "observe:wicked.run.unit.*");
+        let token = plugin_grant_token("acme-phase", "1.0.0", SHA, "wicked.run.unit.*");
+        assert_eq!(got.grants[0].token, token);
+        assert_eq!(
+            token,
+            format!("plugin:acme-phase@1.0.0#{SHA}/observe:wicked.run.unit.*")
+        );
+        approve(&mut store, &token);
+        let got = evaluate_editor_grants(&store, &r, 1).unwrap();
+        assert_eq!(got.grants[0].decision, "allow");
+        assert_eq!(got.grants[0].rule_ids, [GRANTS_LEDGER]);
+        assert_eq!(got.grants[1].decision, "ask");
+        for (version, sha) in [("1.0.1", SHA), ("1.0.0", SHA2)] {
+            let mut changed = r.clone();
+            changed.version = version.into();
+            changed.sha256 = sha.into();
+            assert_eq!(
+                evaluate_editor_grants(&store, &changed, 1).unwrap().grants[0].decision,
+                "ask"
+            );
+        }
+        let permission = "observe:wicked.run.unit.*";
+        assert_eq!(
+            subject_tokens(&r, permission),
+            [
+                "plugin",
+                "plugin:acme-phase",
+                "plugin:acme-phase/observe:wicked.run.unit.*",
+                "plugin-topic:wicked.run.unit.*",
+                "project:kestrel"
+            ]
+        );
+        let ctx = context(&r, permission);
+        assert_eq!(
+            ctx,
+            serde_json::json!({
+                "plugin": {"id": "acme-phase", "topic": "wicked.run.unit.*", "sha256": SHA, "version": "1.0.0"},
+                "project": "kestrel", "scope": SCOPE,
+                "tool": "plugin:acme-phase/observe:wicked.run.unit.*",
+                "work": "plugin:acme-phase/observe:wicked.run.unit.*"
+            })
+        );
+        // Every subject selects a deny, and the trigger reads the plugin context.
+        for subject in subject_tokens(&r, permission) {
+            let deny: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({
+                "id": "OPS-NO-PLUGIN-TOPIC", "rule_type": "policy", "statement": "Do not read this topic.",
+                "severity": "error", "confidence": 1.0, "steering_type": "security",
+                "applies_to": [subject], "effect": "deny", "trigger": {"contains": "\"topic\":\"wicked.run.unit.*\""}
+            })).unwrap();
+            let dynstore: &mut dyn GraphStore = &mut store;
+            dynstore.upsert_nodes(&[deny.to_node()]).unwrap();
+            let got = evaluate_editor_grants(&store, &r, 1).unwrap();
+            assert_eq!(got.grants[0].decision, "deny");
+            assert_eq!(got.grants[0].rule_ids, ["OPS-NO-PLUGIN-TOPIC"]);
+        }
+        let mut forged = plugin(&["wicked.run.unit.*"]);
+        forged.editor_id = "wicked-phase".into();
+        assert!(
+            !evaluate_editor_grants(&store, &forged, 1)
+                .unwrap()
+                .first_party
+        );
+        let empty = open_store(Some(":memory:")).unwrap();
+        assert!(matches!(
+            evaluate_editor_grants(&empty, &r, 1),
+            Err(EditorGrantError::GuardError(_))
+        ));
+    }
+
+    #[test]
+    fn plugin_allow_rules_never_replace_install_consent() {
+        for subject in ["plugin", "plugin-topic:wicked.run.unit.*"] {
+            let mut store = seeded();
+            let allow: wicked_governance::ConformanceRule = serde_json::from_value(serde_json::json!({
+                "id": "OPS-ALLOW-PLUGINS", "rule_type": "policy", "statement": "Allow plugin topics.",
+                "severity": "info", "confidence": 1.0, "steering_type": "security",
+                "applies_to": [subject], "effect": "allow", "trigger": {"contains": "\"plugin\":"}
+            })).unwrap();
+            let dynstore: &mut dyn GraphStore = &mut store;
+            dynstore.upsert_nodes(&[allow.to_node()]).unwrap();
+            let r = plugin(&["wicked.run.unit.*"]);
+            let tokens = subject_tokens(&r, "observe:wicked.run.unit.*");
+            let phases: Vec<_> = tokens.iter().map(String::as_str).collect();
+            let ctx = context(&r, "observe:wicked.run.unit.*");
+            let selected = wicked_governance::select_any(&store, SCOPE, &phases, &ctx).unwrap();
+            assert!(wicked_governance::decide(
+                &selected,
+                SCOPE,
+                "observe:wicked.run.unit.*",
+                &ctx,
+                1
+            )
+            .policy_ids
+            .contains(&"OPS-ALLOW-PLUGINS".to_string()));
+            let got = evaluate_editor_grants(&store, &r, 1).unwrap();
+            assert_eq!(got.grants[0].decision, "ask");
+            assert!(got.grants[0].rule_ids.is_empty());
+        }
+    }
+
+    #[test]
+    fn plugin_topic_validation_and_subject_boundaries_fail_closed() {
+        let store = seeded();
+        let long_segment = format!("wicked.run.{}", "a".repeat(42));
+        let long_topic = format!(
+            "wicked.run.{}.{}.{}",
+            "a".repeat(41),
+            "b".repeat(41),
+            "c".repeat(41)
+        );
+        for topic in [
+            "wicked.**",
+            "wicked.bus.x",
+            "wicked.run",
+            "Wicked.run.x",
+            "wicked.run.**.x",
+            "",
+            "wicked.run.",
+            "wicked.run..x",
+            "wicked.run.X",
+            "wicked.run.1x",
+            "wicked.run.a!",
+            "wicked.run.a*",
+            "wicked.run.***",
+            "wicked.run.é",
+            &long_segment,
+            &long_topic,
+        ] {
+            assert!(
+                matches!(
+                    evaluate_editor_grants(&store, &plugin(&[topic]), 1),
+                    Err(EditorGrantError::BadRequest(_))
+                ),
+                "{topic}"
+            );
+        }
+        for topics in [
+            vec![],
+            vec!["wicked.run.*"; 2],
+            (0..17).map(|_| "wicked.run.*").collect(),
+        ] {
+            assert!(matches!(
+                evaluate_editor_grants(&store, &plugin(&topics), 1),
+                Err(EditorGrantError::BadRequest(_))
+            ));
+        }
+        let topics: Vec<_> = (0..17).map(|i| format!("wicked.run.topic{i}")).collect();
+        let mut r = plugin(&[]);
+        r.observe = topics.clone();
+        assert!(matches!(
+            evaluate_editor_grants(&store, &r, 1),
+            Err(EditorGrantError::BadRequest(_))
+        ));
+        r.observe = topics[..16].to_vec();
+        assert!(evaluate_editor_grants(&store, &r, 1).is_ok());
+        for topic in [
+            format!("wicked.run.{}", "a".repeat(41)),
+            format!(
+                "wicked.run.{}.{}.{}",
+                "a".repeat(41),
+                "b".repeat(41),
+                "c".repeat(25)
+            ),
+            "wicked.run.a_b-c0.*.**".into(),
+        ] {
+            assert!(
+                evaluate_editor_grants(&store, &plugin(&[&topic]), 1).is_ok(),
+                "{topic}"
+            );
+        }
+        let mut r = plugin(&["wicked.run.*"]);
+        r.permissions.push("artifact.read".into());
+        assert!(matches!(
+            evaluate_editor_grants(&store, &r, 1),
+            Err(EditorGrantError::BadRequest(_))
+        ));
+        r.subject = EditorGrantSubject::Editor;
+        assert!(matches!(
+            evaluate_editor_grants(&store, &r, 1),
+            Err(EditorGrantError::BadRequest(_))
+        ));
+    }
+
+    #[test]
+    fn old_editor_json_keeps_its_exact_answer_and_unknown_fields_are_refused() {
+        let store = seeded();
+        let mut json = serde_json::json!({"editorId": "wicked-page", "version": "1.0.0", "sha256": SHA,
+            "permissions": ["artifact.read", "artifact.write", "mcp.session"], "firstParty": true});
+        let old: EditorGrantRequest = serde_json::from_value(json.clone()).unwrap();
+        assert_eq!(
+            old,
+            req(
+                "wicked-page",
+                &["artifact.read", "artifact.write", "mcp.session"],
+                true
+            )
+        );
+        let got = evaluate_editor_grants(&store, &old, 1).unwrap();
+        assert_eq!(
+            serde_json::to_value(got).unwrap(),
+            serde_json::json!({
+                "editorId": "wicked-page", "version": "1.0.0", "sha256": SHA, "project": null, "firstParty": true,
+                "grants": [
+                    {"permission": "artifact.read", "decision": "allow", "ruleIds": ["EDITOR-BUILTIN", "EDITOR-OPEN-DEFAULTS"], "token": grant_token("wicked-page", "1.0.0", SHA, "artifact.read")},
+                    {"permission": "artifact.write", "decision": "allow", "ruleIds": ["EDITOR-BUILTIN"], "token": grant_token("wicked-page", "1.0.0", SHA, "artifact.write")},
+                    {"permission": "mcp.session", "decision": "ask", "ruleIds": [], "token": grant_token("wicked-page", "1.0.0", SHA, "mcp.session")}
+                ]
+            })
+        );
+        json["subject"] = "other".into();
+        assert!(serde_json::from_value::<EditorGrantRequest>(json.clone()).is_err());
+        json["subject"] = "plugin".into();
+        json["extra"] = true.into();
+        assert!(serde_json::from_value::<EditorGrantRequest>(json).is_err());
     }
 
     #[test]

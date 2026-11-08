@@ -75,7 +75,8 @@ mod mcp_gate;
 /// The broker's output decision (DES-MCP-TOOLS-001 §6 step 8), beside `evaluate_mcp_call_json`.
 pub use editor_gate::{
     evaluate_editor_grants, evaluate_editor_grants_json, grant_token as editor_grant_token,
-    EditorGrant, EditorGrantError, EditorGrantRequest, EditorGrants, EDITOR_PERMISSIONS,
+    plugin_grant_token, EditorGrant, EditorGrantError, EditorGrantRequest, EditorGrantSubject,
+    EditorGrants, EDITOR_PERMISSIONS,
 };
 pub use mcp_gate::evaluate_mcp_output_json;
 /// (DES-RULE-CHECK-001) A stub or scripted judge's answer to a rule-check prompt (every rule N/A).
