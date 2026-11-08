@@ -65,6 +65,16 @@ pub fn row(json: &serde_json::Value, seq: u64, at: u64) -> Option<crate::bus::Bu
             Some("working") => "wicked.run.tool.working",
             _ => return None,
         }
+    } else if ty == "skillUsed" {
+        // Skill usage mirrors by its signal (`skill_use`); `handed` is not mirrored (its payload
+        // is the whole delivered list).
+        match json.get("signal").and_then(|s| s.as_str()) {
+            Some("directed") => "wicked.run.skill.directed",
+            Some("opened") => "wicked.run.skill.opened",
+            Some("browsed") => "wicked.run.skill.browsed",
+            Some("ran") => "wicked.run.skill.ran",
+            _ => return None,
+        }
     } else {
         bus_type(ty)?
     };
@@ -206,6 +216,43 @@ mod tests {
         .unwrap();
         assert_eq!(done.payload["outcome"], "denied");
         assert!(row(&serde_json::json!({"type": "unitDone"}), 1, 1).is_none());
+    }
+
+    /// Skill usage mirrors by its signal; the handed report (the whole delivered list) does not.
+    #[test]
+    fn skill_use_mirrors_by_signal_and_handed_is_not_mirrored() {
+        let f = |signal: &str| {
+            serde_json::json!({"type": "skillUsed", "session": "r1", "ord": 2, "signal": signal,
+                "skill": "wicked-garden-qe", "cli": "codex"})
+        };
+        for (signal, bus) in [
+            ("directed", "wicked.run.skill.directed"),
+            ("opened", "wicked.run.skill.opened"),
+            ("browsed", "wicked.run.skill.browsed"),
+            ("ran", "wicked.run.skill.ran"),
+        ] {
+            let r = row(&f(signal), 7, 1).unwrap();
+            assert_eq!(r.event_type, bus);
+            assert_eq!(r.payload["skill"], "wicked-garden-qe");
+        }
+        assert!(row(&f("other"), 7, 1).is_none());
+        // A run names its script and no skill.
+        let ran = row(
+            &serde_json::json!({"type": "skillUsed", "session": "r1", "ord": 2, "signal": "ran",
+                "skill": null, "script": "scripts/qe/prove.py", "cli": "pi"}),
+            9,
+            1,
+        )
+        .unwrap();
+        assert_eq!(ran.event_type, "wicked.run.skill.ran");
+        assert_eq!(ran.payload["script"], "scripts/qe/prove.py");
+        assert!(ran.payload["skill"].is_null());
+        assert!(row(
+            &serde_json::json!({"type": "skillsSnapshotHanded", "session": "r1", "skills": []}),
+            8,
+            1
+        )
+        .is_none());
     }
 
     /// A live tool frame mirrors by its state; the notes frame has its own type.

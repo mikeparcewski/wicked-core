@@ -498,6 +498,19 @@ impl SkillsDelivery {
         }
     }
 
+    /// The lever's wire token on `skillsSnapshotHanded.lever`.
+    pub(crate) fn lever_token(&self) -> &'static str {
+        match self {
+            SkillsDelivery::ClaudePlugin(_) => "claude_plugin",
+            SkillsDelivery::PiSkillFlags { .. } => "pi_skill_flags",
+            SkillsDelivery::CopilotAddDir { .. } => "copilot_add_dir",
+            SkillsDelivery::OpencodeConfig { .. } => "opencode_config",
+            SkillsDelivery::CodexSkillsDir { .. } => "codex_skills_dir",
+            SkillsDelivery::LauncherOnly(_) => "launcher_only",
+            SkillsDelivery::None => "none",
+        }
+    }
+
     /// Does this delivery hand the seat a skills LEVER (a plugin, `--skill`/`--add-dir` flags, an
     /// opencode config, or a populated codex home)? `false` for [`SkillsDelivery::None`] AND
     /// [`SkillsDelivery::LauncherOnly`] — the latter hands the launcher env but no lever, so the
@@ -797,6 +810,10 @@ impl SkillsSnapshot {
     /// the ACP path it is emitted for the spawning turn AND for every reused turn of the cached
     /// session (core#743), each under its own `ord`/`attempt`, with the generation the session
     /// was opened with.
+    ///
+    /// `delivery` is what the launch was handed: its lever and the names it delivered ride the
+    /// event (skill usage, [`Self::handed_names`]); a tool-command unit's admission passes
+    /// [`SkillsDelivery::None`] (`lever: "none"`, no names).
     pub(crate) fn handed_event(
         &self,
         session: &str,
@@ -804,6 +821,7 @@ impl SkillsSnapshot {
         attempt: u32,
         path: &str,
         cli: &str,
+        delivery: &SkillsDelivery,
     ) -> CoreEvent {
         CoreEvent::SkillsSnapshotHanded {
             session: session.to_string(),
@@ -815,7 +833,46 @@ impl SkillsSnapshot {
             content_hash: self.content_hash.clone(),
             root: self.root.to_string_lossy().into_owned(),
             source: self.source.token().to_string(),
+            lever: delivery.lever_token().to_string(),
+            skills: self.handed_names(delivery),
         }
+    }
+
+    /// The frontmatter names `delivery` hands its seat, sorted: Claude's plugin loader exposes the
+    /// TOP-LEVEL skills ([`Self::claude_skill_dir`]); pi's flags and opencode's paths the
+    /// deliverable portable ones; codex what it populated; copilot what its view holds; nothing
+    /// for the launcher alone.
+    pub(crate) fn handed_names(&self, delivery: &SkillsDelivery) -> Vec<String> {
+        let mut names: Vec<String> = match delivery {
+            SkillsDelivery::ClaudePlugin(_) => self
+                .skills
+                .iter()
+                .filter(|s| !s.is_nested())
+                .map(|s| s.name.clone())
+                .collect(),
+            SkillsDelivery::PiSkillFlags { .. } | SkillsDelivery::OpencodeConfig { .. } => self
+                .deliverable_portable()
+                .into_iter()
+                .map(|s| s.name.clone())
+                .collect(),
+            SkillsDelivery::CodexSkillsDir { skills, .. } => {
+                skills.iter().map(|s| s.name.clone()).collect()
+            }
+            SkillsDelivery::CopilotAddDir { view, .. } => {
+                std::fs::read_dir(view.join(".github").join("skills"))
+                    .map(|rd| {
+                        rd.filter_map(|e| e.ok())
+                            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                            .filter(|n| self.skill(n).is_some())
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+            SkillsDelivery::LauncherOnly(_) | SkillsDelivery::None => Vec::new(),
+        };
+        names.sort();
+        names.dedup();
+        names
     }
 
     /// The skills a non-Claude lever may DELIVER as directories, sorted by `dir`: every PORTABLE
@@ -1396,7 +1453,7 @@ impl SkillsSnapshot {
         Ok(())
     }
 
-    #[cfg(test)]
+    /// Every indexed skill (skill usage maps a path to its owner through it).
     pub(crate) fn skills(&self) -> &[SkillEntry] {
         &self.skills
     }
@@ -4514,7 +4571,7 @@ mod tests {
         let base = scratch("event");
         let root = snapshot_root(&gen_dir(&base, "21"), "21", &[]);
         let s = load(&root);
-        let ev = s.handed_event("run-1", 3, 1, "acp", "claude");
+        let ev = s.handed_event("run-1", 3, 1, "acp", "claude", &SkillsDelivery::None);
         assert_eq!(
             ev,
             CoreEvent::SkillsSnapshotHanded {
@@ -4527,10 +4584,14 @@ mod tests {
                 content_hash: Some("sha256:21".to_string()),
                 root: root.to_string_lossy().into_owned(),
                 source: "published".to_string(),
+                lever: "none".to_string(),
+                skills: Vec::new(),
             }
         );
         let json = ev.to_json();
         assert_eq!(json["type"], "skillsSnapshotHanded");
+        assert_eq!(json["lever"], "none");
+        assert_eq!(json["skills"], serde_json::json!([]));
         assert_eq!(json["gen"], "21");
         assert_eq!(json["contentHash"], "sha256:21");
         // A fallback root has no generation to reap.
@@ -4540,7 +4601,14 @@ mod tests {
         )
         .unwrap();
         let json = live
-            .handed_event("run-1", 3, 1, "wrapped_cli", "claude")
+            .handed_event(
+                "run-1",
+                3,
+                1,
+                "wrapped_cli",
+                "claude",
+                &SkillsDelivery::None,
+            )
             .to_json();
         assert!(json["gen"].is_null() && json["contentHash"].is_null());
         assert_eq!(json["source"], "live-cache");
