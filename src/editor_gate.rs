@@ -502,6 +502,27 @@ pub(crate) fn seed_editor_defaults(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// First-run P4 (2026-11-08): studio titles a rule by its statement's first clause, so a fresh
+    /// install's Steering page read "P-2, gate by risk (Balanced)" and "The editor permission
+    /// approvals ledger". Every shipped statement opens with a plain sentence a person can read
+    /// as a title: no posture code, no internal ledger name.
+    #[test]
+    fn shipped_statements_open_with_a_plain_title() {
+        let doc: serde_json::Value = serde_json::from_str(EDITOR_DEFAULTS_RULES).unwrap();
+        for rule in doc["rules"].as_array().unwrap() {
+            let statement = rule["statement"].as_str().unwrap();
+            let first = statement.split(". ").next().unwrap();
+            assert!(
+                !first.starts_with("P-")
+                    && !first.contains("(Balanced)")
+                    && !first.contains("(Ask)")
+                    && !first.to_lowercase().contains("ledger"),
+                "{}: {first}",
+                rule["id"]
+            );
+        }
+    }
     use wicked_apps_core::{open_store, FromNode, GraphStore, ToNode};
 
     const SHA: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";

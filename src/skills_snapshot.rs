@@ -1893,10 +1893,16 @@ pub(crate) fn resolve_ladder_in(
     // (codex round 7); a failure is never read as absence.
     let root = match live_candidate(&cache) {
         Candidate::Absent => {
+            // First-run P9 (2026-11-08): under wicked-crew this line printed at boot, before crew's
+            // own discovery seeded garden from a place this rung never looks (the installer copy, the
+            // npm-global package, the Codex plugin cache), and read as "no garden is installed". It
+            // says what it is: the engine's OWN rung found nothing, and the host's snapshot is pending.
             log(format!(
-                "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset and no installed \
-                 {PLUGIN_NAME} was found in the plugin cache under {}; workers run WITHOUT \
-                 {PLUGIN_NAME} skills, and a run that names one is refused",
+                "[wicked-core] skills.fallback {SKILLS_SNAPSHOT_ENV} is unset (no published skills \
+                 snapshot handed to the engine yet) and the Claude plugin cache under {} holds no \
+                 {PLUGIN_NAME}, the one place the engine looks on its own; until the host (wicked-crew) \
+                 publishes a snapshot, workers run WITHOUT {PLUGIN_NAME} skills, and a run that names \
+                 one is refused",
                 config.display()
             ));
             return Ok(Ladder::Absent);
@@ -4307,6 +4313,14 @@ mod tests {
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].contains("skills.fallback") && lines[0].contains("WITHOUT"),
+            "{lines:?}"
+        );
+        // First-run P9: the line never claims garden is not installed anywhere: it names the one
+        // place the engine looked and that the host's published snapshot is what is pending.
+        assert!(
+            lines[0].contains("the one place the engine looks on its own")
+                && lines[0].contains("until the host (wicked-crew) publishes a snapshot")
+                && !lines[0].contains("no installed"),
             "{lines:?}"
         );
 

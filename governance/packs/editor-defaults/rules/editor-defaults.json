@@ -3,7 +3,7 @@
     {
       "id": "EDITOR-GRANTS",
       "rule_type": "policy",
-      "statement": "The editor permission approvals ledger. Allowing a permission for an editor adds the token editor:<editor-id>@<version>#<sha256>/<permission> (the full 64-hex sha256 of the editor's entry file, and its version) to this rule's excludes through the audited rule upsert; revoking removes it. A new version or a changed entry hash is a different token, so the permission asks again. The engine reads the ledger whether the rule is active or retired, and an explicit deny still dominates an approval.",
+      "statement": "Editors ask before using a permission you have not allowed. This rule is the editor permission approvals ledger: allowing a permission for an editor adds the token editor:<editor-id>@<version>#<sha256>/<permission> (the full 64-hex sha256 of the editor's entry file, and its version) to this rule's excludes through the audited rule upsert; revoking removes it. A new version or a changed entry hash is a different token, so the permission asks again. The engine reads the ledger whether the rule is active or retired, and an explicit deny still dominates an approval.",
       "severity": "error",
       "confidence": 1.0,
       "steering_type": "security",
