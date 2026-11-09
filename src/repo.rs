@@ -381,6 +381,74 @@ pub fn coverage_report_for_repo(
     wicked_governance::recompute_front_half_coverage(&repo_store)
 }
 
+/// Re-index ONE registered repo's checkout into its existing code graph, under the launch indexer's
+/// lock (`code_graph::index_checkout`; crew's repo watcher, wicked-core#1230). The repo resolves from
+/// the registry in the daemon store at `daemon_db` (opened read-only and CLOSED before the index
+/// runs) and its graph under THIS daemon's state home. An unknown `repo_ref` errors; a repo
+/// onboarding never indexed answers `NoGraph` and nothing is written.
+pub fn index_repo_checkout(
+    daemon_db: &str,
+    repo_ref: &str,
+) -> anyhow::Result<crate::code_graph::CheckoutIndex> {
+    let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
+    let root = {
+        let daemon = wicked_apps_core::open_store_ro(Some(daemon_db))?;
+        get_repo(&daemon, repo_ref)?
+            .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?
+            .root_path
+    };
+    // Read under the launch lock (`index_checkout`): the runs actively working on this repo.
+    let held_by = || -> Result<Vec<String>, String> {
+        let daemon = wicked_apps_core::open_store_ro(Some(daemon_db)).map_err(|e| e.to_string())?;
+        active_runs_on_repo(&daemon, repo_ref).map_err(|e| e.to_string())
+    };
+    crate::code_graph::index_checkout(Path::new(&root), held_by).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The runs on `repo_ref` that hold its graph at their base: planning, distributing or executing
+/// (scoring, the floor's affected set), and a `domain-extraction` run that has not ended, parked too
+/// (its pages read the graph with no base check, #1230). A run parked at a gate otherwise
+/// (`AwaitingHuman`) and terminal runs do not hold it.
+pub(crate) fn active_runs_on_repo(
+    store: &dyn GraphRead,
+    repo_ref: &str,
+) -> anyhow::Result<Vec<String>> {
+    use crate::domain::SessionStatus as S;
+    let domain = crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID;
+    // Every registration of the SAME checkout shares its graph (the graph is keyed by the canonical
+    // root), so a run filed under an alias holds it too (codex r3).
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    let repos = list_repos(store)?;
+    let root = repos
+        .iter()
+        .find(|r| r.id == repo_ref)
+        .map(|r| canon(&r.root_path));
+    let mut aliases: std::collections::HashSet<String> = repos
+        .iter()
+        .filter(|r| root.as_ref().is_some_and(|c| canon(&r.root_path) == *c))
+        .map(|r| r.id.clone())
+        .collect();
+    aliases.insert(repo_ref.to_string());
+    let mut ids: Vec<String> = crate::domain::all_sessions(store)?
+        .into_iter()
+        .filter(|s| s.repo_ref.as_deref().is_some_and(|r| aliases.contains(r)))
+        .filter(|s| {
+            // A preset launch records its preset on the plan state; a session's `workflow_id` is
+            // always the synthetic `wf-<run>` (pi r3), so crew's watcher, which reads the run's
+            // launched name, holds a def-launched mapping as well.
+            let mapping = s.team_plan.as_ref().and_then(|t| t.preset.as_deref()) == Some(domain);
+            match s.status {
+                S::Planning | S::Distributing | S::Executing => true,
+                S::AwaitingHuman => mapping,
+                S::Completed | S::Cancelled | S::Failed => false,
+            }
+        })
+        .map(|s| s.id)
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
 /// ONE registered repo's requirements graph, read from that repo's OWN estate store — the source of
 /// truth `wicked-core domain-graph` persists into (`wicked_governance::persist_domain_model`), never
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as

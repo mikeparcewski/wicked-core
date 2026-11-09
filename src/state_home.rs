@@ -1363,6 +1363,9 @@ mod tests {
             "project-graphs",
             "project-settings.json",
             "learn-schedules.json",
+            // crew's repo watcher record and its transient tmp (wicked-core#1230).
+            "repo-watch.json",
+            "repo-watch.json.tmp-4242",
             "repo-graphs",
             "skills",
             // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the

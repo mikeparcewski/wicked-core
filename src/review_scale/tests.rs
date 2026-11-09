@@ -541,6 +541,27 @@ fn bands_table() {
 
 // ── Graph age ────────────────────────────────────────────────────────────────────────────────
 
+/// wicked-core#1230: a graph indexed at the base commit from a working tree with uncommitted
+/// changes (a checkout re-index) holds edits the base does not: it is not current, and says why.
+#[test]
+fn graph_age_a_dirty_tree_index_at_the_base_is_not_current() {
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("in-memory store");
+    store
+        .set_repo_info(&RepoInfo {
+            commit: Some(BASE.to_string()),
+            dirty: true,
+            ..Default::default()
+        })
+        .expect("set_repo_info");
+    let age = graph_age(&store, BASE);
+    assert!(matches!(age, GraphAge::Dirty { .. }), "{age:?}");
+    let why = age.reason().expect("a reason");
+    assert!(
+        why.contains("not known to be the run base") && why.contains(BASE),
+        "{why}"
+    );
+}
+
 #[test]
 fn graph_age_requires_the_indexed_commit_to_be_the_base() {
     let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("in-memory store");

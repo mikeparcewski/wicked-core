@@ -212,6 +212,13 @@
       "worker_read": "none"
     },
     {
+      "prefix": "repo-watch.json",
+      "kind": "file",
+      "owner": "crew",
+      "source": "src/projects/repo-watch.ts — join(crewStateHome(), 'repo-watch.json'), the repo watcher's record (per repo: the fingerprint last indexed, when, the runs seen then, the per-repo switch; wicked-core#1230), written tmp + rename (repo-watch.json.tmp-<pid>)",
+      "worker_read": "none"
+    },
+    {
       "prefix": "team-outbox.ndjson",
       "kind": "file",
       "owner": "engine",

@@ -2523,6 +2523,99 @@ mod tests {
         }
     }
 
+    /// wicked-core#1230: the runs a checkout re-index waits for — active on THIS repo only; a run
+    /// parked at a gate (`AwaitingHuman`) and terminal runs do not hold the graph.
+    #[test]
+    fn active_runs_on_a_repo_are_its_planning_distributing_and_executing_runs() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("store");
+        let mk = |id: &str, repo: Option<&str>, status: SessionStatus| AgentSession {
+            id: id.to_string(),
+            workflow_id: format!("wf-{id}"),
+            repo_ref: repo.map(str::to_string),
+            status,
+            ..sample_session()
+        };
+        let sessions = [
+            mk("a", Some("r1"), SessionStatus::Planning),
+            mk("b", Some("r1"), SessionStatus::Executing),
+            mk("c", Some("r1"), SessionStatus::AwaitingHuman),
+            mk("d", Some("r1"), SessionStatus::Completed),
+            mk("e", Some("r2"), SessionStatus::Executing),
+            mk("f", None, SessionStatus::Distributing),
+            mk("g", Some("r1"), SessionStatus::Distributing),
+            // A domain mapping parked at a gate still holds its graph (#1230); it is known by the
+            // preset on its plan state, as production records it (pi r3).
+            AgentSession {
+                team_plan: Some(crate::plan_gate::TeamPlanState {
+                    preset: Some("domain-extraction".to_string()),
+                    ..Default::default()
+                }),
+                ..mk("h", Some("r1"), SessionStatus::AwaitingHuman)
+            },
+            AgentSession {
+                team_plan: Some(crate::plan_gate::TeamPlanState {
+                    preset: Some("domain-extraction".to_string()),
+                    ..Default::default()
+                }),
+                ..mk("i", Some("r1"), SessionStatus::Completed)
+            },
+        ];
+        let nodes: Vec<Node> = sessions.iter().map(ToNode::to_node).collect();
+        put_nodes(&mut store, &nodes).expect("put");
+        assert_eq!(
+            crate::repo::active_runs_on_repo(&store, "r1").expect("read"),
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "g".to_string(),
+                "h".to_string()
+            ]
+        );
+        assert!(crate::repo::active_runs_on_repo(&store, "r3")
+            .expect("read")
+            .is_empty());
+    }
+
+    /// codex r3 on wicked-core#1230: two registrations of ONE checkout share its graph, so a run
+    /// filed under either holds it for both.
+    #[test]
+    fn a_run_under_an_alias_of_the_same_checkout_holds_the_graph() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("store");
+        let dir = std::env::temp_dir().join(format!("wicked-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let repo = |id: &str, root: &str| crate::repo::RepoEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: root.to_string(),
+            default_branch: "main".to_string(),
+            registered_at: 1,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let run = AgentSession {
+            id: "under-b".to_string(),
+            repo_ref: Some("b".to_string()),
+            status: SessionStatus::Executing,
+            ..sample_session()
+        };
+        let nodes = vec![
+            repo("a", &root).to_node(),
+            repo("b", &format!("{root}/.")).to_node(),
+            repo("c", "/somewhere/else").to_node(),
+            run.to_node(),
+        ];
+        put_nodes(&mut store, &nodes).expect("put");
+        assert_eq!(
+            crate::repo::active_runs_on_repo(&store, "a").expect("read"),
+            vec!["under-b".to_string()]
+        );
+        assert!(crate::repo::active_runs_on_repo(&store, "c")
+            .expect("read")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// EP-K3: a session with no launch exclusion serializes WITHOUT the key (byte-identical to a
     /// pre-K3 row), an old row reads `[]`, and a set exclusion round-trips. The launch's list is
     /// normalized: trimmed, empties dropped, first-seen order, no repeats.
