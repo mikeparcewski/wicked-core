@@ -1030,8 +1030,8 @@ pub enum CheckoutIndex {
     NoGraph,
     /// The registered checkout, as it is on disk now, is indexed into the repo's graph.
     Indexed,
-    /// Nothing written: these runs on the repo are planning, distributing or executing, so the
-    /// graph is held at their base (scoring, the floor's affected set, a domain mapping's pages).
+    /// Nothing written: these runs on the repo hold the graph at their base: planning, distributing
+    /// or executing (scoring, the floor's affected set), or a domain mapping not ended (its pages).
     /// Read under the lock, after the launch path persisted its Planning stub, so a launch whose
     /// D8 took the lock first is always seen (codex r1 on wicked-core#1230).
     Held(Vec<String>),

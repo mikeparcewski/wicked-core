@@ -2883,8 +2883,8 @@ impl Core {
     /// under the launch indexer's lock, so it is never a second writer beside a launch's D8 base index
     /// (crew's repo watcher, wicked-core#1230). The same command onboarding's index step runs. Resolves
     /// to a JSON string `{ "outcome": "indexed" | "no-graph" | "held", "heldBy": string[], "ms": number }`:
-    /// `no-graph` = onboarding never built one; `held` = runs on the repo are planning, distributing or
-    /// executing (`heldBy`, read under the lock), nothing written. An unknown `repo_ref`, or an indexer
+    /// `no-graph` = onboarding never built one; `held` = runs on the repo hold the graph (planning,
+    /// distributing, executing, or a domain mapping not ended; `heldBy`, read under the lock), nothing written. An unknown `repo_ref`, or an indexer
     /// that fails or exceeds its bound, REJECTS with the reason. The graph it leaves is no run's base.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn index_repo_graph(&self, repo_ref: String) -> AsyncTask<CoreTask> {

@@ -405,17 +405,28 @@ pub fn index_repo_checkout(
     crate::code_graph::index_checkout(Path::new(&root), held_by).map_err(|e| anyhow::anyhow!(e))
 }
 
-/// The runs on `repo_ref` that are planning, distributing or executing (a run parked at a gate is
-/// `AwaitingHuman` and is not among them; terminal runs never are).
+/// The runs on `repo_ref` that hold its graph at their base: planning, distributing or executing
+/// (scoring, the floor's affected set), and a `domain-extraction` run that has not ended, parked too
+/// (its pages read the graph with no base check, #1230). A run parked at a gate otherwise
+/// (`AwaitingHuman`) and terminal runs do not hold it.
 pub(crate) fn active_runs_on_repo(
     store: &dyn GraphRead,
     repo_ref: &str,
 ) -> anyhow::Result<Vec<String>> {
     use crate::domain::SessionStatus as S;
+    let domain = crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID;
     let mut ids: Vec<String> = crate::domain::all_sessions(store)?
         .into_iter()
         .filter(|s| s.repo_ref.as_deref() == Some(repo_ref))
-        .filter(|s| matches!(s.status, S::Planning | S::Distributing | S::Executing))
+        .filter(|s| {
+            let mapping = s.workflow_id == domain
+                || s.team_plan.as_ref().and_then(|t| t.preset.as_deref()) == Some(domain);
+            match s.status {
+                S::Planning | S::Distributing | S::Executing => true,
+                S::AwaitingHuman => mapping,
+                S::Completed | S::Cancelled | S::Failed => false,
+            }
+        })
         .map(|s| s.id)
         .collect();
     ids.sort();

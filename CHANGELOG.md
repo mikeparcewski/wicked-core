@@ -19,7 +19,8 @@ Two release tracks share this file, newest entry first regardless of track:
   the onboarding index step's own command, `wicked-estate index <checkout> --db <code_graph_db>`, into the repo's
   EXISTING graph while holding `BASE_INDEX_LOCK`, so crew's repo watcher is never a second writer beside a launch's D8
   base index. It is bounded at 120 s, answers `no-graph` for a repo onboarding never indexed, and answers `held` (with
-  the run ids) without writing while a run on the repo is planning, distributing or executing, read under that lock,
+  the run ids) without writing while a run on the repo is planning, distributing or executing, or is a domain mapping
+  that has not ended, read under that lock,
   after the launch path persisted its Planning stub, so a launch whose D8 took the lock first is always seen. The daemon
   store is read-only and closed before the index runs. The state-home registry (`tests/fixtures/state-home-subtrees.json`)
   classifies crew's new `repo-watch.json` (and its `.tmp-*`), so the worker Read fence never refuses a launch over it. `review_scale::graph_age` now also reads estate's `repo_info.dirty`:

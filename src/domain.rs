@@ -2543,12 +2543,26 @@ mod tests {
             mk("e", Some("r2"), SessionStatus::Executing),
             mk("f", None, SessionStatus::Distributing),
             mk("g", Some("r1"), SessionStatus::Distributing),
+            // A domain mapping parked at a gate still holds its graph (#1230).
+            AgentSession {
+                workflow_id: "domain-extraction".to_string(),
+                ..mk("h", Some("r1"), SessionStatus::AwaitingHuman)
+            },
+            AgentSession {
+                workflow_id: "domain-extraction".to_string(),
+                ..mk("i", Some("r1"), SessionStatus::Completed)
+            },
         ];
         let nodes: Vec<Node> = sessions.iter().map(ToNode::to_node).collect();
         put_nodes(&mut store, &nodes).expect("put");
         assert_eq!(
             crate::repo::active_runs_on_repo(&store, "r1").expect("read"),
-            vec!["a".to_string(), "b".to_string(), "g".to_string()]
+            vec![
+                "a".to_string(),
+                "b".to_string(),
+                "g".to_string(),
+                "h".to_string()
+            ]
         );
         assert!(crate::repo::active_runs_on_repo(&store, "r3")
             .expect("read")
