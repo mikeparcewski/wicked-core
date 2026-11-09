@@ -2882,21 +2882,24 @@ impl Core {
     /// Re-index ONE registered repo's CHECKOUT (what is on disk now) into its existing code graph,
     /// under the launch indexer's lock, so it is never a second writer beside a launch's D8 base index
     /// (crew's repo watcher, wicked-core#1230). The same command onboarding's index step runs. Resolves
-    /// to a JSON string `{ "outcome": "indexed" | "no-graph", "ms": number }`: `no-graph` = onboarding
-    /// never built one, nothing written. An unknown `repo_ref`, or an indexer that fails or exceeds
-    /// its bound, REJECTS with the reason.
+    /// to a JSON string `{ "outcome": "indexed" | "no-graph" | "held", "heldBy": string[], "ms": number }`:
+    /// `no-graph` = onboarding never built one; `held` = runs on the repo are planning, distributing or
+    /// executing (`heldBy`, read under the lock), nothing written. An unknown `repo_ref`, or an indexer
+    /// that fails or exceeds its bound, REJECTS with the reason. The graph it leaves is no run's base.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn index_repo_graph(&self, repo_ref: String) -> AsyncTask<CoreTask> {
         let db_path = self.db_path.clone();
         task(move || {
             let started = std::time::Instant::now();
-            let outcome =
+            let (outcome, held) =
                 match wicked_core::index_repo_checkout(&db_path, &repo_ref).map_err(err)? {
-                    wicked_core::CheckoutIndex::Indexed => "indexed",
-                    wicked_core::CheckoutIndex::NoGraph => "no-graph",
+                    wicked_core::CheckoutIndex::Indexed => ("indexed", Vec::new()),
+                    wicked_core::CheckoutIndex::NoGraph => ("no-graph", Vec::new()),
+                    wicked_core::CheckoutIndex::Held(runs) => ("held", runs),
                 };
             serde_json::to_string(&serde_json::json!({
                 "outcome": outcome,
+                "heldBy": held,
                 "ms": started.elapsed().as_millis() as u64,
             }))
             .map_err(err)

@@ -1024,12 +1024,17 @@ fn run_indexer(
 }
 
 /// What [`index_checkout`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckoutIndex {
     /// The repo was never indexed: onboarding builds the first graph, a re-index does not.
     NoGraph,
     /// The registered checkout, as it is on disk now, is indexed into the repo's graph.
     Indexed,
+    /// Nothing written: these runs on the repo are planning, distributing or executing, so the
+    /// graph is held at their base (scoring, the floor's affected set, a domain mapping's pages).
+    /// Read under the lock, after the launch path persisted its Planning stub, so a launch whose
+    /// D8 took the lock first is always seen (codex r1 on wicked-core#1230).
+    Held(Vec<String>),
 }
 
 /// How long a checkout re-index may run (the same bound a launch's base index has).
@@ -1041,12 +1046,16 @@ pub(crate) const CHECKOUT_INDEX_TIMEOUT: std::time::Duration = BASE_INDEX_TIMEOU
 /// watcher, wicked-core#1230). The graph it leaves is marked not-a-base ([`mark_not_a_base`]), so a
 /// run's later checks ([`crate::review_scale::graph_age`]) fail closed until a launch's D8 indexes
 /// its base again. A repo with no graph yet is left to onboarding (`NoGraph`).
-pub fn index_checkout(repo: &Path) -> Result<CheckoutIndex, String> {
+pub fn index_checkout(
+    repo: &Path,
+    held_by: impl FnOnce() -> Result<Vec<String>, String>,
+) -> Result<CheckoutIndex, String> {
     index_checkout_with(
         &indexer_bin(),
         repo,
         repo_graph_root().as_deref(),
         CHECKOUT_INDEX_TIMEOUT,
+        held_by,
     )
 }
 
@@ -1055,11 +1064,16 @@ fn index_checkout_with(
     repo: &Path,
     root: Option<&Path>,
     timeout: std::time::Duration,
+    held_by: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<CheckoutIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(db) = existing_code_graph_at(repo, root) else {
         return Ok(CheckoutIndex::NoGraph);
     };
+    let held = held_by()?;
+    if !held.is_empty() {
+        return Ok(CheckoutIndex::Held(held));
+    }
     let ran = run_indexer(bin, repo, &db, timeout);
     // Whether it finished or not, a checkout's graph is no run's base (see `mark_not_a_base`).
     mark_not_a_base(&db, "a checkout re-index");
@@ -1442,7 +1456,7 @@ mod tests {
         let never = dir.join("never-run").to_string_lossy().into_owned();
         // Never onboarded: nothing to re-index, nothing runs.
         assert_eq!(
-            index_checkout_with(&never, &repo, Some(&root), patient),
+            index_checkout_with(&never, &repo, Some(&root), patient, || Ok(vec![])),
             Ok(CheckoutIndex::NoGraph)
         );
 
@@ -1475,7 +1489,9 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let (r, c, d) = (root.clone(), checkout.clone(), repo.clone());
-        let waiter = std::thread::spawn(move || index_checkout_with(&c, &d, Some(&r), patient));
+        let waiter = std::thread::spawn(move || {
+            index_checkout_with(&c, &d, Some(&r), patient, || Ok(vec![]))
+        });
         // While D8's index is RUNNING, the checkout re-index has not started its own.
         std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(
@@ -1498,10 +1514,27 @@ mod tests {
             age(&db, BASE),
             crate::review_scale::GraphAge::Dirty { .. }
         ));
-        assert!(
-            index_checkout_with(&script("fails", "exit 3"), &repo, Some(&root), patient)
-                .unwrap_err()
-                .contains("failed")
+        assert!(index_checkout_with(
+            &script("fails", "exit 3"),
+            &repo,
+            Some(&root),
+            patient,
+            || Ok(vec![])
+        )
+        .unwrap_err()
+        .contains("failed"));
+        // A run executing on the repo holds the graph: nothing runs, the runs are named.
+        let before = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            index_checkout_with(&checkout, &repo, Some(&root), patient, || Ok(vec![
+                "run-7".to_string()
+            ])),
+            Ok(CheckoutIndex::Held(vec!["run-7".to_string()]))
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap(),
+            before,
+            "the indexer ran over a held graph"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

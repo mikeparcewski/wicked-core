@@ -397,7 +397,29 @@ pub fn index_repo_checkout(
             .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?
             .root_path
     };
-    crate::code_graph::index_checkout(Path::new(&root)).map_err(|e| anyhow::anyhow!(e))
+    // Read under the launch lock (`index_checkout`): the runs actively working on this repo.
+    let held_by = || -> Result<Vec<String>, String> {
+        let daemon = wicked_apps_core::open_store_ro(Some(daemon_db)).map_err(|e| e.to_string())?;
+        Ok(active_runs_on_repo(&daemon, repo_ref).map_err(|e| e.to_string())?)
+    };
+    crate::code_graph::index_checkout(Path::new(&root), held_by).map_err(|e| anyhow::anyhow!(e))
+}
+
+/// The runs on `repo_ref` that are planning, distributing or executing (a run parked at a gate is
+/// `AwaitingHuman` and is not among them; terminal runs never are).
+pub(crate) fn active_runs_on_repo(
+    store: &dyn GraphRead,
+    repo_ref: &str,
+) -> anyhow::Result<Vec<String>> {
+    use crate::domain::SessionStatus as S;
+    let mut ids: Vec<String> = crate::domain::all_sessions(store)?
+        .into_iter()
+        .filter(|s| s.repo_ref.as_deref() == Some(repo_ref))
+        .filter(|s| matches!(s.status, S::Planning | S::Distributing | S::Executing))
+        .map(|s| s.id)
+        .collect();
+    ids.sort();
+    Ok(ids)
 }
 
 /// ONE registered repo's requirements graph, read from that repo's OWN estate store — the source of

@@ -2523,6 +2523,38 @@ mod tests {
         }
     }
 
+    /// wicked-core#1230: the runs a checkout re-index waits for — active on THIS repo only; a run
+    /// parked at a gate (`AwaitingHuman`) and terminal runs do not hold the graph.
+    #[test]
+    fn active_runs_on_a_repo_are_its_planning_distributing_and_executing_runs() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("store");
+        let mk = |id: &str, repo: Option<&str>, status: SessionStatus| AgentSession {
+            id: id.to_string(),
+            workflow_id: format!("wf-{id}"),
+            repo_ref: repo.map(str::to_string),
+            status,
+            ..sample_session()
+        };
+        let sessions = [
+            mk("a", Some("r1"), SessionStatus::Planning),
+            mk("b", Some("r1"), SessionStatus::Executing),
+            mk("c", Some("r1"), SessionStatus::AwaitingHuman),
+            mk("d", Some("r1"), SessionStatus::Completed),
+            mk("e", Some("r2"), SessionStatus::Executing),
+            mk("f", None, SessionStatus::Distributing),
+            mk("g", Some("r1"), SessionStatus::Distributing),
+        ];
+        let nodes: Vec<Node> = sessions.iter().map(ToNode::to_node).collect();
+        put_nodes(&mut store, &nodes).expect("put");
+        assert_eq!(
+            crate::repo::active_runs_on_repo(&store, "r1").expect("read"),
+            vec!["a".to_string(), "b".to_string(), "g".to_string()]
+        );
+        assert!(crate::repo::active_runs_on_repo(&store, "r3")
+            .expect("read")
+            .is_empty());
+    }
+
     /// EP-K3: a session with no launch exclusion serializes WITHOUT the key (byte-identical to a
     /// pre-K3 row), an old row reads `[]`, and a set exclusion round-trips. The launch's list is
     /// normalized: trimmed, empties dropped, first-seen order, no repeats.

@@ -18,8 +18,11 @@ Two release tracks share this file, newest entry first regardless of track:
   (wicked-core#1230, crew repo watcher).** New napi `indexRepoGraph(repoRef)` (`code_graph::index_checkout`): it runs
   the onboarding index step's own command, `wicked-estate index <checkout> --db <code_graph_db>`, into the repo's
   EXISTING graph while holding `BASE_INDEX_LOCK`, so crew's repo watcher is never a second writer beside a launch's D8
-  base index. It is bounded at 120 s, answers `no-graph` for a repo onboarding never indexed, and reads the daemon store
-  read-only and closes it before the index runs. `review_scale::graph_age` now also reads estate's `repo_info.dirty`:
+  base index. It is bounded at 120 s, answers `no-graph` for a repo onboarding never indexed, and answers `held` (with
+  the run ids) without writing while a run on the repo is planning, distributing or executing, read under that lock,
+  after the launch path persisted its Planning stub, so a launch whose D8 took the lock first is always seen. The daemon
+  store is read-only and closed before the index runs. The state-home registry (`tests/fixtures/state-home-subtrees.json`)
+  classifies crew's new `repo-watch.json` (and its `.tmp-*`), so the worker Read fence never refuses a launch over it. `review_scale::graph_age` now also reads estate's `repo_info.dirty`:
   a graph recorded at the base commit but not known to be the base is `Dirty`, not `Current`. That covers a working
   tree with uncommitted changes, every checkout re-index (a live checkout is never an immutable base, so its graph is
   marked dirty after the index), and an index that did not finish (estate records the new commit before it rewrites the
@@ -2709,7 +2712,8 @@ Two release tracks share this file, newest entry first regardless of track:
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
 - **core-ts 0.15.35** — 2026-11-09 — patch release on main 1e0344d, carrying #1368 and this release's own change.
   - **`indexRepoGraph(repoRef)` (new binding method) and a dirty-tree graph is not a run base (wicked-core#1230).** The
-    checkout re-index crew 0.18.3's repo watcher calls, under the launch indexer's lock; `graph_age` reads `dirty`.
+    checkout re-index crew 0.18.3's repo watcher calls, under the launch indexer's lock (`held` while a run on the repo
+    is active); `graph_age` reads `dirty`; the state-home registry classifies crew's `repo-watch.json`.
   - **Lockfile:** #1368 re-stamped the 0.15.34 platform lock entries.
   - One binding method is added (`indexRepoGraph`); no `LaunchSpec` field or gate-protocol change. The seat and floor
     Dockerfiles, the seat package pins and the base image are unchanged since 0.15.34, so the seat and floor image tags
