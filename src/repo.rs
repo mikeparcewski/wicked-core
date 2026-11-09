@@ -400,7 +400,7 @@ pub fn index_repo_checkout(
     // Read under the launch lock (`index_checkout`): the runs actively working on this repo.
     let held_by = || -> Result<Vec<String>, String> {
         let daemon = wicked_apps_core::open_store_ro(Some(daemon_db)).map_err(|e| e.to_string())?;
-        Ok(active_runs_on_repo(&daemon, repo_ref).map_err(|e| e.to_string())?)
+        active_runs_on_repo(&daemon, repo_ref).map_err(|e| e.to_string())
     };
     crate::code_graph::index_checkout(Path::new(&root), held_by).map_err(|e| anyhow::anyhow!(e))
 }
