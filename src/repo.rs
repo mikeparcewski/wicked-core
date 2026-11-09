@@ -381,6 +381,25 @@ pub fn coverage_report_for_repo(
     wicked_governance::recompute_front_half_coverage(&repo_store)
 }
 
+/// Re-index ONE registered repo's checkout into its existing code graph, under the launch indexer's
+/// lock (`code_graph::index_checkout`; crew's repo watcher, wicked-core#1230). The repo resolves from
+/// the registry in the daemon store at `daemon_db` (opened read-only and CLOSED before the index
+/// runs) and its graph under THIS daemon's state home. An unknown `repo_ref` errors; a repo
+/// onboarding never indexed answers `NoGraph` and nothing is written.
+pub fn index_repo_checkout(
+    daemon_db: &str,
+    repo_ref: &str,
+) -> anyhow::Result<crate::code_graph::CheckoutIndex> {
+    let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
+    let root = {
+        let daemon = wicked_apps_core::open_store_ro(Some(daemon_db))?;
+        get_repo(&daemon, repo_ref)?
+            .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?
+            .root_path
+    };
+    crate::code_graph::index_checkout(Path::new(&root)).map_err(|e| anyhow::anyhow!(e))
+}
+
 /// ONE registered repo's requirements graph, read from that repo's OWN estate store — the source of
 /// truth `wicked-core domain-graph` persists into (`wicked_governance::persist_domain_model`), never
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as

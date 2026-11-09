@@ -1081,6 +1081,15 @@ export declare class Core {
    */
   getCoverageReportForRepo(repoRef: string): Promise<string>
   /**
+   * Re-index ONE registered repo's CHECKOUT (what is on disk now) into its existing code graph,
+   * under the launch indexer's lock, so it is never a second writer beside a launch's D8 base index
+   * (crew's repo watcher, wicked-core#1230). The same command onboarding's index step runs. Resolves
+   * to a JSON string `{ "outcome": "indexed" | "no-graph", "ms": number }`: `no-graph` = onboarding
+   * never built one, nothing written. An unknown `repo_ref`, or an indexer that fails or exceeds
+   * its bound, REJECTS with the reason.
+   */
+  indexRepoGraph(repoRef: string): Promise<string>
+  /**
    * ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
    * of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
    * recomputed from the store's own counts against the configured minimum. Resolves to a JSON

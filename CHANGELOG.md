@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A repo's checkout can be re-indexed under the launch indexer's lock; a dirty-tree graph is not a run's base
+  (wicked-core#1230, crew repo watcher).** New napi `indexRepoGraph(repoRef)` (`code_graph::index_checkout`): it runs
+  the onboarding index step's own command, `wicked-estate index <checkout> --db <code_graph_db>`, into the repo's
+  EXISTING graph while holding `BASE_INDEX_LOCK`, so crew's repo watcher is never a second writer beside a launch's D8
+  base index. It is bounded at 120 s, answers `no-graph` for a repo onboarding never indexed, and reads the daemon store
+  read-only and closes it before the index runs. `review_scale::graph_age` now also reads estate's `repo_info.dirty`:
+  a graph indexed at the base commit from a working tree with uncommitted changes is `Dirty`, not `Current`. So a
+  launch's D8 re-indexes it from the run worktree instead of scoring against uncommitted edits, and a parked run's floor
+  finds it not at its base and runs the declared suite, the reason disclosed. Domain mapping pages still read the graph
+  with no base check (#1230 stays open); crew's watcher does not re-index a repo while a `domain-extraction` run on it
+  is live.
+
 - **A broken warning can be skipped with a reason (e2e-1105 CJ9).** A `/plugin` job started from words, with no
   issue, delivered its pull request and then held at the deliver step: the rule `learn-linked-issue` (severity warn,
   "Every pull request names the issue it closes") was judged broken, and the gate refused `skip_rules` on any broken
@@ -2692,6 +2704,13 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.35** — 2026-11-09 — patch release on main 1e0344d, carrying #1368 and this release's own change.
+  - **`indexRepoGraph(repoRef)` (new binding method) and a dirty-tree graph is not a run base (wicked-core#1230).** The
+    checkout re-index crew 0.18.3's repo watcher calls, under the launch indexer's lock; `graph_age` reads `dirty`.
+  - **Lockfile:** #1368 re-stamped the 0.15.34 platform lock entries.
+  - One binding method is added (`indexRepoGraph`); no `LaunchSpec` field or gate-protocol change. The seat and floor
+    Dockerfiles, the seat package pins and the base image are unchanged since 0.15.34, so the seat and floor image tags
+    and gate protocol 3 are unchanged.
 - **core-ts 0.15.34** — 2026-11-08 — patch release on main ca1b591, carrying 2 PRs since 0.15.33: #1364 and #1365.
   - **A broken warning can be skipped with a reason (#1365, e2e-1105 CJ9).** A job with no issue that delivered its pull
     request held at the deliver step on a broken `warn` rule (`learn-linked-issue`), with no way on but stopping. A

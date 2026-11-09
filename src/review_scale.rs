@@ -94,6 +94,10 @@ pub(crate) enum GraphAge {
     Current,
     /// Indexed at any other commit: older, newer, or unrelated.
     Stale { indexed: String, base: String },
+    /// Indexed at the base commit but from a working tree with uncommitted changes (estate's
+    /// `repo_info.dirty`): the graph holds edits the base does not, so it is not the base either
+    /// (a checkout re-index, crew's repo watcher, wicked-core#1230).
+    Dirty { indexed: String, base: String },
     /// No graph, no recorded commit, or unreadable.
     Missing(String),
 }
@@ -105,6 +109,10 @@ impl GraphAge {
             GraphAge::Current => None,
             GraphAge::Stale { indexed, base } => Some(format!(
                 "graph indexed at {indexed} is not the run base {base}"
+            )),
+            GraphAge::Dirty { indexed, base } => Some(format!(
+                "graph indexed at {indexed} from a working tree with uncommitted changes is not \
+                 the run base {base}"
             )),
             GraphAge::Missing(why) => Some(format!("no graph: {why}")),
         }
@@ -544,15 +552,20 @@ const _: () = assert!(THRESHOLDS.bands.len() == THRESHOLDS.floors.len());
 /// start; the graph is whatever onboarding indexed the registered root at, which the base lift
 /// (`RunBase::lifted`) can leave behind. Anything but equality is stale, and stale scores 100.
 pub(crate) fn graph_age<S: GraphRead + ?Sized>(store: &S, base_commit: &str) -> GraphAge {
-    let indexed = match store.repo_info() {
+    let (indexed, dirty) = match store.repo_info() {
         Err(e) => return GraphAge::Missing(format!("repo info unreadable: {e}")),
         Ok(None) => return GraphAge::Missing("the graph records no repo info".into()),
         Ok(Some(info)) => match info.commit {
-            Some(c) if !c.is_empty() => c,
+            Some(c) if !c.is_empty() => (c, info.dirty),
             _ => return GraphAge::Missing("the graph records no commit".into()),
         },
     };
-    if indexed == base_commit {
+    if indexed == base_commit && dirty {
+        GraphAge::Dirty {
+            indexed,
+            base: base_commit.to_string(),
+        }
+    } else if indexed == base_commit {
         GraphAge::Current
     } else {
         GraphAge::Stale {
