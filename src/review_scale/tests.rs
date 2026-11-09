@@ -557,7 +557,7 @@ fn graph_age_a_dirty_tree_index_at_the_base_is_not_current() {
     assert!(matches!(age, GraphAge::Dirty { .. }), "{age:?}");
     let why = age.reason().expect("a reason");
     assert!(
-        why.contains("uncommitted changes") && why.contains(BASE),
+        why.contains("not known to be the run base") && why.contains(BASE),
         "{why}"
     );
 }

@@ -948,9 +948,38 @@ fn index_at_base_with(
     if current {
         return Ok(BaseIndex::Current);
     }
-    run_indexer(bin, worktree, &db, timeout)?;
+    if let Err(e) = run_indexer(bin, worktree, &db, timeout) {
+        mark_not_a_base(&db, "a launch's base index did not finish");
+        return Err(e);
+    }
     record_registered_root(&db, repo, worktree);
     Ok(BaseIndex::Indexed)
+}
+
+/// Mark the graph as not any run's base: its recorded commit stays, `repo_info.dirty` is set, so
+/// [`crate::review_scale::graph_age`] reads it as `Dirty` and every later check fails closed (D8
+/// re-indexes at a launch; a floor runs the declared suite). For an index that did not finish
+/// (estate records `repo_info` BEFORE it rewrites the graph, so a killed or failed index leaves new
+/// provenance over partial rows; codex r1 on wicked-core#1230), and for every checkout re-index (a
+/// live checkout is never an immutable base: an edit can land while it is read, and git's status
+/// settings can hide untracked source from estate's dirty probe). A graph that cannot be opened is
+/// left as it is (warned): the next index rewrites it.
+fn mark_not_a_base(db: &Path, why: &str) {
+    use wicked_apps_core::GraphWrite;
+    let warn = |e: String| tracing::warn!(db = %db.display(), "{why}, and the graph could not be marked not-a-base: {e}");
+    let mut store = match open_store(Some(&db.to_string_lossy())) {
+        Ok(s) => s,
+        Err(e) => return warn(format!("open: {e}")),
+    };
+    let mut info = match store.repo_info() {
+        Ok(Some(info)) => info,
+        Ok(None) => wicked_estate_core::RepoInfo::default(),
+        Err(e) => return warn(format!("read: {e}")),
+    };
+    info.dirty = true;
+    if let Err(e) = store.set_repo_info(&info) {
+        warn(format!("write: {e}"));
+    }
 }
 
 /// `bin index <tree> --db <db>`, bounded by `timeout` (the child is killed past it). The ONE spawn
@@ -1009,9 +1038,9 @@ pub(crate) const CHECKOUT_INDEX_TIMEOUT: std::time::Duration = BASE_INDEX_TIMEOU
 /// Re-index a registered repo's CHECKOUT (what is on disk now, uncommitted edits included) into its
 /// existing code graph: the onboarding index step's command, `wicked-estate index <repo> --db <db>`,
 /// taken under [`BASE_INDEX_LOCK`] so it is never a second writer beside a launch's D8 (crew's repo
-/// watcher, wicked-core#1230). A graph moved here away from a run's base reads as not current to
-/// that run's later checks ([`crate::review_scale::graph_age`]: another commit, or a dirty tree), so
-/// they fail closed. A repo with no graph yet is left to onboarding (`NoGraph`).
+/// watcher, wicked-core#1230). The graph it leaves is marked not-a-base ([`mark_not_a_base`]), so a
+/// run's later checks ([`crate::review_scale::graph_age`]) fail closed until a launch's D8 indexes
+/// its base again. A repo with no graph yet is left to onboarding (`NoGraph`).
 pub fn index_checkout(repo: &Path) -> Result<CheckoutIndex, String> {
     index_checkout_with(
         &indexer_bin(),
@@ -1031,7 +1060,10 @@ fn index_checkout_with(
     let Some(db) = existing_code_graph_at(repo, root) else {
         return Ok(CheckoutIndex::NoGraph);
     };
-    run_indexer(bin, repo, &db, timeout)?;
+    let ran = run_indexer(bin, repo, &db, timeout);
+    // Whether it finished or not, a checkout's graph is no run's base (see `mark_not_a_base`).
+    mark_not_a_base(&db, "a checkout re-index");
+    ran?;
     Ok(CheckoutIndex::Indexed)
 }
 
@@ -1388,15 +1420,18 @@ mod tests {
     }
 
     /// wicked-core#1230 (crew's repo watcher): the CHECKOUT is re-indexed into the repo's existing
-    /// graph by the same command, under the launch indexer's lock: never beside a D8 base index.
-    /// A never-onboarded repo is left alone; a failing indexer is an `Err`.
+    /// graph by the onboarding command, never while a launch's D8 is writing it (both writers hold
+    /// the lock for the WHOLE index), and the graph it leaves is no run's base. A never-onboarded
+    /// repo is left alone; a failing indexer is an `Err`.
     #[cfg(unix)]
     #[test]
     fn a_checkout_reindex_runs_the_onboarding_command_under_the_launch_lock() {
         use std::os::unix::fs::PermissionsExt;
+        const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("checkout-index");
-        let (root, repo) = (dir.join("graphs"), dir.join("repo"));
+        let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
         std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
         let script = |name: &str, body: &str| {
             let p = dir.join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1413,28 +1448,101 @@ mod tests {
 
         let db = repo_graph_db_at(&root, &repo);
         graph_at(&db, "3071a7632882ade840e3c73772eaf44288c6b4c3");
-        let argv = dir.join("argv");
-        let indexer = script("indexer", &format!("echo \"$@\" > '{}'", argv.display()));
-
-        // Held lock (a launch's D8 mid-index): the re-index waits for it, then runs.
-        let held = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let (r, i, d) = (root.clone(), indexer.clone(), repo.clone());
-        let waiter = std::thread::spawn(move || index_checkout_with(&i, &d, Some(&r), patient));
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        // A clean graph at the base, as estate would record a clean checkout at it.
+        let clean = dir.join("clean.db");
+        graph_at(&clean, BASE);
+        let (started, release, log) = (dir.join("started"), dir.join("release"), dir.join("log"));
+        // D8's stand-in holds its index open until released; the checkout's records that it ran.
+        let d8 = script(
+            "d8",
+            &format!(
+                "touch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\necho d8-done >> '{}'\ncp '{}' \"$4\"",
+                started.display(), release.display(), log.display(), clean.display()
+            ),
+        );
+        let checkout = script(
+            "checkout",
+            &format!(
+                "echo \"checkout $@\" >> '{}'\ncp '{}' \"$4\"",
+                log.display(),
+                clean.display()
+            ),
+        );
+        let (r, d, w) = (root.clone(), repo.clone(), wt.clone());
+        let base =
+            std::thread::spawn(move || index_at_base_with(&d8, &d, &w, BASE, Some(&r), patient));
+        while !started.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let (r, c, d) = (root.clone(), checkout.clone(), repo.clone());
+        let waiter = std::thread::spawn(move || index_checkout_with(&c, &d, Some(&r), patient));
+        // While D8's index is RUNNING, the checkout re-index has not started its own.
+        std::thread::sleep(std::time::Duration::from_millis(500));
         assert!(
-            !argv.exists(),
-            "the re-index ran while the launch indexer held the lock"
+            !log.exists(),
+            "the checkout re-index ran beside a running D8 index"
         );
-        drop(held);
+        std::fs::write(&release, "").unwrap();
+        assert_eq!(base.join().unwrap(), Ok(BaseIndex::Indexed));
         assert_eq!(waiter.join().unwrap(), Ok(CheckoutIndex::Indexed));
+        let lines = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&argv).unwrap().trim(),
-            format!("index {} --db {}", repo.display(), db.display())
+            lines.lines().collect::<Vec<_>>(),
+            vec![
+                "d8-done".to_string(),
+                format!("checkout index {} --db {}", repo.display(), db.display())
+            ]
         );
+        // The checkout's graph is recorded at the base commit, and is still no run's base.
+        assert!(matches!(
+            age(&db, BASE),
+            crate::review_scale::GraphAge::Dirty { .. }
+        ));
         assert!(
             index_checkout_with(&script("fails", "exit 3"), &repo, Some(&root), patient)
                 .unwrap_err()
                 .contains("failed")
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// codex r1 on wicked-core#1230: estate records `repo_info` before it rewrites the graph, so an
+    /// index that fails or is killed leaves the NEW commit over partial rows. Such a graph is no
+    /// run's base: the next launch's D8 re-indexes it instead of trusting it as `Current`.
+    #[cfg(unix)]
+    #[test]
+    fn a_base_index_that_did_not_finish_leaves_a_graph_no_run_trusts() {
+        use std::os::unix::fs::PermissionsExt;
+        const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
+        let dir = scratch("d8-partial");
+        let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt).unwrap();
+        let db = repo_graph_db_at(&root, &repo);
+        graph_at(&db, "3071a7632882ade840e3c73772eaf44288c6b4c3");
+        let partial = dir.join("partial.db");
+        graph_at(&partial, BASE);
+        let p = dir.join("indexer");
+        // The stand-in writes the base provenance (as estate does first), then dies.
+        std::fs::write(
+            &p,
+            format!("#!/bin/sh\ncp '{}' \"$4\"\nexit 9\n", partial.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = index_at_base_with(
+            &p.to_string_lossy(),
+            &repo,
+            &wt,
+            BASE,
+            Some(&root),
+            crate::test_env::PATIENT,
+        );
+        assert!(out.unwrap_err().contains("failed"));
+        assert!(
+            matches!(age(&db, BASE), crate::review_scale::GraphAge::Dirty { .. }),
+            "{:?}",
+            age(&db, BASE)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

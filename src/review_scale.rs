@@ -94,9 +94,10 @@ pub(crate) enum GraphAge {
     Current,
     /// Indexed at any other commit: older, newer, or unrelated.
     Stale { indexed: String, base: String },
-    /// Indexed at the base commit but from a working tree with uncommitted changes (estate's
-    /// `repo_info.dirty`): the graph holds edits the base does not, so it is not the base either
-    /// (a checkout re-index, crew's repo watcher, wicked-core#1230).
+    /// Recorded at the base commit but not known to BE the base (estate's `repo_info.dirty`): indexed
+    /// from a working tree with uncommitted changes, by a checkout re-index (a live checkout is never
+    /// an immutable base), or by an index that did not finish (wicked-core#1230, `code_graph`'s
+    /// `mark_not_a_base`).
     Dirty { indexed: String, base: String },
     /// No graph, no recorded commit, or unreadable.
     Missing(String),
@@ -111,8 +112,8 @@ impl GraphAge {
                 "graph indexed at {indexed} is not the run base {base}"
             )),
             GraphAge::Dirty { indexed, base } => Some(format!(
-                "graph indexed at {indexed} from a working tree with uncommitted changes is not \
-                 the run base {base}"
+                "graph recorded at {indexed} is not known to be the run base {base}: it was \
+                 indexed from a working tree or a live checkout, or its index did not finish"
             )),
             GraphAge::Missing(why) => Some(format!("no graph: {why}")),
         }

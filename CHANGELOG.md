@@ -20,9 +20,12 @@ Two release tracks share this file, newest entry first regardless of track:
   EXISTING graph while holding `BASE_INDEX_LOCK`, so crew's repo watcher is never a second writer beside a launch's D8
   base index. It is bounded at 120 s, answers `no-graph` for a repo onboarding never indexed, and reads the daemon store
   read-only and closes it before the index runs. `review_scale::graph_age` now also reads estate's `repo_info.dirty`:
-  a graph indexed at the base commit from a working tree with uncommitted changes is `Dirty`, not `Current`. So a
-  launch's D8 re-indexes it from the run worktree instead of scoring against uncommitted edits, and a parked run's floor
-  finds it not at its base and runs the declared suite, the reason disclosed. Domain mapping pages still read the graph
+  a graph recorded at the base commit but not known to be the base is `Dirty`, not `Current`. That covers a working
+  tree with uncommitted changes, every checkout re-index (a live checkout is never an immutable base, so its graph is
+  marked dirty after the index), and an index that did not finish (estate records the new commit before it rewrites the
+  rows; both writers now mark the graph dirty on a failed or killed index). So a launch's D8 re-indexes such a graph
+  from the run worktree instead of trusting it, and a parked run's floor finds it not at its base and runs the declared
+  suite, the reason disclosed. Domain mapping pages still read the graph
   with no base check (#1230 stays open); crew's watcher does not re-index a repo while a `domain-extraction` run on it
   is live.
 
