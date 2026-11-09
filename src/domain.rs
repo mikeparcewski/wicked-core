@@ -2543,13 +2543,20 @@ mod tests {
             mk("e", Some("r2"), SessionStatus::Executing),
             mk("f", None, SessionStatus::Distributing),
             mk("g", Some("r1"), SessionStatus::Distributing),
-            // A domain mapping parked at a gate still holds its graph (#1230).
+            // A domain mapping parked at a gate still holds its graph (#1230); it is known by the
+            // preset on its plan state, as production records it (pi r3).
             AgentSession {
-                workflow_id: "domain-extraction".to_string(),
+                team_plan: Some(crate::plan_gate::TeamPlanState {
+                    preset: Some("domain-extraction".to_string()),
+                    ..Default::default()
+                }),
                 ..mk("h", Some("r1"), SessionStatus::AwaitingHuman)
             },
             AgentSession {
-                workflow_id: "domain-extraction".to_string(),
+                team_plan: Some(crate::plan_gate::TeamPlanState {
+                    preset: Some("domain-extraction".to_string()),
+                    ..Default::default()
+                }),
                 ..mk("i", Some("r1"), SessionStatus::Completed)
             },
         ];
@@ -2567,6 +2574,46 @@ mod tests {
         assert!(crate::repo::active_runs_on_repo(&store, "r3")
             .expect("read")
             .is_empty());
+    }
+
+    /// codex r3 on wicked-core#1230: two registrations of ONE checkout share its graph, so a run
+    /// filed under either holds it for both.
+    #[test]
+    fn a_run_under_an_alias_of_the_same_checkout_holds_the_graph() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("store");
+        let dir = std::env::temp_dir().join(format!("wicked-alias-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = dir.to_string_lossy().into_owned();
+        let repo = |id: &str, root: &str| crate::repo::RepoEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            root_path: root.to_string(),
+            default_branch: "main".to_string(),
+            registered_at: 1,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let run = AgentSession {
+            id: "under-b".to_string(),
+            repo_ref: Some("b".to_string()),
+            status: SessionStatus::Executing,
+            ..sample_session()
+        };
+        let nodes = vec![
+            repo("a", &root).to_node(),
+            repo("b", &format!("{root}/.")).to_node(),
+            repo("c", "/somewhere/else").to_node(),
+            run.to_node(),
+        ];
+        put_nodes(&mut store, &nodes).expect("put");
+        assert_eq!(
+            crate::repo::active_runs_on_repo(&store, "a").expect("read"),
+            vec!["under-b".to_string()]
+        );
+        assert!(crate::repo::active_runs_on_repo(&store, "c")
+            .expect("read")
+            .is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// EP-K3: a session with no launch exclusion serializes WITHOUT the key (byte-identical to a

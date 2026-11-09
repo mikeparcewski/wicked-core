@@ -1608,8 +1608,19 @@ mod tests {
             crate::review_scale::GraphAge::Dirty { .. }
         ));
         let ran = dir.join("ran");
+        // The stand-in records that it ran and writes the clean base provenance, as estate does.
+        let clean = dir.join("clean.db");
+        graph_at(&clean, BASE);
         let p = dir.join("indexer");
-        std::fs::write(&p, format!("#!/bin/sh\ntouch '{}'\n", ran.display())).unwrap();
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\ntouch '{}'\ncp '{}' \"$4\"\n",
+                ran.display(),
+                clean.display()
+            ),
+        )
+        .unwrap();
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         let out = index_at_base_with(
             &p.to_string_lossy(),
@@ -1621,6 +1632,7 @@ mod tests {
         );
         assert_eq!(out, Ok(BaseIndex::Indexed));
         assert!(ran.exists(), "D8 trusted a dirty-tree graph as the base");
+        assert_eq!(age(&db, BASE), crate::review_scale::GraphAge::Current);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

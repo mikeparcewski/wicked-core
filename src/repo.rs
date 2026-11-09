@@ -415,12 +415,28 @@ pub(crate) fn active_runs_on_repo(
 ) -> anyhow::Result<Vec<String>> {
     use crate::domain::SessionStatus as S;
     let domain = crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID;
+    // Every registration of the SAME checkout shares its graph (the graph is keyed by the canonical
+    // root), so a run filed under an alias holds it too (codex r3).
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    let repos = list_repos(store)?;
+    let root = repos
+        .iter()
+        .find(|r| r.id == repo_ref)
+        .map(|r| canon(&r.root_path));
+    let mut aliases: std::collections::HashSet<String> = repos
+        .iter()
+        .filter(|r| root.as_ref().is_some_and(|c| canon(&r.root_path) == *c))
+        .map(|r| r.id.clone())
+        .collect();
+    aliases.insert(repo_ref.to_string());
     let mut ids: Vec<String> = crate::domain::all_sessions(store)?
         .into_iter()
-        .filter(|s| s.repo_ref.as_deref() == Some(repo_ref))
+        .filter(|s| s.repo_ref.as_deref().is_some_and(|r| aliases.contains(r)))
         .filter(|s| {
-            let mapping = s.workflow_id == domain
-                || s.team_plan.as_ref().and_then(|t| t.preset.as_deref()) == Some(domain);
+            // A preset launch records its preset on the plan state; a session's `workflow_id` is
+            // always the synthetic `wf-<run>` (pi r3), so crew's watcher, which reads the run's
+            // launched name, holds a def-launched mapping as well.
+            let mapping = s.team_plan.as_ref().and_then(|t| t.preset.as_deref()) == Some(domain);
             match s.status {
                 S::Planning | S::Distributing | S::Executing => true,
                 S::AwaitingHuman => mapping,
