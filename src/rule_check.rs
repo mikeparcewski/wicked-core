@@ -299,6 +299,12 @@ pub struct RuleVerdict {
     /// be put to a council.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_complete: Option<bool>,
+    /// (core#1379) On POL-2101's combined row (the change and the step records, judged apart): the
+    /// record part's status when that part is not settled (not KEPT, nor N/A by fact). A council is
+    /// shown only the change, so such a row is never whole for one, and this says why — not that
+    /// the judge saw part of the change. Absent on every other row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_unsettled: Option<RuleStatus>,
     /// (Part B) Whose conduct a process rule is about (`reviewer`, `engine`, `person`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub party: Option<String>,
@@ -2767,6 +2773,10 @@ fn combine_record(sub: RuleVerdict, rec: RuleVerdict) -> RuleVerdict {
     let rec_settled =
         rec.status == Kept || (rec.status == NotApplicable && rec.how == RuleHow::Fact);
     let whole = Some(sub.evidence_complete == Some(true) && rec_settled);
+    // (core#1379) Why a council cannot take it, when the record part is the only reason (the
+    // judge saw the change whole).
+    let record_unsettled =
+        (sub.evidence_complete == Some(true) && !rec_settled).then_some(rec.status);
     let words = |label: &str, r: &RuleVerdict| {
         format!(
             "{label}: {}",
@@ -2791,6 +2801,7 @@ fn combine_record(sub: RuleVerdict, rec: RuleVerdict) -> RuleVerdict {
                 "{}; not judged where the rule does not apply, {records}",
                 sub.reason
             ),
+            record_unsettled,
             ..sub
         };
     }
@@ -2802,6 +2813,7 @@ fn combine_record(sub: RuleVerdict, rec: RuleVerdict) -> RuleVerdict {
         judge: sub.judge.clone().or_else(|| rec.judge.clone()),
         origin: Some(RuleOrigin::Judge),
         evidence_complete: whole,
+        record_unsettled,
         ..sub.clone()
     };
     let cite_of = |r: &RuleVerdict| Some(r.cite.clone().unwrap_or_else(|| r.reason.clone()));
@@ -2823,6 +2835,7 @@ fn combine_record(sub: RuleVerdict, rec: RuleVerdict) -> RuleVerdict {
             judge: None,
             origin: None,
             evidence_complete: None,
+            record_unsettled,
             ..sub
         },
     }
