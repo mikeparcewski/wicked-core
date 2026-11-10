@@ -4310,6 +4310,19 @@ impl WrappedCliStepRunner {
                                 out.output.pop();
                             }
                             out.output.push_str(&format!(" — {detail})"));
+                        } else if matches!(
+                            why,
+                            crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted
+                                | crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable
+                        ) && !detail.is_empty()
+                        {
+                            // core#1356: the runtime's own network error (the network's name and
+                            // cause), labelled and on the refusal's one line, so the gate can quote it.
+                            if out.output.ends_with(')') {
+                                out.output.pop();
+                            }
+                            out.output
+                                .push_str(&crate::runtime_wait::network_cause_suffix(&detail));
                         }
                         return out;
                     }

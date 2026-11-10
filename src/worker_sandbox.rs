@@ -302,6 +302,12 @@ pub(crate) enum FloorUnarmed {
     NoContainerRuntime,
     /// Container floor: a runtime CLI is present but its engine did not answer.
     ContainerRuntimeDown,
+    /// Container floor: the runtime answers, but it has no address pool left for the seat's
+    /// network (Docker: "all predefined address pools have been fully subnetted"), core#1356.
+    AddressPoolsExhausted,
+    /// Container floor: the runtime answers, but it could not create the seat's own network for
+    /// another reason (its error is the refusal's detail), core#1356.
+    SeatNetworkUnavailable,
     /// Container floor: the seat's image is not defined for this CLI or could not be built.
     NoSeatImage,
     /// Container floor: native Windows (seat containers mount host paths at the same path).
@@ -359,6 +365,17 @@ impl FloorUnarmed {
                  answer (`<runtime> version` failed) — start it (Docker Desktop, Rancher Desktop, \
                  `podman machine start`, `colima start`) and retry"
             }
+            FloorUnarmed::AddressPoolsExhausted => {
+                "address_pools_exhausted: the container runtime answers, but it has no free address \
+                 pool for the seat's network (every predefined pool is already subnetted by other \
+                 networks) — list them with `docker network ls`, remove the unused ones \
+                 (`docker network rm <name>`, or `docker network prune` if none of them is \
+                 needed), or widen the runtime's default-address-pools, then retry"
+            }
+            FloorUnarmed::SeatNetworkUnavailable => {
+                "seat_network_unavailable: the container runtime answers, but it could not create \
+                 the seat's network (its error follows) — fix what it names, then retry"
+            }
             FloorUnarmed::NoSeatImage => {
                 "no_seat_image: the seat's container image is not defined for this CLI or could not \
                  be built (`wicked-core seat-image build <cli>` shows why)"
@@ -414,6 +431,8 @@ impl FloorUnarmed {
             FloorUnarmed::RootUnresolvable => "root_unresolvable",
             FloorUnarmed::NoContainerRuntime => "no_container_runtime",
             FloorUnarmed::ContainerRuntimeDown => "container_runtime_down",
+            FloorUnarmed::AddressPoolsExhausted => "address_pools_exhausted",
+            FloorUnarmed::SeatNetworkUnavailable => "seat_network_unavailable",
             FloorUnarmed::NoSeatImage => "no_seat_image",
             FloorUnarmed::ContainerUnsupportedHost => "container_unsupported_host",
             FloorUnarmed::GateHookUnreachable => "gate_hook_unreachable",
@@ -609,6 +628,18 @@ pub(crate) fn floor_refusal_text(cli: &str, why: FloorUnarmed) -> String {
         return format!(
             "({agent} is signed out: sign it in (Agents → Sign in), then retry — its seat \
              '{cli}' could not run this unit: {})",
+            why.describe()
+        );
+    }
+    // core#1356: the host's network is every seat's, so no failover is offered for it.
+    if matches!(
+        why,
+        FloorUnarmed::AddressPoolsExhausted | FloorUnarmed::SeatNetworkUnavailable
+    ) {
+        return format!(
+            "(seat '{cli}' could not run this governed unit: its seat container did not arm — {}; \
+             the unit is refused rather than run outside the floor (fail closed) — every seat \
+             meets the same runtime, so fix it, then retry on the same seat)",
             why.describe()
         );
     }

@@ -528,7 +528,10 @@ mod tests {
         assert!(v.windows(2).any(|p| p[0] == "--entrypoint" && p[1] == "/"));
         assert_eq!(v.last().unwrap(), "sha256:56a12663c21bffff");
         assert!(!v.iter().any(|a| a == "run" || a == "start"));
-        let sweep = crate::container_floor::sweep_argv(Duration::from_secs(3600));
+        let sweep = crate::container_floor::sweep_argv(
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+        );
         assert!(sweep[0].contains(&"label=wicked.seat=1".to_string()));
     }
 

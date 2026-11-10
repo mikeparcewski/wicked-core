@@ -37,6 +37,8 @@ use wicked_apps_core::HardenedCommand;
 pub(crate) const GATEWAY_IMAGE: &str = "ghcr.io/agentgateway/agentgateway:v1.6.0";
 /// The gateway label, distinct from the seat label so a seat sweep cannot reap it.
 pub(crate) const GATEWAY_LABEL: &str = "wicked.gateway";
+/// (core#1377) The label on a gateway's external bridge naming the gateway directory it serves.
+pub(crate) const DIR_LABEL: &str = "wicked.gateway.dir";
 
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 const CLI_TIMEOUT: Duration = Duration::from_secs(15);
@@ -636,6 +638,9 @@ pub(crate) fn gateway_name(state_home: &Path) -> String {
 pub(crate) struct Gateway {
     pub(crate) name: String,
     pub(crate) external_network: String,
+    /// The daemon's gateway directory the name is derived from: its bridge is labelled with it
+    /// ([`DIR_LABEL`]), so a sweep can tell a bridge whose daemon state is gone (core#1377).
+    pub(crate) dir: PathBuf,
 }
 
 impl Gateway {
@@ -644,6 +649,7 @@ impl Gateway {
         Self {
             external_network: format!("{name}-ext"),
             name,
+            dir: dir.to_path_buf(),
         }
     }
 }
@@ -2111,6 +2117,8 @@ fn external_network_argv(gw: &Gateway) -> Vec<String> {
         "bridge",
         "--label",
         &format!("{GATEWAY_LABEL}=1"),
+        "--label",
+        &format!("{DIR_LABEL}={}", gw.dir.display()),
         &gw.external_network,
     ]
     .into_iter()
@@ -2155,26 +2163,96 @@ fn provision_config(dir: &Path, egress_hosts: Vec<String>) -> Result<GatewayConf
 }
 
 // codex lg-r3 R3: login provisioning never starts or takes over a daemon gateway.
+/// How every refusal of the gateway's external bridge starts: the arming reads it as the host's
+/// network fault (`seat_network_unavailable`, core#1356), never as a seat's failure.
+pub(crate) const BRIDGE_REFUSED: &str = "could not create or reuse the gateway's external bridge";
+/// How a bridge create that could not reach the runtime at all is refused: the runtime's outage.
+pub(crate) const BRIDGE_UNREACHABLE: &str =
+    "could not reach the container runtime to create the gateway's external bridge";
+
 pub(crate) fn ensure_external_bridge(rt: &Runtime, gw: &Gateway) -> Result<(), String> {
-    if checked(rt, &external_network_argv(gw)).is_ok() {
-        return Ok(());
-    }
+    let net = &gw.external_network;
+    // The runtime's stderr is classified whole (core#1356: the runtime out of reach, or its
+    // address pools run out), and relayed only as one redacted, bounded line ([`redact_tail`]).
+    let failed = |raw: &str, fallback: &str| {
+        let shown = raw
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(redact_tail)
+            .unwrap_or_else(|| fallback.to_string());
+        if crate::container_floor::runtime_unreachable(raw) {
+            format!("{BRIDGE_UNREACHABLE} `{net}`: {shown}")
+        } else if crate::container_floor::pools_exhausted(raw) {
+            format!(
+                "{BRIDGE_REFUSED} `{net}`: the container runtime has no free address pool (all \
+                 predefined address pools have been fully subnetted): {shown}"
+            )
+        } else {
+            format!("{BRIDGE_REFUSED} `{net}`: {shown}")
+        }
+    };
+    let created = match cli(rt, &external_network_argv(gw), CLI_TIMEOUT) {
+        Some(o) if o.status.success() => return Ok(()),
+        Some(o) => String::from_utf8_lossy(&o.stderr).into_owned(),
+        None => String::new(),
+    };
+    // An existing network is adopted only when it is this engine's bridge: a bridge, not internal,
+    // carrying the gateway label.
     let argv = [
         "network",
         "inspect",
         "--format",
-        "{{.Driver}} {{.Internal}}",
-        &gw.external_network,
+        &format!("{{{{.Driver}}}} {{{{.Internal}}}} {{{{index .Labels \"{GATEWAY_LABEL}\"}}}}"),
+        net,
     ]
     .into_iter()
     .map(str::to_string)
     .collect::<Vec<_>>();
-    if cli(rt, &argv, CLI_TIMEOUT).is_some_and(|o| {
-        o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "bridge false"
-    }) {
-        Ok(())
-    } else {
-        Err("could not create or reuse the gateway's external bridge".into())
+    match cli(rt, &argv, CLI_TIMEOUT) {
+        Some(o) if o.status.success() => {
+            if String::from_utf8_lossy(&o.stdout).trim() == "bridge false 1" {
+                Ok(())
+            } else {
+                Err(format!(
+                    "{BRIDGE_REFUSED} `{net}`: a network of that name exists and is not this \
+                     engine's gateway bridge (a labelled, non-internal bridge); remove or rename it"
+                ))
+            }
+        }
+        // No such network: the create's own failure is the cause. Any other inspect failure
+        // (the runtime out of reach) is classified on its own words.
+        Some(o) => {
+            let err = String::from_utf8_lossy(&o.stderr).into_owned();
+            let absent = err.to_ascii_lowercase().contains("no such network")
+                || err.to_ascii_lowercase().contains("not found");
+            if absent || err.trim().is_empty() {
+                Err(failed(&created, "the network create gave no error text"))
+            } else {
+                // The inspection's own refusal is why the bridge cannot be reused.
+                Err(failed(&err, "the bridge's inspection gave no error text"))
+            }
+        }
+        None => Err(failed(
+            "",
+            "the network create and its inspection timed out or could not start",
+        )),
+    }
+}
+
+/// Run the gateway container (on the bridge [`ensure_external_bridge`] made or adopted).
+fn start_gateway(rt: &Runtime, gw: &Gateway) -> Result<(), String> {
+    let argv = run_argv(&rt.cli, gw);
+    match cli(rt, &argv[1..], START_TIMEOUT) {
+        Some(o) if o.status.success() => Ok(()),
+        Some(o) => Err(format!(
+            "starting gateway {} failed ({})",
+            gw.name, o.status
+        )),
+        None => Err(format!(
+            "starting gateway {} could not start or timed out",
+            gw.name
+        )),
     }
 }
 
@@ -2277,22 +2355,7 @@ pub(crate) fn ensure_gateway(rt: &Runtime, dir: &Path) -> Result<Gateway, String
     atomic_json(&revoking_path(dir), &Vec::<String>::new())?;
     init_volumes(rt, &gw, dir, &config)?;
     publish_locked(rt, &gw, dir)?;
-    let argv = run_argv(&rt.cli, &gw);
-    match cli(rt, &argv[1..], START_TIMEOUT) {
-        Some(o) if o.status.success() => {}
-        Some(o) => {
-            return Err(format!(
-                "starting gateway {} failed ({})",
-                gw.name, o.status
-            ))
-        }
-        None => {
-            return Err(format!(
-                "starting gateway {} could not start or timed out",
-                gw.name
-            ))
-        }
-    }
+    start_gateway(rt, &gw)?;
     let start = Instant::now();
     while start.elapsed() < START_TIMEOUT {
         let remaining = START_TIMEOUT.saturating_sub(start.elapsed());
@@ -2506,6 +2569,143 @@ mod tests {
 
     const PROVEN: &str = include_str!("../tests/fixtures/gateway/proven-config.yaml");
     const ACCESS_LOG: &str = include_str!("../tests/fixtures/gateway/access-log.ndjson");
+
+    /// core#1356: a gateway bridge the runtime cannot create for lack of address pools says so
+    /// (the arming reads it as `address_pools_exhausted`), naming the bridge.
+    #[cfg(unix)]
+    #[test]
+    fn a_bridge_out_of_address_pools_names_the_pools() {
+        let temp = TempDir::new();
+        let rt = temp.0.join("runtime");
+        crate::test_env::install_stub(
+            &rt,
+            "#!/bin/sh\ncase \"$1 $2\" in\n\
+             'network create') echo 'Error response from daemon: all predefined address pools \
+             have been fully subnetted' >&2; exit 1 ;;\n\
+             esac\nexit 1\n",
+        );
+        let gw = Gateway::for_dir(&temp.0);
+        let e = ensure_external_bridge(&Runtime::answering(rt), &gw).unwrap_err();
+        assert!(crate::container_floor::pools_exhausted(&e), "{e}");
+        assert!(e.contains(&gw.external_network), "{e}");
+        // Any other failure keeps the plain message.
+        let other = temp.0.join("other");
+        crate::test_env::install_stub(&other, "#!/bin/sh\necho 'nope' >&2; exit 1\n");
+        let e = ensure_external_bridge(&Runtime::answering(other), &gw).unwrap_err();
+        assert!(!crate::container_floor::pools_exhausted(&e), "{e}");
+    }
+
+    /// core#1377: removing a gateway removes the container only; its bridge is the sweep's, which
+    /// removes it only once the gateway directory it is labelled with is gone (a bridge removed
+    /// here could be the one this daemon's next start adopts).
+    #[cfg(unix)]
+    #[test]
+    fn removing_a_gateway_leaves_its_bridge_to_the_sweep() {
+        let temp = TempDir::new();
+        let rt = temp.0.join("runtime");
+        let log = temp.0.join("calls.log");
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexit 0\n",
+                log.display()
+            ),
+        );
+        let gw = Gateway::for_dir(&temp.0);
+        assert!(remove_gateway(&Runtime::answering(rt), &gw));
+        let calls = fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls.lines().collect::<Vec<_>>(),
+            [format!("rm --force {}", gw.name)],
+            "{calls}"
+        );
+    }
+
+    /// core#1377: an existing network of the bridge's name is adopted only when it carries the
+    /// gateway label; anything else is refused as the host's network fault, naming it.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_labelled_bridge_is_adopted() {
+        for (answer, ok) in [("bridge false 1", true), ("bridge false <no value>", false)] {
+            let temp = TempDir::new();
+            let rt = temp.0.join("runtime");
+            crate::test_env::install_stub(
+                &rt,
+                &format!(
+                    "#!/bin/sh\ncase \"$1 $2\" in\n\
+                     'network create') echo 'network with name x already exists' >&2; exit 1 ;;\n\
+                     'network inspect') echo '{answer}' ;;\n\
+                     esac\nexit 0\n"
+                ),
+            );
+            let gw = Gateway::for_dir(&temp.0);
+            let got = ensure_external_bridge(&Runtime::answering(rt), &gw);
+            assert_eq!(got.is_ok(), ok, "{answer}: {got:?}");
+            if let Err(e) = got {
+                assert!(e.starts_with(BRIDGE_REFUSED), "{e}");
+                assert!(e.contains(&gw.external_network), "{e}");
+            }
+        }
+    }
+
+    /// core#1377: a gateway's bridge is created labelled with the gateway directory it serves, so
+    /// a sweep can tell when its daemon's state is gone.
+    #[test]
+    fn a_bridge_is_labelled_with_its_gateway_directory() {
+        let gw = Gateway::for_dir(Path::new("/srv/wicked state/gateway"));
+        let argv = external_network_argv(&gw);
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--label", "wicked.gateway=1"]));
+        assert!(argv
+            .windows(2)
+            .any(|w| w == ["--label", "wicked.gateway.dir=/srv/wicked state/gateway"]));
+        assert_eq!(argv.last(), Some(&gw.external_network));
+    }
+
+    /// core#1356: a bridge create that could not reach the runtime is the runtime's outage (it
+    /// rides the runtime wait), and every bridge refusal names the bridge and a redacted cause.
+    #[cfg(unix)]
+    #[test]
+    fn a_bridge_refusal_names_the_bridge_and_an_outage_is_the_runtimes() {
+        let temp = TempDir::new();
+        let gw = Gateway::for_dir(&temp.0);
+        let stub = |name: &str, err: &str| {
+            let rt = temp.0.join(name);
+            crate::test_env::install_stub(
+                &rt,
+                &format!(
+                    "#!/bin/sh\ncase \"$1 $2\" in\n\
+                     'network create') printf '%s\\n' '{err}' >&2; exit 1 ;;\n\
+                     esac\nexit 1\n"
+                ),
+            );
+            ensure_external_bridge(&Runtime::answering(rt), &gw).unwrap_err()
+        };
+        let down = stub(
+            "down",
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+        );
+        assert!(down.starts_with(BRIDGE_UNREACHABLE), "{down}");
+        assert!(crate::container_floor::runtime_unreachable(&down), "{down}");
+        let other = stub("other", "failed to set up iptables: permission denied");
+        assert!(other.starts_with(BRIDGE_REFUSED), "{other}");
+        assert!(
+            other.contains(&gw.external_network) && other.contains("iptables"),
+            "{other}"
+        );
+        let denied = stub(
+            "denied",
+            "permission denied while trying to connect to the Docker daemon socket at unix:///var/run/docker.sock",
+        );
+        assert!(denied.starts_with(BRIDGE_UNREACHABLE), "{denied}");
+        // No error text at all is not proof of an outage: the runner's fresh probe decides.
+        let silent = stub("silent", "");
+        assert!(silent.starts_with(BRIDGE_REFUSED), "{silent}");
+        assert!(silent.contains("gave no error text"), "{silent}");
+        let secret = stub("secret", "bad header sk-ant-oat01-abcdefghijklmnop");
+        assert!(!secret.contains("sk-ant"), "{secret}");
+    }
 
     struct TempDir(PathBuf);
 
@@ -4801,6 +5001,8 @@ esac
                 "bridge",
                 "--label",
                 "wicked.gateway=1",
+                "--label",
+                "wicked.gateway.dir=/state/gateway",
                 &gw.external_network
             ]
         );
