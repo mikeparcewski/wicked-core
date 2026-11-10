@@ -73,6 +73,7 @@ mod knowledge;
 #[cfg(test)]
 mod lockstep;
 mod mcp_gate;
+mod seat_subnet;
 /// The broker's output decision (DES-MCP-TOOLS-001 §6 step 8), beside `evaluate_mcp_call_json`.
 pub use editor_gate::{
     evaluate_editor_grants, evaluate_editor_grants_json, grant_token as editor_grant_token,

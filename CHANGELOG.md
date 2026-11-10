@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Seat networks take a /26 from a wicked-owned pool instead of a whole default address pool (wicked-core#1377
+  follow-up).** Docker's default address pools hold about 31 networks, and each seat network took one, so a host
+  capped out at about three concurrent runs. Each seat network is now created with an explicit subnet from
+  `WICKED_SEAT_SUBNET_POOL` (default `10.213.0.0/16`), cut into `WICKED_SEAT_SUBNET_PREFIX`-sized slots (default
+  `/26`, 24..=28 allowed): 1024 seat networks. A slot is free when it overlaps no subnet of the runtime's networks
+  and no route on the host, so a VPN or corporate route is never shadowed. Routes come from macOS `netstat -rn`, or
+  on Linux from `ip -4 route show table all` (every table). Routes that cannot be read in full refuse the
+  allocation. The runtime's networks are read from their inspection JSON (docker, podman and nerdctl alike). Engines choose and create under a host-wide lock (`/tmp/wicked-seat-subnet.lock`, created
+  shareable by every user),
+  so two daemons never take the same slot. A slot the runtime still refuses as overlapping moves to the next, up to
+  8, then once more on a fresh listing. A pool with no free slot is `address_pools_exhausted` naming the pool. The
+  slot is released when the network is removed (the reap or the sweep). `WICKED_SEAT_SUBNET_POOL=runtime` keeps
+  the runtime's own pools. A malformed, empty or non-Unicode pool or prefix, or a pool wider than a /12, is refused,
+  never
+  silently replaced. Gateway external bridges keep the runtime's pools (one per daemon).
+
 - **A skip's judge-only re-run no longer re-judges the process rules; a disputed rule that no council can take says why
   and names who could sit (wicked-core#1378, wicked-core#1379).** A `skip_rules` / re-check answer never ran the
   reviewed seat again (the re-judge carries its output, at every step); what it re-judged was the four process rules,
@@ -29,6 +45,7 @@ Two release tracks share this file, newest entry first regardless of track:
   3; the parties: claude built the work; codex judged the rule and reviewed the step`), and records those seats in
   `council.eligible`. Who may sit, the council size, the evidence bar and deny-dominates are unchanged: a disputed rule
   still holds until a council rules or the person skips it with a reason.
+
 
 - **Docker running out of address pools now says so, and the engine sweeps the networks it leaks (wicked-core#1377,
   wicked-core#1356 item 2).** A seat network create that failed was always reported as `container_runtime_down`

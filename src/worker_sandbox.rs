@@ -368,9 +368,10 @@ impl FloorUnarmed {
             FloorUnarmed::AddressPoolsExhausted => {
                 "address_pools_exhausted: the container runtime answers, but it has no free address \
                  pool for the seat's network (every predefined pool is already subnetted by other \
-                 networks) — list them with `docker network ls`, remove the unused ones \
-                 (`docker network rm <name>`, or `docker network prune` if none of them is \
-                 needed), or widen the runtime's default-address-pools, then retry"
+                 networks, or the engine's seat subnet pool is) — list them with `docker network ls`, \
+                 remove the unused ones (`docker network rm <name>`, or `docker network prune` if \
+                 none of them is needed), or widen the pool (WICKED_SEAT_SUBNET_POOL, or the \
+                 runtime's default-address-pools), then retry"
             }
             FloorUnarmed::SeatNetworkUnavailable => {
                 "seat_network_unavailable: the container runtime answers, but it could not create \

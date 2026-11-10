@@ -1182,14 +1182,202 @@ pub(crate) fn offline_seats() -> bool {
 
 /// Create seat `name`'s own internal network (named after the container, labelled for the
 /// sweep), or `none` for an offline seat. An internal network has no route out: the only egress
-/// a seat gets is the gateway the engine attaches to it.
+/// a seat gets is the gateway the engine attaches to it. Its subnet is a small slot of the
+/// engine's own pool ([`crate::seat_subnet`]), free of the runtime's networks and the host's
+/// routes, so one seat network no longer takes a whole default address pool.
 pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, String> {
     if offline_seats() {
         return Ok("none".into());
     }
-    // Retried (e2e-1105 09:02Z): one slow answer on a loaded host was `container_runtime_down` for
-    // the seat, and a judge went unchecked. A create that timed out may have landed: the retry then
-    // reads "already exists" for this unit's own network name, which is the success it looks like.
+    let plan = crate::seat_subnet::plan()
+        .map_err(|e| format!("could not create the seat network `{name}`: {e}"))?;
+    ensure_seat_network_with(
+        rt,
+        name,
+        plan,
+        &crate::seat_subnet::host_routes,
+        &subnet_lock_path(),
+    )
+}
+
+/// The host-wide lock engines hold while they choose a seat subnet and create its network, so
+/// two daemons never pick the same free slot at once (a runtime such as nerdctl does not refuse
+/// the second one itself).
+fn subnet_lock_path() -> PathBuf {
+    PathBuf::from("/tmp/wicked-seat-subnet.lock")
+}
+
+/// Create the host lock file readable and writable by every user when it is missing, whatever
+/// the creating daemon's umask, so a lock file one user's engine made never shuts another's out.
+/// Never follows a link; an existing file is left as it is. Best effort.
+fn shared_lock_file(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        if let Ok(f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+        {
+            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o666));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+/// How long a seat network create waits for another engine's choice of subnet.
+const SUBNET_LOCK_WAIT: Duration = Duration::from_secs(60);
+
+/// [`ensure_seat_network`] on `plan`, with `routes` the host's routes and `lock` the host lock.
+pub(crate) fn ensure_seat_network_with(
+    rt: &Runtime,
+    name: &str,
+    plan: crate::seat_subnet::Plan,
+    routes: &dyn Fn() -> Result<Vec<crate::seat_subnet::Cidr>, String>,
+    lock: &Path,
+) -> Result<String, String> {
+    use crate::seat_subnet as sn;
+    let refused = |why: String| format!("could not create the seat network `{name}`: {why}");
+    let (pool, prefix) = match plan {
+        sn::Plan::Runtime => return create_seat_network(rt, name, None),
+        sn::Plan::Pool { pool, prefix } => (pool, prefix),
+    };
+    shared_lock_file(lock);
+    let _held =
+        crate::cli_runner::HostCouncilLock::acquire_until(lock, Instant::now() + SUBNET_LOCK_WAIT)
+            .map_err(|e| {
+                refused(match e {
+                    crate::cli_runner::SlotRefused::Busy => format!(
+                        "another engine held the seat subnet lock ({}) for {}s",
+                        lock.display(),
+                        SUBNET_LOCK_WAIT.as_secs()
+                    ),
+                    crate::cli_runner::SlotRefused::Unavailable(why) => {
+                        format!("the seat subnet lock cannot be taken ({why})")
+                    }
+                })
+            })?;
+    let host = routes().map_err(refused)?;
+    let mut tried = 0;
+    let mut last = None;
+    // Slots the runtime refused as overlapping stay out of every later pass (the conflict may be
+    // one the listing cannot see).
+    let mut refused_slots: Vec<sn::Cidr> = Vec::new();
+    // A second pass on a fresh listing when every slot the first one tried was refused: what is
+    // left then is either a free slot or an exhausted pool, said as such.
+    for _pass in 0..2 {
+        let mut taken = retrying(&mut || runtime_subnets(rt)).map_err(refused)?;
+        taken.extend(host.iter().copied());
+        taken.extend(refused_slots.iter().copied());
+        let free = sn::candidates(pool, prefix, &taken, sn::seed_of(name), sn::MAX_TRIES);
+        if free.is_empty() {
+            return Err(refused(format!(
+                "the seat subnet pool {pool} is fully subnetted (no /{prefix} in it is free of \
+                 the runtime's networks and the host's routes) — remove unused networks, or set \
+                 {} to a larger or other range",
+                sn::POOL_ENV
+            )));
+        }
+        for slot in free {
+            tried += 1;
+            match create_seat_network(rt, name, Some(slot)) {
+                Err(e) if sn::is_overlap_refusal(&e) => {
+                    refused_slots.push(slot);
+                    last = Some(e);
+                }
+                other => return other,
+            }
+        }
+    }
+    Err(format!(
+        "{} (the runtime refused {tried} free-looking /{prefix} slots of the seat subnet pool \
+         {pool} as overlapping)",
+        last.unwrap_or_default()
+    ))
+}
+
+/// The names of the runtime's networks now.
+fn runtime_network_names(rt: &Runtime) -> Result<Vec<String>, String> {
+    let mut ls = rt.cmd();
+    ls.args(["network", "ls", "--format", "{{.Name}}"]);
+    match output_within(ls, rt.bound(PROBE_TIMEOUT)) {
+        Some(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(str::to_string)
+            .collect()),
+        Some(o) => Err(format!(
+            "the runtime did not list its networks: {}",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        None => Err("the runtime did not list its networks in time".into()),
+    }
+}
+
+/// Every IPv4 subnet the runtime's networks hold now, from their inspection JSON (docker, podman
+/// and nerdctl alike), in bounded batches. A network that is not in its batch's answer is asked
+/// again alone; it drops out only when a fresh listing no longer has it (it was removed). Any
+/// network that still exists and cannot be read refuses the whole answer.
+fn runtime_subnets(rt: &Runtime) -> Result<Vec<crate::seat_subnet::Cidr>, String> {
+    let names = runtime_network_names(rt)?;
+    let inspect =
+        |batch: &[String]| -> Result<Vec<(String, Vec<crate::seat_subnet::Cidr>)>, String> {
+            let mut c = rt.cmd();
+            c.args(["network", "inspect"]);
+            c.args(batch);
+            let o = output_within(c, rt.bound(PROBE_TIMEOUT))
+                .ok_or("the runtime did not answer the inspection of its networks")?;
+            crate::seat_subnet::networks_in(&String::from_utf8_lossy(&o.stdout)).ok_or_else(|| {
+                format!(
+                    "the runtime's network inspection could not be read: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                )
+            })
+        };
+    let mut subnets = Vec::new();
+    let mut missing = Vec::new();
+    for batch in names.chunks(100) {
+        // A batch whose answer is not JSON at all (one name gone, on a runtime that then prints
+        // nothing): each of its names is asked alone below.
+        let got = inspect(batch).unwrap_or_default();
+        for n in batch {
+            match got.iter().find(|(name, _)| name == n) {
+                Some((_, s)) => subnets.extend(s.iter().copied()),
+                None => missing.push(n.clone()),
+            }
+        }
+    }
+    if !missing.is_empty() {
+        let now = runtime_network_names(rt)?;
+        // `host` and `none` are pseudo-networks some runtimes (nerdctl) list and never inspect:
+        // they hold no subnet.
+        for n in missing
+            .iter()
+            .filter(|n| now.contains(n) && !matches!(n.as_str(), "host" | "none"))
+        {
+            let one = inspect(std::slice::from_ref(n))?;
+            let (_, s) = one
+                .iter()
+                .find(|(name, _)| name == n)
+                .ok_or_else(|| format!("the runtime's network `{n}` could not be inspected"))?;
+            subnets.extend(s.iter().copied());
+        }
+    }
+    Ok(subnets)
+}
+
+/// One seat network create on `subnet` (`None`: the runtime's own pools). Retried (e2e-1105
+/// 09:02Z): one slow answer on a loaded host was `container_runtime_down` for the seat, and a
+/// judge went unchecked. A create that timed out may have landed: the retry then reads "already
+/// exists" for this unit's own network name, which is the success it looks like. A slot the
+/// runtime refuses as overlapping is answered at once, never retried.
+fn create_seat_network(
+    rt: &Runtime,
+    name: &str,
+    subnet: Option<crate::seat_subnet::Cidr>,
+) -> Result<String, String> {
+    let subnet = subnet.map(|c| c.to_string());
     retrying(&mut || {
         let mut create = rt.cmd();
         create.args([
@@ -1198,23 +1386,34 @@ pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, St
             "--internal",
             "--label",
             &format!("{SEAT_LABEL}=1"),
-            name,
         ]);
+        if let Some(s) = &subnet {
+            create.args(["--subnet", s]);
+        }
+        create.arg(name);
         match output_within(create, rt.bound(PROBE_TIMEOUT)) {
-            Some(o) if o.status.success() => Ok(name.to_string()),
+            Some(o) if o.status.success() => Ok(Ok(name.to_string())),
             Some(o)
                 if String::from_utf8_lossy(&o.stderr).contains("already exists")
                     && own_seat_network(rt, name) =>
             {
-                Ok(name.to_string())
+                Ok(Ok(name.to_string()))
             }
-            Some(o) => Err(format!(
-                "could not create the seat network `{name}`: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            )),
+            Some(o) => {
+                let e = format!(
+                    "could not create the seat network `{name}`: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                if crate::seat_subnet::is_overlap_refusal(&e) {
+                    Ok(Err(e))
+                } else {
+                    Err(e)
+                }
+            }
             None => Err(format!("creating the seat network `{name}` timed out")),
         }
     })
+    .and_then(|r| r)
 }
 
 /// Whether the network `name` that already exists is this engine's own seat network: internal and
@@ -5775,6 +5974,125 @@ mod tests {
         assert!(n.contains(&"label=wicked.seat=1".to_string()));
         // core#1377: an unused seat network goes after an hour, not a day.
         assert!(n.contains(&"until=1h".to_string()), "{n:?}");
+    }
+
+    /// The seat network is created on a slot of the engine's pool, skipping what the runtime's
+    /// networks hold, and moves to the next slot when the runtime says another engine took it
+    /// (a stand-in runtime; never the host's).
+    #[cfg(unix)]
+    #[test]
+    fn a_seat_network_takes_a_free_pool_slot_and_moves_on_when_one_is_taken() {
+        let dir = tmp("seat-subnet");
+        let log = dir.join("calls.log");
+        let n = dir.join("n");
+        let rt = dir.join("docker");
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 'network ls --format {{{{.Name}}}}') echo bridge; echo other; echo host; echo none ;;\n\
+                 'network inspect bridge other host none') echo '[{{\"Name\":\"bridge\",\"IPAM\":{{\"Config\":[{{\"Subnet\":\"172.17.0.0/16\"}}]}}}},{{\"Name\":\"other\",\"IPAM\":{{\"Config\":[{{\"Subnet\":\"10.213.0.0/18\"}}]}}}}]' ;;\n\
+                 'network create'*) echo x >> '{n}'; if [ $(wc -l < '{n}') -le 1 ]; then \
+                 echo 'Error response from daemon: Pool overlaps with other one on this address space' >&2; exit 1; fi ;;\n\
+                 esac\nexit 0\n",
+                log = log.display(),
+                n = n.display()
+            ),
+        );
+        let plan = crate::seat_subnet::plan_from(None, None).unwrap();
+        let routes = || {
+            Ok(vec![
+                crate::seat_subnet::Cidr::parse("10.213.128.0/17").unwrap()
+            ])
+        };
+        let got = ensure_seat_network_with(
+            &Runtime::answering(rt),
+            "wicked-seat-x-1-abc",
+            plan,
+            &routes,
+            &dir.join("subnet.lock"),
+        )
+        .unwrap();
+        assert_eq!(got, "wicked-seat-x-1-abc");
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let subnets: Vec<crate::seat_subnet::Cidr> = calls
+            .lines()
+            .filter(|l| l.starts_with("network create"))
+            .filter_map(|l| {
+                let w: Vec<&str> = l.split_whitespace().collect();
+                let i = w.iter().position(|a| *a == "--subnet")?;
+                crate::seat_subnet::Cidr::parse(w.get(i + 1)?)
+            })
+            .collect();
+        assert_eq!(subnets.len(), 2, "{calls}");
+        let pool = crate::seat_subnet::Cidr::parse(crate::seat_subnet::DEFAULT_POOL).unwrap();
+        let held = crate::seat_subnet::Cidr::parse("10.213.0.0/18").unwrap();
+        let routed = crate::seat_subnet::Cidr::parse("10.213.128.0/17").unwrap();
+        for s in &subnets {
+            assert_eq!(s.len, crate::seat_subnet::DEFAULT_PREFIX);
+            assert!(
+                pool.overlaps(s) && !held.overlaps(s) && !routed.overlaps(s),
+                "{s} {calls}"
+            );
+        }
+        assert_ne!(subnets[0], subnets[1]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A pool whose every slot is taken (or routed) is said as exhausted, which the arming reads
+    /// as `address_pools_exhausted`; unreadable host routes refuse the allocation outright.
+    #[cfg(unix)]
+    #[test]
+    fn a_full_seat_pool_is_exhausted_and_unread_routes_refuse() {
+        let dir = tmp("seat-subnet-full");
+        let rt = dir.join("docker");
+        crate::test_env::install_stub(
+            &rt,
+            "#!/bin/sh\ncase \"$*\" in\n'network ls --format {{.Name}}') echo full ;;\n\
+             'network inspect full') echo '[{\"Name\":\"full\",\"IPAM\":{\"Config\":[{\"Subnet\":\"10.213.0.0/24\"}]}}]' ;;\n\
+             'network create'*) echo created ;;\nesac\nexit 0\n",
+        );
+        let rt = Runtime::answering(rt);
+        let lock = dir.join("subnet.lock");
+        let plan = crate::seat_subnet::plan_from(Some("10.213.0.0/24"), Some("26")).unwrap();
+        let none = || Ok(Vec::new());
+        let e = ensure_seat_network_with(&rt, "n", plan, &none, &lock).unwrap_err();
+        assert!(pools_exhausted(&e), "{e}");
+        assert_eq!(
+            network_failure_kind(&e, &mut || false),
+            FloorUnarmed::AddressPoolsExhausted
+        );
+        let plan = crate::seat_subnet::plan_from(Some("10.214.0.0/24"), Some("26")).unwrap();
+        let unread = || Err("the host's routes could not be read".to_string());
+        let e = ensure_seat_network_with(&rt, "n", plan, &unread, &lock).unwrap_err();
+        assert!(
+            e.contains("routes could not be read") && !pools_exhausted(&e),
+            "{e}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The seat subnet lock file is made shareable by every user's engine whatever the umask,
+    /// and an existing one (or a link planted at the path) is left as it is.
+    #[cfg(unix)]
+    #[test]
+    fn the_subnet_lock_file_is_shared_and_never_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tmp("subnet-lock");
+        let lock = dir.join("subnet.lock");
+        shared_lock_file(&lock);
+        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o666);
+        let target = dir.join("target");
+        std::fs::write(&target, "").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = dir.join("link.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        shared_lock_file(&link);
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
