@@ -2720,6 +2720,16 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.36** — 2026-11-10 — patch release on main 12714c1, carrying 2 PRs since 0.15.35: #1371 and #1384.
+  - **Every index is bounded by a budget sized from the code (#1384, wicked-crew#1481).** `max(120 s, files × 0.30 s) ×
+    1.15`, files = what `git ls-files` lists for the tree, replaces the fixed 120 s on a launch's base re-index and the
+    repo watcher's re-index, and bounds onboarding's first index (it had none). New binding method
+    `indexBudget(tree)` → `{ trackedFiles, counted, budgetMs }`, which crew's project-graph refresh uses instead of its
+    own fixed 600 s.
+  - **Lockfile:** #1371 re-stamped the 0.15.35 platform lock entries.
+  - One binding method is added (`indexBudget`); no `LaunchSpec` field or gate-protocol change. The seat and floor
+    Dockerfiles, the seat package pins and the base image are unchanged since 0.15.35, so the seat and floor image tags
+    and gate protocol 3 are unchanged.
 - **core-ts 0.15.35** — 2026-11-09 — patch release on main 1e0344d, carrying #1368 and this release's own change.
   - **`indexRepoGraph(repoRef)` (new binding method) and a dirty-tree graph is not a run base (wicked-core#1230).** The
     checkout re-index crew 0.18.3's repo watcher calls, under the launch indexer's lock (`held` while a run on the repo
