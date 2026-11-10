@@ -2480,3 +2480,108 @@ fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
     let row = moved.rows.iter().find(|r| r.rule_id == "R2").unwrap();
     assert_ne!(row.status, RuleStatus::Skipped, "{moved:?}");
 }
+
+/// core#1378 (pilot run 9dda9f62, unit 7): a skip at the review step re-ran the rule check as a
+/// judge-only re-run (the seat did not run; its reviewed output was judged as it stood), and every
+/// PROCESS rule was judged again — their evidence is the engine record, which named the re-run's
+/// own attempt number, so the key moved with nothing else changed. The record names the reviewed
+/// attempt on such a re-run: the process rows come back from the cache and no judge reads the
+/// engine record again. A re-run in which the seat ran again is a new step record: judged afresh.
+#[test]
+fn a_judge_only_rerun_reuses_the_process_rows_of_the_reviewed_attempt() {
+    use crate::rule_check::{RuleHow, RuleStatus};
+    let (repo, base, db) = q2_fixture("rejudge-process");
+    let mut input = q2_input(&repo, &base, &db, None);
+    let first_judge = Q2Judge {
+        small: false,
+        asked: Mutex::new(Vec::new()),
+    };
+    let first = q2_check(&input, &first_judge);
+    // The process rows a judge ruled (one of the four is N/A by fact, never judged).
+    let judged: Vec<String> = first
+        .rows
+        .iter()
+        .filter(|r| r.rule_id.starts_with("RVWL-") && r.how == RuleHow::Judge)
+        .map(|r| r.rule_id.clone())
+        .collect();
+    assert_eq!(judged.len(), 3, "{first:?}");
+    let process = |r: &crate::rule_check::RuleCheckReport| -> Vec<crate::rule_check::RuleVerdict> {
+        judged.iter().map(|id| row(r, id).clone()).collect()
+    };
+    let ruled = process(&first);
+    assert!(
+        ruled.iter().all(|r| r.status == RuleStatus::NotApplicable),
+        "{ruled:?}"
+    );
+    // The skip's re-run: attempt 3 of the unit, re-judging the output of attempt 0.
+    input.unit.rule_check = Some(first.clone());
+    input.attempt = 3;
+    input.unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+        output: String::new(),
+        attempt: 0,
+        seats: Vec::new(),
+        monitors: Vec::new(),
+        consumed: false,
+        at: 1,
+    });
+    let rejudge = Q2Judge {
+        small: false,
+        asked: Mutex::new(Vec::new()),
+    };
+    let again = q2_check(&input, &rejudge);
+    for (was, now) in ruled.iter().zip(process(&again)) {
+        assert_eq!(now.how, RuleHow::Cache, "{now:?}");
+        assert_eq!(now.status, was.status);
+        assert_eq!(now.evidence_key, was.evidence_key, "{}", now.rule_id);
+    }
+    assert!(
+        !rejudge
+            .asked
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|p| p.contains("THE ENGINE RECORD follows.")),
+        "no judge reads the unchanged engine record again"
+    );
+    assert_eq!(
+        engine_record(&input, None, None),
+        {
+            let mut reviewed = input.clone();
+            reviewed.attempt = 0;
+            reviewed.unit.requested_rejudge = None;
+            engine_record(&reviewed, None, None)
+        },
+        "the re-run's record is the reviewed attempt's"
+    );
+    // A re-judge already folded (its basis kept on the unit, `consumed`) and a floor re-run (which
+    // the worker serves instead of the re-judge) are this attempt's own record.
+    let armed = input.unit.requested_rejudge.clone().unwrap();
+    input.unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+        consumed: true,
+        ..armed.clone()
+    });
+    assert!(engine_record(&input, None, None).contains("attempt 3."));
+    input.unit.requested_rejudge = Some(armed);
+    let mut floor = report_of(serde_json::json!([run_of("test", 0)]));
+    floor.requested_rerun = Some(crate::repo_checks::FloorRerun {
+        mode: crate::repo_checks::FloorRerunMode::Extend,
+        waive: Vec::new(),
+        output: String::new(),
+        fix: None,
+    });
+    input.unit.repo_checks = Some(floor);
+    assert!(engine_record(&input, None, None).contains("attempt 3."));
+    input.unit.repo_checks = None;
+    // The seat ran again (no re-judge armed): a new step record, judged afresh.
+    input.unit.requested_rejudge = None;
+    input.attempt = 1;
+    let rerun = Q2Judge {
+        small: false,
+        asked: Mutex::new(Vec::new()),
+    };
+    let fresh = q2_check(&input, &rerun);
+    assert!(
+        process(&fresh).iter().all(|r| r.how == RuleHow::Judge),
+        "{fresh:?}"
+    );
+}

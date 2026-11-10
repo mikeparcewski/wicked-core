@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A skip's judge-only re-run no longer re-judges the process rules; a disputed rule that no council can take says why
+  and names who could sit (wicked-core#1378, wicked-core#1379).** A `skip_rules` / re-check answer never ran the
+  reviewed seat again (the re-judge carries its output, at every step); what it re-judged was the four process rules,
+  whose evidence is the engine's record of the step, and that record named the re-run's own attempt number, so every
+  re-run moved their evidence key with nothing else changed. On a judge-only re-run the record now names the reviewed
+  attempt, so those rows come back from the cache. Process rules never hold a gate, so this cannot pass a held rule.
+  POL-2101's combined row now records `recordUnsettled` (the status of its record part) when that part, judged apart
+  from the change, is what keeps the row from a council: the hold reads `record_unsettled: the rule's record part (the
+  step records) is broken, and a rule council is shown only the change, so no council can rule on it`, no longer the
+  false "the rule judge saw only part of the change". A council too short of seats now says who could sit and who the
+  parties are, both where the worker finds fewer than three seats distinct from every party and where the council finds
+  fewer than three voters on the run's unbenched roster (`seats_benched: 1 eligible seat(s) (pi), a rule council needs
+  3; the parties: claude built the work; codex judged the rule and reviewed the step`), and records those seats in
+  `council.eligible`. Who may sit, the council size, the evidence bar and deny-dominates are unchanged: a disputed rule
+  still holds until a council rules or the person skips it with a reason.
+
 - **Docker running out of address pools now says so, and the engine sweeps the networks it leaks (wicked-core#1377,
   wicked-core#1356 item 2).** A seat network create that failed was always reported as `container_runtime_down`
   ("`<runtime> version` failed"), even while the runtime answered. The pilot then waited out host load for about 90

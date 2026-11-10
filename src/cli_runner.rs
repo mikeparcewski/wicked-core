@@ -1116,8 +1116,42 @@ pub(crate) struct CouncilCtx<'a> {
 /// identities). Only a seat whose launched executable IS its declared binary or carrier sits. An
 /// identity that cannot be established is `identity_unknown`; fewer than three seats left is
 /// `seats_benched` — no council is convened either way.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rule_council_seats(
+    creators: &[String],
+    creator_bins: Option<&[String]>,
+    exclude_seats: &[String],
+    authored_by: &[String],
+    authored_binaries: &[String],
+    judge: (Option<&str>, &[String]),
+    reviewer: (Option<&str>, Option<&str>),
+    recorded: Option<&[crate::rule_check::RulePosition]>,
+    registry: &[crate::AgenticCli],
+    no_agent_creator: bool,
+) -> Result<Vec<crate::AgenticCli>, String> {
+    let seats = rule_council_candidates(
+        creators,
+        creator_bins,
+        exclude_seats,
+        authored_by,
+        authored_binaries,
+        judge,
+        reviewer,
+        recorded,
+        registry,
+        no_agent_creator,
+    )?;
+    if seats.len() < crate::decision::RULE_COUNCIL_SIZE {
+        return Err(too_few_council_seats(&seats));
+    }
+    Ok(seats)
+}
+
+/// [`rule_council_seats`] before its quorum check: every seat distinct from every party, however
+/// few (core#1379: a hold names them). `Err` only for an identity that cannot be established.
+#[allow(clippy::too_many_arguments)]
+fn rule_council_candidates(
     creators: &[String],
     creator_bins: Option<&[String]>,
     exclude_seats: &[String],
@@ -1241,14 +1275,104 @@ pub(crate) fn rule_council_seats(
         })
         .cloned()
         .collect();
-    if seats.len() < crate::decision::RULE_COUNCIL_SIZE {
-        return Err(format!(
-            "seats_benched: {} seat(s) distinct from every party, a rule council needs {}",
-            seats.len(),
-            crate::decision::RULE_COUNCIL_SIZE
-        ));
-    }
     Ok(seats)
+}
+
+/// (core#1379) A POL-2101 record part that is not settled, in words.
+fn record_part_words(part: crate::rule_check::RuleStatus) -> &'static str {
+    use crate::rule_check::RuleStatus::*;
+    match part {
+        Broken => "broken",
+        NotApplicable => "not applicable by a reading, not by a recorded fact",
+        Waived => "waived by your instruction, which you confirm",
+        Unchecked | Disputed => "not ruled",
+        Kept | Skipped | Deferred => "not settled",
+    }
+}
+
+/// (core#1379) The quorum refusal, naming the seats that are distinct from every party.
+fn too_few_council_seats(seats: &[crate::AgenticCli]) -> String {
+    let named: Vec<&str> = seats.iter().map(|c| c.key.as_str()).collect();
+    format!(
+        "seats_benched: {} seat(s) distinct from every party ({}), a rule council needs {}",
+        seats.len(),
+        if named.is_empty() {
+            "none".to_string()
+        } else {
+            named.join(", ")
+        },
+        crate::decision::RULE_COUNCIL_SIZE
+    )
+}
+
+/// (core#1379) The parties to a rule dispute, in words, for a hold that says why no council sat:
+/// each seat key once, with what made it a party (built the work, judged the rule, reviewed the
+/// step, excluded at launch).
+fn council_parties(
+    creators: &[String],
+    authored_by: &[String],
+    exclude_seats: &[String],
+    positions: &[crate::rule_check::RulePosition],
+    reviewer: &str,
+    reviewer_ran: Option<&str>,
+    registry: &[crate::AgenticCli],
+) -> String {
+    let mut parties: Vec<(String, Vec<&str>)> = Vec::new();
+    let mut add = |key: &str, why: &'static str| {
+        let key = wicked_apps_core::spawn::seat_cli_key(key).to_string();
+        if key.is_empty() {
+            return;
+        }
+        match parties.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, w)) if !w.contains(&why) => w.push(why),
+            Some(_) => {}
+            None => parties.push((key, vec![why])),
+        }
+    };
+    for k in creators.iter().chain(authored_by) {
+        add(k, "built the work");
+    }
+    // The readings the dispute is between, as recorded (a carried dispute keeps the seats that
+    // read it then, whatever runs now).
+    // Each reading's recorded identities too, where they name a registry seat: a seat whose CLI
+    // the judge or the reviewer actually ran is a party by identity.
+    for p in positions {
+        let judge = p.by == crate::rule_check::BY_RULE_JUDGE;
+        add(
+            &p.seat,
+            if judge {
+                "judged the rule"
+            } else {
+                "reviewed the step"
+            },
+        );
+        for id in &p.ids {
+            if id != wicked_apps_core::spawn::seat_cli_key(&p.seat)
+                && registry.iter().any(|c| &c.key == id)
+            {
+                add(
+                    id,
+                    if judge {
+                        "was what the rule judge ran"
+                    } else {
+                        "was what the reviewer launched"
+                    },
+                );
+            }
+        }
+    }
+    add(reviewer, "reviewed the step");
+    if let Some(k) = reviewer_ran {
+        add(k, "was what the reviewer launched");
+    }
+    for k in exclude_seats {
+        add(k, "was excluded at launch");
+    }
+    parties
+        .iter()
+        .map(|(k, w)| format!("{k} {}", w.join(" and ")))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// Every identity the reviewer of `input` may have executed, as it launched (its
@@ -1322,6 +1446,20 @@ fn settle_rule_disputes(
         RuleVerdict, BY_REVIEWER,
     };
     let reviewer_seat = input.unit.assigned_cli.clone().unwrap_or_default();
+    // (core#1379) The registry seat the reviewer's launch actually ran (a party too, by identity).
+    let reviewer_ran: Option<String> = registry
+        .iter()
+        .find(|c| {
+            launches_its_own_binary(
+                c,
+                &launched_identity(&reviewer_seat, input.unit.assigned_invocation.clone()),
+            )
+        })
+        .map(|c| c.key.clone())
+        .filter(|k| {
+            wicked_apps_core::spawn::seat_cli_key(k)
+                != wicked_apps_core::spawn::seat_cli_key(&reviewer_seat)
+        });
     let ids: Vec<&str> = report.rows.iter().map(|r| r.rule_id.as_str()).collect();
     let positions = crate::rule_check::seat_positions(reviewer_output, &ids);
     for r in report.rows.iter_mut() {
@@ -1387,40 +1525,9 @@ fn settle_rule_disputes(
         }
     }
     for (i, row, pos, was_carried) in work {
-        let hold = |why: String| {
-            disputed_row(
-                &row,
-                RuleCouncil {
-                    positions: pos.clone(),
-                    reason: Some(why),
-                    ..Default::default()
-                },
-            )
-        };
-        let Some(ctx) = council else {
-            report.rows[i] = hold("error: this path convenes no rule council".into());
-            continue;
-        };
-        if report.councils >= crate::rule_check::ATTEMPT_COUNCILS {
-            report.rows[i] = hold(format!(
-                "cap: this gate attempt has convened its {} rule councils",
-                crate::rule_check::ATTEMPT_COUNCILS
-            ));
-            continue;
-        }
-        if row.evidence_complete != Some(true) {
-            report.rows[i] = hold(
-                "incomplete_evidence: the rule judge saw only part of the change, and partial \
-                 evidence cannot settle a rule"
-                    .into(),
-            );
-            continue;
-        }
-        let Some(rule) = rules.iter().find(|r| r.id == row.rule_id) else {
-            report.rows[i] = hold("error: the rule is no longer in force as it was judged".into());
-            continue;
-        };
-        let seats = match rule_council_seats(
+        // (core#1379) Who could sit, worked out before any bar: every hold records them, and a
+        // roster too short for a council says so, naming the seats and the parties.
+        let candidates = rule_council_candidates(
             creators,
             creator_bins,
             &input.unit.exclude_seats,
@@ -1434,12 +1541,79 @@ fn settle_rule_disputes(
             was_carried.then_some(pos.as_slice()),
             registry,
             no_agent_creator,
-        ) {
-            Ok(s) => s,
-            Err(why) => {
+        );
+        let parties = council_parties(
+            creators,
+            &input.unit.authored_by,
+            &input.unit.exclude_seats,
+            &pos,
+            &reviewer_seat,
+            reviewer_ran.as_deref(),
+            registry,
+        );
+        // The seats left, when too few for a council: the refusal names them (they are a superset
+        // of the voters the actor would seat, which it narrows to the run's unbenched roster).
+        let too_few: Option<(String, Vec<String>)> = match &candidates {
+            Ok(s) if s.len() < crate::decision::RULE_COUNCIL_SIZE => Some((
+                format!("{}; the parties: {parties}", too_few_council_seats(s)),
+                s.iter().map(|c| c.key.clone()).collect(),
+            )),
+            _ => None,
+        };
+        let hold_with = |why: String, eligible: Vec<String>| {
+            disputed_row(
+                &row,
+                RuleCouncil {
+                    positions: pos.clone(),
+                    reason: Some(why),
+                    eligible,
+                    ..Default::default()
+                },
+            )
+        };
+        let hold = |why: String| hold_with(why, Vec::new());
+        let Some(ctx) = council else {
+            report.rows[i] = hold("error: this path convenes no rule council".into());
+            continue;
+        };
+        if report.councils >= crate::rule_check::ATTEMPT_COUNCILS {
+            report.rows[i] = hold(format!(
+                "cap: this gate attempt has convened its {} rule councils",
+                crate::rule_check::ATTEMPT_COUNCILS
+            ));
+            continue;
+        }
+        if row.evidence_complete != Some(true) {
+            let why = match row.record_unsettled {
+                // (core#1379) POL-2101's record part, judged apart from the change, is what keeps
+                // the row from a council: a council is shown only the change, so it could never
+                // overturn a record verdict it did not see. Said as that, not as a cut diff.
+                Some(part) => format!(
+                    "record_unsettled: the rule's record part (the step records) is {}, and a \
+                     rule council is shown only the change, so no council can rule on it",
+                    record_part_words(part)
+                ),
+                None => "incomplete_evidence: the rule judge saw only part of the change, and \
+                         partial evidence cannot settle a rule"
+                    .to_string(),
+            };
+            report.rows[i] = hold(why);
+            continue;
+        }
+        let Some(rule) = rules.iter().find(|r| r.id == row.rule_id) else {
+            report.rows[i] = hold("error: the rule is no longer in force as it was judged".into());
+            continue;
+        };
+        let seats = match (candidates, too_few) {
+            (Err(why), _) => {
                 report.rows[i] = hold(why);
                 continue;
             }
+            (Ok(_), Some((why, eligible))) => {
+                report.rows[i] = hold_with(why, eligible);
+                continue;
+            }
+            (Ok(s), None) => s,
         };
         // One absolute deadline from here: the host slot is taken on THIS thread (the unit's own
         // worker) before any council thread or envelope copy exists.
@@ -1531,7 +1705,18 @@ fn settle_rule_disputes(
             instructions,
         };
         report.rows[i] = match outcome {
-            DisputeOutcome::Ruled(v) => crate::rule_check::settle(&row, pos.clone(), &v, &bars),
+            DisputeOutcome::Ruled(mut v) => {
+                // (core#1379) Too few voters once the run's roster and benches were applied: the
+                // refusal names who could sit (the council's own words) and the parties.
+                if let Some(r) = v
+                    .no_ruling_reason
+                    .as_mut()
+                    .filter(|r| r.starts_with("seats_benched"))
+                {
+                    r.push_str(&format!("; the parties: {parties}"));
+                }
+                crate::rule_check::settle(&row, pos.clone(), &v, &bars)
+            }
             DisputeOutcome::TimedOut => hold(format!(
                 "timeout: the council gave no answer within {} s",
                 (crate::rule_check::COUNCIL_DEADLINE + crate::rule_check::COUNCIL_REPLY_GRACE)
@@ -2230,6 +2415,26 @@ fn tail_marked(text: &str, cap: usize) -> String {
     )
 }
 
+/// (core#1378) The attempt whose work the engine record describes: the reviewed seat attempt on a
+/// judge-only re-run (an armed re-judge, which a skip or a rules re-check arms: the seat does not
+/// run again and its reviewed output is judged as it stands), this attempt otherwise. A re-run's
+/// own attempt number is not part of the reviewed step, and keying the process rules on it made
+/// every skip re-judge them (their evidence key moved with nothing else changed).
+fn judged_attempt(input: &StepInput) -> u32 {
+    let floor_rerun = input
+        .unit
+        .repo_checks
+        .as_ref()
+        .is_some_and(|r| r.requested_rerun.is_some());
+    input
+        .unit
+        .requested_rejudge
+        .as_ref()
+        .filter(|j| !j.consumed && !floor_rerun)
+        .map(|j| j.attempt)
+        .unwrap_or(input.attempt)
+}
+
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The engine's record of this review step, which the
 /// process rules (RVWL-1001..1004) are judged on: the step and its round, the send-backs against
 /// the rework cap, the review context actually handed to the reviewer (its prior verdicts as cut,
@@ -2248,7 +2453,7 @@ pub(crate) fn engine_record(
          gate for the person).\n",
         u.ord,
         u.phase_id().unwrap_or("review"),
-        input.attempt,
+        judged_attempt(input),
         u.review_rounds.len() + 1,
         crate::review_context::sent_back_count(&u.review_rounds),
         crate::review_context::MAX_REVIEW_SENDBACKS

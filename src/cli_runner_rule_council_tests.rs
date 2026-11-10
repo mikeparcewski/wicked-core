@@ -179,7 +179,7 @@ fn reviewed(tag: &str) -> StepInput {
 /// The settle step's run: the creator claude, the judge pool [claude, pi], `reviewer` output.
 fn settle_with(
     input: &StepInput,
-    judge: &Judging,
+    judge: &dyn StepRunner,
     reviewer_output: &str,
     council: &FakeCouncil,
     registry: &[crate::AgenticCli],
@@ -449,6 +449,11 @@ fn a_carried_dispute_keeps_its_original_reviewer_out_whatever_the_seat_now_runs(
         .clone()
         .unwrap();
     assert!(why.starts_with("seats_benched"), "{why}");
+    // (core#1379) …and the refusal accounts for it: opencode, which the recorded reviewer ran.
+    assert!(
+        why.contains("codex reviewed the step; opencode was what the reviewer launched"),
+        "{why}"
+    );
 }
 
 /// (codex r2) A special file planted at the slot's path (a FIFO) is refused at once: never a
@@ -769,4 +774,174 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
     );
     actor.join().unwrap();
     assert!(HostCouncilLock::acquire_until(&path, soon()).is_ok());
+}
+
+/// core#1379 (pilot run 9dda9f62, POL-2101 at units 8 and 9): the rule judge read the change whole
+/// and KEPT it, but the rule broke on its RECORD part (the step records); the reviewer said KEPT. A
+/// council is shown only the change, so it can never overturn the record verdict: the dispute
+/// holds, and it used to hold as "the rule judge saw only part of the change", which was false. It
+/// now says the record part holds it.
+#[test]
+fn a_record_part_dispute_says_the_record_part_holds_it() {
+    struct RecordBroken;
+    impl StepRunner for RecordBroken {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let prompt = &input.unit.description;
+            let nonce = crate::rule_check::tests::nonce_of(prompt);
+            let mut lines: Vec<String> = Vec::new();
+            if prompt.contains("THE ENGINE RECORD follows.") {
+                for n in 1001..=1004 {
+                    lines.push(format!(
+                        "RULE RVWL-{n}: N/A — the first round of a fresh step"
+                    ));
+                }
+            } else if prompt.contains("THE STEP RECORDS follow.") {
+                lines.push(
+                    "RULE POL-2101: BROKEN — RECORD 1 states nothing about the chosen stack".into(),
+                );
+            } else {
+                for n in 1001..=1007 {
+                    lines.push(format!(
+                        "RULE MCPS-{n}: KEPT — src/server.ts follows the pack"
+                    ));
+                }
+                lines.push("RULE learn-small-prs: KEPT — src/server.ts is 2 lines".into());
+                lines.push("RULE POL-2101: KEPT — src/server.ts uses fastmcp's own server".into());
+            }
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: 0,
+                attempt: 0,
+                output: format!(
+                    "BEGIN VERDICTS {nonce}\n{}\nEND VERDICTS {nonce}\n",
+                    lines.join("\n")
+                ),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    const REVIEWER: &str =
+        "RULE POL-2101: KEPT — src/server.ts uses fastmcp's own server\nVERDICT: PASS";
+    let (repo, base, db) = super::q2_fixture("record-part");
+    let mut input = super::q2_input(&repo, &base, &db, None);
+    input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
+    let council = FakeCouncil::new("record-part", kept_3_0);
+    let r = settle_with(&input, &RecordBroken, REVIEWER, &council, &registry());
+    assert_eq!(council.convened(), 0, "no council can see the records");
+    let pol = row(&r, "POL-2101");
+    assert_eq!(pol.status, RuleStatus::Disputed, "{pol:?}");
+    assert_eq!(pol.record_unsettled, Some(RuleStatus::Broken));
+    let why = pol
+        .council
+        .as_ref()
+        .and_then(|c| c.reason.clone())
+        .unwrap_or_default();
+    assert_eq!(
+        why,
+        "record_unsettled: the rule's record part (the step records) is broken, and a rule \
+         council is shown only the change, so no council can rule on it"
+    );
+    assert!(pol.reason.contains(&why), "{}", pol.reason);
+    assert!(
+        r.hold().is_some() && r.denial().is_none(),
+        "the dispute holds"
+    );
+    // On the wire: the field rides the row, and a row recorded before it reads `None`.
+    let wire = serde_json::to_value(pol).unwrap();
+    assert_eq!(wire["recordUnsettled"], "broken");
+    let mut old = wire.clone();
+    old.as_object_mut().unwrap().remove("recordUnsettled");
+    let back: crate::rule_check::RuleVerdict = serde_json::from_value(old).unwrap();
+    assert_eq!(back.record_unsettled, None);
+}
+
+/// core#1379: a whole-evidence dispute on a roster with one seat distinct from every party (the
+/// creator, the judge and the reviewer are the other three) convenes nothing, and the hold names
+/// the seat that could sit and each party, so the person knows a re-check cannot convene one.
+#[test]
+fn a_roster_too_short_for_a_council_names_its_seats_and_the_parties() {
+    let input = reviewed("short-roster");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("short-roster", kept_3_0);
+    let reg: Vec<crate::AgenticCli> = ["claude", "codex", "pi", "agy"]
+        .into_iter()
+        .map(seat)
+        .collect();
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &reg);
+    assert_eq!(council.convened(), 0);
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed);
+    let c = r1.council.as_ref().unwrap();
+    assert_eq!(c.eligible, vec!["agy".to_string()]);
+    assert_eq!(
+        c.reason.as_deref(),
+        Some(
+            "seats_benched: 1 seat(s) distinct from every party (agy), a rule council needs 3; \
+             the parties: claude built the work; pi judged the rule; codex reviewed the step"
+        )
+    );
+    // The reviewer `codex` launched running opencode: opencode is a party, and says so.
+    let mut input = reviewed("short-roster-launch");
+    input.unit.assigned_invocation = Some("opencode run {PROMPT}".into());
+    let reg: Vec<crate::AgenticCli> = ["claude", "codex", "pi", "agy", "opencode"]
+        .into_iter()
+        .map(seat)
+        .collect();
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &reg);
+    let why = row(&r, "R1")
+        .council
+        .as_ref()
+        .unwrap()
+        .reason
+        .clone()
+        .unwrap();
+    assert!(
+        why.contains("codex reviewed the step; opencode was what the reviewer launched"),
+        "{why}"
+    );
+}
+
+/// core#1379, the production path: the registry leaves three seats, but the run's roster and
+/// benches leave the council one voter. The council's refusal names that voter, and the hold adds
+/// the parties.
+#[test]
+fn a_council_short_of_voters_names_them_and_the_parties() {
+    fn one_voter(_: &DecisionRequest, _: &[crate::AgenticCli]) -> DisputeOutcome {
+        DisputeOutcome::Ruled(DecisionVerdict {
+            returned: 0,
+            seated: 0,
+            seats: Vec::new(),
+            eligible: vec!["agy".into()],
+            no_ruling_reason: Some(
+                "seats_benched: 1 eligible seat(s) (agy), a rule council needs 3".into(),
+            ),
+            ballots_in: None,
+            votes: Vec::new(),
+            ..votes(&[])
+        })
+    }
+    let input = reviewed("short-voters");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("short-voters", one_voter);
+    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
+    assert_eq!(
+        council.convened(),
+        1,
+        "the registry had three seats: it was asked"
+    );
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Disputed);
+    let c = r1.council.as_ref().unwrap();
+    assert_eq!(c.eligible, vec!["agy".to_string()]);
+    assert_eq!(
+        c.reason.as_deref(),
+        Some(
+            "seats_benched: 1 eligible seat(s) (agy), a rule council needs 3; the parties: \
+             claude built the work; pi judged the rule; codex reviewed the step"
+        )
+    );
 }

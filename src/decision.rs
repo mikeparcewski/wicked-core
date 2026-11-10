@@ -647,6 +647,17 @@ pub(crate) fn convene_decision_with(
         DecisionFrame::Routing => pick.size.max(1),
         DecisionFrame::Dispute { .. } => {
             if voters.len() < RULE_COUNCIL_SIZE {
+                // (core#1379) Named: the person sees who could sit.
+                let why = format!(
+                    "seats_benched: {} eligible seat(s) ({}), a rule council needs \
+                     {RULE_COUNCIL_SIZE}",
+                    voters.len(),
+                    if eligible.is_empty() {
+                        "none".to_string()
+                    } else {
+                        eligible.join(", ")
+                    }
+                );
                 return Ok(DecisionVerdict {
                     task_id: String::new(),
                     winner: None,
@@ -658,11 +669,7 @@ pub(crate) fn convene_decision_with(
                     seats: Vec::new(),
                     seed: pick.seed,
                     eligible,
-                    no_ruling_reason: Some(format!(
-                        "seats_benched: {} eligible seat(s), a rule council needs \
-                         {RULE_COUNCIL_SIZE}",
-                        voters.len()
-                    )),
+                    no_ruling_reason: Some(why),
                     ballots_in: None,
                     votes: Vec::new(),
                 });
@@ -1096,12 +1103,13 @@ mod tests {
         .expect("a verdict, no error");
         assert_eq!(s.calls.load(Ordering::SeqCst), 0, "nothing convened");
         assert!(two.winner.is_none() && two.seats.is_empty());
-        assert!(
-            two.no_ruling_reason
-                .as_deref()
-                .is_some_and(|r| r.starts_with("seats_benched")),
+        // (core#1379) The refusal names the seats that could sit.
+        assert_eq!(
+            two.no_ruling_reason.as_deref(),
+            Some("seats_benched: 2 eligible seat(s) (a, b), a rule council needs 3"),
             "{two:?}"
         );
+        assert_eq!(two.eligible, vec!["a".to_string(), "b".to_string()]);
         let five: Vec<AgenticCli> = ["a", "b", "c", "d", "e"].into_iter().map(seat).collect();
         let v = convene_decision_with(&dispute(), &five, &s.dispatcher, None, None, pick, frame)
             .expect("rules");
