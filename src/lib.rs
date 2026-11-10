@@ -66,6 +66,7 @@ mod graph_browser;
 mod headless;
 mod hook_relay;
 mod image_keep;
+mod index_budget;
 mod install_fence;
 mod interaction;
 mod knowledge;
@@ -274,6 +275,10 @@ pub use gate_hook::{
     run_gate_hook, run_output_gate_hook, HookDrainSummary, COVERAGE_DB_ENV, DECISIONS_PATH_ENV,
     ESTATE_DB_ENV, ESTATE_READ_VERBS, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV,
     GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
+};
+pub use index_budget::{
+    index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
+    INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,
 };
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, judge_mcp_call_json, list_mcp_tools_json,

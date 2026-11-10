@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Indexes are bounded by a budget sized from the code, not a fixed bound (wicked-crew#1481).** New
+  `index_budget`: `budget = max(120 s, files × 0.30 s) × 1.15`, where files is what `git ls-files --cached --others
+  --exclude-standard` lists for the tree being indexed (a walk that skips `.git` when git cannot list it, so an unknown
+  size never shrinks the budget). It replaces the fixed 120 s on a launch's base re-index (D8) and on the repo watcher's
+  checkout re-index (`indexRepoGraph`), and bounds onboarding's first index, which had no bound: a Tool step whose argv
+  is `wicked-estate index <tree> …` is killed past the tree's budget and FAILS (not a cancel), saying which budget it
+  hit. A timeout now reads `the indexer exceeded its budget of 760s for 2203 files and was killed`. New napi
+  `Core.indexBudget(tree)` → `{ trackedFiles, counted: "git" | "walk", budgetMs }`, so crew's project-graph refresh uses
+  the same formula instead of its own fixed 600 s.
 - **A repo's checkout can be re-indexed under the launch indexer's lock; a dirty-tree graph is not a run's base
   (wicked-core#1230, crew repo watcher).** New napi `indexRepoGraph(repoRef)` (`code_graph::index_checkout`): it runs
   the onboarding index step's own command, `wicked-estate index <checkout> --db <code_graph_db>`, into the repo's

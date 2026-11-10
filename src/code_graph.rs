@@ -887,8 +887,17 @@ fn copy_sqlite_db(from: &Path, to: &Path, budget: &StepBudget) -> Result<Install
     result
 }
 
-/// How long a launch waits for its repo graph to be re-indexed at the run's base (D8).
-pub(crate) const BASE_INDEX_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// How long a launch waits for its repo graph to be re-indexed at the run's base (D8), and how long
+/// a checkout re-index may run: the tree's [`crate::index_budget`] (wicked-crew#1481), sized from its
+/// file count when an index is about to run. `Some(bound)` fixes it instead (tests).
+pub(crate) type IndexBound = Option<std::time::Duration>;
+
+fn budget_for(tree: &Path, fixed: IndexBound) -> crate::index_budget::IndexBudget {
+    match fixed {
+        Some(bound) => crate::index_budget::IndexBudget::fixed(bound),
+        None => crate::index_budget::index_budget(tree),
+    }
+}
 
 /// One base re-index at a time in this process: two launches on one repo never write its graph at
 /// once, and concurrent indexers never stack up on the host.
@@ -911,7 +920,7 @@ pub(crate) enum BaseIndex {
 /// (`review_scale::graph_age`), so every behavioural run on a repo whose remote had moved scored
 /// 100 and paid the full floor. The fresh worktree IS the base tree, so indexing it into the
 /// repo's graph (incremental: only changed files are re-extracted) records exactly the base.
-/// Runs on the launch's worktree thread, off the actor, bounded by `BASE_INDEX_TIMEOUT`. `root` is
+/// Runs on the launch's worktree thread, off the actor, bounded by the worktree's index budget. `root` is
 /// the repo-graph root the actor resolved (the thread has no state-home binding). `Err` says why
 /// it did not happen; the run then scores as before (a stale graph fails closed).
 pub(crate) fn index_at_base(
@@ -920,14 +929,7 @@ pub(crate) fn index_at_base(
     base_commit: &str,
     root: Option<&Path>,
 ) -> Result<BaseIndex, String> {
-    index_at_base_with(
-        &indexer_bin(),
-        repo,
-        worktree,
-        base_commit,
-        root,
-        BASE_INDEX_TIMEOUT,
-    )
+    index_at_base_with(&indexer_bin(), repo, worktree, base_commit, root, None)
 }
 
 fn index_at_base_with(
@@ -936,7 +938,7 @@ fn index_at_base_with(
     worktree: &Path,
     base_commit: &str,
     root: Option<&Path>,
-    timeout: std::time::Duration,
+    bound: IndexBound,
 ) -> Result<BaseIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let Some(db) = existing_code_graph_at(repo, root) else {
@@ -948,7 +950,7 @@ fn index_at_base_with(
     if current {
         return Ok(BaseIndex::Current);
     }
-    if let Err(e) = run_indexer(bin, worktree, &db, timeout) {
+    if let Err(e) = run_indexer(bin, worktree, &db, &budget_for(worktree, bound)) {
         mark_not_a_base(&db, "a launch's base index did not finish");
         return Err(e);
     }
@@ -982,13 +984,13 @@ fn mark_not_a_base(db: &Path, why: &str) {
     }
 }
 
-/// `bin index <tree> --db <db>`, bounded by `timeout` (the child is killed past it). The ONE spawn
+/// `bin index <tree> --db <db>`, bounded by `budget` (the child is killed past it). The ONE spawn
 /// both writers under [`BASE_INDEX_LOCK`] use: D8's base index and the checkout re-index.
 fn run_indexer(
     bin: &str,
     tree: &Path,
     db: &Path,
-    timeout: std::time::Duration,
+    budget: &crate::index_budget::IndexBudget,
 ) -> Result<(), String> {
     let mut child = Command::new(bin)
         .hardened()
@@ -1001,7 +1003,7 @@ fn run_indexer(
         .stderr(std::process::Stdio::null())
         .spawn()
         .map_err(|e| format!("could not run the `{bin}` indexer: {e}"))?;
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = std::time::Instant::now() + budget.budget;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1009,8 +1011,8 @@ fn run_indexer(
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!(
-                    "the indexer exceeded {}s and was killed",
-                    timeout.as_secs()
+                    "the indexer exceeded its budget of {} and was killed",
+                    budget.describe()
                 ));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(100)),
@@ -1037,9 +1039,6 @@ pub enum CheckoutIndex {
     Held(Vec<String>),
 }
 
-/// How long a checkout re-index may run (the same bound a launch's base index has).
-pub(crate) const CHECKOUT_INDEX_TIMEOUT: std::time::Duration = BASE_INDEX_TIMEOUT;
-
 /// Re-index a registered repo's CHECKOUT (what is on disk now, uncommitted edits included) into its
 /// existing code graph: the onboarding index step's command, `wicked-estate index <repo> --db <db>`,
 /// taken under [`BASE_INDEX_LOCK`] so it is never a second writer beside a launch's D8 (crew's repo
@@ -1054,7 +1053,7 @@ pub fn index_checkout(
         &indexer_bin(),
         repo,
         repo_graph_root().as_deref(),
-        CHECKOUT_INDEX_TIMEOUT,
+        None,
         held_by,
     )
 }
@@ -1063,7 +1062,7 @@ fn index_checkout_with(
     bin: &str,
     repo: &Path,
     root: Option<&Path>,
-    timeout: std::time::Duration,
+    bound: IndexBound,
     held_by: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<CheckoutIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -1074,7 +1073,7 @@ fn index_checkout_with(
     if !held.is_empty() {
         return Ok(CheckoutIndex::Held(held));
     }
-    let ran = run_indexer(bin, repo, &db, timeout);
+    let ran = run_indexer(bin, repo, &db, &budget_for(repo, bound));
     // Whether it finished or not, a checkout's graph is no run's base (see `mark_not_a_base`).
     mark_not_a_base(&db, "a checkout re-index");
     ran?;
@@ -1364,7 +1363,7 @@ mod tests {
                 &wt,
                 BASE,
                 Some(&root),
-                std::time::Duration::from_secs(timeout),
+                Some(std::time::Duration::from_secs(timeout)),
             )
         };
 
@@ -1427,7 +1426,7 @@ mod tests {
         let started = std::time::Instant::now();
         assert!(run(&script("hangs", "sleep 600"), 1)
             .unwrap_err()
-            .contains("exceeded 1s"));
+            .contains("exceeded its budget of 1s"));
         // Killed at the bound, never waited out: far under the hang's own 600 s on any host.
         assert!(started.elapsed() < std::time::Duration::from_secs(300));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1452,7 +1451,7 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p.to_string_lossy().into_owned()
         };
-        let patient = crate::test_env::PATIENT;
+        let patient = Some(crate::test_env::PATIENT);
         let never = dir.join("never-run").to_string_lossy().into_owned();
         // Never onboarded: nothing to re-index, nothing runs.
         assert_eq!(
@@ -1569,7 +1568,7 @@ mod tests {
             &wt,
             BASE,
             Some(&root),
-            crate::test_env::PATIENT,
+            Some(crate::test_env::PATIENT),
         );
         assert!(out.unwrap_err().contains("failed"));
         assert!(
@@ -1628,7 +1627,7 @@ mod tests {
             &wt,
             BASE,
             Some(&root),
-            crate::test_env::PATIENT,
+            Some(crate::test_env::PATIENT),
         );
         assert_eq!(out, Ok(BaseIndex::Indexed));
         assert!(ran.exists(), "D8 trusted a dirty-tree graph as the base");

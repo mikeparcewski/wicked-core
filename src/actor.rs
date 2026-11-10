@@ -14327,6 +14327,11 @@ fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
 pub(crate) const STOP_CANCELLED: &str = "cancelled";
 pub(crate) const STOP_SUPERSEDED: &str = "superseded";
 pub(crate) const STOP_SHUTDOWN: &str = "shutdown";
+/// (wicked-crew#1481) Not a stop of the run: a `wicked-estate index` Tool step outran its index
+/// budget. Never reaches the wire as a kill: [`run_tool_cmd`] turns it into a `Failed` step that
+/// names the budget, and [`actor_kill_grace`] has no graceful window for it (nothing else kills the
+/// group), so the group is force-killed at once.
+const STOP_OVER_BUDGET: &str = "over_budget";
 
 /// How long the tool worker waits for the ACTOR's graceful kill before forcing (core#576).
 ///
@@ -14399,6 +14404,11 @@ fn actor_kill_grace(reason: &str) -> Option<std::time::Duration> {
 // registers it in lifecycle maps so the actor can kill the group synchronously (core#500).
 // on_done: called when the poll loop exits with the pgid that was spawned; the caller
 // passes it back to deregister_tool_child for a compare-and-remove (core#500).
+//
+// (wicked-crew#1481) A step whose argv is `wicked-estate index <tree> …` (onboarding's first
+// index, or any def's) is bounded by that tree's index budget ([`crate::index_budget`]), the same
+// one a launch's base re-index and the repo watcher's re-index get. Every other step is unbounded,
+// as before.
 fn run_tool_cmd(
     cmd: &[String],
     workdir: Option<&str>,
@@ -14407,7 +14417,76 @@ fn run_tool_cmd(
     on_spawn: &dyn Fn(u32),
     on_done: &dyn Fn(u32),
 ) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
-    run_tool_cmd_jailed(cmd, workdir, extra_env, None, stop, on_spawn, on_done)
+    let budget = estate_index_tree(cmd, workdir).map(|tree| {
+        #[allow(unused_mut)]
+        let mut b = crate::index_budget::index_budget(&tree);
+        #[cfg(test)]
+        if let Some(d) = TEST_INDEX_BUDGET.with(|t| t.get()) {
+            b.budget = d;
+        }
+        b
+    });
+    run_tool_cmd_budgeted(cmd, workdir, extra_env, budget, stop, on_spawn, on_done)
+}
+
+// A test drives the production entry point with a short bound: the tree is still sized (its file
+// count is what the timeout reports), only the duration is replaced (codex r1 on crew#1481).
+#[cfg(test)]
+thread_local! {
+    static TEST_INDEX_BUDGET: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The tree a `wicked-estate index <tree> …` argv indexes (relative to `workdir` when relative);
+/// `None` for any other command.
+fn estate_index_tree(cmd: &[String], workdir: Option<&str>) -> Option<std::path::PathBuf> {
+    let bin = std::path::Path::new(cmd.first()?);
+    let stem = bin.file_stem()?.to_str()?;
+    if stem != "wicked-estate" || cmd.get(1).map(String::as_str) != Some("index") {
+        return None;
+    }
+    let tree = cmd.get(2).filter(|t| !t.starts_with('-'))?;
+    let tree = std::path::Path::new(tree);
+    Some(match workdir {
+        Some(wd) if tree.is_relative() => std::path::Path::new(wd).join(tree),
+        _ => tree.to_path_buf(),
+    })
+}
+
+/// [`run_tool_cmd_jailed`] (unjailed) with an optional index budget: past it the child is killed
+/// and the step FAILS, saying which budget it hit (a timeout is not a cancel: no `ToolKilled`).
+fn run_tool_cmd_budgeted(
+    cmd: &[String],
+    workdir: Option<&str>,
+    extra_env: &[(String, String)],
+    budget: Option<crate::index_budget::IndexBudget>,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (String, crate::workflow::StepStatus, Option<ToolKilled>) {
+    let Some(budget) = budget else {
+        return run_tool_cmd_jailed(cmd, workdir, extra_env, None, stop, on_spawn, on_done);
+    };
+    let deadline = std::time::Instant::now() + budget.budget;
+    let bounded =
+        || stop().or_else(|| (std::time::Instant::now() >= deadline).then_some(STOP_OVER_BUDGET));
+    let (mut out, status, killed) =
+        run_tool_cmd_jailed(cmd, workdir, extra_env, None, &bounded, on_spawn, on_done);
+    match killed {
+        Some(k) if k.reason == STOP_OVER_BUDGET => {
+            let marker = format!("\n[killed: {STOP_OVER_BUDGET}]");
+            if out.ends_with(&marker) {
+                out.truncate(out.len() - marker.len());
+            }
+            out.push_str(&format!(
+                "\n[stopped: the index exceeded its budget of {} after {}s]",
+                budget.describe(),
+                k.ran_ms / 1000
+            ));
+            (out, crate::workflow::StepStatus::Failed, None)
+        }
+        other => (out, status, other),
+    }
 }
 
 /// [`run_tool_cmd`], optionally inside an OS jail (WT-C2): with `jail = Some(wrapper)` the argv is
@@ -36146,6 +36225,142 @@ mod tool_cmd_tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         !alive(pid)
+    }
+
+    /// wicked-crew#1481: onboarding's `wicked-estate index <tree>` step is the one Tool argv that
+    /// gets an index budget; any other command, or an estate subcommand that is not `index`, none.
+    #[test]
+    fn only_an_estate_index_argv_is_budgeted_and_a_relative_tree_resolves_in_the_workdir() {
+        let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            estate_index_tree(&v(&["wicked-estate", "index", "/r", "--db", "/g.db"]), None),
+            Some(std::path::PathBuf::from("/r"))
+        );
+        assert_eq!(
+            estate_index_tree(&v(&["/opt/bin/wicked-estate", "index", "src"]), Some("/w")),
+            Some(std::path::Path::new("/w").join("src"))
+        );
+        assert_eq!(
+            estate_index_tree(&v(&["wicked-estate.exe", "index", "/r"]), None),
+            Some(std::path::PathBuf::from("/r"))
+        );
+        assert_eq!(
+            estate_index_tree(&v(&["wicked-estate", "clusters", "--annotate"]), None),
+            None
+        );
+        assert_eq!(
+            estate_index_tree(&v(&["wicked-estate", "index", "--db", "/g"]), None),
+            None
+        );
+        assert_eq!(
+            estate_index_tree(&v(&["sh", "-c", "wicked-estate index /r"]), None),
+            None
+        );
+        assert_eq!(estate_index_tree(&[], None), None);
+    }
+
+    /// wicked-crew#1481: an index step past its budget is killed and FAILS, naming the budget it hit
+    /// (it is not a cancel: no `ToolKilled`, so nothing reads it as the run being stopped). Fails
+    /// without the fix: onboarding's index had no bound at all and this child would sleep 600 s.
+    #[cfg(unix)]
+    #[test]
+    fn an_index_step_past_its_budget_fails_and_says_which_budget() {
+        let budget = crate::index_budget::IndexBudget {
+            files: Some(7),
+            counted: crate::index_budget::IndexBudgetCount::Git,
+            budget: Duration::from_millis(300),
+        };
+        let started = Instant::now();
+        let (out, st, k) = run_tool_cmd_budgeted(
+            &sh("printf partial; exec sleep 600"),
+            None,
+            &[],
+            Some(budget),
+            &never,
+            &noop_spawn,
+            &noop_done,
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(300),
+            "not killed at the budget"
+        );
+        assert_eq!(st, StepStatus::Failed);
+        assert!(k.is_none());
+        assert!(out.starts_with("partial"), "{out}");
+        assert!(
+            out.contains("[stopped: the index exceeded its budget of 0s for 7 files after"),
+            "{out}"
+        );
+        assert!(!out.contains("[killed:"), "{out}");
+        // Within its budget the step is exactly the unbudgeted run.
+        let (out, st, k) = run_tool_cmd_budgeted(
+            &sh("printf ok"),
+            None,
+            &[],
+            Some(crate::index_budget::IndexBudget::fixed(
+                crate::test_env::PATIENT,
+            )),
+            &never,
+            &noop_spawn,
+            &noop_done,
+        );
+        assert_eq!(
+            (out.as_str(), st, k.is_none()),
+            ("ok", StepStatus::Ok, true)
+        );
+        // A cancel inside the budget is still a cancel.
+        let (_, st, k) = run_tool_cmd_budgeted(
+            &sh("exec sleep 600"),
+            None,
+            &[],
+            Some(crate::index_budget::IndexBudget::fixed(
+                crate::test_env::PATIENT,
+            )),
+            &|| Some(STOP_SHUTDOWN),
+            &noop_spawn,
+            &noop_done,
+        );
+        assert_eq!(st, StepStatus::Cancelled);
+        assert_eq!(k.map(|k| k.reason), Some(STOP_SHUTDOWN));
+    }
+
+    /// The production entry point (`run_tool_cmd`, what onboarding's index step runs) recognizes a
+    /// `wicked-estate index <tree>` argv, sizes the tree and enforces the budget. Fails if any of the
+    /// three is disconnected: before the fix this stand-in slept its full 600 s.
+    #[cfg(unix)]
+    #[test]
+    fn onboardings_index_step_is_sized_and_bounded_through_run_tool_cmd() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("wc-onboard-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let tree = dir.join("tree");
+        std::fs::create_dir_all(tree.join("src")).unwrap();
+        for f in ["a.rs", "src/b.rs", "src/c.rs"] {
+            std::fs::write(tree.join(f), "x").unwrap();
+        }
+        let bin = dir.join("wicked-estate");
+        std::fs::write(&bin, "#!/bin/sh\nexec sleep 600\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let cmd = vec![
+            bin.to_string_lossy().into_owned(),
+            "index".to_string(),
+            tree.to_string_lossy().into_owned(),
+            "--db".to_string(),
+            dir.join("g.db").to_string_lossy().into_owned(),
+        ];
+        TEST_INDEX_BUDGET.with(|t| t.set(Some(Duration::from_millis(300))));
+        let started = Instant::now();
+        let (out, st, k) = run_tool_cmd(&cmd, None, &[], &never, &noop_spawn, &noop_done);
+        TEST_INDEX_BUDGET.with(|t| t.set(None));
+        assert!(started.elapsed() < Duration::from_secs(300), "not bounded");
+        assert_eq!(st, StepStatus::Failed, "{out}");
+        assert!(k.is_none());
+        // Sized from the tree: a walk (not a git work tree) of its three files.
+        assert!(
+            out.contains("exceeded its budget of 0s for 3 files"),
+            "{out}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]

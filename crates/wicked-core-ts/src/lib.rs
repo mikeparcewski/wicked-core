@@ -993,6 +993,17 @@ fn edit_decision(
     })
 }
 
+/// `Core.indexBudget`'s answer for `tree` (unit-tested below; the napi method is thin glue).
+fn index_budget_json(tree: &str) -> napi::Result<String> {
+    let b = wicked_core::index_budget(std::path::Path::new(tree));
+    serde_json::to_string(&serde_json::json!({
+        "trackedFiles": b.files.unwrap_or(0),
+        "counted": b.counted.as_str(),
+        "budgetMs": b.budget_ms(),
+    }))
+    .map_err(err)
+}
+
 // ── the binding surface ────────────────────────────────────────────────────────
 
 /// A handle to a wicked-core runtime. Construct with [`Core::spawn`] (production engine: real
@@ -2906,6 +2917,18 @@ impl Core {
         })
     }
 
+    /// (wicked-crew#1481) How long one `wicked-estate index` of `tree` may run: THE index budget
+    /// (`max(120 s, files × 0.30 s) × 1.15`, `wicked_core::index_budget`), sized from the files
+    /// `git ls-files` lists for the tree (a walk when git cannot list it). The same budget the
+    /// engine bounds its own indexes with; crew's project-graph refresh reads it here, so no second
+    /// copy of the formula exists. Resolves to a JSON string `{ "trackedFiles": number, "counted":
+    /// "git" | "walk", "budgetMs": number }`. Never rejects: a tree that cannot be read counts 0
+    /// files (the floor).
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn index_budget(&self, tree: String) -> AsyncTask<CoreTask> {
+        task(move || index_budget_json(&tree))
+    }
+
     /// ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
     /// of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
     /// recomputed from the store's own counts against the configured minimum. Resolves to a JSON
@@ -3189,6 +3212,22 @@ impl Drop for Subscription {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wicked-crew#1481: `Core.indexBudget` carries the engine's one formula on the wire (no TS
+    /// copy): a tree that is not there is the floor, 138 s.
+    #[test]
+    fn index_budget_json_carries_the_engine_formula() {
+        let v: serde_json::Value =
+            serde_json::from_str(&index_budget_json("/no/such/tree/for/index-budget").unwrap())
+                .unwrap();
+        assert_eq!(v["trackedFiles"], 0);
+        assert_eq!(v["counted"], "walk");
+        assert_eq!(v["budgetMs"], 138_000);
+        assert_eq!(
+            v["budgetMs"].as_u64(),
+            Some(wicked_core::index_budget_for_files(0).as_millis() as u64)
+        );
+    }
 
     /// (core#769, A5) `Core.worktreeBenched()`: a bound run benches every codex seat with the
     /// launcher's reason, an unbound run none, and a malformed roster is refused.

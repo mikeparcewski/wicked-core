@@ -1091,6 +1091,16 @@ export declare class Core {
    */
   indexRepoGraph(repoRef: string): Promise<string>
   /**
+   * (wicked-crew#1481) How long one `wicked-estate index` of `tree` may run: THE index budget
+   * (`max(120 s, files × 0.30 s) × 1.15`, `wicked_core::index_budget`), sized from the files
+   * `git ls-files` lists for the tree (a walk when git cannot list it). The same budget the
+   * engine bounds its own indexes with; crew's project-graph refresh reads it here, so no second
+   * copy of the formula exists. Resolves to a JSON string `{ "trackedFiles": number, "counted":
+   * "git" | "walk", "budgetMs": number }`. Never rejects: a tree that cannot be read counts 0
+   * files (the floor).
+   */
+  indexBudget(tree: string): Promise<string>
+  /**
    * ONE registered repo's requirements graph, read from that repo's OWN estate store (the source
    * of truth `domain-graph` persists into; never a file in the checkout), with its coverage label
    * recomputed from the store's own counts against the configured minimum. Resolves to a JSON
