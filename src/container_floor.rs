@@ -53,7 +53,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use crate::worker_sandbox::{FloorUnarmed, SeatFloor};
@@ -85,6 +85,14 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
 const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
+/// (core#1377) An engine network nothing is attached to is swept once it is this old. A seat's
+/// network is attached within the seconds its unit takes to arm, and a gateway's bridge within its
+/// start; one left empty this long is a crashed or removed owner's. Every engine network takes one
+/// of the runtime's few address pools (Docker: 31), so 24 hours let them run out.
+const NETWORK_SWEEP_AGE: Duration = Duration::from_secs(60 * 60);
+/// (core#1377) How often an arming engine sweeps again: once per process let a long-lived daemon
+/// pile its leftovers up.
+const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
 /// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the subscription routes 4006-4012
 /// ([`crate::seat_credentials::SUBSCRIPTION_ROUTES`]), agy's Gemini API key 4013
@@ -1977,10 +1985,11 @@ pub(crate) fn reap(seat: &SeatContainer) {
 }
 
 /// The runtime's own prune commands for what a crashed engine left behind: stopped seat
-/// containers and unused seat networks (`wicked.seat=1`) older than `older_than`. A live seat
-/// is never touched (prune skips running containers and networks in use).
-pub(crate) fn sweep_argv(older_than: Duration) -> [Vec<String>; 2] {
-    let until = format!("until={}h", older_than.as_secs() / 3600);
+/// containers older than `container_age`, and unused seat networks (`wicked.seat=1`) older than
+/// `network_age`. A live seat is never touched (prune skips running containers and networks in
+/// use).
+pub(crate) fn sweep_argv(container_age: Duration, network_age: Duration) -> [Vec<String>; 2] {
+    let until = |d: Duration| format!("until={}h", (d.as_secs() / 3600).max(1));
     let label = format!("label={SEAT_LABEL}=1");
     [
         vec![
@@ -1990,7 +1999,7 @@ pub(crate) fn sweep_argv(older_than: Duration) -> [Vec<String>; 2] {
             "--filter".into(),
             label.clone(),
             "--filter".into(),
-            until.clone(),
+            until(container_age),
         ],
         vec![
             "network".into(),
@@ -1999,17 +2008,217 @@ pub(crate) fn sweep_argv(older_than: Duration) -> [Vec<String>; 2] {
             "--filter".into(),
             label,
             "--filter".into(),
-            until,
+            until(network_age),
         ],
     ]
 }
 
-/// Run [`sweep_argv`], best effort and bounded. The first [`arm`] calls it once per process.
-pub(crate) fn sweep(rt: &Runtime, older_than: Duration) {
-    for argv in sweep_argv(older_than) {
+/// Run [`sweep_argv`], then [`sweep_gateway_bridges`], best effort and bounded. [`arm`] calls it
+/// at its first arming and then at most every [`SWEEP_EVERY`] ([`sweep_due`]).
+pub(crate) fn sweep(rt: &Runtime) {
+    for argv in sweep_argv(SWEEP_AGE, NETWORK_SWEEP_AGE) {
         let mut c = rt.cmd();
         c.args(&argv);
         let _ = output_within(c, rt.bound(REAP_TIMEOUT));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = sweep_gateway_bridges(rt, NETWORK_SWEEP_AGE, now);
+}
+
+/// Whether the sweep is due: never run (`last` is `None`), or last run `every` or longer ago.
+/// Marks it run when it is.
+fn sweep_due(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
+    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= every);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+/// The gateway container an external bridge belongs to: `wicked-agw-<12 hex>-ext` is
+/// `wicked-agw-<12 hex>`'s ([`crate::seat_gateway::Gateway::for_dir`]). Any other name is none.
+pub(crate) fn gateway_of_bridge(network: &str) -> Option<&str> {
+    let gw = network.strip_suffix("-ext")?;
+    let hex = gw.strip_prefix("wicked-agw-")?;
+    (hex.len() == 12
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then_some(gw)
+}
+
+/// (core#1377) The whole gateway-bridge sweep's bound: it runs on an arming unit's thread, so a
+/// runtime that stops answering mid-sweep costs at most this, and the rest waits for a later sweep.
+const GATEWAY_SWEEP_BUDGET: Duration = Duration::from_secs(45);
+
+/// (core#1377) Remove the external bridges whose daemon is gone, and answer their names. A
+/// gateway's bridge outlives its container and its daemon (a test or proof daemon whose state
+/// home was deleted, a runtime cleanup), and nothing else removed it. A bridge goes only when ALL
+/// hold: it carries the gateway label and a gateway bridge's name; the runtime lists it as
+/// dangling and shows no container on it; it was created at least `older_than` before
+/// `now_unix`; it is labelled with the gateway directory it serves ([`crate::seat_gateway::DIR_LABEL`]),
+/// that directory hashes to the bridge's name, and it no longer exists on this host (no daemon
+/// can start a gateway on a directory that is gone, so none is about to use the bridge); and the
+/// runtime answers definitively that its gateway container does not exist. A bridge with no
+/// directory label (made before it existed) is never removed. Each network is inspected and
+/// removed by its full ID, so a same-named network created meanwhile is never the one removed.
+/// Any answer it cannot read keeps the network (a runtime that cannot list dangling networks,
+/// such as nerdctl, sweeps none), and the sweep stops at the first command that does not answer,
+/// within about [`GATEWAY_SWEEP_BUDGET`].
+pub(crate) fn sweep_gateway_bridges(
+    rt: &Runtime,
+    older_than: Duration,
+    now_unix: u64,
+) -> Vec<String> {
+    let started = Instant::now();
+    let run = |argv: &[&str]| -> Option<std::process::Output> {
+        let left = GATEWAY_SWEEP_BUDGET.checked_sub(started.elapsed())?;
+        let mut c = rt.cmd();
+        c.args(argv);
+        output_within(c, rt.bound(PROBE_TIMEOUT.min(left)))
+    };
+    let label = format!("label={}=1", crate::seat_gateway::GATEWAY_LABEL);
+    let Some(listed) = run(&[
+        "network",
+        "ls",
+        "--filter",
+        &label,
+        "--filter",
+        "dangling=true",
+        "--no-trunc",
+        "--format",
+        "{{.ID}} {{.Name}}",
+    ])
+    .filter(|o| o.status.success()) else {
+        eprintln!(
+            "wicked-core: the gateway-bridge sweep could not list this runtime's dangling gateway \
+             networks; none is removed"
+        );
+        return Vec::new();
+    };
+    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
+    let mut removed = Vec::new();
+    for line in listed.lines() {
+        let mut f = line.split_whitespace();
+        let (Some(id), Some(net), None) = (f.next(), f.next(), f.next()) else {
+            continue;
+        };
+        let Some(gw) = gateway_of_bridge(net) else {
+            continue;
+        };
+        let Some(inspected) = run(&[
+            "network",
+            "inspect",
+            "--format",
+            &format!(
+                "{{{{len .Containers}}}} {{{{.Created.Unix}}}} {{{{index .Labels \"{}\"}}}} \
+                 {{{{.Name}}}} {{{{.ID}}}} {{{{index .Labels \"{}\"}}}}",
+                crate::seat_gateway::GATEWAY_LABEL,
+                crate::seat_gateway::DIR_LABEL
+            ),
+            id,
+        ]) else {
+            break;
+        };
+        let out = String::from_utf8_lossy(&inspected.stdout).into_owned();
+        // Five space-free fields, then the directory label (a path may hold spaces).
+        let mut f = out.trim().splitn(6, ' ');
+        let ours_old_and_empty = inspected.status.success()
+            && f.next().and_then(|n| n.parse::<u64>().ok()) == Some(0)
+            && f.next()
+                .and_then(|c| c.parse::<u64>().ok())
+                .is_some_and(|c| now_unix.saturating_sub(c) >= older_than.as_secs())
+            && f.next() == Some("1")
+            && f.next() == Some(net)
+            && f.next() == Some(id)
+            && f.next().is_some_and(|d| dir_gone(d, gw));
+        if !ours_old_and_empty {
+            continue;
+        }
+        let Some(gateway) = run(&["container", "inspect", "--format", "{{.Name}}", gw]) else {
+            break;
+        };
+        // Only the runtime's own definitive answer: a transport error ("connect: no such file or
+        // directory") says nothing about the container.
+        let err = String::from_utf8_lossy(&gateway.stderr);
+        let gateway_absent = !gateway.status.success()
+            && err.to_ascii_lowercase().contains("no such container")
+            && !runtime_unreachable(&err);
+        if !gateway_absent {
+            continue;
+        }
+        // Read again right before the removal: a daemon starting on that directory recreates it
+        // first. (A start between this read and the removal fails once, recoverably: the next
+        // start makes a fresh bridge, which the sweep never takes while it is young.) The runtime
+        // refuses to remove a network in use: the last guard against a gateway that attached.
+        let dir_label = out.trim().splitn(6, ' ').nth(5).unwrap_or("");
+        if !dir_gone(dir_label, gw) {
+            continue;
+        }
+        match run(&["network", "rm", id]) {
+            Some(o) if o.status.success() => removed.push(net.to_string()),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    removed
+}
+
+/// Whether `dir` (a bridge's directory label) is the gateway directory `gw` is named after and
+/// no longer exists on this host. Anything short of a definitive "not found" keeps the bridge.
+fn dir_gone(dir: &str, gw: &str) -> bool {
+    let p = Path::new(dir);
+    p.is_absolute()
+        && crate::seat_gateway::gateway_name(p) == gw
+        && std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// (core#1356) Whether a network create failed because the runtime has no address pool left:
+/// Docker's "all predefined address pools have been fully subnetted", podman's and nerdctl's
+/// "could not find free subnet" / "failed to find free subnet".
+pub(crate) fn pools_exhausted(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    e.contains("fully subnetted") || e.contains("find free subnet")
+}
+
+/// (core#1356) Whether a runtime error says its CLI could not reach the engine at all (Docker's
+/// "Cannot connect to the Docker daemon", a refused or missing socket, podman's "unable to connect
+/// to Podman"). Such a failure is the runtime's outage even when the engine answers again by the
+/// time it is probed, so the unit still rides the runtime wait and re-runs.
+pub(crate) fn runtime_unreachable(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    [
+        "cannot connect to the docker daemon",
+        "is the docker daemon running",
+        "unable to connect to podman",
+        "connection refused",
+        "connect: no such file or directory",
+        "error during connect",
+        "could not reach the container runtime",
+        "trying to connect to the docker daemon",
+    ]
+    .iter()
+    .any(|m| e.contains(m))
+}
+
+/// (core#1356) What a failed seat-network create is: the address pools ran out, the runtime is
+/// down (`runtime_down`, a fresh liveness probe, asked only when the error names no pool), or the
+/// runtime answers and the network failed for the reason its error gives. Before this, every such
+/// failure read as `container_runtime_down`, and the B4 pilot waited out host load while Docker
+/// answered in a quarter second.
+pub(crate) fn network_failure_kind(
+    err: &str,
+    runtime_down: &mut dyn FnMut() -> bool,
+) -> FloorUnarmed {
+    if pools_exhausted(err) {
+        FloorUnarmed::AddressPoolsExhausted
+    } else if runtime_unreachable(err) || runtime_down() {
+        FloorUnarmed::ContainerRuntimeDown
+    } else {
+        FloorUnarmed::SeatNetworkUnavailable
     }
 }
 
@@ -2991,8 +3200,13 @@ pub(crate) fn arm_noting(
         .collect();
     spec.writable.retain(|w| !pin_dirs.contains(w));
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    static SWEEP: Once = Once::new();
-    SWEEP.call_once(|| sweep(&rt, SWEEP_AGE));
+    static LAST_SWEEP: Mutex<Option<Instant>> = Mutex::new(None);
+    let due = LAST_SWEEP
+        .lock()
+        .is_ok_and(|mut last| sweep_due(&mut last, Instant::now(), SWEEP_EVERY));
+    if due {
+        sweep(&rt);
+    }
     let (image, built_in) =
         ensure_seat_image_noting(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     if let Some(waited) = built_in {
@@ -3054,8 +3268,8 @@ pub(crate) fn arm_noting(
         .and_then(|f| check_seat_image(&f, &dests).map(|()| f.id))
         .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     let name = container_name(cli, run_id, ord);
-    let network =
-        ensure_seat_network(&rt, &name).map_err(|e| (FloorUnarmed::ContainerRuntimeDown, e))?;
+    let network = ensure_seat_network(&rt, &name)
+        .map_err(|e| (network_failure_kind(&e, &mut || !runtime_answers(&rt)), e))?;
     // Owned from here: whatever happens before the seat runs, its network goes.
     let cleanup = ReapOnDrop(Some(SeatContainer {
         runtime: rt.cli.clone(),
@@ -3068,7 +3282,20 @@ pub(crate) fn arm_noting(
     let (env, files, lease, seat_args, copilot_account) =
         match gateway_dir.filter(|_| network != "none") {
             Some(dir) => {
-                let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+                // The gateway's bridge is a network too: out of address pools, or refused by an
+                // answering runtime, it is the host's fault like the seat's own network.
+                let down = |e: String| {
+                    let why = if e.starts_with(crate::seat_gateway::BRIDGE_UNREACHABLE) {
+                        FloorUnarmed::ContainerRuntimeDown
+                    } else if pools_exhausted(&e) {
+                        FloorUnarmed::AddressPoolsExhausted
+                    } else if e.starts_with(crate::seat_gateway::BRIDGE_REFUSED) {
+                        FloorUnarmed::SeatNetworkUnavailable
+                    } else {
+                        FloorUnarmed::GatewayUnavailable
+                    };
+                    (why, e)
+                };
                 let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
                 // The broker's one refresher runs beside this daemon's gateway (a credential that
                 // expired between runs is renewed, by its own CLI, before the seat starts).
@@ -5531,7 +5758,7 @@ mod tests {
 
     #[test]
     fn the_sweep_prunes_only_labelled_seat_leftovers_past_the_age() {
-        let [c, n] = sweep_argv(SWEEP_AGE);
+        let [c, n] = sweep_argv(SWEEP_AGE, NETWORK_SWEEP_AGE);
         assert_eq!(
             c,
             [
@@ -5546,6 +5773,229 @@ mod tests {
         );
         assert_eq!(n[..2], ["network", "prune"]);
         assert!(n.contains(&"label=wicked.seat=1".to_string()));
+        // core#1377: an unused seat network goes after an hour, not a day.
+        assert!(n.contains(&"until=1h".to_string()), "{n:?}");
+    }
+
+    #[test]
+    fn the_sweep_runs_at_the_first_arming_and_then_at_most_hourly() {
+        let t0 = Instant::now();
+        let mut last = None;
+        assert!(sweep_due(&mut last, t0, SWEEP_EVERY));
+        assert!(!sweep_due(
+            &mut last,
+            t0 + Duration::from_secs(59 * 60),
+            SWEEP_EVERY
+        ));
+        assert!(sweep_due(&mut last, t0 + SWEEP_EVERY, SWEEP_EVERY));
+        assert!(!sweep_due(&mut last, t0 + SWEEP_EVERY, SWEEP_EVERY));
+    }
+
+    #[test]
+    fn a_pool_exhaustion_is_its_own_kind_and_never_reads_as_runtime_down() {
+        let mut asked = 0;
+        let docker = "could not create the seat network `wicked-seat-x`: Error response from \
+                      daemon: all predefined address pools have been fully subnetted";
+        let mut down = || {
+            asked += 1;
+            true
+        };
+        assert_eq!(
+            network_failure_kind(docker, &mut down),
+            FloorUnarmed::AddressPoolsExhausted
+        );
+        assert_eq!(
+            network_failure_kind(
+                "Error: could not find free subnet from subnet pools",
+                &mut down
+            ),
+            FloorUnarmed::AddressPoolsExhausted
+        );
+        // The pools named: no liveness probe was needed (or could overrule it).
+        assert_eq!(asked, 0);
+        // An error that says the CLI could not reach the engine is the runtime's outage, even
+        // when the engine answers by the time it is probed (it rides the runtime wait).
+        assert_eq!(
+            network_failure_kind(
+                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the \
+                 docker daemon running?",
+                &mut || false
+            ),
+            FloorUnarmed::ContainerRuntimeDown
+        );
+        // Any other network error: down only when a fresh probe says so.
+        assert_eq!(
+            network_failure_kind("creating the seat network `n` timed out", &mut || true),
+            FloorUnarmed::ContainerRuntimeDown
+        );
+        assert_eq!(
+            network_failure_kind(
+                "could not create the seat network `n`: plugin not found",
+                &mut || false
+            ),
+            FloorUnarmed::SeatNetworkUnavailable
+        );
+        // The refusal names the cause and the remedy, not `<runtime> version`.
+        let d = FloorUnarmed::AddressPoolsExhausted.describe();
+        assert!(d.starts_with("address_pools_exhausted:"), "{d}");
+        assert!(
+            d.contains("docker network rm") && !d.contains("version"),
+            "{d}"
+        );
+        assert_eq!(
+            FloorUnarmed::SeatNetworkUnavailable.as_str(),
+            "seat_network_unavailable"
+        );
+    }
+
+    #[test]
+    fn only_a_gateway_bridge_name_names_a_gateway() {
+        assert_eq!(
+            gateway_of_bridge("wicked-agw-03e179d59030-ext"),
+            Some("wicked-agw-03e179d59030")
+        );
+        for other in [
+            "wicked-agw-03e179d59030",
+            "wicked-agw-03E179D59030-ext",
+            "wicked-agw-03e179d5903-ext",
+            "wicked-agw-03e179d59030x-ext",
+            "wicked-onboarding-dependencies_default",
+            "docling-serve-net",
+            "temporal",
+            "bridge",
+        ] {
+            assert_eq!(gateway_of_bridge(other), None, "{other}");
+        }
+    }
+
+    /// core#1377: the gateway-bridge sweep against a stand-in runtime (never the host's). Of the
+    /// dangling labelled networks it lists, only the old, empty bridge whose labelled gateway
+    /// directory is gone and whose gateway container the runtime says does not exist is removed,
+    /// by its full ID. Every other one stays: a young bridge, a stopped gateway's, one with a
+    /// member, one whose inspection fails, one with no directory label, one whose directory still
+    /// exists (a live daemon's), one labelled with a directory another name hashes from, one
+    /// replaced under the same name, one whose container inspection is a transport error, and a
+    /// name that is not a gateway bridge.
+    #[cfg(unix)]
+    #[test]
+    fn the_gateway_bridge_sweep_removes_only_a_gone_daemons_old_empty_bridge() {
+        let dir = tmp("gw-sweep");
+        let log = dir.join("calls.log");
+        let rt = dir.join("docker");
+        let now: u64 = 1_800_000_000;
+        let (old, young) = (now - 2 * 3600, now - 60);
+        let gone = |t: &str| dir.join(format!("gone-{t}"));
+        let live = dir.join("live-home");
+        std::fs::create_dir_all(&live).unwrap();
+        let name = |p: &Path| crate::seat_gateway::gateway_name(p);
+        let d = |p: &Path| p.display().to_string();
+        // (id, gateway name, inspect answer, container inspect answer)
+        let ok_container = "echo 'Error response from daemon: No such container' >&2; exit 1";
+        let rows: Vec<(String, String, String, String)> = vec![
+            ("dead", gone("dead"), 0, old, "1", None),
+            ("young", gone("young"), 0, young, "1", None),
+            ("stopped", gone("stopped"), 0, old, "1", Some("echo /x")),
+            ("member", gone("member"), 1, old, "1", None),
+            ("unlabelled", gone("unlabelled"), 0, old, "<no value>", None),
+            ("live", live.clone(), 0, old, "1", None),
+            (
+                "unreachable",
+                gone("unreachable"),
+                0,
+                old,
+                "1",
+                Some("echo 'dial unix /var/run/docker.sock: connect: no such file or directory' >&2; exit 1"),
+            ),
+        ]
+        .into_iter()
+        .map(|(id, home, members, created, label, container)| {
+            let gw = name(&home);
+            let dir_label = if id == "unlabelled" { "<no value>".to_string() } else { d(&home) };
+            (
+                format!("id-{id}"),
+                gw.clone(),
+                format!("echo '{members} {created} {label} {gw}-ext id-{id} {dir_label}'"),
+                container.unwrap_or(ok_container).to_string(),
+            )
+        })
+        .collect();
+        let mismatch = name(&gone("mismatch"));
+        let replaced = name(&gone("replaced"));
+        let unreadable = name(&gone("unreadable"));
+        let mut listed: Vec<String> = rows
+            .iter()
+            .map(|r| format!("{} {}-ext", r.0, r.1))
+            .collect();
+        listed.push(format!("id-mismatch {mismatch}-ext"));
+        listed.push(format!("id-replaced {replaced}-ext"));
+        listed.push(format!("id-unreadable {unreadable}-ext"));
+        listed.push("id-foreign wicked-onboarding-dependencies_default".into());
+        let mut cases = String::new();
+        for (id, gw, inspect, container) in &rows {
+            cases.push_str(&format!("*'network inspect'*' {id}') {inspect} ;;\n"));
+            cases.push_str(&format!("*'container inspect'*' {gw}') {container} ;;\n"));
+        }
+        cases.push_str(&format!(
+            "*'network inspect'*' id-mismatch') echo '0 {old} 1 {mismatch}-ext id-mismatch {}' ;;\n",
+            d(&gone("other-home"))
+        ));
+        cases.push_str(&format!(
+            "*'network inspect'*' id-replaced') echo '0 {old} 1 someone-else id-replaced {}' ;;\n",
+            d(&gone("replaced"))
+        ));
+        cases.push_str("*'network inspect'*' id-unreadable') echo boom >&2; exit 1 ;;\n");
+        cases.push_str(&format!("*'container inspect'*) {ok_container} ;;\n"));
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
+                 case \"$*\" in\n\
+                 'network ls --filter label=wicked.gateway=1 --filter dangling=true --no-trunc --format {{{{.ID}}}} {{{{.Name}}}}') \
+                 printf '%s\\n' {listed} ;;\n\
+                 {cases}\
+                 'network rm '*) ;;\n\
+                 *) echo \"unexpected: $*\" >&2; exit 1 ;;\n\
+                 esac\nexit 0\n",
+                log = log.display(),
+                listed = listed
+                    .iter()
+                    .map(|l| format!("'{l}'"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            ),
+        );
+        let removed = sweep_gateway_bridges(&Runtime::answering(rt), NETWORK_SWEEP_AGE, now);
+        assert_eq!(removed, vec![format!("{}-ext", name(&gone("dead")))]);
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let rms: Vec<&str> = calls.lines().filter(|l| l.contains(" rm")).collect();
+        assert_eq!(rms, ["network rm id-dead"], "{calls}");
+        // The foreign network was never even inspected, and nothing was pruned or forced.
+        assert!(!calls.contains("id-foreign"), "{calls}");
+        assert!(
+            !calls.contains("prune") && !calls.contains("--force"),
+            "{calls}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A runtime that cannot list its networks: nothing is inspected or removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_gateway_bridge_sweep_that_cannot_list_removes_nothing() {
+        let dir = tmp("gw-sweep-down");
+        let log = dir.join("calls.log");
+        let rt = dir.join("docker");
+        crate::test_env::install_stub(
+            &rt,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'Cannot connect' >&2; exit 1\n",
+                log.display()
+            ),
+        );
+        assert!(sweep_gateway_bridges(&Runtime::answering(rt), NETWORK_SWEEP_AGE, 1).is_empty());
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(calls.lines().count(), 1, "{calls}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

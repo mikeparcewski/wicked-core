@@ -6822,18 +6822,38 @@ fn apply_step_result(
         && (crate::runtime_wait::is_runtime_unavailable(&output.output)
             // The floor's raw refusal reaches here only past the runner's wait (a launch it
             // saw cancelled); it is still the runtime's, never the seat's (xreview on #1129).
-            || crate::runtime_wait::is_floor_runtime_refusal(&output.output))
+            || crate::runtime_wait::is_floor_runtime_refusal(&output.output)
+            // (core#1356) The runtime answers but could not make the seat's network (its address
+            // pools ran out): the host's fault too, named as what it is.
+            || crate::runtime_wait::is_floor_network_refusal(&output.output))
     {
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         let cli = unit
             .assigned_cli
             .clone()
             .unwrap_or_else(|| "claude".to_string());
-        let why = format!(
-            "Unit {ord} ({cli}) did not run: container runtime unavailable — the host's container \
-             runtime did not answer within the wait, an infrastructure fault, not seat '{cli}''s \
-             (the seat is not benched)"
-        );
+        let network = crate::runtime_wait::is_floor_network_refusal(&output.output);
+        let pools = network
+            && output
+                .output
+                .contains(crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted.as_str());
+        let why = if network {
+            // The runtime's own error (the network's name and cause) rides after the kind's words.
+            let cause = crate::runtime_wait::floor_network_cause(&output.output)
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            format!(
+                "Unit {ord} ({cli}) did not run: the container runtime answers but could not \
+                 create the seat's network{cause} — an infrastructure fault, not seat '{cli}''s \
+                 (the seat is not benched)"
+            )
+        } else {
+            format!(
+                "Unit {ord} ({cli}) did not run: container runtime unavailable — the host's \
+                 container runtime did not answer within the wait, an infrastructure fault, not \
+                 seat '{cli}''s (the seat is not benched)"
+            )
+        };
         emit(
             subscribers,
             CoreEvent::StepFailed {
@@ -6854,11 +6874,19 @@ fn apply_step_result(
         put_node(store, unit.to_node())?;
         persist_rejected_transcript(store, &session, unit, &output.output);
         if human_present {
+            let fix = if pools {
+                "Free the runtime's address pools: list its networks (`docker network ls`) and \
+                 remove the unused ones (`docker network rm <name>`)"
+            } else if network {
+                "Fix what the runtime's error names"
+            } else {
+                "Start the container runtime (Rancher Desktop, Docker Desktop, `podman machine \
+                 start`, `colima start`)"
+            };
             let prompt = format!(
-                "{why}. Start the container runtime (Rancher Desktop, Docker Desktop, `podman \
-                 machine start`, `colima start`), then approve to retry on the same seat \
-                 (optionally amend), or reject to stop the run. Every seat runs in the same \
-                 runtime, so reassigning does not fix it."
+                "{why}. {fix}, then approve to retry on the same seat (optionally amend), or \
+                 reject to stop the run. Every seat runs in the same runtime, so reassigning does \
+                 not fix it."
             );
             pause_for_human(
                 store,

@@ -53,6 +53,48 @@ pub(crate) fn is_floor_runtime_refusal(output: &str) -> bool {
         && first.contains("its seat container did not arm — container_runtime_down")
 }
 
+/// (core#1356) Whether a failed unit's output is the floor's own refusal for a seat network the
+/// runtime could not create while it answers (`address_pools_exhausted`,
+/// `seat_network_unavailable`): the host's fault, never the seat's, and not a blip to wait out
+/// (another seat meets the same runtime). Read like [`is_floor_runtime_refusal`]: the first line
+/// only.
+pub(crate) fn is_floor_network_refusal(output: &str) -> bool {
+    let first = output.trim_start().lines().next().unwrap_or("");
+    first.starts_with("(seat '")
+        && [
+            crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted,
+            crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable,
+        ]
+        .iter()
+        .any(|k| first.contains(&format!("its seat container did not arm — {}", k.as_str())))
+}
+
+/// How a floor network refusal labels the runtime's own error it carries (core#1356).
+const NETWORK_CAUSE_LABEL: &str = " — runtime error: ";
+/// The most of that error the refusal and the gate carry.
+const NETWORK_CAUSE_CAP: usize = 400;
+
+/// The refusal's closing suffix for the runtime's network error `detail`: labelled, on one line
+/// (whitespace runs, newlines included, become one space), bounded, and closed with `)`.
+pub(crate) fn network_cause_suffix(detail: &str) -> String {
+    let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut end = flat.len().min(NETWORK_CAUSE_CAP);
+    while !flat.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{NETWORK_CAUSE_LABEL}{})", &flat[..end])
+}
+
+/// (core#1356) The runtime's own error a floor network refusal carries
+/// ([`network_cause_suffix`]): what follows its label on the refusal's first line, without the
+/// closing `)`. `None` when it carries none.
+pub(crate) fn floor_network_cause(output: &str) -> Option<String> {
+    let first = output.trim_start().lines().next()?;
+    let (_, cause) = first.split_once(NETWORK_CAUSE_LABEL)?;
+    let cause = cause.strip_suffix(')').unwrap_or(cause).trim();
+    (!cause.is_empty()).then(|| cause.to_string())
+}
+
 /// Whether `output` is the runner's "the runtime stayed down" line ([`unavailable_output`]).
 pub(crate) fn is_runtime_unavailable(output: &str) -> bool {
     output.trim_start().starts_with(UNAVAILABLE_MARKER)
@@ -527,6 +569,54 @@ mod tests {
         ));
         assert!(!is_floor_runtime_refusal(
             "(cli `claude` exited 1) Not logged in"
+        ));
+    }
+
+    /// core#1356: a seat network the answering runtime could not create is the host's fault
+    /// (routed past the seat's failure ladder), never the runtime-down wait.
+    #[test]
+    fn a_seat_network_refusal_is_the_hosts_and_is_not_waited_out() {
+        use crate::worker_sandbox::{floor_refusal_text, FloorUnarmed};
+        for k in [
+            FloorUnarmed::AddressPoolsExhausted,
+            FloorUnarmed::SeatNetworkUnavailable,
+        ] {
+            let text = floor_refusal_text("codex", k);
+            assert!(is_floor_network_refusal(&text), "{text}");
+            assert!(!is_floor_runtime_refusal(&text), "{text}");
+            // A failed unit with this output, runtime answering: returned as is, no re-run.
+            let fake = Fake::new(0);
+            let (got, ran) = fake.ride(
+                out(StepStatus::Failed, &text),
+                DEFAULT_WINDOW,
+                &mut Vec::new(),
+            );
+            assert_eq!(got.output, text);
+            assert_eq!(ran, 0);
+            assert!(fake.phases().is_empty());
+        }
+        assert!(!is_floor_network_refusal(&down_text()));
+        // The runtime's error rides labelled on the one line, newlines and embedded dashes kept.
+        let text = format!(
+            "{}{}",
+            floor_refusal_text("codex", FloorUnarmed::SeatNetworkUnavailable).trim_end_matches(')'),
+            network_cause_suffix("could not create `n` — firewall:\n  iptables refused")
+        );
+        assert!(is_floor_network_refusal(&text), "{text}");
+        assert_eq!(
+            floor_network_cause(&text).as_deref(),
+            Some("could not create `n` — firewall: iptables refused")
+        );
+        assert_eq!(
+            floor_network_cause(&floor_refusal_text(
+                "codex",
+                FloorUnarmed::SeatNetworkUnavailable
+            )),
+            None
+        );
+        // Only the floor's own first line: a worker that greps for it is not a host fault.
+        assert!(!is_floor_network_refusal(
+            "(cli `claude` exited 1) grep: its seat container did not arm — address_pools_exhausted"
         ));
     }
 }

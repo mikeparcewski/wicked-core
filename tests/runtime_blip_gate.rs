@@ -329,6 +329,88 @@ fn the_floors_raw_runtime_refusal_never_fails_over_to_another_seat() {
     assert_eq!(*runner.seats.lock().unwrap(), vec!["a".to_string()]);
 }
 
+/// (core#1356) The floor's refusal for a seat network the answering runtime could not create, as
+/// `worker_sandbox::floor_refusal_text` + the runner's appended runtime error render it.
+const POOLS_REFUSAL: &str = "(seat 'a' could not run this governed unit: its seat container did \
+not arm — address_pools_exhausted: the container runtime answers, but it has no free address pool \
+for the seat's network — list them with `docker network ls`; the unit is refused rather than run \
+outside the floor (fail closed) — every seat meets the same runtime, so fix it, then retry on the \
+same seat — runtime error: could not create the seat network `wicked-seat-a-x-1`: Error response from daemon: all \
+predefined address pools have been fully subnetted)";
+
+const NETWORK_REFUSAL: &str = "(seat 'a' could not run this governed unit: its seat container did \
+not arm — seat_network_unavailable: the container runtime answers, but it could not create the \
+seat's network (its error follows) — fix what it names, then retry; the unit is refused rather \
+than run outside the floor (fail closed) — every seat meets the same runtime, so fix it, then \
+retry on the same seat — runtime error: could not create the seat network `wicked-seat-a-x-1`: plugin \"bridge\" \
+not found)";
+
+/// The failure gate a network refusal pauses at: (prompt, the seats dispatched, any bench).
+fn network_gate(sid: &str, text: &'static str) -> (String, Vec<String>, bool) {
+    let runner = Arc::new(RuntimeDown {
+        fail_first: 1,
+        calls: AtomicU32::new(0),
+        seats: Mutex::new(Vec::new()),
+        text,
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(attended(sid, vec![cli("a"), cli("b")]))
+        .expect("launch");
+    let collected = drain(&ev, sid, true);
+    let prompt = collected
+        .iter()
+        .find_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                session,
+                gate_kind,
+                prompt,
+                ..
+            } if session == sid && gate_kind == "failure" => Some(prompt.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("the run must pause at a failure gate, got: {collected:?}"));
+    let benched = collected
+        .iter()
+        .any(|e| matches!(e, CoreEvent::SeatBenched { .. }));
+    let seats = runner.seats.lock().unwrap().clone();
+    (prompt, seats, benched)
+}
+
+#[test]
+fn a_seat_network_out_of_address_pools_pauses_as_infrastructure_naming_the_network() {
+    let (prompt, seats, benched) = network_gate("runtime-pools-exhausted", POOLS_REFUSAL);
+    assert!(
+        prompt.contains("could not create the seat's network")
+            && prompt.contains("wicked-seat-a-x-1")
+            && prompt.contains("fully subnetted")
+            && prompt.contains("docker network rm")
+            && !prompt.contains("Start the container runtime"),
+        "the gate names the network, its cause and the fix: {prompt}"
+    );
+    assert!(!benched, "no bench");
+    assert_eq!(seats, vec!["a".to_string()], "no failover");
+}
+
+#[test]
+fn another_seat_network_error_names_its_cause_and_no_pool_remedy() {
+    let (prompt, seats, benched) = network_gate("runtime-network-other", NETWORK_REFUSAL);
+    assert!(
+        prompt.contains("wicked-seat-a-x-1")
+            && prompt.contains("plugin \"bridge\" not found")
+            && prompt.contains("Fix what the runtime's error names")
+            && !prompt.contains("address pools")
+            && !prompt.contains("Start the container runtime"),
+        "{prompt}"
+    );
+    assert!(!benched, "no bench");
+    assert_eq!(seats, vec!["a".to_string()], "no failover");
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.

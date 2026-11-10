@@ -3035,11 +3035,7 @@ fn gateway_for_dir(dir: Option<&Path>) -> Result<crate::seat_gateway::Gateway, S
     let dir = dir.filter(|p| p.is_absolute()).ok_or_else(|| {
         format!("set {GATEWAY_DIR_ENV} to the daemon's absolute gateway directory")
     })?;
-    let name = crate::seat_gateway::gateway_name(dir);
-    Ok(crate::seat_gateway::Gateway {
-        external_network: format!("{name}-ext"),
-        name,
-    })
+    Ok(crate::seat_gateway::Gateway::for_dir(dir))
 }
 
 #[cfg(unix)]
@@ -3282,7 +3278,7 @@ printf '%s\n' "$*" >> "$base/calls"
 if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
 if [ "$1 $2" = 'network create' ]; then
   [ ! -e "$base/network" ] || exit 1
-  printf 'bridge false\n' > "$base/network"; exit 0
+  printf 'bridge false 1\n' > "$base/network"; exit 0
 fi
 if [ "$1 $2" = 'network inspect' ]; then cat "$base/network"; exit $?; fi
 if [ "$1 $2" = 'container inspect' ]; then

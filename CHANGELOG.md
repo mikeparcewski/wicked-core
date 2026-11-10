@@ -14,6 +14,36 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Docker running out of address pools now says so, and the engine sweeps the networks it leaks (wicked-core#1377,
+  wicked-core#1356 item 2).** A seat network create that failed was always reported as `container_runtime_down`
+  ("`<runtime> version` failed"), even while the runtime answered. The pilot then waited out host load for about 90
+  minutes while Docker had run out of address pools. The floor now classifies the failure. Docker's "all predefined
+  address pools have been fully subnetted", or podman's or nerdctl's "find free subnet", is the new
+  `address_pools_exhausted`, and its remedy is to list the networks and remove the unused ones. An error saying the
+  CLI could not reach the engine is still `container_runtime_down`, and so is any other error when a fresh liveness
+  probe finds the runtime down. Everything else is the new `seat_network_unavailable`, which also covers the
+  gateway's external bridge, carrying the runtime's own error. The actor routes both new kinds as an infrastructure
+  fault: a `failure` gate that names the network, its cause and the fix (address-pool advice only for pool
+  exhaustion), with no bench, no failover and no runtime wait.
+  The arming sweep now runs at the first arm and then at most once an hour, where it ran once per process. It prunes
+  unused seat networks after 1 hour instead of 24. A gateway's external bridge is now created with a second label,
+  `wicked.gateway.dir=<gateway dir>`. The sweep removes a bridge (`wicked-agw-<12 hex>-ext`), by its full network
+  ID, only when all of these hold:
+  - the bridge carries both labels;
+  - the runtime lists it as dangling and no container is attached;
+  - it is at least an hour old;
+  - its labelled gateway directory hashes to the bridge's name and no longer exists on this host;
+  - the runtime answers definitively that its gateway container does not exist.
+
+  A daemon whose directory is gone cannot start a gateway, so the sweep never removes a bridge another daemon is
+  about to use. A bridge made before the directory label existed is never removed. The gateway part is bounded to
+  about 45 s, beside the two prune commands. A runtime that cannot list dangling networks (nerdctl) sweeps none of
+  them. The engine adopts an existing bridge only when it carries the gateway label. A bridge create or inspection
+  that could not reach the runtime is the runtime's outage, and every bridge refusal names the bridge and a
+  redacted cause.
+  Networks the engine did not create are never touched, including the leftover `onboarding-dependencies`,
+  `docling`, `temporal` and `local` networks.
+
 - **Indexes are bounded by a budget sized from the code, not a fixed bound (wicked-crew#1481).** New
   `index_budget`: `budget = max(120 s, files × 0.30 s) × 1.15`, where files is what `git ls-files --cached --others
   --exclude-standard` lists for the tree being indexed (a walk that skips `.git` when git cannot list it, so an unknown
@@ -23,6 +53,7 @@ Two release tracks share this file, newest entry first regardless of track:
   hit. A timeout now reads `the indexer exceeded its budget of 760s for 2203 files and was killed`. New napi
   `Core.indexBudget(tree)` → `{ trackedFiles, counted: "git" | "walk", budgetMs }`, so crew's project-graph refresh uses
   the same formula instead of its own fixed 600 s.
+
 - **A repo's checkout can be re-indexed under the launch indexer's lock; a dirty-tree graph is not a run's base
   (wicked-core#1230, crew repo watcher).** New napi `indexRepoGraph(repoRef)` (`code_graph::index_checkout`): it runs
   the onboarding index step's own command, `wicked-estate index <checkout> --db <code_graph_db>`, into the repo's
