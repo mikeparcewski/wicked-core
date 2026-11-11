@@ -960,13 +960,14 @@ fn list_paths(v: &[&str]) -> String {
 }
 
 /// Why the change touches no source code, when every changed file is a KNOWN non-code type (docs,
-/// text, images, lockfiles); `None` otherwise. An unknown extension may be code, and HTML, JSON,
+/// text, images, lockfiles; never MDX, which carries code); `None` otherwise. An unknown extension may be code, and HTML, JSON,
 /// YAML and the like can carry behaviour (codex r3): those are never ruled out here.
 fn no_source_code(change: &Change) -> Option<String> {
     let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
     let known_non_code = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
-        language_of(p).is_some_and(|l| l == "markdown")
+        // (core#1381 review) MDX is markdown that carries imports, exports and JSX: code.
+        (language_of(p).is_some_and(|l| l == "markdown") && !name.ends_with(".mdx"))
             || [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
                 .iter()
                 .any(|e| name.ends_with(e))

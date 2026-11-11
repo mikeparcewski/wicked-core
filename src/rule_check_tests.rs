@@ -3972,6 +3972,23 @@ fn core1381_pol_2101_is_not_applicable_by_fact_on_a_change_with_no_code() {
         row.reason
     );
     assert!(judge.prompts.lock().unwrap().is_empty(), "no judge call");
+    // (review) MDX carries imports, exports and JSX: an MDX-only change is judged, and a
+    // substance BROKEN denies.
+    let mdx = change_of(
+        "diff --git a/pages/a.mdx b/pages/a.mdx\n--- a/pages/a.mdx\n+++ b/pages/a.mdx\n@@ -1 +1,2 @@\n # A\n+export const fmt = (d) => `${d.getFullYear()}-${d.getMonth() + 1}`;\n",
+        &["pages/a.mdx"],
+    );
+    let judge = PackJudge::with(
+        &[(
+            "POL-2101",
+            "BROKEN — pages/a.mdx hand-writes a date formatter Intl ships",
+        )],
+        &[],
+        &[],
+    );
+    let r = run_pol_2101(&mdx, &judge, &record(REC_NO_CHECK), None);
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+    assert!(r.denial().is_some());
     // A source file in the change: judged as before.
     let judge = PackJudge::with(&[("POL-2101", "BROKEN — x")], &[], &[]);
     let r = run_pol_2101(&change(), &judge, &record(REC_GOOD), None);
