@@ -2686,9 +2686,24 @@ fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
             .map(|e| (e.path, String::from_utf8(e.data).unwrap()))
             .collect::<Vec<_>>()
     };
+    let reads = || seat::HOST_READS.with(|c| c.get());
     let first = body(&r);
     assert_eq!(first, vec![("a/SKILL.md".to_string(), "one".to_string())]);
+    let n = reads();
     assert_eq!(body(&r), first, "a cached read differs from the host");
+    assert_eq!(reads(), n, "an unchanged root was read from the host again");
+    // Another skip list is another signature: read again.
+    let skipping = PlanRoot {
+        skip: vec!["zz".into()],
+        ..r.clone()
+    };
+    body(&skipping);
+    assert_eq!(reads(), n + 1);
+    // A directory moved out and back is read again (codex r2 #1).
+    std::fs::rename(skills.join("a"), base.join("a-away")).unwrap();
+    std::fs::rename(base.join("a-away"), skills.join("a")).unwrap();
+    body(&r);
+    assert_eq!(reads(), n + 2, "a moved directory kept the cached read");
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(skills.join("a/SKILL.md"), "two").unwrap();
     std::fs::write(skills.join("b.md"), "b").unwrap();
@@ -2729,9 +2744,12 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         let g = d.into_iter().find(|x| x.mode == Mode::Git).unwrap();
         (base.unwrap(), g.entries)
     };
+    let builds = || seat::GIT_BUILDS.with(|c| c.get());
     let (base1, g1) = git_of(&tree);
+    let n = builds();
     let (base2, g2) = git_of(&tree);
     assert_eq!((&base1, &g1), (&base2, &g2));
+    assert_eq!(builds(), n, "the same commit rebuilt its .git");
     std::fs::write(t.join("b.txt"), "b").unwrap();
     git_in(&t, &["add", "b.txt"]);
     git_in(&t, &["commit", "-q", "-m", "b"]);
@@ -2745,5 +2763,22 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
     };
     let (_, g4) = git_of(&masked);
     assert_ne!(g4, g3);
+    // A shallow host repository is never cached (codex r1 #6): each arm rebuilds.
+    let shallow = tmp("git-cache-shallow");
+    let src = format!("file://{}", t.display());
+    git_in(&shallow, &["clone", "-q", "--depth", "1", &src, "s"]);
+    let s = shallow.join("s");
+    let st = PlanRoot {
+        host: s.clone(),
+        ..tree.clone()
+    };
+    let shallow_git = |r: &PlanRoot| {
+        seat::copy_in_stream(None, &s, std::slice::from_ref(r), true, &Default::default()).unwrap()
+    };
+    shallow_git(&st);
+    let m = builds();
+    shallow_git(&st);
+    assert_eq!(builds(), m + 1, "a shallow host's .git was cached");
+    let _ = std::fs::remove_dir_all(&shallow);
     let _ = std::fs::remove_dir_all(&t);
 }

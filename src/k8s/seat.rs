@@ -88,8 +88,19 @@ fn root_signature(r: &PlanRoot) -> Option<[u8; 32]> {
     }
     h.update([0xff]);
     let mut listed = sync::host_plain_listing(&r.host, &r.skip).ok()?;
+    // The root and every directory on the way too (codex r2 #1): a directory moved out and back
+    // changes their metadata, not its files'.
+    let mut dirs: Vec<String> = listed
+        .iter()
+        .flat_map(|rel| {
+            let parts: Vec<&str> = rel.split('/').collect();
+            (0..parts.len()).map(move |i| parts[..i].join("/"))
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
     listed.sort();
-    for rel in &listed {
+    for rel in dirs.iter().chain(&listed) {
         let m = std::fs::symlink_metadata(r.host.join(rel)).ok()?;
         field(&mut h, rel.as_bytes());
         for n in [
@@ -131,7 +142,7 @@ fn read_cache_get(host: &Path, sig: &[u8; 32]) -> Option<Vec<Entry>> {
 fn read_cache_put(host: &Path, sig: &[u8; 32], entries: &[Entry]) {
     let size = |es: &[Entry]| {
         es.iter()
-            .map(|e| e.data.len() + e.path.len())
+            .map(|e| e.data.capacity() + e.path.capacity() + ENTRY_OVERHEAD)
             .sum::<usize>()
     };
     if entries.is_empty() || size(entries) > READ_CACHE_ROOT {
@@ -147,6 +158,9 @@ fn read_cache_put(host: &Path, sig: &[u8; 32], entries: &[Entry]) {
         }
     }
 }
+
+/// What a kept entry costs beyond its bytes (codex r2 #3: many empty files are not free).
+const ENTRY_OVERHEAD: usize = 64;
 
 /// The replica's shallow history.
 const REPLICA_DEPTH: &str = "50";
@@ -700,9 +714,15 @@ fn replica_git(
         return Ok(Some((sha, entries)));
     }
     let built = rebuild_replica_git(tree, &sha, &branch, masks, budget)?;
+    #[cfg(test)]
+    GIT_BUILDS.with(|c| c.set(c.get() + 1));
+    // Still not shallow once built (codex r2 #2): a source that changed under the build is not kept.
+    let still = bounded(tree, &["rev-parse", "--is-shallow-repository"]);
+    let cacheable =
+        cacheable && still.ok() && String::from_utf8_lossy(&still.stdout).trim() == "false";
     let size = |es: &[Entry]| {
         es.iter()
-            .map(|e| e.data.len() + e.path.len())
+            .map(|e| e.data.capacity() + e.path.capacity() + ENTRY_OVERHEAD)
             .sum::<usize>()
     };
     // Bounded in bytes (codex r1 #7): a history over a root's share is not kept, and past the
@@ -717,6 +737,13 @@ fn replica_git(
         }
     }
     Ok(Some((sha, built)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (tests) Plain roots read from the host, and replica `.git`s built, on this thread.
+    pub(crate) static HOST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static GIT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Rebuilt replica `.git`s by (tree, commit, branch, masks) (k8s-final), each at most
@@ -983,6 +1010,10 @@ pub(crate) fn copy_in_stream(
             {
                 entries.push(e);
             }
+        }
+        #[cfg(test)]
+        if read_now && r.mode == Mode::Plain {
+            HOST_READS.with(|c| c.set(c.get() + 1));
         }
         if let Some((sig, None)) = &cached {
             if root_signature(r).as_ref() == Some(sig) {
