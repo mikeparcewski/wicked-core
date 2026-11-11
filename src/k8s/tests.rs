@@ -45,6 +45,7 @@ fn seat() -> SeatPod {
         cpu_request: "100m".into(),
         gateway_ip: Some("10.43.0.50".into()),
         shutdown_time: "2026-11-11T05:00:00Z".into(),
+        deadline_secs: 3600,
     }
 }
 
@@ -195,9 +196,11 @@ fn k8s_the_seat_pod_spec_is_restricted_and_hardened() {
     let mounts = c["volumeMounts"].as_array().unwrap();
     let floor = mounts.iter().find(|m| m["mountPath"] == "/floor").unwrap();
     assert_eq!(floor["readOnly"], true);
-    // The canary and unit dirs are in memory.
+    assert_eq!(spec["activeDeadlineSeconds"], 3600);
+    // The canary and unit dirs, /tmp and HOME are in memory (bounded by the memory limit, like
+    // the container floor's tmpfs; review r1 P2).
     let vols = spec["volumes"].as_array().unwrap();
-    for name in ["canary", "unit"] {
+    for name in ["canary", "unit", "tmp", "home"] {
         let v = vols.iter().find(|v| v["name"] == name).unwrap();
         assert_eq!(v["emptyDir"]["medium"], "Memory", "{name}");
     }
@@ -326,6 +329,10 @@ fn k8s_the_broker_is_writable_only_in_the_writer_and_the_service_hides_readiness
     };
     let gateway = cs.iter().find(|c| c["name"] == "gateway").unwrap();
     let writer = cs.iter().find(|c| c["name"] == "writer").unwrap();
+    assert_eq!(
+        gateway["readinessProbe"]["tcpSocket"]["port"],
+        crate::seat_gateway::READY_PORT
+    );
     assert_eq!(mount(gateway, "/broker")["readOnly"], true);
     assert_eq!(mount(gateway, "/cfg")["readOnly"], true);
     assert!(mount(writer, "/broker").get("readOnly").is_none());
@@ -377,35 +384,87 @@ fn k8s_the_gateway_reaches_the_internet_and_named_host_ports_only() {
     assert_eq!(host["ports"][0]["port"], 8711);
 }
 
-/// D5: the engine's account may only change objects carrying its own owner label.
+/// D5 (review r1 P1): the engine's account may write only objects carrying its owner label,
+/// change or delete only objects that already carried it (no relabel takeover), and act only
+/// inside namespaces carrying it; exec and logs are bound per owned namespace, never cluster-wide;
+/// it holds no Secret, PersistentVolume or wildcard verb; the policy is applied before the grant.
 #[test]
 fn k8s_the_engine_account_cannot_change_what_it_does_not_own() {
     let docs = cluster::install_docs("o1");
-    let vap = docs
-        .iter()
-        .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
-        .unwrap();
+    let idx = |kind: &str| docs.iter().position(|d| d["kind"] == kind).unwrap();
+    assert!(idx("ValidatingAdmissionPolicy") < idx("ClusterRoleBinding"));
+    assert!(idx("ValidatingAdmissionPolicyBinding") < idx("ClusterRoleBinding"));
+    let vap = &docs[idx("ValidatingAdmissionPolicy")];
     let cond = vap["spec"]["matchConditions"][0]["expression"]
         .as_str()
         .unwrap();
     assert!(cond.contains("system:serviceaccount:wicked-sys-o1:wicked-engine"));
-    let rule = vap["spec"]["validations"][0]["expression"]
-        .as_str()
-        .unwrap();
-    assert!(rule.contains("'wicked.dev/owner'] == 'o1'"));
     assert_eq!(vap["spec"]["failurePolicy"], "Fail");
     let ops = &vap["spec"]["matchConstraints"]["resourceRules"][0]["operations"];
     assert_eq!(ops, &json!(["CREATE", "UPDATE", "DELETE"]));
-    let binding = docs
+    let rules: Vec<String> = vap["spec"]["validations"]
+        .as_array()
+        .unwrap()
         .iter()
-        .find(|d| d["kind"] == "ValidatingAdmissionPolicyBinding")
-        .unwrap();
+        .map(|v| v["expression"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(rules.len(), 3);
+    assert!(rules[0].starts_with("request.operation == 'DELETE' || (object != null"));
+    assert!(rules[1].starts_with("request.operation == 'CREATE' || (oldObject != null"));
+    assert!(rules[2].contains("namespaceObject != null"));
+    for r in &rules {
+        assert!(r.contains("['wicked.dev/owner'] == 'o1'"), "{r}");
+        assert!(!r.contains("|| true"));
+    }
+    let binding = &docs[idx("ValidatingAdmissionPolicyBinding")];
     assert_eq!(binding["spec"]["validationActions"], json!(["Deny"]));
-    // The role grants no secret access and no cluster-admin verbs.
-    let role = docs.iter().find(|d| d["kind"] == "ClusterRole").unwrap();
-    let text = role["rules"].to_string();
-    assert!(!text.contains("\"secrets\""));
-    assert!(!text.contains("\"*\""));
+    let main = docs
+        .iter()
+        .find(|d| d["kind"] == "ClusterRole" && d["metadata"]["name"] == "wicked-engine-o1")
+        .unwrap();
+    let text = main["rules"].to_string();
+    for banned in [
+        "\"secrets\"",
+        "\"*\"",
+        "persistentvolumes\"",
+        "pods/exec",
+        "pods/log",
+        "escalate",
+        "impersonate",
+    ] {
+        assert!(!text.contains(banned), "{banned} in the cluster-wide role");
+    }
+    // exec/logs: a ClusterRole bound only by RoleBindings in owned namespaces.
+    assert!(!docs.iter().any(|d| d["kind"] == "ClusterRoleBinding"
+        && d["roleRef"]["name"] == cluster::exec_role_name("o1")));
+    let rb = cluster::exec_role_binding("wicked-run-o1-x", "o1");
+    assert_eq!(rb["kind"], "RoleBinding");
+    assert_eq!(rb["metadata"]["namespace"], "wicked-run-o1-x");
+    assert_eq!(rb["metadata"]["labels"][OWNER_LABEL], "o1");
+    // No long-lived token Secret in the cluster's datastore.
+    assert!(!docs.iter().any(|d| d["kind"] == "Secret"));
+}
+
+/// Review r1 P2: a delete is bound to the exact object the ownership check read.
+#[test]
+fn k8s_a_namespace_delete_is_bound_to_the_object_that_was_checked() {
+    let obj = json!({"metadata": {"uid": "u-1", "resourceVersion": "42"}});
+    let d = cluster::delete_preconditions(&obj).unwrap();
+    assert_eq!(d["preconditions"]["uid"], "u-1");
+    assert_eq!(d["preconditions"]["resourceVersion"], "42");
+    assert!(cluster::delete_preconditions(&json!({"metadata": {}})).is_err());
+}
+
+/// Review r1 P2: the engine's credential is a TokenRequest token, renewed from its expiry.
+#[test]
+fn k8s_the_engine_token_expiry_is_read_for_renewal() {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1900000000}"#);
+    assert_eq!(
+        cluster::token_expiry(&format!("h.{payload}.s")),
+        Some(1_900_000_000)
+    );
+    assert_eq!(cluster::token_expiry("not-a-jwt"), None);
 }
 
 /// D5: the controller is the pinned release, byte for byte and by image.
@@ -413,42 +472,63 @@ fn k8s_the_engine_account_cannot_change_what_it_does_not_own() {
 fn k8s_the_controller_is_the_pinned_release() {
     assert!(cluster::check_manifest(cluster::AGENT_SANDBOX_MANIFEST).is_ok());
     assert!(cluster::check_manifest("kind: Namespace").is_err());
-    let dep = |image: &str, avail: u64| {
-        json!({"spec": {"template": {"spec": {"containers": [{"image": image}]}}},
-               "status": {"availableReplicas": avail}})
+    let dep = |image: &str, observed: u64, updated: u64, avail: u64| {
+        json!({"metadata": {"generation": 2},
+               "spec": {"replicas": 1, "template": {"spec": {"containers": [{"image": image}]}}},
+               "status": {"observedGeneration": observed, "updatedReplicas": updated,
+                          "availableReplicas": avail}})
     };
-    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 1)).is_ok());
-    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 0)).is_err());
-    assert!(cluster::judge_controller(&dep("registry.k8s.io/x:v1.0.9", 1)).is_err());
+    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 2, 1, 1)).is_ok());
+    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 2, 1, 0)).is_err());
+    assert!(cluster::judge_controller(&dep("registry.k8s.io/x:v1.0.9", 2, 1, 1)).is_err());
+    // Review r1 P2: an old ReplicaSet's available pods under the new template are not the pin.
+    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 1, 0, 1)).is_err());
+    assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 2, 0, 1)).is_err());
 }
 
 /// C1: the sweep only ever acts on this daemon's run namespaces; a live run keeps its
 /// namespace and loses only an earlier engine's pods.
 #[test]
 fn k8s_sweep_touches_only_this_daemons_labelled_namespaces() {
-    let ns = |name: &str, owner: &str, role: &str, run: &str| json!({"metadata": {"name": name, "labels": {OWNER_LABEL: owner, ROLE_LABEL: role, RUN_LABEL: run}}});
+    let ns = |name: &str, owner: &str, role: &str, run: &str| {
+        json!({"metadata": {"name": name,
+                            "labels": {OWNER_LABEL: owner, ROLE_LABEL: role, RUN_LABEL: label_value(run)},
+                            "annotations": {(render::RUN_ID_ANNOTATION): run}}})
+    };
+    // Review r1 P1: an id the label had to sanitize is still matched to its live run.
+    let long_live = format!("r:live/{}", "x".repeat(80));
     let all = vec![
-        ns("a", "me", "run", "r-live"),
+        ns("a", "me", "run", &long_live),
         ns("b", "me", "run", "r-done"),
         ns("c", "other", "run", "r-done"),
         ns("d", "me", "daemon", ""),
+        json!({"metadata": {"name": "e", "labels": {OWNER_LABEL: "me", ROLE_LABEL: "run"}}}),
         json!({"metadata": {"name": "kube-system"}}),
     ];
-    let plan = cluster::sweep_plan(&all, "me", &|r| r == "r-live");
+    let plan = cluster::sweep_plan(&all, "me", &|r| r == long_live);
     assert_eq!(
         plan,
         vec![
             SweepAction::ReapStalePods("a".into()),
             SweepAction::DeleteNamespace("b".into()),
-        ]
+        ],
+        "a run namespace with no exact run id is never deleted"
+    );
+    let docs =
+        render::run_namespace_docs("ns", "me", &long_live, "d", &RunBudget::default(), "1Gi");
+    assert_eq!(
+        docs[0]["metadata"]["annotations"][render::RUN_ID_ANNOTATION],
+        long_live.as_str()
     );
 }
 
 #[test]
 fn k8s_only_a_ready_undeleted_pod_is_running() {
     let pod = |name: &str, phase: &str, ready: bool, deleting: bool| {
+        let cond = if ready { "True" } else { "False" };
         let mut p = json!({"metadata": {"name": name},
-                           "status": {"phase": phase, "containerStatuses": [{"ready": ready}]}});
+                           "status": {"phase": phase, "containerStatuses": [{"ready": ready}],
+                                      "conditions": [{"type": "Ready", "status": cond}]}});
         if deleting {
             p["metadata"]["deletionTimestamp"] = json!("2026-11-11T00:00:00Z");
         }
@@ -487,13 +567,14 @@ fn k8s_a_delete_is_refused_for_an_object_this_daemon_does_not_own() {
 
 #[test]
 fn k8s_the_engine_kubeconfig_names_only_its_own_context() {
-    let cfg = cluster::engine_kubeconfig("https://127.0.0.1:6443", Some("Q0E="), false, "tok");
+    // Review r1 P2: the admin context's whole (flattened) cluster entry is kept.
+    let cluster_entry = json!({"server": "https://127.0.0.1:6443", "certificate-authority-data": "Q0E=",
+                               "tls-server-name": "k8s.local", "proxy-url": "http://p:3128"});
+    let cfg = cluster::engine_kubeconfig(cluster_entry.clone(), "tok");
     assert_eq!(cfg["current-context"], OWN_CONTEXT);
     assert_eq!(cfg["contexts"].as_array().unwrap().len(), 1);
     assert_eq!(cfg["users"][0]["user"]["token"], "tok");
-    assert!(cfg["clusters"][0]["cluster"]
-        .get("insecure-skip-tls-verify")
-        .is_none());
+    assert_eq!(cfg["clusters"][0]["cluster"], cluster_entry);
 }
 
 #[cfg(unix)]
@@ -506,13 +587,14 @@ fn k8s_a_bounded_call_feeds_stdin_and_reports_the_exit() {
         owner: "o".into(),
     };
     // `sh --context x -c ...` is not runnable; use run_bounded directly.
+    use wicked_apps_core::HardenedCommand;
     let mut c = std::process::Command::new("/bin/sh");
-    c.args(["-c", "cat; exit 3"]);
+    c.hardened().args(["-c", "cat; exit 3"]);
     let r = run_bounded(c, Some(b"hello"), std::time::Duration::from_secs(20));
     assert_eq!(r.code, Some(3));
     assert_eq!(r.stdout, b"hello");
     let mut slow = std::process::Command::new("/bin/sh");
-    slow.args(["-c", "sleep 30"]);
+    slow.hardened().args(["-c", "sleep 30"]);
     let r = run_bounded(slow, None, std::time::Duration::from_millis(300));
     assert_eq!(r.code, None);
     assert_eq!(k.owner, "o");
@@ -522,30 +604,40 @@ fn k8s_a_bounded_call_feeds_stdin_and_reports_the_exit() {
 /// `pids.max` (which reads `max` under the cgroup namespace even when the pod is limited).
 #[test]
 fn k8s_a_pod_without_a_pids_limit_is_refused() {
+    let net = "net=closed\nnet=closed\n";
+    let fork = "sh: can't fork: Resource temporarily unavailable\n";
+    let counts = |n: u32| -> String { (1..=n).map(|i| format!("{i}\n")).collect() };
     // The cluster's real answer at --pod-max-pids=4096 (lane data/pids-probe.txt).
-    let mut limited: String = (1..=4094).map(|i| format!("{i}\n")).collect();
-    limited.push_str("sh: can't fork: Resource temporarily unavailable\n");
-    assert_eq!(render::pids_probe_verdict(&limited), Ok(4094));
-    let mut unbounded: String = (1..=4160).map(|i| format!("{i}\n")).collect();
-    unbounded.push_str("unbounded\n");
+    assert_eq!(
+        render::pids_probe_verdict(&format!("{net}{}{fork}", counts(4094))),
+        Ok(4094)
+    );
+    let unbounded = format!("{net}{}unbounded\n", counts(4160));
     assert!(render::pids_probe_verdict(&unbounded).is_err());
-    // A limit above Docker's 4096 is not parity.
-    let mut high: String = (1..=4150).map(|i| format!("{i}\n")).collect();
-    high.push_str("sh: can't fork: Resource temporarily unavailable\n");
-    assert!(render::pids_probe_verdict(&high).is_err());
+    // Review r1 P3: a limit above 4096 (4095 children = a 4097 cap) is not parity.
+    assert!(render::pids_probe_verdict(&format!("{net}{}{fork}", counts(4095))).is_err());
+    // Review r1 P2: a refusal far below the limit is pressure elsewhere, never a pass.
+    assert!(render::pids_probe_verdict(&format!("{net}{}{fork}", counts(1200))).is_err());
     // A probe that died for another reason proves nothing.
-    assert!(render::pids_probe_verdict("1\n2\n3\n").is_err());
+    assert!(render::pids_probe_verdict(&format!("{net}1\n2\n3\n")).is_err());
     assert!(render::pids_probe_verdict("").is_err());
-    let pod = render::pids_probe_pod("ns", "o", "p", "wicked-floor:x");
+    // Review r1 P1: a cluster that lets a deny-all pod reach the API server or the kubelet
+    // does not enforce NetworkPolicy: refused, whatever the pids answer.
+    let open = format!("net=open\nnet=closed\n{}{fork}", counts(4094));
+    assert!(render::pids_probe_verdict(&open)
+        .unwrap_err()
+        .contains("NetworkPolicy"));
+    assert!(render::pids_probe_verdict(&format!("{}{fork}", counts(4094))).is_err());
+    let pod = render::pids_probe_pod("ns", "o", "p", "wicked-floor:x", "node-1");
+    assert_eq!(pod["spec"]["nodeName"], "node-1");
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
     assert_eq!(
         pod["spec"]["containers"][0]["securityContext"]["readOnlyRootFilesystem"],
         true
     );
-    assert!(pod["spec"]["containers"][0]["command"][3]
-        .as_str()
-        .unwrap()
-        .contains("-lt 4160"));
+    let script = pod["spec"]["containers"][0]["command"][3].as_str().unwrap();
+    assert!(script.contains("-lt 4160"));
+    assert!(script.contains("$KUBERNETES_SERVICE_HOST 443") && script.contains("$HOST_IP 10250"));
 }
 
 #[test]

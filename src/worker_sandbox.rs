@@ -341,8 +341,8 @@ pub(crate) enum FloorUnarmed {
     ControllerMissing,
     // Constructed by the seat arm (B-2 of the stacked k8s-swap series); the allowance goes with it.
     #[allow(dead_code)]
-    /// Kubernetes runner: the seat's pod is waiting for room (its namespace quota or the node's
-    /// memory): a wait, never the seat's failure.
+    /// Kubernetes runner: the seat's pod was refused by its run's quota (an admission 403) or is
+    /// held Pending by the scheduler: a wait and a retry, never the seat's failure.
     AdmissionPending,
     #[allow(dead_code)]
     /// Kubernetes runner: the seat's image is not in the cluster's image store (pods never pull).
@@ -354,8 +354,8 @@ pub(crate) enum FloorUnarmed {
     /// Kubernetes runner: the exec stream to the seat was lost before the CLI's exit code was
     /// known: never read as the CLI's own result.
     ExecStreamLost,
-    /// Kubernetes runner: the cluster sets no pids limit on pods (`pids.max` is `max`), so a seat
-    /// could fork without bound (PARITY B2).
+    /// Kubernetes runner: the engine's probe found no pod pids limit of at most 4096 (measured by
+    /// forking: a container's own `pids.max` reads `max` even under a pod limit), PARITY B2.
     PidsUnlimited,
 }
 
@@ -458,8 +458,9 @@ impl FloorUnarmed {
                  installed at the pinned version — run `wicked-core cluster install`"
             }
             FloorUnarmed::AdmissionPending => {
-                "admission_pending: the seat's pod is waiting for room in the cluster (the run's \
-                 quota or the node's memory); it starts when other work ends"
+                "admission_pending: the seat's pod could not start yet: the run's quota refused its \
+                 creation, or the scheduler holds it for the node's memory; it is retried when other \
+                 work ends"
             }
             FloorUnarmed::ImageUnavailable => {
                 "image_unavailable: the seat's image is not in the cluster's image store (pods never \
@@ -475,9 +476,10 @@ impl FloorUnarmed {
                  finished, so the unit has no result; it is re-run, never read as the CLI's exit"
             }
             FloorUnarmed::PidsUnlimited => {
-                "pids_unlimited: the cluster sets no process limit on pods, so a seat could fork \
-                 without bound — set the kubelet's pod-max-pids (Rancher Desktop: a k3s argument), \
-                 then retry"
+                "pids_unlimited: the engine's probe pod forked past the pod process limit it requires \
+                 (4096) without refusal, or its refusal was not the pod's own limit, so a seat could \
+                 fork without bound — set the kubelet's pod-max-pids to 4096 (Rancher Desktop: a k3s \
+                 argument), then retry"
             }
         }
     }
