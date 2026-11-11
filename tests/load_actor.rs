@@ -21,9 +21,9 @@
 //! `WICKED_LOAD_RUNS=10 WICKED_LOAD_FILES=1300 WICKED_LOAD_SECS=120 \
 //!  cargo test --test load_actor -- --ignored --nocapture`
 //! (core#1429) `WICKED_LOAD_GATES=1` pauses every unit at a gate (`human_confirm: all`) and a gate
-//! thread answers them: Approve, and Stop (a cancel) at the second gate of every third run. Each
-//! run's first unit leaves `WICKED_LOAD_IGNORED` (3000) ignored files under `node_modules/`, so a
-//! Stop reaps a tree with a dependency directory, as a studio run's is. The run then ASSERTS that
+//! thread answers them: Approve, and Stop (a cancel) at the second gate of every third run, after
+//! writing `WICKED_LOAD_IGNORED` (3000) ignored files under the run's `node_modules/`, so a Stop
+//! reaps a tree with a dependency directory, as a studio run's is. The run then ASSERTS that
 //! no actor command took a second or more (`gate` samples time each answer).
 //!
 //! Knobs: `WICKED_LOAD_RUNS` (3), `WICKED_LOAD_FILES` (1300), `WICKED_LOAD_UNITS` (4),
@@ -100,8 +100,6 @@ struct LoadSeat {
     lo_ms: u64,
     hi_ms: u64,
     seq: AtomicU64,
-    /// (core#1429) Ignored files the first unit of a run leaves under `node_modules/`.
-    ignored: u64,
 }
 impl StepRunner for LoadSeat {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
@@ -110,17 +108,6 @@ impl StepRunner for LoadSeat {
         let span = self.hi_ms.saturating_sub(self.lo_ms).max(1);
         let ms = self.lo_ms + (n.wrapping_mul(2_654_435_761) % span);
         std::thread::sleep(Duration::from_millis(ms));
-        // An installed dependency directory: ignored, so the tree stays clean, and a reap deletes it.
-        if self.ignored > 0 && input.unit.ord == 1 {
-            if let Some(wd) = input.workdir.as_deref() {
-                for i in 0..self.ignored {
-                    let dir = wd.join(format!("node_modules/p{:03}", i / 100));
-                    std::fs::create_dir_all(&dir).expect("the fixture's dependency directory");
-                    std::fs::write(dir.join(format!("i{i:05}.js")), "module.exports = 1;\n")
-                        .expect("a fixture dependency file");
-                }
-            }
-        }
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
@@ -356,7 +343,6 @@ fn actor_latency_under_concurrent_runs() {
             lo_ms,
             hi_ms,
             seq: AtomicU64::new(0),
-            ignored,
         }),
     );
     core.register_workflow(workflow(units)).expect("workflow");
@@ -509,13 +495,27 @@ fn actor_latency_under_concurrent_runs() {
                         *e += 1;
                         *e
                     };
-                    // A Stop only over a populated tree: the reap it measures deletes one.
-                    let populated = v
-                        .session
-                        .workdir
-                        .as_deref()
-                        .is_some_and(|w| std::path::Path::new(w).join("node_modules").is_dir());
-                    let stop_here = n.is_multiple_of(3) && k >= 2 && populated;
+                    // A Stop reaps a populated tree: an installed dependency directory, ignored
+                    // (so the tree stays clean and the reap deletes it), written here while the
+                    // run waits at its gate (a read-only phase's seat cannot write it).
+                    let stop_here = n.is_multiple_of(3) && k == 2;
+                    if stop_here {
+                        let wd = v
+                            .session
+                            .workdir
+                            .as_deref()
+                            .expect("a run on a repo has a tree");
+                        for i in 0..ignored {
+                            let dir = std::path::Path::new(wd)
+                                .join(format!("node_modules/p{:03}", i / 100));
+                            std::fs::create_dir_all(&dir).expect("the fixture's dependency dir");
+                            std::fs::write(
+                                dir.join(format!("i{i:05}.js")),
+                                "module.exports = 1;\n",
+                            )
+                            .expect("a fixture dependency file");
+                        }
+                    }
                     let decision = if stop_here {
                         wicked_core::HumanDecision::Reject
                     } else {
