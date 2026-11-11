@@ -4994,6 +4994,13 @@ impl WrappedCliStepRunner {
                     files,
                     tools,
                 ),
+                Ok((-1, out, err, usage, files, tools)) if err.starts_with(SETTLE_FAILED) => (
+                    StepStatus::Failed,
+                    settle_failure_output(&argv[0], &err, &out),
+                    usage,
+                    files,
+                    tools,
+                ),
                 Ok((code, out, err, _, _, tools)) => {
                     // An engine-internal session (judge, triage, council ballot) keeps BOTH
                     // streams: its caller classifies the refusal from this text, and a CLI that
@@ -7458,6 +7465,21 @@ const TIMED_OUT: &str = "__wicked_timed_out__";
 /// deadline is the engine's own turn ceiling. Collapsing them re-creates the 616c8661 ambiguity
 /// where a turn-timeout and an operator cancel are indistinguishable downstream.
 const CANCELLED: &str = "__wicked_cancelled__";
+/// The unit output of a seat pod whose settlement failed: the could-not-run line first (what
+/// classifiers read), then whatever the CLI printed.
+pub(crate) fn settle_failure_output(argv0: &str, err: &str, out: &str) -> String {
+    let why = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
+    let head = format!("{COULD_NOT_RUN_PREFIX}{argv0}`: {why})");
+    if out.trim().is_empty() {
+        head
+    } else {
+        format!("{head}\n{out}")
+    }
+}
+
+/// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
+/// write-back was refused): could not run, the reason after the prefix, the CLI's output kept.
+pub(crate) const SETTLE_FAILED: &str = "__wicked_settle_failed__";
 
 /// Upper bound on retained tool names per unit turn (FINDING-046 review, Copilot). `output` is capped
 /// at `MAX_OUT`; `tools` needs its own ceiling or a hung/looping CLI emitting `tool_use` blocks with
@@ -7746,7 +7768,12 @@ pub(crate) fn run_bounded(
         match crate::k8s::seat::settle(seat, ending) {
             Ok(c) if killed_by.is_none() => code = c,
             Ok(_) => {}
-            Err(e) => return Err(std::io::Error::other(e)),
+            // Could not run, with no trusted exit code, but what the CLI produced is kept as the
+            // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
+            // minutes of output, usage and tool records.
+            Err(e) => {
+                return Ok((-1, out, format!("{SETTLE_FAILED}{e}"), usage, files, tools));
+            }
         }
     }
     if let Some(sentinel) = killed_by {

@@ -223,12 +223,9 @@ fn ignorable(c: char) -> bool {
 
 /// Whether a path component names a git dir on any host file system.
 pub(crate) fn is_git_name(c: &str) -> bool {
-    let folded: String = c
-        .chars()
-        .filter(|c| !ignorable(*c))
-        .collect::<String>()
-        .trim_end_matches(['.', ' '])
-        .to_ascii_lowercase();
+    let folded: String = c.chars().filter(|c| !ignorable(*c)).collect::<String>();
+    let folded = fold(&folded);
+    let folded = folded.trim_end_matches(['.', ' ']);
     folded == ".git" || folded == "git~1"
 }
 
@@ -272,11 +269,16 @@ pub(crate) fn link_stays_inside(rel: &str, target: &[u8]) -> bool {
 }
 
 /// A path as a case-insensitive, normalizing host file system compares it (review r1: a mask
-/// for `.env` must also cover `.ENV`): ignorable characters dropped, lowercased.
+/// for `.env` must also cover `.ENV`): decomposed (NFD, so `\u{e9}` and `e\u{301}` agree, review
+/// r3), ignorable characters dropped, and case-folded through upper then lower case (so `\u{17f}`,
+/// the long s, folds to `s` as APFS folds it, review r3). Coarser than any one file system's rule
+/// on purpose: two names it folds together are refused or masked, never both written.
 pub(crate) fn fold(p: &str) -> String {
-    p.chars()
+    use unicode_normalization::UnicodeNormalization as _;
+    p.nfd()
         .filter(|c| !ignorable(*c))
         .collect::<String>()
+        .to_uppercase()
         .to_lowercase()
 }
 
@@ -374,9 +376,9 @@ pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, 
         if parts.iter().any(|c| is_git_name(c)) {
             return Err(format!("`{}` is inside a git dir", e.path));
         }
-        if !seen.insert(e.path.to_ascii_lowercase()) {
+        if !seen.insert(fold(&e.path)) {
             return Err(format!(
-                "`{}` appears twice (or twice in different case)",
+                "`{}` appears twice (or twice in a spelling the host folds together)",
                 e.path
             ));
         }
@@ -481,8 +483,22 @@ pub(crate) fn git(dir: &Path) -> std::process::Command {
     c
 }
 
-/// Read one host file or link for the copy-in, never following a link. `None` = gone or not a
-/// file or link (left out).
+/// What reading `rel` under `root` would add to a stream (its size, never following a link), for
+/// a caller's running budget. `0` = gone or not a file or link.
+pub(crate) fn entry_size(root: &Path, rel: &str) -> u64 {
+    std::fs::symlink_metadata(root.join(rel))
+        .map(|m| {
+            if m.file_type().is_file() {
+                m.len()
+            } else {
+                256
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Read one host file or link for the copy-in, never following a link. `None` = gone, not a
+/// file or link, or larger than a whole stream (left out).
 pub(crate) fn read_host_entry(root: &Path, rel: &str) -> Option<Entry> {
     let p = root.join(rel);
     let md = std::fs::symlink_metadata(&p).ok()?;
@@ -510,7 +526,21 @@ pub(crate) fn read_host_entry(root: &Path, rel: &str) -> Option<Entry> {
             return None;
         }
     }
-    let data = std::fs::read(&p).ok()?;
+    // Never more than one stream's worth (review r3: a tracked multi-gigabyte file, or one still
+    // growing, would fill the engine's memory before the copy-in's size check): a larger file is
+    // left out here and refused by the caller's budget ([`entry_size`]).
+    let mut data = Vec::new();
+    {
+        use std::io::Read as _;
+        std::fs::File::open(&p)
+            .ok()?
+            .take(MAX_STREAM + 1)
+            .read_to_end(&mut data)
+            .ok()?;
+    }
+    if data.len() as u64 > MAX_STREAM {
+        return None;
+    }
     #[cfg(unix)]
     let exec = {
         use std::os::unix::fs::PermissionsExt;
@@ -583,6 +613,51 @@ pub(crate) struct Applied {
     pub(crate) deleted: usize,
 }
 
+/// The paths the seat may never write, as the host's own file system resolves them (review r2:
+/// on APFS `.ſsh` names `.ssh`; no case or normalization rule of ours can know that, the inode
+/// can). `Err` names the first of `paths` (relative to `root`) whose path, or any ancestor of
+/// it, is one of `guard`. Run for every root before any is applied (review r3), and for every
+/// path an imported commit changes, which no file write may show (review r3).
+#[cfg(unix)]
+pub(crate) fn guard_refusal<'a>(
+    root: &Path,
+    guard: &[String],
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let guarded: std::collections::HashSet<(u64, u64)> = guard
+        .iter()
+        .filter_map(|g| std::fs::symlink_metadata(root.join(g)).ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect();
+    if guarded.is_empty() {
+        return Ok(());
+    }
+    let hits = |rel: &str| -> bool {
+        let mut cur = root.to_path_buf();
+        rel.split('/').any(|c| {
+            cur.push(c);
+            std::fs::symlink_metadata(&cur).is_ok_and(|m| guarded.contains(&(m.dev(), m.ino())))
+        })
+    };
+    match paths.into_iter().find(|p| hits(p)) {
+        Some(p) => Err(format!(
+            "`{p}` is a path the seat may not write (it names a masked path on this host)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Windows hosts run no seat pods (the seat runner is Unix-only).
+#[cfg(not(unix))]
+pub(crate) fn guard_refusal<'a>(
+    _root: &Path,
+    _guard: &[String],
+    _paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    Ok(())
+}
+
 /// Apply checked `entries` and `delete` to the host `root` with a no-follow walk: deletions
 /// first, then each file or link replaced by rename. Never follows a link on the way.
 #[cfg(unix)]
@@ -594,36 +669,14 @@ pub(crate) fn apply(
     delete: &[String],
     guard: &[String],
 ) -> Result<Applied, String> {
-    // The paths the seat may never write, as the host's own file system resolves them (review
-    // r2: on APFS `.ſsh` names `.ssh`; no case or normalization rule of ours can know that, the
-    // inode can). An entry or a deletion whose path, or any ancestor of it, is one of them is
-    // refused.
-    let guarded: std::collections::HashSet<(u64, u64)> = guard
-        .iter()
-        .filter_map(|g| std::fs::symlink_metadata(root.join(g)).ok())
-        .map(|m| {
-            use std::os::unix::fs::MetadataExt;
-            (m.dev(), m.ino())
-        })
-        .collect();
-    let hits_guard = |rel: &str| -> bool {
-        use std::os::unix::fs::MetadataExt;
-        let mut cur = root.to_path_buf();
-        rel.split('/').any(|c| {
-            cur.push(c);
-            std::fs::symlink_metadata(&cur).is_ok_and(|m| guarded.contains(&(m.dev(), m.ino())))
-        })
-    };
-    if let Some(p) = entries
-        .iter()
-        .map(|e| e.path.as_str())
-        .chain(delete.iter().map(String::as_str))
-        .find(|p| hits_guard(p))
-    {
-        return Err(format!(
-            "`{p}` is a path the seat may not write (it names a masked path on this host)"
-        ));
-    }
+    guard_refusal(
+        root,
+        guard,
+        entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .chain(delete.iter().map(String::as_str)),
+    )?;
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = |s: &str| CString::new(s).map_err(|_| format!("`{s}` has a NUL"));
@@ -873,7 +926,11 @@ def comps(rel):
     if any(c in ("", ".", "..") for c in p): die("bad path " + repr(rel))
     return p
 IGN = set(range(0x200B, 0x2010)) | set(range(0x202A, 0x202F)) | set(range(0x2060, 0x2070)) | {0xFEFF}
-def fold(p): return "".join(c for c in p if ord(c) not in IGN).lower()
+try:
+    from unicodedata import normalize as _nfd
+except ImportError:
+    _nfd = lambda form, p: p
+def fold(p): return "".join(c for c in _nfd("NFD", p) if ord(c) not in IGN).upper().lower()
 def under(rel, pre):
     rel, pre = fold(rel), fold(pre)
     return rel == pre or rel.startswith(pre + "/")
@@ -1053,6 +1110,9 @@ def pack(plan):
 def bundle(tree, base):
     root = R + "/" + tree
     head = git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if base == "-":
+        if head.returncode == 0: die("the seat made a first commit in a tree with no history")
+        return
     if head.returncode != 0: die("the replica has no HEAD commit")
     if head.stdout.decode().strip() == base: return
     path = "/tmp/wicked-unit-%d-%s.bundle" % (os.getpid(), os.urandom(8).hex())

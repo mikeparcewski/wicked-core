@@ -53,6 +53,19 @@ impl Volume {
             Volume::Broker => "/broker",
         }
     }
+
+    fn tag(self) -> &'static str {
+        match self {
+            Volume::Config => "cfg",
+            Volume::Broker => "broker",
+        }
+    }
+}
+
+/// The `$0` marker every write of `<v>/<file>` runs under (followed by a unique suffix): the
+/// next write of that file finds an earlier one still running by it ([`write_script`]).
+pub(crate) fn write_marker(v: Volume, file: &str) -> String {
+    format!("wicked-writer-W-{}-{file}-", v.tag())
 }
 
 /// A plain file name a writer script may carry (no path, quote or shell character).
@@ -76,8 +89,19 @@ pub(crate) fn write_script(v: Volume, file: &str, digest: &str) -> Result<String
         return Err("not a sha256 digest".into());
     }
     let d = v.dir();
+    let m = write_marker(v, file);
+    let first = &m[..1];
+    let rest = &m[1..];
     Ok(format!(
-        "set -e; umask 077; t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
+        // The fence (review r3): an earlier write of this file whose client timed out may still
+        // be running in the writer (exec does not end it), and could rename a stale body over
+        // this one after it lands. Every such write is killed first (`$0` is its marker; `[x]y`
+        // keeps the pattern from matching this script's own text), and any rename it already
+        // started is waited out, before this body is taken.
+        "set -e; umask 077; \
+         for p in $(pgrep -f '[{first}]{rest}'); do [ \"$p\" = \"$$\" ] || kill -9 \"$p\" 2>/dev/null || :; done; \
+         i=0; while pgrep -f '[m]v -f {d}/.{file}.' >/dev/null; do i=$((i+1)); [ $i -lt 200 ] || exit 68; sleep 0.05; done; \
+         t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
          [ \"$(sha256sum \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'wicked-writer: the body did not arrive whole' >&2; exit 65; }}; \
          mv -f \"$t\" {d}/{file}; trap - EXIT"
     ))
@@ -144,7 +168,18 @@ impl Gw {
     /// One exec into the writer: `sh -c script` with `$0` = a unique marker (a dead engine's
     /// leftover is findable by it), stdin when given.
     pub(crate) fn exec(&self, script: &str, stdin: Option<&[u8]>, limit: Duration) -> Called {
-        let marker = format!("wicked-writer-{}", uuid::Uuid::new_v4().simple());
+        self.exec_marked("wicked-writer-", script, stdin, limit)
+    }
+
+    /// [`Gw::exec`] under `$0` = `prefix` + a unique suffix.
+    fn exec_marked(
+        &self,
+        prefix: &str,
+        script: &str,
+        stdin: Option<&[u8]>,
+        limit: Duration,
+    ) -> Called {
+        let marker = format!("{prefix}{}", uuid::Uuid::new_v4().simple());
         let mut args = vec!["exec"];
         if stdin.is_some() {
             args.push("-i");
@@ -166,7 +201,10 @@ impl Gw {
     pub(crate) fn write_file(&self, v: Volume, file: &str, body: &[u8]) -> Result<(), String> {
         let digest = super::hex(&Sha256::digest(body));
         let script = write_script(v, file, &digest)?;
-        let r = self.exec(&script, Some(body), EXEC_TIMEOUT);
+        // One write at a time from this engine: the fence in the script ends any earlier write
+        // of the same file, which must only ever be an orphan, never a sibling of ours.
+        let _one = WRITES.lock().unwrap_or_else(|p| p.into_inner());
+        let r = self.exec_marked(&write_marker(v, file), &script, Some(body), EXEC_TIMEOUT);
         if r.ok() {
             Ok(())
         } else {
@@ -244,6 +282,9 @@ impl Gw {
         out
     }
 }
+
+/// Serializes this engine's writer writes ([`Gw::write_file`]).
+static WRITES: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The empty credential file of every route (a reload naming a missing file is refused).
 fn init_broker_script(config: &crate::seat_gateway::GatewayConfig) -> String {
@@ -364,16 +405,7 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
         writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
         // A quarantine whose rotation did not land is finished first (review r2): the
         // gateway never starts again on the token it was stopped under.
-        boot: {
-            let pending = ROTATE.lock().is_ok_and(|q| q.iter().any(|d| d == dir));
-            let t = boot_token(dir, pending).map_err(gwerr)?;
-            if pending {
-                if let Ok(mut q) = ROTATE.lock() {
-                    q.retain(|d| d != dir);
-                }
-            }
-            t
-        },
+        boot: boot_for_start(dir).map_err(gwerr)?,
     };
     // Applied with the host ports already granted (idempotent; it also re-creates a gateway a
     // quarantine stopped, under its new boot token), then again once the host's address is
@@ -523,8 +555,10 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
         o.retain(|d| d != &gw.dir);
     }
     // Stopped first, whatever the host state allows (review r2): the token is rotated after.
-    if let Ok(mut q) = ROTATE.lock() {
-        q.push(gw.dir.clone());
+    // The rotation owed is on disk before the gateway is touched (review r3), so an engine that
+    // dies before it rotates leaves it owed to the next one.
+    if begin_rotation(&gw.dir).is_err() {
+        return false;
     }
     let r = gw.kube.call(
         Some(&gw.ns),
@@ -543,9 +577,7 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
         {
             Ok(p) if p.is_empty() => {
                 if boot_token(&gw.dir, true).is_ok() {
-                    if let Ok(mut q) = ROTATE.lock() {
-                        q.retain(|d| d != &gw.dir);
-                    }
+                    let _ = end_rotation(&gw.dir);
                 }
                 return true;
             }
@@ -555,9 +587,42 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
     false
 }
 
-/// Gateway dirs whose boot token a quarantine has not yet rotated: [`ensure`] rotates it first,
-/// and refuses to start the gateway until it can.
-static ROTATE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+/// The marker of a boot-token rotation a quarantine owes (`config/rotate-pending` of the gateway
+/// dir): [`ensure`] rotates first, and refuses to start the gateway until it can. On disk, not in
+/// the process (review r3): it outlives an engine that died mid-quarantine.
+fn rotation_marker(dir: &Path) -> PathBuf {
+    dir.join("config/rotate-pending")
+}
+
+/// The boot token a gateway (re)starts under: a fresh one when a quarantine still owes its
+/// rotation (whichever engine began it), else the current one.
+pub(crate) fn boot_for_start(dir: &Path) -> Result<String, String> {
+    let pending = rotation_pending(dir);
+    let t = boot_token(dir, pending)?;
+    if pending {
+        end_rotation(dir)?;
+    }
+    Ok(t)
+}
+
+/// Whether a quarantine of `dir`'s gateway still owes its token rotation.
+pub(crate) fn rotation_pending(dir: &Path) -> bool {
+    std::fs::symlink_metadata(rotation_marker(dir)).is_ok()
+}
+
+/// Record that `dir`'s gateway owes a rotation (before it is stopped).
+pub(crate) fn begin_rotation(dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(dir.join("config")).map_err(|e| e.to_string())?;
+    std::fs::write(rotation_marker(dir), b"quarantined").map_err(|e| e.to_string())
+}
+
+/// The rotation is done (the new token is on disk).
+pub(crate) fn end_rotation(dir: &Path) -> Result<(), String> {
+    match std::fs::remove_file(rotation_marker(dir)) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+        _ => Ok(()),
+    }
+}
 
 /// The gateway's boot token (`config/boot-token` of the gateway dir), created when absent or when
 /// `fresh` (a quarantine).

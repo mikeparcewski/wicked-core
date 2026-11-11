@@ -538,7 +538,7 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
 pub(crate) type Baseline = HashMap<PathBuf, HashMap<String, [u8; 32]>>;
 
 /// The copy-in stream of `roots` (the host's side), the tree's base commit and the baseline.
-fn copy_in_stream(
+pub(crate) fn copy_in_stream(
     scope: Option<&str>,
     tree: &Path,
     roots: &[PlanRoot],
@@ -548,6 +548,9 @@ fn copy_in_stream(
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
     let mut base = None;
     let mut baseline = Baseline::new();
+    // The bytes read so far (review r3): a root over the stream's limit is refused as it is read,
+    // never after the whole of it is in memory.
+    let mut budget: u64 = 0;
     for r in roots {
         let replica = replica_of(scope, &r.host)?;
         let rels: Vec<String> = if r.mode == Mode::Files {
@@ -558,15 +561,32 @@ fn copy_in_stream(
                 _ => sync::host_plain_listing(&r.host, &r.skip),
             }
         };
-        let entries: Vec<Entry> = rels
+        let mut entries: Vec<Entry> = Vec::new();
+        for p in rels
             .iter()
             .filter(|p| !r.skip.iter().any(|s| sync::under(p, s)))
             .filter(|p| r.mode != Mode::Tree || !p.split('/').any(sync::is_git_name))
-            .filter_map(|p| sync::read_host_entry(&r.host, p))
-            .collect();
-        // The tree's `.git` first: the codec mirrors the tree by what that git lists.
+        {
+            budget += sync::entry_size(&r.host, p).max(p.len() as u64);
+            if budget > STREAM_LIMIT {
+                return Err(format!(
+                    "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
+                    r.host.join(p).display()
+                ));
+            }
+            if let Some(e) = sync::read_host_entry(&r.host, p) {
+                entries.push(e);
+            }
+        }
+        // The tree's `.git` first: the codec mirrors the tree by what that git lists. Always
+        // sent, empty when the host has no commit (review r3): an empty root still replaces a
+        // `.git` a seat planted in the replica, so its hooks never reach a later unit.
         if r.mode == Mode::Tree && r.host == tree && with_git {
-            if let Some((sha, git_entries)) = replica_git(tree, &r.masks)? {
+            let (sha, git_entries) = match replica_git(tree, &r.masks)? {
+                Some((sha, entries)) => (Some(sha), entries),
+                None => (None, Vec::new()),
+            };
+            {
                 let gr = format!("{replica}/.git");
                 stream.push(Root {
                     replica: gr.clone(),
@@ -584,7 +604,7 @@ fn copy_in_stream(
                         masks: Vec::new(),
                     },
                 ));
-                base = Some(sha);
+                base = sha;
             }
         }
         if r.back {
@@ -1321,7 +1341,7 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         .map_err(|_| "the copy-in baseline is poisoned")?
         .clone();
     // Every root checked and diffed against its baseline before anything is applied.
-    let mut plans: Vec<(&PlanRoot, Vec<Entry>, Vec<String>)> = Vec::new();
+    let mut plans: Vec<RootPlan<'_>> = Vec::new();
     for ((replica, want), got) in refs.iter().zip(&roots) {
         if &got.replica != replica {
             return Err("the write-back's roots are out of order".into());
@@ -1335,12 +1355,31 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         let (writes, deletes) = delta(&want.host, &base, entries)?;
         plans.push((want, writes, deletes));
     }
+    preflight(&plans)?;
+    let tree_back = back
+        .iter()
+        .any(|r| r.mode == Mode::Tree && r.host == seat.tree);
+    // A tree with no commit on the host: a first commit made in the pod is refused, never
+    // dropped while the files land (review r3). The engine imports commits only on top of the
+    // host's HEAD.
+    if seat.base.is_none() && tree_back {
+        let tree = replica_of(seat.scope.as_deref(), &seat.tree)?;
+        let r = codec(
+            &seat.kube,
+            &seat.ns,
+            &["bundle", &tree, NO_BASE],
+            None,
+            Duration::from_secs(60),
+        );
+        if !r.ok() {
+            return Err(format!(
+                "the write-back was refused: {} (the host's tree has no commit to land them on)",
+                r.err_text()
+            ));
+        }
+    }
     let commits = match &seat.base {
-        Some(base)
-            if back
-                .iter()
-                .any(|r| r.mode == Mode::Tree && r.host == seat.tree) =>
-        {
+        Some(base) if tree_back => {
             let masks = back
                 .iter()
                 .find(|r| r.host == seat.tree)
@@ -1363,14 +1402,7 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
             ));
         }
     }
-    for (want, writes, _) in &plans {
-        sync::links_stay_inside_on(Some(&want.host), writes)
-            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
-    }
-    for (want, writes, deletes) in &plans {
-        sync::apply(&want.host, writes, deletes, &want.skip)
-            .map_err(|e| format!("the write-back of {} failed: {e}", want.host.display()))?;
-    }
+    apply_roots(&plans)?;
     if let (Some((new, refname)), Some(base)) = (commits, &seat.base) {
         let git = |args: &[&str]| -> Result<(), String> {
             let o = sync::git(&seat.tree)
@@ -1394,6 +1426,40 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         .and_then(|()| git(&["read-tree", &new]))
         .map_err(|e| format!("the unit's commits could not land: {e}"))?;
         let _ = git(&["update-ref", "-d", &refname]);
+    }
+    Ok(())
+}
+
+/// One root's write-back: the root, the entries to write and the paths to delete.
+pub(crate) type RootPlan<'a> = (&'a PlanRoot, Vec<Entry>, Vec<String>);
+
+/// Every refusal the host's file system decides (masked paths by inode, links leaving their
+/// root), for every root, before anything is applied (review r3: a refusal in a later root
+/// must not leave an earlier root changed).
+pub(crate) fn preflight(plans: &[RootPlan<'_>]) -> Result<(), String> {
+    for (want, writes, deletes) in plans {
+        let refused =
+            |e: String| format!("the write-back of {} was refused: {e}", want.host.display());
+        sync::guard_refusal(
+            &want.host,
+            &want.skip,
+            writes
+                .iter()
+                .map(|e| e.path.as_str())
+                .chain(deletes.iter().map(String::as_str)),
+        )
+        .map_err(refused)?;
+        sync::links_stay_inside_on(Some(&want.host), writes).map_err(refused)?;
+    }
+    Ok(())
+}
+
+/// Apply every root's plan, after [`preflight`] has passed for all of them.
+pub(crate) fn apply_roots(plans: &[RootPlan<'_>]) -> Result<(), String> {
+    preflight(plans)?;
+    for (want, writes, deletes) in plans {
+        sync::apply(&want.host, writes, deletes, &want.skip)
+            .map_err(|e| format!("the write-back of {} failed: {e}", want.host.display()))?;
     }
     Ok(())
 }
@@ -1542,8 +1608,20 @@ fn fetch_commits(
             "the unit's commits change `{p}`, a path the seat may not write; they are kept at {refname}"
         ));
     }
+    // The same paths as the host's file system resolves them (review r3): a commit-only
+    // `.ſsh/k` writes no file, so only this check sees that it names masked `.ssh/k` on APFS.
+    sync::guard_refusal(
+        &seat.tree,
+        masks,
+        changed.split('\0').filter(|p| !p.is_empty()),
+    )
+    .map_err(|e| format!("the unit's commits were refused: {e}; they are kept at {refname}"))?;
     Ok(Some((new, refname)))
 }
+
+/// The `bundle` base that says the host tree has no commit: the pod codec answers nothing when
+/// the replica has none either, and refuses when the seat made one.
+pub(crate) const NO_BASE: &str = "-";
 
 /// The cluster each one-shot session armed on (its scope is deleted there when it ends).
 static SCOPES: Mutex<Option<HashMap<String, Kube>>> = Mutex::new(None);

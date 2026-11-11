@@ -3574,6 +3574,7 @@ dependencies = [
  "sha2",
  "toml",
  "tracing",
+ "unicode-normalization",
  "uuid",
  "wicked-apps-core",
  "wicked-council",

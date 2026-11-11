@@ -88,6 +88,8 @@ portable-pty = "0.8"
 base64 = "0.22"
 # ACP elicitation (DES-002): UUID minting for elicitation IDs + process-gen tokens; structured tracing.
 uuid = { version = "1", features = ["v4", "serde"] }
+# The k8s write-back folds paths as a normalizing host file system compares them (k8s-swap B-2).
+unicode-normalization = "0.1"
 tracing = "0.1"
 # The seat-secret guard's in-process substring search (`seat_secret_guard`): a seat's credential is
 # looked for in the work's objects without ever leaving this process.

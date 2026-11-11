@@ -1161,3 +1161,257 @@ fn k8s_an_ancestor_read_root_leaves_the_clone_out() {
         .unwrap();
     assert!(up.skip.iter().any(|s| s == "app"), "{:?}", up.skip);
 }
+
+// ── review r3 folds ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_two_spellings_a_host_folds_together_are_refused() {
+    // NFC `é` and NFD `e` + U+0301 are one name on APFS.
+    let r = root(vec![
+        entry(Kind::File, "caf\u{e9}", b"a"),
+        entry(Kind::File, "cafe\u{301}", b"b"),
+    ]);
+    assert!(
+        sync::check_entries(&r, &[]).is_err(),
+        "NFC and NFD of one name"
+    );
+    // A file and a directory of one folded name.
+    let r = root(vec![
+        entry(Kind::File, "\u{c9}/a", b"a"),
+        entry(Kind::File, "e\u{301}", b"b"),
+    ]);
+    assert!(
+        sync::check_entries(&r, &[]).is_err(),
+        "a folded file/dir pair"
+    );
+    // The long s folds to `s` (APFS): a mask of `.ssh` covers `.ſsh`.
+    assert!(sync::under(".\u{17f}sh/k", ".ssh"));
+    assert!(sync::under(".SSH/k", ".ssh"));
+    assert!(!sync::under(".sshx/k", ".ssh"));
+    let r = root(vec![
+        entry(Kind::File, "a", b"a"),
+        entry(Kind::File, "b", b"b"),
+    ]);
+    assert!(sync::check_entries(&r, &[]).is_ok());
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_refusal_in_a_later_root_leaves_every_earlier_root_unchanged() {
+    let a = tmp("pre-a");
+    let b = tmp("pre-b");
+    std::fs::write(b.join("secret.txt"), "HOST").unwrap();
+    // Another name for the masked file (a hard link stands in for an APFS alias on any host).
+    std::fs::hard_link(b.join("secret.txt"), b.join("alias.txt")).unwrap();
+    let plain = |host: &Path, masks: Vec<String>| PlanRoot {
+        host: host.to_path_buf(),
+        mode: Mode::Plain,
+        skip: masks.clone(),
+        back: true,
+        files: Vec::new(),
+        masks,
+    };
+    let ra = plain(&a, Vec::new());
+    let rb = plain(&b, vec!["secret.txt".into()]);
+    let plans: Vec<seat::RootPlan<'_>> = vec![
+        (&ra, vec![entry(Kind::File, "ok.txt", b"seat")], Vec::new()),
+        (
+            &rb,
+            vec![entry(Kind::File, "alias.txt", b"seat")],
+            Vec::new(),
+        ),
+    ];
+    assert!(seat::apply_roots(&plans).is_err());
+    assert!(
+        !a.join("ok.txt").exists(),
+        "an earlier root changed before a later root was refused"
+    );
+    assert_eq!(
+        std::fs::read_to_string(b.join("secret.txt")).unwrap(),
+        "HOST"
+    );
+    let _ = std::fs::remove_dir_all(&a);
+    let _ = std::fs::remove_dir_all(&b);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_commit_path_naming_a_mask_on_this_host_is_refused() {
+    let t = tmp("commit-alias");
+    std::fs::write(t.join("secret.txt"), "HOST").unwrap();
+    std::fs::hard_link(t.join("secret.txt"), t.join("alias.txt")).unwrap();
+    let guard = vec!["secret.txt".to_string()];
+    assert!(sync::guard_refusal(&t, &guard, ["src/a.rs", "alias.txt"]).is_err());
+    assert!(sync::guard_refusal(&t, &guard, ["src/a.rs", "new.txt"]).is_ok());
+    let _ = std::fs::remove_dir_all(&t);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_tree_with_no_commit_still_sends_an_empty_git_root_that_replaces_a_planted_one() {
+    let host = tmp("unborn");
+    let ok = std::process::Command::new("git")
+        .hardened()
+        .args(["init", "-q"])
+        .current_dir(&host)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        eprintln!("skipping: git init failed");
+        return;
+    }
+    std::fs::write(host.join("a"), "a").unwrap();
+    let (roots, _) = seat::plan(
+        &host,
+        false,
+        &[PlanMount::Bind {
+            path: host.clone(),
+            rw: true,
+        }],
+        &[],
+        &[],
+        None,
+    );
+    let (body, plan, base, _) = seat::copy_in_stream(None, &host, &roots, true).unwrap();
+    assert!(base.is_none(), "an unborn tree has no base");
+    let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
+    assert_eq!(decoded[0].mode, Mode::Git);
+    assert!(decoded[0].entries.is_empty());
+    let sub = decoded[1].replica.clone();
+    let replica = tmp("unborn-replica");
+    std::fs::create_dir_all(replica.join(&sub).join(".git/hooks")).unwrap();
+    std::fs::write(replica.join(&sub).join(".git/hooks/pre-commit"), "planted").unwrap();
+    let out = codec(&replica, &["unpack", &plan.to_string()], &body);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !replica.join(&sub).join(".git/hooks/pre-commit").exists(),
+        "a planted hook survived the production copy-in"
+    );
+    assert_eq!(std::fs::read(replica.join(&sub).join("a")).unwrap(), b"a");
+    let _ = std::fs::remove_dir_all(&host);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_first_commit_in_a_tree_with_no_history_is_refused_not_dropped() {
+    let replica = tmp("first-commit");
+    let w = replica.join("w");
+    std::fs::create_dir_all(&w).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(&w)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        eprintln!("skipping: git init failed");
+        return;
+    }
+    let none = codec(&replica, &["bundle", "w", seat::NO_BASE], b"");
+    assert!(
+        none.status.success(),
+        "no commit on either side: nothing to land"
+    );
+    assert!(none.stdout.is_empty());
+    std::fs::write(w.join("a"), "a").unwrap();
+    assert!(git(&["add", "a"]));
+    assert!(git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "first"
+    ]));
+    let made = codec(&replica, &["bundle", "w", seat::NO_BASE], b"");
+    assert!(
+        !made.status.success(),
+        "a first commit was silently dropped"
+    );
+    assert!(String::from_utf8_lossy(&made.stderr).contains("first commit"));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
+    let host = tmp("huge");
+    let f = std::fs::File::create(host.join("big.bin")).unwrap();
+    // Sparse: no disk, but a size over the whole stream's limit.
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let r = PlanRoot {
+        host: host.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: false,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let e = seat::copy_in_stream(None, &host, &[r], false).unwrap_err();
+    assert!(e.contains("larger than"), "{e}");
+    assert!(
+        sync::read_host_entry(&host, "big.bin").is_none(),
+        "a file over the stream's limit is never read whole"
+    );
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[test]
+fn k8s_an_earlier_writer_write_is_fenced_before_a_body_is_taken() {
+    let s = gw::write_script(gw::Volume::Config, "config.json", &"a".repeat(64)).unwrap();
+    let marker = gw::write_marker(gw::Volume::Config, "config.json");
+    assert_eq!(marker, "wicked-writer-W-cfg-config.json-");
+    // The kill pattern matches the marker but not the script's own text.
+    let pattern = format!("[{}]{}", &marker[..1], &marker[1..]);
+    assert!(s.contains(&format!("pgrep -f '{pattern}'")));
+    assert!(
+        !s.contains(&marker),
+        "the script's text would match its own fence"
+    );
+    let kill = s.find("kill -9").unwrap();
+    let wait = s.find("[m]v -f /cfg/.config.json.").unwrap();
+    let take = s.find("cat > ").unwrap();
+    assert!(kill < wait && wait < take, "fence first, then the body");
+    assert!(s.contains("[ \"$p\" = \"$$\" ]"), "never kills itself");
+}
+
+#[test]
+fn k8s_a_quarantine_owed_by_a_dead_engine_still_rotates_the_boot_token() {
+    let dir = tmp("rotate");
+    let t1 = gw::boot_token(&dir, false).unwrap();
+    // The quarantine recorded its rotation, then its engine died before rotating.
+    gw::begin_rotation(&dir).unwrap();
+    // A new engine's start: nothing in its memory, the marker on disk.
+    let t2 = gw::boot_for_start(&dir).unwrap();
+    assert_ne!(
+        t1, t2,
+        "the gateway restarted on the token it was stopped under"
+    );
+    assert!(!gw::rotation_pending(&dir));
+    assert_eq!(gw::boot_for_start(&dir).unwrap(), t2, "stable once rotated");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn k8s_a_failed_settlement_keeps_the_clis_output_as_could_not_run() {
+    let err = format!(
+        "{}the write-back was refused: `x` is inside a git dir",
+        crate::execute_wrapped::SETTLE_FAILED
+    );
+    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "minutes of work");
+    assert!(
+        out.starts_with(crate::execute_wrapped::COULD_NOT_RUN_PREFIX),
+        "{out}"
+    );
+    assert!(out.contains("inside a git dir"));
+    assert!(out.ends_with("minutes of work"));
+}
