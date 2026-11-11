@@ -17,8 +17,11 @@ ARG CLI_TARBALL_URL_AMD64=
 ARG CLI_TARBALL_SHA256_AMD64=
 ARG CLI_TARBALL_URL_ARM64=
 ARG CLI_TARBALL_SHA256_ARM64=
+# Python suites (core#1401): a seat runs `python3 -m pytest` as the floor does, from Debian's own
+# archive (pytest, PyYAML, zstandard, venv): no PyPI, no new registry.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends git ca-certificates curl procps ripgrep jq python3 make g++ \
+      python3-pytest python3-yaml python3-zstandard python3-venv \
  && (command -v npm >/dev/null || apt-get install -y --no-install-recommends nodejs npm) \
  && rm -rf /var/lib/apt/lists/*
 # wicked-ledger at the version wicked-crew's QE acceptance check reads (core#1009). The QE unit

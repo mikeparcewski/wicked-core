@@ -7,6 +7,9 @@
 # edit (a toolchain bump) is a new image.
 #   node 22 + npm (the base), rust (pinned, with rustfmt and clippy), and the tools the suites spawn
 #   that a slim base lacks: procps (`ps`), unzip, python3, git, a C toolchain for build scripts.
+#   Python suites (core#1401: wicked-garden's `python3 -m pytest`) get pytest, PyYAML and zstandard,
+#   and jq (the seat image has it; suites shell out to it), from Debian's own archive, the source
+#   every package here comes from: no PyPI, no new registry.
 ARG BASE=node:22-trixie-slim
 FROM ${BASE}
 ARG RUST_TOOLCHAIN=1.99.1
@@ -15,6 +18,7 @@ ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git procps unzip python3 \
       build-essential pkg-config libssl-dev \
+      jq python3-pytest python3-yaml python3-zstandard \
  && rm -rf /var/lib/apt/lists/*
 RUN curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" --component rustfmt,clippy \

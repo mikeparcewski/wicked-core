@@ -4606,6 +4606,33 @@ mod tests {
 
     /// One failed (or slow) attempt is not the outcome: the second attempt answers, after one
     /// short pause. A single-attempt probe read this runtime down (e2e-1105 09:02Z).
+    /// core#1401: the floor image and every seat image carry Python's test toolchain (pytest,
+    /// PyYAML, zstandard) and jq so a pytest suite (wicked-garden) yields floor evidence — installed from
+    /// Debian's archive with the rest of the image, never from PyPI or another registry.
+    #[test]
+    fn the_floor_and_seat_images_carry_pytest_from_the_debian_archive() {
+        for (name, df) in [
+            ("checks floor", crate::checks_container::DOCKERFILE),
+            ("seat", SEAT_DOCKERFILE),
+        ] {
+            for pkg in ["python3-pytest", "python3-yaml", "python3-zstandard", "jq"] {
+                assert!(df.contains(pkg), "the {name} image installs {pkg}");
+            }
+            for untrusted in [
+                "pip install",
+                "pip3 install",
+                "pypi.org",
+                "astral.sh",
+                "uv pip",
+            ] {
+                assert!(
+                    !df.contains(untrusted),
+                    "the {name} image never uses {untrusted}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn one_slow_runtime_answer_is_retried_not_final() {
         let mut calls = 0;
