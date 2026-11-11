@@ -7800,6 +7800,18 @@ pub(crate) fn run_bounded(
             }
         }
     }
+    // A cancel seen only at settlement is a cancel too (codex r2): never a pass or a plain
+    // failure for a unit whose work did not come back.
+    let killed_by = match killed_by {
+        None if pod_seat.is_some()
+            && cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) =>
+        {
+            Some(CANCELLED)
+        }
+        k => k,
+    };
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))

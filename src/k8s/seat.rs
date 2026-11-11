@@ -1780,7 +1780,7 @@ pub(crate) fn settle_unless(
     // The pod is gone: the scratch goes on every path from here (codex b2-seat #14), a lost rc
     // included; only a unit with a result, still wanted, is written back.
     let back = if code.is_ok() && ending != Ending::Cancelled && !cancelled() {
-        write_back(seat)
+        write_back(seat, cancelled)
     } else {
         Ok(())
     };
@@ -1795,7 +1795,7 @@ pub(crate) fn settle_unless(
 /// masked or `.git` path, all BEFORE any host file changes (review r1); then only what the seat
 /// changed against the copy-in baseline is applied with the no-follow walk, a file the host also
 /// changed meanwhile is a conflict (refused, never overwritten), and the host HEAD moves last.
-pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
+pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
     let back: Vec<&PlanRoot> = seat.roots.iter().filter(|r| r.back).collect();
     if back.is_empty() {
         return Ok(());
@@ -1912,13 +1912,13 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         plans.push((want, writes, deletes));
     }
     preflight(&plans)?;
-    if let Some(b) = &seat.branch {
-        // The destination is the branch of the copy-in, still checked out (codex b2-seat #9).
-        if commits.is_some() && head_branch(&seat.tree)?.as_deref() != Some(b.as_str()) {
-            return Err(format!(
-                "the host's checkout moved off {b} while the unit ran; its commits are not landed"
-            ));
-        }
+    // The destination is the copy-in's checkout, still as it was (codex b2-seat #9): its branch,
+    // or still detached (a detached copy-in never lands on a branch checked out since).
+    if commits.is_some() && head_branch(&seat.tree)? != seat.branch {
+        return Err(format!(
+            "the host's checkout moved off {} while the unit ran; its commits are not landed",
+            seat.branch.as_deref().unwrap_or("its detached HEAD")
+        ));
     }
     // The index the landing installs, made before any host file changes (codex b2-seat #7): a
     // held `index.lock` or a failed build refuses the write-back with the host untouched.
@@ -1926,6 +1926,13 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         Some((new, _)) => Some(prepare_index(&seat.tree, new, &seat.id)?),
         None => None,
     };
+    // The last word before the host changes (codex r2): a unit cancelled or reassigned while
+    // its changes were packed, fetched or checked brings nothing back.
+    if cancelled() {
+        return Err(
+            "the unit was cancelled before its write-back landed; nothing came back".into(),
+        );
+    }
     apply_roots(&plans)?;
     if let (Some((new, refname)), Some(base)) = (commits, &seat.base) {
         let git = |args: &[&str]| -> Result<(), String> {
@@ -2007,6 +2014,10 @@ impl Drop for StagedIndex {
         if !self.done {
             let _ = std::fs::remove_file(&self.staged);
         }
+        // The alternate index's own lock, when a killed `read-tree` left it (codex r2).
+        let mut lock = self.staged.clone().into_os_string();
+        lock.push(".lock");
+        let _ = std::fs::remove_file(lock);
     }
 }
 

@@ -1018,12 +1018,16 @@ pub(crate) fn apply(
                 }
                 use std::os::unix::io::FromRawFd;
                 let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
-                // The mode exactly, whatever the umask.
-                let wrote = std::os::unix::fs::PermissionsExt::from_mode(mode as u32);
-                let wrote = f
-                    .set_permissions(wrote)
-                    .and_then(|()| f.write_all(&e.data))
-                    .and_then(|()| f.sync_data());
+                // A replaced file's own mode exactly, whatever the umask; a new file keeps the
+                // umask's say (codex r2: never widened past it).
+                let wrote = match kept_mode {
+                    Some(_) => {
+                        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode as u32))
+                    }
+                    None => Ok(()),
+                }
+                .and_then(|()| f.write_all(&e.data))
+                .and_then(|()| f.sync_data());
                 drop(f);
                 if wrote.is_err() {
                     unsafe { libc::unlinkat(dir.0, tmp.as_ptr(), 0) };
