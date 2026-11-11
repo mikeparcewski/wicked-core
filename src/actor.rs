@@ -20082,6 +20082,10 @@ fn shared_run_terminal(
 /// Mark a run terminally `Cancelled` and emit `RunCancelled` (a no-op status change on an already
 /// terminal run). A late worker result for a cancelled run is discarded by `apply_step_result`'s
 /// terminal guard.
+/// (core#1429) How long a cancel waits on the actor for its worktree reap before the reap goes on
+/// by itself (and says its outcome when it ends).
+const CANCEL_REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
+
 pub(crate) fn cancel_run(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -20184,24 +20188,44 @@ pub(crate) fn cancel_run(
     // on the operator's behalf; the boot reaper applies this rule to cancelled runs too.
     if let Some(repo_id) = &session.repo_ref {
         if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
-            let reaped = crate::repo::reap_worktree_if_clean(&repo.root_path, run_id);
-            if !reaped {
-                // Review of #456, F6: say it on the wire, not only on stderr — the operator's
-                // work survived and this is where. The retention window then applies to the
-                // cancelled tree exactly as to a completed one (`worktree_retained`).
-                emit(
-                    subscribers,
-                    CoreEvent::WorktreeRetained {
-                        session: run_id.to_string(),
-                        path: session.workdir.clone().unwrap_or_default(),
-                        reason: format!(
-                            "cancelled with uncommitted work the `{}` branch does not carry — \
-                             the worktree is kept (clean-only reap; retained for \
-                             WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then reaped clean-only again)",
-                            crate::repo::worktree_branch(run_id)
-                        ),
-                    },
-                );
+            // Review of #456, F6: a kept tree is said on the wire, not only on stderr — the
+            // operator's work survived and this is where. The retention window then applies to
+            // the cancelled tree exactly as to a completed one (`worktree_retained`).
+            let retained = CoreEvent::WorktreeRetained {
+                session: run_id.to_string(),
+                path: session.workdir.clone().unwrap_or_default(),
+                reason: format!(
+                    "cancelled with uncommitted work the `{}` branch does not carry — the \
+                     worktree is kept (clean-only reap; retained for \
+                     WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then reaped clean-only again)",
+                    crate::repo::worktree_branch(run_id)
+                ),
+            };
+            // (core#1429) The reap runs OFF the actor: removing a large tree (a dependency
+            // directory of thousands of files) took a Stop 175 s on the dev host, and every other
+            // run's gate answer and step result waited behind it. The actor waits a short while
+            // for it, so a small tree's outcome is said in order; a longer reap says its outcome
+            // when it ends (`worktreeRetained` then follows `runCancelled`). A relaunch of the
+            // same run id waits for the reap of its tree (`repo`'s per-tree lock).
+            let (root, rid, tx) = (repo.root_path.clone(), run_id.to_string(), self_tx.clone());
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<bool>(0);
+            let late = retained.clone();
+            crate::repo::spawn_bound(move || {
+                let reaped = crate::repo::reap_worktree_if_clean(&root, &rid);
+                // A rendezvous: delivered only while the actor still waits for it; otherwise the
+                // outcome is posted as an event of its own.
+                if done_tx.send(reaped).is_err() && !reaped {
+                    let _ = tx.send(Command::EmitEvent(late));
+                }
+            });
+            match done_rx.recv_timeout(CANCEL_REAP_WAIT) {
+                Ok(false) => emit(subscribers, retained),
+                Ok(true) => {}
+                Err(_) => eprintln!(
+                    "wicked-core: run {run_id}'s worktree is still being reaped after {} ms; it \
+                     finishes off the actor (core#1429)",
+                    CANCEL_REAP_WAIT.as_millis()
+                ),
             }
         }
     }
@@ -33010,6 +33034,90 @@ mod terminal_worktree_reap_tests {
             .output()
             .unwrap();
         String::from_utf8_lossy(&out.stdout).contains(branch)
+    }
+
+    /// core#1429: a cancel (a Stop at a gate is one) never waits on the actor for a slow reap. With
+    /// the tree's reap held (a dependency directory of thousands of files deleting under load), the
+    /// cancel returns within its short wait, the run is cancelled and said so, and the reap's outcome
+    /// (here: the dirty tree is kept) arrives as its own event once the reap ends. A small reap is
+    /// still said in order, inside the cancel.
+    #[test]
+    fn a_cancel_reaps_off_the_actor_and_says_a_late_outcome_when_it_ends() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "cancel-slow", "r-cancel-slow");
+        std::fs::write(wt.join("unlanded.txt"), "uncommitted work\n").unwrap();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        let mut subs = crate::event_log::EventSink::default();
+        subs.push(ev_tx);
+        let (tx, rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let held = crate::repo::hold_tree_for_test(root.to_str().unwrap(), "r-cancel-slow");
+        let t = std::time::Instant::now();
+        let status =
+            cancel_run(&mut store, &mut subs, &runner, &tx, "r-cancel-slow", &None).unwrap();
+        let took = t.elapsed();
+        assert_eq!(status, SessionStatus::Cancelled);
+        assert!(
+            took < CANCEL_REAP_WAIT + std::time::Duration::from_millis(700),
+            "the cancel waited {took:?} on a reap it does not own"
+        );
+        let said: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        assert!(said
+            .iter()
+            .any(|e| matches!(e, CoreEvent::RunCancelled { .. })));
+        assert!(!said
+            .iter()
+            .any(|e| matches!(e, CoreEvent::WorktreeRetained { .. })));
+        drop(held);
+        // Other follow-ups the cancel posts (a campaign notice, say) may come first.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Command::EmitEvent(CoreEvent::WorktreeRetained { session, .. })) => {
+                    assert_eq!(session, "r-cancel-slow");
+                    break;
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("the late reap says its outcome: {e}"),
+            }
+        }
+        assert!(wt.join("unlanded.txt").is_file(), "the dirty tree is kept");
+        let _ = std::fs::remove_dir_all(&root);
+
+        // A reap that ends inside the wait is said in order, by the cancel itself.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) = seeded(&mut store, "cancel-fast", "r-cancel-fast");
+        std::fs::write(wt.join("unlanded.txt"), "uncommitted work\n").unwrap();
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        let mut subs = crate::event_log::EventSink::default();
+        subs.push(ev_tx);
+        let (tx, rx) = channel::<Command>();
+        cancel_run(&mut store, &mut subs, &runner, &tx, "r-cancel-fast", &None).unwrap();
+        let said: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        let retained = said
+            .iter()
+            .position(|e| matches!(e, CoreEvent::WorktreeRetained { .. }));
+        let cancelled = said
+            .iter()
+            .position(|e| matches!(e, CoreEvent::RunCancelled { .. }));
+        assert!(cancelled.is_some(), "{said:?}");
+        match retained {
+            Some(r) => assert!(Some(r) < cancelled, "in order, inside the cancel: {said:?}"),
+            // A loaded host can take the small reap past the wait: then it is said late, once.
+            None => {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    match rx.recv_timeout(left) {
+                        Ok(Command::EmitEvent(CoreEvent::WorktreeRetained { .. })) => break,
+                        Ok(_) => continue,
+                        Err(e) => panic!("the reap's outcome is said: {e}"),
+                    }
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Wave 6 (F-7R2-013): a COMPLETED run's clean worktree is RETAINED by default — the files

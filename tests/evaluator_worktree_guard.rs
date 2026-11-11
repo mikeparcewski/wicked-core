@@ -1534,17 +1534,18 @@ fn rejecting_the_denial_gate_cancels_the_run_and_keeps_the_dirty_worktree() {
             .expect("reject the denial gate"),
         SessionStatus::Cancelled
     );
-    let evs = drain(&events);
+    // (core#1429) The reap runs off the actor: its `worktreeRetained` may follow `runCancelled`.
+    let evs = wait_for_event(&events, |e| {
+        matches!(
+            e,
+            CoreEvent::WorktreeRetained { session, .. } if session == "r-reject-dirty"
+        )
+    })
+    .expect("the creator's uncommitted fix keeps the worktree alive");
+    let evs = [evs, drain(&events)].concat();
     assert!(evs.iter().any(
         |e| matches!(e, CoreEvent::RunCancelled { session, .. } if session == "r-reject-dirty")
     ));
-    assert!(
-        evs.iter().any(|e| matches!(
-            e,
-            CoreEvent::WorktreeRetained { session, .. } if session == "r-reject-dirty"
-        )),
-        "the creator's uncommitted fix keeps the worktree alive: {evs:?}"
-    );
     assert!(!session_failed(&before) && !session_failed(&evs));
     let wt = repo.join("wicked-worktrees").join("r-reject-dirty");
     assert_eq!(
