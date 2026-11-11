@@ -2059,7 +2059,9 @@ pub(crate) fn run(
                         if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                             let root = repo.root_path.clone();
                             let rid = run_id.clone();
-                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
+                            crate::repo::spawn_bound(move || {
+                                crate::repo::remove_worktree(&root, &rid)
+                            });
                         }
                     } else if let Some(path) = workdir {
                         std::thread::spawn(move || {
@@ -2087,7 +2089,7 @@ pub(crate) fn run(
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                                 let root = repo.root_path.clone();
                                 let rid = run_id.clone();
-                                std::thread::spawn(move || {
+                                crate::repo::spawn_bound(move || {
                                     crate::repo::remove_worktree(&root, &rid)
                                 });
                             }
@@ -2180,7 +2182,7 @@ pub(crate) fn run(
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                                 let root = repo.root_path.clone();
                                 let rid = run_id.clone();
-                                std::thread::spawn(move || {
+                                crate::repo::spawn_bound(move || {
                                     crate::repo::remove_worktree(&root, &rid)
                                 });
                             }
@@ -2268,7 +2270,9 @@ pub(crate) fn run(
                         if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                             let root = repo.root_path.clone();
                             let rid = run_id.clone();
-                            std::thread::spawn(move || crate::repo::remove_worktree(&root, &rid));
+                            crate::repo::spawn_bound(move || {
+                                crate::repo::remove_worktree(&root, &rid)
+                            });
                         }
                     }
                 }
@@ -9991,7 +9995,7 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
-    std::thread::spawn(move || {
+    crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid);
         if let Some(repo) = repo {
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
@@ -10070,8 +10074,9 @@ fn reprovision_reaped_worktree(
         return Ok(session);
     };
     if crate::repo::is_live_worktree(std::path::Path::new(&workdir)) {
-        // (core#1373, review on #1431) A resume in place marks a tree no daemon marked yet.
-        crate::repo::adopt_live_worktree(std::path::Path::new(&workdir));
+        // (core#1373, review on #1431) A resume in place marks a tree no daemon marked yet, and
+        // never resumes in another daemon's tree.
+        crate::repo::adopt_live_worktree(std::path::Path::new(&workdir))?;
         return Ok(session);
     }
     let repo = crate::repo::get_repo(&*store, &repo_id)?.ok_or_else(|| {
