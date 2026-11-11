@@ -22,6 +22,10 @@
 //! The parity contract this module is held to is `PARITY.md` of the k8s-swap lane, mirrored in
 //! the module tests (each test names its row).
 
+// Windows hosts run no seat, floor or login pod (the runners are Unix-only): the transport is
+// compiled there but not reached.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 pub(crate) mod cli;
 pub(crate) mod cluster;
 pub(crate) mod floor;

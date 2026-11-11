@@ -256,7 +256,7 @@ fn install(a: &Args, home: &Path) -> Result<Value, String> {
 }
 
 /// [`install`] with no admin choice (tests: refusals before any cluster call).
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn install_for_test(home: &Path) -> Result<Value, String> {
     let a = parse(&["install", "--admin-context", "none"].map(String::from))?;
     install(&a, home)
