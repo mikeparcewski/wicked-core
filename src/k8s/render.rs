@@ -152,6 +152,11 @@ pub(crate) fn default_deny(ns: &str, owner: &str) -> Value {
 /// The roles that may reach the gateway: seats and judges. Floors, sync and fill pods never.
 pub(crate) const GATEWAY_CLIENT_ROLES: &[&str] = &["seat", "judge"];
 
+/// The label saying whether a seat or judge pod may reach the gateway (`online`) or runs with no
+/// network at all (`offline`, `WICKED_SEAT_NETWORK=none`): both gateway policies select
+/// `online` only (review r4: an offline seat could reach a running gateway's CONNECT route by IP).
+pub(crate) const NET_LABEL: &str = "wicked.dev/net";
+
 /// Seats' and judges' only egress: the gateway pods of the daemon namespace, on the seat ports.
 /// No DNS: a seat reaches the gateway by `hostAliases` (closing DNS as a tunnel).
 pub(crate) fn seat_egress(ns: &str, owner: &str, daemon_ns: &str, ports: &[u16]) -> Value {
@@ -160,9 +165,12 @@ pub(crate) fn seat_egress(ns: &str, owner: &str, daemon_ns: &str, ports: &[u16])
         "kind": "NetworkPolicy",
         "metadata": meta("seat-egress-gateway-only", Some(ns), owner, &[]),
         "spec": {
-            "podSelector": {"matchExpressions": [{
-                "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
-            }]},
+            "podSelector": {
+                "matchLabels": {NET_LABEL: "online"},
+                "matchExpressions": [{
+                    "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
+                }],
+            },
             "policyTypes": ["Egress"],
             "egress": [{
                 "to": [{
@@ -197,9 +205,12 @@ pub(crate) fn gateway_ingress(daemon_ns: &str, owner: &str, ports: &[u16]) -> Va
                     "namespaceSelector": {"matchLabels": {
                         OWNER_LABEL: owner, ROLE_LABEL: "run",
                     }},
-                    "podSelector": {"matchExpressions": [{
-                        "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
-                    }]},
+                    "podSelector": {
+                        "matchLabels": {NET_LABEL: "online"},
+                        "matchExpressions": [{
+                            "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
+                        }],
+                    },
                 }],
                 "ports": tcp_ports(ports),
             }]
@@ -518,6 +529,14 @@ pub(crate) fn seat_sandbox(s: &SeatPod) -> Result<Value, String> {
             (super::UNIT_LABEL, &s.unit_label),
             (super::BOOT_LABEL, &s.boot),
             (ROLE_LABEL, &s.role),
+            (
+                NET_LABEL,
+                if s.gateway_ip.is_some() {
+                    "online"
+                } else {
+                    "offline"
+                },
+            ),
         ],
     );
     Ok(json!({

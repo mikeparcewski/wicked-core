@@ -3615,7 +3615,9 @@ pub(crate) fn arm_noting(
         seed_base: seed_base.as_deref(),
         memory: &k8s_memory(memory_from(memory.as_deref())),
         gateway_ip: gateway_ip.as_deref(),
-        deadline: Duration::from_secs(4 * 60 * 60),
+        // The engine's own ceiling for a turn (`WICKED_UNIT_TIMEOUT_SECS`; a unit's budget only
+        // lowers it): the pod outlives no turn the engine would still wait for (review r4).
+        deadline: crate::workflow::unit_timeout_ceiling(),
         role,
     };
     let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;

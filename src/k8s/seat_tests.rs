@@ -1391,13 +1391,20 @@ fn k8s_a_quarantine_owed_by_a_dead_engine_still_rotates_the_boot_token() {
     // The quarantine recorded its rotation, then its engine died before rotating.
     gw::begin_rotation(&dir).unwrap();
     // A new engine's start: nothing in its memory, the marker on disk.
-    let t2 = gw::boot_for_start(&dir).unwrap();
+    let t2 = gw::boot_for_start(&dir, false).unwrap();
     assert_ne!(
         t1, t2,
         "the gateway restarted on the token it was stopped under"
     );
     assert!(!gw::rotation_pending(&dir));
-    assert_eq!(gw::boot_for_start(&dir).unwrap(), t2, "stable once rotated");
+    assert_eq!(
+        gw::boot_for_start(&dir, false).unwrap(),
+        t2,
+        "stable once rotated"
+    );
+    // Review r4: the host could not record it; the Deployment's annotation still does.
+    let t3 = gw::boot_for_start(&dir, true).unwrap();
+    assert_ne!(t2, t3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1414,4 +1421,190 @@ fn k8s_a_failed_settlement_keeps_the_clis_output_as_could_not_run() {
     );
     assert!(out.contains("inside a git dir"));
     assert!(out.ends_with("minutes of work"));
+    // Review r4: the CLI's stderr is kept too.
+    let err = format!(
+        "{}the rc could not be read{}rate limited: retry later",
+        crate::execute_wrapped::SETTLE_FAILED,
+        crate::execute_wrapped::SETTLE_SEP
+    );
+    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "");
+    assert!(
+        out.starts_with(crate::execute_wrapped::COULD_NOT_RUN_PREFIX),
+        "{out}"
+    );
+    assert!(out.contains("the rc could not be read)"), "{out}");
+    assert!(out.ends_with("rate limited: retry later"), "{out}");
+}
+
+// ── review r4 folds ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_a_quarantine_patches_the_deployment_and_records_the_rotation_there() {
+    let p = gw::quarantine_patch();
+    assert_eq!(
+        p["spec"]["replicas"], 0,
+        "stopped by the Deployment itself (no scale verb)"
+    );
+    let dep = json!({"metadata": {"annotations": {gw::ROTATE_ANNOTATION: "1"}}});
+    assert_eq!(p["metadata"], dep["metadata"]);
+    assert!(gw::cluster_rotation_pending(Some(&dep)));
+    assert!(!gw::cluster_rotation_pending(Some(
+        &json!({"metadata": {}})
+    )));
+    assert!(!gw::cluster_rotation_pending(None));
+    // The engine's role may patch deployments (the quarantine's only verb on them).
+    let docs = super::cluster::install_docs("wabc");
+    let role = docs
+        .iter()
+        .find(|d| d["kind"] == "ClusterRole" && d["rules"].to_string().contains("\"deployments\""))
+        .expect("the engine's role");
+    let rule = role["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| {
+            r["resources"] == json!(["deployments"]) && r["verbs"].as_array().unwrap().len() > 1
+        })
+        .expect("the deployments rule");
+    assert!(rule["verbs"].as_array().unwrap().contains(&json!("patch")));
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_links_in_two_roots_cannot_combine_into_an_escape() {
+    let root = tmp("xroot");
+    std::fs::create_dir_all(root.join("sub")).unwrap();
+    let plain = |host: &Path, skip: Vec<String>| PlanRoot {
+        host: host.to_path_buf(),
+        mode: Mode::Plain,
+        skip,
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let outer = plain(&root, vec!["sub".into()]);
+    let inner = plain(&root.join("sub"), Vec::new());
+    let plans: Vec<seat::RootPlan<'_>> = vec![
+        (
+            &outer,
+            vec![entry(Kind::Link, "escape", b"sub/x/../../outside")],
+            Vec::new(),
+        ),
+        (&inner, vec![entry(Kind::Link, "x", b".")], Vec::new()),
+    ];
+    assert!(
+        seat::preflight(&plans).is_err(),
+        "a link led into a nested root"
+    );
+    assert!(!root.join("escape").exists());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_host_link_the_write_back_replaces_is_not_followed() {
+    let root = tmp("replaced-link");
+    std::os::unix::fs::symlink(".", root.join("a")).unwrap();
+    let r = PlanRoot {
+        host: root.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    // `a` becomes a directory; `b -> a/../out` then resolves to `out`, inside the root.
+    let plans: Vec<seat::RootPlan<'_>> = vec![(
+        &r,
+        vec![
+            entry(Kind::File, "a/c", b"c"),
+            entry(Kind::Link, "b", b"a/../out"),
+        ],
+        vec!["a".into()],
+    )];
+    assert!(
+        seat::preflight(&plans).is_ok(),
+        "{:?}",
+        seat::preflight(&plans)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_spelling_change_never_deletes_the_file() {
+    let host = tmp("respell");
+    std::fs::write(host.join("a"), "X").unwrap();
+    let base: std::collections::HashMap<String, [u8; 32]> =
+        [("a".to_string(), sync::digest(&entry(Kind::File, "a", b"X")))].into();
+    let folds = host.join("A").exists();
+    let (writes, deletes) = seat::delta(&host, &base, vec![entry(Kind::File, "A", b"X")]).unwrap();
+    if folds {
+        assert!(deletes.is_empty(), "the only copy was deleted: {deletes:?}");
+        assert!(writes.is_empty());
+    } else {
+        assert_eq!(writes.len(), 1);
+        assert_eq!(deletes, vec!["a".to_string()]);
+    }
+    // Renamed and edited: no false conflict.
+    let (writes, _) = seat::delta(&host, &base, vec![entry(Kind::File, "A", b"Y")]).unwrap();
+    assert_eq!(writes.len(), 1);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[test]
+fn k8s_a_file_and_a_directory_of_one_folded_name_are_refused_however_they_sort() {
+    let r = root(vec![
+        entry(Kind::File, "A", b"a"),
+        entry(Kind::File, "A-", b"b"),
+        entry(Kind::File, "a/b", b"c"),
+    ]);
+    assert!(sync::check_entries(&r, &[]).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_refuses_an_oversized_file_before_reading_it() {
+    let replica = tmp("bigpack");
+    std::fs::create_dir_all(replica.join("w")).unwrap();
+    let f = std::fs::File::create(replica.join("w/big")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let plan = json!([["w", "plain", [], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("limit"));
+    assert!(sync::POD_CODEC.contains(&format!("MAX = {}", sync::MAX_STREAM)));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[test]
+fn k8s_an_offline_seat_is_never_selected_by_the_gateway_policies() {
+    let docs =
+        render::run_namespace_docs("ns", "o", "r", "dns", &render::RunBudget::default(), "1Gi");
+    let egress = docs
+        .iter()
+        .find(|d| d["metadata"]["name"] == "seat-egress-gateway-only")
+        .unwrap();
+    assert_eq!(
+        egress["spec"]["podSelector"]["matchLabels"][render::NET_LABEL],
+        "online"
+    );
+    let ingress = render::gateway_ingress("dns", "o", &[3000]);
+    assert_eq!(
+        ingress["spec"]["ingress"][0]["from"][0]["podSelector"]["matchLabels"][render::NET_LABEL],
+        "online"
+    );
+    let mut s = seat_pod(None, None);
+    s.gateway_ip = None;
+    let sb = render::seat_sandbox(&s).unwrap();
+    assert_eq!(
+        sb["spec"]["podTemplate"]["metadata"]["labels"][render::NET_LABEL],
+        "offline"
+    );
+    s.gateway_ip = Some("10.0.0.1".into());
+    let sb = render::seat_sandbox(&s).unwrap();
+    assert_eq!(
+        sb["spec"]["podTemplate"]["metadata"]["labels"][render::NET_LABEL],
+        "online"
+    );
 }

@@ -398,6 +398,11 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
     // `config_transaction` holds the publish lock (review r1: taking it here too deadlocked).
     let _transaction = crate::seat_gateway::config_transaction(dir).map_err(gwerr)?;
     let ns = daemon_namespace_name(&kube.owner);
+    let cluster_pending = cluster_rotation_pending(
+        kube.get_json(Some(&ns), "deployment", render::GATEWAY_NAME)
+            .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?
+            .as_ref(),
+    );
     let spec = GatewaySpec {
         namespace: ns.clone(),
         owner: kube.owner.clone(),
@@ -405,7 +410,7 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
         writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
         // A quarantine whose rotation did not land is finished first (review r2): the
         // gateway never starts again on the token it was stopped under.
-        boot: boot_for_start(dir).map_err(gwerr)?,
+        boot: boot_for_start(dir, cluster_pending).map_err(gwerr)?,
     };
     // Applied with the host ports already granted (idempotent; it also re-creates a gateway a
     // quarantine stopped, under its new boot token), then again once the host's address is
@@ -417,6 +422,16 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
     let want = host_ports();
     cluster::apply_gateway(kube, &spec, &host).map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
     let pod = cluster::writer_pod(kube, &ns, READY_TIMEOUT).map_err(gwerr)?;
+    if cluster_pending {
+        // The Deployment now runs on the rotated token: the owed rotation is paid.
+        clear_cluster_rotation(&Gw {
+            kube: kube.clone(),
+            ns: ns.clone(),
+            pod: pod.clone(),
+            service_ip: String::new(),
+            dir: dir.to_path_buf(),
+        });
+    }
     let mut gw = Gw {
         kube: kube.clone(),
         ns: ns.clone(),
@@ -554,15 +569,24 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
     if let Ok(mut o) = crate::seat_gateway::OWNED.lock() {
         o.retain(|d| d != &gw.dir);
     }
-    // Stopped first, whatever the host state allows (review r2): the token is rotated after.
-    // The rotation owed is on disk before the gateway is touched (review r3), so an engine that
-    // dies before it rotates leaves it owed to the next one.
-    if begin_rotation(&gw.dir).is_err() {
-        return false;
-    }
+    // Stopped first, whatever the host state allows (review r2, r4): the rotation owed is
+    // recorded on the host when it can be (review r3) AND on the Deployment itself, in the same
+    // patch that scales it to none, so an engine that dies (or a host that cannot write) still
+    // leaves the next start owing it. A patch of the Deployment, never `scale`: the engine's
+    // account holds no `deployments/scale` (review r4).
+    let _ = begin_rotation(&gw.dir);
+    let body = quarantine_patch().to_string();
     let r = gw.kube.call(
         Some(&gw.ns),
-        &["scale", "deployment", render::GATEWAY_NAME, "--replicas=0"],
+        &[
+            "patch",
+            "deployment",
+            render::GATEWAY_NAME,
+            "--type",
+            "merge",
+            "-p",
+            &body,
+        ],
         None,
         EXEC_TIMEOUT,
     );
@@ -578,6 +602,7 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
             Ok(p) if p.is_empty() => {
                 if boot_token(&gw.dir, true).is_ok() {
                     let _ = end_rotation(&gw.dir);
+                    clear_cluster_rotation(gw);
                 }
                 return true;
             }
@@ -594,10 +619,49 @@ fn rotation_marker(dir: &Path) -> PathBuf {
     dir.join("config/rotate-pending")
 }
 
+/// The annotation a quarantine leaves on the gateway Deployment while its token rotation is owed.
+pub(crate) const ROTATE_ANNOTATION: &str = "wicked.dev/rotate-pending";
+
+/// The merge patch that stops the gateway and records the rotation it owes (pure).
+pub(crate) fn quarantine_patch() -> serde_json::Value {
+    serde_json::json!({
+        "metadata": {"annotations": {ROTATE_ANNOTATION: "1"}},
+        "spec": {"replicas": 0},
+    })
+}
+
+/// Whether the gateway Deployment `dep` carries an owed rotation (pure).
+pub(crate) fn cluster_rotation_pending(dep: Option<&serde_json::Value>) -> bool {
+    dep.and_then(|d| d.pointer("/metadata/annotations"))
+        .and_then(|a| a.get(ROTATE_ANNOTATION))
+        .is_some()
+}
+
+/// Drop the Deployment's owed-rotation annotation (the new token is on disk). A failure leaves
+/// it, and the next start rotates once more: never fewer rotations, only more.
+fn clear_cluster_rotation(gw: &Gw) {
+    let body = serde_json::json!({"metadata": {"annotations": {ROTATE_ANNOTATION: null}}});
+    let _ = gw.kube.call(
+        Some(&gw.ns),
+        &[
+            "patch",
+            "deployment",
+            render::GATEWAY_NAME,
+            "--type",
+            "merge",
+            "-p",
+            &body.to_string(),
+        ],
+        None,
+        EXEC_TIMEOUT,
+    );
+}
+
 /// The boot token a gateway (re)starts under: a fresh one when a quarantine still owes its
-/// rotation (whichever engine began it), else the current one.
-pub(crate) fn boot_for_start(dir: &Path) -> Result<String, String> {
-    let pending = rotation_pending(dir);
+/// rotation (whichever engine began it; recorded on the host or, `cluster_pending`, on the
+/// Deployment), else the current one.
+pub(crate) fn boot_for_start(dir: &Path, cluster_pending: bool) -> Result<String, String> {
+    let pending = rotation_pending(dir) || cluster_pending;
     let t = boot_token(dir, pending)?;
     if pending {
         end_rotation(dir)?;

@@ -297,6 +297,34 @@ pub(crate) fn links_stay_inside(entries: &[Entry]) -> Result<(), String> {
 /// [`links_stay_inside`], also following the links already on the host under `root` that the
 /// write-back keeps (review r2: an ignored host link `a -> .` the seat never saw).
 pub(crate) fn links_stay_inside_on(root: Option<&Path>, entries: &[Entry]) -> Result<(), String> {
+    links_stay_inside_final(root, entries, &[], &[])
+}
+
+/// [`links_stay_inside_on`] over the tree as the write-back will leave it (review r4): a host
+/// link the same write-back deletes or replaces (by an entry at its path or under it) is not
+/// followed, and no link may lead into `fence` (the root's nested roots and masks, written back
+/// on their own terms), so links checked in two roots can never combine into an escape.
+pub(crate) fn links_stay_inside_final(
+    root: Option<&Path>,
+    entries: &[Entry],
+    deletes: &[String],
+    fence: &[String],
+) -> Result<(), String> {
+    let gone: std::collections::HashSet<String> = deletes
+        .iter()
+        .map(|d| fold(d))
+        .chain(entries.iter().map(|e| fold(&e.path)))
+        .collect();
+    let ancestors: std::collections::HashSet<String> = entries
+        .iter()
+        .flat_map(|e| {
+            let f = fold(&e.path);
+            let parts: Vec<String> = f.split('/').map(str::to_string).collect();
+            (1..parts.len())
+                .map(|i| parts[..i].join("/"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
     let links: std::collections::HashMap<String, String> = entries
         .iter()
         .filter(|e| e.kind == Kind::Link)
@@ -327,7 +355,18 @@ pub(crate) fn links_stay_inside_on(root: Option<&Path>, entries: &[Entry]) -> Re
                         return Err(format!("`{}` resolves outside its root", e.path));
                     }
                     stack.push(c);
+                    let here = fold(&stack.join("/"));
+                    if fence.iter().any(|f| under(&here, f)) {
+                        return Err(format!(
+                            "`{}` leads into `{}`, a root the write-back keeps apart",
+                            e.path,
+                            stack.join("/")
+                        ));
+                    }
                     let host_link = || {
+                        if gone.contains(&here) || ancestors.contains(&here) {
+                            return None;
+                        }
                         let p = root?.join(stack.join("/"));
                         std::fs::symlink_metadata(&p)
                             .ok()
@@ -395,12 +434,16 @@ pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, 
         out.push(e.clone());
     }
     links_stay_inside(&out)?;
-    // A path cannot be both a file and the parent of another entry.
-    let mut paths: Vec<String> = out.iter().map(|e| fold(&e.path)).collect();
-    paths.sort_unstable();
-    for w in paths.windows(2) {
-        if w[1].starts_with(&format!("{}/", w[0])) {
-            return Err(format!("`{}` is a file and a directory", w[0]));
+    // A path cannot be both a file and the parent of another entry: every ancestor of every
+    // entry is checked against the whole set (review r4: `A`, `A-`, `a/b` are not adjacent).
+    let paths: std::collections::HashSet<String> = out.iter().map(|e| fold(&e.path)).collect();
+    for p in &paths {
+        let parts: Vec<&str> = p.split('/').collect();
+        for i in 1..parts.len() {
+            let anc = parts[..i].join("/");
+            if paths.contains(&anc) {
+                return Err(format!("`{anc}` is a file and a directory"));
+            }
         }
     }
     Ok(out)
@@ -1003,6 +1046,8 @@ def plain_list(rootfd):
 def put(out, k, p, d):
     p = p.encode("utf-8", "surrogateescape")
     out.write(k + struct.pack(">I", len(p)) + p + struct.pack(">Q", len(d)) + d)
+MAX = 536870912
+SENT = 0
 def emit(out, rootfd, rel):
     fd, name = parent(rootfd, rel, False)
     if fd is None: return
@@ -1012,8 +1057,14 @@ def emit(out, rootfd, rel):
         if stat.S_ISLNK(st.st_mode):
             put(out, b"l", rel, os.readlink(name, dir_fd=fd).encode("utf-8", "surrogateescape"))
         elif stat.S_ISREG(st.st_mode):
+            # Never more than the stream may carry (review r4): a sparse multi-gigabyte file a
+            # seat left is refused before it is read, and the read itself is capped.
+            global SENT
+            if st.st_size > MAX - SENT: die("the write-back is larger than the stream's limit at " + rel)
             h = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
-            with os.fdopen(h, "rb") as fh: d = fh.read()
+            with os.fdopen(h, "rb") as fh: d = fh.read(MAX - SENT + 1)
+            SENT += len(d)
+            if SENT > MAX: die("the write-back is larger than the stream's limit at " + rel)
             put(out, b"x" if st.st_mode & 0o111 else b"f", rel, d)
         elif stat.S_ISDIR(st.st_mode): return
         else: put(out, b"o", rel, b"")

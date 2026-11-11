@@ -526,10 +526,19 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
     }
     let _ = std::fs::remove_file(tmp.join(".git/FETCH_HEAD"));
     let gitdir = tmp.join(".git");
-    let entries = sync::host_plain_listing(&gitdir, &[])
-        .iter()
-        .filter_map(|rel| sync::read_host_entry(&gitdir, rel))
-        .collect();
+    // Every file of the rebuilt git dir, or a refusal (review r4: an object pack over the
+    // stream's limit was left out silently, leaving a `.git` whose index named missing objects).
+    let mut entries = Vec::new();
+    for rel in sync::host_plain_listing(&gitdir, &[]) {
+        match sync::read_host_entry(&gitdir, &rel) {
+            Some(e) => entries.push(e),
+            None => {
+                return Err(format!(
+                    "the replica's .git could not be read whole (`{rel}` is unreadable or over                      {STREAM_LIMIT} bytes)"
+                ))
+            }
+        }
+    }
     Ok(Some((sha, entries)))
 }
 
@@ -586,6 +595,16 @@ pub(crate) fn copy_in_stream(
                 Some((sha, entries)) => (Some(sha), entries),
                 None => (None, Vec::new()),
             };
+            // The rebuilt git dir counts against the same budget (review r4).
+            budget += git_entries
+                .iter()
+                .map(|e| (e.data.len() + e.path.len()) as u64)
+                .sum::<u64>();
+            if budget > STREAM_LIMIT {
+                return Err(format!(
+                    "the unit's copy-in is larger than {STREAM_LIMIT} bytes (its .git)"
+                ));
+            }
             {
                 let gr = format!("{replica}/.git");
                 stream.push(Root {
@@ -1061,7 +1080,12 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
             | "DYLD_LIBRARY_PATH"
             | "DYLD_INSERT_LIBRARIES" => continue,
             "HOME" => {
-                home = Some(v.to_string_lossy().into_owned());
+                // In the mounts' own spelling (review r4: macOS spells `/tmp` canonically under `/private`).
+                home = Some(
+                    crate::container_floor::canonical_spelling(v, mounted)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
                 continue;
             }
             "PATH" => {
@@ -1449,7 +1473,8 @@ pub(crate) fn preflight(plans: &[RootPlan<'_>]) -> Result<(), String> {
                 .chain(deletes.iter().map(String::as_str)),
         )
         .map_err(refused)?;
-        sync::links_stay_inside_on(Some(&want.host), writes).map_err(refused)?;
+        sync::links_stay_inside_final(Some(&want.host), writes, deletes, &want.skip)
+            .map_err(refused)?;
     }
     Ok(())
 }
@@ -1473,16 +1498,24 @@ pub(crate) fn delta(
     entries: Vec<Entry>,
 ) -> Result<(Vec<Entry>, Vec<String>), String> {
     let now = |rel: &str| sync::read_host_entry(host, rel).map(|e| sync::digest(&e));
-    let mut seen = std::collections::HashSet::new();
+    // A spelling change (`a` -> `A`, review r4): on a host that folds them, the new spelling
+    // names the old file, so the old one is neither a conflict nor a deletion there; on a host
+    // that does not, they are two files, as in the pod.
+    let folded_base: HashMap<String, &[u8; 32]> =
+        base.iter().map(|(p, d)| (sync::fold(p), d)).collect();
+    let mut seen: Vec<String> = Vec::new();
     let mut writes = Vec::new();
     for e in entries {
-        seen.insert(e.path.clone());
+        seen.push(e.path.clone());
         let d = sync::digest(&e);
-        let was = base.get(&e.path);
+        let cur = now(&e.path);
+        let was = base.get(&e.path).or_else(|| {
+            cur.as_ref()
+                .and(folded_base.get(&sync::fold(&e.path)).copied())
+        });
         if was == Some(&d) {
             continue; // unchanged by the seat
         }
-        let cur = now(&e.path);
         if cur == Some(d) {
             continue; // the host already holds it
         }
@@ -1494,9 +1527,34 @@ pub(crate) fn delta(
         }
         writes.push(e);
     }
+    let same_file = |a: &str, b: &str| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            match (
+                std::fs::symlink_metadata(host.join(a)),
+                std::fs::symlink_metadata(host.join(b)),
+            ) {
+                (Ok(x), Ok(y)) => x.dev() == y.dev() && x.ino() == y.ino(),
+                _ => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (a, b);
+            false
+        }
+    };
     let mut deletes = Vec::new();
     for (rel, was) in base {
-        if seen.contains(rel) {
+        if seen.iter().any(|p| p == rel) {
+            continue;
+        }
+        // Kept under another spelling the host folds to this very file.
+        if seen
+            .iter()
+            .any(|p| sync::fold(p) == sync::fold(rel) && same_file(p, rel))
+        {
             continue;
         }
         match now(rel) {

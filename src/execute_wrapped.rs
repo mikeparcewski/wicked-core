@@ -7468,14 +7468,22 @@ const CANCELLED: &str = "__wicked_cancelled__";
 /// The unit output of a seat pod whose settlement failed: the could-not-run line first (what
 /// classifiers read), then whatever the CLI printed.
 pub(crate) fn settle_failure_output(argv0: &str, err: &str, out: &str) -> String {
-    let why = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
-    let head = format!("{COULD_NOT_RUN_PREFIX}{argv0}`: {why})");
-    if out.trim().is_empty() {
-        head
-    } else {
-        format!("{head}\n{out}")
+    let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
+    let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
+    let mut text = format!("{COULD_NOT_RUN_PREFIX}{argv0}`: {why})");
+    if !out.trim().is_empty() {
+        text.push('\n');
+        text.push_str(out);
     }
+    if !stderr.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(stderr);
+    }
+    text
 }
+
+/// Between a settlement failure's reason and the CLI's stderr in the sentinel.
+pub(crate) const SETTLE_SEP: char = '\u{1e}';
 
 /// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
 /// write-back was refused): could not run, the reason after the prefix, the CLI's output kept.
@@ -7772,7 +7780,15 @@ pub(crate) fn run_bounded(
             // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
             // minutes of output, usage and tool records.
             Err(e) => {
-                return Ok((-1, out, format!("{SETTLE_FAILED}{e}"), usage, files, tools));
+                // The reason, then the CLI's own stderr (review r4: it may say why it failed).
+                return Ok((
+                    -1,
+                    out,
+                    format!("{SETTLE_FAILED}{e}{SETTLE_SEP}{err}"),
+                    usage,
+                    files,
+                    tools,
+                ));
             }
         }
     }
