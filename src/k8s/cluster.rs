@@ -937,6 +937,11 @@ pub(crate) fn ensure_pids_limited(
         }
     }
     let ns = daemon_namespace_name(&kube.owner);
+    // The probe proves enforcement against its own namespace's deny-all: applied here, so the
+    // first arm on a fresh install (before the gateway applies the daemon's policies) does not
+    // read a namespace with no policy yet as a cluster that enforces none (B-2 live).
+    kube.apply(&[render::default_deny(&ns, &kube.owner)])
+        .map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
     let name = format!("pids-probe-{}", super::boot_id());
     let infra = |e: String| (FloorUnarmed::PolicyRefused, e);
     let _ = kube.delete_owned(Some(&ns), "pod", &name, true);

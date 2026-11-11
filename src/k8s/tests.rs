@@ -674,7 +674,13 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     let script = pod["spec"]["containers"][0]["command"][3].as_str().unwrap();
     assert!(script.contains("-lt 4160"));
     assert!(script.contains("$KUBERNETES_SERVICE_HOST 443") && script.contains("$HOST_IP 10250"));
-    assert!(script.contains("1.1.1.1 443") && script.starts_with("/busybox sleep 3;"));
+    // The enforcement check polls (a new pod's policy can land late under load), and still
+    // ends on what it saw: a cluster that never closes answers open.
+    assert!(
+        script.contains("1.1.1.1 443")
+            && script.contains("-lt 10")
+            && script.contains("echo net=$n")
+    );
 }
 
 #[test]

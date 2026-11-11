@@ -771,12 +771,15 @@ pub(crate) fn pids_probe_pod(
 ) -> Value {
     let limit = POD_PIDS_MAX + PIDS_PROBE_SLACK;
     // First the policy enforcement check (review r1 P1): this pod's namespace denies all egress,
-    // so the API server and the node's kubelet must not answer it; then the fork count. The check
-    // waits 3 s: a new pod's policy lands just after its first instant (PARITY F1, seen again on
-    // this probe: both answered at start), and the verdict is about the policy in force.
+    // so the API server and the node's kubelet must not answer it; then the fork count. A new
+    // pod's policy lands after its first instant (PARITY F1), later under load (B-2 live: still
+    // open after 3 s at load ~60), so the check polls up to ~20 s for every target to close; a
+    // cluster that never enforces still answers open at the end.
     let script = format!(
-        "/busybox sleep 3; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\" \"1.1.1.1 443\"; do \
-         if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then echo net=open; else echo net=closed; fi; done; \
+        "i=0; while :; do r=''; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\" \"1.1.1.1 443\"; do \
+         if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then r=\"$r open\"; else r=\"$r closed\"; fi; done; \
+         i=$((i+1)); case \"$r\" in *open*) [ $i -lt 10 ] && {{ /busybox sleep 2; continue; }};; esac; break; done; \
+         for n in $r; do echo net=$n; done; \
          i=0; while [ $i -lt {limit} ]; do /busybox sleep 120 & i=$((i+1)); echo $i; done; \
          echo {PIDS_PROBE_UNBOUNDED}"
     );
