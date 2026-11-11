@@ -2936,6 +2936,43 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.39** — 2026-11-11 — patch release on main 57aac79, carrying 7 PRs since 0.15.38: #1411, #1416, #1425,
+  #1426, #1427, #1428 and #1431.
+  - **The requirements share counts only real behaviour (#1428, closes #1375 and #1235).** The share reads estate's
+    `metadata.behaviour` on each definition: `stub` and `data` units leave the denominator as structural,
+    `test_support` units (Rust `#[cfg(test)]` modules and `#[test]` functions in product files included) as not
+    product; an absent, `real` or unknown value still counts. The test-directory rule also matches named kinds of
+    test (`integration_tests/`, `unit-tests/`, `load_test/`), test-helper segments (`test_utils/`) and a `*_e2e/`
+    directory whose code files are mostly tests by name; an arbitrary `*_tests/` or `*_e2e/` stays product. On the
+    measured AutoGPT slice the share moves from 66% to 71%.
+  - **Requirements carry a business domain (#1425, reqgraph Fix B).** `domain-graph` reads wicked-garden's
+    `business_domain` annotation into an optional `requirement.business_domain` `{id, name, confidence}` and lists
+    the areas in `metadata.business_domains[]` (purpose, requirement count, package directories); domain-model schema
+    bundle 1.3.1. Keys, `SatisfiedBy` edges, overrides and coverage do not move. domain-graph no longer warns about
+    its own kinds (#1376). The domain-extraction reviewer judges a page's business domains when the rules file
+    carries them.
+  - **POL-2101 records the stack check, accepts the reviewer's, and is N/A without code (#1426, closes #1381).** A
+    code-writing unit is asked for one `STACK-CHECK: looked at … :: offers …` line; the record clause is kept when
+    every code step's record or the reviewer's record states the check; the rule is NOT_APPLICABLE by fact on a
+    docs, text or image-only change. A duplicated built-in still breaks it.
+  - **A pack's rules enter a run's rule set only where its scope fits (#1427, #1414).** The mcp-server pack
+    (MCPS-1001..1007) fits a run launched from the `mcp-server` preset or a change in a codebase that builds an MCP
+    server; otherwise its rules are left out before the check and the note names them. An unknown fact removes
+    nothing; an operator-edited pack rule is still judged.
+  - **The boot reaper removes only worktrees its own daemon minted (#1431, #1373).** Each minted or adopted worktree
+    carries its daemon's id in its git admin dir (`wicked-daemon`, a store digest, no path); an unknown-run tree is
+    force-removed only when the marker is the reaper's own; an unmarked tree (another daemon's, or one minted before
+    this release) is kept and reported.
+  - **A dispatch reads its worktree off the actor, once (#1411, #1390 part 2).**
+  - **Lockfile:** #1416 re-stamped the 0.15.38 platform lock entries.
+  - **Upgrade notes.** The behaviour half of #1428 needs a graph indexed by **wicked-estate 0.35.2 or later** (the
+    estate that writes `metadata.behaviour`): install estate 0.35.2, then re-index the repository. A graph an older
+    estate indexed carries no key, so its stubs and data classes still count and the share moves only by the
+    test-directory rule. `requirement.business_domain` is filled only for a map made with **wicked-garden 12.67.0 or
+    later** (the extractor that writes the annotation); otherwise it is absent. No binding method change, no
+    `LaunchSpec` field change; gate protocol 3 is unchanged; no Dockerfile change, so the checks-floor and seat image
+    tags are unchanged. Wire: the requirements graph gains the optional `business_domain` and
+    `metadata.business_domains`.
 - **core-ts 0.15.38** — 2026-11-11 — patch release on main a82ac4f, carrying 6 PRs since 0.15.37: #1399, #1403, #1404,
   #1405, #1407 and #1412.
   - **A targeted re-run with no targeted command is refused, never a test waiver (#1403, closes #1392).** A timed-out
