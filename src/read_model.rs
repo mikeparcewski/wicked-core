@@ -48,6 +48,12 @@ pub(crate) struct ReadModel {
     conn: Mutex<Option<SqliteStore>>,
     /// The actor's command counters: where "between commands" is read from.
     actor: Arc<crate::actor_stats::ActorStats>,
+    /// How long a read waits for a between-commands moment ([`QUIET_BUDGET`]; tests widen it so a
+    /// loaded host cannot turn an interleaving test into a budget test).
+    budget: Duration,
+    /// TEST-ONLY: runs once, between a read's quiet moment and its snapshot pin.
+    #[cfg(test)]
+    after_quiet: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 /// Whether a store spec can be read through a read-only SQLite connection.
@@ -58,21 +64,31 @@ fn readable_spec(spec: &str) -> bool {
         || spec.starts_with("postgresql://"))
 }
 
+/// The store spec a core runs on, resolved once at spawn: a SQLite file path is made absolute, so the
+/// actor (which opens it on its own thread, a moment later) and the read model open the same file
+/// whatever the process's working directory does afterwards. In-memory and Postgres specs are
+/// returned as given.
+pub(crate) fn resolve_spec(spec: String) -> String {
+    if !readable_spec(&spec) {
+        return spec;
+    }
+    std::path::absolute(&spec)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or(spec)
+}
+
 impl ReadModel {
     /// The read model for the store the actor opens at `spec`.
     pub(crate) fn for_store(spec: &str, actor: Arc<crate::actor_stats::ActorStats>) -> Self {
         let off =
             std::env::var("WICKED_READ_MODEL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
-        // Resolved now, at spawn, as the actor resolves it: a later change of the process's working
-        // directory must not point the reads at another store.
         Self {
-            path: (!off && readable_spec(spec)).then(|| {
-                std::path::absolute(spec)
-                    .map(|p| p.to_string_lossy().into_owned())
-                    .unwrap_or_else(|_| spec.to_string())
-            }),
+            path: (!off && readable_spec(spec)).then(|| resolve_spec(spec.to_string())),
             conn: Mutex::new(None),
             actor,
+            budget: QUIET_BUDGET,
+            #[cfg(test)]
+            after_quiet: Mutex::new(None),
         }
     }
 
@@ -98,11 +114,15 @@ impl ReadModel {
             *slot = wicked_apps_core::open_store_ro(Some(path)).ok();
         }
         let store = slot.as_mut()?;
-        let deadline = Instant::now() + QUIET_BUDGET;
+        let deadline = Instant::now() + self.budget;
         loop {
             let quiet = self
                 .actor
                 .between_commands(deadline.saturating_duration_since(Instant::now()));
+            #[cfg(test)]
+            if let Some(hook) = self.after_quiet.lock().unwrap().take() {
+                hook();
+            }
             // `BEGIN` (deferred), then one SELECT: the snapshot everything `f` reads is pinned here.
             if store.begin_batch().is_err() || store.meta_get("history_enabled").is_err() {
                 let _ = store.commit_batch();
@@ -161,6 +181,50 @@ mod tests {
             "a relative store is resolved at spawn: {:?}",
             rel.path
         );
+    }
+
+    #[test]
+    fn a_command_that_begins_before_the_pin_is_waited_out_and_its_whole_write_read() {
+        use wicked_apps_core::ToNode;
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-gen-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        let path = db.to_str().unwrap().to_string();
+        let session = crate::actor::sessions_detail_fold_tests::session;
+        {
+            let mut w = wicked_apps_core::open_store(Some(&path)).unwrap();
+            crate::domain::put_nodes(&mut w, &[session("run-a").to_node()]).unwrap();
+        }
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let mut rm = ReadModel::for_store(&path, actor.clone());
+        rm.budget = Duration::from_secs(30);
+        // Right after the read sees the actor quiet, a command begins and commits HALF its write
+        // (run-b) before the read pins; it commits the rest (run-c) 30 ms later.
+        let (began_tx, began) = std::sync::mpsc::channel();
+        let (a2, p2) = (actor.clone(), path.clone());
+        let writer = std::thread::spawn(move || {
+            let mut w = wicked_apps_core::open_store(Some(&p2)).unwrap();
+            let _cmd = crate::actor_stats::Timed::start(&a2, "Test", 0, Duration::from_secs(3600));
+            crate::domain::put_nodes(&mut w, &[session("run-b").to_node()]).unwrap();
+            began_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(30));
+            crate::domain::put_nodes(&mut w, &[session("run-c").to_node()]).unwrap();
+        });
+        *rm.after_quiet.lock().unwrap() = Some(Box::new(move || began.recv().unwrap()));
+        let n = rm
+            .read(|s| Ok(crate::domain::all_sessions(s)?.len()))
+            .expect("read");
+        writer.join().unwrap();
+        assert_eq!(
+            n, 3,
+            "never the half-written state: the read waited the command out"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

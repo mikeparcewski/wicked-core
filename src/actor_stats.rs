@@ -56,6 +56,8 @@ pub(crate) struct ActorStats {
     finished: AtomicU64,
     /// The actor's loop has ended (shutdown, an early return, or a panic unwinding it).
     stopped: std::sync::atomic::AtomicBool,
+    /// The slow threshold the actor runs with (ms), captured once at its start.
+    slow_ms: AtomicU64,
 }
 
 /// Marks the actor stopped when dropped: held for the whole of the actor thread's run, so every way
@@ -136,6 +138,12 @@ impl ActorStats {
         if self.started.load(Ordering::SeqCst) > self.finished.load(Ordering::SeqCst) {
             self.finished.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// The slow threshold the actor captured at its start (reported by [`ActorStats::view`]).
+    pub(crate) fn set_slow_threshold(&self, slow: Duration) {
+        self.slow_ms
+            .store(slow.as_millis() as u64, Ordering::SeqCst);
     }
 
     /// The actor took `Shutdown` (or its thread ended): no read is answered off it from now on.
@@ -239,7 +247,10 @@ impl ActorStats {
             running,
             backlog: self.backlog.load(Ordering::Relaxed),
             max_backlog: self.max_backlog.load(Ordering::Relaxed),
-            slow_threshold_ms: slow.as_millis() as u64,
+            slow_threshold_ms: match self.slow_ms.load(Ordering::SeqCst) {
+                0 => slow.as_millis() as u64,
+                captured => captured,
+            },
             commands,
             slow: inner.slow.iter().cloned().collect(),
         }

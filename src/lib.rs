@@ -814,7 +814,8 @@ impl Core {
     pub fn spawn_with_pty_sessions(
         path: impl Into<String>,
     ) -> (Core, std::sync::Arc<PersistentStepRunner>) {
-        let path = path.into();
+        // (core#1390) One resolution of the store path, for the actor and the read model alike.
+        let path = read_model::resolve_spec(path.into());
         let (tx, rx) = channel();
         let self_tx = tx.clone();
         let pty = terminal::new_map();
@@ -899,7 +900,8 @@ impl Core {
         // known before a run spends on councils.
         let _ = crate::worker_sandbox::host_boundary();
         let (tx, rx) = channel();
-        let path = path.into();
+        // (core#1390) One resolution of the store path, for the actor and the read model alike.
+        let path = read_model::resolve_spec(path.into());
         let self_tx = tx.clone();
         let pty = terminal::new_map();
         let pty_actor = pty.clone();
@@ -1008,7 +1010,8 @@ impl Core {
         team: Option<crate::team::publish::TeamConfig>,
     ) -> Core {
         let (tx, rx) = channel();
-        let path = path.into();
+        // (core#1390) One resolution of the store path, for the actor and the read model alike.
+        let path = read_model::resolve_spec(path.into());
         let self_tx = tx.clone();
         // The off-actor PTY I/O map: one clone drives write/resize from `Core`, one is owned by the
         // actor for open/close/shutdown. Both reach the same sessions behind its mutex.

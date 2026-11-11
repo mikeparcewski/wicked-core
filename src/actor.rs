@@ -1232,6 +1232,7 @@ pub(crate) fn run(
     // channel into `backlog` in arrival order and taken from its front, so the order
     // they run in is the channel's order exactly; only the count of those waiting becomes visible.
     let slow_threshold = crate::actor_stats::slow_threshold_from_env();
+    stats.set_slow_threshold(slow_threshold);
     // Startup (redrive, orphan reports, the WAL sidecars) is done: reads may pin between commands.
     stats.started_up();
     let mut backlog: std::collections::VecDeque<Command> = std::collections::VecDeque::new();

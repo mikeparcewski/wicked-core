@@ -356,8 +356,8 @@ fn actor_latency_under_concurrent_runs() {
         threads.push(std::thread::spawn(move || {
             while !stop.load(Ordering::Relaxed) {
                 let t = Instant::now();
-                let _ = core.sessions_detail();
-                samples.add("list", t.elapsed());
+                let ok = core.sessions_detail().is_ok();
+                samples.add(if ok { "list" } else { "list_error" }, t.elapsed());
                 std::thread::sleep(Duration::from_millis(150 + 50 * r));
             }
         }));
@@ -379,8 +379,8 @@ fn actor_latency_under_concurrent_runs() {
                 i += 1;
                 if let Some(id) = id {
                     let t = Instant::now();
-                    let _ = core.run_team(&id);
-                    samples.add("team", t.elapsed());
+                    let ok = core.run_team(&id).is_ok();
+                    samples.add(if ok { "team" } else { "team_error" }, t.elapsed());
                     let t = Instant::now();
                     let _ = core.unit_transcript_at(&format!("{id}:s1"), None);
                     samples.add("transcript", t.elapsed());
@@ -446,7 +446,11 @@ fn actor_latency_under_concurrent_runs() {
         std::thread::sleep(Duration::from_millis(500));
         let views = match core.sessions_detail() {
             Ok(v) => v,
-            Err(_) => continue,
+            Err(e) => {
+                samples.add("replace_loop_error", Duration::ZERO);
+                eprintln!("load: the run list failed: {e}");
+                continue;
+            }
         };
         let mut l = live.lock().unwrap();
         let ended: Vec<String> = l
@@ -492,8 +496,11 @@ fn actor_latency_under_concurrent_runs() {
     }
     stop.store(true, Ordering::Relaxed);
     for t in threads {
-        let _ = t.join();
+        t.join().expect("a measuring thread panicked");
     }
+    // A run of good numbers from an engine that had stopped would be no measurement at all.
+    core.list_repos()
+        .expect("the actor still answers commands at the end of the window");
     let stats = core.actor_stats();
     let load1 = Command::new("sysctl")
         .args(["-n", "vm.loadavg"])
