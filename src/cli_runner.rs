@@ -6032,6 +6032,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .filter(|r| r.reason == wicked_council::types::SeatFailureReason::NotLoggedIn.as_str())
         .map(|r| r.seat.clone())
         .collect();
+    // (core#1390) The fold's tree reads, here on the worker thread, for both worker paths.
+    let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
@@ -6048,8 +6050,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         demo_take: None,
         editor_conformance: None,
         draft_render: None,
-        worktree_clean: None,
-        tree_after_failure: None,
+        worktree_clean,
+        tree_after_failure,
     };
     (output, agent_verdict, evidence)
 }

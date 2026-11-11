@@ -65,8 +65,10 @@ pub(crate) struct DispatchProbe {
     pub(crate) seq: u64,
     pub(crate) unit_id: String,
     pub(crate) attempt: u32,
-    /// The author the FIRST pass stamped (the second pass sees the stamp already made).
-    pub(crate) new_author: Option<(String, Vec<String>)>,
+    /// The run's status and cursor when the probe started: a run that moved on since (paused,
+    /// ended, relaunched, advanced) is not this dispatch's any more.
+    pub(crate) status: crate::domain::SessionStatus,
+    pub(crate) cursor: usize,
     /// The one snapshot of the worktree, pinned to the registered repository.
     pub(crate) snapshot: Result<WorktreeSnapshot, String>,
     pub(crate) qe: Option<ScoredQe>,
@@ -116,7 +118,9 @@ pub(crate) struct ProbeJob {
     pub(crate) session: AgentSession,
     pub(crate) workdir: PathBuf,
     pub(crate) repo: RepoEntry,
-    pub(crate) new_author: Option<(String, Vec<String>)>,
+    /// The state home the actor's code-graph resolver is bound to: the probe thread resolves the
+    /// QE score's graph through the same one (a thread-local binding does not follow a thread).
+    pub(crate) state_home: Option<PathBuf>,
     /// Score the QE unit on the tree it starts on.
     pub(crate) score_qe: bool,
     /// Read the reviewer's requirements record.
@@ -147,8 +151,12 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
                 let _ = release.recv();
             }
         }
-        let (unit_id, attempt, new_author) =
-            (job.unit.id.clone(), job.attempt, job.new_author.clone());
+        let (unit_id, attempt, status, cursor) = (
+            job.unit.id.clone(),
+            job.attempt,
+            job.session.status,
+            job.session.unit_ix,
+        );
         // A probe that panics still answers — with no tree, so the dispatch goes on fail-closed
         // (no baseline: a guarded gate denies) rather than leaving the run waiting for ever.
         let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(seq, job)))
@@ -156,7 +164,8 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
                 seq,
                 unit_id,
                 attempt,
-                new_author,
+                status,
+                cursor,
                 snapshot: Err("the worktree probe panicked".into()),
                 qe: None,
                 requirements: None,
@@ -182,7 +191,16 @@ pub(crate) fn take_current(run_id: &str, probe: &DispatchProbe) -> bool {
     })
 }
 
+/// Forget `run_id`'s probe: the run ended or was launched afresh, and the probe's answer, when it
+/// lands, is dropped (it is no longer the run's live one).
+pub(crate) fn forget(run_id: &str) {
+    PROBING.with(|p| {
+        p.borrow_mut().remove(run_id);
+    });
+}
+
 fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
+    let _state_home = crate::code_graph::StateHomeScope::bind(job.state_home.clone());
     let root = PathBuf::from(&job.repo.root_path);
     let snapshot = crate::worktree_guard::snapshot(&job.workdir, &root).map_err(|e| e.to_string());
     // The baseline the dispatch will hold: the unit's own, or this snapshot when it has none.
@@ -226,7 +244,8 @@ fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
         seq,
         unit_id: job.unit.id.clone(),
         attempt: job.attempt,
-        new_author: job.new_author,
+        status: job.session.status,
+        cursor: job.session.unit_ix,
         snapshot,
         qe,
         requirements,

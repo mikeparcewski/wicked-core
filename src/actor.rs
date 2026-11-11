@@ -1459,6 +1459,9 @@ pub(crate) fn run(
                             .into());
                         }
                     }
+                    // (core#1390) A probe of an earlier, ended life of this run id is never
+                    // this launch's.
+                    dispatch_probe::forget(&run_id);
                     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
                     // Extra write roots (core#259) are judged in the sync fast path like the
                     // project/preflight checks above: an invalid root is a synchronous Err with
@@ -3876,22 +3879,36 @@ pub(crate) fn run(
                 if !dispatch_probe::take_current(&run_id, &probe) {
                     continue;
                 }
-                let live = match crate::domain::get_session(&store, &run_id) {
-                    Ok(Some(s)) => {
-                        !matches!(
-                            s.status,
-                            SessionStatus::Completed
-                                | SessionStatus::Cancelled
-                                | SessionStatus::Failed
-                        ) && s.attempt == probe.attempt
+                // The run must still be where the probe left it: same status (a pause, an end or
+                // a relaunch changes it — and another path then owns the next dispatch), same
+                // cursor, same attempt, same unit. A store that cannot say is a dispatch error,
+                // never a silently dropped dispatch.
+                let current = crate::domain::get_session(&store, &run_id).and_then(|s| {
+                    let units = crate::domain::session_units(&store, &run_id)?;
+                    Ok(s.map(|s| (s, units)))
+                });
+                let still_waiting = match current {
+                    Ok(Some((s, units))) => {
+                        s.status == probe.status
+                            && s.unit_ix == probe.cursor
+                            && s.attempt == probe.attempt
+                            && units.get(unit_ix).is_some_and(|u| u.id == probe.unit_id)
                     }
-                    _ => false,
+                    Ok(None) => false,
+                    Err(e) => {
+                        in_flight.remove(&run_id);
+                        fail_run_by_id(
+                            &mut store,
+                            &mut subscribers,
+                            &runner,
+                            &self_tx,
+                            &run_id,
+                            anyhow::anyhow!("the dispatch could not re-read the run: {e}"),
+                        );
+                        continue;
+                    }
                 };
-                let same_unit = crate::domain::session_units(&store, &run_id)
-                    .ok()
-                    .and_then(|u| u.get(unit_ix).map(|u| u.id == probe.unit_id))
-                    .unwrap_or(false);
-                if !(live && same_unit) {
+                if !still_waiting {
                     continue;
                 }
                 match dispatch_unit_with(
@@ -6464,21 +6481,16 @@ fn apply_step_result(
     // Without this, three "done" units of refusal one-liners reached the coverage gate looking
     // like finished phases. Non-skill units are exempt: free-text work could legitimately quote
     // such a line.
-    if unit.skill_ref.is_some() && matches!(output.status, crate::workflow::StepStatus::Ok) {
-        let t = output.output.trim();
-        if t.starts_with("Unknown command:") && t.len() < 200 {
-            output.status = crate::workflow::StepStatus::Failed;
-        }
+    if unknown_command_noop(unit, &output) {
+        output.status = crate::workflow::StepStatus::Failed;
     }
     // (core#769) IN-TOOL APPROVAL REFUSAL TRIPWIRE: an Ok agent step whose every command was
     // refused by a host-forced approval policy (codex on a signed requirements bundle — the seat
     // kept going and wrote prose saying so) did no work it could verify. It takes the failure
     // path, where the appended line — the launcher's own frame, last — classifies as
     // `approval_unavailable`: the seat is benched for the run and the unit fails over.
-    if unit.tool_cmd.is_none() && matches!(output.status, crate::workflow::StepStatus::Ok) {
-        if let Some(n) =
-            wicked_council::types::SeatFailureReason::in_tool_approval_refusals(&output.output)
-        {
+    {
+        if let Some(n) = approval_refusals(unit, &output) {
             output.status = crate::workflow::StepStatus::Failed;
             output.output.push_str(&format!(
                 "\n(wicked-core: the seat ran no command — {n} exec_command failed: \
@@ -9698,6 +9710,8 @@ fn fail_run(
     session: &mut crate::domain::AgentSession,
     ord: u32,
 ) -> StepApplied {
+    // (core#1390) A dispatch probe still out for this run is no longer its dispatch.
+    dispatch_probe::forget(&session.id);
     session.status = SessionStatus::Failed;
     session.finished_at = Some(crate::interaction::now_millis());
     power_gate::set_outcome(&*store, session, "failed");
@@ -11565,6 +11579,66 @@ fn dispatch_unit(
     )
 }
 
+/// (core#126) The fold's NO-OP tripwire: an Ok step of a SKILL-driven unit whose whole output is
+/// the CLI refusing the invocation is not completed work and takes the failure path.
+pub(crate) fn unknown_command_noop(
+    unit: &crate::domain::WorkUnit,
+    output: &crate::workflow::StepOutput,
+) -> bool {
+    let t = output.output.trim();
+    unit.skill_ref.is_some()
+        && matches!(output.status, crate::workflow::StepStatus::Ok)
+        && t.starts_with("Unknown command:")
+        && t.len() < 200
+}
+
+/// (core#769) The fold's in-tool approval refusal tripwire: an Ok agent step whose every command a
+/// host-forced approval policy refused — how many, when it is one.
+pub(crate) fn approval_refusals(
+    unit: &crate::domain::WorkUnit,
+    output: &crate::workflow::StepOutput,
+) -> Option<usize> {
+    (unit.tool_cmd.is_none() && matches!(output.status, crate::workflow::StepStatus::Ok))
+        .then(|| {
+            wicked_council::types::SeatFailureReason::in_tool_approval_refusals(&output.output)
+        })
+        .flatten()
+}
+
+/// (core#1390) The tree reads the fold of a step needs, taken on the WORKER thread right after the
+/// step (nothing else changes the run's tree between then and the fold), for every worker path —
+/// in-process and bus-mediated alike: whether the worktree is clean, and, for an attempt the fold
+/// will treat as failed (its status, or either tripwire above) of a unit with an author probe, the
+/// tree it left. `(None, None)` for a unit with no worktree.
+pub(crate) fn post_step_reads(
+    input: &StepInput,
+    output: &crate::workflow::StepOutput,
+) -> (Option<bool>, Option<crate::workflow::PostStepTree>) {
+    let Some(wd) = input.workdir.as_deref() else {
+        return (None, None);
+    };
+    let clean = worktree_is_clean(Some(&wd.to_string_lossy()));
+    let failed = output.status != crate::workflow::StepStatus::Ok
+        || unknown_command_noop(&input.unit, output)
+        || approval_refusals(&input.unit, output).is_some();
+    let tree = failed
+        .then(|| {
+            input
+                .unit
+                .author_probe
+                .as_ref()
+                .filter(|p| p.attempt == output.attempt)
+        })
+        .flatten()
+        .map(|p| crate::workflow::PostStepTree {
+            git_dir: p.git_dir.clone(),
+            tree: crate::worktree_guard::snapshot_through(wd, std::path::Path::new(&p.git_dir))
+                .ok()
+                .map(|snap| snap.tree),
+        });
+    (Some(clean), tree)
+}
+
 /// (core#1390) What this dispatch must read of the run's worktree, handed to the probe thread; `None`
 /// when it reads nothing (no worktree, no registered repository, or no read this unit takes), and
 /// the dispatch then goes on at once, on the actor, as before.
@@ -11601,7 +11675,7 @@ fn dispatch_probe_job(
         session: session.clone(),
         workdir,
         repo,
-        new_author: new_author.clone(),
+        state_home: crate::code_graph::bound_state_home(),
         score_qe,
         requirements,
     })
@@ -11798,6 +11872,18 @@ fn dispatch_unit_with(
         unit.exclude_seats = session.exclude_seats.clone();
         team_changed = true;
     }
+    // (core#1390) The worktree reads this dispatch needs — the baseline, the author's start tree,
+    // the QE floor note's tree, the editor-conformance tree, the QE score and the requirements
+    // record — run off the actor. The FIRST pass decides them on an in-memory copy, persists
+    // nothing, hands them to the probe thread and returns; the SECOND pass, back with the probe,
+    // does all of this dispatch's bookkeeping for real (so a probe dropped as stale leaves no
+    // stamp of an author who never ran) and reads the tree from the probe.
+    if probe.is_none() {
+        if let Some(job) = dispatch_probe_job(&*store, &session, &units, &unit, &new_author) {
+            dispatch_probe::start(self_tx, job);
+            return Ok(true);
+        }
+    }
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
@@ -11829,22 +11915,6 @@ fn dispatch_unit_with(
     // guard on `worktree_guarded`, the tree-changed floor on `default_floor`), so taking it here
     // adds the pin (the dependency install's git dir with it), the seat secret scan, an author
     // probe taken from it and the clear-and-retake on an approved gate; no guard, floor or judge.
-    // (core#1390) The worktree reads below — the baseline, the author's start tree, the QE floor
-    // note's tree, the editor-conformance tree, the QE score and the requirements record — run off
-    // the actor: the first pass hands them to the probe thread and returns; the second pass, back
-    // with the probe, reads them from it.
-    let probe = match probe {
-        Some(p) => Some(p),
-        None => {
-            if let Some(job) = dispatch_probe_job(&*store, &session, &units, &unit, &new_author) {
-                dispatch_probe::start(self_tx, job);
-                return Ok(true);
-            }
-            None
-        }
-    };
-    // The first pass stamped the author; this pass sees the stamp already made.
-    let new_author = new_author.or_else(|| probe.as_ref().and_then(|p| p.new_author.clone()));
     let mut baseline_fresh = false;
     if unit.tool_cmd.is_none() && unit.worktree_baseline.is_none() {
         if let Some(wd) = session.workdir.as_deref() {
@@ -13305,29 +13375,6 @@ fn dispatch_unit_with(
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
         );
-        // (core#1390) The tree reads the fold needs, taken here on the worker thread instead of on
-        // the actor: nothing else changes this run's tree between now and the fold.
-        let mut evidence = evidence;
-        if let Some(wd) = input.workdir.as_deref() {
-            let wd_str = wd.to_string_lossy();
-            evidence.worktree_clean = Some(worktree_is_clean(Some(&wd_str)));
-            if output.status != crate::workflow::StepStatus::Ok {
-                evidence.tree_after_failure = input
-                    .unit
-                    .author_probe
-                    .as_ref()
-                    .filter(|p| p.attempt == output.attempt)
-                    .map(|p| crate::workflow::PostStepTree {
-                        git_dir: p.git_dir.clone(),
-                        tree: crate::worktree_guard::snapshot_through(
-                            wd,
-                            std::path::Path::new(&p.git_dir),
-                        )
-                        .ok()
-                        .map(|snap| snap.tree),
-                    });
-            }
-        }
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
@@ -15422,6 +15469,7 @@ fn finalize_run(
     self_tx: &Sender<Command>,
     run_id: &str,
 ) -> anyhow::Result<()> {
+    dispatch_probe::forget(run_id);
     if let Some(mut session) = crate::domain::get_session(store, run_id)? {
         // (X1 round 2, M2) A run whose launch plan its PA has not scoped yet ran only its
         // `pa-scope` step: it is never complete (the scope step's boundary decides the plan).
@@ -19978,6 +20026,8 @@ pub(crate) fn cancel_run(
     run_id: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
 ) -> anyhow::Result<SessionStatus> {
+    // (core#1390) A dispatch probe still out for this run is no longer its dispatch.
+    dispatch_probe::forget(run_id);
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     // Already terminal: report the status, do NOT re-emit a terminal event (or re-notify a campaign).

@@ -136,6 +136,10 @@ fn fixture(tag: &str) -> Fixture {
 }
 
 fn launch(f: &Fixture, run: &str) {
+    launch_with(f, run, crate::HumanConfirm::None)
+}
+
+fn launch_with(f: &Fixture, run: &str, human_confirm: crate::HumanConfirm) {
     f.core
         .launch_run(crate::LaunchSpec {
             base_ref: None,
@@ -144,7 +148,7 @@ fn launch(f: &Fixture, run: &str) {
             clis: vec![cli("a"), cli("b")],
             entity_mode: crate::EntityMode::Shared,
             session_id: run.into(),
-            human_confirm: crate::HumanConfirm::None,
+            human_confirm,
             auto_deliver: false,
             repo_ref: Some(f.repo_ref.clone()),
             workflow: Some("probe-one".into()),
@@ -194,6 +198,21 @@ fn the_actor_answers_while_a_dispatch_reads_its_worktree_and_the_unit_runs_on_th
     entered
         .recv_timeout(Duration::from_secs(60))
         .expect("the dispatch hands its worktree read to the probe thread");
+    // While the probe is held, the tree changes: the baseline must be the tree as the probe reads
+    // it after release, not a tree read before.
+    let view = f
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run)
+        .expect("the run");
+    let wt = std::path::PathBuf::from(view.session.workdir.clone().expect("a worktree"));
+    assert_eq!(
+        view.units[0].last_attempt, None,
+        "the first pass persists nothing of the dispatch"
+    );
+    std::fs::write(wt.join("src/while-held.ts"), "export const h = 1;\n").unwrap();
 
     // The probe is out — on the actor's old path this was a snapshot on the actor thread, and
     // every command waited behind it.
@@ -216,9 +235,13 @@ fn the_actor_answers_while_a_dispatch_reads_its_worktree_and_the_unit_runs_on_th
     }
     let ran = f.seat.ran.lock().unwrap().clone();
     assert_eq!(ran.len(), 1, "the unit runs once the probe lands: {ran:?}");
-    assert!(
-        ran[0].1.is_some(),
-        "it ran with the baseline the probe read: {ran:?}"
+    let expected = crate::worktree_guard::snapshot(&wt, &f.dir.join("repo"))
+        .expect("snapshot")
+        .tree;
+    assert_eq!(
+        ran[0].1.as_deref(),
+        Some(expected.as_str()),
+        "it ran on the baseline the probe read after release (with the file written meanwhile)"
     );
     let stats = f.core.actor_stats();
     assert!(
@@ -241,20 +264,67 @@ fn a_probe_whose_run_was_cancelled_meanwhile_is_dropped() {
     f.core.cancel_run(&run).expect("cancel");
     release.send(()).unwrap();
     // The probe lands on a cancelled run: nothing is dispatched.
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while Instant::now() < deadline
-        && !f
-            .core
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let answered = || {
+        f.core
             .actor_stats()
             .commands
             .iter()
             .any(|c| c.command == "DispatchProbed")
-    {
+    };
+    while Instant::now() < deadline && !answered() {
         std::thread::sleep(Duration::from_millis(20));
     }
+    assert!(answered(), "the probe's answer landed (and was dropped)");
     std::thread::sleep(Duration::from_millis(200));
     assert!(f.seat.ran.lock().unwrap().is_empty(), "no unit ran");
     assert_eq!(status(&f, &run), Some(crate::SessionStatus::Cancelled));
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// (review of #1411, P1) A probe of a cancelled life of a run id never dispatches into a fresh
+/// launch of the same id — not even one paused at a human gate on the same attempt and unit.
+#[test]
+fn a_probe_from_a_cancelled_life_never_dispatches_into_a_relaunch() {
+    let f = fixture("relaunch");
+    let run = format!("probe-relaunch-{}", std::process::id());
+    let (entered, release) = hold(&run);
+    launch(&f, &run);
+    entered
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the probe is out");
+    f.core.cancel_run(&run).expect("cancel");
+    launch_with(&f, &run, crate::HumanConfirm::All);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && status(&f, &run) != Some(crate::SessionStatus::AwaitingHuman)
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        status(&f, &run),
+        Some(crate::SessionStatus::AwaitingHuman),
+        "the relaunch waits at its human gate"
+    );
+    release.send(()).unwrap();
+    let answered = || {
+        f.core
+            .actor_stats()
+            .commands
+            .iter()
+            .any(|c| c.command == "DispatchProbed")
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !answered() {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(answered(), "the old probe's answer landed");
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(
+        f.seat.ran.lock().unwrap().is_empty(),
+        "nothing ran past the relaunch's human gate"
+    );
+    assert_eq!(status(&f, &run), Some(crate::SessionStatus::AwaitingHuman));
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
 }
