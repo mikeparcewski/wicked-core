@@ -3,6 +3,8 @@
 //! Login uses the gateway's external bridge; a login auth-host allowlist is a later slice.
 //! Broker expiry is reported in Unix seconds (Claude stores milliseconds).
 
+#![cfg_attr(not(unix), allow(dead_code))]
+// agy lg-r1 A7
 // k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
 // seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
 #![allow(dead_code)]

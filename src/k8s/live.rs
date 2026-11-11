@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::Value;
+use wicked_apps_core::HardenedCommand as _;
 
 use super::cluster;
 use super::render::{self, GatewaySpec, ReplicaMount, RunBudget, SeatPod};
@@ -391,7 +392,8 @@ fn seat_cmd(
     env: &[(&str, &str)],
 ) -> std::process::Command {
     let mut c = std::process::Command::new(&wrapper[0]);
-    c.args(&wrapper[1..])
+    c.hardened()
+        .args(&wrapper[1..])
         .args(["/bin/sh", "-c", script])
         .current_dir(cwd);
     for (k, v) in env {

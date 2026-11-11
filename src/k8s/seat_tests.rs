@@ -5,6 +5,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::json;
+use wicked_apps_core::HardenedCommand as _;
 
 use super::gw;
 use super::render::{self, ReplicaMount, SeatPod};
@@ -204,7 +205,8 @@ fn k8s_write_back_applies_without_following_a_planted_link() {
 fn codec(replica: &Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
     use std::io::Write as _;
     let mut c = std::process::Command::new("python3");
-    c.args(["-I", "-c", sync::POD_CODEC])
+    c.hardened()
+        .args(["-I", "-c", sync::POD_CODEC])
         .args(args)
         .env("WICKED_SYNC_ROOT", replica)
         .stdin(std::process::Stdio::piped())
@@ -919,13 +921,13 @@ fn k8s_the_pod_codec_scrubs_a_planted_masked_file_at_copy_in() {
 #[test]
 fn k8s_a_capped_call_stops_at_its_cap() {
     let mut c = std::process::Command::new("sh");
-    c.args(["-c", "yes x | head -c 1000000"]);
+    c.hardened().args(["-c", "yes x | head -c 1000000"]);
     let r = super::run_capped(c, None, std::time::Duration::from_secs(20), 1000);
     assert!(!r.ok(), "a capped call reported success");
     assert!(r.stdout.is_empty());
     assert!(String::from_utf8_lossy(&r.stderr).contains("cap"));
     let mut c = std::process::Command::new("sh");
-    c.args(["-c", "printf abc"]);
+    c.hardened().args(["-c", "printf abc"]);
     let r = super::run_capped(c, None, std::time::Duration::from_secs(20), 1000);
     assert!(r.ok() && r.stdout == b"abc");
 }
