@@ -1093,6 +1093,8 @@ struct Live {
     dead: Option<String>,
     /// What every copied path holds, for the after-check comparison.
     expect: Vec<(String, Expect)>,
+    /// The exit-code file id of the check last handed out ([`crate::k8s::floor::check_argv`]).
+    rc: Option<String>,
 }
 
 /// Why a container floor could not be prepared: `auto` falls back on these only.
@@ -1647,7 +1649,7 @@ impl ChecksFloor {
         pod.memory_request = "1Gi".into();
         pod.env = self.env(plan.cargo);
         pod.empty = vec![
-            (work.clone(), "16Gi".into()),
+            (work.clone(), "8Gi".into()),
             ("/tmp".into(), "8Gi".into()),
             (HOME.into(), "2Gi".into()),
         ];
@@ -1697,6 +1699,11 @@ impl ChecksFloor {
         self.place
             .start(&pod)
             .map_err(|e| format!("the floor pod did not start: {e}"))?;
+        // No repository code runs in a pod not proven offline, its node included (review r1).
+        if let Err(e) = self.place.prove_offline(&name) {
+            self.remove(&name);
+            return Err(e);
+        }
         // From here on the pod is ours to remove, whatever fails.
         let expect = match self.copy_in(tree, &name, &plan) {
             Ok(x) => x,
@@ -1715,6 +1722,7 @@ impl ChecksFloor {
             export,
             dead: None,
             expect,
+            rc: None,
         })
     }
 
@@ -1928,7 +1936,10 @@ print(json.dumps({'dirs':dirs,'files':files}))
         if slot.is_none() {
             *slot = Some(self.start(tree, export)?);
         }
-        let l = slot.as_ref().expect("started above");
+        let l = slot.as_mut().expect("started above");
+        let rc_id = crate::k8s::floor::rc_id();
+        l.rc = Some(rc_id.clone());
+        let l = &*l;
         if let Some(why) = &l.dead {
             return Err(why.clone());
         }
@@ -1970,7 +1981,7 @@ print(json.dumps({'dirs':dirs,'files':files}))
                 ),
             ];
             let mut c = self.place.exec(&l.name, false);
-            c.args(crate::k8s::floor::check_argv(&cwd, &[], &argv));
+            c.args(crate::k8s::floor::check_argv(&rc_id, &cwd, &[], &argv));
             return Ok(c);
         }
         let argv: Vec<String> = match fill {
@@ -2002,7 +2013,9 @@ print(json.dumps({'dirs':dirs,'files':files}))
         // The fixed wrapper enters `cwd`, sets the guide's environment, ends what the check left
         // running and writes its exit code for [`ChecksFloor::after`] (B13).
         let mut c = self.place.exec(&l.name, false);
-        c.args(crate::k8s::floor::check_argv(&cwd, extra_env, &argv));
+        c.args(crate::k8s::floor::check_argv(
+            &rc_id, &cwd, extra_env, &argv,
+        ));
         Ok(c)
     }
 
@@ -2026,14 +2039,25 @@ print(json.dumps({'dirs':dirs,'files':files}))
             &["sh", "-c", "kill -9 -1 2>/dev/null; exit 0"],
             REAP,
         );
-        let rc = self
-            .place
-            .run(
-                &l.name,
-                &["sh", "-c", "cat /wicked-rc/rc 2>/dev/null; exit 0"],
-                REAP,
-            )
-            .ok();
+        // This check's own file only (review r1): a file an earlier check left can never stand
+        // for one whose exec never started.
+        let rc = match l.rc.take() {
+            Some(id) => self
+                .place
+                .run(
+                    &l.name,
+                    &[
+                        "sh",
+                        "-c",
+                        "f=/wicked-rc/rc-$1; cat \"$f\" 2>/dev/null; rm -f \"$f\"; exit 0",
+                        "rc",
+                        &id,
+                    ],
+                    REAP,
+                )
+                .ok(),
+            None => None,
+        };
         let lost =
             crate::k8s::floor::rc_verdict(seen, rc.as_deref().filter(|r| !r.trim().is_empty()));
         // The OOM counter (cgroup v2 `memory.events`, else v1 `memory.oom_control`; preparing the
@@ -2244,7 +2268,7 @@ impl Filler<'_> {
              echo WICKED-FILL-START; \
              if ! {cmd} > {FILL_DIR}/{INSTALL_LOG} 2>&1; then tail -n 60 {FILL_DIR}/{INSTALL_LOG}; exit 3; fi; \
              mkdir -p node_modules; {addons}\
-             find node_modules -mindepth 1 -maxdepth 1 -exec cp -a {{}} {FILL_DIR}/ \\; ; \
+             find node_modules -mindepth 1 -maxdepth 1 -exec cp -a -t {FILL_DIR} {{}} + ; \
              find . -path ./node_modules -prune -o -type d -name node_modules -prune -print0 \
                | tar --null -T - -c -f {FILL_DIR}/{NESTED_TAR}; \
              {mark}"
@@ -2327,7 +2351,18 @@ impl Filler<'_> {
         reach: &str,
         what: &str,
     ) -> Result<Fill, String> {
-        let name = unique_name("fill");
+        // One fill pod per claim, named for it (review r1): an earlier fill of the claim that
+        // outlived its client is deleted and waited out before this one writes.
+        let name = format!("fill-{claim}");
+        if let Err(e) = self
+            .place
+            .kube
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+        {
+            return Err(format!(
+                "an earlier fill of {claim} could not be ended: {e}"
+            ));
+        }
         let mut pod = self.place.pod(
             &name,
             crate::k8s::render::FILL_ROLE,
@@ -2337,7 +2372,7 @@ impl Filler<'_> {
         pod.memory_limit = crate::container_floor::k8s_memory(self.memory);
         pod.memory_request = "512Mi".into();
         pod.empty = vec![
-            ("/work".into(), "16Gi".into()),
+            ("/work".into(), "8Gi".into()),
             ("/tmp".into(), "4Gi".into()),
             ("/home/floor".into(), "2Gi".into()),
         ];
@@ -2481,11 +2516,27 @@ pub(crate) fn seat_node_modules(
     let snap = crate::worktree_guard::snapshot_through(tree, git_dir)
         .map_err(|e| format!("the tree could not be snapshotted: {e}"))?;
     let entries = ls_tree(git_dir, &snap.tree)?;
-    let Some(lock) = entries.iter().find(|e| e.path == "package-lock.json") else {
+    // npm's own choice of lockfile, as the floor makes it (review r1): a shrinkwrap wins.
+    let Some(lock) = ["npm-shrinkwrap.json", "package-lock.json"]
+        .into_iter()
+        .find_map(|f| entries.iter().find(|e| e.path == f))
+    else {
         return Ok(SeatNm::Skip("no package-lock.json to install from".into()));
     };
     if lock.is_link() {
-        return Ok(SeatNm::Skip("package-lock.json is a link".into()));
+        return Ok(SeatNm::Skip(format!("{} is a link", lock.path)));
+    }
+    let lock_name = lock.path.clone();
+    // The engine's node_modules never ride the write-back (review r1): only where the
+    // repository ignores them, at the root and nested.
+    let probe = [
+        "node_modules/.wicked".to_string(),
+        "a/node_modules/.wicked".to_string(),
+    ];
+    if crate::k8s::seat::host_ignored(tree, &probe)?.len() != probe.len() {
+        return Ok(SeatNm::Skip(
+            "the repository does not ignore node_modules (the seat's would be written back)".into(),
+        ));
     }
     if entries
         .iter()
@@ -2495,8 +2546,8 @@ pub(crate) fn seat_node_modules(
             "the repository tracks files under node_modules".into(),
         ));
     }
-    let lock = read_blob(git_dir, &snap.tree, "package-lock.json")
-        .ok_or("the lockfile could not be read")?;
+    let lock =
+        read_blob(git_dir, &snap.tree, &lock_name).ok_or("the lockfile could not be read")?;
     if let Some(dep) = git_dependency(&lock) {
         return Ok(SeatNm::Skip(format!(
             "the lockfile installs a git dependency ({dep}), whose `prepare` npm runs even with \

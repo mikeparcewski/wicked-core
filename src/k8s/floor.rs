@@ -110,6 +110,49 @@ impl Place {
         }
     }
 
+    /// Prove the running pod `name` has no network (it has no egress policy of its own): retried
+    /// while the namespace's deny-all lands. `Err` = it does not hold here.
+    pub(crate) fn prove_offline(&self, name: &str) -> Result<(), String> {
+        let host_ip = self
+            .kube
+            .get_json(Some(&self.ns), "pod", name)
+            .ok()
+            .flatten()
+            .and_then(|p| {
+                p.pointer("/status/hostIP")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .filter(|ip| {
+                ip.chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+            });
+        let script = offline_script(host_ip.as_deref());
+        let start = Instant::now();
+        let mut last = String::new();
+        while start.elapsed() < Duration::from_secs(20) {
+            match self.run(
+                name,
+                &["/floor/busybox", "sh", "-c", &script],
+                Duration::from_secs(15),
+            ) {
+                Ok(out)
+                    if out.contains("net=closed")
+                        && (host_ip.is_none() || out.contains("node=closed")) =>
+                {
+                    return Ok(());
+                }
+                Ok(out) => last = out.replace('\n', " "),
+                Err(e) => last = e,
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        Err(format!(
+            "the floor pod is not offline ({}); the checks do not run here",
+            last.trim()
+        ))
+    }
+
     /// Create `spec`'s pod and wait until it runs. A pod that does not start is deleted, and
     /// the reason names what held it (an image, a policy, the quota).
     pub(crate) fn start(&self, spec: &FloorPod) -> Result<(), String> {
@@ -216,7 +259,10 @@ pub(crate) fn stuck(pod: &Value) -> Option<String> {
             if is_init && code == 0 {
                 continue;
             }
-            let reason = t.get("reason").and_then(Value::as_str).unwrap_or("terminated");
+            let reason = t
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("terminated");
             return Some(format!("a container ended ({reason}, exit {code})"));
         }
     }
@@ -226,28 +272,53 @@ pub(crate) fn stuck(pod: &Value) -> Option<String> {
     }
 }
 
-/// The argv a check runs as inside its floor pod (pure): the fixed wrapper clears the exit-code
-/// file, enters `cwd`, runs `env` + `argv`, ends everything the check left running
-/// (`kill -9 -1` spares the pod's PID 1 and the wrapper) and writes the check's exit code to
-/// [`RC_FILE`]. `env` rides `env(1)`'s argv: the floor's environment carries no secret.
-pub(crate) fn check_argv(cwd: &str, env: &[(String, String)], argv: &[String]) -> Vec<String> {
+/// The argv a check runs as inside its floor pod (pure): the fixed wrapper enters `cwd`, runs
+/// `env` + `argv`, ends everything the check left running (`kill -9 -1` spares the pod's PID 1
+/// and the wrapper) and writes the check's exit code to its own file, `rc-<id>` under [`RC_DIR`]
+/// (review r1: one attempt's code is never read as another's). `env` rides `env(1)`'s argv
+/// after `--`: the floor's environment carries no secret.
+pub(crate) fn check_argv(
+    id: &str,
+    cwd: &str,
+    env: &[(String, String)],
+    argv: &[String],
+) -> Vec<String> {
     let mut v: Vec<String> = [
         "/bin/sh",
         "-c",
         concat!(
-            "rm -f /wicked-rc/rc; cd \"$1\" || exit 126; shift; \"$@\"; rc=$?; ",
-            "kill -9 -1 2>/dev/null; echo \"$rc\" > /wicked-rc/rc; exit $rc"
+            "id=$1; cd \"$2\" || exit 126; shift 2; \"$@\"; rc=$?; ",
+            "kill -9 -1 2>/dev/null; echo \"$rc\" > /wicked-rc/rc-$id; exit $rc"
         ),
         "wicked-check",
     ]
     .map(String::from)
     .to_vec();
+    v.push(id.to_string());
     v.push(cwd.to_string());
     v.push("/usr/bin/env".into());
-    v.extend(env.iter().map(|(k, val)| format!("{k}={val}")));
     v.push("--".into());
+    v.extend(env.iter().map(|(k, val)| format!("{k}={val}")));
     v.extend(argv.iter().cloned());
     v
+}
+
+/// A fresh id for one check's exit-code file (lowercase hex).
+pub(crate) fn rc_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..16].to_string()
+}
+
+/// The in-pod script that proves a floor pod offline before any repository code runs in it
+/// (pure): the internet and the pod's own node (its kubelet port, which listens on every node
+/// address) must not answer (review r1: NetworkPolicy does not portably cover node traffic).
+pub(crate) fn offline_script(host_ip: Option<&str>) -> String {
+    let node = host_ip
+        .map(|ip| format!("nc_ {ip} 10250 node & "))
+        .unwrap_or_default();
+    format!(
+        "nc_() {{ if /floor/busybox nc -w 2 \"$1\" \"$2\" </dev/null >/dev/null 2>&1; then echo \"$3=open\"; else echo \"$3=closed\"; fi; }}; \
+         nc_ 1.1.1.1 443 net & {node}wait"
+    )
 }
 
 /// Whether the check's exit code as kubectl reported it (`seen`) is the check's own, given what

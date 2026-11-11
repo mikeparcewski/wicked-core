@@ -798,24 +798,75 @@ fn k8s_a_floor_pod_refuses_overlapping_or_escaping_mounts() {
 #[test]
 fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
     let a = floor::check_argv(
+        "0123abcd",
         "/work/head/pkg",
         &[("A".into(), "b c".into())],
         &["npm".into(), "test".into()],
     );
     assert_eq!(a[0], "/bin/sh");
-    assert!(a[2].starts_with("rm -f /wicked-rc/rc;"));
+    assert!(
+        a[2].contains("/wicked-rc/rc-$id"),
+        "each attempt its own file"
+    );
     assert!(a[2].contains("kill -9 -1") && a[2].ends_with("exit $rc"));
     assert_eq!(
         &a[4..],
         [
+            "0123abcd",
             "/work/head/pkg",
             "/usr/bin/env",
-            "A=b c",
             "--",
+            "A=b c",
             "npm",
             "test"
         ]
     );
+    assert_ne!(floor::rc_id(), floor::rc_id());
+}
+
+/// Review r1: `env A=b -- cmd` runs `--`; the assignments go after `--`. Executed, not read.
+#[cfg(unix)]
+#[test]
+fn k8s_the_wrapper_env_line_runs_the_check_with_its_environment() {
+    use wicked_apps_core::HardenedCommand as _;
+    if !std::path::Path::new("/usr/bin/env").exists() {
+        return;
+    }
+    let a = floor::check_argv(
+        "x",
+        "/",
+        &[("WICKED_T".into(), "ok".into())],
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf %s \"$WICKED_T\"".into(),
+        ],
+    );
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, b"ok");
+}
+
+#[test]
+fn k8s_a_floor_pod_is_proven_offline_including_its_node() {
+    let s = floor::offline_script(Some("192.168.5.15"));
+    assert!(s.contains("nc_ 1.1.1.1 443 net"));
+    assert!(
+        s.contains("nc_ 192.168.5.15 10250 node"),
+        "the node's kubelet port listens"
+    );
+    let p = render::floor_pod(&floor_pod_spec("floor")).unwrap();
+    let scratch = p["spec"]["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["name"].as_str().is_some_and(|n| n.starts_with('e')))
+        .all(|v| v["emptyDir"]["medium"] == "Memory");
+    assert!(scratch, "scratch is in memory, charged to the pod's cap");
 }
 
 #[test]

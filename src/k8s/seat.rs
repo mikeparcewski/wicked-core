@@ -1350,11 +1350,16 @@ pub(crate) fn arm(
             None,
             Duration::from_secs(120),
         );
+        // A seat never starts on half its dependencies (review r1).
         if !r.ok() {
-            eprintln!(
-                "wicked-core: the seat's nested node_modules were not unpacked: {}",
-                r.err_text()
-            );
+            reap(&id);
+            return Err((
+                FloorUnarmed::ClusterUnreachable,
+                format!(
+                    "the seat's nested node_modules could not be unpacked: {}",
+                    r.err_text()
+                ),
+            ));
         }
     }
     guard.0 = None;
@@ -2446,8 +2451,12 @@ fn fetch_commits(
 /// The in-pod script that unpacks the fill's nested `node_modules` archive into `tree` (pure).
 pub(crate) fn nested_unpack_script(tree: &Path) -> String {
     let t = format!("'{}'", tree.to_string_lossy().replace('\'', "'\\''"));
+    // Every nested node_modules already in the tree goes first (review r1: an ignored one the
+    // replica kept from an earlier seat could carry a planted `.bin` shim), as `npm ci` empties
+    // them; the root one is the read-only claim and is left alone.
     format!(
-        "a={t}/node_modules/{n}; [ -f \"$a\" ] || exit 0; cd {t} && /floor/busybox tar -x -f \"$a\"",
+        "set -e; cd {t}; /floor/busybox find . -path ./node_modules -prune -o -type d -name node_modules -prune -exec /floor/busybox rm -rf {{}} \\; ; \
+         a=./node_modules/{n}; [ -f \"$a\" ] || exit 0; /floor/busybox tar -x -f \"$a\"",
         n = crate::checks_container::NESTED_TAR
     )
 }

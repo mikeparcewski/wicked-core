@@ -775,7 +775,12 @@ mod live {
             .checks
             .iter()
             .find(|c| c.name == "lint")
-            .unwrap_or_else(|| panic!("lint ran: {:#?} {:?} {:?}", r.checks, r.sandbox_error, r.runner));
+            .unwrap_or_else(|| {
+                panic!(
+                    "lint ran: {:#?} {:?} {:?}",
+                    r.checks, r.sandbox_error, r.runner
+                )
+            });
         assert!(
             lint.spawn_error
                 .as_deref()
@@ -817,7 +822,12 @@ mod live {
             .checks
             .iter()
             .find(|c| c.name == "test")
-            .unwrap_or_else(|| panic!("test ran: {:#?} {:?} {:?}", r.checks, r.sandbox_error, r.runner));
+            .unwrap_or_else(|| {
+                panic!(
+                    "test ran: {:#?} {:?} {:?}",
+                    r.checks, r.sandbox_error, r.runner
+                )
+            });
         assert_eq!(t.exit_code, Some(0));
         assert!(
             t.spawn_error

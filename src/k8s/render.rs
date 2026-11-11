@@ -784,7 +784,7 @@ pub(crate) struct FloorPod {
     pub(crate) memory_limit: String,
     pub(crate) memory_request: String,
     pub(crate) env: Vec<(String, String)>,
-    /// Scratch dirs on the node's disk: (mount path, size limit).
+    /// Scratch dirs, in memory: (mount path, size limit).
     pub(crate) empty: Vec<(String, String)>,
     /// Claims of the namespace: (claim, mount path, read-only).
     pub(crate) claims: Vec<(String, String, bool)>,
@@ -812,7 +812,9 @@ pub(crate) fn floor_pod(f: &FloorPod) -> Result<Value, String> {
         paths.push(path);
         let name = format!("e{i}");
         mounts.push(json!({"name": name, "mountPath": path}));
-        volumes.push(json!({"name": name, "emptyDir": {"sizeLimit": size}}));
+        // In memory, like the Docker floor's tmpfs (review r1): charged to the pod's memory cap,
+        // so a check cannot fill the node's disk through unlinked or unaccounted files.
+        volumes.push(json!({"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}));
     }
     for (i, (claim, path, ro)) in f.claims.iter().enumerate() {
         paths.push(path);
