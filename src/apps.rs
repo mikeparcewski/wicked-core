@@ -607,13 +607,24 @@ pub(crate) fn dispatch_refusal(
         }
         return None;
     }
-    let after_qe = units
-        .iter()
-        .any(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none() && u.ord < unit.ord);
-    if is_publish(session) && after_qe {
+    if reads_publish_tree(session, units, unit) {
         return publish_consent_refusal(session, units, current_tree().as_deref());
     }
     None
+}
+
+/// Whether [`dispatch_refusal`] reads the run's current worktree tree for `unit`: a publish's Tool
+/// step past its QE backstop. The dispatch probe reads it off the actor exactly then (core#1390).
+pub(crate) fn reads_publish_tree(
+    session: &AgentSession,
+    units: &[WorkUnit],
+    unit: &WorkUnit,
+) -> bool {
+    unit.tool_cmd.is_some()
+        && is_publish(session)
+        && units.iter().any(|u| {
+            crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none() && u.ord < unit.ord
+        })
 }
 
 #[cfg(test)]

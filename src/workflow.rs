@@ -414,6 +414,38 @@ pub struct UnitEvidence {
     /// and what the counter printed). `None` for every other unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
+    /// (core#1390) Whether the unit's worktree is clean (no uncommitted change, no run-branch
+    /// commit) right after the step, read on the worker thread so the fold runs no git on the
+    /// actor. `None` = not read here; the fold then reads it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_clean: Option<bool>,
+    /// (core#1390) After a FAILED attempt of a unit that carries an author probe: the tree it left,
+    /// read on the worker thread through the probe's pinned git dir, for the fold's
+    /// unproductive-author retraction. `None` = not read here; the fold then reads it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_after_failure: Option<PostStepTree>,
+    /// (core#1390) A pre-build unit's phase-scope observation (core#283), read on the worker thread
+    /// after the step. `None` = not read here; the fold then reads it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_scope: Option<PhaseScopeRead>,
+}
+
+/// (core#1390) What the worker read for the fold's phase-scope warning ([`UnitEvidence::phase_scope`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseScopeRead {
+    /// The warning, when the unit's worktree contribution touched non-documentation files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
+}
+
+/// (core#1390) A tree read on the worker thread after a step ([`UnitEvidence::tree_after_failure`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostStepTree {
+    /// The pinned git dir it was read through (the fold uses it only when it is the probe's).
+    pub git_dir: String,
+    /// The tree id; `None` when the snapshot failed (the fold then keeps the author stamp).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree: Option<String>,
 }
 
 /// (F-7R3-001) One judge seat's refusal during the agent judge's rotation

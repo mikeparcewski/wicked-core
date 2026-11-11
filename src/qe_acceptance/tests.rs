@@ -120,6 +120,35 @@ fn the_qe_unit_with_no_repo_diff_is_required_with_the_reason() {
     ));
 }
 
+/// (core#1390) The dispatch probe scores the QE unit off the actor: a score computed ahead on the
+/// dispatch's inputs is the one the dispatch would compute, and the dispatch decides on it.
+#[test]
+fn a_score_computed_ahead_is_the_dispatchs_own_and_is_the_one_used() {
+    let s = session(requiring());
+    let ahead = score_ahead(&s, 3, None, None);
+    let Dispatched::Decided(own) = on_dispatch(&s, &qe_unit(3), None, None) else {
+        panic!("decided");
+    };
+    assert_eq!(ahead, own, "same inputs, same score");
+    let mut marked = ahead.clone();
+    marked.reason = "scored ahead".into();
+    let Dispatched::Decided(used) =
+        on_dispatch_with(&s, &qe_unit(3), None, None, Some(marked.clone()))
+    else {
+        panic!("decided");
+    };
+    assert_eq!(
+        used, marked,
+        "the dispatch decides on the score it is handed"
+    );
+    // An operator decision is still never rescored, whatever score is handed in.
+    let fixed = session(requiring().with_qe_override(&QeOverride::Force).unwrap());
+    assert!(matches!(
+        on_dispatch_with(&fixed, &qe_unit(3), None, None, Some(marked)),
+        Dispatched::Unchanged
+    ));
+}
+
 #[test]
 fn a_creator_after_a_waiver_revokes_it() {
     let mut s = session(requiring());

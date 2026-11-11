@@ -1590,6 +1590,17 @@ fn the_apps_dispatch_guard() {
     assert!(ok(&on_builder, &units)
         .unwrap()
         .contains("built an Apps turn"));
+    // (core#1390) produce is where the guard reads the tree — and so where the dispatch probe
+    // reads it off the actor; nowhere else on this run.
+    assert!(reads_publish_tree(&s, &units, &produce));
+    assert!(
+        !reads_publish_tree(&s, &units, &qe),
+        "an agent unit reads no tree here"
+    );
+    assert!(
+        !reads_publish_tree(&s, &units, &check),
+        "the check precedes the QE unit"
+    );
     // produce: refused without the bound PASS, dispatched with it on the same tree.
     assert!(ok(&produce, &units).unwrap().contains("bound QE PASS"));
     units[qe_ix].qe_review = Some(pass_review());

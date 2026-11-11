@@ -577,6 +577,14 @@ pub(crate) enum Command {
     /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
     #[cfg(test)]
     HeldTeamReplies { reply: Sender<usize> },
+    /// (core#1390) A dispatch's worktree probe came back from its thread
+    /// ([`crate::actor`]'s `dispatch_probe`): the actor runs the dispatch again with it, if the
+    /// probe is still the run's live one and the run has not moved on.
+    DispatchProbed {
+        run_id: String,
+        unit_ix: usize,
+        probe: Box<crate::actor::DispatchProbe>,
+    },
     /// TEST-ONLY (core#1390): the actor parks on this command until `release` fires or drops.
     #[cfg(test)]
     HoldActor {
@@ -737,6 +745,7 @@ impl Command {
             Command::LiveTeamRuns { .. } => "LiveTeamRuns",
             #[cfg(test)]
             Command::HeldTeamReplies { .. } => "HeldTeamReplies",
+            Command::DispatchProbed { .. } => "DispatchProbed",
             #[cfg(test)]
             Command::HoldActor { .. } => "HoldActor",
             Command::TeamRescored { .. } => "TeamRescored",

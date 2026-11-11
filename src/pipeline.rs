@@ -1072,7 +1072,12 @@ pub(crate) fn apply_and_finish_unit(
     // deny: the check is a heuristic over file names, and a deny would turn it into a gate. The
     // unit (with the warning) is persisted by the `put_node` below, so the evidence rides the same
     // write as the gate's own resolution. Dedup guards a retried attempt from stacking copies.
-    if let Some(warning) = crate::actor::phase_scope_warning(unit, workdir.as_deref()) {
+    // (core#1390) Read on the worker thread when the payload carries it; read here otherwise.
+    let scope_warning = match evidence.phase_scope.as_ref() {
+        Some(read) => read.warning.clone(),
+        None => crate::actor::phase_scope_warning(unit, workdir.as_deref()),
+    };
+    if let Some(warning) = scope_warning {
         // Log only when NEWLY recorded — a retried attempt re-derives the same warning and
         // would otherwise spam identical lines while the evidence stays unchanged (Copilot
         // review on #287).
