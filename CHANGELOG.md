@@ -56,7 +56,8 @@ Two release tracks share this file, newest entry first regardless of track:
   record states the check or the reviewer's record does. A KEPT must quote one of them. A BROKEN must name a creator
   record shown whole, and it counts only when the reviewer's record was shown whole too. The substance half is
   unchanged, so a duplicated built-in still breaks the rule (deny-dominates), and so does a code step that left no
-  record at all. The rule is now NOT_APPLICABLE by fact on a change that touches only docs, text or images, and the
+  record at all. The rule is now NOT_APPLICABLE by fact on a change that touches only prose (markdown, reStructuredText, a
+  license, readme or changelog) or images (a `.txt` or a lockfile still reaches the judges), and the
   substance judge is told that a text, literal, prompt or comment-only edit is N/A while a change to logic is always
   judged. The rule statement is unchanged, so stores seeded before this keep the record split. The pack doc gains a
   "when it does not apply" paragraph.
@@ -2954,7 +2955,8 @@ Two release tracks share this file, newest entry first regardless of track:
   - **POL-2101 records the stack check, accepts the reviewer's, and is N/A without code (#1426, closes #1381).** A
     code-writing unit is asked for one `STACK-CHECK: looked at … :: offers …` line; the record clause is kept when
     every code step's record or the reviewer's record states the check; the rule is NOT_APPLICABLE by fact on a
-    docs, text or image-only change. A duplicated built-in still breaks it.
+    change that touches only prose (markdown, reStructuredText, a license, readme or changelog) or images; a `.txt`
+    or a lockfile still reaches the judges. A duplicated built-in still breaks it.
   - **A pack's rules enter a run's rule set only where its scope fits (#1427, #1414).** The mcp-server pack
     (MCPS-1001..1007) fits a run launched from the `mcp-server` preset or a change in a codebase that builds an MCP
     server; otherwise its rules are left out before the check and the note names them. An unknown fact removes
