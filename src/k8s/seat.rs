@@ -1719,6 +1719,17 @@ pub(crate) enum Ending {
 /// (or the client's for a timeout or cancel); `Err` = the unit has no result (a lost stream, a
 /// pod not confirmed gone, a write-back refused): could-not-run, never a pass.
 pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
+    settle_unless(seat, ending, &|| false)
+}
+
+/// [`settle`], with `cancelled` asked again once the pod is gone, right before the write-back
+/// (codex b2-gw #4): a unit cancelled or reassigned while its rc was read or its pod deleted
+/// brings nothing back.
+pub(crate) fn settle_unless(
+    seat: &Seat,
+    ending: Ending,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<i32, String> {
     let mut settled = seat.settled.lock().unwrap_or_else(|p| p.into_inner());
     if *settled {
         return Err("the seat was already reaped".into());
@@ -1765,13 +1776,15 @@ pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
     drop(settled);
     unregister(&seat.id);
     gone.map_err(|e| format!("{}: {e}", FloorUnarmed::ExecStreamLost.describe()))?;
-    let code = code?;
-    let back = if ending != Ending::Cancelled {
+    // The pod is gone: the scratch goes on every path from here (codex b2-seat #14), a lost rc
+    // included; only a unit with a result, still wanted, is written back.
+    let back = if code.is_ok() && ending != Ending::Cancelled && !cancelled() {
         write_back(seat)
     } else {
         Ok(())
     };
     drop_scratch(seat);
+    let code = code?;
     back?;
     Ok(code)
 }

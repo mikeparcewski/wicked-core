@@ -386,7 +386,9 @@ fn view_init(floor_image: &str, sub: &str) -> Value {
         "image": floor_image,
         "imagePullPolicy": "Never",
         "command": ["/busybox", "sh", "-c",
-            "cd /wicked-ro && /busybox tar -cf - . | /busybox tar -C /wicked-view -xf -"],
+            // Both sides' failure fails the init (codex b2-gw #6): a copy cut short never
+            // starts the reviewer on part of the tree.
+            "set -o pipefail; cd /wicked-ro && /busybox tar -cf - . | /busybox tar -C /wicked-view -xf -"],
         "securityContext": hardened_context(),
         "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},
         "volumeMounts": [

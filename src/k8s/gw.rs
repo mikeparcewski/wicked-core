@@ -100,11 +100,14 @@ pub(crate) fn write_script(v: Volume, file: &str, digest: &str) -> Result<String
         // started is waited out, before this body is taken. The kernel lock is the barrier (review
         // r5): every write holds it from before its body to after its rename (busybox `flock` has no
         // `-w`: a bounded `-n` retry, 20 s, found by the B-4 live run), and a rename child
-        // an old write forked holds it too, so no stale rename can land after this one.
+        // an old write forked holds it too, so no stale rename can land after this one. A killed
+        // write's body (a credential, codex b2-gw #7 / b4-r2 #3) is removed under the lock: no
+        // earlier write is alive by then to rename it.
         "set -e; umask 077; \
          for p in $(pgrep -f '[{first}]{rest}'); do [ \"$p\" = \"$$\" ] || kill -9 \"$p\" 2>/dev/null || :; done; \
          i=0; while pgrep -f '[m]v -f {d}/.{file}.' >/dev/null; do i=$((i+1)); [ $i -lt 200 ] || exit 68; sleep 0.05; done; \
          exec 9>{d}/.{file}.lock; i=0; until flock -n 9; do i=$((i+1)); [ $i -lt 400 ] || {{ echo 'wicked-writer: an earlier write still holds the file' >&2; exit 69; }}; sleep 0.05; done; \
+         rm -f {d}/.{file}.[0-9]*; \
          t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
          [ \"$(sha256sum \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'wicked-writer: the body did not arrive whole' >&2; exit 65; }}; \
          mv -f \"$t\" {d}/{file}; trap - EXIT"
@@ -117,7 +120,7 @@ pub(crate) fn confirm_script(accepted: bool) -> String {
     let want = if accepted { "HTTP/1.1 200" } else { " 401 " };
     format!(
         "read K; i=0; while [ $i -lt 60 ]; do \
-         o=$(wget -S -O /dev/null --header \"x-api-key: $K\" http://127.0.0.1:{}/ 2>&1); \
+         o=$(wget -T 2 -S -O /dev/null --header \"x-api-key: $K\" http://127.0.0.1:{}/ 2>&1); \
          case \"$o\" in *'{want}'*) exit 0;; esac; i=$((i+1)); sleep 0.25; done; exit 1",
         crate::seat_gateway::READY_PORT
     )
@@ -290,20 +293,27 @@ impl Gw {
             .map(super::rfc3339)
             .unwrap_or_else(|_| super::rfc3339(0));
         let t = format!("--since-time={since}");
-        let r = self.kube.call(
-            Some(&self.ns),
-            &["logs", "-c", "gateway", self.pod.as_str(), &t],
-            None,
-            EXEC_TIMEOUT,
-        );
-        if !r.ok() {
-            return Vec::new();
+        // The container's previous run too (codex b2-gw #8): a gateway restart mid-unit keeps
+        // the records before it. A pod replaced mid-unit still loses its predecessor's.
+        let mut out = Vec::new();
+        for previous in [true, false] {
+            let mut a = vec!["logs", "-c", "gateway", self.pod.as_str(), t.as_str()];
+            if previous {
+                a.push("--previous");
+            }
+            let r = self.kube.call(Some(&self.ns), &a, None, EXEC_TIMEOUT);
+            if !r.ok() {
+                continue;
+            }
+            out.extend(crate::seat_gateway::parse_records(
+                &String::from_utf8_lossy(&r.stdout),
+                unit,
+            ));
+            out.extend(crate::seat_gateway::parse_records(
+                &String::from_utf8_lossy(&r.stderr),
+                unit,
+            ));
         }
-        let mut out = crate::seat_gateway::parse_records(&String::from_utf8_lossy(&r.stdout), unit);
-        out.extend(crate::seat_gateway::parse_records(
-            &String::from_utf8_lossy(&r.stderr),
-            unit,
-        ));
         out
     }
 }
@@ -701,8 +711,56 @@ pub(crate) fn rotation_pending(dir: &Path) -> bool {
 
 /// Record that `dir`'s gateway owes a rotation (before it is stopped).
 pub(crate) fn begin_rotation(dir: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(dir.join("config")).map_err(|e| e.to_string())?;
-    std::fs::write(rotation_marker(dir), b"quarantined").map_err(|e| e.to_string())
+    state_write(dir, &rotation_marker(dir), b"quarantined")
+}
+
+/// The gateway dir's `config` dir: a real directory (made when absent), never a link
+/// (codex b2-gw #1).
+fn state_dir(dir: &Path) -> Result<PathBuf, String> {
+    let c = dir.join("config");
+    std::fs::create_dir_all(&c).map_err(|e| e.to_string())?;
+    match std::fs::symlink_metadata(&c) {
+        Ok(m) if m.file_type().is_dir() => Ok(c),
+        _ => Err(format!("{} is not a directory", c.display())),
+    }
+}
+
+/// Replace one gateway state file: an owner-only file created new beside it, renamed over it
+/// (a link planted at the name is replaced, never followed).
+fn state_write(dir: &Path, path: &Path, body: &[u8]) -> Result<(), String> {
+    let c = state_dir(dir)?;
+    let tmp = c.join(format!(".state-{}", uuid::Uuid::new_v4().simple()));
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let wrote = o
+        .open(&tmp)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, body))
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = wrote {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(())
+}
+
+/// A small gateway state file, only when it is a regular file (no link followed), bounded.
+fn state_read(path: &Path) -> Option<String> {
+    use std::io::Read as _;
+    std::fs::symlink_metadata(path)
+        .ok()
+        .filter(|m| m.file_type().is_file() && m.len() <= 256)?;
+    let mut s = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(256)
+        .read_to_string(&mut s)
+        .ok()?;
+    Some(s)
 }
 
 /// The rotation is done (the new token is on disk).
@@ -718,16 +776,16 @@ pub(crate) fn end_rotation(dir: &Path) -> Result<(), String> {
 pub(crate) fn boot_token(dir: &Path, fresh: bool) -> Result<String, String> {
     let path = dir.join("config/boot-token");
     if !fresh {
-        if let Ok(t) = std::fs::read_to_string(&path) {
+        if let Some(t) = state_read(&path) {
             let t = t.trim();
-            if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+            // Only a token this engine wrote (a uuid's 32 hex digits).
+            if t.len() == 32 && t.chars().all(|c| c.is_ascii_hexdigit()) {
                 return Ok(t.to_string());
             }
         }
     }
     let t = uuid::Uuid::new_v4().simple().to_string();
-    std::fs::create_dir_all(dir.join("config")).map_err(|e| e.to_string())?;
-    std::fs::write(&path, &t).map_err(|e| e.to_string())?;
+    state_write(dir, &path, t.as_bytes())?;
     Ok(t)
 }
 

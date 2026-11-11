@@ -2539,3 +2539,67 @@ fn k8s_a_bundle_dir_is_private_and_new() {
     drop(d);
     assert!(!p.exists());
 }
+
+// ── codex per-module round (b2-gw-glue): folds ──────────────────────────────────────────────
+
+#[test]
+fn k8s_a_writer_write_removes_killed_writes_bodies_under_its_lock() {
+    let s = gw::write_script(gw::Volume::Broker, "anthropic.token", &"a".repeat(64)).unwrap();
+    let lock = s.find("flock -n 9").unwrap();
+    let rm = s
+        .find("rm -f /broker/.anthropic.token.[0-9]*")
+        .expect("stale bodies removed");
+    let body = s.find("cat > \"$t\"").unwrap();
+    assert!(lock < rm && rm < body, "{s}");
+}
+
+#[test]
+fn k8s_key_confirmation_bounds_every_attempt() {
+    assert!(gw::confirm_script(true).contains("wget -T 2 "));
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_boot_token_never_follows_a_planted_link() {
+    let dir = tmp("boot");
+    let outside = tmp("boot-outside").join("victim");
+    std::fs::write(&outside, "keep").unwrap();
+    std::fs::create_dir_all(dir.join("config")).unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("config/boot-token")).unwrap();
+    let t = gw::boot_token(&dir, false).unwrap();
+    assert_eq!(std::fs::read_to_string(&outside).unwrap(), "keep");
+    assert!(!std::fs::symlink_metadata(dir.join("config/boot-token"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(
+        gw::boot_token(&dir, false).unwrap(),
+        t,
+        "the token it wrote is read back"
+    );
+    // A token this engine never wrote (any alphanumeric text) is not taken.
+    std::fs::write(dir.join("config/boot-token"), "operatorsecret").unwrap();
+    assert_ne!(gw::boot_token(&dir, false).unwrap(), "operatorsecret");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn k8s_a_seat_image_link_at_a_pod_mount_is_refused() {
+    for at in ["/wicked-unit", "/wicked-ro"] {
+        let facts = crate::container_floor::ImageFacts {
+            symlinks: [PathBuf::from(at)].into(),
+            ..Default::default()
+        };
+        assert!(
+            crate::container_floor::check_seat_image(&facts, &[]).is_err(),
+            "{at}"
+        );
+    }
+}
+
+#[test]
+fn k8s_a_read_only_view_copy_fails_when_either_side_fails() {
+    let pod = render::seat_pod_spec(&seat_pod(Some(PathBuf::from("/w/t")), None)).unwrap();
+    let init = pod.to_string();
+    assert!(init.contains("set -o pipefail;"), "{init}");
+}

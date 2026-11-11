@@ -7768,12 +7768,20 @@ pub(crate) fn run_bounded(
     // pod is deleted and waited out, and only then does the unit's work come back (B11).
     let mut code = code;
     if let Some(seat) = &pod_seat {
+        // The token is read again here and once more before the write-back (codex b2-gw #4):
+        // a cancel that lands after the client ended still brings nothing back.
+        let is_cancelled = || {
+            cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        };
         let ending = match killed_by {
             Some(k) if k == CANCELLED => crate::k8s::seat::Ending::Cancelled,
+            _ if is_cancelled() => crate::k8s::seat::Ending::Cancelled,
             Some(_) => crate::k8s::seat::Ending::TimedOut,
             None => crate::k8s::seat::Ending::Exited(code),
         };
-        match crate::k8s::seat::settle(seat, ending) {
+        match crate::k8s::seat::settle_unless(seat, ending, &is_cancelled) {
             Ok(c) if killed_by.is_none() => code = c,
             Ok(_) => {}
             // Could not run, with no trusted exit code, but what the CLI produced is kept as the

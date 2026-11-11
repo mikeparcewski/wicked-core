@@ -983,7 +983,17 @@ pub(crate) fn check_seat_image(facts: &ImageFacts, dests: &[PathBuf]) -> Result<
                 .into(),
         );
     }
-    let reserved = [FLOOR_DIR, "/wicked-canary", "/tmp", "/home/seat"].map(PathBuf::from);
+    // The pod's own mounts too (codex b2-gw #2): its unit dir (env, argv, rc) and a read-only
+    // unit's view source.
+    let reserved = [
+        FLOOR_DIR,
+        "/wicked-canary",
+        "/tmp",
+        "/home/seat",
+        crate::k8s::render::UNIT_DIR,
+        crate::k8s::render::VIEW_SOURCE,
+    ]
+    .map(PathBuf::from);
     for d in reserved.iter().chain(dests) {
         if let Some(link) = d.ancestors().find(|a| facts.symlinks.contains(*a)) {
             return Err(format!(
