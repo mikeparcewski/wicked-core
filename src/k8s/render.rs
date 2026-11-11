@@ -20,16 +20,16 @@ pub(crate) const UNIT_DIR: &str = "/wicked-unit";
 /// The PVC holding a run's replica (its trees, git state and the unit's admitted roots, each
 /// at its host path).
 pub(crate) const REPLICA_PVC: &str = "replica";
-/// The pod's own PID 1: a static init that reaps zombies and, as its namespace's init, cannot be
-/// killed by a seat or a check (`kill -9 -1`), then an idle sleep. No workload ever starts at
+/// The pod's own PID 1: a busybox shell loop. As its PID namespace's init it ignores every
+/// signal sent from inside the pod (a seat's or a check's `kill -9 -1` leaves it running, and the
+/// pod with it), and each `sleep` it waits for reaps any orphan that exited (no zombies hold the
+/// pids limit). Measured on the cluster (lane data/init-probe.txt). No workload ever starts at
 /// container start (PARITY F1): the CLI starts only by exec, after the deny check.
 pub(crate) const IDLE_COMMAND: &[&str] = &[
-    "/floor/tini",
-    "-s",
-    "--",
     "/floor/busybox",
-    "sleep",
-    "2147483647",
+    "sh",
+    "-c",
+    "trap '' TERM INT HUP; while :; do /floor/busybox sleep 2; done",
 ];
 /// The gateway's listeners a seat may reach (see `container_floor::GATEWAY_PORTS`).
 pub(crate) fn seat_gateway_ports() -> &'static [u16] {
@@ -352,14 +352,14 @@ fn floor_init(floor_image: &str) -> Value {
         "name": "floor",
         "image": floor_image,
         "imagePullPolicy": "Never",
-        "command": ["/busybox", "cp", "/launch", "/busybox", "/landrun", "/tini", "/floor/"],
+        "command": ["/busybox", "cp", "/launch", "/busybox", "/landrun", "/floor/"],
         "securityContext": hardened_context(),
         "resources": {"requests": {"memory": "16Mi", "cpu": "10m"}, "limits": {"memory": "64Mi"}},
         "volumeMounts": [{"name": "floor", "mountPath": FLOOR_DIR}],
     })
 }
 
-/// A seat's pod template: the seat image idling under the engine's init, every replica path
+/// A seat's pod template: the seat image idling under the engine's PID 1 loop, every replica path
 /// at its host path with the mount plan's access, in-memory canary and unit dirs, and no
 /// service-account token, service links or host namespaces.
 pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
@@ -502,26 +502,16 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                     "enableServiceLinks": false,
                     "securityContext": pod_context(GATEWAY_UID),
                     "terminationGracePeriodSeconds": 5,
-                    "containers": [
-                        {
-                            "name": "gateway",
-                            "image": g.image,
-                            "imagePullPolicy": "IfNotPresent",
-                            "args": ["-f", "/cfg/config.json"],
-                            "securityContext": hardened_context(),
-                            "resources": {
-                                "requests": {"memory": "128Mi", "cpu": "50m"},
-                                "limits": {"memory": "512Mi"},
-                            },
-                            "volumeMounts": [
-                                {"name": "cfg", "mountPath": "/cfg", "readOnly": true},
-                                {"name": "broker", "mountPath": "/broker", "readOnly": true},
-                            ],
-                        },
+                    // The writer is a native sidecar (an init container that keeps running):
+                    // it is up before the gateway, so the engine can publish the first config
+                    // into it; `wait-config` holds the gateway until that config exists
+                    // (agentgateway's image has no shell to wait with).
+                    "initContainers": [
                         {
                             "name": "writer",
                             "image": g.writer_image,
                             "imagePullPolicy": "IfNotPresent",
+                            "restartPolicy": "Always",
                             "command": ["sleep", "2147483647"],
                             "securityContext": hardened_context(),
                             "resources": {
@@ -534,7 +524,34 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                                 {"name": "tmp", "mountPath": "/tmp"},
                             ],
                         },
+                        {
+                            "name": "wait-config",
+                            "image": g.writer_image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "command": ["sh", "-c", "until [ -s /cfg/config.json ]; do sleep 0.2; done"],
+                            "securityContext": hardened_context(),
+                            "resources": {
+                                "requests": {"memory": "8Mi", "cpu": "5m"},
+                                "limits": {"memory": "32Mi"},
+                            },
+                            "volumeMounts": [{"name": "cfg", "mountPath": "/cfg", "readOnly": true}],
+                        },
                     ],
+                    "containers": [{
+                        "name": "gateway",
+                        "image": g.image,
+                        "imagePullPolicy": "IfNotPresent",
+                        "args": ["-f", "/cfg/config.json"],
+                        "securityContext": hardened_context(),
+                        "resources": {
+                            "requests": {"memory": "128Mi", "cpu": "50m"},
+                            "limits": {"memory": "512Mi"},
+                        },
+                        "volumeMounts": [
+                            {"name": "cfg", "mountPath": "/cfg", "readOnly": true},
+                            {"name": "broker", "mountPath": "/broker", "readOnly": true},
+                        ],
+                    }],
                     "volumes": [
                         {"name": "cfg", "persistentVolumeClaim": {"claimName": GATEWAY_CONFIG_PVC}},
                         {"name": "broker", "persistentVolumeClaim": {"claimName": GATEWAY_BROKER_PVC}},
