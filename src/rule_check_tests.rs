@@ -216,6 +216,7 @@ fn run_steps(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -541,6 +542,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             instructions: None,
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -780,6 +782,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             instructions: None,
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -1415,6 +1418,7 @@ fn run_told(
             instructions: Some(TOUCH_NO_TEST),
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -1640,6 +1644,7 @@ fn changed_instructions_check_the_rule_again() {
             instructions: Some("A new instruction from the person."),
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -1817,6 +1822,7 @@ fn run_packs(
             instructions,
             engine_record: engine,
             creator_records: records,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -2849,7 +2855,13 @@ fn the_stub_answers_every_prompt_kind_and_the_packs_never_hold_a_scripted_run() 
         "{r:?}"
     );
     // The record prompt offers no N/A form; the stub still answers it (the substance decides).
-    let (p, _) = record_prompt(&[(&pack("POL-2101"), "")], &record(REC_GOOD), None, "n1");
+    let (p, _) = record_prompt(
+        &[(&pack("POL-2101"), "")],
+        &record(REC_GOOD),
+        None,
+        None,
+        "n1",
+    );
     assert!(!p.contains("RULE <id>: N/A"), "{p}");
     assert!(stub_rule_verdicts(&p)
         .unwrap()
@@ -3027,6 +3039,7 @@ fn pol_2101_needs_no_judge_when_no_agent_wrote_code_and_holds_when_creators_are_
                 instructions: None,
                 engine_record: Some(ENGINE),
                 creator_records: Some(records),
+                reviewer_record: None,
                 no_agent_code,
                 stage: CheckStage::Review,
                 deliver_tokens: &[],
@@ -3102,6 +3115,7 @@ fn run_stage(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage,
             deliver_tokens,
@@ -3318,6 +3332,7 @@ fn run_seated(
             instructions: None,
             engine_record: None,
             creator_records: None,
+            reviewer_record: None,
             no_agent_code: false,
             stage: CheckStage::Review,
             deliver_tokens: &[],
@@ -3780,4 +3795,310 @@ fn a_review_judge_rules_on_the_change_and_keeps_unknown_for_what_it_touches() {
     assert!(flat.contains("If the change touches what the rule speaks of but the evidence cannot show the rule kept, answer UNKNOWN"), "{flat}");
     let d = prompt_for(&batch, "title", &[], None, None, "n1", CheckStage::Delivery);
     assert!(!d.contains("You rule on THIS change"), "{d}");
+}
+
+// ── core#1381: POL-2101's record clause reads the reviewer's record; N/A on a change with no code ──
+
+/// A builder's record that did the work and never wrote down a stack check.
+const REC_NO_CHECK: &str = "Changed src/add.rs to take two arguments and return their sum; the \
+                            tests in tests/add.rs pass (cargo test: exit 0).";
+/// The reviewer's own output, which records the check it made.
+const REVIEWER_CHECKED: &str = "Reviewed src/add.rs.\n- STACK-CHECK: looked at the std::ops::Add \
+                                docs at the pinned toolchain :: offers the + operator this change \
+                                already uses; nothing is rebuilt.\nRULE POL-2101: KEPT — no \
+                                duplicate\nVERDICT: PASS";
+
+#[allow(clippy::too_many_arguments)]
+fn run_pol_2101(
+    c: &Change,
+    judge: &dyn RuleJudge,
+    records: &[CreatorRecord],
+    reviewer: Option<&str>,
+) -> RuleCheckReport {
+    let rules = [pack("POL-2101")];
+    let f = job_facts(&mcp_steps(), None, None, c);
+    let seats = seats();
+    check(
+        &CheckInput {
+            rules: &rules,
+            facts: &f,
+            change: c,
+            floor: Some("repo checks passed; test: passed"),
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: Some(ENGINE),
+            creator_records: Some(records),
+            reviewer_record: reviewer,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+/// The crew#1486 case: the substance judge finds no duplicate, the builder's record has no
+/// stack-check sentence, and the REVIEWER recorded the check. The rule is KEPT (it was BROKEN on
+/// the record alone, and disputed against the reviewer's KEPT). The record call is shown the
+/// reviewer's output as its own numbered record, and its KEPT rests on a quote of it.
+#[test]
+fn core1381_the_reviewers_recorded_check_keeps_the_record_clause() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_k = "KEPT — RECORD 2: \"looked at the std::ops::Add docs at the pinned toolchain\"";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
+    let r = run_pol_2101(
+        &change(),
+        &judge,
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+    );
+    let row = row_of(&r, "POL-2101");
+    assert_eq!(row.status, RuleStatus::Kept, "{row:?}");
+    assert!(r.denial().is_none() && r.hold().is_none(), "{r:?}");
+    let asked = judge.of(Asked::Record);
+    assert_eq!(asked.len(), 1);
+    assert!(
+        asked[0].contains("RECORD 2 of 2: the output of the reviewer of this step"),
+        "{}",
+        asked[0]
+    );
+    assert!(asked[0].contains("or when the reviewer's record (RECORD 2)"));
+    // The substance judge is never shown the reviewer's (or the creator's) words.
+    for p in judge.of(Asked::Change) {
+        assert!(!p.contains("std::ops::Add docs"), "{p}");
+        assert!(!p.contains(REC_NO_CHECK), "{p}");
+    }
+
+    // Without the reviewer's record the same KEPT quotes no record shown: it does not count.
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), None);
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Unchecked);
+}
+
+/// Deny-dominates holds: a substance BROKEN (a duplicated built-in) breaks the rule whatever the
+/// reviewer recorded; a record BROKEN that names the creator's record still breaks it when the
+/// reviewer's record (shown whole) does not record the check either.
+#[test]
+fn core1381_a_reviewer_record_never_unbreaks_the_rule() {
+    let sub_b = "BROKEN — src/add.rs hand-writes an adder the language ships";
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_k = "KEPT — \"looked at the std::ops::Add docs at the pinned toolchain\"";
+    let judge = PackJudge::with(&[("POL-2101", sub_b)], &[], &[("POL-2101", rec_k)]);
+    let r = run_pol_2101(
+        &change(),
+        &judge,
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+    );
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken);
+    assert!(r.denial().is_some());
+
+    // A reviewer that only claims the rule is kept wrote no STACK-CHECK line: no reviewer record
+    // is shown at all, and the creator's missing check breaks the rule.
+    let rec_b = "BROKEN — RECORD 1 never says what was looked at";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(
+        &change(),
+        &judge,
+        &record(REC_NO_CHECK),
+        Some("Reviewed src/add.rs: fine, it checked the stack.\nRULE POL-2101: KEPT — no duplicate\nVERDICT: PASS"),
+    );
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+    assert!(r.denial().is_some());
+    assert!(judge
+        .of(Asked::Record)
+        .iter()
+        .all(|p| !p.contains("the reviewer of this step")));
+}
+
+/// (review on #1426, r3) A quoted or fenced STACK-CHECK line is evidence the reviewer cites, not
+/// its own check; and a reviewer capture the runner cut proves no check absent.
+#[test]
+fn core1381_a_quoted_check_is_not_the_reviewers_and_a_cut_capture_proves_nothing_absent() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_b = "BROKEN — RECORD 1 never says what was looked at";
+    let quoted =
+        "The builder claimed this; I did not verify it.\n> STACK-CHECK: looked at the docs :: \
+                  offers +\n```\nSTACK-CHECK: looked at x :: offers y\n```\nVERDICT: PASS";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(quoted));
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+    assert!(judge
+        .of(Asked::Record)
+        .iter()
+        .all(|p| !p.contains("the reviewer of this step")));
+    let cut = "Reviewed src/add.rs … (output truncated)";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(cut));
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::Unchecked,
+        "{r:?}"
+    );
+    assert!(r.denial().is_none());
+    // A substance BROKEN still denies on a cut capture.
+    let judge = PackJudge::with(
+        &[("POL-2101", "BROKEN — rebuilds +")],
+        &[],
+        &[("POL-2101", rec_b)],
+    );
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(cut));
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken);
+}
+
+/// (review on #1426) Only the reviewer's STACK-CHECK lines are its record: what else it writes
+/// (a BROKEN it later drops, say) never moves the evidence key, so a dispute on unchanged code and
+/// an unchanged recorded check still carries; a changed check line does move it.
+#[test]
+fn core1381_only_the_reviewers_stack_check_lines_key_the_record() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_k = "KEPT — \"looked at the std::ops::Add docs at the pinned toolchain\"";
+    let key = |reviewer: &str| {
+        let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
+        let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(reviewer));
+        row_of(&r, "POL-2101").evidence_key.clone().expect("a key")
+    };
+    let with_broken = format!("{REVIEWER_CHECKED}\nRULE POL-2101: BROKEN — src/add.rs rebuilds +");
+    assert_eq!(key(REVIEWER_CHECKED), key(&with_broken));
+    let other = REVIEWER_CHECKED.replace("nothing is rebuilt", "Add is reused");
+    assert_ne!(key(REVIEWER_CHECKED), key(&other));
+}
+
+/// A BROKEN that names only the reviewer's record, or that rests on a reviewer record the prompt
+/// cut (the check is recorded when EITHER side states it, so a cut one cannot prove it absent),
+/// does not count: the rule is re-asked, then held, never broken on it.
+#[test]
+fn core1381_a_broken_needs_a_whole_creator_record_and_a_whole_reviewer_record() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let only_reviewer = "BROKEN — RECORD 2 never says what was looked at";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", only_reviewer)]);
+    let r = run_pol_2101(
+        &change(),
+        &judge,
+        &record(REC_NO_CHECK),
+        Some(REVIEWER_CHECKED),
+    );
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::Unchecked,
+        "{r:?}"
+    );
+
+    let long = format!("STACK-CHECK: looked at {}", "x".repeat(RECORD_CAP * 9));
+    let rec_b = "BROKEN — RECORD 1 never says what was looked at";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(&long));
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::Unchecked,
+        "{r:?}"
+    );
+    assert!(r.denial().is_none());
+    // The same answer with no reviewer record shown breaks it, as before.
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), None);
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+}
+
+/// A change that touches no source code (docs and text only) uses and rebuilds no capability of a
+/// stack: POL-2101 is NOT_APPLICABLE by that fact, and no judge is asked about it.
+#[test]
+fn core1381_pol_2101_is_not_applicable_by_fact_on_a_change_with_no_code() {
+    let docs = change_of(
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-Hi\n+Hello\n",
+        &["README.md", "docs/guide.md", "docs/arch.rst"],
+    );
+    let judge = PackJudge::with(
+        &[("POL-2101", "BROKEN — x")],
+        &[],
+        &[("POL-2101", "BROKEN — RECORD 1")],
+    );
+    let r = run_pol_2101(&docs, &judge, &record(REC_NO_CHECK), None);
+    let row = row_of(&r, "POL-2101");
+    assert_eq!(row.status, RuleStatus::NotApplicable, "{row:?}");
+    assert_eq!(row.how, RuleHow::Fact);
+    assert!(
+        row.reason.contains("touches no source code"),
+        "{}",
+        row.reason
+    );
+    assert!(judge.prompts.lock().unwrap().is_empty(), "no judge call");
+    // (review) MDX carries imports, exports and JSX: an MDX-only change is judged, and a
+    // substance BROKEN denies.
+    let mdx = change_of(
+        "diff --git a/pages/a.mdx b/pages/a.mdx\n--- a/pages/a.mdx\n+++ b/pages/a.mdx\n@@ -1 +1,2 @@\n # A\n+export const fmt = (d) => `${d.getFullYear()}-${d.getMonth() + 1}`;\n",
+        &["pages/a.mdx"],
+    );
+    let judge = PackJudge::with(
+        &[(
+            "POL-2101",
+            "BROKEN — pages/a.mdx hand-writes a date formatter Intl ships",
+        )],
+        &[],
+        &[],
+    );
+    let r = run_pol_2101(&mdx, &judge, &record(REC_NO_CHECK), None);
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+    assert!(r.denial().is_some());
+    // (review) A `.txt` may be a build include or a requirements file, and a lockfile is a
+    // dependency change: judged, never N/A by fact.
+    for (path, body) in [
+        ("CMakeLists.txt", "+function(my_join out a b)\n"),
+        ("requirements.txt", "+leftpad-py==1.0\n"),
+        ("requirements/prod.txt", "+leftpad-py==1.0\n"),
+        ("cmake/helpers.txt", "+function(my_join out a b)\n"),
+        ("Cargo.lock", "+name = \"leftpad\"\n"),
+    ] {
+        let c = change_of(&format!("--- a/{path}\n+++ b/{path}\n{body}"), &[path]);
+        let judge = PackJudge::with(&[("POL-2101", "BROKEN — it rebuilds a built-in")], &[], &[]);
+        let r = run_pol_2101(&c, &judge, &record(REC_NO_CHECK), None);
+        assert_eq!(
+            row_of(&r, "POL-2101").status,
+            RuleStatus::Broken,
+            "{path}: {r:?}"
+        );
+    }
+    // A source file in the change: judged as before.
+    let judge = PackJudge::with(&[("POL-2101", "BROKEN — x")], &[], &[]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_GOOD), None);
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken);
+}
+
+/// The substance judge is told when the rule does not apply: a text, literal or prompt-only edit
+/// is N/A (crew#1468), a change that adds logic is judged; and a substance N/A is the row's N/A.
+#[test]
+fn core1381_the_substance_judge_is_told_text_only_changes_are_not_applicable() {
+    let lit = change_of(
+        "diff --git a/src/msg.ts b/src/msg.ts\n--- a/src/msg.ts\n+++ b/src/msg.ts\n@@ -1 +1 @@\n-export const HI = \"Hi\";\n+export const HI = \"Hello\";\n",
+        &["src/msg.ts"],
+    );
+    let judge = PackJudge::with(
+        &[("POL-2101", "N/A — the change only edits a string literal")],
+        &[],
+        &[(
+            "POL-2101",
+            "BROKEN — RECORD 1 never says what was looked at",
+        )],
+    );
+    let r = run_pol_2101(&lit, &judge, &record(REC_NO_CHECK), None);
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::NotApplicable,
+        "{r:?}"
+    );
+    assert!(r.denial().is_none());
+    let sub = judge.of(Asked::Change);
+    assert!(
+        sub.iter()
+            .any(|p| p.contains("only edits text, string literals, prompts")
+                && p.contains("A change that adds or changes logic is judged, never N/A")),
+        "{sub:?}"
+    );
 }
