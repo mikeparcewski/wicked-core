@@ -816,6 +816,15 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("net="))
         .collect();
+    // No network answer at all is a probe that did not run to its end (evicted, cut): an
+    // infrastructure failure to retry, never a claim about the cluster's policy (live, B-2).
+    if net.is_empty() {
+        return Err(
+            "the pids-limit probe printed no network answer (its pod was evicted or its log \
+             was cut); retry"
+                .into(),
+        );
+    }
     if net.len() != 3 || net.iter().any(|n| *n != "closed") {
         return Err(format!(
             "the cluster does not enforce NetworkPolicy: a pod in a deny-all namespace reached \

@@ -153,6 +153,9 @@ pub(crate) fn plan(
             continue;
         }
         let mut skip = sync::nested(path, &dirs);
+        // The repository boundary under an ancestor root (a read root above the clone) stays
+        // absent there too (review r2); the tree and admitted roots are their own roots.
+        skip.extend(sync::nested(path, protected));
         let root_masks = sync::nested(path, &masks);
         skip.extend(root_masks.iter().cloned());
         let seed = seed_base.is_some_and(|b| path.starts_with(b));
@@ -502,10 +505,10 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
     // seat's `git add -A` never stages its deletion (review r1). Its blob stays in the history,
     // as the Docker floor's read-only object store held it.
     if !masks.is_empty() {
-        let mut args = vec!["ls-files", "-z", "--"];
-        args.extend(masks.iter().map(String::as_str));
+        // Every tracked path, matched by the same folded rule as the copy-in (review r2: a
+        // pathspec is case-sensitive and glob-shaped; the mask is neither).
         let o = sync::git(&tmp)
-            .args(&args)
+            .args(["ls-files", "-z"])
             .output()
             .map_err(|e| e.to_string())?;
         let tracked: Vec<String> = o
@@ -513,6 +516,7 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
             .split(|b| *b == 0)
             .filter(|p| !p.is_empty())
             .map(|p| String::from_utf8_lossy(p).into_owned())
+            .filter(|p| masks.iter().any(|m| sync::under(p, m)))
             .collect();
         if !tracked.is_empty() {
             let mut args = vec!["update-index", "--skip-worktree", "--"];
@@ -1081,7 +1085,7 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
     // through landrun, ride the unit file; the exec's own argv ends at the marker.
     let marker = args
         .iter()
-        .position(|a| a.starts_with(MARKER_PREFIX))
+        .position(|a| *a == format!("{MARKER_PREFIX}{id}"))
         .ok_or("the seat argv has no marker")?;
     let mut launch = args[marker + 1..end].to_vec();
     for n in &names {
@@ -1346,8 +1350,25 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         }
         _ => None,
     };
+    // The host's HEAD must still be the base the commits fast-forward (review r2), checked
+    // before any file changes.
+    if let (Some(_), Some(base)) = (&commits, &seat.base) {
+        let o = sync::git(&seat.tree)
+            .args(["rev-parse", "--verify", "-q", "HEAD^{commit}"])
+            .output()
+            .map_err(|e| e.to_string())?;
+        if String::from_utf8_lossy(&o.stdout).trim() != base {
+            return Err(format!(
+                "the host's HEAD moved off {base} while the unit ran; its commits are not landed"
+            ));
+        }
+    }
+    for (want, writes, _) in &plans {
+        sync::links_stay_inside_on(Some(&want.host), writes)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+    }
     for (want, writes, deletes) in &plans {
-        sync::apply(&want.host, writes, deletes)
+        sync::apply(&want.host, writes, deletes, &want.skip)
             .map_err(|e| format!("the write-back of {} failed: {e}", want.host.display()))?;
     }
     if let (Some((new, refname)), Some(base)) = (commits, &seat.base) {
@@ -1501,7 +1522,17 @@ fn fetch_commits(
             "the unit's branch is not a fast-forward of {base} (its history was rewritten); its commits are kept at {refname}"
         ));
     }
-    let changed = git(&["diff", "--name-only", "--no-renames", "-z", base, &new])?;
+    // Every imported commit's own changes, merges included (review r2: a masked change undone
+    // by a later commit is absent from the endpoint diff).
+    let changed = git(&[
+        "log",
+        "--format=",
+        "--name-only",
+        "--no-renames",
+        "-m",
+        "-z",
+        &format!("{base}..{new}"),
+    ])?;
     if let Some(p) = changed
         .split('\0')
         .filter(|p| !p.is_empty())

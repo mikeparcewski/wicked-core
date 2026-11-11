@@ -3584,9 +3584,15 @@ pub(crate) fn arm_noting(
     }
     let protected: Vec<PathBuf> = spec.protected.clone();
     let plan_mounts = crate::k8s::seat::plan_mounts(&mounts);
+    // Canonical, like the mount plan's paths (review r2: macOS spells a worker home under /var
+    // or /tmp as /private/...).
+    let canon =
+        |p: &Path| crate::worker_sandbox::canon_lenient(p).unwrap_or_else(|| p.to_path_buf());
     let seed_base =
         crate::worker_sandbox::seat_cache_dir(wicked_apps_core::spawn::SeatCli::from_binary(cli))
-            .and_then(|d| d.parent().map(Path::to_path_buf));
+            .and_then(|d| d.parent().map(Path::to_path_buf))
+            .map(|d| canon(&d));
+    let seat_dirs: Vec<PathBuf> = inp.seat_dirs.iter().map(|d| canon(d)).collect();
     let role = if crate::k8s::seat::one_shot_scope(run_id).is_some() {
         "judge"
     } else {
@@ -3605,7 +3611,7 @@ pub(crate) fn arm_noting(
         mounts: &plan_mounts,
         protected: &protected,
         write_roots: &inp.write_roots,
-        seat_dirs: &inp.seat_dirs,
+        seat_dirs: &seat_dirs,
         seed_base: seed_base.as_deref(),
         memory: &k8s_memory(memory_from(memory.as_deref())),
         gateway_ip: gateway_ip.as_deref(),

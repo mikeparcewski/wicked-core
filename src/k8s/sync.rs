@@ -289,6 +289,12 @@ pub(crate) fn under(rel: &str, prefix: &str) -> bool {
 /// Every link among `entries` resolves inside the root, following the other links of the set
 /// on the way (review r1: `a -> .` and `b -> a/../out` are each lexically inside, together not).
 pub(crate) fn links_stay_inside(entries: &[Entry]) -> Result<(), String> {
+    links_stay_inside_on(None, entries)
+}
+
+/// [`links_stay_inside`], also following the links already on the host under `root` that the
+/// write-back keeps (review r2: an ignored host link `a -> .` the seat never saw).
+pub(crate) fn links_stay_inside_on(root: Option<&Path>, entries: &[Entry]) -> Result<(), String> {
     let links: std::collections::HashMap<String, String> = entries
         .iter()
         .filter(|e| e.kind == Kind::Link)
@@ -319,7 +325,20 @@ pub(crate) fn links_stay_inside(entries: &[Entry]) -> Result<(), String> {
                         return Err(format!("`{}` resolves outside its root", e.path));
                     }
                     stack.push(c);
-                    if let Some(t) = links.get(&fold(&stack.join("/"))) {
+                    let host_link = || {
+                        let p = root?.join(stack.join("/"));
+                        std::fs::symlink_metadata(&p)
+                            .ok()
+                            .filter(|m| m.file_type().is_symlink())?;
+                        std::fs::read_link(&p)
+                            .ok()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    };
+                    let found = links
+                        .get(&fold(&stack.join("/")))
+                        .cloned()
+                        .or_else(host_link);
+                    if let Some(t) = found.as_ref() {
                         if t.starts_with('/') {
                             return Err(format!("`{}` resolves outside its root", e.path));
                         }
@@ -569,7 +588,42 @@ pub(crate) struct Applied {
 #[cfg(unix)]
 // `mode_t` is u16 on macOS and u32 on Linux: the casts are needed on one of them.
 #[allow(clippy::unnecessary_cast)]
-pub(crate) fn apply(root: &Path, entries: &[Entry], delete: &[String]) -> Result<Applied, String> {
+pub(crate) fn apply(
+    root: &Path,
+    entries: &[Entry],
+    delete: &[String],
+    guard: &[String],
+) -> Result<Applied, String> {
+    // The paths the seat may never write, as the host's own file system resolves them (review
+    // r2: on APFS `.ſsh` names `.ssh`; no case or normalization rule of ours can know that, the
+    // inode can). An entry or a deletion whose path, or any ancestor of it, is one of them is
+    // refused.
+    let guarded: std::collections::HashSet<(u64, u64)> = guard
+        .iter()
+        .filter_map(|g| std::fs::symlink_metadata(root.join(g)).ok())
+        .map(|m| {
+            use std::os::unix::fs::MetadataExt;
+            (m.dev(), m.ino())
+        })
+        .collect();
+    let hits_guard = |rel: &str| -> bool {
+        use std::os::unix::fs::MetadataExt;
+        let mut cur = root.to_path_buf();
+        rel.split('/').any(|c| {
+            cur.push(c);
+            std::fs::symlink_metadata(&cur).is_ok_and(|m| guarded.contains(&(m.dev(), m.ino())))
+        })
+    };
+    if let Some(p) = entries
+        .iter()
+        .map(|e| e.path.as_str())
+        .chain(delete.iter().map(String::as_str))
+        .find(|p| hits_guard(p))
+    {
+        return Err(format!(
+            "`{p}` is a path the seat may not write (it names a masked path on this host)"
+        ));
+    }
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     let c = |s: &str| CString::new(s).map_err(|_| format!("`{s}` has a NUL"));
@@ -784,6 +838,7 @@ pub(crate) fn apply(
     _root: &Path,
     _entries: &[Entry],
     _delete: &[String],
+    _guard: &[String],
 ) -> Result<Applied, String> {
     Err("the Kubernetes write-back needs a Unix host".into())
 }
@@ -913,13 +968,23 @@ def unpack(plan):
         r, m, skip = cur
         # A masked path the replica holds (a seat planted it, or it predates the mask) goes: a
         # mask is the absence of the path (review r1).
-        for mk in plan[r][2]:
-            fd, name = parent(rootfd, mk, False)
-            if fd is None: continue
-            try:
-                for n in os.listdir(fd):
-                    if fold(n) == fold(name): remove_any(fd, n)
-            finally: os.close(fd)
+        masks = plan[r][2]
+        if masks:
+            for rel in plain_list(rootfd):
+                if any(under(rel, mk) for mk in masks):
+                    fd, name = parent(rootfd, rel, False)
+                    if fd is None: continue
+                    try: os.unlink(name, dir_fd=fd)
+                    except FileNotFoundError: pass
+                    finally: os.close(fd)
+        if m == "git" and not wrote:
+            os.close(rootfd)
+            pfd = openroot(os.path.dirname(r), False) if "/" in r else os.open(R, os.O_RDONLY)
+            if pfd is not None:
+                try: remove_any(pfd, os.path.basename(r))
+                except FileNotFoundError: pass
+                finally: os.close(pfd)
+            return
         if m in ("tree", "plain"):
             have = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
             have = [h for h in have if not (m == "tree" and under(h, ".git"))]
@@ -969,7 +1034,8 @@ def unpack(plan):
     finish()
 def pack(plan):
     out = sys.stdout.buffer; out.write(b"WKS1\n")
-    for r, m, skip in plan:
+    for item in plan:
+        r, m, skip = item[0], item[1], item[2]
         rootfd = openroot(r, False)
         put(out, b"R", r, m.encode())
         if rootfd is None: continue
@@ -989,10 +1055,15 @@ def bundle(tree, base):
     head = git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
     if head.returncode != 0: die("the replica has no HEAD commit")
     if head.stdout.decode().strip() == base: return
-    b = git(root, "bundle", "create", "/tmp/wicked-unit.bundle", "HEAD", "^" + base)
-    if b.returncode != 0: die("git bundle failed: " + b.stderr.decode(errors="replace").strip())
-    with open("/tmp/wicked-unit.bundle", "rb") as fh: shutil.copyfileobj(fh, sys.stdout.buffer)
-    os.unlink("/tmp/wicked-unit.bundle")
+    path = "/tmp/wicked-unit-%d-%s.bundle" % (os.getpid(), os.urandom(8).hex())
+    try:
+        b = git(root, "bundle", "create", path, "HEAD", "^" + base)
+        if b.returncode != 0: die("git bundle failed: " + b.stderr.decode(errors="replace").strip())
+        with open(path, "rb") as fh: shutil.copyfileobj(fh, sys.stdout.buffer)
+    finally:
+        for f in (path, path + ".lock"):
+            try: os.unlink(f)
+            except FileNotFoundError: pass
 op = sys.argv[1]
 if op == "unpack": unpack(json.loads(sys.argv[2]))
 elif op == "pack": pack(json.loads(sys.argv[2]))

@@ -362,7 +362,18 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
         owner: kube.owner.clone(),
         image: crate::seat_gateway::GATEWAY_IMAGE.into(),
         writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
-        boot: boot_token(dir, false).map_err(gwerr)?,
+        // A quarantine whose rotation did not land is finished first (review r2): the
+        // gateway never starts again on the token it was stopped under.
+        boot: {
+            let pending = ROTATE.lock().is_ok_and(|q| q.iter().any(|d| d == dir));
+            let t = boot_token(dir, pending).map_err(gwerr)?;
+            if pending {
+                if let Ok(mut q) = ROTATE.lock() {
+                    q.retain(|d| d != dir);
+                }
+            }
+            t
+        },
     };
     // Applied with the host ports already granted (idempotent; it also re-creates a gateway a
     // quarantine stopped, under its new boot token), then again once the host's address is
@@ -511,8 +522,9 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
     if let Ok(mut o) = crate::seat_gateway::OWNED.lock() {
         o.retain(|d| d != &gw.dir);
     }
-    if boot_token(&gw.dir, true).is_err() {
-        return false;
+    // Stopped first, whatever the host state allows (review r2): the token is rotated after.
+    if let Ok(mut q) = ROTATE.lock() {
+        q.push(gw.dir.clone());
     }
     let r = gw.kube.call(
         Some(&gw.ns),
@@ -529,12 +541,23 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
             .kube
             .list_owned(Some(&gw.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
         {
-            Ok(p) if p.is_empty() => return true,
+            Ok(p) if p.is_empty() => {
+                if boot_token(&gw.dir, true).is_ok() {
+                    if let Ok(mut q) = ROTATE.lock() {
+                        q.retain(|d| d != &gw.dir);
+                    }
+                }
+                return true;
+            }
             _ => std::thread::sleep(Duration::from_millis(500)),
         }
     }
     false
 }
+
+/// Gateway dirs whose boot token a quarantine has not yet rotated: [`ensure`] rotates it first,
+/// and refuses to start the gateway until it can.
+static ROTATE: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
 
 /// The gateway's boot token (`config/boot-token` of the gateway dir), created when absent or when
 /// `fresh` (a quarantine).

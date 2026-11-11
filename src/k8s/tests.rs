@@ -234,7 +234,15 @@ fn k8s_replica_paths_mount_at_their_host_paths_with_their_access() {
         .unwrap();
     assert_eq!(skills["readOnly"], true);
     // A path under `/tmp` is allowed (an engine session's scratch tree, review r1 of B-2).
-    for bad in ["/tmp", "/floor", "/floor/x", "/wicked-canary", "/", "/a/../b", "rel/x"] {
+    for bad in [
+        "/tmp",
+        "/floor",
+        "/floor/x",
+        "/wicked-canary",
+        "/",
+        "/a/../b",
+        "rel/x",
+    ] {
         let mut s = seat();
         s.mounts.push(ReplicaMount {
             path: PathBuf::from(bad),
@@ -644,6 +652,12 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     assert!(render::pids_probe_verdict(&format!("{net}1\n2\n3\n")).is_err());
     assert!(render::pids_probe_verdict("").is_err());
     // Review r1 P1: a cluster that lets a deny-all pod reach the API server or the kubelet
+    // An empty log (an evicted probe) is a retry, never a policy verdict.
+    let e = render::pids_probe_verdict("").unwrap_err();
+    assert!(
+        e.contains("retry") && !e.contains("does not enforce"),
+        "{e}"
+    );
     // does not enforce NetworkPolicy: refused, whatever the pids answer.
     let open = format!("net=closed\nnet=closed\nnet=open\n{}{fork}", counts(4094));
     assert!(render::pids_probe_verdict(&open)

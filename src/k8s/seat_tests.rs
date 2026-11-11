@@ -158,7 +158,7 @@ fn k8s_write_back_applies_without_following_a_planted_link() {
         .modified()
         .unwrap();
     std::thread::sleep(std::time::Duration::from_millis(20));
-    let done = sync::apply(&host, &entries, &["gone.txt".into()]).unwrap();
+    let done = sync::apply(&host, &entries, &["gone.txt".into()], &[]).unwrap();
     assert_eq!((done.written, done.unchanged, done.deleted), (3, 1, 1));
     assert!(!host.join("gone.txt").exists());
     assert_eq!(
@@ -192,7 +192,7 @@ fn k8s_write_back_applies_without_following_a_planted_link() {
     // A delete through a link on the way deletes nothing outside.
     std::fs::write(outside.join("victim"), "v").unwrap();
     std::os::unix::fs::symlink(&outside, host.join("via")).unwrap();
-    sync::apply(&host, &[], &["via/victim".into()]).unwrap();
+    sync::apply(&host, &[], &["via/victim".into()], &[]).unwrap();
     assert!(outside.join("victim").exists());
     let _ = std::fs::remove_dir_all(&host);
     let _ = std::fs::remove_dir_all(&outside);
@@ -878,13 +878,14 @@ fn k8s_a_file_replacing_a_nested_tree_lands_after_its_contents_go() {
         &host,
         &[entry(Kind::File, "dir", b"now a file")],
         &["dir/nested/old".into()],
+        &[],
     )
     .unwrap();
     assert_eq!(std::fs::read(host.join("dir")).unwrap(), b"now a file");
     // A directory still holding a file (ignored output) is never removed.
     std::fs::create_dir_all(host.join("keep/sub")).unwrap();
     std::fs::write(host.join("keep/sub/build.o"), "b").unwrap();
-    assert!(sync::apply(&host, &[entry(Kind::File, "keep", b"x")], &[]).is_err());
+    assert!(sync::apply(&host, &[entry(Kind::File, "keep", b"x")], &[], &[]).is_err());
     assert!(host.join("keep/sub/build.o").exists());
     let _ = std::fs::remove_dir_all(&host);
 }
@@ -1009,4 +1010,152 @@ fn k8s_a_key_registers_and_revokes_without_deadlocking_the_publish_lock() {
     a.unwrap();
     b.unwrap();
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ── review r2 folds ──────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_production_plan_packs_and_unpacks_through_the_pod_codec() {
+    let replica = tmp("plan4");
+    let r = PlanRoot {
+        host: "/w".into(),
+        mode: Mode::Plain,
+        skip: vec![".env".into()],
+        back: true,
+        files: Vec::new(),
+        masks: vec![".env".into()],
+    };
+    let plan = seat::codec_plan(&[("w".into(), &r)]).to_string();
+    let stream = sync::encode(&[Root {
+        replica: "w".into(),
+        mode: Mode::Plain,
+        entries: vec![entry(Kind::File, "a", b"a")],
+    }]);
+    let up = codec(&replica, &["unpack", &plan], &stream);
+    assert!(
+        up.status.success(),
+        "{}",
+        String::from_utf8_lossy(&up.stderr)
+    );
+    let packed = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let roots = sync::decode(&mut packed.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert_eq!(roots[0].entries.len(), 1);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_nested_mask_is_scrubbed_in_any_case_and_an_empty_git_root_leaves_no_git() {
+    let replica = tmp("scrub2");
+    std::fs::create_dir_all(replica.join("w/Secrets")).unwrap();
+    std::fs::write(replica.join("w/Secrets/k"), "planted").unwrap();
+    std::fs::create_dir_all(replica.join("w/.git/hooks")).unwrap();
+    std::fs::write(replica.join("w/.git/hooks/pre-commit"), "planted").unwrap();
+    let stream = sync::encode(&[
+        Root {
+            replica: "w/.git".into(),
+            mode: Mode::Git,
+            entries: vec![],
+        },
+        Root {
+            replica: "w".into(),
+            mode: Mode::Tree,
+            entries: vec![entry(Kind::File, "a", b"a")],
+        },
+    ]);
+    let plan = json!([
+        ["w/.git", "git", [], []],
+        ["w", "tree", [".git", "secrets/k"], ["secrets/k"]]
+    ])
+    .to_string();
+    let out = codec(&replica, &["unpack", &plan], &stream);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !replica.join("w/Secrets/k").exists(),
+        "a case-varied nested mask survived"
+    );
+    assert!(
+        !replica.join("w/.git").exists(),
+        "a planted .git survived a repo-less copy-in"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_host_link_the_seat_never_saw_cannot_carry_its_link_outside() {
+    let host = tmp("hostlink");
+    std::os::unix::fs::symlink(".", host.join("a")).unwrap();
+    let writes = vec![entry(Kind::Link, "b", b"a/../outside")];
+    assert!(
+        sync::links_stay_inside(&writes).is_ok(),
+        "lexically inside on its own"
+    );
+    assert!(sync::links_stay_inside_on(Some(&host), &writes).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_write_naming_a_mask_by_another_spelling_is_refused_by_inode() {
+    let host = tmp("alias");
+    std::fs::write(host.join(".env"), "HOST_SECRET").unwrap();
+    // On a case-insensitive host `.ENV` IS `.env`; on a case-sensitive one it is another file.
+    let aliases = host.join(".ENV").exists();
+    let r = sync::apply(
+        &host,
+        &[entry(Kind::File, ".ENV", b"x")],
+        &[],
+        &[".env".into()],
+    );
+    if aliases {
+        assert!(r.is_err(), "an alias of a mask was written");
+        assert_eq!(
+            std::fs::read_to_string(host.join(".env")).unwrap(),
+            "HOST_SECRET"
+        );
+    } else {
+        assert!(r.is_ok());
+    }
+    assert!(sync::apply(&host, &[], &[".env".into()], &[".env".into()]).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[test]
+fn k8s_an_ancestor_read_root_leaves_the_clone_out() {
+    let clone = PathBuf::from("/srv/repos/app");
+    let tree = clone.join("wt/run-1");
+    let mounts = vec![
+        PlanMount::Bind {
+            path: "/srv/repos".into(),
+            rw: false,
+        },
+        PlanMount::Bind {
+            path: tree.clone(),
+            rw: true,
+        },
+    ];
+    let (roots, _) = seat::plan(
+        &tree,
+        false,
+        &mounts,
+        std::slice::from_ref(&clone),
+        std::slice::from_ref(&tree),
+        None,
+    );
+    let up = roots
+        .iter()
+        .find(|r| r.host == Path::new("/srv/repos"))
+        .unwrap();
+    assert!(up.skip.iter().any(|s| s == "app"), "{:?}", up.skip);
 }
