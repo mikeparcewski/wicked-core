@@ -4645,7 +4645,7 @@ fn run_unit_and_judge_on(
     let runner = &crate::run_context::Stamping::wrap(runner.clone(), &input.run_id, input.unit.ord);
     // (power-speed-2) The scope the unit's early floor runs in: it is joined where the floor's
     // result is read, and in any case before this returns.
-    std::thread::scope(|scope| {
+    let (output, verdict, mut evidence) = std::thread::scope(|scope| {
         run_unit_and_judge_in(
             scope,
             runner,
@@ -4659,7 +4659,14 @@ fn run_unit_and_judge_on(
             exec_bus,
             team,
         )
-    })
+    });
+    // (core#1390) The fold's tree reads, here on the worker thread for every worker path (in-process
+    // and bus-mediated) and every way the unit ended — an early return included — so the fold runs
+    // no git on the actor.
+    let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
+    evidence.worktree_clean = worktree_clean;
+    evidence.tree_after_failure = tree_after_failure;
+    (output, verdict, evidence)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6032,8 +6039,6 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .filter(|r| r.reason == wicked_council::types::SeatFailureReason::NotLoggedIn.as_str())
         .map(|r| r.seat.clone())
         .collect();
-    // (core#1390) The fold's tree reads, here on the worker thread, for both worker paths.
-    let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
     let evidence = crate::workflow::UnitEvidence {
         worktree_guard,
         repo_checks,
@@ -6050,8 +6055,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
         demo_take: None,
         editor_conformance: None,
         draft_render: None,
-        worktree_clean,
-        tree_after_failure,
+        // Read by `run_unit_and_judge_on`, after every way out of this function.
+        worktree_clean: None,
+        tree_after_failure: None,
     };
     (output, agent_verdict, evidence)
 }

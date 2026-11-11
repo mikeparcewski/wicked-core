@@ -328,3 +328,72 @@ fn a_probe_from_a_cancelled_life_never_dispatches_into_a_relaunch() {
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
 }
+
+/// (review of #1411) The post-step tree reads run on the worker thread for every attempt the fold
+/// treats as failed — a failed status or either fold tripwire — and only for those; a clean read
+/// always rides along. Read through the probe's pinned git dir.
+#[test]
+fn post_step_reads_cover_every_attempt_the_fold_treats_as_failed() {
+    let f = fixture("post");
+    let repo = f.dir.join("repo");
+    let git_dir = repo.join(".git").to_string_lossy().into_owned();
+    let mut unit = crate::domain::WorkUnit::pending("p:s1", "p", 1, "do it");
+    unit.author_probe = Some(crate::domain::AuthorProbe {
+        seat: "a".into(),
+        attempt: 0,
+        tree: String::new(),
+        git_dir: git_dir.clone(),
+        binaries_before: Vec::new(),
+    });
+    let input = StepInput {
+        run_id: "p".into(),
+        unit_ix: 0,
+        attempt: 0,
+        unit,
+        workflow_id: "wf".into(),
+        entity_mode: crate::EntityMode::Shared,
+        workdir: Some(repo.clone()),
+        governance: None,
+        prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
+        required_skills: Vec::new(),
+    };
+    let out = |status: StepStatus, text: &str| StepOutput {
+        run_id: "p".into(),
+        unit_ix: 0,
+        attempt: 0,
+        output: text.into(),
+        status,
+        usage: None,
+        files: Vec::new(),
+        tools: Vec::new(),
+        governed: false,
+    };
+    let (clean, tree) = super::super::post_step_reads(&input, &out(StepStatus::Ok, "done"));
+    assert_eq!(clean, Some(true), "a clean tree reads clean");
+    assert_eq!(tree, None, "a passing attempt reads no failure tree");
+    let (_, tree) = super::super::post_step_reads(&input, &out(StepStatus::Failed, "boom"));
+    let tree = tree.expect("a failed attempt with an author probe reads its tree");
+    assert_eq!(tree.git_dir, git_dir);
+    assert!(tree.tree.is_some(), "read through the probe's git dir");
+    // The fold's no-op tripwire turns an Ok skill step into a failure: read the tree for it too.
+    let mut skill = input.clone();
+    skill.unit.skill_ref = Some("wicked-garden:x".into());
+    let (_, tree) =
+        super::super::post_step_reads(&skill, &out(StepStatus::Ok, "Unknown command: /x"));
+    assert!(
+        tree.is_some(),
+        "an attempt the fold will fail reads its tree"
+    );
+    // Another attempt's probe is not this attempt's.
+    let mut other = input.clone();
+    other.attempt = 1;
+    let mut failed_again = out(StepStatus::Failed, "boom");
+    failed_again.attempt = 1;
+    let (_, tree) = super::super::post_step_reads(&other, &failed_again);
+    assert_eq!(tree, None);
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
