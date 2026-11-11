@@ -1116,14 +1116,37 @@ R = os.environ.get("WICKED_SYNC_ROOT", "/replica")
 # Every git call runs under Landlock (codex b2-seat #1, b2-sync #1/#2): the `.git` it reads is
 # the seat's, and the sync pod mounts every scope of the namespace, so git (and anything a
 # seat-written config makes it run) reads only the unit's own tree and writes only a private
-# temp dir. No `--best-effort`: a kernel without Landlock refuses the write-back, never runs it
-# open. `-` = no jail (the engine's tests on a host without Landlock only).
+# temp dir. `--best-effort` lets the launcher use the ABI the kernel has, so before the first
+# git call the jail is PROVEN in force (a file it grants reads, one beside it is refused); a
+# kernel without Landlock refuses the write-back, never runs it open. `-` = no jail (the
+# engine's tests on a host without Landlock only).
 JAIL = os.environ.get("WICKED_SYNC_JAIL", "/floor/landrun")
+PROVEN = False
 def die(m):
     sys.stderr.write("wicked-sync: " + m + "\n"); sys.exit(3)
+def prove_jail():
+    global PROVEN
+    if JAIL == "-" or PROVEN: return
+    d = tempfile.mkdtemp(prefix="wicked-jail-", dir="/tmp")
+    try:
+        ok = d + "/granted"; bad = d + "-canary"
+        for f in (ok, bad):
+            with open(f, "w") as fh: fh.write("x")
+        probe = ("import sys\nopen(%r).read()\ntry: open(%r).read()\n"
+                 "except PermissionError: sys.exit(7)\nsys.exit(0)") % (ok, bad)
+        r = subprocess.run(jail(d, None, {}) + [sys.executable, "-I", "-c", probe], env={},
+                           stdin=subprocess.DEVNULL, capture_output=True)
+        if r.returncode != 7:
+            die("Landlock is not in force in the sync pod (probe exit %s: %s); the replica is "
+                "not read" % (r.returncode, r.stderr.decode(errors="replace").strip()[-300:]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        try: os.unlink(d + "-canary")
+        except FileNotFoundError: pass
+    PROVEN = True
 def jail(root, rw, env):
     if JAIL == "-": return []
-    a = [JAIL, "--ignore-missing"]
+    a = [JAIL, "--best-effort", "--ignore-missing"]
     for p in ("/usr", "/bin", "/lib", "/lib64", "/sbin"): a += ["--rox", p]
     for p in ("/etc", "/proc", "/dev", root): a += ["--ro", p]
     a += ["--rw", "/dev/null"]
@@ -1138,6 +1161,7 @@ def git(root, *args, rw=None):
            "HOME": rw or "/nonexistent", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1",
            "GIT_DIR": root + "/.git", "GIT_WORK_TREE": root, "GIT_CEILING_DIRECTORIES": R,
            "GIT_ALLOW_PROTOCOL": "none", "GIT_OPTIONAL_LOCKS": "0"}
+    prove_jail()
     return subprocess.run(jail(root, rw, env) +
                           ["git", "-c", "core.fsmonitor=false",
                            "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",

@@ -2089,14 +2089,12 @@ fn k8s_codec_git_runs_jailed_to_the_units_own_tree_and_fails_closed() {
     std::fs::create_dir_all(&bin).unwrap();
     let rec = bin.join("argv");
     let jail = bin.join("landrun");
-    std::fs::write(
-        &jail,
-        format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
-            rec.display()
-        ),
-    )
-    .unwrap();
+    let script = format!(
+        "#!/bin/sh\ncase \"$*\" in *-canary*) [ -f '{r}.open' ] || exit 7;; esac\n\
+         printf '%s\\n' \"$@\" >> '{r}'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+        r = rec.display()
+    );
+    std::fs::write(&jail, script).unwrap();
     std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = codec_jailed(
         &replica,
@@ -2136,10 +2134,17 @@ fn k8s_codec_git_runs_jailed_to_the_units_own_tree_and_fails_closed() {
     assert!(granted("--rw")
         .iter()
         .all(|p| p == "/dev/null" || p.starts_with("/tmp/wicked-unit-")));
-    assert!(
-        !lines.contains(&"--best-effort"),
-        "a kernel without Landlock must refuse"
+    // A launcher that confines nothing (a kernel without Landlock under `--best-effort`) is
+    // caught by the probe before git runs: refused.
+    std::fs::write(format!("{}.open", rec.display()), "").unwrap();
+    let open = codec_jailed(
+        &replica,
+        &["bundle", "scope-a/w", &base],
+        b"",
+        jail.to_str().unwrap(),
     );
+    assert!(!open.status.success());
+    assert!(String::from_utf8_lossy(&open.stderr).contains("Landlock is not in force"));
     // A launcher that is not there refuses: the git call never runs open.
     let none = codec_jailed(
         &replica,
