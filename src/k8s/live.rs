@@ -19,7 +19,9 @@ fn live() -> Option<(String, String)> {
         eprintln!("skipped: set WICKED_K8S_LIVE=1 and WICKED_K8S_ADMIN_CONTEXT to run");
         return None;
     }
-    let ctx = std::env::var("WICKED_K8S_ADMIN_CONTEXT").ok()?;
+    // Review r1 P2: once live testing is asked for, a missing context fails, never skips.
+    let ctx = std::env::var("WICKED_K8S_ADMIN_CONTEXT")
+        .expect("WICKED_K8S_LIVE=1 needs WICKED_K8S_ADMIN_CONTEXT");
     let image = std::env::var("WICKED_K8S_LIVE_SEAT_IMAGE")
         .unwrap_or_else(|_| "wicked-seat-codex:2d518ac11d63".into());
     Some((ctx, image))
@@ -114,7 +116,7 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         "metadata": {"name": "not-ours", "namespace": daemon_namespace_name(&engine.owner)}});
     let refused = engine.apply(&[foreign]).unwrap_err();
     assert!(
-        refused.contains("may only change objects labelled"),
+        refused.contains("may only write objects labelled"),
         "{refused}"
     );
     let kube_system = engine.call(
@@ -168,17 +170,19 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         gw.pod,
         gw.service_ip
     );
-    // The readiness port answers inside the pod (the writer shares its network namespace).
+    // The readiness port answers inside the pod (the writer shares its network namespace), and
+    // refuses a call with no unit key: the gateway serves its policy (review r1 P2).
     let ready = w(
         &format!(
-            "wget -q -O /dev/null -T 3 http://127.0.0.1:{}/ 2>&1; echo rc=$?",
+            "wget -S -q -O /dev/null -T 3 http://127.0.0.1:{}/ 2>&1; true",
             crate::seat_gateway::READY_PORT
         ),
         None,
     );
-    eprintln!(
-        "readiness probe: {}",
-        String::from_utf8_lossy(&ready.stdout).trim()
+    let ready = String::from_utf8_lossy(&ready.stdout).to_string();
+    assert!(
+        ready.contains(" 401 "),
+        "the readiness listener did not refuse a keyless call: {ready}"
     );
 
     // B2: the pids limit, measured.
@@ -212,6 +216,7 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         cpu_request: "100m".into(),
         gateway_ip: Some(gw.service_ip.clone()),
         shutdown_time: rfc3339_after(Duration::from_secs(15 * 60)),
+        deadline_secs: 15 * 60,
     };
     let t_seat = std::time::Instant::now();
     engine
@@ -260,42 +265,77 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
     let alive = exec(&engine, &ns, "seat-1", "seat", "echo alive", None);
     assert!(alive.ok(), "the seat pod died on kill -9 -1");
 
-    // B5 + F1: from the seat, only the gateway's seat ports answer.
+    // B5 + F1: from the seat, only the gateway's seat ports answer. Every target below is a
+    // LISTENING port (review r1 P2: a closed port proves nothing), and an exec that fails is an
+    // error, never "closed".
     let probe = |host: &str, port: u16| -> bool {
         let r = exec(&engine, &ns, "seat-1", "seat",
-            &format!("/floor/busybox nc -w 3 {host} {port} </dev/null >/dev/null 2>&1 && echo open || echo closed"), None);
-        String::from_utf8_lossy(&r.stdout).contains("open")
+            &format!("if /floor/busybox nc -w 3 {host} {port} </dev/null >/dev/null 2>&1; then echo open; else echo closed; fi"), None);
+        let out = String::from_utf8_lossy(&r.stdout).trim().to_string();
+        assert!(
+            r.ok() && (out == "open" || out == "closed"),
+            "probe {host}:{port} did not run: {}",
+            r.err_text()
+        );
+        out == "open"
     };
-    let api = exec(
-        &engine,
-        &ns,
-        "seat-1",
-        "seat",
-        "echo $KUBERNETES_SERVICE_HOST",
-        None,
-    );
-    let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
+    let env = |name: &str| {
+        let r = exec(
+            &engine,
+            &ns,
+            "seat-1",
+            "seat",
+            &format!("echo ${name}"),
+            None,
+        );
+        String::from_utf8_lossy(&r.stdout).trim().to_string()
+    };
+    let api = env("KUBERNETES_SERVICE_HOST");
     assert!(!api.is_empty());
+    let pod_json = engine
+        .get_json(Some(&ns), "pod", "seat-1")
+        .unwrap()
+        .unwrap();
+    let node_ip = pod_json["status"]["hostIP"].as_str().unwrap().to_string();
+    let gw_pod = engine
+        .get_json(Some(&dns), "pod", &gw.pod)
+        .unwrap()
+        .unwrap();
+    let gw_ip = gw_pod["status"]["podIP"].as_str().unwrap().to_string();
+    // The same targets answer from the gateway's own pod (so they listen) ...
+    let listens = |host: &str, port: u16| {
+        let r = w(&format!("if nc -w 3 {host} {port} </dev/null >/dev/null 2>&1; then echo open; else echo closed; fi"), None);
+        String::from_utf8_lossy(&r.stdout).trim() == "open"
+    };
+    assert!(
+        listens(&gw_ip, crate::seat_gateway::READY_PORT),
+        "the readiness port does not listen"
+    );
+    eprintln!(
+        "from the gateway pod: node {node_ip}:10250 open={}",
+        listens(&node_ip, 10250)
+    );
+    // ... and are refused from the seat.
     assert!(!probe(&api, 443), "the API server is reachable from a seat");
+    assert!(
+        !probe(&node_ip, 10250),
+        "the node's kubelet is reachable from a seat"
+    );
+    assert!(
+        !probe(&node_ip, 6443),
+        "the node's API port is reachable from a seat"
+    );
     assert!(
         !probe("1.1.1.1", 443),
         "the internet is reachable from a seat"
     );
     assert!(
-        !probe("192.168.5.2", 22),
-        "the VM host is reachable from a seat"
+        !probe(&gw_ip, crate::seat_gateway::READY_PORT),
+        "the gateway's readiness port is reachable from a seat"
     );
     assert!(
         probe("agw", 3000),
         "the gateway's CONNECT port is not reachable as agw"
-    );
-    assert!(
-        !probe("agw", crate::seat_gateway::READY_PORT),
-        "the readiness port is reachable"
-    );
-    assert!(
-        !probe(&gw.service_ip, 22),
-        "an unlisted gateway port answered"
     );
 
     // B4: the Landlock canary in the Sandbox pod, with the seat floor's own argv shape.

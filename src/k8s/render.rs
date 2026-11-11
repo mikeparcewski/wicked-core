@@ -343,6 +343,9 @@ pub(crate) struct SeatPod {
     pub(crate) gateway_ip: Option<String>,
     /// RFC 3339: past it the controller deletes the sandbox even if the engine is gone.
     pub(crate) shutdown_time: String,
+    /// The pod's own deadline (`activeDeadlineSeconds`): the kubelet kills it past this, even
+    /// with no controller or API server left.
+    pub(crate) deadline_secs: u64,
 }
 
 /// The init container that copies the engine's trusted launcher files out of the floor image
@@ -397,6 +400,8 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         "hostIPC": false,
         "restartPolicy": "Never",
         "terminationGracePeriodSeconds": 1,
+        // Kubelet-enforced, independent of the controller and the engine (review r1 P2).
+        "activeDeadlineSeconds": s.deadline_secs,
         "securityContext": pod_context(POD_UID),
         "initContainers": [floor_init(&s.floor_image)],
         "containers": [{
@@ -419,8 +424,10 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         }],
         "volumes": [
             {"name": "floor", "emptyDir": {"sizeLimit": "64Mi"}},
-            {"name": "tmp", "emptyDir": {"sizeLimit": "2Gi"}},
-            {"name": "home", "emptyDir": {"sizeLimit": "512Mi"}},
+            // In memory, like the container floor's tmpfs: charged to the seat's memory limit, so
+            // a seat cannot fill the node's disk through them (review r1 P2).
+            {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "2Gi"}},
+            {"name": "home", "emptyDir": {"medium": "Memory", "sizeLimit": "512Mi"}},
             {"name": "canary", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
             {"name": "unit", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}},
             {"name": "replica", "persistentVolumeClaim": {"claimName": REPLICA_PVC}},
@@ -541,6 +548,12 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                         "image": g.image,
                         "imagePullPolicy": "IfNotPresent",
                         "args": ["-f", "/cfg/config.json"],
+                        // Ready only once agentgateway listens (review r1 P2).
+                        "readinessProbe": {
+                            "tcpSocket": {"port": crate::seat_gateway::READY_PORT},
+                            "periodSeconds": 1,
+                            "failureThreshold": 3,
+                        },
                         "securityContext": hardened_context(),
                         "resources": {
                             "requests": {"memory": "128Mi", "cpu": "50m"},
@@ -629,16 +642,29 @@ pub(crate) fn sync_pod(
 }
 
 /// Every object of a run namespace, in apply order (the namespace first).
+/// The annotation holding a run namespace's exact run id (a label value may be sanitized; the
+/// sweep asks the engine about the exact id, review r1 P1).
+pub(crate) const RUN_ID_ANNOTATION: &str = "wicked.dev/run-id";
+
 pub(crate) fn run_namespace_docs(
     ns: &str,
     owner: &str,
-    run_label: &str,
+    run_id: &str,
     daemon_ns: &str,
     budget: &RunBudget,
     replica_size: &str,
 ) -> Vec<Value> {
+    let mut ns_doc = namespace(
+        ns,
+        owner,
+        &[
+            (RUN_LABEL, &super::label_value(run_id)),
+            (ROLE_LABEL, "run"),
+        ],
+    );
+    ns_doc["metadata"]["annotations"] = json!({RUN_ID_ANNOTATION: run_id});
     vec![
-        namespace(ns, owner, &[(RUN_LABEL, run_label), (ROLE_LABEL, "run")]),
+        ns_doc,
         resource_quota(ns, owner, budget),
         limit_range(ns, owner),
         default_deny(ns, owner),
@@ -659,26 +685,42 @@ pub(crate) const PIDS_PROBE_UNBOUNDED: &str = "unbounded";
 /// cgroup namespace), so the limit is measured by behaviour: fork idle children until a fork is
 /// refused, printing the count. No network (the daemon namespace denies it), no seat image, no
 /// credentials; the container's exit ends every child.
-pub(crate) fn pids_probe_pod(ns: &str, owner: &str, name: &str, floor_image: &str) -> Value {
+pub(crate) fn pids_probe_pod(
+    ns: &str,
+    owner: &str,
+    name: &str,
+    floor_image: &str,
+    node: &str,
+) -> Value {
     let limit = POD_PIDS_MAX + PIDS_PROBE_SLACK;
+    // First the policy enforcement check (review r1 P1): this pod's namespace denies all egress,
+    // so the API server and the node's kubelet must not answer it; then the fork count. The check
+    // waits 3 s: a new pod's policy lands just after its first instant (PARITY F1, seen again on
+    // this probe: both answered at start), and the verdict is about the policy in force.
+    let script = format!(
+        "/busybox sleep 3; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\"; do \
+         if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then echo net=open; else echo net=closed; fi; done; \
+         i=0; while [ $i -lt {limit} ]; do /busybox sleep 120 & i=$((i+1)); echo $i; done; \
+         echo {PIDS_PROBE_UNBOUNDED}"
+    );
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
         "metadata": meta(name, Some(ns), owner, &[(ROLE_LABEL, "probe")]),
         "spec": {
+            "nodeName": node,
             "automountServiceAccountToken": false,
             "enableServiceLinks": false,
             "restartPolicy": "Never",
             "terminationGracePeriodSeconds": 0,
+            "activeDeadlineSeconds": 120,
             "securityContext": pod_context(POD_UID),
             "containers": [{
                 "name": "probe",
                 "image": floor_image,
                 "imagePullPolicy": "Never",
-                "command": ["/busybox", "sh", "-c", format!(
-                    "i=0; while [ $i -lt {limit} ]; do /busybox sleep 120 & i=$((i+1)); echo $i; done; \
-                     echo {PIDS_PROBE_UNBOUNDED}"
-                )],
+                "command": ["/busybox", "sh", "-c", script],
+                "env": [{"name": "HOST_IP", "valueFrom": {"fieldRef": {"fieldPath": "status.hostIP"}}}],
                 "securityContext": hardened_context(),
                 "resources": {
                     "requests": {"memory": "64Mi", "cpu": "50m"},
@@ -693,6 +735,16 @@ pub(crate) fn pids_probe_pod(ns: &str, owner: &str, name: &str, floor_image: &st
 /// the limit; `Err` = the pod forked past [`POD_PIDS_MAX`] (no limit, or one too high) or the log
 /// says nothing usable.
 pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
+    let net: Vec<&str> = log
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("net="))
+        .collect();
+    if net.len() != 2 || net.iter().any(|n| *n != "closed") {
+        return Err(format!(
+            "the cluster does not enforce NetworkPolicy: a pod in a deny-all namespace reached \
+             the API server or the node's kubelet ({net:?})"
+        ));
+    }
     if log.lines().any(|l| l.trim() == PIDS_PROBE_UNBOUNDED) {
         return Err(format!(
             "a pod forked {} processes without refusal: the cluster sets no pod pids limit (or \
@@ -710,9 +762,18 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
             "the pids probe stopped after {last} children without a refused fork"
         ));
     }
-    if last > POD_PIDS_MAX {
+    // The pod also holds the probe's shell and the pod's pause process: a limit of N refuses
+    // the child after N - 2. A refusal far below the limit is pressure elsewhere (the node's
+    // pid space, memory), not evidence of a pod limit (review r1 P2/P3): never a pass.
+    let most = POD_PIDS_MAX - 2;
+    if last > most {
         return Err(format!(
-            "a pod forked {last} processes: the pod pids limit is above {POD_PIDS_MAX}"
+            "a pod forked {last} children: the pod pids limit is above {POD_PIDS_MAX}"
+        ));
+    }
+    if last + PIDS_PROBE_SLACK * 2 < most {
+        return Err(format!(
+            "a fork was refused after only {last} children: not the pod's own limit; retry"
         ));
     }
     Ok(last)
