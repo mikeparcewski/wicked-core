@@ -105,6 +105,31 @@ fn only_an_agy_seat_gets_the_pseudo_terminal_devices() {
     let policy = landrun_prefix(&[], &[], &[]);
     assert!(policy.windows(2).any(|p| p == ["--ro", "/dev"]));
     assert!(policy.windows(2).any(|p| p == ["--rw", "/dev/null"]));
+    // The assembled launch policy (B-6 review): agy's devices are granted before landrun's own
+    // `--` separator, and no other CLI gets them.
+    let sep = |v: &[String]| {
+        v.iter()
+            .enumerate()
+            .filter(|(_, a)| *a == "--")
+            .nth(1)
+            .unwrap()
+            .0
+    };
+    let agy = seat_launch_policy("agy", landrun_prefix(&[], &[], &[]));
+    let at = sep(&agy);
+    for d in ["/dev/ptmx", "/dev/pts"] {
+        let i = agy
+            .windows(2)
+            .position(|p| p == ["--rw", d])
+            .unwrap_or_else(|| panic!("{d} is not granted: {agy:?}"));
+        assert!(i < at, "{d} is granted after the separator: {agy:?}");
+    }
+    let codex = seat_launch_policy("codex", landrun_prefix(&[], &[], &[]));
+    assert!(
+        !codex.iter().any(|a| a == "/dev/ptmx" || a == "/dev/pts"),
+        "{codex:?}"
+    );
+    assert_eq!(codex.len() + 4, agy.len());
 }
 
 /// An agy CLI needs a pipe for stdin; mentioning agy in another CLI's prompt does not.

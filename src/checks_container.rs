@@ -1731,9 +1731,9 @@ print(json.dumps({'dirs':dirs,'files':files}))
         self.place.delete(name);
     }
 
-    /// The `docker exec` for one check: `root` must be the floor's head worktree (a head check) or
-    /// the base export (a base check, whose identity picks the base container: a fresh export is a
-    /// fresh container). `Err` is a reason the check could not run.
+    /// The pod exec for one check: `root` must be the floor's head worktree (a head check) or the
+    /// base export (a base check, whose identity picks the base pod: a fresh export is a fresh
+    /// pod). `Err` is a reason the check could not run.
     pub(crate) fn command(
         &self,
         tree: Tree,

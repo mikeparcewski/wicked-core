@@ -1712,7 +1712,8 @@ pub(crate) trait BrokerIo {
     ) -> Result<Value, String>;
 }
 
-/// Test transport only (k8s-final B-6): the state-machine tests below still drive the sign-in flow through it; port them to MemIo (src/seat_login_io_tests.rs) and delete it.
+/// Test transport only (k8s-final B-6): the state-machine tests below still drive the sign-in
+/// flow through it; port them to MemIo (`src/seat_login_io_tests.rs`, core#1438) and delete it.
 #[cfg(unix)]
 #[derive(Clone)]
 #[cfg(test)]

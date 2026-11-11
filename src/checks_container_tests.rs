@@ -361,6 +361,17 @@ fn the_engine_written_tar_extracts_to_the_same_tree() {
     );
 }
 
+/// The fill pod's install is fixed, with every lifecycle script off (B-6 review: the Kubernetes
+/// fill runs exactly this argv).
+#[test]
+fn the_fill_install_is_fixed_with_scripts_off() {
+    assert_eq!(
+        NPM_FILL,
+        ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
+    );
+    assert!(!NPM_FILL.iter().any(|a| a.contains("=false")));
+}
+
 #[test]
 fn an_oom_kill_is_read_from_the_cgroup_events() {
     assert_eq!(

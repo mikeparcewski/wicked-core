@@ -2,8 +2,10 @@
 //!
 //! Seats run as pods on a local Kubernetes cluster (Rancher Desktop or Docker Desktop
 //! Kubernetes), installed once with `wicked-core cluster install --admin-context <ctx>
-//! --home <state home>`. The container CLI (`docker`, `nerdctl`, or `podman`) only builds
-//! images into the store shared with the cluster; pods use `imagePullPolicy: Never`.
+//! --home <state home>`. The container CLI (`docker`, `nerdctl`, or `podman`) never runs a
+//! seat: it builds images into the store shared with the cluster (pods use `imagePullPolicy:
+//! Never`) and inspects a seat image before an arm ([`inspect_seat_image`]: a short-lived helper
+//! that runs only the floor's own busybox over the image as data).
 //!
 //! The mount plan comes from [`SeatFloor`]: writable roots, read views, pinned launch files,
 //! and secret masks. [`crate::k8s::seat`] carries it into the pod along with the trusted floor
@@ -1840,14 +1842,14 @@ pub(crate) fn write_seat_files(
     Ok(())
 }
 
-/// A seat armed in the container floor: the wrapper, the argv to run after it, the runtime that
-/// armed it (by file name: `docker`, `podman`, `nerdctl`). Its `Debug` names the env's
+/// A seat armed as a pod: the wrapper (`kubectl exec` into the seat pod), the argv to run after
+/// it, and the tool that runs it (`kubectl`). Its `Debug` names the env's
 /// variables, never their values (a unit key, a claude seat's pass-through token).
 pub(crate) struct ArmedContainer {
     pub(crate) wrapper: Vec<String>,
     pub(crate) argv: Vec<String>,
     pub(crate) tool: &'static str,
-    /// Removes the seat's container and network on every path out of the unit (held by the
+    /// Reaps the seat's pod on every path out of the unit (held by the
     /// caller until the unit ends; `run_bounded`'s own reap makes it a no-op on the normal path).
     pub(crate) cleanup: ReapOnDrop,
     /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
@@ -2454,18 +2456,7 @@ pub(crate) fn arm_noting(
             rw: true,
         });
     }
-    let mut landrun: Vec<String> = vec![SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()];
-    landrun.extend(landrun_prefix(&land_mounts, GATEWAY_PORTS, &own_ports));
-    if let Some(at) = landrun.iter().position(|a| a == "--").and_then(|first| {
-        landrun[first + 1..]
-            .iter()
-            .position(|a| a == "--")
-            .map(|i| first + 1 + i)
-    }) {
-        for d in seat_devices(cli).iter().rev() {
-            landrun.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
-        }
-    }
+    let landrun = seat_launch_policy(cli, landrun_prefix(&land_mounts, GATEWAY_PORTS, &own_ports));
     let protected: Vec<PathBuf> = spec.protected.clone();
     let plan_mounts = crate::k8s::seat::plan_mounts(&mounts);
     // Canonical, like the mount plan's paths (review r2: macOS spells a worker home under /var
@@ -2538,6 +2529,25 @@ pub(crate) fn arm_noting(
         copilot_account,
         view,
     })
+}
+
+/// The launcher argv a seat pod runs under (pure): the floor entry and canary, then the Landlock
+/// policy `prefix`, with `cli`'s devices (agy's pseudo-terminal) granted read-write before
+/// landrun's own `--` separator.
+pub(crate) fn seat_launch_policy(cli: &str, prefix: Vec<String>) -> Vec<String> {
+    let mut landrun: Vec<String> = vec![SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()];
+    landrun.extend(prefix);
+    if let Some(at) = landrun.iter().position(|a| a == "--").and_then(|first| {
+        landrun[first + 1..]
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| first + 1 + i)
+    }) {
+        for d in seat_devices(cli).iter().rev() {
+            landrun.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
+        }
+    }
+    landrun
 }
 
 /// A container memory limit (`3g`, `512m`) as a Kubernetes quantity (`3Gi`, `512Mi`).
@@ -4258,6 +4268,55 @@ mod tests {
         hc.healthcheck = true;
         let e = check_seat_image(&hc, &dests).unwrap_err();
         assert!(e.contains("HEALTHCHECK"), "{e}");
+    }
+
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`; kept by B-6 review: the Kubernetes arm still inspects the
+    /// seat image through the image builder): codex ln-r1's hostile image (`/floor` -> a dir it then
+    /// declares as a volume, with its own `launch`) is refused by the engine's inspection, which
+    /// runs only the floor's own busybox over the image as data; the engine's seat image passes.
+    #[cfg(unix)]
+    #[test]
+    fn live_a_hostile_seat_image_is_refused_before_it_runs() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
+            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
+            return;
+        }
+        let rt = runtime().expect("a container runtime answers");
+        let floor = ensure_floor_image(&rt).expect("the floor image");
+        let good = ensure_seat_image(&rt, "claude").expect("the claude seat image");
+        let dests = vec![PathBuf::from("/Users/op/wt")];
+        let f = inspect_seat_image(&rt, &floor, &good).expect("inspected");
+        assert!(
+            f.symlinks.contains(Path::new("/bin")),
+            "the base's own links are seen"
+        );
+        check_seat_image(&f, &dests).expect("the engine's seat image passes");
+        assert!(
+            valid_image_id(&f.id).is_some(),
+            "the seat runs the inspected id: {}",
+            f.id
+        );
+        let df = "FROM busybox:1.37-musl\nRUN mkdir -p /opt/evil && ln -s /opt/evil /floor && printf '#!/bin/sh\\necho BYPASSED\\n' > /opt/evil/launch && chmod 0755 /opt/evil/launch\nVOLUME [\"/opt/evil\"]\n";
+        let tag = "wicked-test-hostile-seat:1";
+        build_image(&rt, df, tag, &[]).expect("hostile image built");
+        let f = inspect_seat_image(&rt, &floor, tag).expect("inspected");
+        assert!(f.symlinks.contains(Path::new("/floor")), "{f:?}");
+        let e = check_seat_image(&f, &dests).unwrap_err();
+        assert!(e.contains("volume") || e.contains("symbolic link"), "{e}");
+        // Codex ln-r3's image: no volume, no link, an active HEALTHCHECK -> refused.
+        let df = "FROM busybox:1.37-musl\nHEALTHCHECK --interval=100ms CMD [\"/bin/sh\", \"-c\", \"printf BYPASSED > /wicked-canary/healthcheck-bypass\"]\n";
+        let hc_tag = "wicked-test-healthcheck-seat:1";
+        build_image(&rt, df, hc_tag, &[]).expect("healthcheck image built");
+        let f = inspect_seat_image(&rt, &floor, hc_tag).expect("inspected");
+        assert!(f.healthcheck, "{f:?}");
+        let e = check_seat_image(&f, &dests).unwrap_err();
+        assert!(e.contains("HEALTHCHECK"), "{e}");
+        let mut rm = rt.cmd();
+        rm.args(["image", "rm", "-f", tag, hc_tag]);
+        let _ = output_within(rm, PROBE_TIMEOUT);
     }
 
     /// Codex ln-r2 (P2): both runtimes' image id spellings are immutable ids; nothing else is.

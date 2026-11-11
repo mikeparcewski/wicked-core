@@ -1829,8 +1829,8 @@ fn strip_plugin_dir(argv: &mut Vec<String>, prompt_ix: Option<usize>) -> Vec<Str
 /// file-reading tools"). Every one of them is lifted to its enforced twin here; a bare tool name
 /// of any of them (no path) is a whole-tool deny and rides as stated.
 ///
-/// Manual check against the live CLI (the automated one is the `WICKED_CONTAINER_LIVE` test
-/// `live_the_absolute_fence_bites_…_1029`, Read + Edit in the pinned seat): in a scratch config dir,
+/// Manual check against the live CLI (the automated Docker-era proof was deleted with the Docker
+/// runner in B-6; its pod port is core#1439): in a scratch config dir,
 /// `printf '{"permissions":{"deny":["Read(//tmp/fence/**)","Edit(//tmp/fence/**)"]}}' > s.json`
 /// (`//` is the absolute anchor — a single `/` anchors at the settings file's directory, core#1029),
 /// then `claude -p --settings s.json --setting-sources "" --permission-mode acceptEdits
@@ -17062,10 +17062,12 @@ mod tests {
     /// including `~/.claude/plugins`) are mounted when the container floor arms, so the view the
     /// fence is narrowed to is the whole mount set: with `~/.claude/plugins` a link to `~/.wicked`,
     /// the arm-time mounts bind `.wicked` whole, so its blanket STAYS (estate's stores stay
-    /// denied). Retargeting a read-root symlink leaves the resolved mount plan unchanged.
+    /// denied). (B-6: the Docker-era retarget-between-arm-and-spawn half is gone with its subject:
+    /// a pod seat sees only the replica copy made at arm time from these resolved mounts, and no
+    /// later step resolves a read root again.)
     #[cfg(unix)]
     #[test]
-    fn the_gate_read_roots_are_in_the_view_and_symlink_retargeting_adds_no_mount() {
+    fn the_gate_read_roots_are_in_the_view() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let home = std::env::temp_dir().canonicalize().unwrap().join(format!(
             "wicked-sf1019-rr-{}",
@@ -17139,29 +17141,6 @@ mod tests {
             assert!(view.mounted.contains(path));
         }
 
-        // (codex review of #1042, round 2) The link RETARGETED between arming and spawn: armed on
-        // an unrelated plugins dir (so `.wicked` is narrowed), then pointed at `.wicked`.
-        // The resolved plan still names the original target.
-        let link = home.join(".claude").join("plugins");
-        let real = home.join("plugins-real");
-        std::fs::create_dir_all(&real).unwrap();
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let mut mounts = crate::container_floor::mount_plan(&spec).unwrap();
-        crate::container_floor::add_read_roots(&mut mounts, &roots);
-        let view = crate::container_floor::mount_view(&mounts, &working);
-        assert_eq!(
-            crate::container_floor::narrow_fenced_dir(&wicked, &view).unwrap(),
-            Some(Vec::new()),
-            "armed on the unrelated target, `.wicked` is narrowed: {view:?}"
-        );
-        std::fs::remove_file(&link).unwrap();
-        std::os::unix::fs::symlink(&wicked, &link).unwrap();
-        assert!(!mounts.iter().any(|m| matches!(m,
-            crate::container_floor::Mount::Bind { path, .. } if path == &wicked)));
-        assert!(mounts.iter().any(|m| matches!(m,
-            crate::container_floor::Mount::Bind { path, rw: false } if path == &real)));
-        assert!(!view.mounted.contains(&wicked));
         let _ = std::fs::remove_dir_all(&home);
     }
 

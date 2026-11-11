@@ -167,8 +167,8 @@ Kubernetes cluster (Rancher Desktop or Docker Desktop Kubernetes), installed onc
 `wicked-core cluster install --admin-context <ctx> --home <state home>`. Seats use the trusted
 floor launcher, a read-only root and the model gateway. A unit whose pod cannot start is refused;
 `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. The container CLI (`docker`,
-`nerdctl` or `podman`) only builds images into the store the cluster shares
-(`imagePullPolicy: Never`). `wicked-core seat-image build|status` builds or reports the images.
+`nerdctl` or `podman`) never runs a seat: it builds images into the store the cluster shares
+(`imagePullPolicy: Never`) and inspects a seat image before an arm. `wicked-core seat-image build|status` builds or reports the images.
 
 Two smaller consequences of the same rule, worth knowing before you debug them:
 

@@ -34,8 +34,9 @@ open to check a claim.
 
 Seats and the checks floor run as pods on a local Kubernetes cluster (Rancher Desktop or
 Docker Desktop Kubernetes), installed once with `wicked-core cluster install --admin-context
-<ctx> --home <state home>`. The container CLI (`docker`, `nerdctl` or `podman`) only builds
-images into the store the cluster shares (`imagePullPolicy: Never`). Use
+<ctx> --home <state home>`. The container CLI (`docker`, `nerdctl` or `podman`) never runs a
+seat: it builds images into the store the cluster shares (`imagePullPolicy: Never`) and
+inspects a seat image before an arm (a short-lived helper running only the floor's busybox). Use
 `wicked-core seat-image build|status` to build or report images.
 
 ## Conventions
