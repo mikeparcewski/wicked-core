@@ -484,12 +484,20 @@ pub(crate) fn host_tree_listing(root: &Path) -> Result<Vec<String>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let mut v: Vec<String> = out
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|s| !s.is_empty())
-        .filter_map(|s| String::from_utf8(s.to_vec()).ok())
-        .collect();
+    // A name the stream cannot carry refuses the copy-in (review r5): left out, the seat's
+    // `git add -A` would record its deletion.
+    let mut v: Vec<String> = Vec::new();
+    for raw in out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        match String::from_utf8(raw.to_vec()) {
+            Ok(p) => v.push(p),
+            Err(_) => {
+                return Err(format!(
+                    "`{}` is not a UTF-8 path; the copy-in carries UTF-8 names only",
+                    String::from_utf8_lossy(raw)
+                ))
+            }
+        }
+    }
     v.sort();
     v.dedup();
     Ok(v)

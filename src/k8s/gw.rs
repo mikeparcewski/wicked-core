@@ -97,10 +97,13 @@ pub(crate) fn write_script(v: Volume, file: &str, digest: &str) -> Result<String
         // be running in the writer (exec does not end it), and could rename a stale body over
         // this one after it lands. Every such write is killed first (`$0` is its marker; `[x]y`
         // keeps the pattern from matching this script's own text), and any rename it already
-        // started is waited out, before this body is taken.
+        // started is waited out, before this body is taken. The kernel lock is the barrier (review
+        // r5): every write holds it from before its body to after its rename, and a rename child
+        // an old write forked holds it too, so no stale rename can land after this one.
         "set -e; umask 077; \
          for p in $(pgrep -f '[{first}]{rest}'); do [ \"$p\" = \"$$\" ] || kill -9 \"$p\" 2>/dev/null || :; done; \
          i=0; while pgrep -f '[m]v -f {d}/.{file}.' >/dev/null; do i=$((i+1)); [ $i -lt 200 ] || exit 68; sleep 0.05; done; \
+         exec 9>{d}/.{file}.lock; flock -w 20 9 || {{ echo 'wicked-writer: an earlier write still holds the file' >&2; exit 69; }}; \
          t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
          [ \"$(sha256sum \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'wicked-writer: the body did not arrive whole' >&2; exit 65; }}; \
          mv -f \"$t\" {d}/{file}; trap - EXIT"

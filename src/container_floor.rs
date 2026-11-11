@@ -3598,6 +3598,12 @@ pub(crate) fn arm_noting(
     } else {
         "seat"
     };
+    // In the mount plan's own spelling (review r5: `/tmp/...` names a `/private` path there).
+    let write_roots: Vec<PathBuf> = inp
+        .write_roots
+        .iter()
+        .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
+        .collect();
     let arm_spec = crate::k8s::seat::ArmSpec {
         run_id,
         ord,
@@ -3610,7 +3616,7 @@ pub(crate) fn arm_noting(
         view: read_only_view,
         mounts: &plan_mounts,
         protected: &protected,
-        write_roots: &inp.write_roots,
+        write_roots: &write_roots,
         seat_dirs: &seat_dirs,
         seed_base: seed_base.as_deref(),
         memory: &k8s_memory(memory_from(memory.as_deref())),

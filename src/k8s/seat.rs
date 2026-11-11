@@ -419,7 +419,16 @@ fn codec(
         sync::POD_CODEC,
     ]);
     a.extend(args);
-    kube.call_capped(Some(ns), &a, stdin, limit, STREAM_LIMIT)
+    let r = kube.call_capped(Some(ns), &a, stdin, limit, STREAM_LIMIT);
+    if !r.ok() {
+        // A client that gave up may leave its codec running in the sync pod, still writing the
+        // replica (review r5): the pod goes, and every process with it, before the replica is
+        // used again (the next arm makes a new sync pod).
+        if let Err(e) = kube.delete_owned(Some(ns), "pod", "sync", true) {
+            eprintln!("wicked-core: the sync pod in {ns} was not reset: {e}");
+        }
+    }
+    r
 }
 
 /// The host's side of a tree root's `.git` for the replica: a shallow clone of the tree's HEAD,
@@ -583,8 +592,19 @@ pub(crate) fn copy_in_stream(
                     r.host.join(p).display()
                 ));
             }
-            if let Some(e) = sync::read_host_entry(&r.host, p) {
-                entries.push(e);
+            match sync::read_host_entry(&r.host, p) {
+                Some(e) => entries.push(e),
+                // A regular file that is there but cannot be read refuses the copy-in (review
+                // r5); a path that is gone, or a directory (a gitlink), is simply absent.
+                None if std::fs::symlink_metadata(r.host.join(p))
+                    .is_ok_and(|m| m.file_type().is_file()) =>
+                {
+                    return Err(format!(
+                        "`{}` could not be read for the copy-in",
+                        r.host.join(p).display()
+                    ))
+                }
+                None => {}
             }
         }
         // The tree's `.git` first: the codec mirrors the tree by what that git lists. Always
@@ -832,17 +852,56 @@ pub(crate) fn sandbox_refusal(sbx: &Value) -> Option<(FloorUnarmed, String)> {
 /// The deny check before a seat's first exec (B5, F1): from the seat, the API server and the
 /// internet are refused, and (online) the gateway's CONNECT port answers. Retried briefly: a
 /// fresh pod's policy is programmed asynchronously.
+/// The deny check's in-pod script (pure): the API server, the internet and (with `host_ip`) the
+/// pod's node on every gateway port must be closed; the gateway open when `online`.
+pub(crate) fn deny_script(online: bool, host_ip: Option<&str>) -> String {
+    let mut node = String::new();
+    if let Some(ip) = host_ip {
+        for p in render::seat_gateway_ports() {
+            node.push_str(&format!("nc_ {ip} {p} node{p} & "));
+        }
+    }
+    format!(
+        "nc_() {{ if /floor/busybox nc -w 2 \"$1\" \"$2\" </dev/null >/dev/null 2>&1; then echo \"$3=open\"; else echo \"$3=closed\"; fi; }}; \
+         nc_ \"$KUBERNETES_SERVICE_HOST\" \"$KUBERNETES_SERVICE_PORT\" api & nc_ 1.1.1.1 443 net & {node}{} wait",
+        if online { "nc_ agw 3000 gw & " } else { "" }
+    )
+}
+
+/// Whether the deny check's output holds (pure).
+pub(crate) fn deny_holds(out: &str, online: bool, node: bool) -> bool {
+    out.contains("api=closed")
+        && out.contains("net=closed")
+        && (!online || out.contains("gw=open"))
+        && (!node
+            || render::seat_gateway_ports()
+                .iter()
+                .all(|p| out.contains(&format!("node{p}=closed"))))
+}
+
 fn deny_check(
     kube: &Kube,
     ns: &str,
     pod: &str,
     online: bool,
 ) -> Result<(), (FloorUnarmed, String)> {
-    let script = format!(
-        "nc_() {{ if /floor/busybox nc -w 2 \"$1\" \"$2\" </dev/null >/dev/null 2>&1; then echo \"$3=open\"; else echo \"$3=closed\"; fi; }}; \
-         nc_ \"$KUBERNETES_SERVICE_HOST\" \"$KUBERNETES_SERVICE_PORT\" api & nc_ 1.1.1.1 443 net & {} wait",
-        if online { "nc_ agw 3000 gw & " } else { "" }
-    );
+    // The pod's own node on every port the seat's Landlock grants (review r5: NetworkPolicy
+    // does not portably cover traffic to the local node), so a node-local listener on such a
+    // port is refused here, at arm time, on the cluster as it is.
+    let host_ip = kube
+        .get_json(Some(ns), "pod", pod)
+        .ok()
+        .flatten()
+        .and_then(|p| {
+            p.pointer("/status/hostIP")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|ip| {
+            ip.chars()
+                .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+        });
+    let script = deny_script(online, host_ip.as_deref());
     let start = Instant::now();
     let mut last = String::new();
     while start.elapsed() < Duration::from_secs(20) {
@@ -863,11 +922,7 @@ fn deny_check(
             Duration::from_secs(15),
         );
         let out = String::from_utf8_lossy(&r.stdout).to_string();
-        if r.ok()
-            && out.contains("api=closed")
-            && out.contains("net=closed")
-            && (!online || out.contains("gw=open"))
-        {
+        if r.ok() && deny_holds(&out, online, host_ip.is_some()) {
             return Ok(());
         }
         last = if r.ok() {
@@ -1376,7 +1431,14 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
             entries.retain(|e| want.files.contains(&e.path));
         }
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
-        let (writes, deletes) = delta(&want.host, &base, entries)?;
+        let (writes, mut deletes) = delta(&want.host, &base, entries)?;
+        // A tracked file the host's ignore rules match (force-added) is never listed by the
+        // pod's `ls-files --exclude-standard`, changed or not: its absence there is no deletion
+        // (review r5). A seat that really deleted one leaves it on the host (the safe side).
+        if want.mode == Mode::Tree && !deletes.is_empty() {
+            let ignored = host_ignored(&want.host, &deletes)?;
+            deletes.retain(|d| !ignored.contains(d));
+        }
         plans.push((want, writes, deletes));
     }
     preflight(&plans)?;
@@ -1454,6 +1516,30 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
     Ok(())
 }
 
+/// Which of `paths` (relative to the tree `root`) the host's ignore rules match.
+pub(crate) fn host_ignored(
+    root: &Path,
+    paths: &[String],
+) -> Result<std::collections::HashSet<String>, String> {
+    let mut c = sync::git(root);
+    c.args(["check-ignore", "--no-index", "-z", "--stdin"]);
+    let mut stdin = Vec::new();
+    for p in paths {
+        stdin.extend_from_slice(p.as_bytes());
+        stdin.push(0);
+    }
+    let r = super::run_capped(c, Some(&stdin), Duration::from_secs(60), 64 << 20);
+    // 0 = some ignored, 1 = none; anything else is an error.
+    if !matches!(r.code, Some(0) | Some(1)) {
+        return Err(format!("git check-ignore failed: {}", r.err_text()));
+    }
+    Ok(r.stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
 /// One root's write-back: the root, the entries to write and the paths to delete.
 pub(crate) type RootPlan<'a> = (&'a PlanRoot, Vec<Entry>, Vec<String>);
 
@@ -1475,6 +1561,25 @@ pub(crate) fn preflight(plans: &[RootPlan<'_>]) -> Result<(), String> {
         .map_err(refused)?;
         sync::links_stay_inside_final(Some(&want.host), writes, deletes, &want.skip)
             .map_err(refused)?;
+        // A file or link replacing a host directory: everything under it must be a planned
+        // deletion, or the apply would refuse halfway, after deleting (review r5).
+        let gone: std::collections::HashSet<&str> = deletes.iter().map(String::as_str).collect();
+        for e in writes {
+            let at = want.host.join(&e.path);
+            if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_dir()) {
+                if let Some(kept) = sync::host_plain_listing(&at, &[])
+                    .into_iter()
+                    .map(|rel| format!("{}/{rel}", e.path))
+                    .find(|p| !gone.contains(p.as_str()))
+                {
+                    return Err(refused(format!(
+                        "`{}` replaces a directory that keeps `{kept}` (ignored or never seen \
+                         by the seat)",
+                        e.path
+                    )));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1605,18 +1710,19 @@ fn fetch_commits(
         }
     }
     let _rm = Rm(file.clone());
+    // Bounded in time and output (review r5): the history is the seat's, and a small bundle can
+    // make `git log` print without end.
     let git = |args: &[&str]| -> Result<String, String> {
-        let o = sync::git(&seat.tree)
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if o.status.success() {
-            Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
+        let mut c = sync::git(&seat.tree);
+        c.args(args);
+        let r = super::run_capped(c, None, Duration::from_secs(300), 64 << 20);
+        if r.ok() {
+            Ok(String::from_utf8_lossy(&r.stdout).trim().to_string())
         } else {
             Err(format!(
                 "git {}: {}",
                 args.iter().find(|a| !a.starts_with('-')).unwrap_or(&""),
-                String::from_utf8_lossy(&o.stderr).trim()
+                r.err_text()
             ))
         }
     };

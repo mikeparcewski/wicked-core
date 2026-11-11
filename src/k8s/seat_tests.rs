@@ -1608,3 +1608,115 @@ fn k8s_an_offline_seat_is_never_selected_by_the_gateway_policies() {
         "online"
     );
 }
+
+// ── review r5 folds ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_a_writer_write_holds_a_kernel_lock_from_before_its_body_to_after_its_rename() {
+    let s = gw::write_script(gw::Volume::Config, "config.json", &"a".repeat(64)).unwrap();
+    let lock = s.find("flock -w").expect("the kernel lock");
+    let take = s.find("cat > ").unwrap();
+    let rename = s.find("mv -f \"$t\"").unwrap();
+    assert!(s.find("exec 9>/cfg/.config.json.lock").unwrap() < lock);
+    assert!(
+        lock < take && take < rename,
+        "locked before the body, renamed under it"
+    );
+}
+
+#[test]
+fn k8s_the_deny_check_proves_the_seats_own_node_closed_on_every_gateway_port() {
+    let s = seat::deny_script(true, Some("192.168.5.15"));
+    for p in render::seat_gateway_ports() {
+        assert!(s.contains(&format!("nc_ 192.168.5.15 {p} node{p}")), "{s}");
+    }
+    let mut out = String::from("api=closed\nnet=closed\ngw=open\n");
+    for p in render::seat_gateway_ports() {
+        out.push_str(&format!("node{p}=closed\n"));
+    }
+    assert!(seat::deny_holds(&out, true, true));
+    let open = out.replacen("=closed\n", "=open\n", 3);
+    assert!(!seat::deny_holds(&open, true, true), "a node port answered");
+    assert!(seat::deny_holds(
+        "api=closed net=closed gw=open",
+        true,
+        false
+    ));
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_force_added_ignored_file_is_never_read_as_deleted() {
+    let host = tmp("forced");
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(&host)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !git(&["init", "-q"]) {
+        eprintln!("skipping: git init failed");
+        return;
+    }
+    std::fs::write(host.join(".gitignore"), "out/\n").unwrap();
+    std::fs::create_dir_all(host.join("out")).unwrap();
+    std::fs::write(host.join("out/important"), "keep").unwrap();
+    std::fs::write(host.join("src.rs"), "s").unwrap();
+    assert!(git(&["add", "-f", "out/important", "src.rs", ".gitignore"]));
+    let ignored = seat::host_ignored(&host, &["out/important".into(), "src.rs".into()]).unwrap();
+    assert!(ignored.contains("out/important"));
+    assert!(!ignored.contains("src.rs"), "a plain deletion still counts");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_file_replacing_a_directory_with_unseen_contents_is_refused_before_any_change() {
+    let host = tmp("dir-replace");
+    std::fs::create_dir_all(host.join("dir")).unwrap();
+    std::fs::write(host.join("dir/tracked"), "t").unwrap();
+    std::fs::write(host.join("dir/ignored"), "i").unwrap();
+    let r = PlanRoot {
+        host: host.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let plans: Vec<seat::RootPlan<'_>> = vec![(
+        &r,
+        vec![entry(Kind::File, "dir", b"now a file")],
+        vec!["dir/tracked".into()],
+    )];
+    assert!(seat::apply_roots(&plans).is_err());
+    assert!(
+        host.join("dir/tracked").exists(),
+        "deleted before the refusal"
+    );
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn k8s_a_name_the_stream_cannot_carry_refuses_the_copy_in() {
+    use std::os::unix::ffi::OsStrExt;
+    let host = tmp("non-utf8");
+    let ok = std::process::Command::new("git")
+        .hardened()
+        .args(["init", "-q"])
+        .current_dir(&host)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !ok {
+        return;
+    }
+    let name = std::ffi::OsStr::from_bytes(b"bad\xff");
+    if std::fs::write(host.join(name), "x").is_err() {
+        return;
+    }
+    assert!(sync::host_tree_listing(&host).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
