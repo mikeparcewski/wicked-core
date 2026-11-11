@@ -2585,3 +2585,182 @@ fn a_judge_only_rerun_reuses_the_process_rows_of_the_reviewed_attempt() {
         "{fresh:?}"
     );
 }
+
+// ── core#1414: a shipped pack's rules enter a run's rule set only where the pack fits ──────────
+
+/// A judge that keeps every rule it is asked about and records each prompt.
+struct KeepAll {
+    asked: Mutex<Vec<String>>,
+}
+
+impl StepRunner for KeepAll {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        let prompt = input.unit.description.clone();
+        self.asked.lock().unwrap().push(prompt.clone());
+        let nonce = crate::rule_check::tests::nonce_of(&prompt);
+        let mut ids: Vec<String> = (1001..=1007).map(|n| format!("MCPS-{n}")).collect();
+        ids.extend((1001..=1004).map(|n| format!("RVWL-{n}")));
+        ids.extend(["POL-2101".to_string(), "learn-small-prs".to_string()]);
+        let lines: Vec<String> = ids
+            .iter()
+            .filter(|id| prompt.contains(&format!("RULE {id} (")))
+            .map(|id| format!("RULE {id}: KEPT — \"src/tracker.ts\""))
+            .collect();
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: 0,
+            attempt: 0,
+            output: format!(
+                "BEGIN VERDICTS {nonce}\n{}\nEND VERDICTS {nonce}\n",
+                lines.join("\n")
+            ),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+/// A crew-shaped repository (a package.json whose dependencies name no MCP server SDK, though its
+/// keywords say "mcp"), a store holding the seeded packs, and, when `preset` is given, the run's
+/// session recording the preset its launch named.
+fn pack_scope_fixture(
+    tag: &str,
+    deps: &str,
+    preset: Option<Option<&str>>,
+    change: &str,
+) -> (std::path::PathBuf, String, String) {
+    let (repo, _, db) = seeded_change(&format!("scope-{tag}"));
+    std::fs::write(
+        repo.join("package.json"),
+        format!(
+            "{{\"name\":\"crew\",\"keywords\":[\"mcp\",\"agents\"],\"dependencies\":{{{deps}}}}}\n"
+        ),
+    )
+    .unwrap();
+    let _ = std::fs::remove_file(repo.join("src/app.ts"));
+    git(&repo, &["add", "-A"]);
+    git(&repo, &["commit", "-qm", "manifest"]);
+    let base = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("src/tracker.ts"), change).unwrap();
+    if let Some(preset) = preset {
+        use wicked_apps_core::ToNode;
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut s = crate::actor::sessions_detail_fold_tests::session("s");
+        s.team_plan = preset.map(|p| crate::plan_gate::TeamPlanState {
+            preset: Some(p.to_string()),
+            ..Default::default()
+        });
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+    }
+    (repo, base, db)
+}
+
+fn scope_check(
+    repo: &std::path::Path,
+    base: &str,
+    db: &str,
+) -> (crate::rule_check::RuleCheckReport, Vec<String>, Vec<String>) {
+    let input = q2_input(repo, base, db, None);
+    let judge = KeepAll {
+        asked: Mutex::new(Vec::new()),
+    };
+    let pool = vec![seat("claude"), seat("codex")];
+    let notes = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let seen = std::sync::Arc::clone(&notes);
+    let sink = move |n: &str| seen.lock().unwrap().push(n.to_string());
+    let report = run_rule_check(
+        &input,
+        &["claude".to_string()],
+        Some(&[]),
+        &pool,
+        &pool,
+        None,
+        &judge,
+        &sink,
+    )
+    .expect("a report");
+    let asked = judge.asked.into_inner().unwrap();
+    let notes = notes.lock().unwrap().clone();
+    (report, asked, notes)
+}
+
+fn mcps_rows(r: &crate::rule_check::RuleCheckReport) -> Vec<&str> {
+    r.rows
+        .iter()
+        .map(|x| x.rule_id.as_str())
+        .filter(|id| id.starts_with("MCPS-"))
+        .collect()
+}
+
+/// The core#1414 case: a crew change (a tracker option, no MCP server) on a `feature` run. The
+/// mcp-server pack does not fit, so MCPS-1001..1007 are not in the run's rule set at all: no row,
+/// no judge is asked about them, and the engine says so. Every other rule is still checked.
+#[test]
+fn core1414_the_mcp_server_pack_is_not_in_a_non_mcp_runs_rule_set() {
+    let (repo, base, db) = pack_scope_fixture(
+        "crew",
+        "\"fastify\":\"^4.28.0\"",
+        Some(Some("feature")),
+        "export const tracker = \"github\";\n",
+    );
+    let (r, asked, notes) = scope_check(&repo, &base, &db);
+    assert!(mcps_rows(&r).is_empty(), "no MCPS row: {r:?}");
+    assert!(
+        asked.iter().all(|p| !p.contains("RULE MCPS-")),
+        "no judge is asked about an MCPS rule"
+    );
+    assert!(
+        r.rows.iter().any(|x| x.rule_id == "learn-small-prs"),
+        "{r:?}"
+    );
+    assert!(r.rows.iter().any(|x| x.rule_id == "POL-2101"), "{r:?}");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("7 pack rule(s) out of scope") && n.contains("MCPS-1007")),
+        "{notes:?}"
+    );
+    // A run whose record shows no preset at all: the same.
+    let (repo, base, db) = pack_scope_fixture(
+        "nopreset",
+        "\"fastify\":\"^4.28.0\"",
+        Some(None),
+        "export const tracker = \"github\";\n",
+    );
+    assert!(mcps_rows(&scope_check(&repo, &base, &db).0).is_empty());
+}
+
+/// Each fact that fits the pack keeps it in the rule set, judged as before: the `mcp-server`
+/// preset, a manifest above the change that depends on an MCP server SDK, an added line that
+/// imports one. And an unknown fact (the run's session cannot be found) removes nothing.
+#[test]
+fn core1414_the_mcp_server_pack_stays_where_it_fits_or_the_fit_is_unknown() {
+    let plain = "export const tracker = \"github\";\n";
+    for (tag, deps, preset, change) in [
+        ("preset", "\"fastify\":\"^4\"", Some(Some("mcp-server")), plain),
+        (
+            "manifest",
+            "\"@modelcontextprotocol/sdk\":\"^1.20.0\"",
+            Some(Some("feature")),
+            plain,
+        ),
+        (
+            "import",
+            "",
+            Some(Some("feature")),
+            "import { FastMCP } from \"fastmcp\";\nexport const s = new FastMCP({ name: \"t\" });\n",
+        ),
+        ("unknown", "\"fastify\":\"^4\"", None, plain),
+    ] {
+        let (repo, base, db) = pack_scope_fixture(tag, deps, preset, change);
+        let (r, asked, _) = scope_check(&repo, &base, &db);
+        assert_eq!(mcps_rows(&r).len(), 7, "{tag}: every MCPS rule is checked: {r:?}");
+        assert!(
+            asked.iter().any(|p| p.contains("RULE MCPS-1007 (")),
+            "{tag}: MCPS-1007 is judged"
+        );
+    }
+}

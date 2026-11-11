@@ -2188,6 +2188,35 @@ fn run_rule_check_with(
             ))
         }
     };
+    // (core#1414) A shipped pack whose scope does not fit the run, by fact, puts none of its rules
+    // in the run's rule set (never judged, never skipped). Unknown removes nothing.
+    let rules = {
+        let fit = crate::steering_packs::RunFit {
+            preset: launch_preset(&gov.db_path, &input.run_id),
+            builds_mcp_server: crate::steering_packs::builds_mcp_server(
+                wd,
+                &change.paths,
+                &change.diff,
+            ),
+        };
+        let (kept, out): (Vec<_>, Vec<_>) = rules
+            .into_iter()
+            .partition(|r| crate::steering_packs::out_of_scope(r, &fit).is_none());
+        if let Some(why) = out
+            .first()
+            .and_then(|r| crate::steering_packs::out_of_scope(r, &fit))
+        {
+            engine_note(
+                emit_delta,
+                &format!(
+                    "rule check: {} pack rule(s) out of scope, not in this run's rule set ({}): {why}",
+                    out.len(),
+                    out.iter().map(|r| r.id.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+            );
+        }
+        kept
+    };
     if rules.is_empty() {
         return None;
     }
@@ -2746,6 +2775,14 @@ pub(crate) fn no_agent_creator_of(
 ) -> bool {
     run_units_strict(db_path, run_id)
         .is_some_and(|units| no_agent_code_in(&units, unit) && no_agent_author_in(&units, unit))
+}
+
+/// (core#1414) The preset the run's launch named, read from the run's store READ-ONLY:
+/// `Some(None)` = the run's record shows it named none; `None` = the record could not be read.
+fn launch_preset(db_path: &str, run_id: &str) -> Option<Option<String>> {
+    let store = wicked_apps_core::open_store_ro(Some(db_path)).ok()?;
+    let session = crate::domain::get_session(&store, run_id).ok()??;
+    Some(session.team_plan.and_then(|t| t.preset))
 }
 
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the
