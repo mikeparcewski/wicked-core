@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A governance pack's rules apply only where the pack's scope fits the run (wicked-core#1414).** The mcp-server
+  pack's MCPS-1001..1007 were judged on every run with a build or review step, so a crew change that builds no MCP
+  server was ruled broken on MCPS-1007 (an SPDX header on every file) and the operator had to skip it. Each shipped
+  pack now has a scope in the engine's pack table. The mcp-server pack fits a run launched from the `mcp-server`
+  preset, or a change in a codebase that builds an MCP server: a manifest at the worktree root or above a changed
+  file depends on an MCP server SDK, or an added line imports one. When the pack does not fit, by fact, its rules are
+  left out of the run's rule set before the check, so they are never judged or skipped, and the rule check's note
+  names them. An unknown fact removes nothing (the run's session or a manifest cannot be read), and an
+  operator-edited pack rule is still judged. `review-loop` and `stack-builtins` fit every run.
+
 - **POL-2101 no longer breaks on a missing record line when the check was made (wicked-core#1381).** The
   stack-builtins rule was disputed or broken on nearly every governed run because the builder's output had no
   stack-check sentence, even when the rule judge found no duplicated built-in. Three changes. A code-writing agent

@@ -25,10 +25,197 @@
 
 use wicked_apps_core::ToNode;
 
-/// One shipped pack: its directory name under `governance/packs/` and its docs, root-relative.
+/// One shipped pack: its directory name under `governance/packs/`, its docs, root-relative, and
+/// the runs its rules are in force on (core#1414).
 struct ShippedPack {
     name: &'static str,
     docs: &'static [(&'static str, &'static [u8])],
+    fits: PackFit,
+}
+
+/// (core#1414) Which runs a shipped pack's rules are in force on. A rule of a pack that does not fit
+/// the run, by fact, never enters the run's rule set: it is not judged and not skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PackFit {
+    /// Every run (`review-loop`, `stack-builtins`).
+    Any,
+    /// Runs that build an MCP server (`mcp-server`: "defaults for MCP servers the `mcp-server`
+    /// workflow builds"): a run launched from the `mcp-server` preset, or a change in a codebase
+    /// that builds one ([`builds_mcp_server`]).
+    McpServer,
+}
+
+/// The preset the `mcp-server` workflow launches as.
+pub(crate) const MCP_SERVER_PRESET: &str = "mcp-server";
+
+/// (core#1414) What is known about the run a pack's fit is decided on. `None` = not known (it
+/// removes nothing).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct RunFit {
+    /// The preset the launch named: `Some(None)` = the run's record shows it named none.
+    pub preset: Option<Option<String>>,
+    /// Whether the change is in a codebase that builds an MCP server ([`builds_mcp_server`]).
+    pub builds_mcp_server: Option<bool>,
+}
+
+/// (core#1414) Why `rule` is out of the run's rule set: it is a shipped pack rule AS SHIPPED whose
+/// pack does not fit the run, by fact. `None` = it stays (it fits, or a fact is unknown, or it is
+/// not a shipped rule as shipped: an operator-edited or broadened pack rule is judged from its
+/// stored meaning, wherever it is).
+pub(crate) fn out_of_scope(
+    rule: &wicked_governance::ConformanceRule,
+    run: &RunFit,
+) -> Option<&'static str> {
+    match pack_overlay(rule)?.fits {
+        PackFit::Any => None,
+        PackFit::McpServer => {
+            let other_preset = matches!(
+                &run.preset,
+                Some(p) if p.as_deref() != Some(MCP_SERVER_PRESET)
+            );
+            (other_preset && run.builds_mcp_server == Some(false)).then_some(
+                "the mcp-server pack: this run is not the mcp-server workflow and its change is not \
+                 in a codebase that builds an MCP server (no manifest above a changed file declares \
+                 an MCP server SDK, and the change imports none)",
+            )
+        }
+    }
+}
+
+/// The manifests whose dependencies say a codebase builds an MCP server.
+const MANIFESTS: &[&str] = &[
+    "package.json",
+    "pyproject.toml",
+    "requirements.txt",
+    "Cargo.toml",
+    "go.mod",
+];
+
+/// The most bytes of one manifest read.
+const MANIFEST_CAP: u64 = 1024 * 1024;
+/// The most directories looked at for manifests.
+const MAX_MANIFEST_DIRS: usize = 256;
+
+/// Whether a manifest's text declares an MCP server SDK as a dependency.
+fn manifest_declares_mcp(name: &str, text: &str) -> bool {
+    match name {
+        "package.json" => {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+                // Unparseable: read it as text (a dependency key is a quoted name).
+                return text.contains("\"@modelcontextprotocol/")
+                    || text.contains("\"fastmcp\"")
+                    || text.contains("\"mcp-framework\"");
+            };
+            [
+                "dependencies",
+                "devDependencies",
+                "peerDependencies",
+                "optionalDependencies",
+            ]
+            .iter()
+            .filter_map(|k| v.get(*k).and_then(|d| d.as_object()))
+            .flat_map(|d| d.keys())
+            .any(|k| {
+                k.starts_with("@modelcontextprotocol/") || k == "fastmcp" || k == "mcp-framework"
+            })
+        }
+        "pyproject.toml" | "requirements.txt" => {
+            // A requirement named `mcp` or `fastmcp` (with extras or a version spec), quoted in
+            // pyproject or at the start of a requirements line.
+            static PY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            PY.get_or_init(|| {
+                regex::Regex::new(
+                    r#"(?mi)(^|["'])\s*(fastmcp|mcp)\s*(\[[^\]]*\])?\s*([<>=!~;,"']|$)"#,
+                )
+                .expect("a valid pattern")
+            })
+            .is_match(text)
+        }
+        "Cargo.toml" => {
+            static RS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+            RS.get_or_init(|| {
+                regex::Regex::new(r"(?m)^\s*(rmcp|rust-mcp-sdk)\s*(=|\.)").expect("a valid pattern")
+            })
+            .is_match(text)
+        }
+        "go.mod" => {
+            text.contains("github.com/mark3labs/mcp-go")
+                || text.contains("github.com/modelcontextprotocol/go-sdk")
+        }
+        _ => false,
+    }
+}
+
+/// Whether an added line of the change imports an MCP server SDK.
+fn diff_imports_mcp(diff: &str) -> bool {
+    static IMPORT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = IMPORT.get_or_init(|| {
+        regex::Regex::new(
+            r#"(@modelcontextprotocol/sdk|["']fastmcp["']|\b(from|import)\s+fastmcp\b|\bfrom\s+mcp(\.server)?(\.fastmcp)?\s+import\b|\bimport\s+mcp(\.server)?\b|\brmcp::|github\.com/mark3labs/mcp-go|github\.com/modelcontextprotocol/go-sdk)"#,
+        )
+        .expect("a valid pattern")
+    });
+    diff.lines()
+        .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+        .any(|l| re.is_match(l))
+}
+
+/// (core#1414) Whether the change at `wd` is in a codebase that builds an MCP server: a manifest at
+/// the worktree root or in any directory above a changed file declares an MCP server SDK, or an
+/// added line imports one. `None` when a manifest exists and cannot be read (unknown removes
+/// nothing). Only paths inside the worktree are looked at.
+pub(crate) fn builds_mcp_server(
+    wd: &std::path::Path,
+    paths: &[String],
+    diff: &str,
+) -> Option<bool> {
+    if diff_imports_mcp(diff) {
+        return Some(true);
+    }
+    let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
+        std::collections::BTreeSet::new();
+    dirs.insert(std::path::PathBuf::new());
+    for p in paths {
+        let rel = std::path::Path::new(p);
+        // A path that climbs out of the worktree (or is absolute) names no directory of it.
+        if rel.is_absolute()
+            || rel
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+        {
+            continue;
+        }
+        let mut d = rel.parent();
+        while let Some(dir) = d {
+            dirs.insert(dir.to_path_buf());
+            d = dir.parent();
+        }
+    }
+    if dirs.len() > MAX_MANIFEST_DIRS {
+        return None;
+    }
+    let mut unknown = false;
+    for dir in &dirs {
+        for name in MANIFESTS {
+            let file = wd.join(dir).join(name);
+            let Ok(meta) = std::fs::symlink_metadata(&file) else {
+                continue;
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            use std::io::Read;
+            let mut text = String::new();
+            let read = std::fs::File::open(&file)
+                .and_then(|f| f.take(MANIFEST_CAP).read_to_string(&mut text));
+            match read {
+                Ok(_) if manifest_declares_mcp(name, &text) => return Some(true),
+                Ok(_) => {}
+                Err(_) => unknown = true,
+            }
+        }
+    }
+    (!unknown).then_some(false)
 }
 
 macro_rules! pack_doc {
@@ -47,6 +234,7 @@ macro_rules! pack_doc {
 const SHIPPED_PACKS: &[ShippedPack] = &[
     ShippedPack {
         name: "mcp-server",
+        fits: PackFit::McpServer,
         docs: &[
             pack_doc!("mcp-server", "mcp-server-authentication.md"),
             pack_doc!("mcp-server", "mcp-server-contract-tests.md"),
@@ -59,6 +247,7 @@ const SHIPPED_PACKS: &[ShippedPack] = &[
     },
     ShippedPack {
         name: "review-loop",
+        fits: PackFit::Any,
         docs: &[
             pack_doc!("review-loop", "review-loop-bounded-rework.md"),
             pack_doc!("review-loop", "review-loop-foreground-evidence.md"),
@@ -68,6 +257,7 @@ const SHIPPED_PACKS: &[ShippedPack] = &[
     },
     ShippedPack {
         name: "stack-builtins",
+        fits: PackFit::Any,
         docs: &[pack_doc!("stack-builtins", "stack-builtins.md")],
     },
 ];
@@ -132,6 +322,8 @@ pub(crate) struct PackOverlay {
     pub scope: String,
     /// The shipped rule's content key with no overlay ([`crate::rule_check::canonical_key`]).
     canonical: String,
+    /// (core#1414) The runs its pack's rules are in force on.
+    pub fits: PackFit,
 }
 
 /// The kind of each shipped rule id the table knows. A shipped rule missing here gets no overlay
@@ -183,12 +375,13 @@ fn table() -> &'static std::collections::BTreeMap<String, PackOverlay> {
                 .next()
                 .unwrap_or_default()
                 .to_string();
-            let Some(scope) = SHIPPED_PACKS
-                .iter()
-                .flat_map(|p| p.docs.iter())
-                .find(|(f, _)| *f == file)
-                .and_then(|(_, bytes)| doc_title(bytes))
-            else {
+            let Some((fits, scope)) = SHIPPED_PACKS.iter().find_map(|p| {
+                p.docs
+                    .iter()
+                    .find(|(f, _)| *f == file)
+                    .and_then(|(_, bytes)| doc_title(bytes))
+                    .map(|t| (p.fits, t))
+            }) else {
                 continue;
             };
             out.insert(
@@ -197,6 +390,7 @@ fn table() -> &'static std::collections::BTreeMap<String, PackOverlay> {
                     kind,
                     scope,
                     canonical: crate::rule_check::canonical_key(&rule),
+                    fits,
                 },
             );
         }
@@ -374,5 +568,159 @@ mod tests {
                 .retired,
             "a retired rule stays retired across a re-seed"
         );
+    }
+
+    /// (core#1414) Only a shipped mcp-server rule AS SHIPPED leaves the rule set, and only when
+    /// both facts are known and neither fits: another preset (or none) and no MCP server built.
+    #[test]
+    fn only_a_shipped_mcp_rule_leaves_and_only_on_known_facts() {
+        let rules = shipped_rules().unwrap();
+        let mcps = rules.iter().find(|r| r.id == "MCPS-1007").unwrap();
+        let pol = rules.iter().find(|r| r.id == "POL-2101").unwrap();
+        let rvwl = rules.iter().find(|r| r.id == "RVWL-1001").unwrap();
+        let fit = |preset: Option<Option<&str>>, builds: Option<bool>| RunFit {
+            preset: preset.map(|p| p.map(str::to_string)),
+            builds_mcp_server: builds,
+        };
+        let out = fit(Some(Some("feature")), Some(false));
+        assert!(out_of_scope(mcps, &out).is_some());
+        assert!(out_of_scope(mcps, &fit(Some(None), Some(false))).is_some());
+        assert!(
+            out_of_scope(pol, &out).is_none(),
+            "stack-builtins fits every run"
+        );
+        assert!(
+            out_of_scope(rvwl, &out).is_none(),
+            "review-loop fits every run"
+        );
+        for stays in [
+            fit(Some(Some(MCP_SERVER_PRESET)), Some(false)),
+            fit(Some(Some("feature")), Some(true)),
+            fit(None, Some(false)),
+            fit(Some(Some("feature")), None),
+        ] {
+            assert!(out_of_scope(mcps, &stays).is_none(), "{stays:?}");
+        }
+        // An operator-edited (or broadened) MCPS rule is judged from its stored meaning: never
+        // removed by the shipped pack's scope.
+        let mut edited = mcps.clone();
+        edited
+            .statement
+            .push_str(" Every service in this org, MCP or not.");
+        assert!(out_of_scope(&edited, &out).is_none());
+    }
+
+    fn scope_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pack-scope-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// (core#1414) What says a codebase builds an MCP server: a manifest above a changed file that
+    /// depends on an MCP server SDK (per ecosystem), or an added line importing one. A keyword, a
+    /// description or a similarly named package says nothing.
+    #[test]
+    fn a_codebase_builds_an_mcp_server_by_its_manifests_or_its_imports() {
+        let d = scope_dir("manifests");
+        std::fs::create_dir_all(d.join("packages/crew/src")).unwrap();
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"name":"root","keywords":["mcp"],"description":"MCP-server jobs","devDependencies":{"typescript":"5"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("packages/crew/package.json"),
+            r#"{"name":"crew","dependencies":{"fastify":"4","mcp-proxy-lite":"1"}}"#,
+        )
+        .unwrap();
+        let paths = vec!["packages/crew/src/tracker.ts".to_string()];
+        assert_eq!(
+            builds_mcp_server(&d, &paths, "+const x = 1;\n"),
+            Some(false)
+        );
+        // The nearest package depends on the SDK.
+        std::fs::write(
+            d.join("packages/crew/package.json"),
+            r#"{"name":"crew","dependencies":{"@modelcontextprotocol/sdk":"1.20.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(builds_mcp_server(&d, &paths, ""), Some(true));
+        // A manifest beside an unrelated path is not read for this change.
+        let other = vec!["docs/readme.md".to_string()];
+        assert_eq!(builds_mcp_server(&d, &other, ""), Some(false));
+
+        for (name, text, want) in [
+            (
+                "pyproject.toml",
+                "[project]\ndependencies = [\"mcp[cli]>=1.2\", \"httpx\"]\n",
+                true,
+            ),
+            (
+                "pyproject.toml",
+                "[project]\nname = \"mcp-tools-docs\"\ndependencies = [\"httpx\"]\n",
+                false,
+            ),
+            ("requirements.txt", "httpx==0.27\nfastmcp>=2.0\n", true),
+            ("requirements.txt", "mcpx==1.0\n", false),
+            (
+                "Cargo.toml",
+                "[dependencies]\nrmcp = { version = \"0.8\" }\n",
+                true,
+            ),
+            ("Cargo.toml", "[dependencies]\nserde = \"1\"\n", false),
+            (
+                "go.mod",
+                "module x\nrequire github.com/mark3labs/mcp-go v0.30.0\n",
+                true,
+            ),
+        ] {
+            let d = scope_dir("eco");
+            std::fs::write(d.join(name), text).unwrap();
+            assert_eq!(
+                builds_mcp_server(&d, &["src/a.rs".to_string()], ""),
+                Some(want),
+                "{name}: {text}"
+            );
+        }
+        let d = scope_dir("imports");
+        for (line, want) in [
+            ("+import { FastMCP } from \"fastmcp\";", true),
+            (
+                "+import { McpServer } from \"@modelcontextprotocol/sdk/server/mcp.js\";",
+                true,
+            ),
+            ("+from mcp.server.fastmcp import FastMCP", true),
+            ("+from fastmcp import FastMCP", true),
+            ("+use rmcp::ServerHandler;", true),
+            ("-import { FastMCP } from \"fastmcp\";", false),
+            ("+// the mcp-server pack's rules", false),
+            ("+const mcpServerUrl = cfg.mcp;", false),
+        ] {
+            let diff = format!("+++ b/src/a.ts\n{line}\n");
+            assert_eq!(builds_mcp_server(&d, &[], &diff), Some(want), "{line}");
+        }
+        // A path that climbs out of the worktree names none of its directories.
+        let up = vec!["../outside/src/a.ts".to_string()];
+        assert_eq!(builds_mcp_server(&d, &up, ""), Some(false));
+    }
+
+    /// (core#1414) A manifest that exists and cannot be read leaves the fit unknown: nothing is
+    /// removed on it.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_manifest_leaves_the_fit_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scope_dir("unreadable");
+        let f = d.join("package.json");
+        std::fs::write(&f, r#"{"dependencies":{"fastmcp":"3"}}"#).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root can read anything; the case only exists for an ordinary user.
+        let readable = std::fs::read(&f).is_ok();
+        let got = builds_mcp_server(&d, &["src/a.ts".to_string()], "");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if !readable {
+            assert_eq!(got, None);
+        }
     }
 }

@@ -49,6 +49,17 @@ Every recalled rule cites its id (`PAT-`/`POL-`, INV-C1) and its provenance ref
 | [`review-loop/`](review-loop/review-loop-stateful-verdicts.md) | `testing` · `development` · `operations` | How governed review loops converge (RVWL-1001..1004: stateful verdicts with prior verdicts and human rulings, foreground pasted evidence, rework bounded at two send-backs then a human adjudication, one slice per intent) | none (`guidance`; the planned gate for RVWL-1003 is `engine:review-adjudication`) |
 | [`stack-builtins/`](stack-builtins/stack-builtins.md) | `development` | Use what the chosen stack already provides (POL-2101: the user and policies choose the framework; check its built-ins at the pinned version before writing code, record the check, justify any duplicate; reviewers flag every duplicate). Groups under `engineering-doctrine`; the AW-13 seed run stages this doc beside the corpus | none (`guidance`; build and review phases recall it) |
 
+**A pack's scope decides which runs its rules are in force on** (core#1414). The engine's
+shipped-pack table (`src/steering_packs.rs`) gives each boot-seeded pack one. `review-loop` and
+`stack-builtins` fit every run. `mcp-server` fits a run launched from the `mcp-server` preset, or a
+change in a codebase that builds an MCP server: a manifest at the worktree root or in a directory
+above a changed file depends on an MCP server SDK (`@modelcontextprotocol/*`, `fastmcp`,
+`mcp-framework`, Python `mcp`/`fastmcp`, Rust `rmcp`, Go `mcp-go` or the go-sdk), or an added
+line imports one. When a pack does not fit, its rules are not in the run's rule set at all: never
+judged, never skipped, and the rule check's note names them. A fact the engine cannot read (the
+run's session, an unreadable manifest) removes nothing, and a pack rule the operator edited is
+judged from its stored meaning wherever it is.
+
 `mcp-server`, `review-loop` and `stack-builtins` are **boot-seeded**: the daemon embeds their docs
 (`src/steering_packs.rs`) and writes their rules into the store at start, insert-only, so
 `rules.recall` finds them without a `rules ingest` and a retired rule stays retired. A newer doc
