@@ -7,7 +7,7 @@
 # trusted launcher (containers/floor.Dockerfile, mounted read-only at /floor) is the entrypoint.
 # At run time the user is the operator's uid (`--user`), the root filesystem is read-only and HOME
 # is a tmpfs. WICKED_SEAT_BASE_IMAGE swaps the base for a project toolchain image (Debian-based).
-ARG BASE=node:22-trixie-slim
+ARG BASE=node:24.22.2-trixie-slim
 FROM ${BASE}
 ARG CLI
 ARG CLI_PACKAGE=

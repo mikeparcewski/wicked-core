@@ -80,7 +80,7 @@ pub(crate) const MEMORY_ENV: &str = "WICKED_SEAT_MEMORY";
 /// The label on every seat container (and the seat network), for the reap and the sweep.
 pub(crate) const SEAT_LABEL: &str = "wicked.seat";
 
-const DEFAULT_BASE: &str = "node:22-trixie-slim";
+const DEFAULT_BASE: &str = "node:24.22.2-trixie-slim";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const REAP_TIMEOUT: Duration = Duration::from_secs(20);
@@ -4606,6 +4606,69 @@ mod tests {
 
     /// One failed (or slow) attempt is not the outcome: the second attempt answers, after one
     /// short pause. A single-attempt probe read this runtime down (e2e-1105 09:02Z).
+    /// The floor's and every seat's Node: one pinned release (both Dockerfiles' `BASE` and the
+    /// seat builder's default), recent enough for what the product repos run on it — crew's SQLite
+    /// uploads need Node 24.12 or 25.1 or later (`packages/crew/src/sources/uploads.ts`,
+    /// `sqliteAvailable`), and every product repo's `engines.node` (as of 2026-11-11; a repo that
+    /// raises its floor raises it here too).
+    #[test]
+    fn the_floor_and_seat_node_satisfies_every_product_repos_engines() {
+        fn version_of(base: &str) -> (u32, u32, u32) {
+            let tag = base.strip_prefix("node:").expect("a node image");
+            let v = tag.split('-').next().unwrap();
+            let p: Vec<u32> = v
+                .split('.')
+                .map(|x| x.parse().expect("a pinned release"))
+                .collect();
+            assert_eq!(
+                p.len(),
+                3,
+                "pinned to a full release, not a floating tag: {base}"
+            );
+            (p[0], p[1], p[2])
+        }
+        let arg = |df: &str| -> String {
+            df.lines()
+                .find_map(|l| l.strip_prefix("ARG BASE="))
+                .expect("ARG BASE")
+                .trim()
+                .to_string()
+        };
+        let bases = [
+            arg(crate::checks_container::DOCKERFILE),
+            arg(SEAT_DOCKERFILE),
+            DEFAULT_BASE.to_string(),
+        ];
+        assert!(
+            bases.iter().all(|b| b == &bases[0]),
+            "one Node for floor and seats: {bases:?}"
+        );
+        let v = version_of(&bases[0]);
+        let (major, minor, _) = v;
+        assert!(
+            major > 25 || (major == 25 && minor >= 1) || (major == 24 && minor >= 12),
+            "crew's uploads need Node 24.12, 25.1 or later: {v:?}"
+        );
+        for (repo, engines) in [
+            ("wicked-crew", ">=22.12.0"),
+            ("wicked-crew/packages/crew", ">=22.0.0"),
+            ("wicked-studio", ">=22.0.0"),
+            ("wicked-interactive", ">=20.0.0"),
+            ("wicked-garden", ">=20.0.0"),
+            ("wicked-installer", ">=20.0.0"),
+            ("wicked-bus", ">=20.0.0"),
+            ("wicked-ledger", ">=22.0.0"),
+            ("wicked-vault", ">=20.0.0"),
+        ] {
+            let min = engines.strip_prefix(">=").expect("a lower bound");
+            let m: Vec<u32> = min.split('.').map(|x| x.parse().unwrap()).collect();
+            assert!(
+                v >= (m[0], m[1], m[2]),
+                "{repo} engines.node {engines}: {v:?}"
+            );
+        }
+    }
+
     /// core#1401: the floor image and every seat image carry Python's test toolchain (pytest,
     /// PyYAML, zstandard) and jq so a pytest suite (wicked-garden) yields floor evidence — installed from
     /// Debian's archive with the rest of the image, never from PyPI or another registry.

@@ -14,6 +14,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The checks floor and seat images run Node 24 (pinned 24.22.2), up from 22.** crew's SQLite uploads need
+  Node 24.12 or 25.1 or later, so nine crew tests always failed in the floor, on the base and the change alike.
+  The checks image, the seat image and the seat builder's default base now pin one Node release. A test asserts
+  that this release meets crew's uploads requirement and every product repo's `engines.node`. Image tags are
+  content hashes, so each image is rebuilt once on first use.
+
 - **Fixed: "Re-run with the targeted tests" no longer turns into "run no tests" (wicked-core#1392).** On a repo
   with no targeted test command, the `targeted` answer at a timed-out floor's gate used to waive the whole test set,
   and the floor then passed and the gate allowed the change with no test evidence. Now a timed-out floor's report
