@@ -95,7 +95,8 @@ pub struct ModelCoverage {
     pub placeholders: u64,
     /// Behavior-bearing nodes with nothing recorded yet.
     pub unmapped: u64,
-    /// Behaviour-kind nodes left out of the denominator because their file is not product code.
+    /// Behaviour-kind nodes left out of the denominator because their file is not product code, or
+    /// because estate classed the unit as test support (`metadata.behaviour`).
     pub not_product: u64,
 }
 
@@ -420,6 +421,8 @@ struct BehaviorIndex {
     /// TS interfaces with evidence of runtime content: a member outside the declaration (a class or
     /// namespace merged into the same symbol), or a member with a behaviour-out edge.
     carries_body: std::collections::HashSet<String>,
+    /// `*_e2e/` directories the graph shows are test directories ([`e2e_test_dirs`]).
+    e2e_test_dirs: std::collections::HashSet<String>,
 }
 
 impl BehaviorIndex {
@@ -465,6 +468,7 @@ impl BehaviorIndex {
             has_behavior_out,
             bodiless,
             carries_body,
+            e2e_test_dirs: e2e_test_dirs(nodes.iter().map(|n| n.location.file.as_str())),
         })
     }
 }
@@ -500,10 +504,15 @@ fn is_behavior_bearing(
 ) -> bool {
     use wicked_apps_core::NodeKind::*;
     match &node.kind {
-        // Behavior-bearing: the atomic units of logic. Namespace≈Module.
-        Namespace | Class | Struct => true,
-        // A callable counts unless it is a TS interface's method signature.
-        Function | Method | Constructor => !idx.bodiless.contains(node.symbol.as_str()),
+        // Behavior-bearing: the atomic units of logic. Namespace≈Module. A class or struct estate
+        // classed as a data shape or a stub interface is not ([`estate_not_behaviour`]).
+        Namespace => true,
+        Class | Struct => !estate_not_behaviour(node),
+        // A callable counts unless it is a TS interface's method signature, or estate classed its
+        // body as a stub or a field-only constructor.
+        Function | Method | Constructor => {
+            !idx.bodiless.contains(node.symbol.as_str()) && !estate_not_behaviour(node)
+        }
         // A TS interface counts only when the graph shows behaviour; other interfaces and traits count.
         Interface | Trait => {
             !is_ts_interface(node)
@@ -546,11 +555,37 @@ fn is_behavior_bearing(
     }
 }
 
+/// The node metadata key estate (≥0.35.2, `wicked_estate_extract::behaviour`) writes on every
+/// callable, class and struct it inspects (Python, TypeScript, TSX, JavaScript, Rust): `real`,
+/// `stub`, `data` or `test_support`, with the deciding shape in `behaviour_reason`. Read as a string
+/// so core needs no estate bump: older graphs simply lack it.
+const BEHAVIOUR_KEY: &str = "behaviour";
+
+/// The estate classification, when it is one this module acts on.
+fn estate_behaviour(node: &wicked_apps_core::Node) -> Option<&str> {
+    node.metadata.get(BEHAVIOUR_KEY).and_then(|v| v.as_str())
+}
+
+/// Estate found no behaviour in the unit's body (core#1375; reqgraph measurement on AutoGPT: ~30%
+/// of the counted units were stubs, empty or field-only classes and assign-only constructors).
+/// Only the two exact values leave the denominator: an absent, `real` or unknown value keeps the
+/// node counted, because dropping real behaviour would inflate coverage.
+fn estate_not_behaviour(node: &wicked_apps_core::Node) -> bool {
+    matches!(estate_behaviour(node), Some("stub" | "data"))
+}
+
 /// Test, spec and fixture files, by directory (any case: `Tests/` in .NET, `Specs/`) or by file
-/// name (case kept: `*Tests.cs` is a test, `Contest.py` is not). The same patterns as
-/// wicked-garden's `extract_loop.is_test_path`, which frames pages and writes their rules.
+/// name (case kept: `*Tests.cs` is a test, `Contest.py` is not). A directory is a test directory
+/// as a whole segment, as a named kind of test (`integration_tests/`, `unit-tests/`, `load_test/`)
+/// or as a test-helper segment (`test_utils/`). An arbitrary `*_tests/` is NOT (`ab_tests/` and
+/// `statistical_tests/` are product code); a `*_e2e/` segment is one only with evidence in the
+/// graph ([`BehaviorIndex::e2e_test_dirs`], core#1375). The same directory rule as estate's
+/// `behaviour::test_path_reason`; wicked-garden's `extract_loop.is_test_path` (which frames pages
+/// and writes their rules) still has the whole-segment rule only.
 static TEST_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-    regex::Regex::new(r"(?i)(^|/)(tests?|__tests__|specs?|e2e|fixtures?|testdata)/")
+    regex::Regex::new(
+        r"(?i)(^|/)(tests?|__tests__|__mocks__|specs?|e2e|fixtures?|testdata|(unit|integration|functional|system|acceptance|smoke|regression|contract|component|end[_-]to[_-]end|api|ui|perf|load|stress)[_-]tests?|tests?[_-](utils?|helpers?|support|fixtures?|common))/",
+    )
         .expect("test-dir pattern compiles")
 });
 static TEST_FILE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
@@ -591,8 +626,9 @@ const DATA_EXTS: &[&str] = &[
 /// make the share harder to reach, never easier). An EXTRACTED rule stays in whatever its file
 /// (`is_product_node`): a Salesforce Flow (`.flow-meta.xml`) or a cloud policy (`.json`) is
 /// executable behaviour, not data. Classified by file only: a test module inside a product file
-/// (Rust's `#[cfg(test)] mod tests`) still counts, in the denominator and, once a page resolves it,
-/// in the real count, so it can bias the share either way (codex r3 on #1234; post-mvp).
+/// (Rust's `#[cfg(test)] mod tests`) passes here; the share leaves it out only when estate marked
+/// the node `test_support` ([`is_product_node`], core#1235), and a `*_e2e/` directory needs the
+/// graph's evidence too.
 #[must_use]
 pub fn is_product_file(file: &str) -> bool {
     !is_test_file(file) && !is_data_file(file)
@@ -604,6 +640,61 @@ fn is_test_file(file: &str) -> bool {
     TEST_DIR.is_match(&norm) || TEST_FILE.is_match(&norm)
 }
 
+/// A directory segment ending in `_e2e`/`-e2e` (`billing_e2e`): a test directory only with evidence,
+/// because `crypto_e2e/` can hold end-to-end encryption.
+static E2E_SUFFIX_DIR: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?i)(^|/)[^/]+[_-]e2e$").expect("e2e-suffix pattern compiles")
+});
+
+/// The `*_e2e/` directories that are test directories: the files directly in one are mostly tests
+/// by name (more test files than other code files; data files and `__init__.py` do not count).
+/// AutoGPT's `executor/billing_e2e/` holds two `*_test.py` files beside `provider.py`; a product
+/// `crypto_e2e/` with a colocated `keys_test.py` beside `keys.py` stays product.
+fn e2e_test_dirs<'a>(files: impl Iterator<Item = &'a str>) -> std::collections::HashSet<String> {
+    use std::collections::{HashMap, HashSet};
+    let mut tally: HashMap<String, (u32, u32)> = HashMap::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for file in files {
+        let norm = file.replace('\\', "/");
+        if !seen.insert(norm.clone()) {
+            continue;
+        }
+        let Some((dir, name)) = norm.rsplit_once('/') else {
+            continue;
+        };
+        if !E2E_SUFFIX_DIR.is_match(dir) || is_data_file(&norm) || name == "__init__.py" {
+            continue;
+        }
+        let t = tally.entry(dir.to_string()).or_default();
+        if TEST_FILE.is_match(&norm) {
+            t.0 += 1;
+        } else {
+            t.1 += 1;
+        }
+    }
+    tally
+        .into_iter()
+        .filter(|(_, (tests, other))| tests > other)
+        .map(|(dir, _)| dir)
+        .collect()
+}
+
+/// Whether `file` sits under one of `dirs` (at any depth).
+fn under_any(file: &str, dirs: &std::collections::HashSet<String>) -> bool {
+    if dirs.is_empty() {
+        return false;
+    }
+    let norm = file.replace('\\', "/");
+    let mut cur = norm.as_str();
+    while let Some((parent, _)) = cur.rsplit_once('/') {
+        if dirs.contains(parent) {
+            return true;
+        }
+        cur = parent;
+    }
+    false
+}
+
 /// A data, manifest or document file, by extension (garden's `is_data_path`).
 fn is_data_file(file: &str) -> bool {
     let lower = file.to_ascii_lowercase();
@@ -613,8 +704,16 @@ fn is_data_file(file: &str) -> bool {
 /// Whether a behaviour-kind node is product behaviour: in a product file ([`is_product_file`]), or an
 /// extracted rule (a rules-engine extractor's `Rule` node, executable whatever its file's
 /// extension) outside test and fixture files. The one predicate the coverage recompute and the build share.
-fn is_product_node(node: &wicked_apps_core::Node) -> bool {
+fn is_product_node(node: &wicked_apps_core::Node, idx: &BehaviorIndex) -> bool {
     let file = &node.location.file;
+    if under_any(file, &idx.e2e_test_dirs) {
+        return false;
+    }
+    // Estate marks test code inside a product file (Rust `#[cfg(test)]` modules, `#[test]`
+    // functions: core#1235) and test-directory code: not product either.
+    if estate_behaviour(node) == Some("test_support") {
+        return false;
+    }
     // An extracted rule passes the data-extension test only; a rule in a test or fixture file is
     // still a test (codex r2 on #1234).
     !is_test_file(file)
@@ -778,7 +877,7 @@ fn recompute_observing(
             observe(node, UnitClass::Uncounted(Uncounted::Structural))?;
             continue;
         }
-        if !is_product_node(node) {
+        if !is_product_node(node, &idx) {
             observe(node, UnitClass::Uncounted(Uncounted::NotProduct))?;
             not_product += 1;
             continue;
@@ -1399,7 +1498,7 @@ pub fn build_domain_model_with(
         // Not product behaviour (a test, data, manifest or document file): no requirement, even
         // when an earlier page annotated it, so the graph matches the denominator (agy on #1234).
         // First, before any annotation is read or validated (codex r2 on #1234).
-        if !is_product_node(node) {
+        if !is_product_node(node, &idx) {
             continue;
         }
         let semantics = store.node_semantics(&node.symbol)?;
@@ -3094,8 +3193,29 @@ mod tests {
             "src\\Tests\\Run.cs",
             "e2e/journey.ts",
             "fixtures/repo/main.ts",
+            // core#1375: suffixed and helper test directories.
+            // Named kinds of test and test-helper directories (core#1375).
+            "pkg/integration_tests/helpers.py",
+            "web/unit-tests/setup.ts",
+            "load_test/locustfile.py",
+            "pkg/test_utils/factory.py",
+            "src/__mocks__/api.ts",
         ] {
             assert!(!is_product_file(file), "{file} is not product code");
+        }
+        // Words that only look like a test directory stay product code (codex r1: an arbitrary
+        // `*_tests/` or `*_e2e/` is not evidence; `*_e2e/` needs the graph's, see below).
+        for file in [
+            "src/e2e_encryption/keys.py",
+            "src/ab_test/assign.py",
+            "src/ab_tests/assign.py",
+            "src/statistical_tests/welch.py",
+            "src/crypto_e2e/keys.py",
+            "backend/executor/billing_e2e/provider.py",
+            "src/testing/harness.py",
+            "src/test_runner/main.py",
+        ] {
+            assert!(is_product_file(file), "{file} is product code");
         }
     }
 
@@ -4354,6 +4474,180 @@ mod tests {
                 .corroboration
                 .is_none());
             assert!(build_domain_model_with(&s, &cov(&s), "9.9.9", &opts).is_err());
+        }
+
+        /// A node estate classified, as the extractor writes it (`behaviour` + `behaviour_reason`).
+        fn classed(
+            store: &mut SqliteStore,
+            name: &str,
+            kind: NodeKind,
+            file: &str,
+            behaviour: &str,
+            reason: Option<&str>,
+        ) -> Node {
+            let mut n = Node::new(
+                Symbol::synthetic("src", format!("{file}::{name}")).id(),
+                kind,
+                name.to_string(),
+                Language::new("python"),
+                Location::new(file.to_string(), Span::ZERO),
+            );
+            n.metadata
+                .insert(BEHAVIOUR_KEY.to_string(), behaviour.into());
+            if let Some(r) = reason {
+                n.metadata.insert("behaviour_reason".to_string(), r.into());
+            }
+            store.begin_batch().unwrap();
+            store.upsert_nodes(std::slice::from_ref(&n)).unwrap();
+            store.commit_batch().unwrap();
+            n
+        }
+
+        /// reqgraph measurement (AutoGPT 9cb76f9): about 30% of the counted units were not
+        /// behaviour. Estate now says which (`metadata.behaviour`): a stub body, a data shape and a
+        /// field-only constructor leave the denominator as structural units, test support leaves
+        /// it as not-product (core#1235: Rust `#[cfg(test)]` code in a product file). `real`, an
+        /// absent key and an unknown value keep counting: dropping real behaviour would inflate
+        /// coverage. Falsifier: drop `estate_not_behaviour` / the `test_support` check and
+        /// `behavior_bearing` reads 8.
+        #[test]
+        fn estate_non_behaviour_leaves_the_denominator() {
+            let mut s = store();
+            let f = "backend/executor/manager.py";
+            classed(
+                &mut s,
+                "todo",
+                NodeKind::Function,
+                f,
+                "stub",
+                Some("pass_only"),
+            );
+            classed(
+                &mut s,
+                "Port",
+                NodeKind::Class,
+                f,
+                "stub",
+                Some("interface_only"),
+            );
+            classed(
+                &mut s,
+                "Model",
+                NodeKind::Class,
+                f,
+                "data",
+                Some("fields_only_class"),
+            );
+            classed(
+                &mut s,
+                "Point",
+                NodeKind::Struct,
+                "src/geo.rs",
+                "data",
+                Some("struct_decl"),
+            );
+            classed(
+                &mut s,
+                "__init__",
+                NodeKind::Method,
+                f,
+                "data",
+                Some("field_only_constructor"),
+            );
+            let helper = classed(
+                &mut s,
+                "helper",
+                NodeKind::Function,
+                "src/geo.rs",
+                "test_support",
+                Some("cfg_test_module"),
+            );
+            let run = classed(&mut s, "run", NodeKind::Function, f, "real", None);
+            classed(&mut s, "future", NodeKind::Function, f, "maybe", None);
+            node(&mut s, "legacy", NodeKind::Function, f);
+            map(&mut s, &run, "seat-1", "code-body");
+            // An earlier page mapped the helper before estate classed it (codex r1 on this test):
+            // the build must drop its requirement too.
+            map(&mut s, &helper, "seat-1", "code-body");
+            let r = cov(&s);
+            assert_eq!(r.behavior_bearing, 3, "real + unknown + absent: {r:?}");
+            assert_eq!(r.not_product, 1, "the cfg(test) helper: {r:?}");
+            assert_eq!(r.resolved, 1);
+            // The domain build agrees: one requirement, the real unit, at 1/3.
+            let d = build_at(&s, 1);
+            let cov_meta = d.metadata.coverage.clone().unwrap();
+            assert_eq!(
+                (
+                    cov_meta.behavior_bearing,
+                    cov_meta.real,
+                    cov_meta.not_product
+                ),
+                (3, 1, 1),
+                "{cov_meta:?}"
+            );
+            assert!(
+                d.domains
+                    .get("src")
+                    .is_none_or(|dm| dm.requirements.is_empty()),
+                "the test helper emits no requirement: {:?}",
+                d.domains.keys().collect::<Vec<_>>()
+            );
+            assert_eq!(d.domains["backend/executor"].requirements.len(), 1);
+        }
+
+        /// core#1375: `billing_e2e/provider.py` is test support even on a graph estate indexed
+        /// before it wrote `behaviour`, because the directory is mostly tests (two `*_test.py`
+        /// beside it, as in AutoGPT). A `crypto_e2e/` whose one test sits beside its product file
+        /// stays product (codex r1: a suffix alone is no evidence).
+        #[test]
+        fn a_suffixed_test_directory_is_not_product() {
+            let mut s = store();
+            let e2e = "backend/executor/billing_e2e";
+            node(
+                &mut s,
+                "make_provider",
+                NodeKind::Function,
+                &format!("{e2e}/provider.py"),
+            );
+            node(
+                &mut s,
+                "a",
+                NodeKind::Function,
+                &format!("{e2e}/agent_run_billing_test.py"),
+            );
+            node(
+                &mut s,
+                "b",
+                NodeKind::Function,
+                &format!("{e2e}/failed_llm_run_billing_test.py"),
+            );
+            node(
+                &mut s,
+                "init",
+                NodeKind::Function,
+                &format!("{e2e}/__init__.py"),
+            );
+            node(
+                &mut s,
+                "derive",
+                NodeKind::Function,
+                "src/crypto_e2e/keys.py",
+            );
+            node(
+                &mut s,
+                "t",
+                NodeKind::Function,
+                "src/crypto_e2e/keys_test.py",
+            );
+            node(
+                &mut s,
+                "charge",
+                NodeKind::Function,
+                "backend/executor/billing.py",
+            );
+            let r = cov(&s);
+            // Counted: charge + derive. Not product: the 4 billing_e2e units + keys_test.
+            assert_eq!((r.behavior_bearing, r.not_product), (2, 5), "{r:?}");
         }
 
         #[test]
