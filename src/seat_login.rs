@@ -308,7 +308,13 @@ pub(crate) fn login_argv(
         argv.extend(["-e".into(), format!("{var}=/home/login/{dir}")]);
     }
     argv.push(image.into());
-    let command: &[&str] = match cli {
+    argv.extend(login_command(cli).iter().map(|s| (*s).to_string()));
+    argv
+}
+
+/// The command a container-login agent's sign-in runs in its login container or pod (pure).
+pub(crate) fn login_command(cli: &str) -> &'static [&'static str] {
+    match cli {
         // A long-lived token the claude CLI mints for scripts (core#1024): its seats pass it
         // through, so the broker never renews a claude sign-in. The CLI prints the token and
         // keeps no copy; the login script reads it from claude's output (or, failing that, asks
@@ -320,9 +326,7 @@ pub(crate) fn login_argv(
         // agy's Gemini API key, pasted unechoed into the throwaway volume; agy itself never runs.
         "agy" => &["sh", "-c", AGY_API_KEY_LOGIN, "wicked-login"],
         _ => &[],
-    };
-    argv.extend(command.iter().map(|s| (*s).to_string()));
-    argv
+    }
 }
 
 /// Where agy's login leaves the Gemini API key the operator pasted.
@@ -829,7 +833,7 @@ fn strip_terminal_controls(text: &str) -> (String, bool) {
 /// helper creates every one of them before the login runs: codex refuses a `CODEX_HOME` that
 /// does not exist ("Error loading configuration"), so its login exited before any sign-in and
 /// ingest then found no `auth.json`.
-fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
+pub(crate) fn login_homes(cli: &str) -> &'static [(&'static str, &'static str)] {
     match cli {
         "claude" => &[("CLAUDE_CONFIG_DIR", "claude")],
         "codex" => &[("CODEX_HOME", "codex")],
@@ -1601,16 +1605,11 @@ pub(crate) fn record_expiry(cli: &str, record: &Value) -> Result<Option<u64>, St
 
 /// The broker's retained OAuth record `file`, or `None` when absent or empty (signed out).
 #[cfg(unix)]
-pub(crate) fn read_broker_record(
-    rt: &Runtime,
-    gw: &Gateway,
-    file: &str,
-) -> Result<Option<Vec<u8>>, String> {
-    let volume = volumes(gw).1;
-    if !volume_exists(rt, &volume)? {
+pub(crate) fn read_broker_record(io: &dyn BrokerIo, file: &str) -> Result<Option<Vec<u8>>, String> {
+    if !io.broker_present()? {
         return Ok(None);
     }
-    let files = read_volume(rt, &volume, &[file], false)?;
+    let files = io.read_broker(&[file], false)?;
     Ok(files
         .into_iter()
         .next()
@@ -1701,6 +1700,192 @@ pub(crate) fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64
         Ok(expires_at) => BrokerStatus::SignedIn { expires_at },
         Err(e) => BrokerStatus::Unknown(e),
     }
+}
+
+/// The transport the sign-in state machine drives (k8s-swap B-4): the broker's storage, the
+/// gateway's publication, the login stores and the account reads. The state machine (journals,
+/// tombstones, sessions and their repair order) is one copy over this seam; the cluster's
+/// transport is [`crate::k8s::login::K8sIo`], and [`DockerIo`] is the container floor's, kept
+/// until the Docker path is deleted (B-6).
+///
+/// The mutating methods are called with the broker's mutation lock held; a status read
+/// (`broker_status`) and [`BrokerIo::prepare_login`] run without it.
+#[cfg(unix)]
+pub(crate) trait BrokerIo {
+    /// Whether the broker's storage exists (none = nothing was ever signed in).
+    fn broker_present(&self) -> Result<bool, String>;
+    /// Provision the broker's storage on a first sign-in, never taking the daemon's ownership.
+    fn init_broker(&self, dir: &Path) -> Result<(), String>;
+    /// Read broker `paths` (a missing file is skipped). `presence`: a file that is not a
+    /// retained record ([`is_archive`]) is read as a marker only (nonempty = present).
+    fn read_broker(&self, paths: &[&str], presence: bool)
+        -> Result<Vec<(String, Vec<u8>)>, String>;
+    /// Replace broker `file` with `body`, whole or not at all.
+    fn write_broker(&self, dir: &Path, cli: &str, file: &str, body: &[u8]) -> Result<(), String>;
+    /// Empty broker `files` (signed out: a route names them, so they are never deleted).
+    fn empty_broker(&self, dir: &Path, cli: &str, files: &[&str]) -> Result<(), String>;
+    /// Remove broker `file` (journals and staged records only).
+    fn remove_broker(&self, dir: &Path, cli: &str, file: &str) -> Result<(), String>;
+    /// Settle what a dead owner's mutation left running.
+    fn cleanup(&self, dir: &Path) -> Result<(), String>;
+    /// Point `cli`'s routes at `literals` and publish the config.
+    fn route_sign_in(
+        &self,
+        dir: &Path,
+        cli: &str,
+        literals: &crate::seat_gateway::RouteLiterals,
+    ) -> Result<(), String>;
+    /// Clear `cli`'s route literals and confirm the gateway applied the generation.
+    fn confirm_sign_out(&self, dir: &Path, cli: &str) -> Result<(), String>;
+    /// Whether login session `session`'s store (or its login) still exists.
+    fn login_exists(&self, session: &str) -> Result<bool, String>;
+    /// Create login session `session`'s store (empty), before its marker is written.
+    fn create_login(&self, session: &str) -> Result<(), String>;
+    /// Make `cli`'s configuration homes in the store (after the marker is written).
+    fn init_login(&self, dir: &Path, cli: &str, session: &str) -> Result<(), String>;
+    /// Everything a login of `cli` needs that may take long or must hold first (an image build, the
+    /// cluster's isolation proof), done BEFORE the session transaction (review B-4 #3, #4).
+    fn prepare_login(&self, _cli: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Start session `session`'s login and render the argv crew runs in its terminal (the caller
+    /// holds the mutation lock, so no sign-out or newer sign-in can supersede it meanwhile).
+    fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String>;
+    /// Read `paths` (relative to the login HOME) from the store: a missing file is skipped; a
+    /// link on the way, a non-regular or an oversized file is refused.
+    fn read_login(&self, session: &str, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String>;
+    /// End session `session`'s login (its terminal is over), keeping the store.
+    fn stop_login(&self, session: &str) -> Result<(), String>;
+    /// End the login and remove the store; one already gone counts as removed.
+    fn remove_login(&self, session: &str) -> Result<(), String>;
+    /// Make an account read from the gateway's network; the token rides stdin.
+    fn send(
+        &self,
+        dir: &Path,
+        cli: &str,
+        request: &crate::seat_refresh::Request,
+    ) -> Result<Value, String>;
+}
+
+/// The container floor's transport (Docker helpers and volumes), until B-6 deletes it.
+#[cfg(unix)]
+#[derive(Clone)]
+pub(crate) struct DockerIo {
+    pub(crate) rt: Runtime,
+    pub(crate) gw: Gateway,
+    /// The seat image a login container runs (`open_login`).
+    pub(crate) image: Option<String>,
+}
+
+#[cfg(unix)]
+impl DockerIo {
+    pub(crate) fn new(rt: &Runtime, gw: &Gateway) -> Self {
+        Self {
+            rt: rt.clone(),
+            gw: gw.clone(),
+            image: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl BrokerIo for DockerIo {
+    fn broker_present(&self) -> Result<bool, String> {
+        volume_exists(&self.rt, &volumes(&self.gw).1)
+    }
+    fn init_broker(&self, dir: &Path) -> Result<(), String> {
+        crate::seat_gateway::init_gateway_volumes(&self.rt, &self.gw, dir)
+    }
+    fn read_broker(
+        &self,
+        paths: &[&str],
+        presence: bool,
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        read_volume(&self.rt, &volumes(&self.gw).1, paths, presence)
+    }
+    fn write_broker(&self, dir: &Path, cli: &str, file: &str, body: &[u8]) -> Result<(), String> {
+        crate::seat_gateway::set_broker_credential(&self.rt, &self.gw, dir, cli, file, body)
+    }
+    fn empty_broker(&self, dir: &Path, cli: &str, files: &[&str]) -> Result<(), String> {
+        crate::seat_gateway::mutation_helper(
+            &self.rt,
+            dir,
+            cli,
+            &revoke_argv(&volumes(&self.gw).1, files),
+            &[],
+            TIMEOUT,
+        )
+        .map(|_| ())
+    }
+    fn remove_broker(&self, dir: &Path, cli: &str, file: &str) -> Result<(), String> {
+        crate::seat_gateway::remove_broker_file(&self.rt, &self.gw, dir, cli, file)
+    }
+    fn cleanup(&self, dir: &Path) -> Result<(), String> {
+        crate::seat_gateway::cleanup_mutations(&self.rt, dir)
+    }
+    fn route_sign_in(
+        &self,
+        dir: &Path,
+        cli: &str,
+        literals: &crate::seat_gateway::RouteLiterals,
+    ) -> Result<(), String> {
+        crate::seat_gateway::route_sign_in(&self.rt, &self.gw, dir, cli, literals)
+    }
+    fn confirm_sign_out(&self, dir: &Path, cli: &str) -> Result<(), String> {
+        crate::seat_gateway::confirm_sign_out(&self.rt, &self.gw, dir, cli)
+    }
+    fn login_exists(&self, session: &str) -> Result<bool, String> {
+        volume_exists(&self.rt, session)
+    }
+    fn create_login(&self, session: &str) -> Result<(), String> {
+        checked(
+            &self.rt,
+            &["volume".into(), "create".into(), session.into()],
+        )
+    }
+    fn init_login(&self, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+        crate::seat_gateway::mutation_helper(
+            &self.rt,
+            dir,
+            cli,
+            &init_login_argv(session, cli),
+            &[],
+            TIMEOUT,
+        )
+        .map(|_| ())
+    }
+    fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String> {
+        let image = self.image.as_deref().ok_or("no seat image for the login")?;
+        // agy's API-key sign-in only reads a paste: no network at all.
+        let network = if cli == "agy" {
+            "none"
+        } else {
+            self.gw.external_network.as_str()
+        };
+        Ok(login_argv(&self.rt.cli, cli, image, session, network))
+    }
+    fn read_login(&self, session: &str, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        read_volume(&self.rt, session, paths, false)
+    }
+    fn stop_login(&self, session: &str) -> Result<(), String> {
+        stop_login_container(&self.rt, session)
+    }
+    fn remove_login(&self, session: &str) -> Result<(), String> {
+        remove_login_volume(&self.rt, session)
+    }
+    fn send(
+        &self,
+        dir: &Path,
+        cli: &str,
+        request: &crate::seat_refresh::Request,
+    ) -> Result<Value, String> {
+        crate::seat_refresh::send(&self.rt, dir, cli, &self.gw.external_network, request)
+    }
+}
+
+/// The daemon's gateway name for gateway dir `dir` (session and renewal-home names carry it).
+pub(crate) fn gw_name(dir: &Path) -> String {
+    crate::seat_gateway::gateway_name(dir)
 }
 
 /// Helper argv is pure; scripts and paths are fixed by this module, never supplied by the CLI.
@@ -1807,7 +1992,7 @@ fn init_login_argv(volume: &str, cli: &str) -> Vec<String> {
 }
 
 /// The copilot settings its login volume is seeded with (`storeTokenPlaintext`, see above).
-const COPILOT_SETTINGS: &str = r#"{"storeTokenPlaintext":true}"#;
+pub(crate) const COPILOT_SETTINGS: &str = r#"{"storeTokenPlaintext":true}"#;
 
 #[cfg(unix)]
 fn execute(rt: &Runtime, argv: &[String]) -> Result<std::process::Output, String> {
@@ -1888,15 +2073,9 @@ fn read_volume(
 /// write succeeds. Failure retains the login volume for a retry. Writes are individually atomic
 /// through set_broker_credential, but the runtime offers no multi-file transaction here.
 #[cfg(unix)]
-fn ingest(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-    volume: &str,
-) -> Result<IngestReport, String> {
+fn ingest(io: &dyn BrokerIo, dir: &Path, cli: &str, volume: &str) -> Result<IngestReport, String> {
     let owned = broker_files(cli)?;
-    if !login_exists(rt, dir, cli, volume)? {
+    if !login_exists(io, dir, cli, volume)? {
         return Err(missing(
             cli,
             if host_login(cli) {
@@ -1911,7 +2090,7 @@ fn ingest(
     let read = if from_home {
         read_home(&login_home(dir, volume), credential_paths(cli))
     } else {
-        read_volume(rt, volume, credential_paths(cli), false)
+        io.read_login(volume, credential_paths(cli))
     };
     let (input, tokens) = match read.and_then(|input| {
         let tokens = extract_tokens(cli, &input)?;
@@ -1929,9 +2108,9 @@ fn ingest(
             return Err(e);
         }
     };
-    if !volume_exists(rt, &volumes(gw).1)? {
+    if !io.broker_present()? {
         // codex lg-r3 R3: first sign-in provisions storage without taking daemon ownership.
-        crate::seat_gateway::init_gateway_volumes(rt, gw, dir)?;
+        io.init_broker(dir)?;
     }
     let skipped = skipped_providers(cli, &input);
     // codex lg-r2 C4: journal before any broker mutation, including stale-mode clearing.
@@ -1948,22 +2127,14 @@ fn ingest(
         .map(|(n, b)| (n, String::from_utf8_lossy(b).into_owned()))
         .collect();
     let staged = serde_json::to_vec(&journal).map_err(|_| "could not encode ingest journal")?;
-    crate::seat_gateway::set_broker_credential(
-        rt,
-        gw,
-        dir,
-        cli,
-        &format!("{cli}.ingest.next"),
-        &staged,
-    )?;
-    publish_ingest(rt, gw, dir, cli, volume, &tokens, owned)?;
-    broker_report(rt, gw, cli).map(|report| IngestReport { skipped, ..report })
+    io.write_broker(dir, cli, &format!("{cli}.ingest.next"), &staged)?;
+    publish_ingest(io, dir, cli, volume, &tokens, owned)?;
+    broker_report(io, cli).map(|report| IngestReport { skipped, ..report })
 }
 
 #[cfg(unix)]
 fn publish_ingest(
-    rt: &Runtime,
-    gw: &Gateway,
+    io: &dyn BrokerIo,
     dir: &Path,
     cli: &str,
     volume: &str,
@@ -1971,7 +2142,7 @@ fn publish_ingest(
     owned: &[&str],
 ) -> Result<(), String> {
     for (name, bytes) in tokens {
-        crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, bytes)?;
+        io.write_broker(dir, cli, name, bytes)?;
     }
     let stale: Vec<&str> = owned
         .iter()
@@ -1979,22 +2150,15 @@ fn publish_ingest(
         .filter(|f| !tokens.iter().any(|(n, _)| n == f))
         .collect();
     if !stale.is_empty() {
-        crate::seat_gateway::mutation_helper(
-            rt,
-            dir,
-            cli,
-            &revoke_argv(&volumes(gw).1, &stale),
-            &[],
-            TIMEOUT,
-        )?;
+        io.empty_broker(dir, cli, &stale)?;
     }
     // codex lg-r2 C3: a retry must never replay this now-obsolete login generation.
     write_session_state(dir, cli, volume, true)
 }
 
 #[cfg(unix)]
-fn broker_report(rt: &Runtime, gw: &Gateway, cli: &str) -> Result<IngestReport, String> {
-    let files = read_volume(rt, &volumes(gw).1, broker_files(cli)?, false)?;
+fn broker_report(io: &dyn BrokerIo, cli: &str) -> Result<IngestReport, String> {
+    let files = io.read_broker(broker_files(cli)?, false)?;
     let mut expires_at = None;
     for (name, bytes) in &files {
         if !bytes.is_empty() && is_archive(name) {
@@ -2062,21 +2226,16 @@ pub(crate) fn route_literals(
 
 /// Caller holds the broker lock. Repair sign-in before refresh checks expiry (codex lg-r2 C4).
 #[cfg(unix)]
-pub(crate) fn repair_ingest(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-) -> Result<bool, String> {
-    if complete_sign_out(rt, gw, dir, cli)? {
+pub(crate) fn repair_ingest(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<bool, String> {
+    if complete_sign_out(io, dir, cli)? {
         return Ok(false);
     }
     if !signin_pending(dir, cli) {
         return Ok(false);
     }
-    let volume = read_session(dir, gw, cli)?.ok_or("incomplete sign-in has no session")?;
+    let volume = read_session(dir, cli)?.ok_or("incomplete sign-in has no session")?;
     if !session_committed(dir, cli)? {
-        let Some(staged) = read_broker_record(rt, gw, &format!("{cli}.ingest.next"))? else {
+        let Some(staged) = read_broker_record(io, &format!("{cli}.ingest.next"))? else {
             return Ok(false);
         };
         let journal: Vec<(String, String)> =
@@ -2089,11 +2248,11 @@ pub(crate) fn repair_ingest(
         if tokens.iter().any(|(n, _)| !owned.contains(&n.as_str())) {
             return Err("invalid ingest journal file".into());
         }
-        publish_ingest(rt, gw, dir, cli, &volume, &tokens, owned)?;
+        publish_ingest(io, dir, cli, &volume, &tokens, owned)?;
     }
-    let report = broker_report(rt, gw, cli)?;
-    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &report.literals)?;
-    crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{cli}.ingest.next"))?;
+    let report = broker_report(io, cli)?;
+    io.route_sign_in(dir, cli, &report.literals)?;
+    io.remove_broker(dir, cli, &format!("{cli}.ingest.next"))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
     crate::seat_refresh::record_last(dir, cli, None);
     Ok(true)
@@ -2122,25 +2281,24 @@ pub(crate) fn publication_status(dir: &Path, cli: &str, status: BrokerStatus) ->
 }
 
 #[cfg(unix)]
-pub(crate) fn broker_status(rt: &Runtime, gw: &Gateway, cli: &str) -> BrokerStatus {
-    broker_reading(rt, gw, cli).0
+pub(crate) fn broker_status(io: &dyn BrokerIo, cli: &str) -> BrokerStatus {
+    broker_reading(io, cli).0
 }
 
 /// The broker's status for `cli` and the route files it was read from (presence markers, plus
 /// the retained OAuth record) — one read for both the status and the seat's credential kind.
 #[cfg(unix)]
-fn broker_reading(rt: &Runtime, gw: &Gateway, cli: &str) -> (BrokerStatus, Vec<(String, Vec<u8>)>) {
+fn broker_reading(io: &dyn BrokerIo, cli: &str) -> (BrokerStatus, Vec<(String, Vec<u8>)>) {
     let paths = match broker_files(cli) {
         Ok(paths) => paths,
         Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
     };
-    let volume = volumes(gw).1;
-    match volume_exists(rt, &volume) {
+    match io.broker_present() {
         Ok(false) => return (BrokerStatus::SignedOut, Vec::new()),
         Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
         Ok(true) => {}
     }
-    let files = match read_volume(rt, &volume, paths, true) {
+    let files = match io.read_broker(paths, true) {
         Ok(files) => files,
         Err(e) => return (BrokerStatus::Unknown(e), Vec::new()),
     };
@@ -2224,8 +2382,7 @@ pub(crate) fn sign_in_from_files(
 /// A failed refresh of a still-valid credential still runs (the status says so on the tab).
 #[cfg(unix)]
 pub(crate) fn seat_sign_in(
-    rt: &Runtime,
-    gw: &Gateway,
+    io: &dyn BrokerIo,
     dir: &Path,
     cli: &str,
 ) -> Result<crate::seat_credentials::SeatSignIn, String> {
@@ -2234,9 +2391,9 @@ pub(crate) fn seat_sign_in(
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
     // agy c6-r1: an interrupted sign-in, sign-out or refresh is finished first, as ingest does,
     // so a crash mid-publication heals on the next unit instead of refusing every one after it.
-    settle_broker(rt, gw, dir, cli)
+    settle_broker(io, dir, cli)
         .map_err(|e| format!("{cli}'s sign-in could not be settled: {e}"))?;
-    let (status, files) = broker_reading(rt, gw, cli);
+    let (status, files) = broker_reading(io, cli);
     let status = publication_status(
         dir,
         cli,
@@ -2262,20 +2419,16 @@ pub(crate) fn seat_sign_in(
 /// read from the broker under its lock. The seat's claude sends it upstream itself; the gateway
 /// relays it unchanged.
 #[cfg(unix)]
-pub(crate) fn claude_seat_token(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<String, String> {
-    claude_broker_token(rt, gw, dir)?.ok_or_else(|| "claude is not signed in".into())
+pub(crate) fn claude_seat_token(io: &dyn BrokerIo, dir: &Path) -> Result<String, String> {
+    claude_broker_token(io, dir)?.ok_or_else(|| "claude is not signed in".into())
 }
 
 /// [`claude_seat_token`], with signed out as `Ok(None)`: the seat-secret guard asks the broker
 /// which token a delivery must not carry (`seat_secret_guard::from_broker`).
 #[cfg(unix)]
-pub(crate) fn claude_broker_token(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-) -> Result<Option<String>, String> {
+pub(crate) fn claude_broker_token(io: &dyn BrokerIo, dir: &Path) -> Result<Option<String>, String> {
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
-    let Some(bytes) = read_broker_record(rt, gw, "anthropic.token")? else {
+    let Some(bytes) = read_broker_record(io, "anthropic.token")? else {
         return Ok(None);
     };
     let token = String::from_utf8(bytes).map_err(|_| "claude: invalid broker token")?;
@@ -2286,79 +2439,57 @@ pub(crate) fn claude_broker_token(
     Ok(Some(token.to_string()))
 }
 
-/// Native Windows has no seat sign-ins (the container floor needs a Unix host).
-#[cfg(not(unix))]
-pub(crate) fn claude_seat_token(
-    _rt: &crate::container_floor::Runtime,
-    _gw: &crate::seat_gateway::Gateway,
-    _dir: &Path,
-) -> Result<String, String> {
-    Err("seat sign-ins need a Unix host".into())
-}
-
 /// Finish whatever broker mutation of `cli` a crash interrupted (caller holds the mutation lock):
 /// a helper's cleanup, a sign-out tombstone, an ingest journal, a refresh's staged record. The
 /// same order `ingest_and_route` repairs in.
 #[cfg(unix)]
-fn settle_broker(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<(), String> {
-    crate::seat_gateway::cleanup_mutations(rt, dir)?;
-    complete_sign_out(rt, gw, dir, cli)?;
+fn settle_broker(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<(), String> {
+    io.cleanup(dir)?;
+    complete_sign_out(io, dir, cli)?;
     if signin_pending(dir, cli) {
-        repair_ingest(rt, gw, dir, cli)?;
+        repair_ingest(io, dir, cli)?;
     } else {
-        crate::seat_refresh::repair_refresh(rt, gw, dir, cli)?;
+        crate::seat_refresh::repair_refresh(io, dir, cli)?;
     }
     // codex c6-r3: a published sign-in whose cleanup a crash interrupted still has its login
     // volume (a copy of the credential) and session marker; finish them as ingest_and_route does.
     // An uncommitted session is a login that may still be open: it is never touched here.
-    if let Some(volume) = read_session(dir, gw, cli)? {
+    if let Some(volume) = read_session(dir, cli)? {
         if session_committed(dir, cli)? {
-            discard_login(rt, dir, cli, &volume)?;
+            discard_login(io, dir, cli, &volume)?;
             crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
         }
     }
     Ok(())
 }
 
-/// Native Windows has no seat sign-ins (the container floor needs a Unix host).
-#[cfg(not(unix))]
-pub(crate) fn seat_sign_in(
-    _rt: &crate::container_floor::Runtime,
-    _gw: &crate::seat_gateway::Gateway,
-    _dir: &Path,
-    _cli: &str,
-) -> Result<crate::seat_credentials::SeatSignIn, String> {
-    Err("seat sign-ins need a Unix host".into())
-}
-
 /// Ingest, then point the gateway's routes at the new sign-in: codex's ChatGPT route carries the
 /// account id as a literal header, so the served config is re-rendered and published.
 #[cfg(unix)]
 pub(crate) fn ingest_and_route(
-    rt: &Runtime,
-    gw: &Gateway,
+    io: &dyn BrokerIo,
     dir: &Path,
     cli: &str,
 ) -> Result<IngestReport, String> {
     // codex lg-r1 #2: hold the same broker lock from reading through publication.
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
-    crate::seat_gateway::cleanup_mutations(rt, dir)?;
-    complete_sign_out(rt, gw, dir, cli)?;
-    let volume = read_session(dir, gw, cli)?.ok_or_else(|| missing(cli, "login session"))?;
+    io.cleanup(dir)?;
+    complete_sign_out(io, dir, cli)?;
+    let volume = read_session(dir, cli)?.ok_or_else(|| missing(cli, "login session"))?;
     // The terminal has ended: its container is stopped before the volume is read, so whatever the
     // CLI wrote is final and nothing still holds the volume when it is removed. A host login's
     // process group was ended with its terminal.
-    halt_login(rt, dir, cli, &volume)?;
-    repair_ingest(rt, gw, dir, cli)?;
+    halt_login(io, dir, cli, &volume)?;
+    repair_ingest(io, dir, cli)?;
     // codex lg-r3 R2: rescue or staging can survive even a failed pending-marker write.
     if !signin_pending(dir, cli) {
-        crate::seat_refresh::repair_refresh(rt, gw, dir, cli)?;
+        crate::seat_refresh::repair_refresh(io, dir, cli)?;
     }
     let imported = !session_committed(dir, cli)?;
     let mut report = if imported {
-        ingest(rt, gw, dir, cli, &volume)?
+        ingest(io, dir, cli, &volume)?
     } else {
-        broker_report(rt, gw, cli)?
+        broker_report(io, cli)?
     };
     // copilot: the account's Copilot API host and the models it may use, read with the new
     // token (DES-SEAT-LOGIN-SUBSCRIPTIONS OD-1). A failed read does not undo the sign-in: it is
@@ -2369,20 +2500,20 @@ pub(crate) fn ingest_and_route(
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or_default();
-        match crate::seat_refresh::resolve_copilot(rt, gw, dir, now) {
-            Ok(_) => report.literals = broker_report(rt, gw, cli)?.literals,
+        match crate::seat_refresh::resolve_copilot(io, dir, now) {
+            Ok(_) => report.literals = broker_report(io, cli)?.literals,
             Err(e) => account_error = Some((now, format!("reading the Copilot account: {e}"))),
         }
     }
-    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &report.literals)?;
-    crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{cli}.ingest.next"))?;
+    io.route_sign_in(dir, cli, &report.literals)?;
+    io.remove_broker(dir, cli, &format!("{cli}.ingest.next"))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
     // codex lg-r1 #8: the retry source survives every write/publish failure. codex lg-r4: the
     // session marker is the only record of the credential-bearing login volume, so it goes
     // LAST, after the volume is confirmed gone (a retry of a committed session whose volume is
     // already absent just finishes here).
     write_session_state(dir, cli, &volume, true)?;
-    discard_login(rt, dir, cli, &volume)?;
+    discard_login(io, dir, cli, &volume)?;
     match std::fs::remove_file(session_path(dir, cli)) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -2408,21 +2539,16 @@ pub(crate) fn ingest_and_route(
 
 /// Sign out, then clear what the routes carried for this agent (codex's account header).
 #[cfg(unix)]
-pub(crate) fn sign_out_and_route(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-) -> Result<(), String> {
+pub(crate) fn sign_out_and_route(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<(), String> {
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
-    crate::seat_gateway::cleanup_mutations(rt, dir)?;
+    io.cleanup(dir)?;
     broker_files(cli)?;
     let tombstone = signout_path(dir, cli);
     // codex lg-r3 R4: a crash after the first empty write must never authorize recovery.
     if !tombstone.try_exists().map_err(|e| e.to_string())? {
         crate::seat_refresh::create_private_file(&tombstone, b"sign-out")?;
     }
-    complete_sign_out(rt, gw, dir, cli).map(|_| ())
+    complete_sign_out(io, dir, cli).map(|_| ())
 }
 
 fn signout_path(dir: &Path, cli: &str) -> std::path::PathBuf {
@@ -2431,20 +2557,15 @@ fn signout_path(dir: &Path, cli: &str) -> std::path::PathBuf {
 
 /// Caller holds the mutation lock. Tombstones always win over publication journals.
 #[cfg(unix)]
-pub(crate) fn complete_sign_out(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-) -> Result<bool, String> {
+pub(crate) fn complete_sign_out(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<bool, String> {
     let tombstone = signout_path(dir, cli);
     if !tombstone.try_exists().map_err(|e| e.to_string())? {
         return Ok(false);
     }
     // codex lg-r3 R4: retry even a prior tombstone creation whose fsync failed.
     crate::seat_refresh::sync_private_file(&tombstone)?;
-    sign_out(rt, gw, dir, cli)?;
-    if volume_exists(rt, &volumes(gw).1)? {
+    sign_out(io, dir, cli)?;
+    if io.broker_present()? {
         for name in [
             format!("{cli}.ingest.next"),
             format!(
@@ -2452,37 +2573,35 @@ pub(crate) fn complete_sign_out(
                 crate::seat_refresh::record_file(cli).unwrap_or(cli)
             ),
         ] {
-            crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &name)?;
+            io.remove_broker(dir, cli, &name)?;
         }
     }
-    if let Some(volume) = read_session(dir, gw, cli)? {
+    if let Some(volume) = read_session(dir, cli)? {
         // codex lg-r3 R4: retry a crash between removal of the volume and its session marker.
         if host_login(cli) {
-            discard_login(rt, dir, cli, &volume)?;
-        } else if volume_exists(rt, &volume)? {
-            remove_login_volume(rt, &volume)?;
+            discard_login(io, dir, cli, &volume)?;
+        } else if io.login_exists(&volume)? {
+            io.remove_login(&volume)?;
         } else {
-            stop_login_container(rt, &volume)?;
+            io.stop_login(&volume)?;
         }
         crate::seat_refresh::remove_private_file(&session_path(dir, cli))?;
     }
     crate::seat_refresh::remove_private_file(&crate::seat_refresh::rescue_path(dir, cli))?;
     crate::seat_refresh::clear_pending(dir, cli)?;
-    crate::seat_gateway::confirm_sign_out(rt, gw, dir, cli)?;
+    io.confirm_sign_out(dir, cli)?;
     crate::seat_refresh::record_last(dir, cli, None);
     crate::seat_refresh::remove_private_file(&tombstone)?;
     Ok(true)
 }
 
 #[cfg(unix)]
-fn sign_out(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<(), String> {
+fn sign_out(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<(), String> {
     let files = broker_files(cli)?;
-    let volume = volumes(gw).1;
-    if !volume_exists(rt, &volume)? {
+    if !io.broker_present()? {
         return Ok(());
     }
-    crate::seat_gateway::mutation_helper(rt, dir, cli, &revoke_argv(&volume, files), &[], TIMEOUT)
-        .map(|_| ())
+    io.empty_broker(dir, cli, files)
 }
 
 fn session_path(dir: &Path, cli: &str) -> std::path::PathBuf {
@@ -2490,11 +2609,7 @@ fn session_path(dir: &Path, cli: &str) -> std::path::PathBuf {
 }
 
 // codex lg-r1 #10: never infer a volume from a CLI; ingest exactly the recorded session.
-fn read_session(
-    dir: &Path,
-    gw: &crate::seat_gateway::Gateway,
-    cli: &str,
-) -> Result<Option<String>, String> {
+fn read_session(dir: &Path, cli: &str) -> Result<Option<String>, String> {
     let name = match std::fs::read_to_string(session_path(dir, cli)) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -2504,7 +2619,7 @@ fn read_session(
     if !matches!(state, "" | "committed") {
         return Err("invalid login session state".into());
     }
-    let prefix = format!("{}-login-{cli}-", gw.name);
+    let prefix = format!("{}-login-{cli}-", gw_name(dir));
     if !name
         .strip_prefix(&prefix)
         .is_some_and(|n| n.len() == 8 && n.bytes().all(|c| c.is_ascii_hexdigit()))
@@ -2515,25 +2630,31 @@ fn read_session(
 }
 
 #[cfg(unix)]
-fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<String, String> {
+fn new_session(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<String, String> {
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
-    crate::seat_gateway::cleanup_mutations(rt, dir)?;
-    complete_sign_out(rt, gw, dir, cli)?;
-    if signin_pending(dir, cli) && !repair_ingest(rt, gw, dir, cli)? {
+    new_session_locked(io, dir, cli)
+}
+
+/// [`new_session`] for a caller that holds the mutation lock.
+#[cfg(unix)]
+fn new_session_locked(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<String, String> {
+    io.cleanup(dir)?;
+    complete_sign_out(io, dir, cli)?;
+    if signin_pending(dir, cli) && !repair_ingest(io, dir, cli)? {
         return Err("sign-in incomplete; retry ingest first".into());
     }
-    let previous = read_session(dir, gw, cli)?;
+    let previous = read_session(dir, cli)?;
     if let Some(old) = &previous {
-        discard_login(rt, dir, cli, old)?;
+        discard_login(io, dir, cli, old)?;
         std::fs::remove_file(session_path(dir, cli)).map_err(|e| e.to_string())?;
     }
     if host_login(cli) {
         // A home whose session marker never got written (a crash between the two) is swept too.
-        sweep_login_homes(dir, gw, cli)?;
+        sweep_login_homes(dir, cli)?;
     }
     let volume = loop {
-        let candidate = login_volume(&gw.name, cli);
-        if previous.as_ref() != Some(&candidate) && !login_exists(rt, dir, cli, &candidate)? {
+        let candidate = login_volume(&gw_name(dir), cli);
+        if previous.as_ref() != Some(&candidate) && !login_exists(io, dir, cli, &candidate)? {
             break candidate;
         }
     };
@@ -2542,16 +2663,9 @@ fn new_session(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<Stri
         write_session(dir, cli, &volume)?;
         return Ok(volume);
     }
-    checked(rt, &["volume".into(), "create".into(), volume.clone()])?;
+    io.create_login(&volume)?;
     write_session(dir, cli, &volume)?;
-    crate::seat_gateway::mutation_helper(
-        rt,
-        dir,
-        cli,
-        &init_login_argv(&volume, cli),
-        &[],
-        TIMEOUT,
-    )?;
+    io.init_login(dir, cli, &volume)?;
     Ok(volume)
 }
 
@@ -2611,8 +2725,8 @@ pub(crate) fn remove_refresh_home(dir: &Path, session: &str) -> Result<(), Strin
 /// Remove every renewal home of `cli` under this daemon's gateway directory (a crash's leftover:
 /// a copy of the credential). Callers hold the mutation lock, so none is in use.
 #[cfg(unix)]
-pub(crate) fn sweep_refresh_homes(dir: &Path, gw: &Gateway, cli: &str) -> Result<(), String> {
-    let prefix = format!("{}-refresh-{cli}-", gw.name);
+pub(crate) fn sweep_refresh_homes(dir: &Path, cli: &str) -> Result<(), String> {
+    let prefix = format!("{}-refresh-{cli}-", gw_name(dir));
     let entries = match std::fs::read_dir(dir.join("login")) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2764,8 +2878,8 @@ fn stop_host_login(dir: &Path, session: &str) -> Result<(), String> {
 /// Remove every throwaway home of `cli`'s host logins under this daemon's gateway directory,
 /// ending any login still running in one.
 #[cfg(unix)]
-fn sweep_login_homes(dir: &Path, gw: &Gateway, cli: &str) -> Result<(), String> {
-    let prefix = format!("{}-login-{cli}-", gw.name);
+fn sweep_login_homes(dir: &Path, cli: &str) -> Result<(), String> {
+    let prefix = format!("{}-login-{cli}-", gw_name(dir));
     let entries = match std::fs::read_dir(dir.join("login")) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -2867,39 +2981,39 @@ fn read_home(home: &Path, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, Stri
 /// home, or a login volume a container session from before the upgrade left (the session
 /// marker records no backend, so both are looked for).
 #[cfg(unix)]
-fn login_exists(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<bool, String> {
+fn login_exists(io: &dyn BrokerIo, dir: &Path, cli: &str, session: &str) -> Result<bool, String> {
     if host_login(cli) && std::fs::symlink_metadata(login_home(dir, session)).is_ok() {
         return Ok(true);
     }
-    volume_exists(rt, session)
+    io.login_exists(session)
 }
 
 /// End session `session`'s login: a host login's process group (normally gone with its
 /// terminal) and any login container, including a pre-upgrade one of a host-login agent.
 #[cfg(unix)]
-fn halt_login(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+fn halt_login(io: &dyn BrokerIo, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
     if host_login(cli) {
         stop_host_login(dir, session)?;
-        if !volume_exists(rt, session)? {
+        if !io.login_exists(session)? {
             return Ok(());
         }
     }
-    stop_login_container(rt, session)
+    io.stop_login(session)
 }
 
 /// Remove session `session`'s credential-bearing store after ending its login: the host home,
 /// and a login volume (a host-login agent's pre-upgrade container session keeps its volume
 /// until it is confirmed removed, never orphaned by the marker's removal).
 #[cfg(unix)]
-fn discard_login(rt: &Runtime, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
+fn discard_login(io: &dyn BrokerIo, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
     if host_login(cli) {
         stop_host_login(dir, session)?;
         remove_login_home(dir, session)?;
-        if !volume_exists(rt, session)? {
+        if !io.login_exists(session)? {
             return Ok(());
         }
     }
-    remove_login_volume(rt, session)
+    io.remove_login(session)
 }
 
 /// Stop and remove the login container of session `volume`, if it still runs. Its terminal is
@@ -3044,26 +3158,51 @@ fn gateway_for_dir(dir: Option<&Path>) -> Result<crate::seat_gateway::Gateway, S
 }
 
 #[cfg(unix)]
-fn prepare_login_argv(
+fn prepare_login_argv(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<Vec<String>, String> {
+    // C6: an agent whose credential the broker cannot hold never opens a login (the user would
+    // complete a real sign-in only for ingest to discard it).
+    broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
+    io.prepare_login(cli)?;
+    // One transaction from the session to its started login (review B-4 #3): a sign-out or a newer
+    // sign-in waits, so it can never finish before this login's pod exists and leave it behind.
+    let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    let volume = new_session_locked(io, dir, cli)?;
+    match io.open_login(cli, &volume) {
+        Ok(argv) => Ok(argv),
+        Err(e) => {
+            // A login that did not start is discarded with its store, inside the transaction.
+            // Its session marker goes only once that is done (codex b4-r2 #2): it is how a
+            // sign-out or the next sign-in finds a pod and store a failed cleanup left.
+            match discard_login(io, dir, cli, &volume) {
+                Ok(()) => {
+                    let _ = crate::seat_refresh::remove_private_file(&session_path(dir, cli));
+                    Err(e)
+                }
+                Err(c) => Err(format!(
+                    "{e}; its login could not be cleaned up ({c}), and is left for the next \
+                     sign-in or sign-out to clear"
+                )),
+            }
+        }
+    }
+}
+
+/// The Docker floor's [`prepare_login_argv`] (its tests; B-6 deletes it with them).
+#[cfg(all(unix, test))]
+fn prepare_docker_login_argv(
     rt: &Runtime,
     gw: &Gateway,
     dir: &Path,
     cli: &str,
     image: &str,
 ) -> Result<Vec<String>, String> {
-    // C6: an agent whose credential the broker cannot hold never opens a login (the user would
-    // complete a real sign-in only for ingest to discard it).
-    broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
     // codex lg-r3 R3: only the daemon may take ownership and revoke stale unit keys.
     crate::seat_gateway::ensure_external_bridge(rt, gw)?;
-    let volume = new_session(rt, gw, dir, cli)?;
-    // agy's API-key sign-in only reads a paste: no network at all.
-    let network = if cli == "agy" {
-        "none"
-    } else {
-        gw.external_network.as_str()
+    let io = DockerIo {
+        image: Some(image.to_string()),
+        ..DockerIo::new(rt, gw)
     };
-    Ok(login_argv(&rt.cli, cli, image, &volume, network))
+    prepare_login_argv(&io, dir, cli)
 }
 
 /// The host CLI's `--version`, run as the login will run (isolated environment, in the
@@ -3103,8 +3242,7 @@ fn host_version(
 /// the daemon's environment, of which only [`HOST_LOGIN_PASSTHROUGH`] reaches the login.
 #[cfg(unix)]
 fn prepare_host_login_argv(
-    rt: &Runtime,
-    gw: &Gateway,
+    io: &dyn BrokerIo,
     dir: &Path,
     cli: &str,
     daemon_env: &[(String, String)],
@@ -3130,7 +3268,7 @@ fn prepare_host_login_argv(
     // probe that fails touches no session marker (codex review: a failure after `new_session`
     // could delete a concurrent sign-in's marker outside the mutation lock). A probe home a
     // crash leaves behind matches the session pattern, so the next sign-in sweeps it.
-    let probe = login_volume(&gw.name, cli);
+    let probe = login_volume(&gw_name(dir), cli);
     create_login_home(dir, cli, &probe)?;
     let version = host_version(&exe, &login_home(dir, &probe), cli, daemon_env);
     remove_login_home(dir, &probe)?;
@@ -3140,7 +3278,7 @@ fn prepare_host_login_argv(
             exe.display()
         ));
     };
-    let session = new_session(rt, gw, dir, cli)?;
+    let session = new_session(io, dir, cli)?;
     let home = login_home(dir, &session);
     let banner = host_login_banner(cli, &version, pinned);
     Ok(host_login_argv(
@@ -3156,20 +3294,35 @@ fn prepare_host_login_argv(
 #[cfg(unix)]
 fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
     let dir = std::env::var_os(GATEWAY_DIR_ENV).map(std::path::PathBuf::from);
-    let gw = gateway_for_dir(dir.as_deref())?;
-    let rt = crate::container_floor::runtime()
-        .map_err(|why| format!("a container runtime is required: {}", why.describe()))?;
+    gateway_for_dir(dir.as_deref())?;
+    let dir = dir.as_deref().expect("validated by gateway_for_dir");
+    // The seats run on the daemon's cluster (k8s-swap): so do their sign-ins. A status read never
+    // starts anything; every other verb may provision the gateway's storage on a first sign-in,
+    // never taking the daemon's ownership (`k8s::gw::attach`).
+    let io = match crate::k8s::login::K8sIo::for_dir(dir, verb != "status") {
+        Ok(io) => io,
+        // A status read always answers a status (review B-4 pi #9): a cluster that cannot be read
+        // now, or a gateway stopped after a revocation, is Unknown, never an error with no JSON.
+        Err(e) if verb == "status" => {
+            let status = publication_status(dir, cli, BrokerStatus::Unknown(e));
+            println!(
+                "{}",
+                serde_json::to_string(&status).map_err(|_| "could not encode broker status")?
+            );
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
+    };
+    let io: &dyn BrokerIo = &io;
     match verb {
         "argv" => {
-            let dir = dir.as_deref().expect("validated directory");
             let argv = if host_login(cli) {
                 let env: Vec<(String, String)> = std::env::vars_os()
                     .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                     .collect();
-                prepare_host_login_argv(&rt, &gw, dir, cli, &env)?
+                prepare_host_login_argv(io, dir, cli, &env)?
             } else {
-                let image = crate::container_floor::ensure_seat_image(&rt, cli)?;
-                prepare_login_argv(&rt, &gw, dir, cli, &image)?
+                prepare_login_argv(io, dir, cli)?
             };
             println!(
                 "{}",
@@ -3178,8 +3331,7 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
             Ok(0)
         }
         "ingest" => {
-            let dir = dir.as_deref().expect("validated by gateway_for_dir");
-            let report = ingest_and_route(&rt, &gw, dir, cli)?;
+            let report = ingest_and_route(io, dir, cli)?;
             println!(
                 "{}",
                 serde_json::to_string(&report).map_err(|_| "could not encode ingest report")?
@@ -3188,12 +3340,10 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
         }
         "status" => {
             let status = with_last_refresh(
-                broker_status(&rt, &gw, cli),
-                dir.as_deref()
-                    .and_then(|d| crate::seat_refresh::last_refresh(d, cli)),
+                broker_status(io, cli),
+                crate::seat_refresh::last_refresh(dir, cli),
             );
-            let status =
-                publication_status(dir.as_deref().expect("validated directory"), cli, status);
+            let status = publication_status(dir, cli, status);
             let rc = if matches!(status, BrokerStatus::Unknown(_)) {
                 1
             } else {
@@ -3206,13 +3356,11 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
             Ok(rc)
         }
         "sign-out" => {
-            let dir = dir.as_deref().expect("validated by gateway_for_dir");
-            sign_out_and_route(&rt, &gw, dir, cli)?;
+            sign_out_and_route(io, dir, cli)?;
             Ok(0)
         }
         "refresh" => {
-            let dir = dir.as_deref().expect("validated by gateway_for_dir");
-            let outcome = crate::seat_refresh::refresh(&rt, &gw, dir, cli, true)?;
+            let outcome = crate::seat_refresh::refresh(io, dir, cli, true)?;
             println!(
                 "{}",
                 serde_json::to_string(&outcome).map_err(|_| "could not encode the outcome")?
@@ -3248,6 +3396,11 @@ pub fn seat_login_main(args: &[String]) -> i32 {
         1
     }
 }
+
+/// The state machine over its transport seam (k8s-swap B-4), with an in-memory transport.
+#[cfg(all(test, unix))]
+#[path = "seat_login_io_tests.rs"]
+mod io_tests;
 
 /// agy's API-key sign-in: the paste, the broker kind, the route, the seat (and LIVE, end to end).
 #[cfg(all(test, unix))]
@@ -3348,7 +3501,7 @@ esac
     /// Write `content` at `path` in `cli`'s open host login home (what the host CLI leaves).
     #[cfg(unix)]
     fn host_input(fake: &FakeRuntime, cli: &str, path: &str, content: &str) {
-        let session = read_session(&fake.dir, &fake.gw, cli)
+        let session = read_session(&fake.dir, cli)
             .unwrap()
             .expect("an open login session");
         let file = login_home(&fake.dir, &session).join(path);
@@ -3424,9 +3577,12 @@ esac
         )
         .unwrap();
         assert_eq!(
-            read_broker_record(&fake.rt, &fake.gw, "claude.credentials.json")
-                .unwrap()
-                .unwrap(),
+            read_broker_record(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                "claude.credentials.json"
+            )
+            .unwrap()
+            .unwrap(),
             b"FAKE-record"
         );
         crate::seat_gateway::remove_broker_file(
@@ -3456,12 +3612,12 @@ esac
         let live = UnitKey::new("FAKE-run", "FAKE-unit", "claude");
         register_unit(&fake.dir, live.clone()).unwrap();
         let before = std::fs::read(fake.dir.join("config/units.json")).unwrap();
-        let argv =
-            prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").unwrap();
+        let argv = prepare_docker_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image")
+            .unwrap();
         assert!(argv
             .windows(2)
             .any(|w| w[0] == "--network" && w[1] == fake.gw.external_network));
-        prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").unwrap();
+        prepare_docker_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("config/units.json")).unwrap(),
             before
@@ -3469,16 +3625,32 @@ esac
         assert!(!fake.calls().contains("container inspect"));
         assert!(!fake.calls().contains("cat > /v/"));
         std::fs::write(fake.dir.join("network"), "bridge true").unwrap();
-        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").is_err());
+        assert!(
+            prepare_docker_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image")
+                .is_err()
+        );
         std::fs::write(fake.dir.join("network"), "overlay false").unwrap();
-        assert!(prepare_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image").is_err());
+        assert!(
+            prepare_docker_login_argv(&fake.rt, &fake.gw, &fake.dir, "claude", "FAKE-image")
+                .is_err()
+        );
 
         // First ingest has no broker volume yet; initialization keeps existing files, too.
         std::fs::write(fake.dir.join("volumes"), "").unwrap();
         std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-live-claude").unwrap();
-        new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("config/units.json")).unwrap(),
             before
@@ -3531,16 +3703,24 @@ esac
         let rescue = crate::seat_refresh::rescue_path(&fake.dir, "claude");
         crate::seat_refresh::create_private_file(&rescue, rescued.to_string().as_bytes()).unwrap();
         std::fs::write(fake.dir.join("fail_claude.credentials.json.next"), "").unwrap();
-        assert!(
-            crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude").is_err()
-        );
+        assert!(crate::seat_refresh::repair_refresh(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude"
+        )
+        .is_err());
         assert!(rescue.exists());
         assert_eq!(
             std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
             old.to_string()
         );
         std::fs::remove_file(fake.dir.join("fail_claude.credentials.json.next")).unwrap();
-        crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        crate::seat_refresh::repair_refresh(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert!(!rescue.exists());
         assert!(!pending.exists());
         assert_eq!(
@@ -3562,8 +3742,12 @@ esac
             std::fs::write(&pending, marker).unwrap();
             std::fs::write(fake.dir.join("calls"), "").unwrap();
             assert_eq!(
-                crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude")
-                    .unwrap_err(),
+                crate::seat_refresh::repair_refresh(
+                    &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                    &fake.dir,
+                    "claude"
+                )
+                .unwrap_err(),
                 "rotated credential not yet stored in the broker"
             );
             assert!(pending.exists());
@@ -3576,7 +3760,12 @@ esac
         }
         // Only a fully committed generation may recover from current after `.next` removal.
         std::fs::write(&pending, "rotated credential stored").unwrap();
-        crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        crate::seat_refresh::repair_refresh(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert!(!pending.exists());
         // codex lg-r4: a staged record with no pending marker can only be an orphan writer's
         // (a real one always writes the marker before staging): it is discarded, never served.
@@ -3587,7 +3776,12 @@ esac
             orphan.to_string(),
         )
         .unwrap();
-        crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        crate::seat_refresh::repair_refresh(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
             rescued.to_string()
@@ -3605,7 +3799,12 @@ esac
         }
         for recovery in 0..3 {
             let fake = FakeRuntime::new();
-            new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+            new_session(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "claude",
+            )
+            .unwrap();
             let record = oauth(9_000_000_000_000);
             let journal = vec![
                 ("claude.credentials.json", record.to_string()),
@@ -3635,7 +3834,12 @@ esac
             crate::seat_refresh::create_private_file(&rescue, record.to_string().as_bytes())
                 .unwrap();
             std::fs::write(fake.dir.join("fail_remove_claude.ingest.next"), "").unwrap();
-            assert!(sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").is_err());
+            assert!(sign_out_and_route(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "claude"
+            )
+            .is_err());
             assert!(signout_path(&fake.dir, "claude").exists());
             assert!(std::fs::read(fake.dir.join("broker/anthropic.token"))
                 .unwrap()
@@ -3649,18 +3853,30 @@ esac
             std::fs::write(fake.dir.join("calls"), "").unwrap();
             let repair = || -> Result<(), String> {
                 match recovery {
-                    0 => {
-                        crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", false)
-                            .map(|_| ())
-                    }
+                    0 => crate::seat_refresh::refresh(
+                        &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                        &fake.dir,
+                        "claude",
+                        false,
+                    )
+                    .map(|_| ()),
                     1 => {
                         let _lock = crate::seat_refresh::mutation_lock(&fake.dir)?;
-                        repair_ingest(&fake.rt, &fake.gw, &fake.dir, "claude").map(|_| ())
+                        repair_ingest(
+                            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                            &fake.dir,
+                            "claude",
+                        )
+                        .map(|_| ())
                     }
                     _ => {
                         let _lock = crate::seat_refresh::mutation_lock(&fake.dir)?;
-                        crate::seat_refresh::repair_refresh(&fake.rt, &fake.gw, &fake.dir, "claude")
-                            .map(|_| ())
+                        crate::seat_refresh::repair_refresh(
+                            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                            &fake.dir,
+                            "claude",
+                        )
+                        .map(|_| ())
                     }
                 }
             };
@@ -3698,46 +3914,79 @@ esac
             return;
         }
         let fake = FakeRuntime::new();
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
         let mut invalid = chatgpt();
         invalid["tokens"]["account_id"] = json!("FAKE\r\nx-evil: 1");
         host_input(&fake, "codex", "codex/auth.json", &invalid.to_string());
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex"
+        )
+        .is_err());
         assert!(!fake.calls().contains("cat > /v/"));
         // Nothing usable: the host login is over and its home is gone.
-        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         assert!(!login_home(&fake.dir, &session).exists());
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
         std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex"
+        )
+        .is_err());
         assert!(fake.calls().contains("cat > /v/.openai.token.new"));
         assert_eq!(
-            read_session(&fake.dir, &fake.gw, "codex").unwrap(),
+            read_session(&fake.dir, "codex").unwrap(),
             Some(session.clone())
         );
         std::fs::remove_file(fake.dir.join("fail_publish")).unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert!(!login_home(&fake.dir, &session).exists());
-        assert!(read_session(&fake.dir, &fake.gw, "codex")
-            .unwrap()
-            .is_none());
+        assert!(read_session(&fake.dir, "codex").unwrap().is_none());
         // A login container keeps its session (and volume) for a retry until removal succeeds.
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
         std::fs::write(fake.dir.join("fail_remove"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").is_err());
-        assert_eq!(
-            read_session(&fake.dir, &fake.gw, "claude").unwrap(),
-            Some(session)
-        );
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude"
+        )
+        .is_err());
+        assert_eq!(read_session(&fake.dir, "claude").unwrap(), Some(session));
         std::fs::remove_file(fake.dir.join("fail_remove")).unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert!(fake.calls().contains("volume rm"));
-        assert!(read_session(&fake.dir, &fake.gw, "claude")
-            .unwrap()
-            .is_none());
+        assert!(read_session(&fake.dir, "claude").unwrap().is_none());
     }
 
     /// codex lg-r4: the session marker is the only record of the credential-bearing login
@@ -3762,8 +4011,18 @@ esac
     fn new_login_sessions_remove_previous_volume_and_ingest_only_recorded_session() {
         use std::os::unix::fs::PermissionsExt;
         let fake = FakeRuntime::new();
-        let first = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
-        let second = new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        let first = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
+        let second = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert_ne!(first, second);
         let calls = fake.calls();
         assert!(
@@ -3771,7 +4030,7 @@ esac
                 < calls.find(&format!("volume create {second}")).unwrap()
         );
         assert_eq!(
-            read_session(&fake.dir, &fake.gw, "claude").unwrap(),
+            read_session(&fake.dir, "claude").unwrap(),
             Some(second.clone())
         );
         assert_eq!(
@@ -3784,7 +4043,12 @@ esac
         );
         std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert!(fake.calls().contains(&format!("{second}:/in:ro")));
         assert!(!fake.calls().contains(&first));
     }
@@ -3799,7 +4063,12 @@ esac
         }
         for sign_out in [false, true] {
             let fake = FakeRuntime::new();
-            new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+            new_session(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "codex",
+            )
+            .unwrap();
             host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
             std::fs::write(fake.dir.join("calls"), "").unwrap();
             let held = crate::seat_refresh::mutation_lock(&fake.dir).unwrap();
@@ -3808,9 +4077,10 @@ esac
             let worker = std::thread::spawn(move || {
                 tx.send(()).unwrap();
                 if sign_out {
-                    sign_out_and_route(&rt, &gw, &dir, "codex")
+                    sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
                 } else {
-                    ingest_and_route(&rt, &gw, &dir, "codex").map(|_| ())
+                    ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+                        .map(|_| ())
                 }
             });
             rx.recv().unwrap();
@@ -3836,12 +4106,22 @@ esac
         }
         let fake = FakeRuntime::new();
         std::fs::write(fake.dir.join("fail_probe"), "").unwrap();
-        let error = sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
+        let error = sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap_err();
         assert!(error.contains("sign-out could not confirm"));
         assert!(fake.calls().contains("cat > /v/.config.json.new"));
         assert!(fake.calls().contains("read K;"));
         std::fs::remove_file(fake.dir.join("fail_probe")).unwrap();
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
     }
 
     /// codex c6-r3: arm finishes a published sign-in's interrupted cleanup (its login volume holds
@@ -3851,19 +4131,31 @@ esac
     fn arm_finishes_a_committed_sign_ins_cleanup_and_leaves_an_open_login_alone() {
         let fake = FakeRuntime::new();
         std::fs::write(fake.dir.join("broker/pi.token"), "FAKE-key").unwrap();
-        let open = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let open = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         assert_eq!(
-            seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap(),
+            seat_sign_in(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "pi"
+            )
+            .unwrap(),
             crate::seat_credentials::CredentialKind::ProviderKey.into()
         );
-        assert_eq!(
-            read_session(&fake.dir, &fake.gw, "pi").unwrap(),
-            Some(open.clone())
-        );
+        assert_eq!(read_session(&fake.dir, "pi").unwrap(), Some(open.clone()));
         assert!(login_home(&fake.dir, &open).exists());
         write_session_state(&fake.dir, "pi", &open, true).unwrap();
-        assert!(seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "pi").is_ok());
-        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+        assert!(seat_sign_in(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi"
+        )
+        .is_ok());
+        assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
         assert!(!login_home(&fake.dir, &open).exists());
     }
 
@@ -3871,17 +4163,32 @@ esac
     #[test]
     fn committed_ingest_retry_preserves_since_rotated_record() {
         let fake = FakeRuntime::new();
-        new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
         std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex"
+        )
+        .is_err());
         assert!(session_committed(&fake.dir, "codex").unwrap());
         let mut rotated = chatgpt();
         rotated["tokens"]["refresh_token"] = json!("FAKE-rotated-R2");
         std::fs::write(fake.dir.join("broker/codex.auth.json"), rotated.to_string()).unwrap();
         std::fs::remove_file(fake.dir.join("fail_publish")).unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert!(!fake.calls().contains("cat > /v/.codex.auth.json.new"));
         let current: Value = serde_json::from_slice(
             &std::fs::read(fake.dir.join("broker/codex.auth.json")).unwrap(),
@@ -3894,7 +4201,12 @@ esac
     #[test]
     fn partial_ingest_is_unknown_and_refresh_repairs_before_not_due() {
         let fake = FakeRuntime::new();
-        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
@@ -3905,13 +4217,24 @@ esac
         )
         .unwrap();
         std::fs::write(fake.dir.join("fail_anthropic.token"), "").unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").is_err());
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude"
+        )
+        .is_err());
         assert!(
             matches!(publication_status(&fake.dir, "claude", BrokerStatus::SignedOut), BrokerStatus::Unknown(ref reason) if reason == "sign-in incomplete")
         );
         std::fs::remove_file(fake.dir.join("fail_anthropic.token")).unwrap();
         assert!(matches!(
-            crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", false).unwrap(),
+            crate::seat_refresh::refresh(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "claude",
+                false
+            )
+            .unwrap(),
             crate::seat_refresh::Outcome::NotDue { .. }
         ));
         assert_eq!(
@@ -3941,7 +4264,11 @@ esac
                     error: None,
                 }),
             );
-            let result = sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "codex");
+            let result = sign_out_and_route(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "codex",
+            );
             assert_eq!(result.is_ok(), state != "unknown");
             assert!(!fake.calls().contains("read K;"));
             let revoking: Vec<String> = std::fs::read(fake.dir.join("config/revoking.json"))
@@ -3993,7 +4320,13 @@ esac
             }),
         );
         assert!(matches!(
-            crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", false).unwrap(),
+            crate::seat_refresh::refresh(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "claude",
+                false
+            )
+            .unwrap(),
             crate::seat_refresh::Outcome::NotDue { .. }
         ));
         assert_eq!(
@@ -4010,7 +4343,10 @@ esac
             .exists());
         assert!(matches!(
             with_last_refresh(
-                broker_status(&fake.rt, &fake.gw, "claude"),
+                broker_status(
+                    &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                    "claude"
+                ),
                 crate::seat_refresh::last_refresh(&fake.dir, "claude")
             ),
             BrokerStatus::SignedIn { .. }
@@ -4036,12 +4372,22 @@ esac
         )
         .unwrap();
         std::fs::write(fake.dir.join("fail_cleanup"), "").unwrap();
-        assert!(sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").is_err());
+        assert!(sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude"
+        )
+        .is_err());
         assert!(!fake.calls().contains(": > /in/"));
         assert!(crate::seat_gateway::unsettled_path(&fake.dir, "claude").exists());
         std::fs::remove_file(fake.dir.join("fail_cleanup")).unwrap();
         std::fs::write(fake.dir.join("state"), "stopped").unwrap();
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert!(!crate::seat_gateway::unsettled_path(&fake.dir, "claude").exists());
         assert!(fake.calls().contains(": > /in/anthropic.token"));
     }
@@ -4066,7 +4412,12 @@ esac
                 },
             )
             .unwrap();
-            sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+            sign_out_and_route(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "codex",
+            )
+            .unwrap();
             assert_eq!(
                 fake.calls().contains("cat > /v/.config.json.new"),
                 config_exists
@@ -4237,13 +4588,23 @@ esac
         )
         .unwrap();
         std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-old-access").unwrap();
-        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         std::fs::write(
             fake.dir.join("setup-token"),
             "sk-ant-oat01-FAKE-setup-0001\n",
         )
         .unwrap();
-        let report = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        let report = ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert_eq!(report.files, vec!["anthropic.token".to_string()]);
         assert_eq!(report.expires_at, None);
         assert_eq!(
@@ -4256,27 +4617,55 @@ esac
                 .is_empty()
         );
         assert_eq!(
-            broker_status(&fake.rt, &fake.gw, "claude"),
+            broker_status(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                "claude"
+            ),
             BrokerStatus::SignedIn { expires_at: None }
         );
-        let sign_in = seat_sign_in(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        let sign_in = seat_sign_in(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         assert_eq!(
             sign_in.kind,
             Some(crate::seat_credentials::CredentialKind::ClaudeOauth)
         );
         assert_eq!(
-            claude_seat_token(&fake.rt, &fake.gw, &fake.dir).unwrap(),
+            claude_seat_token(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir
+            )
+            .unwrap(),
             "sk-ant-oat01-FAKE-setup-0001"
         );
         assert_eq!(
-            crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", true).unwrap(),
+            crate::seat_refresh::refresh(
+                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+                &fake.dir,
+                "claude",
+                true
+            )
+            .unwrap(),
             crate::seat_refresh::Outcome::NotRefreshable,
             "a pass-through token is never renewed by the broker"
         );
         // A bad paste is refused before the broker changes, and never repeated.
-        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         std::fs::write(fake.dir.join("setup-token"), "FAKE-pasted-url").unwrap();
-        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
+        let err = ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap_err();
         assert!(
             err.contains("claude setup-token") && !err.contains("FAKE"),
             "{err}"
@@ -4286,9 +4675,19 @@ esac
             b"sk-ant-oat01-FAKE-setup-0001"
         );
         // Nothing pasted back (the window closed, or the script stopped): the error says so.
-        new_session(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap();
+        new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap();
         std::fs::remove_file(fake.dir.join("setup-token")).unwrap();
-        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "claude").unwrap_err();
+        let err = ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+        )
+        .unwrap_err();
         assert!(
             err.contains("signed out") && err.contains("nor pasted back"),
             "{err}"
@@ -5082,12 +5481,17 @@ esac
         )
         .unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
-        let err = crate::seat_refresh::refresh(&fake.rt, &fake.gw, &fake.dir, "claude", false)
-            .unwrap_err();
+        let err = crate::seat_refresh::refresh(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "claude",
+            false,
+        )
+        .unwrap_err();
         assert_eq!(err, crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN);
         assert!(matches!(
             with_last_refresh(
-                broker_status(&fake.rt, &fake.gw, "claude"),
+                broker_status(&crate::seat_login::DockerIo::new(&fake.rt, &fake.gw), "claude"),
                 crate::seat_refresh::last_refresh(&fake.dir, "claude")
             ),
             BrokerStatus::RefreshFailing { ref reason, .. } if reason == crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN
@@ -5364,7 +5768,12 @@ esac
         }
         use std::os::unix::fs::PermissionsExt;
         let fake = FakeRuntime::new();
-        let first = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let first = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         let home = login_home(&fake.dir, &first);
         for d in std::iter::once(home.clone()).chain(host_login_dirs(&home, "codex")) {
             let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
@@ -5376,7 +5785,12 @@ esac
         let other = login_home(&fake.dir, &format!("{}-login-pi-0000abcd", fake.gw.name));
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(home.join("codex/auth.json"), chatgpt().to_string()).unwrap();
-        let second = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let second = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert!(
             !home.exists() && !orphan.exists(),
             "previous and orphaned homes are swept"
@@ -5384,13 +5798,18 @@ esac
         assert!(other.exists(), "another agent's login is left alone");
         assert!(!fake.calls().contains("volume create"), "no login volume");
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("broker/openai.token")).unwrap(),
             b"FAKE-codex-access"
         );
         assert!(!login_home(&fake.dir, &second).exists());
-        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
     }
 
     /// A cancelled or failed host login (nothing usable in its home) and a home that smuggles a
@@ -5399,15 +5818,30 @@ esac
     #[test]
     fn a_host_login_that_left_nothing_usable_is_cleaned_up_before_any_broker_change() {
         let fake = FakeRuntime::new();
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         std::fs::write(fake.dir.join("calls"), "").unwrap();
-        let err = ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap_err();
+        let err = ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap_err();
         assert!(err.contains("pi"), "{err}");
         assert!(!login_home(&fake.dir, &session).exists());
-        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
         assert!(!fake.calls().contains("cat > /v/"), "no broker write");
         // A symlinked credential file is refused, never followed.
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         let elsewhere = fake.dir.join("elsewhere.json");
         std::fs::write(&elsewhere, chatgpt().to_string()).unwrap();
         std::os::unix::fs::symlink(
@@ -5415,15 +5849,30 @@ esac
             login_home(&fake.dir, &session).join("codex/auth.json"),
         )
         .unwrap();
-        assert!(ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").is_err());
+        assert!(ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex"
+        )
+        .is_err());
         assert!(!login_home(&fake.dir, &session).exists());
         assert!(elsewhere.exists(), "the link's target is never touched");
         assert!(!fake.calls().contains("cat > /v/"));
         // Sign-out removes an open host login's home too.
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "opencode").unwrap();
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "opencode").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "opencode",
+        )
+        .unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "opencode",
+        )
+        .unwrap();
         assert!(!login_home(&fake.dir, &session).exists());
-        assert_eq!(read_session(&fake.dir, &fake.gw, "opencode").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "opencode").unwrap(), None);
     }
 
     /// The host CLI is found on the daemon's PATH and must answer a version; the session it
@@ -5440,18 +5889,28 @@ esac
         let bin = fake.dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         let env = |path: &Path| vec![("PATH".to_string(), path.display().to_string())];
-        let err = prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", &env(&bin))
-            .unwrap_err();
+        let err = prepare_host_login_argv(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+            &env(&bin),
+        )
+        .unwrap_err();
         assert!(err.contains("codex is not installed on this host"), "{err}");
-        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         // A stand-in that records where it ran and with which environment.
         crate::test_env::install_stub(
             &bin.join("codex"),
             "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$HOME\" \"$CODEX_HOME\" \"${OPENAI_API_KEY:-unset}\" > \"$HOME/../probe\"\necho 'codex-cli 9.9.9'\n",
         );
-        let argv =
-            prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "codex", &env(&bin)).unwrap();
-        let session = read_session(&fake.dir, &fake.gw, "codex").unwrap().unwrap();
+        let argv = prepare_host_login_argv(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+            &env(&bin),
+        )
+        .unwrap();
+        let session = read_session(&fake.dir, "codex").unwrap().unwrap();
         let home = login_home(&fake.dir, &session);
         assert_eq!(argv.last().unwrap(), "cli_auth_credentials_store=\"file\"");
         let banner = &argv[argv.iter().position(|a| a == "wicked-login").unwrap() + 1];
@@ -5490,10 +5949,15 @@ esac
         assert!(pid.parse::<i32>().is_ok_and(|p| p > 1), "{pid}");
         // Not a coding agent (no version): refused, and its session removed.
         crate::test_env::install_stub(&bin.join("pi"), "#!/bin/sh\necho 'not that tool'\n");
-        let err =
-            prepare_host_login_argv(&fake.rt, &fake.gw, &fake.dir, "pi", &env(&bin)).unwrap_err();
+        let err = prepare_host_login_argv(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+            &env(&bin),
+        )
+        .unwrap_err();
         assert!(err.contains("answered no version"), "{err}");
-        assert_eq!(read_session(&fake.dir, &fake.gw, "pi").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
     }
 
     /// codex review r1 #1: a sign-out (or a new sign-in) while the host login terminal is still
@@ -5514,7 +5978,12 @@ esac
         }
         use std::os::unix::process::CommandExt;
         let fake = FakeRuntime::new();
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — a stand-in login: records its pid as the login shell does.
         let mut login = std::process::Command::new("/bin/sh")
@@ -5530,13 +5999,23 @@ esac
         while !pid_file.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         let status = login.wait().unwrap();
         assert!(!status.success(), "the login was ended: {status:?}");
         assert!(!login_home(&fake.dir, &session).exists());
         assert!(!pid_file.exists());
         // A pid file older than the process it names is a recycled pid: left alone.
-        let session = new_session(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        let session = new_session(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — an unrelated process that happens to lead its group.
         let mut other = std::process::Command::new("sleep")
@@ -5552,7 +6031,12 @@ esac
             .unwrap()
             .set_modified(old)
             .unwrap();
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "pi").unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "pi",
+        )
+        .unwrap();
         assert!(
             other.try_wait().unwrap().is_none(),
             "a recycled pid is never signalled"
@@ -5579,16 +6063,26 @@ esac
         write_session(&fake.dir, "codex", &legacy).unwrap();
         // Its credential is still ingested from the volume, as before the upgrade.
         std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
-        ingest_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        ingest_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert!(fake.calls().contains(&format!("{legacy}:/in:ro")));
         assert!(fake.calls().contains(&format!("volume rm {legacy}")));
-        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         // A sign-out of an open legacy session removes its volume too.
         std::fs::write(fake.dir.join("calls"), "").unwrap();
         write_session(&fake.dir, "codex", &legacy).unwrap();
-        sign_out_and_route(&fake.rt, &fake.gw, &fake.dir, "codex").unwrap();
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+            &fake.dir,
+            "codex",
+        )
+        .unwrap();
         assert!(fake.calls().contains(&format!("volume rm {legacy}")));
-        assert_eq!(read_session(&fake.dir, &fake.gw, "codex").unwrap(), None);
+        assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
     }
 
     /// codex review r1 #4: no component is followed through a symlink and no FIFO is waited on.
@@ -6799,9 +7293,10 @@ esac
             }
             last
         };
-        let report = ingest_and_route(&rt, &gw, &dir, "codex").expect("ingested");
+        let report = ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+            .expect("ingested");
         let signed_in = ask(&|b| b.contains("FAKE-codex-access") && b.contains("FAKE-account-id"));
-        let status_in = broker_status(&rt, &gw, "codex");
+        let status_in = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "codex");
         let login_gone = !login_home(&dir, &volume).exists();
         // The broker's one refresher (core#1024): a forced refresh is codex's own (a FAKE codex
         // on this host renews its auth.json); the gateway serves the new token with no restart
@@ -6811,22 +7306,38 @@ esac
             &[("FAKE-codex-access", "FAKE-codex-access-v2")],
         );
         *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = Some(dir.join("bin"));
-        let refreshed = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", true);
+        let refreshed = crate::seat_refresh::refresh(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "codex",
+            true,
+        );
         let after_refresh = ask(&|b| b.contains("FAKE-codex-access-v2"));
-        let not_due = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", false);
+        let not_due = crate::seat_refresh::refresh(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "codex",
+            false,
+        );
         // codex refuses: the refresh fails, the status says so, the served token stays.
         std::fs::write(dir.join("refuse-codex"), "").unwrap();
-        let refused = crate::seat_refresh::refresh(&rt, &gw, &dir, "codex", true);
+        let refused = crate::seat_refresh::refresh(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "codex",
+            true,
+        );
         let status_failing = with_last_refresh(
-            broker_status(&rt, &gw, "codex"),
+            broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "codex"),
             crate::seat_refresh::last_refresh(&dir, "codex"),
         );
         *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = None;
         let renewals = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap_or_default();
-        sign_out_and_route(&rt, &gw, &dir, "codex").expect("signed out");
+        sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+            .expect("signed out");
         let signed_out =
             ask(&|b| !b.contains("FAKE-codex-access") && !b.contains("FAKE-account-id"));
-        let status_out = broker_status(&rt, &gw, "codex");
+        let status_out = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "codex");
         let logs = run(&["logs", &gw.name]);
         let all_logs = format!(
             "{}{}",
@@ -6981,12 +7492,14 @@ esac
         login["github-copilot"]["access"] =
             json!("tid=FAKE-pi-copilot;proxy-ep=proxy.individual.githubcopilot.com");
         let volume = host_login_with(&dir, &gw.name, "pi", "pi/auth.json", &login.to_string());
-        let report = ingest_and_route(&rt, &gw, &dir, "pi").expect("ingested");
+        let report = ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "pi")
+            .expect("ingested");
         assert!(
             !login_home(&dir, &volume).exists(),
             "the throwaway home is removed"
         );
-        let sign_in = seat_sign_in(&rt, &gw, &dir, "pi").expect("pi is signed in");
+        let sign_in = seat_sign_in(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "pi")
+            .expect("pi is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
             format!(
@@ -7099,7 +7612,12 @@ esac
             ],
         );
         *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = Some(dir.join("bin"));
-        let refreshed = crate::seat_refresh::refresh(&rt, &gw, &dir, "pi", true);
+        let refreshed = crate::seat_refresh::refresh(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "pi",
+            true,
+        );
         *crate::seat_refresh::TEST_CLI_DIR.lock().unwrap() = None;
         let renewals = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap_or_default();
         let after_refresh = {
@@ -7114,14 +7632,15 @@ esac
             }
             last
         };
-        let status_in = broker_status(&rt, &gw, "pi");
-        sign_out_and_route(&rt, &gw, &dir, "pi").expect("signed out");
+        let status_in = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "pi");
+        sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "pi")
+            .expect("signed out");
         let before_out = upstream().len();
         for port in [4006, 4007, 4008] {
             curl(port, &key.key);
         }
         let after_out = upstream()[before_out..].to_string();
-        let status_out = broker_status(&rt, &gw, "pi");
+        let status_out = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "pi");
         let logs = run(&["logs", &gw.name]);
         let gw_logs = format!(
             "{}{}",
@@ -7328,12 +7847,22 @@ esac
             "data/opencode/wicked-auth.json",
             &login.to_string(),
         );
-        let report = ingest_and_route(&rt, &gw, &dir, "opencode").expect("ingested");
+        let report = ingest_and_route(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "opencode",
+        )
+        .expect("ingested");
         assert!(
             !login_home(&dir, &volume).exists(),
             "the throwaway home is removed"
         );
-        let sign_in = seat_sign_in(&rt, &gw, &dir, "opencode").expect("opencode is signed in");
+        let sign_in = seat_sign_in(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "opencode",
+        )
+        .expect("opencode is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
             format!(
@@ -7522,15 +8051,20 @@ esac
             "--standalone",
         ]);
         let exported: Value = serde_json::from_slice(&exported.stdout).unwrap_or(json!([]));
-        let status_in = broker_status(&rt, &gw, "opencode");
-        sign_out_and_route(&rt, &gw, &dir, "opencode").expect("signed out");
+        let status_in = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "opencode");
+        sign_out_and_route(
+            &crate::seat_login::DockerIo::new(&rt, &gw),
+            &dir,
+            "opencode",
+        )
+        .expect("signed out");
         let before_out = upstream().len();
         for port in [4009, 4010, 4011] {
             curl(port, &key.key);
         }
         std::thread::sleep(Duration::from_secs(1));
         let after_out = upstream()[before_out..].to_string();
-        let status_out = broker_status(&rt, &gw, "opencode");
+        let status_out = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "opencode");
         let logs = run(&["logs", &gw.name]);
         let gw_logs = format!(
             "{}{}",
@@ -7879,11 +8413,12 @@ esac
         // at sign-in; both reads go to the stub here.
         *crate::seat_refresh::COPILOT_TEST_ORIGIN.lock().unwrap() =
             Some(format!("http://{stub}:8080"));
-        let report = ingest_and_route(&rt, &gw, &dir, "copilot");
+        let report = ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "copilot");
         *crate::seat_refresh::COPILOT_TEST_ORIGIN.lock().unwrap() = None;
         let report = report.expect("ingested");
         let account = crate::seat_gateway::copilot_account(&dir);
-        let sign_in = seat_sign_in(&rt, &gw, &dir, "copilot").expect("copilot is signed in");
+        let sign_in = seat_sign_in(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "copilot")
+            .expect("copilot is signed in");
         let upstream = || {
             let o = run(&["logs", &stub]);
             format!(
@@ -7987,13 +8522,14 @@ esac
             }
             std::thread::sleep(Duration::from_millis(250));
         }
-        let status_in = broker_status(&rt, &gw, "copilot");
-        sign_out_and_route(&rt, &gw, &dir, "copilot").expect("signed out");
+        let status_in = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "copilot");
+        sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "copilot")
+            .expect("signed out");
         let before_out = upstream().len();
         curl(&key.key);
         std::thread::sleep(Duration::from_secs(1));
         let after_out = upstream()[before_out..].to_string();
-        let status_out = broker_status(&rt, &gw, "copilot");
+        let status_out = broker_status(&crate::seat_login::DockerIo::new(&rt, &gw), "copilot");
         let logs = run(&["logs", &gw.name]);
         let gw_logs = format!(
             "{}{}",
@@ -8347,26 +8883,32 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
         // 2a. A sign-in whose tab closed mid-login: crew kills the terminal's client, which leaves
         // `docker run -it` running on the login volume. Ingest (crew runs it on the terminal's
         // exit) stops it; nothing was signed in; the next sign-in opens normally.
-        let abandoned = prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("login argv");
-        let abandoned_volume = read_session(&dir, &gw, "claude").unwrap().unwrap();
+        let abandoned =
+            prepare_docker_login_argv(&rt, &gw, &dir, "claude", &fake).expect("login argv");
+        let abandoned_volume = read_session(&dir, "claude").unwrap().unwrap();
         let _ = login_terminal(&abandoned, None);
         let lingered = running(&abandoned_volume);
-        let abandoned_ingest = ingest_and_route(&rt, &gw, &dir, "claude").map(|r| r.files);
+        let abandoned_ingest =
+            ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "claude")
+                .map(|r| r.files);
         let stopped = !running(&abandoned_volume);
         // 2a'. One an earlier engine left (named `wicked-login-<cli>-<hex>`, not after its session).
-        prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("argv");
-        let legacy_volume = read_session(&dir, &gw, "claude").unwrap().unwrap();
+        prepare_docker_login_argv(&rt, &gw, &dir, "claude", &fake).expect("argv");
+        let legacy_volume = read_session(&dir, "claude").unwrap().unwrap();
         let legacy = format!("wicked-login-claude-{}", uuid::Uuid::new_v4().simple());
         let mount = format!("{legacy_volume}:/home/login");
         let o = run(&[
             "run", "-d", "--name", &legacy, "-v", &mount, &fake, "sleep", "300",
         ]);
         assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-        let legacy_ingest = ingest_and_route(&rt, &gw, &dir, "claude").map(|r| r.files);
+        let legacy_ingest =
+            ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "claude")
+                .map(|r| r.files);
         let legacy_stopped = !running(&legacy);
         // 2b. Agents -> Sign in: the login argv crew runs, in the engine's PTY.
-        let login = prepare_login_argv(&rt, &gw, &dir, "claude", &fake).expect("the login argv");
-        let volume = read_session(&dir, &gw, "claude")
+        let login =
+            prepare_docker_login_argv(&rt, &gw, &dir, "claude", &fake).expect("the login argv");
+        let volume = read_session(&dir, "claude")
             .unwrap()
             .expect("a login session");
         let abandoned_gone = !volume_exists(&rt, &abandoned_volume).unwrap()
@@ -8377,7 +8919,8 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
             Some("sk-ant-oat01-FAKE-c6-setup"),
         );
         // 3. Crew's ingest on the terminal's exit.
-        let report = ingest_and_route(&rt, &gw, &dir, "claude").expect("ingested");
+        let report = ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "claude")
+            .expect("ingested");
         let login_gone = !volume_exists(&rt, &volume).unwrap();
         // 4. The agent's governed seat.
         let armed = seat(2).expect("a signed-in agent's seat arms");
@@ -8405,7 +8948,8 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
         }
         drop(armed.cleanup);
         // 5. Sign out: refused again.
-        sign_out_and_route(&rt, &gw, &dir, "claude").expect("signed out");
+        sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "claude")
+            .expect("signed out");
         let after = seat(3).map(|_| ()).unwrap_err();
         let logs = run(&["logs", &gw.name]);
         let gw_logs = format!(
@@ -8588,7 +9132,8 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
             "codex/auth.json",
             &serde_json::to_string(&chatgpt()).unwrap(),
         );
-        ingest_and_route(&rt, &gw, &dir, "codex").expect("ingested");
+        ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+            .expect("ingested");
         // A real linked run worktree with the engine's pin, as a governed unit has.
         let repo = base.join("repo");
         let wt = base.join("wt");
@@ -8707,7 +9252,8 @@ curl -s --max-time 8 -H "authorization: Bearer $CLAUDE_CODE_OAUTH_TOKEN" -H "$AN
             String::from_utf8_lossy(&logs.stdout),
             String::from_utf8_lossy(&logs.stderr)
         );
-        sign_out_and_route(&rt, &gw, &dir, "codex").expect("signed out");
+        sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+            .expect("signed out");
         run(&["rm", "-f", &stub, &gw.name]);
         run(&["network", "rm", &gw.external_network]);
         let (cfg, broker) = crate::seat_gateway::volumes(&gw);

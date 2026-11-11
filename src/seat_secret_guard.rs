@@ -208,10 +208,10 @@ pub(crate) fn from_broker(gateway_dir: Option<&Path>) -> Result<Vec<SeatSecret>,
 
 #[cfg(unix)]
 fn broker_token(dir: &Path) -> Result<Option<String>, String> {
-    let rt = crate::container_floor::runtime()
-        .map_err(|w| format!("no container runtime answered ({w:?})"))?;
-    let gw = crate::seat_gateway::Gateway::for_dir(dir);
-    crate::seat_login::claude_broker_token(&rt, &gw, dir)
+    // The broker lives on the daemon's cluster (k8s-swap B-4); a daemon with no gateway there
+    // yet holds no sign-in.
+    let io = crate::k8s::login::K8sIo::for_dir(dir, false)?;
+    crate::seat_login::claude_broker_token(&io, dir)
 }
 
 #[cfg(not(unix))]

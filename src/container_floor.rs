@@ -3491,6 +3491,17 @@ pub(crate) fn arm_noting(
         match gateway_dir.filter(|_| online) {
             Some(dir) => {
                 let gw = crate::k8s::gw::ensure(&kube, dir)?;
+                // The broker's one refresher runs beside this daemon's gateway (a credential that
+                // expired between runs is renewed, by its own CLI, before the seat starts). Each
+                // pass finds the gateway again (a quarantine re-creates it).
+                #[cfg(unix)]
+                {
+                    let (kube, dir) = (kube.clone(), dir.to_path_buf());
+                    crate::seat_refresh::start(&dir.clone(), move || {
+                        crate::k8s::login::K8sIo::attach(&kube, &dir, false)
+                            .map(|io| Box::new(io) as Box<dyn crate::seat_login::BrokerIo>)
+                    });
+                }
                 let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
                 // The agent's sign-in, read from the broker the gateway alone mounts.
                 let kind = crate::k8s::gw::seat_sign_in(&gw, cli)
