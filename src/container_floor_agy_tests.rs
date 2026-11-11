@@ -136,11 +136,15 @@ fn only_an_agy_seat_gets_the_pseudo_terminal_devices() {
 #[test]
 fn an_agy_seat_takes_its_stdin_from_a_pipe() {
     // Predicate only: these commands are never spawned.
+    // spawn-audit: test-only — never spawned; the predicate reads the program name.
     assert!(stdin_must_be_a_pipe(&Command::new("/usr/local/bin/agy")));
+    // spawn-audit: test-only — never spawned.
     assert!(stdin_must_be_a_pipe(&Command::new("agy")));
+    // spawn-audit: test-only — never spawned.
     let mut claude = Command::new("claude");
     claude.args(["-p", "agy"]);
     assert!(!stdin_must_be_a_pipe(&claude));
+    // spawn-audit: test-only — never spawned.
     let mut codex = Command::new("codex");
     codex.args(["exec", "--", "agy"]);
     assert!(!stdin_must_be_a_pipe(&codex));
