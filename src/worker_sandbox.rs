@@ -339,14 +339,18 @@ pub(crate) enum FloorUnarmed {
     ClusterUnreachable,
     /// Kubernetes runner: the agent-sandbox controller is absent, or not the pinned version.
     ControllerMissing,
+    // Constructed by the seat arm (B-2 of the stacked k8s-swap series); the allowance goes with it.
+    #[allow(dead_code)]
     /// Kubernetes runner: the seat's pod is waiting for room (its namespace quota or the node's
     /// memory): a wait, never the seat's failure.
     AdmissionPending,
+    #[allow(dead_code)]
     /// Kubernetes runner: the seat's image is not in the cluster's image store (pods never pull).
     ImageUnavailable,
     /// Kubernetes runner: the cluster refused the pod or one of its policies (PodSecurity,
     /// admission, a policy the engine requires that did not apply).
     PolicyRefused,
+    #[allow(dead_code)]
     /// Kubernetes runner: the exec stream to the seat was lost before the CLI's exit code was
     /// known: never read as the CLI's own result.
     ExecStreamLost,

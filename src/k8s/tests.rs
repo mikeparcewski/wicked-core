@@ -98,8 +98,15 @@ fn k8s_no_configured_cluster_is_no_cluster_never_the_current_context() {
     let err = resolve_settings(home.0.as_path(), None, None, None, None, on_path).unwrap_err();
     assert_eq!(err.0, FloorUnarmed::NoCluster);
     // An explicit context is honoured, on kubectl's own kubeconfig.
-    let k = resolve_settings(home.0.as_path(), None, None, Some("rancher-desktop"), None, on_path)
-        .unwrap();
+    let k = resolve_settings(
+        home.0.as_path(),
+        None,
+        None,
+        Some("rancher-desktop"),
+        None,
+        on_path,
+    )
+    .unwrap();
     assert_eq!(k.context, "rancher-desktop");
     assert_eq!(k.kubeconfig, None);
     // The engine's own kubeconfig, once installed, is the default.
@@ -301,7 +308,11 @@ fn k8s_the_broker_is_writable_only_in_the_writer_and_the_service_hides_readiness
         .as_array()
         .unwrap()
         .iter()
-        .chain(d["spec"]["template"]["spec"]["initContainers"].as_array().unwrap())
+        .chain(
+            d["spec"]["template"]["spec"]["initContainers"]
+                .as_array()
+                .unwrap(),
+        )
         .cloned()
         .collect();
     let mount = |c: &Value, path: &str| -> Value {
@@ -318,8 +329,14 @@ fn k8s_the_broker_is_writable_only_in_the_writer_and_the_service_hides_readiness
     assert_eq!(mount(gateway, "/broker")["readOnly"], true);
     assert_eq!(mount(gateway, "/cfg")["readOnly"], true);
     assert!(mount(writer, "/broker").get("readOnly").is_none());
-    assert_eq!(d["spec"]["template"]["spec"]["automountServiceAccountToken"], false);
-    assert_eq!(writer["restartPolicy"], "Always", "the writer is a native sidecar");
+    assert_eq!(
+        d["spec"]["template"]["spec"]["automountServiceAccountToken"],
+        false
+    );
+    assert_eq!(
+        writer["restartPolicy"], "Always",
+        "the writer is a native sidecar"
+    );
     for c in &cs {
         assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
     }
@@ -353,10 +370,7 @@ fn k8s_the_gateway_reaches_the_internet_and_named_host_ports_only() {
     let internet = &rules[0]["to"][0]["ipBlock"];
     assert_eq!(internet["cidr"], "0.0.0.0/0");
     for r in render::PRIVATE_RANGES {
-        assert!(internet["except"]
-            .as_array()
-            .unwrap()
-            .contains(&json!(r)));
+        assert!(internet["except"].as_array().unwrap().contains(&json!(r)));
     }
     let host = rules.last().unwrap();
     assert_eq!(host["to"][0]["ipBlock"]["cidr"], "192.168.5.2/32");
@@ -371,9 +385,13 @@ fn k8s_the_engine_account_cannot_change_what_it_does_not_own() {
         .iter()
         .find(|d| d["kind"] == "ValidatingAdmissionPolicy")
         .unwrap();
-    let cond = vap["spec"]["matchConditions"][0]["expression"].as_str().unwrap();
+    let cond = vap["spec"]["matchConditions"][0]["expression"]
+        .as_str()
+        .unwrap();
     assert!(cond.contains("system:serviceaccount:wicked-sys-o1:wicked-engine"));
-    let rule = vap["spec"]["validations"][0]["expression"].as_str().unwrap();
+    let rule = vap["spec"]["validations"][0]["expression"]
+        .as_str()
+        .unwrap();
     assert!(rule.contains("'wicked.dev/owner'] == 'o1'"));
     assert_eq!(vap["spec"]["failurePolicy"], "Fail");
     let ops = &vap["spec"]["matchConstraints"]["resourceRules"][0]["operations"];
@@ -408,9 +426,7 @@ fn k8s_the_controller_is_the_pinned_release() {
 /// namespace and loses only an earlier engine's pods.
 #[test]
 fn k8s_sweep_touches_only_this_daemons_labelled_namespaces() {
-    let ns = |name: &str, owner: &str, role: &str, run: &str| {
-        json!({"metadata": {"name": name, "labels": {OWNER_LABEL: owner, ROLE_LABEL: role, RUN_LABEL: run}}})
-    };
+    let ns = |name: &str, owner: &str, role: &str, run: &str| json!({"metadata": {"name": name, "labels": {OWNER_LABEL: owner, ROLE_LABEL: role, RUN_LABEL: run}}});
     let all = vec![
         ns("a", "me", "run", "r-live"),
         ns("b", "me", "run", "r-done"),
@@ -438,9 +454,18 @@ fn k8s_only_a_ready_undeleted_pod_is_running() {
         }
         p
     };
-    assert_eq!(cluster::running_pod(&[pod("a", "Pending", false, false)]), None);
-    assert_eq!(cluster::running_pod(&[pod("a", "Running", false, false)]), None);
-    assert_eq!(cluster::running_pod(&[pod("a", "Running", true, true)]), None);
+    assert_eq!(
+        cluster::running_pod(&[pod("a", "Pending", false, false)]),
+        None
+    );
+    assert_eq!(
+        cluster::running_pod(&[pod("a", "Running", false, false)]),
+        None
+    );
+    assert_eq!(
+        cluster::running_pod(&[pod("a", "Running", true, true)]),
+        None
+    );
     assert_eq!(
         cluster::running_pod(&[
             pod("a", "Running", true, true),
@@ -513,7 +538,10 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     assert!(render::pids_probe_verdict("").is_err());
     let pod = render::pids_probe_pod("ns", "o", "p", "wicked-floor:x");
     assert_eq!(pod["spec"]["automountServiceAccountToken"], false);
-    assert_eq!(pod["spec"]["containers"][0]["securityContext"]["readOnlyRootFilesystem"], true);
+    assert_eq!(
+        pod["spec"]["containers"][0]["securityContext"]["readOnlyRootFilesystem"],
+        true
+    );
     assert!(pod["spec"]["containers"][0]["command"][3]
         .as_str()
         .unwrap()

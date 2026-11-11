@@ -374,10 +374,9 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
     for m in &s.mounts {
         let sub = replica_sub_path(&m.path)
             .ok_or_else(|| format!("{} cannot be a replica path", m.path.display()))?;
-        if reserved
-            .iter()
-            .any(|r| m.path == Path::new(r) || m.path.starts_with(r) || Path::new(r).starts_with(&m.path))
-        {
+        if reserved.iter().any(|r| {
+            m.path == Path::new(r) || m.path.starts_with(r) || Path::new(r).starts_with(&m.path)
+        }) {
             return Err(format!(
                 "{} would cover a path the pod reserves",
                 m.path.display()
@@ -704,7 +703,7 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
     let last = log
         .lines()
         .filter_map(|l| l.trim().parse::<u32>().ok())
-        .last()
+        .next_back()
         .ok_or("the pids probe printed no count")?;
     if !log.contains("can't fork") {
         return Err(format!(

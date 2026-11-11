@@ -35,12 +35,28 @@ impl Drop for Uninstall {
     }
 }
 
-fn exec(k: &Kube, ns: &str, pod: &str, container: &str, script: &str, stdin: Option<&[u8]>) -> Called {
+fn exec(
+    k: &Kube,
+    ns: &str,
+    pod: &str,
+    container: &str,
+    script: &str,
+    stdin: Option<&[u8]>,
+) -> Called {
     let mut args = vec!["exec"];
     if stdin.is_some() {
         args.push("-i");
     }
-    args.extend(["-c", container, pod, "--", "/floor/busybox", "sh", "-c", script]);
+    args.extend([
+        "-c",
+        container,
+        pod,
+        "--",
+        "/floor/busybox",
+        "sh",
+        "-c",
+        script,
+    ]);
     k.call(Some(ns), &args, stdin, Duration::from_secs(60))
 }
 
@@ -54,7 +70,8 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         return;
     };
     let t0 = std::time::Instant::now();
-    let home = std::env::temp_dir().join(format!("wicked-k8s-live-{}", uuid::Uuid::new_v4().simple()));
+    let home =
+        std::env::temp_dir().join(format!("wicked-k8s-live-{}", uuid::Uuid::new_v4().simple()));
     std::fs::create_dir_all(&home).unwrap();
     let mut admin = resolve_settings(
         &home,
@@ -75,20 +92,41 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
 
     // D5: install, then everything else on the engine's own kubeconfig.
     let kc = cluster::install(&admin, &home).expect("cluster install");
-    let engine = resolve_settings(&home, None, None, None, None, crate::validator::find_on_path)
-        .expect("the engine's own kubeconfig");
+    let engine = resolve_settings(
+        &home,
+        None,
+        None,
+        None,
+        None,
+        crate::validator::find_on_path,
+    )
+    .expect("the engine's own kubeconfig");
     assert_eq!(engine.kubeconfig.as_deref(), Some(kc.as_path()));
     assert_eq!(engine.owner, admin.owner);
     cluster::probe(&engine).expect("the cluster and controller answer the engine");
-    eprintln!("[{:>5.1}s] installed; engine probe ok", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[{:>5.1}s] installed; engine probe ok",
+        t0.elapsed().as_secs_f64()
+    );
 
     // D5: the engine's account cannot touch an object without its owner label.
     let foreign = serde_json::json!({"apiVersion": "v1", "kind": "ConfigMap",
         "metadata": {"name": "not-ours", "namespace": daemon_namespace_name(&engine.owner)}});
     let refused = engine.apply(&[foreign]).unwrap_err();
-    assert!(refused.contains("may only change objects labelled"), "{refused}");
-    let kube_system = engine.call(None, &["delete", "namespace", "kube-system", "--dry-run=server"], None, Duration::from_secs(30));
-    assert!(!kube_system.ok(), "the engine account could delete kube-system");
+    assert!(
+        refused.contains("may only change objects labelled"),
+        "{refused}"
+    );
+    let kube_system = engine.call(
+        None,
+        &["delete", "namespace", "kube-system", "--dry-run=server"],
+        None,
+        Duration::from_secs(30),
+    );
+    assert!(
+        !kube_system.ok(),
+        "the engine account could delete kube-system"
+    );
 
     // B9: the gateway and its writer sidecar; the first config is published through the writer.
     let dns = daemon_namespace_name(&engine.owner);
@@ -117,17 +155,38 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         engine.call(Some(&dns), &args, stdin, Duration::from_secs(60))
     };
     assert!(w(&touch, None).ok(), "broker files");
-    let publish = w("umask 077; cat > /cfg/.config.json.new && mv /cfg/.config.json.new /cfg/config.json", Some(&body));
+    let publish = w(
+        "umask 077; cat > /cfg/.config.json.new && mv /cfg/.config.json.new /cfg/config.json",
+        Some(&body),
+    );
     assert!(publish.ok(), "{}", publish.err_text());
-    let gw = cluster::gateway_ready(&engine, &dns, Duration::from_secs(120)).expect("gateway serves");
-    eprintln!("[{:>5.1}s] gateway {} at {}", t0.elapsed().as_secs_f64(), gw.pod, gw.service_ip);
+    let gw =
+        cluster::gateway_ready(&engine, &dns, Duration::from_secs(120)).expect("gateway serves");
+    eprintln!(
+        "[{:>5.1}s] gateway {} at {}",
+        t0.elapsed().as_secs_f64(),
+        gw.pod,
+        gw.service_ip
+    );
     // The readiness port answers inside the pod (the writer shares its network namespace).
-    let ready = w(&format!("wget -q -O /dev/null -T 3 http://127.0.0.1:{}/ 2>&1; echo rc=$?", crate::seat_gateway::READY_PORT), None);
-    eprintln!("readiness probe: {}", String::from_utf8_lossy(&ready.stdout).trim());
+    let ready = w(
+        &format!(
+            "wget -q -O /dev/null -T 3 http://127.0.0.1:{}/ 2>&1; echo rc=$?",
+            crate::seat_gateway::READY_PORT
+        ),
+        None,
+    );
+    eprintln!(
+        "readiness probe: {}",
+        String::from_utf8_lossy(&ready.stdout).trim()
+    );
 
     // B2: the pids limit, measured.
     let n = cluster::ensure_pids_limited(&engine, &floor).expect("pods are pids-limited");
-    eprintln!("[{:>5.1}s] pids probe: refused after {n}", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[{:>5.1}s] pids probe: refused after {n}",
+        t0.elapsed().as_secs_f64()
+    );
 
     // A run namespace and one seat.
     let run = format!("live-{}", uuid::Uuid::new_v4().simple());
@@ -144,7 +203,10 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         image: seat_image.clone(),
         floor_image: floor.clone(),
         workdir: tree.clone(),
-        mounts: vec![ReplicaMount { path: tree.clone(), rw: true }],
+        mounts: vec![ReplicaMount {
+            path: tree.clone(),
+            rw: true,
+        }],
         memory_limit: "1Gi".into(),
         memory_request: "256Mi".into(),
         cpu_request: "100m".into(),
@@ -152,10 +214,14 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         shutdown_time: rfc3339_after(Duration::from_secs(15 * 60)),
     };
     let t_seat = std::time::Instant::now();
-    engine.apply(&[render::seat_sandbox(&sb).unwrap()]).expect("seat sandbox");
+    engine
+        .apply(&[render::seat_sandbox(&sb).unwrap()])
+        .expect("seat sandbox");
     let mut ready = false;
     while t_seat.elapsed() < Duration::from_secs(120) {
-        let pods = engine.list_owned(Some(&ns), "pods", &[(UNIT_LABEL, "u1")]).unwrap();
+        let pods = engine
+            .list_owned(Some(&ns), "pods", &[(UNIT_LABEL, "u1")])
+            .unwrap();
         if cluster::running_pod(&pods).is_some() {
             ready = true;
             break;
@@ -163,12 +229,34 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         std::thread::sleep(Duration::from_millis(200));
     }
     assert!(ready, "the seat pod did not run");
-    eprintln!("[{:>5.1}s] seat pod running after {:.2}s", t0.elapsed().as_secs_f64(), t_seat.elapsed().as_secs_f64());
+    eprintln!(
+        "[{:>5.1}s] seat pod running after {:.2}s",
+        t0.elapsed().as_secs_f64(),
+        t_seat.elapsed().as_secs_f64()
+    );
 
     // B3: the engine's loop is PID 1, and survives the seat's kill -9 -1.
-    let ps = exec(&engine, &ns, "seat-1", "seat", "cat /proc/1/cmdline | tr '\\0' ' '", None);
-    assert!(String::from_utf8_lossy(&ps.stdout).starts_with("/floor/busybox sh -c trap"), "{:?}", String::from_utf8_lossy(&ps.stdout));
-    let _ = exec(&engine, &ns, "seat-1", "seat", "/floor/busybox sleep 30 & kill -9 -1", None);
+    let ps = exec(
+        &engine,
+        &ns,
+        "seat-1",
+        "seat",
+        "cat /proc/1/cmdline | tr '\\0' ' '",
+        None,
+    );
+    assert!(
+        String::from_utf8_lossy(&ps.stdout).starts_with("/floor/busybox sh -c trap"),
+        "{:?}",
+        String::from_utf8_lossy(&ps.stdout)
+    );
+    let _ = exec(
+        &engine,
+        &ns,
+        "seat-1",
+        "seat",
+        "/floor/busybox sleep 30 & kill -9 -1",
+        None,
+    );
     let alive = exec(&engine, &ns, "seat-1", "seat", "echo alive", None);
     assert!(alive.ok(), "the seat pod died on kill -9 -1");
 
@@ -178,15 +266,37 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
             &format!("/floor/busybox nc -w 3 {host} {port} </dev/null >/dev/null 2>&1 && echo open || echo closed"), None);
         String::from_utf8_lossy(&r.stdout).contains("open")
     };
-    let api = exec(&engine, &ns, "seat-1", "seat", "echo $KUBERNETES_SERVICE_HOST", None);
+    let api = exec(
+        &engine,
+        &ns,
+        "seat-1",
+        "seat",
+        "echo $KUBERNETES_SERVICE_HOST",
+        None,
+    );
     let api = String::from_utf8_lossy(&api.stdout).trim().to_string();
     assert!(!api.is_empty());
     assert!(!probe(&api, 443), "the API server is reachable from a seat");
-    assert!(!probe("1.1.1.1", 443), "the internet is reachable from a seat");
-    assert!(!probe("192.168.5.2", 22), "the VM host is reachable from a seat");
-    assert!(probe("agw", 3000), "the gateway's CONNECT port is not reachable as agw");
-    assert!(!probe("agw", crate::seat_gateway::READY_PORT), "the readiness port is reachable");
-    assert!(!probe(&gw.service_ip, 22), "an unlisted gateway port answered");
+    assert!(
+        !probe("1.1.1.1", 443),
+        "the internet is reachable from a seat"
+    );
+    assert!(
+        !probe("192.168.5.2", 22),
+        "the VM host is reachable from a seat"
+    );
+    assert!(
+        probe("agw", 3000),
+        "the gateway's CONNECT port is not reachable as agw"
+    );
+    assert!(
+        !probe("agw", crate::seat_gateway::READY_PORT),
+        "the readiness port is reachable"
+    );
+    assert!(
+        !probe(&gw.service_ip, 22),
+        "an unlisted gateway port answered"
+    );
 
     // B4: the Landlock canary in the Sandbox pod, with the seat floor's own argv shape.
     let canary = exec(&engine, &ns, "seat-1", "seat",
@@ -200,9 +310,15 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
     assert!(String::from_utf8_lossy(&canary.stdout).contains("wrote-tree"));
 
     // C1: the sandbox carries its dead-man's switch; the run's deletion takes everything.
-    let sbx: Value = engine.get_json(Some(&ns), "sandboxes.agents.x-k8s.io", "seat-1").unwrap().unwrap();
+    let sbx: Value = engine
+        .get_json(Some(&ns), "sandboxes.agents.x-k8s.io", "seat-1")
+        .unwrap()
+        .unwrap();
     assert_eq!(sbx["spec"]["shutdownPolicy"], "Delete");
     assert!(cluster::delete_run(&engine, &run, true).unwrap());
     assert!(engine.get_json(None, "namespace", &ns).unwrap().is_none());
-    eprintln!("[{:>5.1}s] run namespace deleted", t0.elapsed().as_secs_f64());
+    eprintln!(
+        "[{:>5.1}s] run namespace deleted",
+        t0.elapsed().as_secs_f64()
+    );
 }
