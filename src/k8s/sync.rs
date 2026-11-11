@@ -31,7 +31,7 @@ pub(crate) const ROOT: u8 = b'R';
 /// Kind byte: the end of the stream.
 pub(crate) const END: u8 = b'E';
 /// The most bytes one stream may carry (a write-back larger than this is refused, not cut).
-pub(crate) const MAX_STREAM: u64 = 2 << 30;
+pub(crate) const MAX_STREAM: u64 = 512 << 20;
 /// The most entries one stream may carry.
 pub(crate) const MAX_ENTRIES: usize = 400_000;
 
@@ -271,9 +271,77 @@ pub(crate) fn link_stays_inside(rel: &str, target: &[u8]) -> bool {
     true
 }
 
-/// Whether `rel` (under a root) is `prefix` or lies under it.
+/// A path as a case-insensitive, normalizing host file system compares it (review r1: a mask
+/// for `.env` must also cover `.ENV`): ignorable characters dropped, lowercased.
+pub(crate) fn fold(p: &str) -> String {
+    p.chars()
+        .filter(|c| !ignorable(*c))
+        .collect::<String>()
+        .to_lowercase()
+}
+
+/// Whether `rel` (under a root) is `prefix` or lies under it, compared folded ([`fold`]).
 pub(crate) fn under(rel: &str, prefix: &str) -> bool {
+    let (rel, prefix) = (fold(rel), fold(prefix));
     rel == prefix || rel.starts_with(&format!("{prefix}/"))
+}
+
+/// Every link among `entries` resolves inside the root, following the other links of the set
+/// on the way (review r1: `a -> .` and `b -> a/../out` are each lexically inside, together not).
+pub(crate) fn links_stay_inside(entries: &[Entry]) -> Result<(), String> {
+    let links: std::collections::HashMap<String, String> = entries
+        .iter()
+        .filter(|e| e.kind == Kind::Link)
+        .map(|e| (fold(&e.path), String::from_utf8_lossy(&e.data).into_owned()))
+        .collect();
+    for e in entries.iter().filter(|e| e.kind == Kind::Link) {
+        let mut stack: Vec<String> = e.path.split('/').map(str::to_string).collect();
+        stack.pop();
+        let mut todo: std::collections::VecDeque<String> = String::from_utf8_lossy(&e.data)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let mut steps = 0;
+        while let Some(c) = todo.pop_front() {
+            steps += 1;
+            if steps > 4096 {
+                return Err(format!("`{}`: its links do not resolve", e.path));
+            }
+            match c.as_str() {
+                "" | "." => {}
+                ".." => {
+                    if stack.pop().is_none() {
+                        return Err(format!("`{}` resolves outside its root", e.path));
+                    }
+                }
+                _ => {
+                    if c.starts_with('/') {
+                        return Err(format!("`{}` resolves outside its root", e.path));
+                    }
+                    stack.push(c);
+                    if let Some(t) = links.get(&fold(&stack.join("/"))) {
+                        if t.starts_with('/') {
+                            return Err(format!("`{}` resolves outside its root", e.path));
+                        }
+                        stack.pop();
+                        for (i, part) in t.split('/').enumerate() {
+                            todo.insert(i, part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A content digest of one entry (its kind and its bytes), for the copy-in baseline.
+pub(crate) fn digest(e: &Entry) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update([e.kind.byte()]);
+    h.update(&e.data);
+    h.finalize().into()
 }
 
 /// The write-back's checks on one root's entries (untrusted: they came from a seat's replica).
@@ -305,8 +373,9 @@ pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, 
         }
         out.push(e.clone());
     }
+    links_stay_inside(&out)?;
     // A path cannot be both a file and the parent of another entry.
-    let mut paths: Vec<&str> = out.iter().map(|e| e.path.as_str()).collect();
+    let mut paths: Vec<String> = out.iter().map(|e| fold(&e.path)).collect();
     paths.sort_unstable();
     for w in paths.windows(2) {
         if w[1].starts_with(&format!("{}/", w[0])) {
@@ -498,6 +567,8 @@ pub(crate) struct Applied {
 /// Apply checked `entries` and `delete` to the host `root` with a no-follow walk: deletions
 /// first, then each file or link replaced by rename. Never follows a link on the way.
 #[cfg(unix)]
+// `mode_t` is u16 on macOS and u32 on Linux: the casts are needed on one of them.
+#[allow(clippy::unnecessary_cast)]
 pub(crate) fn apply(root: &Path, entries: &[Entry], delete: &[String]) -> Result<Applied, String> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
@@ -614,9 +685,7 @@ pub(crate) fn apply(root: &Path, entries: &[Entry], delete: &[String]) -> Result
                 }
             }
         }
-        if existing == Some(libc::S_IFDIR as u32)
-            && unsafe { libc::unlinkat(dir.0, name.as_ptr(), libc::AT_REMOVEDIR) } != 0
-        {
+        if existing == Some(libc::S_IFDIR as u32) && !remove_empty_dirs(dir.0, &name) {
             return Err(format!(
                 "`{}` replaces a directory that is not empty",
                 e.path
@@ -666,6 +735,50 @@ pub(crate) fn apply(root: &Path, entries: &[Entry], delete: &[String]) -> Result
     Ok(done)
 }
 
+/// Remove the directory `name` of `dir` and the empty directories under it, never following a
+/// link; `false` when anything but an empty directory is left in it (review r1: a deletion
+/// empties a nested tree, its directories go before a file takes its place).
+#[cfg(unix)]
+fn remove_empty_dirs(dir: i32, name: &std::ffi::CStr) -> bool {
+    // SAFETY: fd-relative libc calls on NUL-terminated names; every fd opened is closed.
+    unsafe {
+        if libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) == 0 {
+            return true;
+        }
+        let fd = libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return false;
+        }
+        let dup = libc::dup(fd);
+        let d = libc::fdopendir(dup);
+        if d.is_null() {
+            libc::close(dup);
+            libc::close(fd);
+            return false;
+        }
+        let mut subdirs: Vec<std::ffi::CString> = Vec::new();
+        loop {
+            let ent = libc::readdir(d);
+            if ent.is_null() {
+                break;
+            }
+            let n = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
+            if n.to_bytes() == b"." || n.to_bytes() == b".." {
+                continue;
+            }
+            subdirs.push(n.to_owned());
+        }
+        libc::closedir(d);
+        let ok = subdirs.iter().all(|s| remove_empty_dirs(fd, s));
+        libc::close(fd);
+        ok && libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) == 0
+    }
+}
+
 #[cfg(not(unix))]
 pub(crate) fn apply(
     _root: &Path,
@@ -704,7 +817,11 @@ def comps(rel):
     p = rel.split("/")
     if any(c in ("", ".", "..") for c in p): die("bad path " + repr(rel))
     return p
-def under(rel, pre): return rel == pre or rel.startswith(pre + "/")
+IGN = set(range(0x200B, 0x2010)) | set(range(0x202A, 0x202F)) | set(range(0x2060, 0x2070)) | {0xFEFF}
+def fold(p): return "".join(c for c in p if ord(c) not in IGN).lower()
+def under(rel, pre):
+    rel, pre = fold(rel), fold(pre)
+    return rel == pre or rel.startswith(pre + "/")
 skip = []
 def opendir(fd, name): return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
 def remove_any(fd, name):
@@ -794,6 +911,15 @@ def unpack(plan):
     def finish():
         if cur is None: return
         r, m, skip = cur
+        # A masked path the replica holds (a seat planted it, or it predates the mask) goes: a
+        # mask is the absence of the path (review r1).
+        for mk in plan[r][2]:
+            fd, name = parent(rootfd, mk, False)
+            if fd is None: continue
+            try:
+                for n in os.listdir(fd):
+                    if fold(n) == fold(name): remove_any(fd, n)
+            finally: os.close(fd)
         if m in ("tree", "plain"):
             have = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
             have = [h for h in have if not (m == "tree" and under(h, ".git"))]
@@ -808,7 +934,7 @@ def unpack(plan):
                 except FileNotFoundError: pass
                 finally: os.close(fd)
         os.close(rootfd)
-    plan = {p[0]: (p[1], p[2]) for p in plan}
+    plan = {p[0]: (p[1], p[2], p[3] if len(p) > 3 else []) for p in plan}
     for k, p, d in entries(f):
         if k == b"R":
             finish(); cur = None; wrote = set(); m = d.decode()

@@ -140,6 +140,7 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         owner: engine.owner.clone(),
         image: crate::seat_gateway::GATEWAY_IMAGE.into(),
         writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
+        boot: "b1-live".into(),
     };
     cluster::apply_gateway(&engine, &spec, &[]).expect("gateway objects");
     let writer = cluster::writer_pod(&engine, &dns, Duration::from_secs(120)).expect("writer");
@@ -165,6 +166,7 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         Some(&body),
     );
     assert!(publish.ok(), "{}", publish.err_text());
+    assert!(w("printf b1-live > /cfg/boot", None).ok(), "the boot token");
     let gw =
         cluster::gateway_ready(&engine, &dns, Duration::from_secs(120)).expect("gateway serves");
     eprintln!(

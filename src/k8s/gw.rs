@@ -354,7 +354,7 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
         return Err(gwerr("the gateway directory must be absolute".into()));
     }
     let _broker = crate::seat_refresh::mutation_lock(dir).map_err(gwerr)?;
-    let _publishing = crate::seat_gateway::PUBLISH_LOCK.lock();
+    // `config_transaction` holds the publish lock (review r1: taking it here too deadlocked).
     let _transaction = crate::seat_gateway::config_transaction(dir).map_err(gwerr)?;
     let ns = daemon_namespace_name(&kube.owner);
     let spec = GatewaySpec {
@@ -362,16 +362,17 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
         owner: kube.owner.clone(),
         image: crate::seat_gateway::GATEWAY_IMAGE.into(),
         writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
+        boot: boot_token(dir, false).map_err(gwerr)?,
     };
-    // First without host ports (the host's address is resolved from inside), then with them.
+    // Applied with the host ports already granted (idempotent; it also re-creates a gateway a
+    // quarantine stopped, under its new boot token), then again once the host's address is
+    // resolved from inside, when a port is missing.
     let existing = kube
         .get_json(Some(&ns), "networkpolicy", "gateway-egress")
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
     let mut host: Vec<HostPort> = existing.as_ref().map(render_host_ports).unwrap_or_default();
     let want = host_ports();
-    if existing.is_none() {
-        cluster::apply_gateway(kube, &spec, &host).map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
-    }
+    cluster::apply_gateway(kube, &spec, &host).map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
     let pod = cluster::writer_pod(kube, &ns, READY_TIMEOUT).map_err(gwerr)?;
     let mut gw = Gw {
         kube: kube.clone(),
@@ -387,7 +388,7 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
             .copied()
             .filter(|p| !host.iter().any(|h| &h.ip == ip && h.port == *p))
             .collect();
-        if !missing.is_empty() || existing.is_none() {
+        if !missing.is_empty() {
             host.retain(|h| &h.ip == ip);
             host.extend(missing.into_iter().map(|port| HostPort {
                 ip: ip.clone(),
@@ -419,6 +420,9 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
     }
     crate::seat_gateway::persist_units(dir, &config).map_err(gwerr)?;
     gw.publish().map_err(gwerr)?;
+    // Only now may the gateway container start (a fresh pod waits for this token).
+    gw.write_file(Volume::Config, "boot", spec.boot.as_bytes())
+        .map_err(gwerr)?;
     let served = cluster::gateway_ready(kube, &ns, READY_TIMEOUT).map_err(gwerr)?;
     gw.pod = served.pod;
     gw.service_ip = served.service_ip;
@@ -482,7 +486,6 @@ fn settle_revoking_locked(gw: &Gw) -> Result<(), String> {
 /// Register `unit` and publish; the seat starts only once the gateway serves its key.
 pub(crate) fn register_live(gw: &Gw, unit: UnitKey) -> Result<(), String> {
     let _broker = crate::seat_refresh::mutation_lock(&gw.dir)?;
-    let _publishing = crate::seat_gateway::PUBLISH_LOCK.lock();
     let _transaction = crate::seat_gateway::config_transaction(&gw.dir)?;
     let key = unit.key.clone();
     crate::seat_gateway::register_unit_locked(&gw.dir, unit)?;
@@ -493,20 +496,23 @@ pub(crate) fn register_live(gw: &Gw, unit: UnitKey) -> Result<(), String> {
 /// Revoke `key`: complete only when the gateway refuses it (and every key still pending).
 pub(crate) fn deregister_live(gw: &Gw, key: &str) -> Result<(), String> {
     let _broker = crate::seat_refresh::mutation_lock(&gw.dir)?;
-    let _publishing = crate::seat_gateway::PUBLISH_LOCK.lock();
     let _transaction = crate::seat_gateway::config_transaction(&gw.dir)?;
     crate::seat_gateway::deregister_unit_locked(&gw.dir, key)?;
     settle_revoking_locked(gw)
 }
 
 /// A revocation the gateway never confirmed: the gateway is stopped (scaled to none, its pods
-/// waited out), so no served policy outlives a key the engine meant to revoke. The next
-/// [`ensure`] publishes a config without it before the gateway serves again. `true` when no
+/// waited out) and its boot token replaced, so no served policy outlives a key the engine meant
+/// to revoke: the next [`ensure`] re-creates it, and its gateway container starts only after the
+/// writer has published a config without the key and the new token (review r1). `true` when no
 /// gateway pod is left.
 pub(crate) fn quarantine(gw: &Gw) -> bool {
     let _publishing = crate::seat_gateway::PUBLISH_LOCK.lock();
     if let Ok(mut o) = crate::seat_gateway::OWNED.lock() {
         o.retain(|d| d != &gw.dir);
+    }
+    if boot_token(&gw.dir, true).is_err() {
+        return false;
     }
     let r = gw.kube.call(
         Some(&gw.ns),
@@ -523,19 +529,29 @@ pub(crate) fn quarantine(gw: &Gw) -> bool {
             .kube
             .list_owned(Some(&gw.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
         {
-            Ok(p) if p.is_empty() => {
-                let _ = gw.kube.call(
-                    Some(&gw.ns),
-                    &["scale", "deployment", render::GATEWAY_NAME, "--replicas=1"],
-                    None,
-                    EXEC_TIMEOUT,
-                );
-                return true;
-            }
+            Ok(p) if p.is_empty() => return true,
             _ => std::thread::sleep(Duration::from_millis(500)),
         }
     }
     false
+}
+
+/// The gateway's boot token (`config/boot-token` of the gateway dir), created when absent or when
+/// `fresh` (a quarantine).
+pub(crate) fn boot_token(dir: &Path, fresh: bool) -> Result<String, String> {
+    let path = dir.join("config/boot-token");
+    if !fresh {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            let t = t.trim();
+            if !t.is_empty() && t.chars().all(|c| c.is_ascii_alphanumeric()) {
+                return Ok(t.to_string());
+            }
+        }
+    }
+    let t = uuid::Uuid::new_v4().simple().to_string();
+    std::fs::create_dir_all(dir.join("config")).map_err(|e| e.to_string())?;
+    std::fs::write(&path, &t).map_err(|e| e.to_string())?;
+    Ok(t)
 }
 
 /// The broker files a status read of `cli` needs: retained records whole, the rest as presence.

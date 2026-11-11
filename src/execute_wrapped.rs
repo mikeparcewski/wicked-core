@@ -3522,18 +3522,16 @@ impl WrappedCliStepRunner {
                 self.operational_home.is_some(),
                 true,
             );
-        // Warm the first unit's route before rendering any ask flags/files. Use the same
-        // cached runtime and <operational_home>/gateway directory as container_floor::arm.
+        // Warm the first unit's route before rendering any ask flags/files: the daemon's
+        // gateway on its cluster, from the same <operational_home>/gateway directory the pod
+        // arm uses (review r1: never the Docker gateway, whose routes a pod cannot reach).
         // A process-cached route cannot provide a gateway to an offline or homeless runner.
         let gateway_ok = otherwise_eligible
             && self.operational_home.as_deref().is_some_and(|home| {
                 crate::seat_gateway::mcp_route_ready()
-                    || crate::container_floor::runtime()
-                        .ok()
-                        .is_some_and(|runtime| {
-                            crate::seat_gateway::ensure_gateway(&runtime, &home.join("gateway"))
-                                .is_ok()
-                        })
+                    || crate::k8s::kube_for(home).ok().is_some_and(|kube| {
+                        crate::k8s::gw::ensure(&kube, &home.join("gateway")).is_ok()
+                    })
             });
         let mut ask_enabled = gateway_ok && crate::seat_gateway::mcp_route_ready();
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
@@ -9465,7 +9463,7 @@ mod tests {
                  *'get sandboxes.agents.x-k8s.io'*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"o\"}}}}}}';;\n\
                  *' get pod '*) :;;\n\
                  *' delete '*) :;;\n\
-                 *' exec -i -c seat '*) for a; do last=$a; done; echo \"seat-said:$last\";;\n\
+                 *' exec -i -c seat '*) echo seat-ran;;\n\
                  esac\nexit 0\n",
                 d = dir.display()
             ),
@@ -9521,16 +9519,16 @@ mod tests {
         )
         .expect("ran");
         assert_eq!(code, 0);
-        assert!(out.contains("seat-said:hello"), "{out}");
+        assert!(out.contains("seat-ran"), "{out}");
         let env = std::fs::read_to_string(dir.join("env")).unwrap();
+        assert!(
+            env.contains("'claude' '-p' 'hello'") && env.contains("'--env' 'UNIT_SECRET'"),
+            "the argv is not in the unit file: {env}"
+        );
         assert!(env.contains("export UNIT_SECRET='s3cr3t'"), "{env}");
         assert!(env.contains("export WICKED_UNIT_CWD="), "{env}");
         let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
         assert!(!calls.contains("s3cr3t"), "a secret rode an argv: {calls}");
-        assert!(
-            calls.contains("--env UNIT_SECRET"),
-            "landrun was not told the name: {calls}"
-        );
         assert!(
             calls.contains("delete sandboxes.agents.x-k8s.io seat-1"),
             "{calls}"

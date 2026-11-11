@@ -475,7 +475,7 @@ fn k8s_bound_files_are_a_files_root_of_their_directory() {
     );
     assert!(!f.back);
     let plan = seat::codec_plan(&[("x".into(), f)]);
-    assert_eq!(plan, json!([["x", "files", ["settings-build.json"]]]));
+    assert_eq!(plan, json!([["x", "files", ["settings-build.json"], []]]));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -493,6 +493,11 @@ fn k8s_no_secret_or_prompt_is_ever_on_an_exec_argv() {
         "export ANTHROPIC_API_KEY='wk-secret'\\''; rm -rf / #'\nexport MULTI='a\nb'\n"
     );
     assert!(seat::env_file(&[("BAD-NAME".into(), "x".into())]).is_err());
+    assert_eq!(
+        seat::argv_line(&["claude".into(), "-p".into(), "it's".into()]).unwrap(),
+        "set -- 'claude' '-p' 'it'\\''s'\n"
+    );
+    assert!(seat::argv_line(&[]).is_err());
     assert!(seat::env_file(&[("1X".into(), "x".into())]).is_err());
     // The wrapper's fixed script carries no value; the marker is an id.
     assert!(!seat::WRAPPER.contains("wk-"));
@@ -781,4 +786,227 @@ fn k8s_a_pod_seats_read_only_writes_are_left_to_the_view_but_pre_build_is_still_
         "a pre-build creator's tree comes back: still judged in a pod"
     );
     std::env::remove_var(crate::gate_hook::SEAT_POD_ENV);
+}
+
+// ── review r1 folds ──────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_a_mask_covers_every_case_spelling_of_its_path() {
+    let r = root(vec![
+        entry(Kind::File, ".ENV", b"planted"),
+        entry(Kind::File, "Secrets/K", b"planted"),
+        entry(Kind::File, "ok.txt", b"x"),
+    ]);
+    let ok = sync::check_entries(&r, &[".env".into(), "secrets".into()]).unwrap();
+    assert_eq!(
+        ok.iter().map(|e| e.path.as_str()).collect::<Vec<_>>(),
+        vec!["ok.txt"]
+    );
+    assert!(sync::under(".e\u{200b}NV", ".env"));
+}
+
+#[test]
+fn k8s_links_that_escape_together_are_refused() {
+    let r = root(vec![
+        entry(Kind::Link, "a", b"."),
+        entry(Kind::Link, "b", b"a/../outside"),
+    ]);
+    assert!(
+        sync::check_entries(&r, &[]).is_err(),
+        "a -> . and b -> a/../outside escape together"
+    );
+    let ok = root(vec![
+        entry(Kind::Link, "d/a", b".."),
+        entry(Kind::Link, "d/b", b"a/x"),
+        entry(Kind::File, "x", b"1"),
+    ]);
+    assert!(sync::check_entries(&ok, &[]).is_ok());
+    let cycle = root(vec![
+        entry(Kind::Link, "a", b"b"),
+        entry(Kind::Link, "b", b"a"),
+    ]);
+    assert!(sync::check_entries(&cycle, &[]).is_err());
+}
+
+#[test]
+fn k8s_write_back_applies_only_the_seats_delta_and_refuses_a_conflict() {
+    let host = tmp("delta");
+    std::fs::write(host.join("seat.txt"), "v1").unwrap();
+    std::fs::write(host.join("hosts.txt"), "v1").unwrap();
+    std::fs::write(host.join("both.txt"), "v1").unwrap();
+    std::fs::write(host.join("gone.txt"), "v1").unwrap();
+    let v1 = sync::digest(&entry(Kind::File, "x", b"v1"));
+    let base: std::collections::HashMap<String, [u8; 32]> =
+        ["seat.txt", "hosts.txt", "both.txt", "gone.txt"]
+            .iter()
+            .map(|p| (p.to_string(), v1))
+            .collect();
+    // While the unit ran, the host changed `hosts.txt` and created `new-on-host.txt`.
+    std::fs::write(host.join("hosts.txt"), "host-v2").unwrap();
+    std::fs::write(host.join("new-on-host.txt"), "h").unwrap();
+    let replica = vec![
+        entry(Kind::File, "seat.txt", b"seat-v2"),
+        entry(Kind::File, "hosts.txt", b"v1"),
+        entry(Kind::File, "both.txt", b"v1"),
+        entry(Kind::File, "added.txt", b"a"),
+    ];
+    let (writes, deletes) = seat::delta(&host, &base, replica.clone()).unwrap();
+    let w: Vec<&str> = writes.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        w,
+        vec!["seat.txt", "added.txt"],
+        "the host's own change was written over"
+    );
+    assert_eq!(deletes, vec!["gone.txt".to_string()]);
+    // Both changed one file: refused, never overwritten.
+    std::fs::write(host.join("both.txt"), "host-v2").unwrap();
+    let mut conflict = replica;
+    conflict[2] = entry(Kind::File, "both.txt", b"seat-v2");
+    assert!(seat::delta(&host, &base, conflict)
+        .unwrap_err()
+        .contains("both.txt"));
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_file_replacing_a_nested_tree_lands_after_its_contents_go() {
+    let host = tmp("dir2file");
+    std::fs::create_dir_all(host.join("dir/nested")).unwrap();
+    std::fs::write(host.join("dir/nested/old"), "o").unwrap();
+    sync::apply(
+        &host,
+        &[entry(Kind::File, "dir", b"now a file")],
+        &["dir/nested/old".into()],
+    )
+    .unwrap();
+    assert_eq!(std::fs::read(host.join("dir")).unwrap(), b"now a file");
+    // A directory still holding a file (ignored output) is never removed.
+    std::fs::create_dir_all(host.join("keep/sub")).unwrap();
+    std::fs::write(host.join("keep/sub/build.o"), "b").unwrap();
+    assert!(sync::apply(&host, &[entry(Kind::File, "keep", b"x")], &[]).is_err());
+    assert!(host.join("keep/sub/build.o").exists());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_scrubs_a_planted_masked_file_at_copy_in() {
+    let replica = tmp("scrub");
+    let tree = "w";
+    std::fs::create_dir_all(replica.join(tree)).unwrap();
+    std::fs::write(replica.join(tree).join(".ENV"), "planted by a seat").unwrap();
+    let stream = sync::encode(&[Root {
+        replica: tree.into(),
+        mode: Mode::Plain,
+        entries: vec![entry(Kind::File, "a", b"a")],
+    }]);
+    let plan = json!([[tree, "plain", [".env"], [".env"]]]).to_string();
+    let out = codec(&replica, &["unpack", &plan], &stream);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !replica.join(tree).join(".ENV").exists(),
+        "a planted masked file survived the copy-in"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[test]
+fn k8s_a_capped_call_stops_at_its_cap() {
+    let mut c = std::process::Command::new("sh");
+    c.args(["-c", "yes x | head -c 1000000"]);
+    let r = super::run_capped(c, None, std::time::Duration::from_secs(20), 1000);
+    assert!(!r.ok(), "a capped call reported success");
+    assert!(r.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&r.stderr).contains("cap"));
+    let mut c = std::process::Command::new("sh");
+    c.args(["-c", "printf abc"]);
+    let r = super::run_capped(c, None, std::time::Duration::from_secs(20), 1000);
+    assert!(r.ok() && r.stdout == b"abc");
+}
+
+#[test]
+fn k8s_a_quarantined_gateway_starts_only_on_a_new_boot_token() {
+    let dir = tmp("boot");
+    let t1 = gw::boot_token(&dir, false).unwrap();
+    assert_eq!(
+        gw::boot_token(&dir, false).unwrap(),
+        t1,
+        "the token is stable across arms"
+    );
+    let t2 = gw::boot_token(&dir, true).unwrap();
+    assert_ne!(t1, t2, "a quarantine keeps the old token");
+    let spec = render::GatewaySpec {
+        namespace: "n".into(),
+        owner: "o".into(),
+        image: "g".into(),
+        writer_image: "w".into(),
+        boot: t2.clone(),
+    };
+    let d = render::gateway_deployment(&spec);
+    let wait = &d["spec"]["template"]["spec"]["initContainers"][1];
+    assert_eq!(wait["name"], "wait-config");
+    assert!(wait["command"][2].as_str().unwrap().contains("/cfg/boot"));
+    assert_eq!(wait["env"][0]["value"], t2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn k8s_a_tree_under_tmp_can_be_mounted_but_tmp_itself_cannot() {
+    let mut p = seat_pod(None, None);
+    p.workdir = "/tmp/wicked-core-sandbox/x".into();
+    p.mounts = vec![ReplicaMount {
+        path: "/tmp/wicked-core-sandbox/x".into(),
+        rw: true,
+    }];
+    assert!(render::seat_pod_spec(&p).is_ok());
+    p.mounts = vec![ReplicaMount {
+        path: "/tmp".into(),
+        rw: true,
+    }];
+    assert!(render::seat_pod_spec(&p).is_err());
+    p.mounts = vec![ReplicaMount {
+        path: "/wicked-unit/x".into(),
+        rw: true,
+    }];
+    assert!(render::seat_pod_spec(&p).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_key_registers_and_revokes_without_deadlocking_the_publish_lock() {
+    let dir = tmp("gwlock");
+    let kubectl = dir.join("kubectl");
+    crate::test_env::install_stub(&kubectl, "#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n");
+    let g = gw::Gw {
+        kube: super::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "t".into(),
+            owner: "o".into(),
+        },
+        ns: "ns".into(),
+        pod: "agw-1".into(),
+        service_ip: "10.0.0.1".into(),
+        dir: dir.join("gateway"),
+    };
+    std::fs::create_dir_all(&g.dir).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let g2 = g.clone();
+    std::thread::spawn(move || {
+        let key = crate::seat_gateway::UnitKey::new("r", "r#1", "codex");
+        let a = gw::register_live(&g2, key.clone());
+        let b = gw::deregister_live(&g2, &key.key);
+        let _ = tx.send((a, b));
+    });
+    let (a, b) = rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("register/deregister deadlocked");
+    a.unwrap();
+    b.unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
 }

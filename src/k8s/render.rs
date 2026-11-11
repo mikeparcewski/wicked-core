@@ -368,15 +368,14 @@ pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
 }
 
 /// The init container that copies a read-only unit's replica tree into its view (no link
-/// followed; the top-level `target` build dir stays out: a read-only posture builds into its own
-/// scratch).
+/// followed; tracked content under any name, `target/` included, review r1).
 fn view_init(floor_image: &str, sub: &str) -> Value {
     json!({
         "name": "view",
         "image": floor_image,
         "imagePullPolicy": "Never",
         "command": ["/busybox", "sh", "-c",
-            "cd /wicked-ro && /busybox tar -cf - --exclude ./target . | /busybox tar -C /wicked-view -xf -"],
+            "cd /wicked-ro && /busybox tar -cf - . | /busybox tar -C /wicked-view -xf -"],
         "securityContext": hardened_context(),
         "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},
         "volumeMounts": [
@@ -440,9 +439,12 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         }
         let sub = scoped_sub_path(s.scope.as_deref(), &m.path)
             .ok_or_else(|| format!("{} cannot be a replica path", m.path.display()))?;
-        if reserved.iter().any(|r| {
-            m.path == Path::new(r) || m.path.starts_with(r) || Path::new(r).starts_with(&m.path)
-        }) {
+        // A path under `/tmp` may be mounted over the pod's scratch (an engine session's tree
+        // lives there on Linux, review r1); `/tmp` itself and every other reserved path may not.
+        if reserved
+            .iter()
+            .any(|r| Path::new(r).starts_with(&m.path) || (*r != "/tmp" && m.path.starts_with(r)))
+        {
             return Err(format!(
                 "{} would cover a path the pod reserves",
                 m.path.display()
@@ -546,6 +548,10 @@ pub(crate) struct GatewaySpec {
     pub(crate) owner: String,
     pub(crate) image: String,
     pub(crate) writer_image: String,
+    /// The gateway's boot token: its container starts only once the writer has published a
+    /// config AND this token to `/cfg/boot` (review r1: a gateway re-created after a quarantine
+    /// must never serve the config it was quarantined with).
+    pub(crate) boot: String,
 }
 
 pub(crate) const GATEWAY_NAME: &str = "agw";
@@ -600,7 +606,8 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                             "name": "wait-config",
                             "image": g.writer_image,
                             "imagePullPolicy": "IfNotPresent",
-                            "command": ["sh", "-c", "until [ -s /cfg/config.json ]; do sleep 0.2; done"],
+                            "command": ["sh", "-c", "until [ -s /cfg/config.json ] && [ \"$(cat /cfg/boot 2>/dev/null)\" = \"$WICKED_GW_BOOT\" ]; do sleep 0.2; done"],
+                            "env": [{"name": "WICKED_GW_BOOT", "value": g.boot}],
                             "securityContext": hardened_context(),
                             "resources": {
                                 "requests": {"memory": "8Mi", "cpu": "5m"},

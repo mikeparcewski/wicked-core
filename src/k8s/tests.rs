@@ -57,6 +57,7 @@ fn gw() -> GatewaySpec {
         owner: "wabc123def456".into(),
         image: crate::seat_gateway::GATEWAY_IMAGE.into(),
         writer_image: "busybox:1.37".into(),
+        boot: "boot-1".into(),
     }
 }
 
@@ -232,7 +233,8 @@ fn k8s_replica_paths_mount_at_their_host_paths_with_their_access() {
         .find(|m| m["mountPath"] == "/home/op/.wicked/skills/snap")
         .unwrap();
     assert_eq!(skills["readOnly"], true);
-    for bad in ["/tmp/x", "/floor", "/", "/a/../b", "rel/x"] {
+    // A path under `/tmp` is allowed (an engine session's scratch tree, review r1 of B-2).
+    for bad in ["/tmp", "/floor", "/floor/x", "/wicked-canary", "/", "/a/../b", "rel/x"] {
         let mut s = seat();
         s.mounts.push(ReplicaMount {
             path: PathBuf::from(bad),

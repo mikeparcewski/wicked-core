@@ -34,7 +34,8 @@ pub(crate) mod sync;
 
 #[cfg(test)]
 mod live;
-#[cfg(test)]
+// The seat runner is Unix-only (no Windows host runs seats), and its fixtures are Unix paths.
+#[cfg(all(test, unix))]
 mod seat_tests;
 #[cfg(test)]
 mod tests;
@@ -348,6 +349,20 @@ impl Kube {
         run_bounded(cmd, stdin, limit)
     }
 
+    /// [`Kube::call`] with stdout capped at `cap` bytes ([`run_capped`]).
+    pub(crate) fn call_capped(
+        &self,
+        ns: Option<&str>,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        limit: Duration,
+        cap: u64,
+    ) -> Called {
+        let mut cmd = self.cmd(ns);
+        cmd.args(args);
+        run_capped(cmd, stdin, limit, cap)
+    }
+
     /// `kubectl apply --server-side` of `docs` (a JSON `List`): idempotent, and large CRDs fit
     /// (a client-side apply's annotation would not).
     pub(crate) fn apply(&self, docs: &[Value]) -> Result<(), String> {
@@ -494,8 +509,21 @@ pub(crate) fn is_owned_by(obj: &Value, owner: &str) -> bool {
 
 /// Run `cmd` to completion within `limit`, feeding `stdin` on its own thread, draining both
 /// pipes; past the deadline the child's whole process group is killed.
-pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duration) -> Called {
+pub(crate) fn run_bounded(cmd: Command, stdin: Option<&[u8]>, limit: Duration) -> Called {
+    run_capped(cmd, stdin, limit, u64::MAX)
+}
+
+/// [`run_bounded`], killing the call when its stdout passes `cap` bytes (review r1: a seat's
+/// replica must not stream more into the engine than the write-back will ever accept). A capped
+/// call answers no exit code and says so on stderr.
+pub(crate) fn run_capped(
+    mut cmd: Command,
+    stdin: Option<&[u8]>,
+    limit: Duration,
+    cap: u64,
+) -> Called {
     use std::io::Read;
+    let over = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin.is_some() {
         cmd.stdin(Stdio::piped());
@@ -529,12 +557,20 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
         });
         rx
     });
-    let drain = |p: Option<Box<dyn Read + Send>>| {
+    let drain = |p: Option<Box<dyn Read + Send>>,
+                 cap: u64,
+                 over: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>| {
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
-            if let Some(mut p) = p {
-                let _ = p.read_to_end(&mut buf);
+            if let Some(p) = p {
+                let _ = p.take(cap.saturating_add(1)).read_to_end(&mut buf);
+            }
+            if buf.len() as u64 > cap {
+                if let Some(o) = over {
+                    o.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                buf.clear();
             }
             let _ = tx.send(buf);
         });
@@ -545,18 +581,28 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
             .stdout
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        cap,
+        Some(std::sync::Arc::clone(&over)),
     );
     let err = drain(
         child
             .stderr
             .take()
             .map(|p| Box::new(p) as Box<dyn Read + Send>),
+        1 << 20,
+        None,
     );
     let start = Instant::now();
     let code = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break Some(s.code().unwrap_or(-1)),
-            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(25)),
+            Ok(Some(s)) if !over.load(std::sync::atomic::Ordering::SeqCst) => {
+                break Some(s.code().unwrap_or(-1))
+            }
+            Ok(None)
+                if start.elapsed() < limit && !over.load(std::sync::atomic::Ordering::SeqCst) =>
+            {
+                std::thread::sleep(Duration::from_millis(25))
+            }
             _ => {
                 #[cfg(unix)]
                 // SAFETY: killpg on the child's own process group (pgid == its pid).
@@ -580,9 +626,18 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
             }
         }
     }
+    let stdout = out.recv_timeout(grace).unwrap_or_default();
+    if over.load(std::sync::atomic::Ordering::SeqCst) {
+        return Called {
+            code: None,
+            stdout: Vec::new(),
+            stderr: format!("the output passed its {cap}-byte cap; the call was stopped")
+                .into_bytes(),
+        };
+    }
     Called {
         code,
-        stdout: out.recv_timeout(grace).unwrap_or_default(),
+        stdout,
         stderr: err.recv_timeout(grace).unwrap_or_default(),
     }
 }
