@@ -608,11 +608,15 @@ pub(crate) fn sync_pod(
     json!({
         "apiVersion": "v1",
         "kind": "Pod",
-        "metadata": meta("sync", Some(ns), owner, &[(RUN_LABEL, run_label), (ROLE_LABEL, "sync")]),
+        // The boot label: a restarted engine's sweep reaps a sync pod its predecessor left with a
+        // command still running in it (review r2 P2).
+        "metadata": meta("sync", Some(ns), owner, &[
+            (RUN_LABEL, run_label), (ROLE_LABEL, "sync"), (super::BOOT_LABEL, super::boot_id()),
+        ]),
         "spec": {
             "automountServiceAccountToken": false,
             "enableServiceLinks": false,
-            "restartPolicy": "Always",
+            "restartPolicy": "Never",
             "terminationGracePeriodSeconds": 1,
             "securityContext": pod_context(POD_UID),
             "initContainers": [floor_init(floor_image)],
@@ -698,7 +702,7 @@ pub(crate) fn pids_probe_pod(
     // waits 3 s: a new pod's policy lands just after its first instant (PARITY F1, seen again on
     // this probe: both answered at start), and the verdict is about the policy in force.
     let script = format!(
-        "/busybox sleep 3; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\"; do \
+        "/busybox sleep 3; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\" \"1.1.1.1 443\"; do \
          if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then echo net=open; else echo net=closed; fi; done; \
          i=0; while [ $i -lt {limit} ]; do /busybox sleep 120 & i=$((i+1)); echo $i; done; \
          echo {PIDS_PROBE_UNBOUNDED}"
@@ -739,10 +743,10 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("net="))
         .collect();
-    if net.len() != 2 || net.iter().any(|n| *n != "closed") {
+    if net.len() != 3 || net.iter().any(|n| *n != "closed") {
         return Err(format!(
             "the cluster does not enforce NetworkPolicy: a pod in a deny-all namespace reached \
-             the API server or the node's kubelet ({net:?})"
+             the API server, the node's kubelet or the internet ({net:?})"
         ));
     }
     if log.lines().any(|l| l.trim() == PIDS_PROBE_UNBOUNDED) {

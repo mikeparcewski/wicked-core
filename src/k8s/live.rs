@@ -106,6 +106,9 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
     assert_eq!(engine.kubeconfig.as_deref(), Some(kc.as_path()));
     assert_eq!(engine.owner, admin.owner);
     cluster::probe(&engine).expect("the cluster and controller answer the engine");
+    // Review r2: the engine renews its own token as itself (TokenRequest on its own account).
+    assert!(cluster::renew_token_below(&engine, u64::MAX).expect("self-renewal"));
+    cluster::probe(&engine).expect("the renewed token works");
     eprintln!(
         "[{:>5.1}s] installed; engine probe ok",
         t0.elapsed().as_secs_f64()

@@ -106,7 +106,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// `raw` as a label value: `[A-Za-z0-9._-]`, at most 63, starting and ending alphanumeric. A
-/// value that had to change gets a short digest suffix, so two ids never map to one label.
+/// value that had to change gets a short digest suffix. A label is a selector, never an
+/// identity: two ids CAN map to one label (`"a b"` and the literal `"a-b-c8687a08"`), so every
+/// identity decision reads the exact id (a run's [`render::RUN_ID_ANNOTATION`]), review r2 P3.
 pub(crate) fn label_value(raw: &str) -> String {
     let clean: String = raw
         .chars()
@@ -508,14 +510,19 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
             }
         }
     };
+    // The feeder reports on a channel, so the deadline holds while it writes: a descendant that
+    // keeps the stdin pipe open can never block this call past `limit` (review r2 P2).
     let feeder = stdin.map(|body| {
         let body = body.to_vec();
         let pipe = child.stdin.take();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
         std::thread::spawn(move || {
             if let Some(mut p) = pipe {
                 let _ = p.write_all(&body);
             }
-        })
+            let _ = tx.send(());
+        });
+        rx
     });
     let drain = |p: Option<Box<dyn Read + Send>>| {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -557,10 +564,17 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
             }
         }
     };
-    if let Some(f) = feeder {
-        let _ = f.join();
-    }
     let grace = Duration::from_secs(2);
+    if let Some(f) = feeder {
+        let left = limit.saturating_sub(start.elapsed()).max(grace);
+        if f.recv_timeout(left).is_err() {
+            #[cfg(unix)]
+            // SAFETY: killpg on the child's own process group (pgid == its pid).
+            unsafe {
+                libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
     Called {
         code,
         stdout: out.recv_timeout(grace).unwrap_or_default(),
