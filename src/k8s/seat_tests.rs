@@ -203,12 +203,19 @@ fn k8s_write_back_applies_without_following_a_planted_link() {
 
 #[cfg(unix)]
 fn codec(replica: &Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
+    codec_jailed(replica, args, stdin, "-")
+}
+
+/// The codec with `jail` as its Landlock launcher (`-` = none: this host has no Landlock).
+#[cfg(unix)]
+fn codec_jailed(replica: &Path, args: &[&str], stdin: &[u8], jail: &str) -> std::process::Output {
     use std::io::Write as _;
     let mut c = std::process::Command::new("python3");
     c.hardened()
         .args(["-I", "-c", sync::POD_CODEC])
         .args(args)
         .env("WICKED_SYNC_ROOT", replica)
+        .env("WICKED_SYNC_JAIL", jail)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
@@ -1362,7 +1369,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
     let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
     assert!(e.contains("larger than"), "{e}");
     assert!(
-        sync::read_host_entry(&host, "big.bin").is_none(),
+        sync::read_host_entry(&host, "big.bin").is_err(),
         "a file over the stream's limit is never read whole"
     );
     let _ = std::fs::remove_dir_all(&host);
@@ -2020,4 +2027,510 @@ fn k8s_a_bundle_refuses_a_gitfile() {
     assert_eq!(out.status.code(), Some(3));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not a directory"));
     let _ = std::fs::remove_dir_all(&replica);
+}
+
+// ── codex per-module round (b2-seat, b2-sync): folds ────────────────────────────────────────
+
+/// A git repository at `dir` with one commit per `(file, body)`; `None` when git is unusable.
+#[cfg(unix)]
+fn repo_with(dir: &Path, commits: &[(&str, &str)]) -> Option<()> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    std::fs::create_dir_all(dir).ok()?;
+    git(&["init", "-q"]).then_some(())?;
+    for (f, body) in commits {
+        std::fs::write(dir.join(f), body).ok()?;
+        git(&["add", f]).then_some(())?;
+        git(&[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "-m",
+            f,
+        ])
+        .then_some(())?;
+    }
+    Some(())
+}
+
+#[cfg(unix)]
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let o = std::process::Command::new("git")
+        .hardened()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_codec_git_runs_jailed_to_the_units_own_tree_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let replica = tmp("jail");
+    let w = replica.join("scope-a/w");
+    if repo_with(&w, &[("a", "1"), ("b", "2")]).is_none() {
+        eprintln!("skipping: git unusable");
+        return;
+    }
+    let base = git_out(&w, &["rev-parse", "HEAD~1"]);
+    // A fake launcher: records its argv, then runs what follows its `--`.
+    let bin = tmp("jail-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let rec = bin.join("argv");
+    let jail = bin.join("landrun");
+    std::fs::write(
+        &jail,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$@\" >> '{}'\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n",
+            rec.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&jail, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = codec_jailed(
+        &replica,
+        &["bundle", "scope-a/w", &base],
+        b"",
+        jail.to_str().unwrap(),
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !out.stdout.is_empty(),
+        "the commit came back through the jail"
+    );
+    let argv = std::fs::read_to_string(&rec).unwrap();
+    let lines: Vec<&str> = argv.lines().collect();
+    let granted = |flag: &str| -> Vec<String> {
+        lines
+            .windows(2)
+            .filter(|w| w[0] == flag)
+            .map(|w| w[1].to_string())
+            .collect()
+    };
+    let root = format!("{}/scope-a/w", replica.display());
+    assert!(granted("--ro").contains(&root), "{argv}");
+    // Nothing of the replica beyond the unit's own tree, and no write but a private temp dir.
+    for flag in ["--ro", "--rox", "--rw", "--rwx"] {
+        for p in granted(flag) {
+            assert!(
+                !p.starts_with(&replica.display().to_string()) || p == root,
+                "{flag} {p} grants more of the replica than the unit's tree"
+            );
+        }
+    }
+    assert!(granted("--rw")
+        .iter()
+        .all(|p| p == "/dev/null" || p.starts_with("/tmp/wicked-unit-")));
+    assert!(
+        !lines.contains(&"--best-effort"),
+        "a kernel without Landlock must refuse"
+    );
+    // A launcher that is not there refuses: the git call never runs open.
+    let none = codec_jailed(
+        &replica,
+        &["bundle", "scope-a/w", &base],
+        b"",
+        "/nonexistent/landrun",
+    );
+    assert!(!none.status.success());
+    let _ = std::fs::remove_dir_all(&replica);
+    let _ = std::fs::remove_dir_all(&bin);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_promisor_remote_in_a_seat_git_never_runs_its_command() {
+    let replica = tmp("promisor");
+    let w = replica.join("w");
+    if repo_with(&w, &[("a", "1"), ("b", "2")]).is_none() {
+        eprintln!("skipping: git unusable");
+        return;
+    }
+    let base = git_out(&w, &["rev-parse", "HEAD~1"]);
+    let blob = git_out(&w, &["rev-parse", "HEAD:b"]);
+    std::fs::remove_file(w.join(".git/objects").join(&blob[..2]).join(&blob[2..])).unwrap();
+    let marker = tmp("promisor-ran").join("ran");
+    for (k, v) in [
+        ("extensions.partialClone", "origin".to_string()),
+        ("remote.origin.url", "ssh://h/r".to_string()),
+        ("remote.origin.promisor", "true".to_string()),
+        (
+            "core.sshCommand",
+            format!("touch '{}'; false", marker.display()),
+        ),
+    ] {
+        git_out(&w, &["config", k, &v]);
+    }
+    let out = codec(&replica, &["bundle", "w", &base], b"");
+    assert!(!out.status.success(), "a missing object refuses the bundle");
+    assert!(
+        !marker.exists(),
+        "the seat's configured command ran in the sync pod"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_tree_with_no_history_and_no_git_dir_has_no_commits_to_land() {
+    let replica = tmp("nogit");
+    std::fs::create_dir_all(replica.join("w")).unwrap();
+    std::fs::write(replica.join("w/edited"), "e").unwrap();
+    let out = codec(&replica, &["bundle", "w", seat::NO_BASE], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.stdout.is_empty());
+    // A link where the git dir belongs is still refused.
+    std::os::unix::fs::symlink("/tmp", replica.join("w/.git")).unwrap();
+    assert!(!codec(&replica, &["bundle", "w", seat::NO_BASE], b"")
+        .status
+        .success());
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_deleted_force_added_file_is_a_deletion_and_an_ignored_untracked_one_is_not() {
+    let host = tmp("forced2");
+    if repo_with(&host, &[("src.rs", "s")]).is_none() {
+        eprintln!("skipping: git unusable");
+        return;
+    }
+    std::fs::write(host.join(".gitignore"), "out/\n").unwrap();
+    std::fs::create_dir_all(host.join("out")).unwrap();
+    std::fs::write(host.join("out/important"), "keep").unwrap();
+    std::fs::write(host.join("out/scratch"), "x").unwrap();
+    git_out(&host, &["add", "-f", "out/important", ".gitignore"]);
+    let d = seat::tree_deletions(
+        &host,
+        vec![
+            "out/important".into(),
+            "out/scratch".into(),
+            "src.rs".into(),
+        ],
+    )
+    .unwrap();
+    assert!(
+        d.contains(&"out/important".to_string()),
+        "a tracked file the seat deleted: {d:?}"
+    );
+    assert!(d.contains(&"src.rs".to_string()));
+    assert!(
+        !d.contains(&"out/scratch".to_string()),
+        "ignored and untracked: kept"
+    );
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_kept_link_cannot_be_made_to_escape_by_changing_what_it_passes() {
+    let host = tmp("retained");
+    std::fs::create_dir_all(host.join("a")).unwrap();
+    std::fs::write(host.join("a/file"), "f").unwrap();
+    std::os::unix::fs::symlink("a/..", host.join("b")).unwrap();
+    std::os::unix::fs::symlink("../elsewhere", host.join("c")).unwrap();
+    let b = entry(Kind::Link, "b", b"a/..");
+    let c = entry(Kind::Link, "c", b"../elsewhere");
+    let writes = vec![entry(Kind::Link, "a", b".")];
+    let deletes = vec!["a/file".to_string()];
+    let e = seat::check_retained_links(&host, std::slice::from_ref(&b), &writes, &deletes, &[])
+        .unwrap_err();
+    assert!(e.contains("`b`"), "{e}");
+    // A link that already led outside is the host's own: left as it is.
+    seat::check_retained_links(&host, &[c], &writes[..0], &deletes, &[]).unwrap();
+    // Nothing changed around it: fine.
+    seat::check_retained_links(&host, &[b], &[], &[], &[]).unwrap();
+    let base: std::collections::HashMap<String, [u8; 32]> = [(
+        "b".to_string(),
+        sync::digest(&entry(Kind::Link, "b", b"a/..")),
+    )]
+    .into();
+    assert_eq!(
+        seat::retained_links(
+            &[
+                entry(Kind::Link, "b", b"a/.."),
+                entry(Kind::Link, "n", b"x")
+            ],
+            &base
+        )
+        .len(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_host_link_under_another_spelling_is_still_followed() {
+    let host = tmp("spelling-link");
+    std::fs::create_dir_all(&host).unwrap();
+    std::os::unix::fs::symlink("/etc", host.join("a")).unwrap();
+    // `A` (a file) replaces nothing at `a` on a case-sensitive host; `b -> a` must follow the
+    // host's `a`, which leaves the root.
+    let entries = vec![entry(Kind::File, "A", b"x"), entry(Kind::Link, "b", b"a")];
+    assert!(sync::links_stay_inside_final(Some(&host), &entries, &[], &[]).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_replaced_private_file_keeps_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = tmp("modes");
+    std::fs::create_dir_all(&host).unwrap();
+    std::fs::write(host.join("secret"), "old").unwrap();
+    std::fs::set_permissions(host.join("secret"), std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(host.join("tool"), "old").unwrap();
+    std::fs::set_permissions(host.join("tool"), std::fs::Permissions::from_mode(0o640)).unwrap();
+    sync::apply(
+        &host,
+        &[
+            entry(Kind::File, "secret", b"new"),
+            entry(Kind::Exec, "tool", b"#!"),
+        ],
+        &[],
+        &[],
+    )
+    .unwrap();
+    let mode = |n: &str| {
+        std::fs::metadata(host.join(n))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    assert_eq!(mode("secret"), 0o600);
+    assert_eq!(mode("tool"), 0o750);
+    assert_eq!(std::fs::read(host.join("secret")).unwrap(), b"new");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_host_state_that_cannot_be_read_is_never_read_as_absent() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = tmp("unreadable");
+    std::fs::create_dir_all(host.join("d")).unwrap();
+    std::fs::write(host.join("ignored.env"), "secret").unwrap();
+    std::fs::set_permissions(
+        host.join("ignored.env"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    if std::fs::read(host.join("ignored.env")).is_ok() {
+        eprintln!("skipping: running as a user that reads mode-000 files");
+        return;
+    }
+    // A new path in the write-back over a host file the engine cannot compare: refused.
+    let e = seat::delta(
+        &host,
+        &Default::default(),
+        vec![entry(Kind::File, "ignored.env", b"seat")],
+    )
+    .unwrap_err();
+    assert!(e.contains("could not be read"), "{e}");
+    // A listing that cannot read a directory is refused, never short.
+    std::fs::write(host.join("d/f"), "f").unwrap();
+    std::fs::set_permissions(host.join("d"), std::fs::Permissions::from_mode(0o000)).unwrap();
+    assert!(sync::host_plain_listing(&host, &[]).is_err());
+    // A deletion under a directory the engine cannot open is an error, never a skip.
+    assert!(sync::apply(&host, &[], &["d/f".into()], &[]).is_err());
+    std::fs::set_permissions(host.join("d"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::set_permissions(
+        host.join("ignored.env"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_repository_git_cannot_read_is_refused_not_copied_whole() {
+    let host = tmp("broken-repo");
+    std::fs::create_dir_all(host.join(".git")).unwrap();
+    std::fs::write(host.join(".git/HEAD"), "garbage").unwrap();
+    std::fs::write(host.join(".env"), "ignored secret").unwrap();
+    assert!(sync::host_tree_listing(&host).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_cut_seed_is_never_taken_as_seeded() {
+    let replica = tmp("seed-cut");
+    std::fs::create_dir_all(&replica).unwrap();
+    let full = sync::encode(&[Root {
+        replica: "cache/c".into(),
+        mode: Mode::Seed,
+        entries: vec![
+            entry(Kind::File, "one", b"1"),
+            entry(Kind::File, "two", b"2"),
+        ],
+    }]);
+    let plan = json!([["cache/c", "seed", []]]).to_string();
+    let cut = &full[..full.len() - 20];
+    assert!(!codec(&replica, &["unpack", &plan], cut).status.success());
+    assert!(
+        !replica.join("cache/c").exists(),
+        "a partial seed was published"
+    );
+    let out = codec(&replica, &["unpack", &plan], &full);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(std::fs::read(replica.join("cache/c/two")).unwrap(), b"2");
+    assert!(!replica.join("cache/c.wicked-seeding").exists());
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
+    let host = tmp("plain-git");
+    std::fs::create_dir_all(host.join(".git")).unwrap();
+    std::fs::write(host.join(".git/config"), "c").unwrap();
+    std::fs::write(host.join("evidence.json"), "{}").unwrap();
+    let r = PlanRoot {
+        host: host.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let (stream, _, _, baseline) =
+        seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap();
+    let roots = sync::decode(&mut stream.as_slice(), sync::MAX_STREAM).unwrap();
+    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["evidence.json"]);
+    assert!(baseline.values().all(|b| !b.contains_key(".git/config")));
+    // The pod side packs no `.git` of a plain root either.
+    let replica = tmp("plain-git-replica");
+    let rp = replica.join("p");
+    std::fs::create_dir_all(rp.join(".git")).unwrap();
+    std::fs::write(rp.join(".git/config"), "c").unwrap();
+    std::fs::write(rp.join("e"), "e").unwrap();
+    let out = codec(
+        &replica,
+        &["pack", &json!([["p", "plain", []]]).to_string()],
+        b"",
+    );
+    let back = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert_eq!(back[0].entries.len(), 1);
+    let _ = std::fs::remove_dir_all(&host);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+#[test]
+fn k8s_a_stream_of_root_records_alone_is_bounded() {
+    let roots: Vec<Root> = (0..sync::MAX_ROOTS + 1)
+        .map(|i| Root {
+            replica: format!("r{i}"),
+            mode: Mode::Plain,
+            entries: Vec::new(),
+        })
+        .collect();
+    let s = sync::encode(&roots);
+    let e = sync::decode(&mut s.as_slice(), sync::MAX_STREAM).unwrap_err();
+    assert!(e.contains("roots"), "{e}");
+}
+
+#[test]
+fn k8s_the_fenced_scratch_is_no_home_and_goes_at_settle() {
+    let mk = |p: &str| PlanRoot {
+        host: PathBuf::from(p),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: false,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let mut roots = vec![mk("/w/home"), mk("/w/scratch")];
+    let dirs = [PathBuf::from("/w/home"), PathBuf::from("/w/scratch")];
+    seat::mark_homes(&mut roots, &dirs, Some(Path::new("/w/scratch")));
+    assert_eq!(roots[0].mode, Mode::Home);
+    assert_eq!(
+        roots[1].mode,
+        Mode::Plain,
+        "the scratch would stay in the replica"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_landing_index_is_built_aside_and_a_held_lock_refuses() {
+    let host = tmp("index");
+    if repo_with(&host, &[("a", "1"), ("b", "2")]).is_none() {
+        eprintln!("skipping: git unusable");
+        return;
+    }
+    let head = git_out(&host, &["rev-parse", "HEAD"]);
+    let before = std::fs::read(host.join(".git/index")).unwrap();
+    std::fs::write(host.join(".git/index.lock"), "").unwrap();
+    assert!(seat::prepare_index(&host, &head, "u1").is_err());
+    assert_eq!(std::fs::read(host.join(".git/index")).unwrap(), before);
+    std::fs::remove_file(host.join(".git/index.lock")).unwrap();
+    let staged = seat::prepare_index(&host, &head, "u1").unwrap();
+    assert!(host.join(".git/index.wicked-u1").exists());
+    drop(staged);
+    assert!(
+        !host.join(".git/index.wicked-u1").exists(),
+        "an unused staged index is removed"
+    );
+    let staged = seat::prepare_index(&host, &head, "u2").unwrap();
+    staged.install().unwrap();
+    assert!(!host.join(".git/index.wicked-u2").exists());
+    assert_eq!(git_out(&host, &["status", "--porcelain"]), "");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_the_landing_branch_is_read_as_the_copy_in_saw_it() {
+    let host = tmp("branch");
+    if repo_with(&host, &[("a", "1")]).is_none() {
+        eprintln!("skipping: git unusable");
+        return;
+    }
+    let b = seat::head_branch(&host).unwrap().expect("a branch");
+    assert!(b.starts_with("refs/heads/"));
+    git_out(&host, &["checkout", "-q", "--detach"]);
+    assert_eq!(seat::head_branch(&host).unwrap(), None);
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_bundle_dir_is_private_and_new() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = seat::private_temp_dir("wicked-test-private").unwrap();
+    assert_eq!(
+        std::fs::metadata(&d.0).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let p = d.0.clone();
+    drop(d);
+    assert!(!p.exists());
 }

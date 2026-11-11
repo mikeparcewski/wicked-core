@@ -3596,6 +3596,7 @@ pub(crate) fn arm_noting(
             .and_then(|d| d.parent().map(Path::to_path_buf))
             .map(|d| canon(&d));
     let seat_dirs: Vec<PathBuf> = inp.seat_dirs.iter().map(|d| canon(d)).collect();
+    let scratch_dir: Option<PathBuf> = inp.scratch.as_deref().map(canon);
     let role = if crate::k8s::seat::one_shot_scope(run_id).is_some() {
         "judge"
     } else {
@@ -3621,6 +3622,7 @@ pub(crate) fn arm_noting(
         protected: &protected,
         write_roots: &write_roots,
         seat_dirs: &seat_dirs,
+        scratch: scratch_dir.as_deref(),
         seed_base: seed_base.as_deref(),
         memory: &k8s_memory(memory_from(memory.as_deref())),
         gateway_ip: gateway_ip.as_deref(),

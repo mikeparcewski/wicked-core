@@ -552,6 +552,7 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
             std::slice::from_ref(&tree)
         },
         seat_dirs: &[],
+        scratch: None,
         seed_base: None,
         memory: "1Gi",
         gateway_ip: Some(&gw.service_ip),

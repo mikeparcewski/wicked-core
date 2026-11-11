@@ -68,6 +68,8 @@ fn seeded_key(ns: &str, replica: &str) -> String {
 }
 /// The replica's shallow history.
 const REPLICA_DEPTH: &str = "50";
+/// The deadline of one engine git call on a host tree.
+const GIT_CALL: Duration = Duration::from_secs(300);
 
 /// One root of a unit's replica: where it is on the host, how it syncs, what of it the seat may
 /// never write (masks and nested roots, relative), and whether it comes back.
@@ -295,6 +297,9 @@ pub(crate) struct Seat {
     pub(crate) roots: Vec<PlanRoot>,
     /// The host HEAD the replica's `.git` was built at (`None`: no commits, or no git).
     pub(crate) base: Option<String>,
+    /// The branch the host's HEAD named at copy-in (`None`: detached, or no commits): the
+    /// commits land on it and nowhere else.
+    pub(crate) branch: Option<String>,
     /// What every root that comes back held at copy-in.
     pub(crate) baseline: Mutex<Baseline>,
     /// The unit's seat homes, re-synced right before the CLI starts (placeholder files).
@@ -379,6 +384,56 @@ pub(crate) fn place(kube: &Kube, run_id: &str) -> (String, Option<String>, Strin
     }
 }
 
+/// The seat's homes among `roots` become [`Mode::Home`] (kept in the replica, never back); the
+/// fenced `scratch` is no home and stays plain, removed at settle (codex b2-seat #12).
+pub(crate) fn mark_homes(roots: &mut [PlanRoot], seat_dirs: &[PathBuf], scratch: Option<&Path>) {
+    for r in roots.iter_mut() {
+        if r.mode == Mode::Plain
+            && seat_dirs.contains(&r.host)
+            && scratch.is_none_or(|x| x != r.host)
+        {
+            r.mode = Mode::Home;
+            r.back = false;
+        }
+    }
+}
+
+/// Namespaces whose sync pod a cut codec call left unconfirmed gone (codex b2-seat #5): no codec
+/// runs there, and no new copy-in starts, until its deletion is confirmed.
+static SYNC_SUSPECT: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+
+/// Mark (`true`) or clear the sync pod of `ns` as suspect.
+pub(crate) fn mark_sync_suspect(ns: &str, on: bool) {
+    let mut g = SYNC_SUSPECT.lock().unwrap_or_else(|p| p.into_inner());
+    let set = g.get_or_insert_with(HashSet::new);
+    if on {
+        set.insert(ns.to_string());
+    } else {
+        set.remove(ns);
+    }
+}
+
+/// `Ok` when the sync pod of `ns` is not suspect, or its deletion is now confirmed.
+fn clear_sync_suspect(kube: &Kube, ns: &str) -> Result<(), String> {
+    let suspect = SYNC_SUSPECT
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|s| s.contains(ns));
+    if !suspect {
+        return Ok(());
+    }
+    kube.delete_owned(Some(ns), "pod", "sync", true)
+        .map_err(|e| {
+            format!(
+                "the sync pod in {ns} may still run a cut codec and was not confirmed gone ({e}); \
+             the replica is not used until it is"
+            )
+        })?;
+    mark_sync_suspect(ns, false);
+    Ok(())
+}
+
 /// The sync pod of `ns`, created when absent and waited for.
 fn ensure_sync(
     kube: &Kube,
@@ -387,6 +442,7 @@ fn ensure_sync(
     image: &str,
     floor: &str,
 ) -> Result<(), (FloorUnarmed, String)> {
+    clear_sync_suspect(kube, ns).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
     let running = |kube: &Kube| -> Result<bool, String> {
         let pods = kube.list_owned(Some(ns), "pods", &[(ROLE_LABEL, "sync")])?;
         Ok(cluster::running_pod(&pods).as_deref() == Some("sync"))
@@ -435,6 +491,13 @@ fn codec(
     stdin: Option<&[u8]>,
     limit: Duration,
 ) -> super::Called {
+    if let Err(e) = clear_sync_suspect(kube, ns) {
+        return super::Called {
+            code: None,
+            stdout: Vec::new(),
+            stderr: e.into_bytes(),
+        };
+    }
     let mut a = vec!["exec"];
     if stdin.is_some() {
         a.push("-i");
@@ -460,6 +523,7 @@ fn codec(
         // used again (the next arm makes a new sync pod).
         if let Err(e) = kube.delete_owned(Some(ns), "pod", "sync", true) {
             eprintln!("wicked-core: the sync pod in {ns} was not reset: {e}");
+            mark_sync_suspect(ns, true);
         }
     }
     r
@@ -475,24 +539,30 @@ pub(crate) fn resets_sync(code: Option<i32>) -> bool {
 
 /// The host's side of a tree root's `.git` for the replica: a shallow clone of the tree's HEAD,
 /// its branch and index set, read as a `git` root. `None` = the tree has no commit.
-fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entry>)>, String> {
-    let head = sync::git(tree)
-        .args(["rev-parse", "--verify", "-q", "HEAD^{commit}"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !head.status.success() {
+fn replica_git(
+    tree: &Path,
+    masks: &[String],
+    budget: u64,
+) -> Result<Option<(String, Vec<Entry>)>, String> {
+    // Every git call bounded in time and output (codex b2-seat #13).
+    let bounded = |dir: &Path, args: &[&str]| -> super::Called {
+        let mut c = sync::git(dir);
+        c.args(args);
+        super::run_capped(c, None, GIT_CALL, 64 << 20)
+    };
+    let head = bounded(tree, &["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
+    if head.code.is_none() {
+        return Err(format!(
+            "git rev-parse in {}: {}",
+            tree.display(),
+            head.err_text()
+        ));
+    }
+    if !head.ok() {
         return Ok(None);
     }
     let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
-    let branch = sync::git(tree)
-        .args(["symbolic-ref", "-q", "HEAD"])
-        .output()
-        .map_err(|e| e.to_string())?;
-    let branch = branch
-        .status
-        .success()
-        .then(|| String::from_utf8_lossy(&branch.stdout).trim().to_string())
-        .filter(|b| b.starts_with("refs/heads/"));
+    let branch = head_branch(tree)?;
     let tmp = std::env::temp_dir().join(format!(
         "wicked-replica-git-{}",
         uuid::Uuid::new_v4().simple()
@@ -506,17 +576,14 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
     let _rm = Rm(tmp.clone());
     std::fs::create_dir_all(&tmp).map_err(|e| e.to_string())?;
     let run = |args: &[&str]| -> Result<(), String> {
-        let o = sync::git(&tmp)
-            .args(args)
-            .output()
-            .map_err(|e| e.to_string())?;
-        if o.status.success() {
+        let o = bounded(&tmp, args);
+        if o.ok() {
             Ok(())
         } else {
             Err(format!(
                 "git {}: {}",
                 args.first().unwrap_or(&""),
-                String::from_utf8_lossy(&o.stderr).trim()
+                o.err_text()
             ))
         }
     };
@@ -558,10 +625,10 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
     if !masks.is_empty() {
         // Every tracked path, matched by the same folded rule as the copy-in (review r2: a
         // pathspec is case-sensitive and glob-shaped; the mask is neither).
-        let o = sync::git(&tmp)
-            .args(["ls-files", "-z"])
-            .output()
-            .map_err(|e| e.to_string())?;
+        let o = bounded(&tmp, &["ls-files", "-z"]);
+        if !o.ok() {
+            return Err(format!("git ls-files: {}", o.err_text()));
+        }
         let tracked: Vec<String> = o
             .stdout
             .split(|b| *b == 0)
@@ -579,18 +646,47 @@ fn replica_git(tree: &Path, masks: &[String]) -> Result<Option<(String, Vec<Entr
     let gitdir = tmp.join(".git");
     // Every file of the rebuilt git dir, or a refusal (review r4: an object pack over the
     // stream's limit was left out silently, leaving a `.git` whose index named missing objects).
+    // Sized from metadata before any byte is read (codex b2-seat #13): a history of many small
+    // objects over the copy-in's remaining budget is refused without being held in memory.
+    let listed = sync::host_plain_listing(&gitdir, &[])?;
+    let size: u64 = listed
+        .iter()
+        .map(|rel| sync::entry_size(&gitdir, rel) + rel.len() as u64)
+        .sum();
+    if size > budget {
+        return Err(format!(
+            "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
+        ));
+    }
     let mut entries = Vec::new();
-    for rel in sync::host_plain_listing(&gitdir, &[]) {
-        match sync::read_host_entry(&gitdir, &rel) {
+    for rel in listed {
+        match sync::read_host_entry(&gitdir, &rel)? {
             Some(e) => entries.push(e),
             None => {
                 return Err(format!(
-                    "the replica's .git could not be read whole (`{rel}` is unreadable or over                      {STREAM_LIMIT} bytes)"
+                    "the replica's .git could not be read whole (`{rel}` went away)"
                 ))
             }
         }
     }
     Ok(Some((sha, entries)))
+}
+
+/// The branch a host tree's HEAD names (`refs/heads/...`), or `None` when it is detached.
+pub(crate) fn head_branch(tree: &Path) -> Result<Option<String>, String> {
+    let mut c = sync::git(tree);
+    c.args(["symbolic-ref", "-q", "HEAD"]);
+    let o = super::run_capped(c, None, GIT_CALL, 1 << 20);
+    match o.code {
+        Some(0) => Ok(Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|b| b.starts_with("refs/heads/"))),
+        Some(1) => Ok(None),
+        _ => Err(format!(
+            "git symbolic-ref in {}: {}",
+            tree.display(),
+            o.err_text()
+        )),
+    }
 }
 
 /// What each root that comes back held at copy-in (relative path -> content digest): the
@@ -612,6 +708,7 @@ pub(crate) fn copy_in_stream(
     // The bytes read so far (review r3): a root over the stream's limit is refused as it is read,
     // never after the whole of it is in memory.
     let mut budget: u64 = 0;
+    let mut count: usize = 0;
     let mut seed_used: u64 = 0;
     for r in roots {
         let replica = replica_of(scope, &r.host)?;
@@ -635,15 +732,27 @@ pub(crate) fn copy_in_stream(
         } else {
             match r.mode {
                 Mode::Tree => sync::host_tree_listing(&r.host)?,
-                _ => sync::host_plain_listing(&r.host, &r.skip),
+                _ => sync::host_plain_listing(&r.host, &r.skip)?,
             }
         };
         let mut entries: Vec<Entry> = Vec::new();
+        // Neither a tree nor a plain root carries git metadata (codex b2-sync #17): only the
+        // tree's own rebuilt `.git` root does, and nothing of a `.git` ever comes back.
+        let no_git = matches!(r.mode, Mode::Tree | Mode::Plain);
         for p in rels
             .iter()
             .filter(|p| !r.skip.iter().any(|s| sync::under(p, s)))
-            .filter(|p| r.mode != Mode::Tree || !p.split('/').any(sync::is_git_name))
+            .filter(|p| !no_git || !p.split('/').any(sync::is_git_name))
         {
+            // As many entries as a write-back may carry, or refused now (codex b2-sync #16): a
+            // unit is never armed on a tree it could not bring back.
+            count += 1;
+            if count > sync::MAX_ENTRIES {
+                return Err(format!(
+                    "the unit's copy-in has more than {} files",
+                    sync::MAX_ENTRIES
+                ));
+            }
             budget += sync::entry_size(&r.host, p).max(p.len() as u64);
             if budget > STREAM_LIMIT {
                 return Err(format!(
@@ -651,26 +760,19 @@ pub(crate) fn copy_in_stream(
                     r.host.join(p).display()
                 ));
             }
-            match sync::read_host_entry(&r.host, p) {
-                Some(e) => entries.push(e),
-                // A regular file that is there but cannot be read refuses the copy-in (review
-                // r5); a path that is gone, or a directory (a gitlink), is simply absent.
-                None if std::fs::symlink_metadata(r.host.join(p))
-                    .is_ok_and(|m| m.file_type().is_file()) =>
-                {
-                    return Err(format!(
-                        "`{}` could not be read for the copy-in",
-                        r.host.join(p).display()
-                    ))
-                }
-                None => {}
+            // A file that is there but cannot be read refuses the copy-in (review r5); a path
+            // that is gone, or a directory (a gitlink), is simply absent.
+            if let Some(e) = sync::read_host_entry(&r.host, p)
+                .map_err(|e| format!("the copy-in was refused: {e}"))?
+            {
+                entries.push(e);
             }
         }
         // The tree's `.git` first: the codec mirrors the tree by what that git lists. Always
         // sent, empty when the host has no commit (review r3): an empty root still replaces a
         // `.git` a seat planted in the replica, so its hooks never reach a later unit.
         if r.mode == Mode::Tree && r.host == tree && with_git {
-            let (sha, git_entries) = match replica_git(tree, &r.masks)? {
+            let (sha, git_entries) = match replica_git(tree, &r.masks, STREAM_LIMIT - budget)? {
                 Some((sha, entries)) => (Some(sha), entries),
                 None => (None, Vec::new()),
             };
@@ -732,7 +834,19 @@ pub(crate) fn copy_in_stream(
 fn seed_entries(host: &Path, skip: &[String], used: &mut u64) -> Vec<Entry> {
     let mut size: u64 = 0;
     let mut out = Vec::new();
-    for p in sync::host_plain_listing(host, skip) {
+    // A cache is optional (codex b2-sync #11): one that cannot be listed or read whole starts
+    // the seat with it empty, said so, never in part.
+    let listed = match sync::host_plain_listing(host, skip) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: the seat cache {} is left out: {e}",
+                host.display()
+            );
+            return Vec::new();
+        }
+    };
+    for p in listed {
         size += sync::entry_size(host, &p).max(p.len() as u64);
         if *used + size > SEED_LIMIT {
             eprintln!(
@@ -741,8 +855,16 @@ fn seed_entries(host: &Path, skip: &[String], used: &mut u64) -> Vec<Entry> {
             );
             return Vec::new();
         }
-        if let Some(e) = sync::read_host_entry(host, &p) {
-            out.push(e);
+        match sync::read_host_entry(host, &p) {
+            Ok(Some(e)) => out.push(e),
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: the seat cache {} is left out: {e}",
+                    host.display()
+                );
+                return Vec::new();
+            }
         }
     }
     *used += size;
@@ -823,6 +945,8 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) protected: &'a [PathBuf],
     pub(crate) write_roots: &'a [PathBuf],
     pub(crate) seat_dirs: &'a [PathBuf],
+    /// The unit's fenced scratch (one of `seat_dirs`): removed at settle, never kept.
+    pub(crate) scratch: Option<&'a Path>,
     pub(crate) seed_base: Option<&'a Path>,
     pub(crate) memory: &'a str,
     pub(crate) gateway_ip: Option<&'a str>,
@@ -1082,13 +1206,10 @@ pub(crate) fn arm(
     );
     // Seat homes stay in the replica (review r7 #1); the unit's other writable dirs that do not
     // come back (fenced scratch) are removed from it when the unit settles (review r7 #3).
+    // The fenced scratch is among the seat's dirs but is no home (codex b2-seat #12): it stays
+    // plain, so it is selected below and removed at settle, never kept in the replica.
     let mut roots = roots;
-    for r in roots.iter_mut() {
-        if r.mode == Mode::Plain && s.seat_dirs.contains(&r.host) {
-            r.mode = Mode::Home;
-            r.back = false;
-        }
-    }
+    mark_homes(&mut roots, s.seat_dirs, s.scratch);
     let scratch: Vec<PathBuf> = pod_mounts
         .iter()
         .filter(|m| m.rw)
@@ -1106,6 +1227,11 @@ pub(crate) fn arm(
     clear_stale(kube, &ns)?;
     let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
     drop(_arming);
+    // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
+    let branch = match &base {
+        Some(_) => head_branch(s.tree).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?,
+        None => None,
+    };
     let id = uuid::Uuid::new_v4().simple().to_string();
     let sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
     let unit_label = label_value(&format!("{}-{}", s.ord, &id[..10]));
@@ -1148,6 +1274,7 @@ pub(crate) fn arm(
         tree: s.tree.to_path_buf(),
         roots,
         base,
+        branch,
         baseline: Mutex::new(baseline),
         seat_dirs: s.seat_dirs.to_vec(),
         scratch,
@@ -1687,8 +1814,10 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         .lock()
         .map_err(|_| "the copy-in baseline is poisoned")?
         .clone();
-    // Every root checked and diffed against its baseline before anything is applied.
-    let mut plans: Vec<RootPlan<'_>> = Vec::new();
+    // Every root checked before anything is fetched or applied; diffed against the host only
+    // after the commits are in (below), so the conflict check reads the host as it is when the
+    // write-back lands, not minutes earlier (codex b2-seat #4).
+    let mut checked: Vec<(&PlanRoot, Vec<Entry>)> = Vec::new();
     for ((replica, want), got) in refs.iter().zip(&roots) {
         if &got.replica != replica {
             return Err("the write-back's roots are out of order".into());
@@ -1703,18 +1832,8 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
-        let base = baseline.get(&want.host).cloned().unwrap_or_default();
-        let (writes, mut deletes) = delta(&want.host, &base, entries)?;
-        // A tracked file the host's ignore rules match (force-added) is never listed by the
-        // pod's `ls-files --exclude-standard`, changed or not: its absence there is no deletion
-        // (review r5). A seat that really deleted one leaves it on the host (the safe side).
-        if want.mode == Mode::Tree && !deletes.is_empty() {
-            let ignored = host_ignored(&want.host, &deletes)?;
-            deletes.retain(|d| !ignored.contains(d));
-        }
-        plans.push((want, writes, deletes));
+        checked.push((want, entries));
     }
-    preflight(&plans)?;
     let tree_back = back
         .iter()
         .any(|r| r.mode == Mode::Tree && r.host == seat.tree);
@@ -1739,12 +1858,14 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
     }
     let commits = match &seat.base {
         Some(base) if tree_back => {
-            let masks = back
+            // The tree's whole write policy (codex b2-seat #11): its masks and its nested roots,
+            // which a commit could otherwise change without a file write.
+            let fence = back
                 .iter()
                 .find(|r| r.host == seat.tree)
-                .map(|r| r.masks.clone())
+                .map(|r| r.skip.clone())
                 .unwrap_or_default();
-            fetch_commits(seat, base, &masks)?
+            fetch_commits(seat, base, &fence)?
         }
         _ => None,
     };
@@ -1761,6 +1882,36 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
             ));
         }
     }
+    let mut plans: Vec<RootPlan<'_>> = Vec::new();
+    for (want, entries) in checked {
+        let base = baseline.get(&want.host).cloned().unwrap_or_default();
+        let retained = retained_links(&entries, &base);
+        let (writes, mut deletes) = delta(&want.host, &base, entries)?;
+        // The pod's `ls-files -c -o --exclude-standard` lists every tracked file, ignored or
+        // not, so a tracked path it does not list was deleted (codex b2-seat #10). Only an
+        // untracked one the host's ignore rules now match is no deletion (the safe side).
+        if want.mode == Mode::Tree && !deletes.is_empty() {
+            deletes = tree_deletions(&want.host, deletes)?;
+        }
+        check_retained_links(&want.host, &retained, &writes, &deletes, &want.skip)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        plans.push((want, writes, deletes));
+    }
+    preflight(&plans)?;
+    if let Some(b) = &seat.branch {
+        // The destination is the branch of the copy-in, still checked out (codex b2-seat #9).
+        if commits.is_some() && head_branch(&seat.tree)?.as_deref() != Some(b.as_str()) {
+            return Err(format!(
+                "the host's checkout moved off {b} while the unit ran; its commits are not landed"
+            ));
+        }
+    }
+    // The index the landing installs, made before any host file changes (codex b2-seat #7): a
+    // held `index.lock` or a failed build refuses the write-back with the host untouched.
+    let staged_index = match &commits {
+        Some((new, _)) => Some(prepare_index(&seat.tree, new, &seat.id)?),
+        None => None,
+    };
     apply_roots(&plans)?;
     if let (Some((new, refname)), Some(base)) = (commits, &seat.base) {
         let git = |args: &[&str]| -> Result<(), String> {
@@ -1774,17 +1925,185 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
                 Err(String::from_utf8_lossy(&o.stderr).trim().to_string())
             }
         };
-        git(&[
+        let mut update = vec![
             "update-ref",
             "-m",
             "wicked: the unit's commits (k8s write-back)",
-            "HEAD",
-            &new,
-            base,
-        ])
-        .and_then(|()| git(&["read-tree", &new]))
-        .map_err(|e| format!("the unit's commits could not land: {e}"))?;
+        ];
+        match &seat.branch {
+            Some(b) => update.push(b.as_str()),
+            None => update.extend(["--no-deref", "HEAD"]),
+        }
+        update.extend([new.as_str(), base.as_str()]);
+        git(&update).map_err(|e| format!("the unit's commits could not land: {e}"))?;
+        if let Some(staged) = staged_index {
+            staged.install().map_err(|e| {
+                format!(
+                    "the unit's commits landed but the index could not be updated ({e}); run \
+                     `git read-tree HEAD` in {}",
+                    seat.tree.display()
+                )
+            })?;
+        }
         let _ = git(&["update-ref", "-d", &refname]);
+    }
+    Ok(())
+}
+
+/// A new owner-only directory under the temp dir, removed with everything in it when dropped.
+pub(crate) struct PrivateDir(pub(crate) PathBuf);
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Make a [`PrivateDir`] (`0700`, created new: an existing path of that name is an error).
+pub(crate) fn private_temp_dir(tag: &str) -> Result<PrivateDir, String> {
+    let p = std::env::temp_dir().join(format!("{tag}-{}", uuid::Uuid::new_v4().simple()));
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(PrivateDir(p))
+}
+
+/// The index a landing installs, built aside from the host's own (removed unless installed).
+pub(crate) struct StagedIndex {
+    staged: PathBuf,
+    index: PathBuf,
+    done: bool,
+}
+
+impl StagedIndex {
+    /// Put the staged index in place of the host's (one rename).
+    pub(crate) fn install(mut self) -> std::io::Result<()> {
+        std::fs::rename(&self.staged, &self.index)?;
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl Drop for StagedIndex {
+    fn drop(&mut self) {
+        if !self.done {
+            let _ = std::fs::remove_file(&self.staged);
+        }
+    }
+}
+
+/// Build the index of commit `new` for the host tree beside its own index (codex b2-seat #7):
+/// refused, with nothing changed, while another git holds `index.lock`.
+pub(crate) fn prepare_index(tree: &Path, new: &str, id: &str) -> Result<StagedIndex, String> {
+    let mut c = sync::git(tree);
+    c.args(["rev-parse", "--path-format=absolute", "--git-path", "index"]);
+    let o = super::run_capped(c, None, GIT_CALL, 1 << 20);
+    if !o.ok() {
+        return Err(format!(
+            "the host's index could not be found: {}",
+            o.err_text()
+        ));
+    }
+    let index = PathBuf::from(String::from_utf8_lossy(&o.stdout).trim());
+    let mut lock = index.clone().into_os_string();
+    lock.push(".lock");
+    if std::fs::symlink_metadata(&lock).is_ok() {
+        return Err(format!(
+            "{} is held by another git; the unit's commits are not landed",
+            PathBuf::from(lock).display()
+        ));
+    }
+    let staged = index.with_file_name(format!("index.wicked-{id}"));
+    let guard = StagedIndex {
+        staged: staged.clone(),
+        index,
+        done: false,
+    };
+    let mut c = sync::git(tree);
+    c.env("GIT_INDEX_FILE", &staged).args(["read-tree", new]);
+    let o = super::run_capped(c, None, GIT_CALL, 1 << 20);
+    if !o.ok() {
+        return Err(format!(
+            "the index of the unit's commits could not be built: {}",
+            o.err_text()
+        ));
+    }
+    Ok(guard)
+}
+
+/// The deletions of a tree root that are real (codex b2-seat #10): every tracked path, and an
+/// untracked one only when the host's ignore rules do not match it.
+pub(crate) fn tree_deletions(root: &Path, deletes: Vec<String>) -> Result<Vec<String>, String> {
+    let tracked = host_tracked(root)?;
+    let untracked: Vec<String> = deletes
+        .iter()
+        .filter(|d| !tracked.contains(*d))
+        .cloned()
+        .collect();
+    if untracked.is_empty() {
+        return Ok(deletes);
+    }
+    let ignored = host_ignored(root, &untracked)?;
+    Ok(deletes
+        .into_iter()
+        .filter(|d| !ignored.contains(d))
+        .collect())
+}
+
+/// The tracked paths of the host tree `root` (its index).
+pub(crate) fn host_tracked(root: &Path) -> Result<HashSet<String>, String> {
+    let mut c = sync::git(root);
+    c.args(["ls-files", "-z", "-c"]);
+    let r = super::run_capped(c, None, GIT_CALL, 256 << 20);
+    if !r.ok() {
+        return Err(format!("git ls-files failed: {}", r.err_text()));
+    }
+    Ok(r.stdout
+        .split(|b| *b == 0)
+        .filter(|p| !p.is_empty())
+        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .collect())
+}
+
+/// The links of a root's write-back the seat left exactly as the host gave them.
+pub(crate) fn retained_links(entries: &[Entry], base: &HashMap<String, [u8; 32]>) -> Vec<Entry> {
+    entries
+        .iter()
+        .filter(|e| e.kind == sync::Kind::Link)
+        .filter(|e| base.get(&e.path) == Some(&sync::digest(e)))
+        .cloned()
+        .collect()
+}
+
+/// A link the seat kept unchanged must not come to resolve outside its root through what the
+/// write-back changes around it (codex b2-sync #4: `b -> a/..` stays, `a` becomes `a -> .`). A
+/// link that already resolved outside before the write-back is the host's own, left as it is.
+pub(crate) fn check_retained_links(
+    host: &Path,
+    retained: &[Entry],
+    writes: &[Entry],
+    deletes: &[String],
+    fence: &[String],
+) -> Result<(), String> {
+    if writes.is_empty() && deletes.is_empty() {
+        return Ok(());
+    }
+    for l in retained {
+        let mut after: Vec<Entry> = writes.to_vec();
+        after.push(l.clone());
+        if sync::links_stay_inside_final(Some(host), &after, deletes, fence).is_ok() {
+            continue;
+        }
+        if sync::links_stay_inside_final(Some(host), std::slice::from_ref(l), &[], fence).is_ok() {
+            return Err(format!(
+                "`{}` would resolve outside its root once the unit's changes land",
+                l.path
+            ));
+        }
     }
     Ok(())
 }
@@ -1841,6 +2160,7 @@ pub(crate) fn preflight(plans: &[RootPlan<'_>]) -> Result<(), String> {
             let at = want.host.join(&e.path);
             if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_dir()) {
                 if let Some(kept) = sync::host_plain_listing(&at, &[])
+                    .map_err(refused)?
                     .into_iter()
                     .map(|rel| format!("{}/{rel}", e.path))
                     .find(|p| !gone.contains(p.as_str()))
@@ -1875,7 +2195,11 @@ pub(crate) fn delta(
     base: &HashMap<String, [u8; 32]>,
     entries: Vec<Entry>,
 ) -> Result<(Vec<Entry>, Vec<String>), String> {
-    let now = |rel: &str| sync::read_host_entry(host, rel).map(|e| sync::digest(&e));
+    // The host's content now; a file that is there but cannot be compared (unreadable, too
+    // large, not a file) refuses the write-back, never reads as absent (codex b2-sync #9).
+    let now = |rel: &str| -> Result<Option<[u8; 32]>, String> {
+        Ok(sync::read_host_entry(host, rel)?.map(|e| sync::digest(&e)))
+    };
     // A spelling change (`a` -> `A`, review r4): on a host that folds them, the new spelling
     // names the old file, so the old one is neither a conflict nor a deletion there; on a host
     // that does not, they are two files, as in the pod.
@@ -1886,7 +2210,7 @@ pub(crate) fn delta(
     for e in entries {
         seen.push(e.path.clone());
         let d = sync::digest(&e);
-        let cur = now(&e.path);
+        let cur = now(&e.path)?;
         let was = base.get(&e.path).or_else(|| {
             cur.as_ref()
                 .and(folded_base.get(&sync::fold(&e.path)).copied())
@@ -1935,7 +2259,7 @@ pub(crate) fn delta(
         {
             continue;
         }
-        match now(rel) {
+        match now(rel)? {
             None => {}
             Some(cur) if &cur == was => deletes.push(rel.clone()),
             Some(_) => {
@@ -1974,15 +2298,21 @@ fn fetch_commits(
     if r.stdout.is_empty() {
         return Ok(None);
     }
-    let file = std::env::temp_dir().join(format!("wicked-unit-{}.bundle", seat.id));
-    std::fs::write(&file, &r.stdout).map_err(|e| e.to_string())?;
-    struct Rm(PathBuf);
-    impl Drop for Rm {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+    // A private dir made new for this bundle and a file created exclusively in it, both owner
+    // only (codex b2-seat #2): no planted link is followed and the history is nobody else's.
+    let dir = private_temp_dir("wicked-unit-bundle")?;
+    let file = dir.0.join("unit.bundle");
+    {
+        let mut o = std::fs::OpenOptions::new();
+        o.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            o.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
+        let mut f = o.open(&file).map_err(|e| e.to_string())?;
+        std::io::Write::write_all(&mut f, &r.stdout).map_err(|e| e.to_string())?;
     }
-    let _rm = Rm(file.clone());
     // Bounded in time and output (review r5): the history is the seat's, and a small bundle can
     // make `git log` print without end.
     let git = |args: &[&str]| -> Result<String, String> {
@@ -2138,6 +2468,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         tree: tree.to_path_buf(),
         roots: Vec::new(),
         base: None,
+        branch: None,
         baseline: Mutex::new(Baseline::new()),
         seat_dirs: Vec::new(),
         scratch: Vec::new(),

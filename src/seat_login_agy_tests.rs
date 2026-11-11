@@ -458,6 +458,7 @@ fn live_agys_api_key_reaches_the_gemini_api_only_through_its_route() {
             gemini.join("config"),
             gemini.clone(),
         ],
+        scratch: None,
         unmask: vec![],
         pinned: vec![],
         net: vec![],
