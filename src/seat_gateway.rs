@@ -17,8 +17,9 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 // agy lg-r1 A7: callers remain available.
 // k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
-// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
-#![allow(dead_code)]
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead
+// (unix only here: the line above already allows it elsewhere, and a duplicate is an error).
+#![cfg_attr(unix, allow(dead_code))]
 
 use std::fs;
 use std::io::Write;
