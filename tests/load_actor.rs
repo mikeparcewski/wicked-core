@@ -314,6 +314,11 @@ fn actor_latency_under_concurrent_runs() {
     if gated && std::env::var_os("WICKED_ACTOR_SLOW_MS").is_none() {
         std::env::set_var("WICKED_ACTOR_SLOW_MS", "1000");
     }
+    // (review r2 on #1433) A gated run measures Stops over populated trees: never zero files.
+    assert!(
+        !gated || knob("WICKED_LOAD_IGNORED", 3000) > 0,
+        "WICKED_LOAD_GATES=1 needs WICKED_LOAD_IGNORED > 0"
+    );
     let ignored = if gated {
         knob("WICKED_LOAD_IGNORED", 3000)
     } else {
