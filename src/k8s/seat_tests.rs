@@ -1617,7 +1617,9 @@ fn k8s_an_offline_seat_is_never_selected_by_the_gateway_policies() {
 #[test]
 fn k8s_a_writer_write_holds_a_kernel_lock_from_before_its_body_to_after_its_rename() {
     let s = gw::write_script(gw::Volume::Config, "config.json", &"a".repeat(64)).unwrap();
-    let lock = s.find("flock -w").expect("the kernel lock");
+    // busybox `flock` (the writer's) has no `-w`: a bounded `-n` retry (B-4 live run).
+    assert!(!s.contains("flock -w"));
+    let lock = s.find("until flock -n 9").expect("the kernel lock");
     let take = s.find("cat > ").unwrap();
     let rename = s.find("mv -f \"$t\"").unwrap();
     assert!(s.find("exec 9>/cfg/.config.json.lock").unwrap() < lock);
