@@ -20210,8 +20210,11 @@ pub(crate) fn cancel_run(
             let (root, rid, tx) = (repo.root_path.clone(), run_id.to_string(), self_tx.clone());
             let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<bool>(0);
             let late = retained.clone();
+            // Its place in the tree's queue is taken HERE, before the cancel replies: a relaunch
+            // of this run id (only possible after the reply) mints after the reap.
+            let ticket = crate::repo::reserve_tree(&root, &rid);
             crate::repo::spawn_bound(move || {
-                let reaped = crate::repo::reap_worktree_if_clean(&root, &rid);
+                let reaped = crate::repo::reap_worktree_with(ticket, &root, &rid);
                 // A rendezvous: delivered only while the actor still waits for it; otherwise the
                 // outcome is posted as an event of its own.
                 if done_tx.send(reaped).is_err() && !reaped {

@@ -115,9 +115,9 @@ impl StepRunner for LoadSeat {
             if let Some(wd) = input.workdir.as_deref() {
                 for i in 0..self.ignored {
                     let dir = wd.join(format!("node_modules/p{:03}", i / 100));
-                    let _ = std::fs::create_dir_all(&dir);
-                    let _ =
-                        std::fs::write(dir.join(format!("i{i:05}.js")), "module.exports = 1;\n");
+                    std::fs::create_dir_all(&dir).expect("the fixture's dependency directory");
+                    std::fs::write(dir.join(format!("i{i:05}.js")), "module.exports = 1;\n")
+                        .expect("a fixture dependency file");
                 }
             }
         }
@@ -322,6 +322,11 @@ fn actor_latency_under_concurrent_runs() {
     let units = knob("WICKED_LOAD_UNITS", 4);
     let secs = knob("WICKED_LOAD_SECS", 60);
     let gated = knob("WICKED_LOAD_GATES", 0) == 1;
+    // (review on #1433) The bound is asserted over every command of the window: each one over a
+    // second is kept on the slow list, which no faster run evicts as the per-variant ring would.
+    if gated && std::env::var_os("WICKED_ACTOR_SLOW_MS").is_none() {
+        std::env::set_var("WICKED_ACTOR_SLOW_MS", "1000");
+    }
     let ignored = if gated {
         knob("WICKED_LOAD_IGNORED", 3000)
     } else {
@@ -504,8 +509,14 @@ fn actor_latency_under_concurrent_runs() {
                         *e += 1;
                         *e
                     };
-                    let decision = if n.is_multiple_of(3) && k == 2 {
-                        stopped.fetch_add(1, Ordering::Relaxed);
+                    // A Stop only over a populated tree: the reap it measures deletes one.
+                    let populated = v
+                        .session
+                        .workdir
+                        .as_deref()
+                        .is_some_and(|w| std::path::Path::new(w).join("node_modules").is_dir());
+                    let stop_here = n.is_multiple_of(3) && k >= 2 && populated;
+                    let decision = if stop_here {
                         wicked_core::HumanDecision::Reject
                     } else {
                         wicked_core::HumanDecision::Approve {
@@ -514,8 +525,14 @@ fn actor_latency_under_concurrent_runs() {
                         }
                     };
                     let t = Instant::now();
-                    let ok = core.confirm_gate(&id, decision).is_ok();
-                    samples.add(if ok { "gate" } else { "gate_refused" }, t.elapsed());
+                    let res = core.confirm_gate(&id, decision);
+                    samples.add(
+                        if res.is_ok() { "gate" } else { "gate_refused" },
+                        t.elapsed(),
+                    );
+                    if stop_here && matches!(res, Ok(SessionStatus::Cancelled)) {
+                        stopped.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -617,14 +634,14 @@ fn actor_latency_under_concurrent_runs() {
     let _ = std::fs::remove_dir_all(&base);
     // (core#1429) With gates answered (Stops included), no actor command takes a second.
     if gated {
-        let worst = stats.commands.iter().map(|c| c.max_ms).max().unwrap_or(0);
         assert!(
-            stats.commands.iter().any(|c| c.command == "ConfirmGate"),
-            "the window answered no gate: {text}"
+            stopped.load(Ordering::Relaxed) > 0,
+            "the window Stopped no run over a populated tree: {text}"
         );
         assert!(
-            worst < 1000,
-            "an actor command took {worst} ms (the bound is 1000 ms): {text}"
+            stats.slow_threshold_ms <= 1000 && stats.slow.is_empty(),
+            "an actor command took a second or more: {:?}",
+            stats.slow
         );
     }
 }
