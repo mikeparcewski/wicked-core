@@ -664,6 +664,9 @@ fn k8s_a_read_only_units_view_is_never_in_the_write_back() {
     let tree = at("/home/u/wt");
     assert_eq!(tree.len(), 1);
     assert_eq!(tree[0]["name"], "view");
+    // One level down in the emptyDir, in a dir the view init makes as the pod's uid: the
+    // emptyDir's root is the kubelet's, and git refuses a tree it does not own (phase C).
+    assert_eq!(tree[0]["subPath"], render::VIEW_TREE);
     // The replica's copy is the view's read-only source, scoped to the session.
     let src = at(render::VIEW_SOURCE);
     assert_eq!(src[0]["readOnly"], true);
@@ -679,6 +682,12 @@ fn k8s_a_read_only_units_view_is_never_in_the_write_back() {
         .map(|c| c["name"].as_str().unwrap())
         .collect();
     assert_eq!(init, vec!["floor", "view"]);
+    let copy = spec["initContainers"][1]["command"][3].as_str().unwrap();
+    assert!(
+        copy.contains(&format!("mkdir /wicked-view/{}", render::VIEW_TREE))
+            && copy.contains(&format!("-C /wicked-view/{} -xf", render::VIEW_TREE)),
+        "{copy}"
+    );
     let vol = spec["volumes"]
         .as_array()
         .unwrap()

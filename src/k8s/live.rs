@@ -638,11 +638,19 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
     let before = git(&["rev-parse", "HEAD^{tree}"]);
     let (ro, wrapper) = super::seat::arm(&engine, &spec(true, "live2-run", 2), landrun(true))
         .expect("the view arms");
-    let cmd = seat_cmd(&wrapper, &tree, "set -e; touch x; echo z > a.txt; python3 -c 'open(\"p\",\"w\").write(\"p\")' 2>/dev/null || true; cat a.txt", &[]);
+    // Phase C: an evaluator's git works in its view (the tree root is the seat's own, never
+    // "dubious ownership"), and sees the change it made there.
+    let cmd = seat_cmd(&wrapper, &tree, "set -e; touch x; echo z > a.txt; python3 -c 'open(\"p\",\"w\").write(\"p\")' 2>/dev/null || true; cat a.txt; \
+                  echo LOG=$(git log --format=%H -1); git diff --stat; git status --porcelain", &[]);
     let (fin, _) = super::seat::finalize(&cmd).unwrap().unwrap();
     let (code, out, err) = run_seat(fin);
     assert_eq!(code, 0, "{out}\n{err}");
     assert!(out.contains('z'), "the view was not writable: {out}");
+    assert!(
+        out.contains(&format!("LOG={head}")) && out.contains("a.txt |"),
+        "git log/diff in a read-only unit: {out}\n{err}"
+    );
+    assert!(!err.contains("dubious ownership"), "{err}");
     super::seat::settle(&ro, super::seat::Ending::Exited(code)).expect("settled");
     assert_eq!(
         std::fs::read_to_string(tree.join("a.txt")).unwrap(),

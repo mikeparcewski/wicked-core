@@ -378,6 +378,12 @@ pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
     })
 }
 
+/// The dir inside a read-only unit's view emptyDir that holds the tree, mounted at the tree's
+/// path by `subPath`. The emptyDir's own root is the kubelet's (`0:<fsGroup>`), so git in the
+/// pod refused a tree mounted there ("dubious ownership", phase C); this dir is made by the
+/// view init as the pod's uid, so the tree root is the seat's own, as on the replica.
+pub(crate) const VIEW_TREE: &str = "tree";
+
 /// The init container that copies a read-only unit's replica tree into its view (no link
 /// followed; tracked content under any name, `target/` included, review r1).
 fn view_init(floor_image: &str, sub: &str) -> Value {
@@ -388,7 +394,8 @@ fn view_init(floor_image: &str, sub: &str) -> Value {
         "command": ["/busybox", "sh", "-c",
             // Both sides' failure fails the init (codex b2-gw #6): a copy cut short never
             // starts the reviewer on part of the tree.
-            "set -o pipefail; cd /wicked-ro && /busybox tar -cf - . | /busybox tar -C /wicked-view -xf -"],
+            format!("set -o pipefail; /busybox mkdir /wicked-view/{VIEW_TREE} && cd /wicked-ro && \
+                     /busybox tar -cf - . | /busybox tar -C /wicked-view/{VIEW_TREE} -xf -")],
         "securityContext": hardened_context(),
         "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},
         "volumeMounts": [
@@ -439,7 +446,9 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         mounts.push(
             json!({"name": "replica", "mountPath": VIEW_SOURCE, "subPath": sub, "readOnly": true}),
         );
-        mounts.push(json!({"name": "view", "mountPath": tree.to_string_lossy()}));
+        mounts.push(
+            json!({"name": "view", "mountPath": tree.to_string_lossy(), "subPath": VIEW_TREE}),
+        );
         init.push(view_init(&s.floor_image, &sub));
         extra_volumes.push(json!({"name": "view", "emptyDir": {"sizeLimit": "8Gi"}}));
     }
