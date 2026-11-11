@@ -573,6 +573,9 @@ pub(crate) fn sidecar_base(path: &str) -> String {
     }
 }
 
+/// (core#1390) The most commands moved off the channel per turn of the actor loop.
+const BACKLOG_DRAIN: usize = 256;
+
 /// Channel-silence window that counts as "idle" for the WAL checkpoint (the `recv_timeout` on the
 /// actor loop). Small enough to notice idleness promptly; the min interval below (not this tick)
 /// bounds how often a checkpoint actually runs.
@@ -801,6 +804,8 @@ pub(crate) fn run(
     qe_host: crate::assurance::HostQeAcceptance,
     stats: Arc<crate::actor_stats::ActorStats>,
 ) {
+    // (core#1390) However this thread ends, its core's reads stop answering from the store.
+    let _stopped = crate::actor_stats::StopGuard(&stats);
     // DES-TEAMING-002 P1: this thread's link to the team publisher. The actor never opens the
     // bus; it sends the publisher requests and waits for acknowledgements as commands.
     team_gate::install(team_link);
@@ -1254,8 +1259,9 @@ pub(crate) fn run(
         // wakes" without sleeping, so the equivalence is by construction here rather than by test
         // (the knob parse itself is pinned in `wal_checkpoint_min_interval_honors_the_env_knob`).
         // How many commands waited for the actor when it became free (the one it runs next
-        // included) — after a long command, the queue that built up behind it.
-        backlog.extend(rx.try_iter());
+        // included) — after a long command, the queue that built up behind it. Bounded per turn,
+        // so a sustained producer can never hold the oldest command back.
+        backlog.extend(rx.try_iter().take(BACKLOG_DRAIN));
         stats.set_backlog(backlog.len());
         let cmd = if let Some(cmd) = backlog.pop_front() {
             cmd
@@ -4319,7 +4325,7 @@ pub(crate) fn run(
             #[cfg(test)]
             Command::HoldActor { entered, release } => {
                 let _ = entered.send(());
-                let _ = release.recv();
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
             }
             Command::PowerCheckpoint {
                 run_id,
@@ -4498,6 +4504,9 @@ pub(crate) fn run(
                 );
             }
             Command::Shutdown => {
+                // (core#1390) From here every read goes to the actor and fails "stopped", exactly
+                // as a read queued behind this command did — it waits for the channel to close.
+                stats.mark_stopped();
                 crate::power::unregister_actor(process_gen);
                 subscribers.close_asks();
                 // Stop ACP workers before dropping the actor channel. Ordinary prompt waits

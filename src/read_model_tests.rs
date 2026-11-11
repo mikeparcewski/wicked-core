@@ -75,11 +75,34 @@ fn run_reads_answer_while_the_actor_is_held_and_its_timing_names_the_hold() {
     };
     std::thread::sleep(Duration::from_millis(100));
 
-    let t = Instant::now();
-    let mut ids = core.sessions().expect("sessions");
-    ids.sort();
-    assert_eq!(ids, vec!["run-a", "run-b"]);
-    let mut views = core.sessions_detail().expect("sessions_detail");
+    // The reads run on their own thread, behind a bounded wait, and the hold is released whatever
+    // they do — so a read that fell back to the actor fails this test instead of hanging it.
+    let (done_tx, done) = channel();
+    {
+        let core = core.clone();
+        std::thread::spawn(move || {
+            let t = Instant::now();
+            let ids = core.sessions().map(|mut ids| {
+                ids.sort();
+                ids
+            });
+            let views = core.sessions_detail();
+            let team = core.run_team("run-a");
+            let stats = core.actor_stats();
+            let _ = done_tx.send((t.elapsed(), ids, views, team, stats));
+        });
+    }
+    let got = done.recv_timeout(Duration::from_secs(5));
+    std::thread::sleep(Duration::from_millis(200));
+    release.send(()).unwrap();
+    let (took, ids, views, team, stats) =
+        got.expect("every run read answered while the actor was held");
+    assert!(
+        took < Duration::from_secs(2),
+        "answered without the actor ({took:?})"
+    );
+    assert_eq!(ids.expect("sessions"), vec!["run-a", "run-b"]);
+    let mut views = views.expect("sessions_detail");
     views.sort_by(|a, b| a.session.id.cmp(&b.session.id));
     let units: Vec<(String, Vec<u32>)> = views
         .iter()
@@ -95,27 +118,13 @@ fn run_reads_answer_while_the_actor_is_held_and_its_timing_names_the_hold() {
         vec![("run-a".into(), vec![1, 2]), ("run-b".into(), vec![1])],
         "each run with its own units, in ord order"
     );
-    assert_eq!(core.work_output("run-a:u1"), None, "never ran: no output");
-    assert!(core.unit_transcript_at("run-a:u1", None).is_none());
-    assert_eq!(
-        core.run_team("run-a").expect("a known run"),
-        None,
-        "not a team run"
-    );
-    let stats = core.actor_stats();
-    let took = t.elapsed();
-    assert!(
-        took < Duration::from_secs(2),
-        "every read answered without the actor (took {took:?})"
-    );
+    assert_eq!(team.expect("a known run"), None, "not a team run");
     assert_eq!(
         stats.running.as_ref().map(|r| r.command.as_str()),
         Some("HoldActor"),
         "the stats name the command every read would have waited behind: {stats:?}"
     );
 
-    std::thread::sleep(Duration::from_millis(200));
-    release.send(()).unwrap();
     pinger.join().unwrap();
     core.ping();
     let stats = core.actor_stats();
@@ -170,68 +179,121 @@ fn an_unknown_run_is_still_the_actors_answer_and_an_in_memory_core_reads_through
 #[test]
 fn a_write_committed_through_the_actor_is_what_the_next_read_sees() {
     let (dir, db) = temp_db("ryw");
+    seed(&db);
     let core = crate::Core::spawn_with_engine(
         db,
         Arc::new(NoCouncil),
         Arc::new(crate::workflow::StubStepRunner),
     );
-    core.ping();
-    assert!(core.sessions_detail().unwrap().is_empty());
-    let p = core.project_create("rm-ryw", None).expect("create");
-    // The reply came after the write committed: a project read through the read-only path sees it.
-    assert!(crate::project::list_projects(
-        &wicked_apps_core::open_store_ro(Some(dir.join("estate.db").to_str().unwrap())).unwrap()
-    )
-    .unwrap()
-    .iter()
-    .any(|q| q.id == p.id));
+    let status = |core: &crate::Core| {
+        core.sessions_detail()
+            .unwrap()
+            .into_iter()
+            .find(|v| v.session.id == "run-a")
+            .map(|v| v.session.status)
+    };
+    // Warm the read connection, then write through the actor and read through the same core.
+    assert_eq!(status(&core), Some(crate::SessionStatus::AwaitingHuman));
+    assert_eq!(
+        core.cancel_run("run-a").expect("cancel"),
+        crate::SessionStatus::Cancelled
+    );
+    assert_eq!(
+        status(&core),
+        Some(crate::SessionStatus::Cancelled),
+        "the read after the reply sees the write"
+    );
     drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn once_the_actor_takes_shutdown_no_read_is_answered_off_it() {
+    let (dir, db) = temp_db("stop");
+    seed(&db);
+    let core = crate::Core::spawn_with_engine(
+        db,
+        Arc::new(NoCouncil),
+        Arc::new(crate::workflow::StubStepRunner),
+    );
+    assert_eq!(core.sessions().unwrap().len(), 2);
+    let events = core.subscribe();
+    core.shutdown_for_test();
+    // The actor took `Shutdown` once its subscribers are gone.
+    while events.recv_timeout(Duration::from_secs(10)).is_ok() {}
+    assert!(
+        core.sessions().is_err(),
+        "a stopped actor's reads fail, as before"
+    );
+    assert!(core.sessions_detail().is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// The Core methods allowed to answer from the read model. Every one is a read a caller shows or
 /// polls; none decides a gate, a reassign, a delivery or a deny.
-const READ_ONLY_METHODS: [&str; 5] = [
-    "sessions",
-    "sessions_detail",
-    "work_output",
-    "unit_transcript_at",
-    "run_team",
-];
+const READ_ONLY_METHODS: [&str; 3] = ["sessions", "sessions_detail", "run_team"];
+
+/// `(method, line)` for each line of `lib` inside a `fn`.
+fn methods_of(lib: &str) -> Vec<(String, &str)> {
+    let mut current = String::new();
+    lib.lines()
+        .map(|line| {
+            let t = line.trim_start();
+            if let Some(rest) = t
+                .strip_prefix("pub fn ")
+                .or_else(|| t.strip_prefix("pub(crate) fn "))
+                .or_else(|| t.strip_prefix("fn "))
+            {
+                current = rest
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or_default()
+                    .to_string();
+            }
+            (current.clone(), line)
+        })
+        .collect()
+}
 
 #[test]
 fn read_model_serves_reads_only() {
-    // 1. Inside `Core`, only the listed read methods touch `self.reads`.
     let lib = include_str!("lib.rs");
-    let mut current: Option<String> = None;
-    let mut users = std::collections::BTreeSet::new();
-    for line in lib.lines() {
-        let t = line.trim_start();
-        if let Some(rest) = t
-            .strip_prefix("pub fn ")
-            .or_else(|| t.strip_prefix("pub(crate) fn "))
-            .or_else(|| t.strip_prefix("fn "))
-        {
-            current = rest.split(['(', '<']).next().map(str::to_string);
-        }
-        if line.contains("self.reads") || t.starts_with(".reads") {
-            users.insert(current.clone().unwrap_or_default());
-        }
-    }
+    let lines = methods_of(lib);
+    // 1. Inside `Core`, only the listed read methods touch the read model.
+    let users: std::collections::BTreeSet<String> = lines
+        .iter()
+        .filter(|(_, l)| {
+            l.contains("run_read_model.") || l.trim_start().starts_with(".run_read_model")
+        })
+        .map(|(m, _)| m.clone())
+        .collect();
     let allowed: std::collections::BTreeSet<String> =
         READ_ONLY_METHODS.iter().map(|s| s.to_string()).collect();
-    assert!(
-        users.is_subset(&allowed),
-        "only read methods may answer from the read model; also used by: {:?}",
-        users.difference(&allowed).collect::<Vec<_>>()
-    );
-    assert!(
-        users.contains("sessions_detail"),
-        "the guard sees the real uses: {users:?}"
+    assert_eq!(
+        users, allowed,
+        "exactly the read methods answer from the read model"
     );
 
-    // 2. Nothing outside `lib.rs` and the read model itself names it: the actor, the gate hook,
-    // the relay, the runners and every decision module can never reach it.
+    // 2. No other `Core` method consumes one of those reads: a gate, reassign or delivery path
+    // that called `self.sessions_detail()` would decide on the read model.
+    let callers: Vec<String> = lines
+        .iter()
+        .filter(|(m, l)| {
+            !allowed.contains(m)
+                && READ_ONLY_METHODS
+                    .iter()
+                    .any(|r| l.contains(&format!("self.{r}(")))
+        })
+        .map(|(m, l)| format!("{m}: {}", l.trim()))
+        .collect();
+    assert!(
+        callers.is_empty(),
+        "a Core method other than the reads consumes a read-model answer: {callers:?}"
+    );
+
+    // 3. Nothing outside `lib.rs` and the read model itself reaches it: the actor, the gate hook,
+    // the relay, the runners and every decision module hold no handle to it (they hold no `Core`
+    // either; the actor reads its own store).
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     let mut stack = vec![src.clone()];

@@ -54,6 +54,17 @@ pub(crate) struct ActorStats {
     /// snapshot on that (the read path of `Core`'s run reads).
     started: AtomicU64,
     finished: AtomicU64,
+    /// The actor's loop has ended (shutdown, an early return, or a panic unwinding it).
+    stopped: std::sync::atomic::AtomicBool,
+}
+
+/// Marks the actor stopped when dropped: held for the whole of the actor thread's run, so every way
+/// out of it (a return, a panic unwinding it) is seen.
+pub(crate) struct StopGuard<'a>(pub(crate) &'a ActorStats);
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        self.0.stopped.store(true, Ordering::SeqCst);
+    }
 }
 
 /// The command the actor is running at the moment of the read.
@@ -124,6 +135,16 @@ impl ActorStats {
         if self.started.load(Ordering::SeqCst) > self.finished.load(Ordering::SeqCst) {
             self.finished.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    /// The actor took `Shutdown` (or its thread ended): no read is answered off it from now on.
+    pub(crate) fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::SeqCst);
+    }
+
+    /// The actor's loop has ended or is ending.
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.stopped.load(Ordering::SeqCst)
     }
 
     /// Commands begun so far (startup counts as one).
@@ -357,14 +378,21 @@ mod tests {
         assert_eq!(s.between_commands(Duration::ZERO), Some(2));
         let s = std::sync::Arc::new(ActorStats::starting());
         s.started_up();
+        let (began_tx, began) = std::sync::mpsc::channel();
         let t = {
             let s = s.clone();
             std::thread::spawn(move || {
                 let _t = Timed::start(&s, "Projects", 0, Duration::from_secs(3600));
+                began_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(30));
             })
         };
-        std::thread::sleep(Duration::from_millis(5));
+        began.recv().unwrap();
+        assert_eq!(
+            s.between_commands(Duration::ZERO),
+            None,
+            "busy while it runs"
+        );
         assert_eq!(
             s.between_commands(Duration::from_secs(5)),
             Some(2),

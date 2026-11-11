@@ -15,6 +15,10 @@
 //! command) does the read go ahead on the last committed state, which may then be one the running
 //! command is midway through.
 //!
+//! Served here: `Core::sessions`, `Core::sessions_detail` (crew's GET /runs, the stall watchdog's
+//! `listExecuting`) and `Core::run_team`. Transcripts stay on the actor: their store helpers fold a
+//! read error into "no record", which this path could not tell from a real answer.
+//!
 //! What it is NOT: an input to any decision. Gates, reassigns, delivery, the hook-decision fold and
 //! every deny are decided on the actor from the actor's own store. A read here may show a state a
 //! command is midway through (it committed the session, not yet the units); the actor re-validates
@@ -78,6 +82,12 @@ impl ReadModel {
     pub(crate) fn read<T>(&self, f: impl FnOnce(&SqliteStore) -> anyhow::Result<T>) -> Option<T> {
         let path = self.path.as_deref()?;
         let mut slot = self.conn.lock().unwrap_or_else(|p| p.into_inner());
+        // A stopped actor answers every read with its own error ("core actor stopped"), as before;
+        // the connection goes with it, so nothing of this core holds the store open after it.
+        if self.actor.is_stopped() {
+            *slot = None;
+            return None;
+        }
         if slot.is_none() {
             *slot = wicked_apps_core::open_store_ro(Some(path)).ok();
         }
@@ -95,8 +105,9 @@ impl ReadModel {
             }
             match quiet {
                 // Pinned while no command had begun since the quiet moment: a between-commands
-                // state. Or the budget ran out: the last committed state.
-                Some(generation) if self.actor.generation() != generation => {}
+                // state. Or the budget ran out: the last committed state, never another try.
+                Some(generation)
+                    if self.actor.generation() != generation && Instant::now() < deadline => {}
                 _ => break,
             }
             // A command began before the pin: let it finish and pin again (within the budget).
@@ -106,10 +117,12 @@ impl ReadModel {
             }
         }
         let out = f(store);
-        // `COMMIT` ends the read transaction; a connection that cannot end it is not reused.
+        // `COMMIT` ends the read transaction; a connection that cannot end it is not reused, and
+        // what it read is not trusted either: the actor answers instead.
         let ended = store.commit_batch().is_ok();
         if !ended || out.is_err() {
             *slot = None;
+            return None;
         }
         out.ok()
     }
@@ -128,6 +141,41 @@ mod tests {
         assert!(!readable_spec("postgres://h/db"));
         assert!(!readable_spec("postgresql://h/db"));
         assert!(!ReadModel::for_store(":memory:", Default::default()).applies());
+    }
+
+    #[test]
+    fn one_read_sees_one_committed_state_even_when_a_write_lands_midway() {
+        use wicked_apps_core::{GraphStore, ToNode};
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-snap-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        let mut writer = wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap();
+        let session = crate::actor::sessions_detail_fold_tests::session;
+        crate::domain::put_nodes(&mut writer, &[session("run-a").to_node()]).unwrap();
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let rm = ReadModel::for_store(db.to_str().unwrap(), actor);
+        let (before, after) = rm
+            .read(|s| {
+                let before = crate::domain::all_sessions(s)?.len();
+                // A writer commits between the two reads of one fold.
+                let w: &mut dyn GraphStore = &mut writer;
+                crate::domain::put_nodes(w, &[session("run-b").to_node()])?;
+                let after = crate::domain::all_sessions(s)?.len();
+                Ok((before, after))
+            })
+            .expect("read");
+        assert_eq!((before, after), (1, 1), "the read's snapshot does not move");
+        assert_eq!(
+            rm.read(|s| Ok(crate::domain::all_sessions(s)?.len())),
+            Some(2),
+            "the next read sees the commit"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

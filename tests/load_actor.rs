@@ -9,7 +9,8 @@
 //!
 //! * `list`: `sessions_detail()`, the read behind crew's GET /runs and the watchdog's
 //!   `listExecuting`;
-//! * `team`, `transcript`: the per-run reads the run page polls;
+//! * `team` (read model) and `transcript` (still through the actor): the per-run reads the run
+//!   page polls;
 //! * `ping`: an actor round trip, which is how long a write such as a gate answer waits for its
 //!   turn;
 //! * `gate_hook`: the real `wicked-core gate-hook` subprocess judging a `Read` and a `Bash` call
@@ -379,7 +380,7 @@ fn actor_latency_under_concurrent_runs() {
                     let _ = core.run_team(&id);
                     samples.add("team", t.elapsed());
                     let t = Instant::now();
-                    let _ = core.unit_transcript_at(&format!("{id}:1"), None);
+                    let _ = core.unit_transcript_at(&format!("{id}:s1"), None);
                     samples.add("transcript", t.elapsed());
                 }
                 std::thread::sleep(Duration::from_millis(200));

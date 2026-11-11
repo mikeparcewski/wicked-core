@@ -644,7 +644,7 @@ pub struct Core {
     tx: Sender<Command>,
     /// (core#1390) Run reads answered off the actor, from a read-only connection
     /// ([`read_model`]). Reads only: no decision path holds it.
-    reads: Arc<read_model::ReadModel>,
+    run_read_model: Arc<read_model::ReadModel>,
     /// (core#1390) The actor's per-command timing and backlog ([`Core::actor_stats`]).
     stats: Arc<actor_stats::ActorStats>,
     /// Whether this core's actor publishes team runs (its `TeamLink` is a publisher) — fixed at
@@ -871,7 +871,7 @@ impl Core {
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         let core = Core {
             tx: tx.clone(),
-            reads,
+            run_read_model: reads,
             stats,
             team_publishes,
             pty,
@@ -986,7 +986,7 @@ impl Core {
             });
         let core = Core {
             tx: tx.clone(),
-            reads,
+            run_read_model: reads,
             stats,
             team_publishes,
             pty,
@@ -1059,7 +1059,7 @@ impl Core {
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         Core {
             tx: tx.clone(),
-            reads,
+            run_read_model: reads,
             stats,
             team_publishes,
             pty,
@@ -1749,7 +1749,7 @@ impl Core {
     /// The agent session ids currently on the store (lightweight; use [`sessions_detail`] for the
     /// full project list).
     pub fn sessions(&self) -> anyhow::Result<Vec<String>> {
-        if let Some(ids) = self.reads.read(actor::list_sessions) {
+        if let Some(ids) = self.run_read_model.read(actor::list_sessions) {
             return Ok(ids);
         }
         let (reply, rx) = channel();
@@ -1813,7 +1813,7 @@ impl Core {
     pub fn run_team(&self, run_id: &str) -> anyhow::Result<Option<RunTeamView>> {
         // Off the actor (core#1390), as the actor's own `RunTeam` arm reads it; an unknown run is
         // the actor's answer (its error) to give.
-        if let Some(Some(view)) = self.reads.read(|s| {
+        if let Some(Some(view)) = self.run_read_model.read(|s| {
             domain::get_session(s, run_id)?
                 .map(|session| {
                     let units = domain::session_units(s, run_id)?;
@@ -1942,6 +1942,12 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// TEST-ONLY (core#1390): send the actor `Shutdown` while this handle lives on.
+    #[cfg(test)]
+    pub(crate) fn shutdown_for_test(&self) {
+        let _ = self.tx.send(Command::Shutdown);
+    }
+
     /// TEST-ONLY (core#1390): park the actor on one command until `release` fires (or drops);
     /// `entered` fires once it is parked. Stands in for a long command.
     #[cfg(test)]
@@ -1978,7 +1984,7 @@ impl Core {
     /// sessions and their units come from one committed state — and through the actor only when
     /// this store has none.
     pub fn sessions_detail(&self) -> anyhow::Result<Vec<SessionView>> {
-        if let Some(views) = self.reads.read(actor::list_projects) {
+        if let Some(views) = self.run_read_model.read(actor::list_projects) {
             return Ok(views);
         }
         let (reply, rx) = channel();
@@ -1994,12 +2000,6 @@ impl Core {
     /// status/`denial` (or [`Core::unit_transcript`]) to distinguish partial from resolved; `None`
     /// only when no output was ever stored (never ran, or denied before any output existed).
     pub fn work_output(&self, unit_id: &str) -> Option<String> {
-        if let Some(out) = self
-            .reads
-            .read(|s| Ok(domain::get_unit_transcript(s, unit_id).and_then(|t| t.output)))
-        {
-            return out;
-        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::WorkOutput(unit_id.to_string(), reply))
@@ -2026,12 +2026,6 @@ impl Core {
         unit_id: &str,
         attempt: Option<u32>,
     ) -> Option<domain::UnitTranscript> {
-        if let Some(t) = self
-            .reads
-            .read(|s| Ok(domain::get_unit_transcript_at(s, unit_id, attempt)))
-        {
-            return t;
-        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::UnitTranscript(unit_id.to_string(), attempt, reply))
