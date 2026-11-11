@@ -11,7 +11,8 @@
 //! only when CLEAN ([`reap_worktree_if_clean`]): a tree holding uncommitted work is kept and logged,
 //! never force-deleted, because those bytes may be the only copy of the work. The startup orphan
 //! reaper ([`reap_orphan_worktrees`]) applies the same rule to terminal runs' leftovers and
-//! force-removes only worktrees whose run id no longer exists on the store at all. The
+//! force-removes only worktrees whose run id no longer exists on the store at all AND that this
+//! daemon minted (core#1373: another daemon may share the checkout). The
 //! `wicked/<run_id>` BRANCH is never deleted by any of this — the branch is the durable record of a
 //! run's landed work; the worktree is scaffolding.
 
@@ -1112,6 +1113,194 @@ fn stamp_worktree_owner(wt: &Path, run_id: &str) {
     }
 }
 
+// ── Worktree DAEMON ownership (core#1373) ────────────────────────────────────────────────────────
+//
+// Two daemons on one host (a stable daemon and a test rig, each with its own state home) can
+// register the same checkout: the worktrees root is the checkout's, not the state home's. Each
+// daemon's store knows only its own runs, so "a run id my store has never heard of" says nothing
+// about whether a tree is an orphan: it may be the OTHER daemon's live or retained tree. So every
+// tree a daemon mints (or adopts) carries that daemon's id in its git admin dir, beside the run-id
+// marker (`<repo>/.git/worktrees/<name>/wicked-daemon`), and the boot reaper force-removes a tree
+// of an unknown run only when the marker names the reaping daemon itself.
+
+/// The daemon marker's file name in a worktree's git admin dir.
+const DAEMON_MARKER: &str = "wicked-daemon";
+
+thread_local! {
+    /// The daemon id the calling thread mints worktrees for ([`DaemonOwnerScope`]).
+    static DAEMON_OWNER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Binds the calling thread to a daemon id for every worktree it mints, for the guard's lifetime
+/// (the actor binds its own at boot; a thread it spawns to mint a tree re-binds the same id).
+pub(crate) struct DaemonOwnerScope {
+    prev: Option<String>,
+}
+
+impl DaemonOwnerScope {
+    pub(crate) fn bind(owner: Option<String>) -> Self {
+        DaemonOwnerScope {
+            prev: DAEMON_OWNER.with(|c| c.replace(owner)),
+        }
+    }
+}
+
+impl Drop for DaemonOwnerScope {
+    fn drop(&mut self) {
+        let prev = self.prev.take();
+        DAEMON_OWNER.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// The daemon id the calling thread is bound to, if any.
+pub(crate) fn bound_daemon_owner() -> Option<String> {
+    DAEMON_OWNER.with(|c| c.borrow().clone())
+}
+
+/// The daemon id of the store at `db_path`: a digest of its canonical path (or of its spec, for a
+/// `postgres://` store), so the marker carries neither a path nor a credential. Two daemons with
+/// their own state homes have their own stores, so their ids differ; one daemon restarted on the
+/// same store keeps its id.
+pub(crate) fn daemon_owner_of_store(db_path: &str) -> String {
+    use sha2::Digest;
+    // (review on #1431) An in-memory or temporary store is a store of its own each time it opens:
+    // a fresh id, never one shared with another ephemeral store.
+    let p = db_path.trim();
+    if p.is_empty() || p == ":memory:" || (p.starts_with("file:") && p.contains("mode=memory")) {
+        return format!("store-mem-{}", uuid::Uuid::new_v4().simple());
+    }
+    let spec = if db_path.contains("://") {
+        db_path.to_string()
+    } else {
+        std::fs::canonicalize(db_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| db_path.to_string())
+    };
+    let hex: String = sha2::Sha256::digest(spec.as_bytes())
+        .iter()
+        .take(16)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!("store-{hex}")
+}
+
+/// The daemon id a live worktree was minted (or adopted) by — `None` when it carries none (a tree
+/// from an engine before core#1373, or one another engine minted without it).
+fn worktree_daemon(wt: &Path) -> Option<String> {
+    let marker = worktree_admin_dir(wt)?.join(DAEMON_MARKER);
+    let owner = match std::fs::read_to_string(marker) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // (review r3 on #1431) A marker that exists and cannot be read is nobody's to touch.
+        Err(_) => return Some(UNREADABLE_OWNER.to_string()),
+    };
+    let owner = owner.trim();
+    (!owner.is_empty()).then(|| owner.to_string())
+}
+
+/// The owner a marker that cannot be read stands for: no daemon's id, so no daemon may touch it.
+const UNREADABLE_OWNER: &str = "\u{0}unreadable";
+
+/// (review r3 on #1431) Whether the calling thread's daemon may act on the tree at `wt` (its check
+/// scratch included): [`daemon_may_touch`] for the actor's cleanup threads.
+pub(crate) fn may_touch_tree(wt: &Path) -> bool {
+    !wt.exists() || daemon_may_touch(wt)
+}
+
+/// Record the calling thread's daemon as the worktree's owner, when it has none yet: a tree another
+/// daemon marked is never re-marked. Best-effort, like [`stamp_worktree_owner`]: an unmarked tree
+/// is only ever kept by the boot reaper, never removed on an unknown run id.
+fn stamp_worktree_daemon(wt: &Path) -> bool {
+    let Some(owner) = bound_daemon_owner() else {
+        return true;
+    };
+    let Some(dir) = worktree_admin_dir(wt) else {
+        return true;
+    };
+    let marker = dir.join(DAEMON_MARKER);
+    // (review on #1431) A no-clobber claim: of two daemons stamping one unmarked tree at once,
+    // exactly one creates the marker; the other finds it and leaves it as it is.
+    // (review r3) Written whole to a private file first, then published with a hard link, which
+    // never replaces an existing marker: an interrupted write leaves no partial marker behind.
+    let tmp = dir.join(format!(
+        "{DAEMON_MARKER}.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(e) = std::fs::write(&tmp, &owner) {
+        eprintln!(
+            "wicked-core: could not stamp the daemon owner on worktree {} ({e}) — the boot reaper \
+             will keep it rather than remove it (core#1373)",
+            wt.display()
+        );
+        return true;
+    }
+    let published = std::fs::hard_link(&tmp, &marker);
+    let _ = std::fs::remove_file(&tmp);
+    match published {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = std::fs::read_to_string(&marker).unwrap_or_default();
+            if existing.trim() == owner {
+                return true;
+            }
+            eprintln!(
+                "wicked-core: worktree {} is marked as another daemon's ({}); leaving its \
+                 marker as it is (core#1373)",
+                wt.display(),
+                existing.trim()
+            );
+            false
+        }
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not stamp the daemon owner on worktree {} ({e}) — the boot \
+                 reaper will keep it rather than remove it (core#1373)",
+                wt.display()
+            );
+            true
+        }
+    }
+}
+
+/// (review on #1431) Whether the calling thread's daemon may use or destroy the tree at `wt`: true
+/// unless the thread is bound to a daemon and the tree is marked as ANOTHER daemon's.
+fn daemon_may_touch(wt: &Path) -> bool {
+    match (bound_daemon_owner(), worktree_daemon(wt)) {
+        (Some(me), Some(owner)) => me == owner,
+        // (review on #1431) A thread bound to no daemon owns no marked tree.
+        (None, Some(_)) => false,
+        (_, None) => true,
+    }
+}
+
+/// (review on #1431) Spawn `f` on a thread bound to the calling thread's daemon: a cleanup the
+/// actor hands off touches only what the daemon may touch.
+pub(crate) fn spawn_bound<F>(f: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce() + Send + 'static,
+{
+    let owner = bound_daemon_owner();
+    std::thread::spawn(move || {
+        let _scope = DaemonOwnerScope::bind(owner);
+        f()
+    })
+}
+
+/// (review on #1431) Adopt a live worktree a resume found in place (no mint): it takes the calling
+/// thread's daemon marker when no daemon has marked it yet, so a tree minted before core#1373 is
+/// this daemon's from its first resume on.
+pub(crate) fn adopt_live_worktree(wt: &Path) -> anyhow::Result<()> {
+    if !daemon_may_touch(wt) || !stamp_worktree_daemon(wt) {
+        anyhow::bail!(
+            "worktree {} belongs to another daemon on this shared checkout; refusing to resume a \
+             run in it here (core#1373)",
+            wt.display()
+        );
+    }
+    Ok(())
+}
+
 /// The branch a run's worktree lives on — the ONE spelling (`wicked/` + the sanitized id), so
 /// log lines and diagnostics cannot drift back to the raw `wicked/{run_id}` form that campaign
 /// ids made illegal (core#337).
@@ -1125,9 +1314,59 @@ pub(crate) fn worktree_branch(run_id: &str) -> String {
 /// startup reaper keys by directory NAME, which is the owner's sanitized spelling). False means
 /// the tree belongs to a DIFFERENT raw run id that merely spells the same name — leave it alone.
 fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
+    // (core#1373) Never another daemon's tree, whatever its run id.
+    if !daemon_may_touch(wt) {
+        return false;
+    }
     match worktree_owner(wt) {
         None => true,
         Some(owner) => owner == run_id || sanitize_worktree_id(&owner) == run_id,
+    }
+}
+
+/// (review r3 on #1431) One run's tree is minted, removed or reaped by one thread at a time in this
+/// process: an ownership check and the git removal it guards are never split by another thread's
+/// removal and a replacement mint (two cleanups the actor queued for one failed launch, say).
+/// Keyed by the repository and the run's worktree name. Across daemons, the checks above stand.
+struct TreeLock(String);
+
+fn tree_locks() -> &'static (std::sync::Mutex<HashSet<String>>, std::sync::Condvar) {
+    static LOCKS: std::sync::OnceLock<(std::sync::Mutex<HashSet<String>>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| {
+        (
+            std::sync::Mutex::new(HashSet::new()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+impl TreeLock {
+    fn take(repo_root: &str, run_id: &str) -> Self {
+        let key = format!("{repo_root}\0{}", sanitize_worktree_id(run_id));
+        let (held, freed) = tree_locks();
+        let mut set = held.lock().unwrap_or_else(|p| p.into_inner());
+        while set.contains(&key) {
+            set = freed.wait(set).unwrap_or_else(|p| p.into_inner());
+        }
+        set.insert(key.clone());
+        TreeLock(key)
+    }
+}
+
+/// (tests) Hold `run_id`'s tree lock, as a removal still going would.
+#[cfg(test)]
+pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {
+    TreeLock::take(repo_root, run_id)
+}
+
+impl Drop for TreeLock {
+    fn drop(&mut self) {
+        let (held, freed) = tree_locks();
+        held.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+        freed.notify_all();
     }
 }
 
@@ -1411,6 +1650,8 @@ pub fn create_worktree_based(
     run_id: &str,
     base_ref: Option<&str>,
 ) -> anyhow::Result<(PathBuf, Option<RunBase>)> {
+    // A removal or reap of this run's tree still going on another thread ends first.
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
@@ -1428,6 +1669,24 @@ pub fn create_worktree_based(
                 // Unmarked: a pre-marker mint resolved FOR this id, or a tree a downstream
                 // pre-provisioned for exactly this run (crew#390/#391) — adopt it.
                 None => stamp_worktree_owner(&wt, run_id),
+            }
+            // (core#1373) …and never another daemon's tree (review on #1431): the same run id in
+            // two stores must not hand one daemon the other's working tree.
+            if !daemon_may_touch(&wt) {
+                anyhow::bail!(
+                    "worktree {} belongs to another daemon on this shared checkout; refusing to \
+                     hand it to run {run_id} here (core#1373)",
+                    wt.display()
+                );
+            }
+            // …and this daemon's, when no daemon has marked it yet: a claim lost to another daemon
+            // adopting it at the same moment refuses too.
+            if !stamp_worktree_daemon(&wt) {
+                anyhow::bail!(
+                    "worktree {} was just claimed by another daemon on this shared checkout; \
+                     refusing to hand it to run {run_id} here (core#1373)",
+                    wt.display()
+                );
             }
             return Ok((wt, None)); // genuine resume — reuse it
         }
@@ -1491,9 +1750,11 @@ pub fn create_worktree_based(
             anyhow::bail!("git worktree add failed: {err}{err2}");
         }
         stamp_worktree_owner(&wt, run_id);
+        let _ = stamp_worktree_daemon(&wt);
         return Ok((wt, None));
     }
     stamp_worktree_owner(&wt, run_id);
+    let _ = stamp_worktree_daemon(&wt);
     Ok((wt, Some(base)))
 }
 
@@ -1503,6 +1764,7 @@ pub fn create_worktree_based(
 /// startup leftover whose run id no longer exists on the store (no record, nothing to preserve).
 /// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     // A colliding run id derives the OWNER's path (core#337, hashless colon tier) — and this is
     // the FORCE form, so touching a tree minted for a different raw id would destroy a live
@@ -1518,9 +1780,13 @@ pub fn remove_worktree(repo_root: &str, run_id: &str) {
     // The run's repo-checks scratch lives in the engine's check cache, not in the tree.
     crate::repo_checks::remove_check_scratch(&wt, run_id);
     let wt_str = wt.to_string_lossy().to_string();
-    let _ = git(repo_root, &["worktree", "remove", "--force", &wt_str]);
-    // If git refused (e.g. already gone), drop the dir directly.
-    if wt.is_dir() {
+    let removed = matches!(
+        git(repo_root, &["worktree", "remove", "--force", &wt_str]),
+        Ok((true, _, _))
+    );
+    // If git refused (e.g. already gone), drop the dir directly. (review on #1431) Never after git
+    // removed it: the path may already hold a replacement another daemon minted.
+    if !removed && wt.is_dir() && daemon_may_touch(&wt) {
         let _ = std::fs::remove_dir_all(&wt);
     }
 }
@@ -1573,6 +1839,7 @@ pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
 /// named leftover rather than a silent leak; a clean tree adds nothing the branch doesn't already
 /// carry, and goes. The branch itself is never touched either way.
 pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable, and the
@@ -1624,12 +1891,18 @@ pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
 ///    same rule the terminal-status reap applies, re-run here so a crash between a run going
 ///    terminal and its reap (or a run predating the reap) converges on the next start instead of
 ///    surviving restarts forever (FINDING-003: 14 did);
-///  - unknown to the store → [`remove_worktree`] (force): no session record exists, so there is no
-///    run to resume and no outcome the leftover documents.
+///  - unknown to the store, and marked as THIS daemon's (`daemon`) → [`remove_worktree`] (force):
+///    no session record exists, so there is no run to resume and no outcome the leftover documents;
+///  - (core#1373) marked as ANOTHER daemon's → never touched, whatever the store knows;
+///  - unknown to the store and carrying no daemon marker (another daemon's on a shared checkout,
+///    or a tree minted before the marker) → kept and reported: an unknown run id alone never
+///    removes a tree. Only an empty non-worktree shell is cleared. `daemon: None` (no id) owns
+///    nothing, so it force-removes nothing.
 pub fn reap_orphan_worktrees(
     repos: &[RepoEntry],
     live_run_ids: &HashSet<String>,
     terminal_run_ids: &HashSet<String>,
+    daemon: Option<&str>,
 ) {
     // A worktree directory carries either a run id verbatim (plain ids; a raw-spelling campaign
     // tree crew pre-provisioned) or the id's SANITIZED spelling (core#337 — what create_worktree
@@ -1640,6 +1913,8 @@ pub fn reap_orphan_worktrees(
         all.extend(ids.iter().map(|id| sanitize_worktree_id(id)));
         all
     };
+    // (review on #1431) Every helper below acts as `daemon`, and only on what it may touch.
+    let _scope = DaemonOwnerScope::bind(daemon.map(str::to_string));
     let live_names = with_sanitized(live_run_ids);
     let terminal_names = with_sanitized(terminal_run_ids);
     for repo in repos {
@@ -1656,14 +1931,57 @@ pub fn reap_orphan_worktrees(
                     if live_names.contains(name) {
                         continue;
                     }
-                    // (core#1050) Every run's check scratch over this tree goes: the scratch is
-                    // keyed by the RAW run id, which a sanitized directory name cannot spell back,
-                    // and no live run maps to this path (checked just above).
-                    crate::repo_checks::remove_tree_scratch(&e.path());
-                    if terminal_names.contains(name) {
+                    let path = e.path();
+                    // (core#1373) A tree another daemon marked is that daemon's, whatever this
+                    // store knows: never removed, and its check scratch is never swept.
+                    let marked = worktree_daemon(&path);
+                    if let Some(other) = marked.as_deref().filter(|m| Some(*m) != daemon) {
+                        eprintln!(
+                            "wicked-core: keeping worktree {} — it belongs to another daemon \
+                             ({other}) on this shared checkout (core#1373)",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    let ours = marked.is_some();
+                    // (review on #1431) The helpers below re-derive the tree's path from its
+                    // name; they act on the tree checked here, or not at all (a legacy-layout
+                    // tree of the same name would be derived first).
+                    if worktree_path(&repo.root_path, name) != path {
+                        eprintln!(
+                            "wicked-core: keeping worktree {} — another tree of the same name \
+                             shadows it (core#1373)",
+                            path.display()
+                        );
+                        continue;
+                    }
+                    if terminal_names.contains(name) && ours {
+                        // (core#1050) Every run's check scratch over this tree goes: the scratch
+                        // is keyed by the RAW run id, which a sanitized directory name cannot
+                        // spell back, and no live run maps to this path (checked just above).
+                        crate::repo_checks::remove_tree_scratch(&path);
                         let _ = reap_worktree_if_clean(&repo.root_path, name);
-                    } else {
+                    } else if ours {
+                        // This daemon's own tree, of a run its store no longer knows: nothing
+                        // to resume, so it goes (FINDING-003).
+                        crate::repo_checks::remove_tree_scratch(&path);
                         remove_worktree(&repo.root_path, name);
+                    } else if !is_live_worktree(&path)
+                        && std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_none())
+                    {
+                        // An empty shell holds nothing of anyone's.
+                        let _ = std::fs::remove_dir(&path);
+                    } else {
+                        // (core#1373) An unknown run id alone never removes a tree: with no
+                        // marker of this daemon it may be another daemon's (or a tree minted
+                        // before the marker existed). Kept, and said.
+                        eprintln!(
+                            "wicked-core: keeping worktree {} — run {name} is unknown to this \
+                             daemon's store and the tree carries no marker of this daemon, so it \
+                             may be another daemon's on a shared checkout; remove it by hand if \
+                             it is an orphan (core#1373)",
+                            path.display()
+                        );
                     }
                 }
             }
@@ -3601,6 +3919,8 @@ mod tests {
     fn startup_reaper_reaps_terminal_keeps_live_and_forces_unknown() {
         let root = git_repo("reap-startup");
         let p = root.to_str().unwrap();
+        // (core#1373) The trees are this daemon's own: minted under its id.
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
         let wt_live = create_worktree(p, "run-live").unwrap();
         let wt_done = create_worktree(p, "run-done").unwrap();
         let wt_dirty = create_worktree(p, "run-dirty").unwrap();
@@ -3622,7 +3942,12 @@ mod tests {
         let terminal: HashSet<String> = ["run-done".to_string(), "run-dirty".to_string()]
             .into_iter()
             .collect();
-        reap_orphan_worktrees(std::slice::from_ref(&repo), &live, &terminal);
+        reap_orphan_worktrees(
+            std::slice::from_ref(&repo),
+            &live,
+            &terminal,
+            Some("daemon-me"),
+        );
 
         assert!(
             is_live_worktree(&wt_live),
@@ -3637,6 +3962,326 @@ mod tests {
             !wt_gone.exists(),
             "a worktree no session owns is force-removed, dirty or not"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1373: two daemons, each with its own store, register ONE checkout. Daemon A restarts
+    /// with a store that knows none of the runs: it force-removes only its own orphan, and keeps
+    /// daemon B's tree (its uncommitted work intact, its check scratch too) and a tree no daemon
+    /// marked. Then B's restart takes B's own orphan, and A's marker survives a resume by B of
+    /// nothing of its own (a marker is never overwritten).
+    #[test]
+    fn the_boot_reaper_removes_only_this_daemons_worktrees_on_a_shared_checkout() {
+        let root = git_repo("reap-two-daemons");
+        let p = root.to_str().unwrap();
+        let (a, b) = (
+            daemon_owner_of_store("/state-a/core.db"),
+            daemon_owner_of_store("/state-b/core.db"),
+        );
+        assert_ne!(a, b, "two stores, two daemon ids");
+        assert!(!a.contains("state-a"), "the id carries no path: {a}");
+        let wt_a = {
+            let _scope = DaemonOwnerScope::bind(Some(a.clone()));
+            create_worktree(p, "run-of-a").unwrap()
+        };
+        let wt_b = {
+            let _scope = DaemonOwnerScope::bind(Some(b.clone()));
+            create_worktree(p, "run-of-b").unwrap()
+        };
+        std::fs::write(
+            wt_b.join("unlanded.txt"),
+            "b's work in progress
+",
+        )
+        .unwrap();
+        let wt_old = create_worktree(p, "run-unmarked").unwrap();
+        assert_eq!(worktree_daemon(&wt_a).as_deref(), Some(a.as_str()));
+        assert_eq!(worktree_daemon(&wt_b).as_deref(), Some(b.as_str()));
+        assert_eq!(worktree_daemon(&wt_old), None);
+        // B's check scratch over its tree.
+        let cache = crate::repo_checks::check_cache_root().unwrap();
+        let leaf_b = crate::repo_checks::scratch_dir_for(&cache, &wt_b, Some("run-of-b"));
+        std::fs::create_dir_all(leaf_b.join("cargo-target")).unwrap();
+
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let none: HashSet<String> = HashSet::new();
+        // A daemon with no id owns nothing: nothing is removed on an unknown id.
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, None);
+        assert!(is_live_worktree(&wt_a) && is_live_worktree(&wt_b) && is_live_worktree(&wt_old));
+
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, Some(&a));
+        assert!(!wt_a.exists(), "A's own orphan goes");
+        assert!(
+            is_live_worktree(&wt_b) && wt_b.join("unlanded.txt").is_file(),
+            "B's tree and its uncommitted work survive A's restart"
+        );
+        assert!(leaf_b.is_dir(), "B's check scratch is not A's to sweep");
+        assert!(
+            is_live_worktree(&wt_old),
+            "an unmarked tree is never removed on an unknown run id alone"
+        );
+        // B's resume of its own run keeps its marker; a tree marked by B is never re-marked by A.
+        {
+            let _scope = DaemonOwnerScope::bind(Some(a.clone()));
+            stamp_worktree_daemon(&wt_b);
+        }
+        assert_eq!(worktree_daemon(&wt_b).as_deref(), Some(b.as_str()));
+
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, Some(&b));
+        assert!(
+            !wt_b.exists(),
+            "B's restart takes B's own orphan (force: it is B's)"
+        );
+        assert!(is_live_worktree(&wt_old));
+        let _ = std::fs::remove_dir_all(&leaf_b);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (review on #1431) Another daemon's tree is never handed over or destroyed by this one: a
+    /// reuse under the same run id fails loudly, a cancel's force-remove and a terminal reap leave
+    /// it, and the boot reaper acts only on the exact tree it checked (a legacy-layout tree of the
+    /// same name is derived first by name, so the current-layout one is kept, not confused).
+    #[test]
+    fn another_daemons_tree_is_never_reused_or_removed_and_the_reaper_acts_on_what_it_checked() {
+        let root = git_repo("reap-foreign");
+        let p = root.to_str().unwrap();
+        let wt_b = {
+            let _b = DaemonOwnerScope::bind(Some("daemon-b".into()));
+            create_worktree(p, "run-shared").unwrap()
+        };
+        std::fs::write(wt_b.join("unlanded.txt"), "b's work\n").unwrap();
+        {
+            let _a = DaemonOwnerScope::bind(Some("daemon-a".into()));
+            let err = create_worktree(p, "run-shared").unwrap_err().to_string();
+            assert!(err.contains("another daemon"), "{err}");
+            remove_worktree(p, "run-shared");
+            assert!(reap_worktree_if_clean(p, "run-shared"));
+        }
+        assert!(is_live_worktree(&wt_b) && wt_b.join("unlanded.txt").is_file());
+
+        // A legacy-layout tree of B's and a current-layout tree of A's, under one name.
+        let legacy = legacy_worktrees_root(p).join("run-dup");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let (ok, _, err) = git(
+            p,
+            &[
+                "worktree",
+                "add",
+                legacy.to_str().unwrap(),
+                "-b",
+                "legacy-dup",
+            ],
+        )
+        .unwrap();
+        assert!(ok, "{err}");
+        {
+            let _b = DaemonOwnerScope::bind(Some("daemon-b".into()));
+            stamp_worktree_daemon(&legacy);
+        }
+        std::fs::write(legacy.join("unlanded.txt"), "b's legacy work\n").unwrap();
+        let current = worktrees_root(p).join("run-dup");
+        let (ok, _, err) = git(
+            p,
+            &[
+                "worktree",
+                "add",
+                current.to_str().unwrap(),
+                "-b",
+                "current-dup",
+            ],
+        )
+        .unwrap();
+        assert!(ok, "{err}");
+        {
+            let _a = DaemonOwnerScope::bind(Some("daemon-a".into()));
+            stamp_worktree_daemon(&current);
+        }
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let none: HashSet<String> = HashSet::new();
+        reap_orphan_worktrees(std::slice::from_ref(&repo), &none, &none, Some("daemon-a"));
+        assert!(
+            is_live_worktree(&legacy) && legacy.join("unlanded.txt").is_file(),
+            "B's legacy tree survives A's reap of a same-named tree"
+        );
+        assert!(
+            is_live_worktree(&current),
+            "the shadowed tree is kept, not confused"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (review r2 on #1431) A thread bound to no daemon owns no marked tree; a resume never adopts
+    /// another daemon's tree; a terminal run id in this store never reaps a tree this daemon did
+    /// not mark (a deterministic campaign id can repeat across stores); two ephemeral stores never
+    /// share an id.
+    #[test]
+    fn ownership_holds_on_unbound_threads_resumes_terminal_ids_and_ephemeral_stores() {
+        let root = git_repo("reap-r2");
+        let p = root.to_str().unwrap();
+        let wt_b = {
+            let _b = DaemonOwnerScope::bind(Some("daemon-b".into()));
+            create_worktree(p, "camp:node:a0").unwrap()
+        };
+        std::fs::write(wt_b.join("unlanded.txt"), "b's work\n").unwrap();
+        // An unbound cleanup thread (a launch failure's, say) leaves it.
+        std::thread::spawn({
+            let p = p.to_string();
+            move || remove_worktree(&p, "camp:node:a0")
+        })
+        .join()
+        .unwrap();
+        assert!(is_live_worktree(&wt_b) && wt_b.join("unlanded.txt").is_file());
+        {
+            let _a = DaemonOwnerScope::bind(Some("daemon-a".into()));
+            assert!(
+                adopt_live_worktree(&wt_b).is_err(),
+                "never resumes in B's tree"
+            );
+        }
+        // An unmarked tree whose run id is terminal in A's store (a campaign id B also ran).
+        let wt_old = create_worktree(p, "camp:old:a0").unwrap();
+        let repo = RepoEntry {
+            id: "r".into(),
+            name: "r".into(),
+            root_path: p.to_string(),
+            default_branch: "main".into(),
+            registered_at: 0,
+            code_graph_db: String::new(),
+            findings: Vec::new(),
+        };
+        let none: HashSet<String> = HashSet::new();
+        let terminal: HashSet<String> = ["camp:old:a0".to_string()].into_iter().collect();
+        reap_orphan_worktrees(
+            std::slice::from_ref(&repo),
+            &none,
+            &terminal,
+            Some("daemon-a"),
+        );
+        assert!(
+            is_live_worktree(&wt_old),
+            "an unmarked terminal tree is kept"
+        );
+        assert!(is_live_worktree(&wt_b));
+        assert_ne!(
+            daemon_owner_of_store(":memory:"),
+            daemon_owner_of_store(":memory:")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (review r3 on #1431) The daemon's own cleanup threads still clean its marked trees (bound),
+    /// an unreadable marker is nobody's to remove, the marker is published whole, and one run's
+    /// tree is removed by one thread at a time (a removal waits for the one still going).
+    #[test]
+    fn bound_cleanups_unreadable_markers_whole_markers_and_one_removal_at_a_time() {
+        let root = git_repo("reap-r3");
+        let p = root.to_str().unwrap().to_string();
+        let _a = DaemonOwnerScope::bind(Some("daemon-a".into()));
+        let wt = create_worktree(&p, "run-kept").unwrap();
+        let admin = worktree_admin_dir(&wt).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(admin.join(DAEMON_MARKER)).unwrap(),
+            "daemon-a"
+        );
+        assert!(
+            std::fs::read_dir(&admin).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wicked-daemon.")),
+            "no private marker file is left behind"
+        );
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(wt.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/x")).unwrap();
+        std::fs::write(wt.join("node_modules/x/i.js"), "1\n").unwrap();
+        spawn_bound({
+            let p = p.clone();
+            move || clean_ignored_in_worktree(&p, "run-kept")
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !wt.join("node_modules").exists(),
+            "a bound cleanup cleans its own tree"
+        );
+        assert!(is_live_worktree(&wt));
+
+        // One removal at a time: a second waits for the first (held here).
+        let held = hold_tree_for_test(&p, "run-kept");
+        let remover = spawn_bound({
+            let p = p.clone();
+            move || remove_worktree(&p, "run-kept")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            is_live_worktree(&wt),
+            "the removal waits for the tree's lock"
+        );
+        drop(held);
+        remover.join().unwrap();
+        assert!(!wt.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let wt = create_worktree(&p, "run-locked").unwrap();
+            let marker = worktree_admin_dir(&wt).unwrap().join(DAEMON_MARKER);
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&marker).is_err() {
+                remove_worktree(&p, "run-locked");
+                assert!(
+                    is_live_worktree(&wt),
+                    "an unreadable marker is nobody's to remove"
+                );
+            }
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (review on #1431) A resume that finds its tree in place adopts it for the resuming daemon.
+    #[test]
+    fn a_tree_found_in_place_on_resume_is_adopted() {
+        let root = git_repo("reap-inplace");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-parked").unwrap();
+        let _x = DaemonOwnerScope::bind(Some("daemon-x".into()));
+        adopt_live_worktree(&wt).unwrap();
+        assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-x"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1373: a resumed or adopted tree that no daemon marked takes the resuming daemon's
+    /// marker (so a pre-upgrade live run becomes reapable by its own daemon once it is orphaned).
+    #[test]
+    fn a_resumed_unmarked_worktree_takes_the_resuming_daemons_marker() {
+        let root = git_repo("reap-adopt");
+        let p = root.to_str().unwrap();
+        let wt = create_worktree(p, "run-old").unwrap();
+        assert_eq!(worktree_daemon(&wt), None);
+        let _scope = DaemonOwnerScope::bind(Some("daemon-x".into()));
+        assert_eq!(
+            create_worktree(p, "run-old").unwrap(),
+            wt,
+            "a resume reuses it"
+        );
+        assert_eq!(worktree_daemon(&wt).as_deref(), Some("daemon-x"));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3828,6 +4473,8 @@ mod tests {
     fn startup_reaper_recognizes_campaign_worktrees_by_their_sanitized_names() {
         let root = git_repo("reap-campaign");
         let p = root.to_str().unwrap();
+        // (core#1373) The trees are the reaper's own: a terminal tree is reaped only then.
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
         let wt_live = create_worktree(p, "camp:live:a0").unwrap();
         let wt_done = create_worktree(p, "camp:done:a0").unwrap();
 
@@ -3850,7 +4497,12 @@ mod tests {
         let leaf_live = crate::repo_checks::scratch_dir_for(&cache, &wt_live, Some("camp:live:a0"));
         std::fs::create_dir_all(leaf_done.join("cargo-target")).unwrap();
         std::fs::create_dir_all(leaf_live.join("cargo-target")).unwrap();
-        reap_orphan_worktrees(std::slice::from_ref(&repo), &live, &terminal);
+        reap_orphan_worktrees(
+            std::slice::from_ref(&repo),
+            &live,
+            &terminal,
+            Some("daemon-me"),
+        );
         assert!(!leaf_done.exists(), "{}", leaf_done.display());
         assert!(leaf_live.is_dir(), "a live run's check scratch is kept");
         let _ = std::fs::remove_dir_all(&leaf_live);
