@@ -971,8 +971,12 @@ fn k8s_a_quarantined_gateway_starts_only_on_a_new_boot_token() {
         boot: t2.clone(),
     };
     let d = render::gateway_deployment(&spec);
-    let wait = &d["spec"]["template"]["spec"]["initContainers"][1];
-    assert_eq!(wait["name"], "wait-config");
+    let wait = d["spec"]["template"]["spec"]["initContainers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["name"] == "wait-config")
+        .unwrap();
     assert!(wait["command"][2].as_str().unwrap().contains("/cfg/boot"));
     assert_eq!(wait["env"][0]["value"], t2);
     let _ = std::fs::remove_dir_all(&dir);

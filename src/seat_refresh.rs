@@ -580,12 +580,11 @@ fn unix_now() -> u64 {
 
 #[cfg(unix)]
 pub(crate) fn repair_refresh(
-    rt: &crate::container_floor::Runtime,
-    gw: &crate::seat_gateway::Gateway,
+    io: &dyn crate::seat_login::BrokerIo,
     dir: &Path,
     cli: &str,
 ) -> Result<Option<Vec<u8>>, String> {
-    if crate::seat_login::complete_sign_out(rt, gw, dir, cli)? {
+    if crate::seat_login::complete_sign_out(io, dir, cli)? {
         return Ok(None);
     }
     let Some(file) = record_file(cli) else {
@@ -602,7 +601,7 @@ pub(crate) fn repair_refresh(
     let bytes = if let Some(bytes) = rescue {
         write_pending_state(dir, cli, ROTATION_ISSUED)?;
         stage_rotated(&format!("{file}.next"), &bytes, &mut |name, body| {
-            crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, body)
+            io.write_broker(dir, cli, name, body)
         })
         .map_err(|_| rotation_unstored(dir, cli))?;
         remove_private_file(&rescue_path(dir, cli))?;
@@ -611,20 +610,20 @@ pub(crate) fn repair_refresh(
         let pending = pending_path(dir, cli)
             .try_exists()
             .map_err(|e| e.to_string())?;
-        let staged = crate::seat_login::read_broker_record(rt, gw, &format!("{file}.next"))?;
+        let staged = crate::seat_login::read_broker_record(io, &format!("{file}.next"))?;
         match staged {
             // codex lg-r4: a staged record is trusted only under its pending marker (written
             // before staging); one without it is an orphan writer's and is discarded.
             Some(_) if !pending => {
-                crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, &format!("{file}.next"))?;
-                crate::seat_login::read_broker_record(rt, gw, file)?
+                io.remove_broker(dir, cli, &format!("{file}.next"))?;
+                crate::seat_login::read_broker_record(io, file)?
             }
             Some(bytes) => Some(bytes),
             None if !pending
                 || std::fs::read(pending_path(dir, cli)).map_err(|e| e.to_string())?
                     == ROTATION_STORED =>
             {
-                crate::seat_login::read_broker_record(rt, gw, file)?
+                crate::seat_login::read_broker_record(io, file)?
             }
             // codex lg-r3 R2: no evidence the issued generation reached the broker.
             None => return Err(rotation_unstored(dir, cli)),
@@ -634,8 +633,8 @@ pub(crate) fn repair_refresh(
         dir,
         cli,
         bytes.as_deref(),
-        |name, body| crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, body),
-        |name| crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, name),
+        |name, body| io.write_broker(dir, cli, name, body),
+        |name| io.remove_broker(dir, cli, name),
     )?;
     Ok(bytes)
 }
@@ -686,7 +685,7 @@ fn refusal(status: u16, body: &[u8]) -> String {
 mod live {
     use super::*;
     use crate::container_floor::{output_within, Runtime};
-    use crate::seat_gateway::Gateway;
+    use crate::seat_login::BrokerIo;
     use std::time::{Duration, Instant};
     use wicked_apps_core::HardenedCommand;
 
@@ -771,7 +770,13 @@ mod live {
         .chain(curl)
         .collect::<Vec<_>>();
         let out = crate::seat_gateway::mutation_helper(rt, dir, cli, &argv, &bytes, POST_TIMEOUT)?;
-        let (out, status) = split_status(&out);
+        answer(&out)
+    }
+
+    /// An account read's answer from curl's output ([`request_argv`]): a refusal names its
+    /// status, an oversized or non-JSON answer is refused, and no error repeats the answer.
+    pub(crate) fn answer(out: &[u8]) -> Result<Value, String> {
+        let (out, status) = split_status(out);
         if let Some(code) = status.filter(|c| !(200..300).contains(c)) {
             return Err(refusal(code, out));
         }
@@ -780,6 +785,9 @@ mod live {
         }
         serde_json::from_slice(out).map_err(|_| "the account answer is not JSON".into())
     }
+
+    /// How long one account read may take, end to end.
+    pub(crate) const ACCOUNT_TIMEOUT: Duration = POST_TIMEOUT;
 
     /// The host executable of `cli`'s renewing CLI, on the daemon's search path.
     fn renewing_exe(cli: &str, daemon_env: &[(String, String)]) -> Result<PathBuf, String> {
@@ -946,7 +954,6 @@ mod live {
     /// log.
     pub(crate) fn renew_on_host(
         dir: &Path,
-        gw: &Gateway,
         cli: &str,
         record: &Value,
         entry: Option<&str>,
@@ -958,7 +965,7 @@ mod live {
             .collect();
         let exe = renewing_exe(cli, &daemon_env)?;
         let bytes = serde_json::to_vec(record).map_err(|_| "could not encode the record")?;
-        let session = crate::seat_login::refresh_session(&gw.name, cli);
+        let session = crate::seat_login::refresh_session(&crate::seat_login::gw_name(dir), cli);
         let home = crate::seat_login::create_refresh_home(dir, cli, &session)?;
         let env = crate::seat_login::host_cli_env(&home, cli, &daemon_env);
         let result = (|| {
@@ -1014,8 +1021,7 @@ mod live {
 
     /// Refresh `cli` when its credential is due (or `force`). One pass per gateway dir at a time.
     pub(crate) fn refresh(
-        rt: &Runtime,
-        gw: &Gateway,
+        io: &dyn BrokerIo,
         dir: &Path,
         cli: &str,
         force: bool,
@@ -1023,24 +1029,24 @@ mod live {
         let Some(_lock) = try_mutation_lock(dir)? else {
             return Ok(Outcome::Busy);
         };
-        crate::seat_gateway::cleanup_mutations(rt, dir)?;
-        if crate::seat_login::complete_sign_out(rt, gw, dir, cli)? {
+        io.cleanup(dir)?;
+        if crate::seat_login::complete_sign_out(io, dir, cli)? {
             return Ok(Outcome::NotRefreshable);
         }
         if cli == "copilot" {
-            return copilot_pass(rt, gw, dir, force);
+            return copilot_pass(io, dir, force);
         }
         let Some(file) = record_file(cli) else {
             return Ok(Outcome::NotRefreshable);
         };
-        crate::seat_login::repair_ingest(rt, gw, dir, cli)?;
+        crate::seat_login::repair_ingest(io, dir, cli)?;
         if crate::seat_login::signin_pending(dir, cli) {
             return Err("sign-in incomplete; retry ingest first".into());
         }
         // A crash can leave a renewal's throwaway home (a copy of the credential): gone first.
-        crate::seat_login::sweep_refresh_homes(dir, gw, cli)?;
+        crate::seat_login::sweep_refresh_homes(dir, cli)?;
         // Re-read only after acquiring the broker lock (codex lg-r1 #2).
-        let bytes = repair_refresh(rt, gw, dir, cli)?;
+        let bytes = repair_refresh(io, dir, cli)?;
         let Some(bytes) = bytes else {
             return Ok(Outcome::NotRefreshable);
         };
@@ -1071,7 +1077,7 @@ mod live {
         let mut failures: Vec<String> = Vec::new();
         for entry in &plan {
             let renewed = if renews_on_host(cli) {
-                renew_on_host(dir, gw, cli, &record, entry.as_deref(), force, now)
+                renew_on_host(dir, cli, &record, entry.as_deref(), force, now)
             } else {
                 // claude: an earlier `claude auth login` record, never renewed (its seats now
                 // pass a `claude setup-token` token through).
@@ -1101,8 +1107,8 @@ mod live {
                     cli,
                     file,
                     &files,
-                    |name, b| crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, b),
-                    |name| crate::seat_gateway::remove_broker_file(rt, gw, dir, cli, name),
+                    |name, b| io.write_broker(dir, cli, name, b),
+                    |name| io.remove_broker(dir, cli, name),
                 )
             })();
             if let Err(e) = committed {
@@ -1132,7 +1138,7 @@ mod live {
                     if !marker.exists() {
                         create_private_file(&marker, b"route literals unpublished")?;
                     }
-                    crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+                    io.route_sign_in(dir, cli, &literals)?;
                     remove_private_file(&marker)?;
                 }
                 Ok::<(), String>(())
@@ -1168,14 +1174,9 @@ mod live {
     /// copilot's pass (caller holds the mutation lock): re-read the account when it was never
     /// read, or was read [`RESOLVE_EVERY_SECS`](crate::copilot_account::RESOLVE_EVERY_SECS) ago,
     /// or with `force`. A failed read keeps what was published before and is shown on the tab.
-    fn copilot_pass(
-        rt: &Runtime,
-        gw: &Gateway,
-        dir: &Path,
-        force: bool,
-    ) -> Result<Outcome, String> {
+    fn copilot_pass(io: &dyn BrokerIo, dir: &Path, force: bool) -> Result<Outcome, String> {
         let cli = "copilot";
-        crate::seat_login::repair_ingest(rt, gw, dir, cli)?;
+        crate::seat_login::repair_ingest(io, dir, cli)?;
         if crate::seat_login::signin_pending(dir, cli) {
             return Err("sign-in incomplete; retry ingest first".into());
         }
@@ -1192,7 +1193,7 @@ mod live {
         if fresh && !force && !literals_pending_path(dir, cli).exists() {
             return Ok(Outcome::NotDue { expires_at: None });
         }
-        match resolve_copilot(rt, gw, dir, now) {
+        match resolve_copilot(io, dir, now) {
             Ok(true) => {
                 record_last(
                     dir,
@@ -1225,41 +1226,26 @@ mod live {
     /// Read the copilot sign-in's account with the brokered GitHub token, keep it beside the
     /// token and publish it on the route (caller holds the mutation lock). `Ok(false)` = signed
     /// out. Errors name the step and status only, never an answer or the token.
-    pub(crate) fn resolve_copilot(
-        rt: &Runtime,
-        gw: &Gateway,
-        dir: &Path,
-        now: u64,
-    ) -> Result<bool, String> {
+    pub(crate) fn resolve_copilot(io: &dyn BrokerIo, dir: &Path, now: u64) -> Result<bool, String> {
         let cli = "copilot";
         let Some(token) =
-            crate::seat_login::read_broker_record(rt, gw, crate::seat_gateway::COPILOT_CLI_FILE)?
+            crate::seat_login::read_broker_record(io, crate::seat_gateway::COPILOT_CLI_FILE)?
         else {
             return Ok(false);
         };
         let token = String::from_utf8(token).map_err(|_| "invalid credential token")?;
         let token = token.trim();
-        let user = send(
-            rt,
-            dir,
-            cli,
-            &gw.external_network,
-            &copilot_account_request(token, None),
-        )
-        .map_err(|e| format!("copilot_internal/user: {e}"))?;
+        let user = io
+            .send(dir, cli, &copilot_account_request(token, None))
+            .map_err(|e| format!("copilot_internal/user: {e}"))?;
         let host = crate::copilot_account::api_host(&user)?;
-        let list = send(
-            rt,
-            dir,
-            cli,
-            &gw.external_network,
-            &copilot_account_request(token, Some(&host)),
-        )
-        .map_err(|e| format!("{host}/models: {e}"))?;
+        let list = io
+            .send(dir, cli, &copilot_account_request(token, Some(&host)))
+            .map_err(|e| format!("{host}/models: {e}"))?;
         let account = crate::copilot_account::account_models(&list, now)?;
         let files = crate::copilot_account::account_files(&host, &account)?;
         for (name, bytes) in &files {
-            crate::seat_gateway::set_broker_credential(rt, gw, dir, cli, name, bytes)?;
+            io.write_broker(dir, cli, name, bytes)?;
         }
         let literals = crate::seat_login::route_literals(cli, &files)?;
         // Journal the publication: its marker outlives a failed or interrupted publish, so the
@@ -1268,7 +1254,7 @@ mod live {
         if !marker.exists() {
             create_private_file(&marker, b"route literals unpublished")?;
         }
-        crate::seat_gateway::route_sign_in(rt, gw, dir, cli, &literals)?;
+        io.route_sign_in(dir, cli, &literals)?;
         remove_private_file(&marker)?;
         Ok(true)
     }
@@ -1276,7 +1262,12 @@ mod live {
     /// Start the daemon's refresher loop for gateway dir `dir`, once per process: a first pass
     /// runs now (a credential that expired between runs is refreshed before the seat starts),
     /// then one every [`PASS_EVERY`].
-    pub(crate) fn start(rt: &Runtime, gw: &Gateway, dir: &Path) {
+    /// `io` answers the transport for one pass (resolved again every pass, so a gateway that was
+    /// re-created meanwhile is found again); a pass that cannot get one is logged and skipped.
+    pub(crate) fn start(
+        dir: &Path,
+        io: impl Fn() -> Result<Box<dyn BrokerIo>, String> + Send + 'static,
+    ) {
         static STARTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
         {
             let mut s = STARTED.lock().unwrap_or_else(|p| p.into_inner());
@@ -1286,10 +1277,19 @@ mod live {
             s.push(dir.to_path_buf());
         }
         let pass = {
-            let (rt, gw, dir) = (rt.clone(), gw.clone(), dir.to_path_buf());
+            let dir = dir.to_path_buf();
             move || {
+                let io = match io() {
+                    Ok(io) => io,
+                    Err(e) => {
+                        eprintln!(
+                            "wicked-core: the sign-in refresher could not reach the broker: {e}"
+                        );
+                        return;
+                    }
+                };
                 for cli in REFRESHABLE {
-                    if let Err(e) = refresh(&rt, &gw, &dir, cli, false) {
+                    if let Err(e) = refresh(io.as_ref(), &dir, cli, false) {
                         eprintln!("wicked-core: refreshing the {cli} sign-in failed: {e}");
                     }
                 }
@@ -1305,12 +1305,12 @@ mod live {
     }
 }
 
-#[cfg(unix)]
-#[allow(unused_imports)]
-// `start` (the refresher container) is B-4's to move onto the cluster.
-pub(crate) use live::{refresh, resolve_copilot, start};
 #[cfg(all(unix, test))]
-pub(crate) use live::{renew_on_host, request_argv};
+pub(crate) use live::renew_on_host;
+#[cfg(unix)]
+pub(crate) use live::{
+    answer, refresh, request_argv, resolve_copilot, send, start, ACCOUNT_TIMEOUT,
+};
 
 /// (tests) FAKE renewing CLIs: shell stubs of codex, pi and opencode that renew the way the real
 /// ones do (in their own store, in the throwaway home they are run in) by rewriting each `from`
@@ -1666,24 +1666,23 @@ mod tests {
             ],
         );
         *TEST_CLI_DIR.lock().unwrap() = Some(bin.clone());
-        let gw = crate::seat_gateway::Gateway::for_dir(&dir);
         let now = 1_900_000_000;
-        let codex = renew_on_host(&dir, &gw, "codex", &codex_record(), None, false, now);
-        let pi = renew_on_host(&dir, &gw, "pi", &pi_record(), Some("anthropic"), true, now);
+        let codex = renew_on_host(&dir, "codex", &codex_record(), None, false, now);
+        let pi = renew_on_host(&dir, "pi", &pi_record(), Some("anthropic"), true, now);
         let export = json!([{"id": "cur", "integrationID": "openai", "label": "OAuth",
             "active": true, "value": {"type": "oauth", "methodID": "chatgpt-headless",
             "refresh": "FAKE-r", "access": "FAKE-a", "expires": 1_000_u64,
             "metadata": {"accountID": "acct-FAKE"}}}]);
-        let opencode = renew_on_host(&dir, &gw, "opencode", &export, Some("openai"), false, now);
+        let opencode = renew_on_host(&dir, "opencode", &export, Some("openai"), false, now);
         std::fs::write(dir.join("refuse-codex"), "").unwrap();
-        let refused = renew_on_host(&dir, &gw, "codex", &codex_record(), None, true, now);
+        let refused = renew_on_host(&dir, "codex", &codex_record(), None, true, now);
         let mut stale = export.clone();
         stale[0]["value"]["refresh"] = json!("FAKE-q");
-        let expired = renew_on_host(&dir, &gw, "opencode", &stale, Some("openai"), false, now);
+        let expired = renew_on_host(&dir, "opencode", &stale, Some("openai"), false, now);
         std::fs::write(dir.join("refuse-opencode"), "").unwrap();
-        let failed = renew_on_host(&dir, &gw, "opencode", &export, Some("openai"), false, now);
+        let failed = renew_on_host(&dir, "opencode", &export, Some("openai"), false, now);
         *TEST_CLI_DIR.lock().unwrap() = Some(dir.join("nothing-here"));
-        let missing = renew_on_host(&dir, &gw, "codex", &codex_record(), None, true, now);
+        let missing = renew_on_host(&dir, "codex", &codex_record(), None, true, now);
         *TEST_CLI_DIR.lock().unwrap() = None;
         let log = std::fs::read_to_string(dir.join("stub-cli.log")).unwrap();
         let homes: Vec<_> = std::fs::read_dir(dir.join("login"))
@@ -1966,7 +1965,13 @@ esac
         let rt = crate::container_floor::Runtime::answering("/nonexistent-FAKE-runtime".into());
         let gw = crate::seat_gateway::Gateway::for_dir(&dir);
         assert_eq!(
-            refresh(&rt, &gw, &dir, "claude", true).unwrap(),
+            refresh(
+                &crate::seat_login::DockerIo::new(&rt, &gw),
+                &dir,
+                "claude",
+                true
+            )
+            .unwrap(),
             Outcome::Busy
         );
         drop(lock);

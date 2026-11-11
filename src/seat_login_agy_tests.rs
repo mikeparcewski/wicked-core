@@ -486,14 +486,13 @@ fn live_agys_api_key_reaches_the_gemini_api_only_through_its_route() {
     // 1. Signed out.
     let before = seat(1).map(|_| ()).unwrap_err();
     // 2. Agents -> Sign in, in the engine's PTY.
-    let login = prepare_login_argv(&rt, &gw, &dir, "agy", &image).expect("the login argv");
-    let volume = read_session(&dir, &gw, "agy")
-        .unwrap()
-        .expect("a login session");
+    let login = prepare_docker_login_argv(&rt, &gw, &dir, "agy", &image).expect("the login argv");
+    let volume = read_session(&dir, "agy").unwrap().expect("a login session");
     cleanup.2.push(volume.clone());
     let (transcript, exit) = super::tests::login_terminal_pasting(&login, None, Some(FAKE_KEY));
     // 3. Ingest, as crew runs it on the terminal's exit.
-    let report = ingest_and_route(&rt, &gw, &dir, "agy").expect("ingested");
+    let report = ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "agy")
+        .expect("ingested");
     let login_gone = !volume_exists(&rt, &volume).unwrap();
     // 4. The governed seat.
     let mut armed = seat(2).expect("a signed-in agy seat arms");
@@ -573,7 +572,8 @@ fn live_agys_api_key_reaches_the_gemini_api_only_through_its_route() {
     }
     drop(armed.cleanup);
     // 6. Sign out.
-    sign_out_and_route(&rt, &gw, &dir, "agy").expect("signed out");
+    sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "agy")
+        .expect("signed out");
     let after = seat(3).map(|_| ()).unwrap_err();
     let logs = run(&["logs", &gw.name]);
     let gw_logs = format!(

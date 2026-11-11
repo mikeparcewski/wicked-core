@@ -549,8 +549,10 @@ pub(crate) fn daemon_docs(g: &GatewaySpec, host: &[HostPort]) -> Vec<Value> {
         render::gateway_ingress(&g.namespace, &g.owner, ports),
         render::gateway_egress(&g.namespace, &g.owner, host),
         render::fill_egress(&g.namespace, &g.owner),
+        render::login_egress(&g.namespace, &g.owner),
         render::pvc(&g.namespace, &g.owner, render::GATEWAY_CONFIG_PVC, "64Mi"),
         render::pvc(&g.namespace, &g.owner, render::GATEWAY_BROKER_PVC, "64Mi"),
+        render::pvc(&g.namespace, &g.owner, render::GATEWAY_LOGINS_PVC, "64Mi"),
         render::gateway_deployment(g),
         render::gateway_service(g, ports),
     ]

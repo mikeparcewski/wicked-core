@@ -266,12 +266,28 @@ fn dns_rule() -> Value {
 /// A cache fill's egress (it alone has the network, and runs no repository code): the internet
 /// on https and http, and DNS; never a private or cluster range.
 pub(crate) fn fill_egress(ns: &str, owner: &str) -> Value {
+    internet_egress(ns, owner, "fill-egress-internet", "fill")
+}
+
+/// A login pod's egress (B-4): the vendor's sign-in on https and http, and DNS, as the container
+/// floor's login ran on the gateway's external bridge; never a private or cluster range. An
+/// offline login (agy's pasted key) has role `login-offline`, which no egress policy selects.
+pub(crate) fn login_egress(ns: &str, owner: &str) -> Value {
+    internet_egress(ns, owner, "login-egress-internet", LOGIN_ROLE)
+}
+
+/// The role of a login pod that reaches its vendor's sign-in.
+pub(crate) const LOGIN_ROLE: &str = "login";
+/// The role of a login pod with no network at all.
+pub(crate) const LOGIN_OFFLINE_ROLE: &str = "login-offline";
+
+fn internet_egress(ns: &str, owner: &str, name: &str, role: &str) -> Value {
     json!({
         "apiVersion": "networking.k8s.io/v1",
         "kind": "NetworkPolicy",
-        "metadata": meta("fill-egress-internet", Some(ns), owner, &[]),
+        "metadata": meta(name, Some(ns), owner, &[]),
         "spec": {
-            "podSelector": {"matchLabels": {ROLE_LABEL: "fill"}},
+            "podSelector": {"matchLabels": {ROLE_LABEL: role}},
             "policyTypes": ["Egress"],
             "egress": [
                 {"to": [{"ipBlock": {"cidr": "0.0.0.0/0", "except": PRIVATE_RANGES}}],
@@ -623,6 +639,12 @@ pub(crate) const GATEWAY_NAME: &str = "agw";
 /// The gateway's config and broker volumes.
 pub(crate) const GATEWAY_CONFIG_PVC: &str = "gateway-config";
 pub(crate) const GATEWAY_BROKER_PVC: &str = "gateway-broker";
+/// The login stores (k8s-swap B-4): one directory per sign-in session (`/logins/<session>` in the
+/// writer), each mounted as a login pod's HOME. Only the writer and that session's login pod
+/// mount it, never a seat.
+pub(crate) const GATEWAY_LOGINS_PVC: &str = "gateway-logins";
+/// Where the writer mounts the login stores.
+pub(crate) const LOGINS_DIR: &str = "/logins";
 
 /// The gateway: agentgateway reading its config and the broker read-only, beside one long-lived
 /// `writer` container (the only one that mounts them read-write): config publishes, credential
@@ -664,8 +686,24 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                             "volumeMounts": [
                                 {"name": "cfg", "mountPath": "/cfg"},
                                 {"name": "broker", "mountPath": "/broker"},
+                                {"name": "logins", "mountPath": LOGINS_DIR},
                                 {"name": "tmp", "mountPath": "/tmp"},
                             ],
+                        },
+                        // The account reader (copilot's API host and models, B-4): curl on the
+                        // gateway's own network, as the container floor read it from the gateway's
+                        // external bridge. It mounts nothing; the token rides exec stdin.
+                        {
+                            "name": "fetch",
+                            "image": crate::seat_refresh::REFRESH_IMAGE,
+                            "imagePullPolicy": "IfNotPresent",
+                            "restartPolicy": "Always",
+                            "command": ["sleep", "2147483647"],
+                            "securityContext": hardened_context(),
+                            "resources": {
+                                "requests": {"memory": "8Mi", "cpu": "5m"},
+                                "limits": {"memory": "64Mi"},
+                            },
                         },
                         {
                             "name": "wait-config",
@@ -705,10 +743,86 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                     "volumes": [
                         {"name": "cfg", "persistentVolumeClaim": {"claimName": GATEWAY_CONFIG_PVC}},
                         {"name": "broker", "persistentVolumeClaim": {"claimName": GATEWAY_BROKER_PVC}},
+                        {"name": "logins", "persistentVolumeClaim": {"claimName": GATEWAY_LOGINS_PVC}},
                         {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "16Mi"}},
                     ],
                 },
             },
+        }
+    })
+}
+
+/// One sign-in's login pod (B-4): the agent's seat image idling under a shell loop (PID 1 ignores
+/// signals and reaps), its session's store as HOME, no service-account token, and a kubelet
+/// deadline, so a login nobody finishes ends even if no engine is left. The login itself starts
+/// only by `kubectl exec -it` from crew's terminal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LoginPod {
+    /// The session name (a DNS label: `<gateway>-login-<cli>-<8 hex>`).
+    pub(crate) name: String,
+    pub(crate) namespace: String,
+    pub(crate) owner: String,
+    pub(crate) image: String,
+    /// Whether it reaches the vendor (`login` role) or nothing (`login-offline`).
+    pub(crate) online: bool,
+    /// The CLI's configuration-home variables (relative to HOME).
+    pub(crate) homes: Vec<(String, String)>,
+}
+
+/// The login pod's HOME (its session's store).
+pub(crate) const LOGIN_HOME: &str = "/home/login";
+/// How long a login pod may live (a sign-in is held 15 minutes by crew).
+pub(crate) const LOGIN_DEADLINE_SECS: u64 = 20 * 60;
+
+pub(crate) fn login_pod(l: &LoginPod) -> Value {
+    let role = if l.online {
+        LOGIN_ROLE
+    } else {
+        LOGIN_OFFLINE_ROLE
+    };
+    let mut env = vec![
+        json!({"name": "HOME", "value": LOGIN_HOME}),
+        json!({"name": "TMPDIR", "value": "/tmp"}),
+        json!({"name": "LANG", "value": "C.UTF-8"}),
+    ];
+    for (var, dir) in &l.homes {
+        env.push(json!({"name": var, "value": format!("{LOGIN_HOME}/{dir}")}));
+    }
+    json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": meta(&l.name, Some(&l.namespace), &l.owner, &[(ROLE_LABEL, role)]),
+        "spec": {
+            "automountServiceAccountToken": false,
+            "enableServiceLinks": false,
+            "hostNetwork": false,
+            "hostPID": false,
+            "hostIPC": false,
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 1,
+            "activeDeadlineSeconds": LOGIN_DEADLINE_SECS,
+            "securityContext": pod_context(GATEWAY_UID),
+            "containers": [{
+                "name": "login",
+                "image": l.image,
+                "imagePullPolicy": "Never",
+                "command": ["sh", "-c", "trap '' TERM INT HUP; while :; do sleep 2; done"],
+                "workingDir": LOGIN_HOME,
+                "env": env,
+                "securityContext": hardened_context(),
+                "resources": {
+                    "requests": {"memory": "64Mi", "cpu": "50m"},
+                    "limits": {"memory": "1Gi"},
+                },
+                "volumeMounts": [
+                    {"name": "logins", "mountPath": LOGIN_HOME, "subPath": l.name},
+                    {"name": "tmp", "mountPath": "/tmp"},
+                ],
+            }],
+            "volumes": [
+                {"name": "logins", "persistentVolumeClaim": {"claimName": GATEWAY_LOGINS_PVC}},
+                {"name": "tmp", "emptyDir": {"medium": "Memory", "sizeLimit": "256Mi"}},
+            ],
         }
     })
 }

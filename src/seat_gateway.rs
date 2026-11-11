@@ -1434,12 +1434,23 @@ pub(crate) fn route_sign_in(
     cli: &str,
     literals: &RouteLiterals,
 ) -> Result<(), String> {
+    route_sign_in_with(dir, cli, literals, || publish_for_cli(rt, gw, dir, cli))
+}
+
+/// The host half of [`route_sign_in`], for any transport (k8s-swap B-4): the route literals are
+/// persisted and the config re-rendered under the config transaction, then `publish` ships it.
+pub(crate) fn route_sign_in_with(
+    dir: &Path,
+    cli: &str,
+    literals: &RouteLiterals,
+    publish: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
     let _transaction = config_transaction(dir)?;
     set_route_literals_locked(dir, cli, literals)?;
     rerender_without_pending(dir)?; // agy lg-r1 A8: never resurrect pending revocations.
     let config = load_config(dir)?;
     persist_units(dir, &config)?;
-    publish_for_cli(rt, gw, dir, cli)
+    publish()
 }
 
 // codex lg-r1 #9: a temporary readiness key proves this reload generation was applied.
@@ -1482,6 +1493,31 @@ pub(crate) fn confirm_sign_out(
         |key, accepted| confirm_key(rt, gw, key, accepted),
     )
     .map_err(|e| format!("sign-out could not confirm gateway config application: {e}"))
+}
+
+/// The host half of [`confirm_sign_out`] for a transport that answers whether a gateway serves
+/// (k8s-swap B-4): `serving` = `Some(true)` serving (the generation is confirmed with a readiness
+/// key), `Some(false)` none serving (published if it can be, and no pending key can be served),
+/// `None` unknown (refused).
+pub(crate) fn confirm_sign_out_with(
+    dir: &Path,
+    cli: &str,
+    serving: Option<bool>,
+    mut publish: impl FnMut() -> Result<(), String>,
+    confirm: impl FnMut(&str, bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let _transaction = config_transaction(dir)?;
+    set_route_literals_locked(dir, cli, &RouteLiterals::default())?;
+    rerender_without_pending(dir)?;
+    match serving {
+        Some(true) => confirm_generation(dir, publish, confirm)
+            .map_err(|e| format!("sign-out could not confirm gateway config application: {e}")),
+        Some(false) => {
+            publish()?;
+            atomic_json(&revoking_path(dir), &Vec::<String>::new())
+        }
+        None => Err("sign-out could not confirm gateway state".into()),
+    }
 }
 
 fn confirm_generation(

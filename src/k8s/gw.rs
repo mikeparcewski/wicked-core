@@ -89,10 +89,29 @@ pub(crate) fn write_script(v: Volume, file: &str, digest: &str) -> Result<String
         return Err("not a sha256 digest".into());
     }
     let d = v.dir();
+    Ok(format!(
+        "{} t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
+         [ \"$(sha256sum \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'wicked-writer: the body did not arrive whole' >&2; exit 65; }}; \
+         mv -f \"$t\" {d}/{file}; trap - EXIT",
+        fence(v, file)
+    ))
+}
+
+/// The writer script that removes `<dir>/<file>` behind the same fence as a write of it (B-4: a
+/// journal or a staged record, which no route names).
+pub(crate) fn remove_script(v: Volume, file: &str) -> Result<String, String> {
+    plain_name(file)?;
+    Ok(format!("{} rm -f {}/{file}", fence(v, file), v.dir()))
+}
+
+/// The fence every write or removal of `<v>/<file>` runs behind (see [`write_script`]), ending
+/// with the file's kernel lock held on fd 9.
+fn fence(v: Volume, file: &str) -> String {
+    let d = v.dir();
     let m = write_marker(v, file);
     let first = &m[..1];
     let rest = &m[1..];
-    Ok(format!(
+    format!(
         // The fence (review r3): an earlier write of this file whose client timed out may still
         // be running in the writer (exec does not end it), and could rename a stale body over
         // this one after it lands. Every such write is killed first (`$0` is its marker; `[x]y`
@@ -107,11 +126,8 @@ pub(crate) fn write_script(v: Volume, file: &str, digest: &str) -> Result<String
          for p in $(pgrep -f '[{first}]{rest}'); do [ \"$p\" = \"$$\" ] || kill -9 \"$p\" 2>/dev/null || :; done; \
          i=0; while pgrep -f '[m]v -f {d}/.{file}.' >/dev/null; do i=$((i+1)); [ $i -lt 200 ] || exit 68; sleep 0.05; done; \
          exec 9>{d}/.{file}.lock; i=0; until flock -n 9; do i=$((i+1)); [ $i -lt 400 ] || {{ echo 'wicked-writer: an earlier write still holds the file' >&2; exit 69; }}; sleep 0.05; done; \
-         rm -f {d}/.{file}.[0-9]*; \
-         t={d}/.{file}.$$; trap 'rm -f \"$t\"' EXIT; cat > \"$t\"; \
-         [ \"$(sha256sum \"$t\" | cut -d' ' -f1)\" = {digest} ] || {{ echo 'wicked-writer: the body did not arrive whole' >&2; exit 65; }}; \
-         mv -f \"$t\" {d}/{file}; trap - EXIT"
-    ))
+         rm -f {d}/.{file}.[0-9]*;"
+    )
 }
 
 /// The readiness probe script: the key on stdin, then up to 15 s until the gateway answers it
@@ -221,6 +237,39 @@ impl Gw {
                 r.err_text()
             ))
         }
+    }
+
+    /// Remove `<volume>/<file>` behind the write fence (a journal or a staged record).
+    pub(crate) fn remove_file(&self, v: Volume, file: &str) -> Result<(), String> {
+        let script = remove_script(v, file)?;
+        let _one = WRITES.lock().unwrap_or_else(|p| p.into_inner());
+        let r = self.exec_marked(&write_marker(v, file), &script, None, EXEC_TIMEOUT);
+        if r.ok() {
+            Ok(())
+        } else {
+            Err(format!(
+                "the gateway writer could not remove {file}: {}",
+                r.err_text()
+            ))
+        }
+    }
+
+    /// Whether a gateway serves now (its pod Running with every container ready): `None` when
+    /// the cluster could not say.
+    pub(crate) fn serving(&self) -> Option<bool> {
+        self.kube
+            .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
+            .ok()
+            .map(|pods| cluster::running_pod(&pods).is_some())
+    }
+
+    /// One exec of `argv` in the gateway pod's `fetch` sidecar (the account reader), with
+    /// `stdin`, its stdout capped at `cap`.
+    pub(crate) fn fetch(&self, argv: &[String], stdin: &[u8], limit: Duration, cap: u64) -> Called {
+        let mut args: Vec<&str> = vec!["exec", "-i", "-c", "fetch", self.pod.as_str(), "--"];
+        args.extend(argv.iter().map(String::as_str));
+        self.kube
+            .call_capped(Some(&self.ns), &args, Some(stdin), limit, cap)
     }
 
     /// Empty a broker file (signed out): the gateway's routes reference it, so it is never
@@ -528,6 +577,79 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
     Ok(gw)
 }
 
+/// The daemon's gateway for a sign-in (the `seat-login` CLI, B-4), never taking the daemon's
+/// ownership: no config or boot token is published, no unit key is touched, and a quarantined
+/// gateway is never restarted (its rotation is the daemon's to finish). `provision`: a first
+/// sign-in applies the daemon's objects as [`ensure`] would (same boot token, the host ports the
+/// egress policy already grants), so the broker's storage exists before any run; the gateway
+/// container keeps waiting for the daemon's first config. Without `provision`, `Ok(None)` when
+/// the daemon has no gateway yet (nothing was ever signed in on this cluster).
+pub(crate) fn attach(
+    kube: &Kube,
+    dir: &Path,
+    provision: bool,
+) -> Result<Option<Gw>, (FloorUnarmed, String)> {
+    let gwerr = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+    let unreachable = |e: String| (FloorUnarmed::ClusterUnreachable, e);
+    if !dir.is_absolute() {
+        return Err(gwerr("the gateway directory must be absolute".into()));
+    }
+    let ns = daemon_namespace_name(&kube.owner);
+    let quarantined = |dep: &Option<serde_json::Value>| {
+        rotation_pending(dir)
+            || cluster_rotation_pending(dep.as_ref())
+            || dep
+                .as_ref()
+                .and_then(|d| d.pointer("/spec/replicas"))
+                .and_then(serde_json::Value::as_u64)
+                == Some(0)
+    };
+    let refused = || {
+        gwerr(
+            "the gateway is stopped after a revocation it could not confirm; the daemon restarts              it before its next seat. Start a run, then sign in again"
+                .into(),
+        )
+    };
+    let dep = kube
+        .get_json(Some(&ns), "deployment", render::GATEWAY_NAME)
+        .map_err(unreachable)?;
+    if quarantined(&dep) {
+        return Err(refused());
+    }
+    if provision {
+        let _broker = crate::seat_refresh::mutation_lock(dir).map_err(gwerr)?;
+        let _transaction = crate::seat_gateway::config_transaction(dir).map_err(gwerr)?;
+        let dep = kube
+            .get_json(Some(&ns), "deployment", render::GATEWAY_NAME)
+            .map_err(unreachable)?;
+        if quarantined(&dep) {
+            return Err(refused());
+        }
+        let existing = kube
+            .get_json(Some(&ns), "networkpolicy", "gateway-egress")
+            .map_err(unreachable)?;
+        let host: Vec<HostPort> = existing.as_ref().map(render_host_ports).unwrap_or_default();
+        let spec = GatewaySpec {
+            namespace: ns.clone(),
+            owner: kube.owner.clone(),
+            image: crate::seat_gateway::GATEWAY_IMAGE.into(),
+            writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
+            boot: boot_token(dir, false).map_err(gwerr)?,
+        };
+        cluster::apply_gateway(kube, &spec, &host).map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
+    } else if dep.is_none() {
+        return Ok(None);
+    }
+    let pod = cluster::writer_pod(kube, &ns, READY_TIMEOUT).map_err(gwerr)?;
+    Ok(Some(Gw {
+        kube: kube.clone(),
+        ns,
+        pod,
+        service_ip: String::new(),
+        dir: dir.to_path_buf(),
+    }))
+}
+
 /// The host ports an existing gateway egress policy names (pure).
 pub(crate) fn render_host_ports(policy: &serde_json::Value) -> Vec<HostPort> {
     let mut out = Vec::new();
@@ -789,61 +911,34 @@ pub(crate) fn boot_token(dir: &Path, fresh: bool) -> Result<String, String> {
     Ok(t)
 }
 
-/// The broker files a status read of `cli` needs: retained records whole, the rest as presence.
-fn status_files(cli: &str) -> Result<Vec<(&'static str, bool)>, String> {
-    Ok(crate::seat_login::broker_files(cli)?
-        .iter()
-        .map(|f| (*f, !crate::seat_login::is_archive(f)))
-        .collect())
-}
-
-/// The sign-in a governed seat of `cli` runs on, read from the broker through the writer (the
-/// cluster half of `seat_login::seat_sign_in`). Signed out, expired or unreadable = the reason.
+/// The sign-in a governed seat of `cli` runs on, read through the writer by the one sign-in
+/// state machine (`seat_login::seat_sign_in`): an interrupted sign-in, sign-out or refresh is
+/// settled first (C4). Signed out, expired or unreadable = the reason.
+#[cfg(unix)]
 pub(crate) fn seat_sign_in(
     gw: &Gw,
     cli: &str,
 ) -> Result<crate::seat_credentials::SeatSignIn, String> {
-    use crate::seat_login::BrokerStatus;
-    let _lock = crate::seat_refresh::mutation_lock(&gw.dir)?;
-    let files = gw.read_broker(&status_files(cli)?)?;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_err(|_| "system clock precedes Unix epoch")?
-        .as_secs();
-    let status = crate::seat_login::status_from_files(cli, &files, now);
-    let status = crate::seat_login::publication_status(
-        &gw.dir,
-        cli,
-        crate::seat_login::with_last_refresh(
-            status,
-            crate::seat_refresh::last_refresh(&gw.dir, cli),
-        ),
-    );
-    match status {
-        BrokerStatus::SignedIn { .. } | BrokerStatus::RefreshFailing { .. } => {
-            crate::seat_login::sign_in_from_files(cli, &files, now)
-                .ok_or_else(|| format!("{cli}: the broker holds no usable sign-in"))
-        }
-        BrokerStatus::SignedOut => Err(format!("{cli} is not signed in")),
-        BrokerStatus::Expired => Err(format!("{cli}'s sign-in has expired")),
-        BrokerStatus::Unknown(why) => Err(format!("{cli}'s sign-in could not be read: {why}")),
-    }
+    crate::seat_login::seat_sign_in(&super::login::K8sIo::of(gw), &gw.dir, cli)
 }
 
 /// The claude setup-token a claude seat signed in with OAuth passes through (core#1024).
+#[cfg(unix)]
 pub(crate) fn claude_seat_token(gw: &Gw) -> Result<String, String> {
-    let _lock = crate::seat_refresh::mutation_lock(&gw.dir)?;
-    let files = gw.read_broker(&[("anthropic.token", false)])?;
-    let token = files
-        .into_iter()
-        .next()
-        .map(|(_, b)| b)
-        .filter(|b| !b.is_empty())
-        .ok_or("claude is not signed in")?;
-    let token = String::from_utf8(token).map_err(|_| "claude: invalid broker token")?;
-    let token = token.trim();
-    if token.is_empty() || token.chars().any(|c| c.is_control() || c.is_whitespace()) {
-        return Err("claude: invalid broker token".into());
-    }
-    Ok(token.to_string())
+    crate::seat_login::claude_seat_token(&super::login::K8sIo::of(gw), &gw.dir)
+}
+
+/// Native Windows runs no seats (the seat runner needs a Unix host).
+#[cfg(not(unix))]
+pub(crate) fn seat_sign_in(
+    _gw: &Gw,
+    _cli: &str,
+) -> Result<crate::seat_credentials::SeatSignIn, String> {
+    Err("seat sign-ins need a Unix host".into())
+}
+
+/// Native Windows runs no seats (the seat runner needs a Unix host).
+#[cfg(not(unix))]
+pub(crate) fn claude_seat_token(_gw: &Gw) -> Result<String, String> {
+    Err("seat sign-ins need a Unix host".into())
 }
