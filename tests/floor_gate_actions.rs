@@ -364,21 +364,11 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
         Some((_, _, false, Some(s), _)) if s == source => true,
         other => {
             // Only a floor that could not run under an OS boundary excuses the test (core#1392
-            // review): a floor that RAN and was not denied this way is a failure, never a skip.
-            let ran = evs.iter().any(|e| {
-                matches!(
-                    e,
-                    CoreEvent::RepoChecksEvaluated {
-                        ord: 3,
-                        sandbox_error: None,
-                        ..
-                    }
-                )
-            });
+            // review): a floor that ran (or never reported) and was not denied this way fails.
             assert!(
-                !ran,
-                "the fix floor ran under an OS write boundary but was not denied by `{source}`: \
-                 {other:?}"
+                no_boundary(evs),
+                "the fix floor was not denied by `{source}` and did not report a missing OS \
+                 write boundary: {other:?}"
             );
             eprintln!(
                 "floor_gate_actions: the fix floor was not denied by `{source}` on this host \
@@ -388,6 +378,27 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
             false
         }
     }
+}
+
+/// Did the fix unit's floor say it could not arm an OS write boundary (`sandbox_error`)? The one
+/// shape that excuses a test here. A Windows host has no boundary at all, and there a floor that
+/// never reported counts too; anywhere else a missing report is a failure, never a skip.
+fn no_boundary(evs: &[CoreEvent]) -> bool {
+    let mut reported = false;
+    for e in evs {
+        if let CoreEvent::RepoChecksEvaluated {
+            ord: 3,
+            sandbox_error,
+            ..
+        } = e
+        {
+            if sandbox_error.is_some() {
+                return true;
+            }
+            reported = true;
+        }
+    }
+    cfg!(windows) && !reported
 }
 
 fn no_session_failed(evs: &[CoreEvent]) {
@@ -649,7 +660,7 @@ fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
     let first = until_settled(&events, sid);
     no_session_failed(&first);
     let f = floors(&first, 3);
-    if f.is_empty() || f.iter().all(|x| x.1 == "not_run") {
+    if no_boundary(&first) {
         eprintln!(
             "floor_gate_actions: no OS write boundary on this host ({f:?}); nothing to assert"
         );

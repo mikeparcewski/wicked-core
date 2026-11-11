@@ -20261,6 +20261,38 @@ mod sessions_detail_fold_tests {
         }
     }
 
+    /// core#1392 (review r2): a unit a daemon from before the waiver label approved — its stored
+    /// floor report says the operator's re-run waived the tests, its receipt does not — is never
+    /// folded again before delivery; the delivery receipt reads the label off the report itself.
+    #[test]
+    fn a_delivery_labels_a_waiver_from_a_unit_it_never_folded_again() {
+        let s = session("legacy-waiver-1392");
+        let mut u = crate::domain::WorkUnit::pending(
+            "legacy-waiver-1392:3",
+            "legacy-waiver-1392",
+            3,
+            "fix",
+        );
+        let mut report = crate::repo_checks::red_report(&["a"], None);
+        report.passed = true;
+        report.checks[0].name = "lint".into();
+        report.waived = vec!["test".into()];
+        report.rerun = Some(crate::repo_checks::FloorRerunMode::Targeted);
+        u.repo_checks = Some(report);
+        u.assurance = Some(crate::assurance::AssuranceReceipt::default());
+        let delivery = crate::deliver_lift::delivery_receipt(&s, std::slice::from_ref(&u));
+        let k = delivery
+            .skipped
+            .iter()
+            .find(|k| k.reason == crate::assurance::SKIP_WAIVED_BY_OPERATOR)
+            .expect("the waiver is on the delivery");
+        assert_eq!(k.instrument, crate::assurance::REPO_CHECKS);
+        assert_eq!(
+            k.detail.as_deref(),
+            Some("tests waived by the operator (`targeted`, with no targeted command): test (unit 3)")
+        );
+    }
+
     /// A store of `sessions` runs × `units` units each, written interleaved (unit k of every run,
     /// then unit k+1) so no run's units sit contiguously, each unit carrying ~1 KB of text.
     fn seeded(sessions: usize, units: usize) -> wicked_apps_core::SqliteStore {

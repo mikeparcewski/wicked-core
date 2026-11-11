@@ -24,6 +24,7 @@ Two release tracks share this file, newest entry first regardless of track:
   `accept_partial` remains the explicit waiver. Its floor note now leads with "tests waived by the operator
   (`accept_partial`): …", and the gate receipt records `skipped[] {instrument: repo_checks, reason:
   waived_by_operator}`, which the delivery receipt carries.
+
 - **The checks floor image and the seat images carry Python's test toolchain (wicked-core#1401).** wicked-garden's
   suite runs `python3 -m pytest`, and neither image had pytest, so every garden run's floor failed with "No Python
   with pytest found" and the operator had to approve the gate as their own judgment. Both images now install
