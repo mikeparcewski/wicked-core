@@ -14,6 +14,22 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Run reads no longer wait behind the engine's single-writer actor; the actor's slow commands are named (wicked-core#1390,
+  part 1).** `sessions`, `sessions_detail` (crew's GET /runs and the stall watchdog's `listExecuting`), `work_output`,
+  `unit_transcript` and `run_team` are answered on the caller's thread from a read-only SQLite connection, each inside
+  one read transaction. Before, a ~30 ms read queued behind one long actor command: on the dev host a worktree snapshot
+  held the actor for 30–45 s, so GET /runs had a p99 of 35 s and the watchdog timed out 33 times. A read first waits
+  (up to 100 ms) for a moment between two actor commands and pins its snapshot there, so a read issued after a
+  command's event sees that whole command. Only when the actor stays busy past that budget does it read the last
+  committed state. No decision reads it: gates, reassigns, delivery and every deny are still decided on the actor,
+  which re-validates any answer sent on a read (a guard test pins which `Core` methods may use it). An in-memory or
+  `postgres://` store, or `WICKED_READ_MODEL=off`, keeps every read on the actor. The actor now times every command
+  by variant, logs any at or past `WICKED_ACTOR_SLOW_MS` (default 1000) as `wicked-core: slow actor command <Variant>
+  took <ms> ms (backlog <n>)`, and `Core::actor_stats` (napi `actorStats()`, synchronous, never queued) reports the
+  command running now and for how long, the backlog, and p50/p99/max per variant. `tests/load_actor.rs` (`#[ignore]`)
+  is the load harness: N concurrent fake-seat runs on an M-file repo, measuring the run reads, an actor round trip
+  and the real gate hook.
+
 - **The checks floor can build an allowlisted native addon (wicked-core#1393).** The floor installs with scripts
   off (`npm ci --ignore-scripts`), so `better-sqlite3` had no binding, and wicked-interactive's bus and SSE tests
   failed or hung for an environment reason. A repository can now declare `"native_rebuild": ["better-sqlite3"]` in

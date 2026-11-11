@@ -30,6 +30,7 @@ macro_rules! eprintln {
 mod acp_permission;
 mod acp_runner;
 mod actor;
+mod actor_stats;
 pub(crate) mod ask;
 pub use ask::{AskError, AskMulti, AskRequest, AskTicket, AskUnit};
 mod applications;
@@ -114,6 +115,9 @@ pub mod power;
 mod preset;
 mod project;
 mod qe_acceptance;
+mod read_model;
+#[cfg(test)]
+mod read_model_tests;
 mod remote_write_fence;
 mod repeat;
 mod repo;
@@ -235,6 +239,7 @@ pub(crate) mod test_env {
 
 pub use acp_runner::AcpStepRunner;
 pub use actor::{NoEligibleSeat, RunBusy, RunExists, CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
+pub use actor_stats::{ActorStatsView, CommandTiming, RunningCommand, SlowCommand};
 pub use applications::{
     attach_doc, attach_repo, create_app, delete_app, get_app, list_apps, AppDoc, AppRepo,
     Application, SeedKind,
@@ -637,6 +642,14 @@ impl Drop for ShutdownGuard {
 #[derive(Clone)]
 pub struct Core {
     tx: Sender<Command>,
+    /// (core#1390) Run reads answered off the actor, from a read-only connection
+    /// ([`read_model`]). Reads only: no decision path holds it.
+    reads: Arc<read_model::ReadModel>,
+    /// (core#1390) The actor's per-command timing and backlog ([`Core::actor_stats`]).
+    stats: Arc<actor_stats::ActorStats>,
+    /// Whether this core's actor publishes team runs (its `TeamLink` is a publisher) — fixed at
+    /// spawn, so a team view read off the actor says what the actor's would.
+    team_publishes: bool,
     /// The off-actor PTY writer/master/child map (DES-TERMINAL-001 §4). `write_terminal` /
     /// `resize_terminal` act on this DIRECTLY — no store round-trip — so keystroke I/O never queues
     /// behind the single store-writer actor. Shared (cloned) with the actor, which owns open/close.
@@ -831,6 +844,10 @@ impl Core {
         let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
+        let team_publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
+        let stats = Arc::new(actor_stats::ActorStats::starting());
+        let stats_actor = stats.clone();
+        let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -846,6 +863,7 @@ impl Core {
                 empty_write_reg,
                 team_link,
                 qe_host_actor,
+                stats_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
@@ -853,6 +871,9 @@ impl Core {
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         let core = Core {
             tx: tx.clone(),
+            reads,
+            stats,
+            team_publishes,
             pty,
             log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
@@ -910,6 +931,10 @@ impl Core {
         let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
+        let team_publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
+        let stats = Arc::new(actor_stats::ActorStats::starting());
+        let stats_actor = stats.clone();
+        let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
         let publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
         std::thread::spawn(move || {
             actor::run(
@@ -926,6 +951,7 @@ impl Core {
                 actor_write_reg,
                 team_link,
                 qe_host_actor,
+                stats_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
@@ -960,6 +986,9 @@ impl Core {
             });
         let core = Core {
             tx: tx.clone(),
+            reads,
+            stats,
+            team_publishes,
             pty,
             log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
@@ -1003,6 +1032,10 @@ impl Core {
         let qe_host = crate::assurance::HostQeAcceptance::from_env();
         let qe_host_actor = qe_host.clone();
         let team_link = crate::team::publish::TeamLink::spawn(&team_cfg, tx.clone());
+        let team_publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
+        let stats = Arc::new(actor_stats::ActorStats::starting());
+        let stats_actor = stats.clone();
+        let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
         std::thread::spawn(move || {
             actor::run(
                 bus_bridge_actor,
@@ -1018,6 +1051,7 @@ impl Core {
                 spawn_write_reg,
                 team_link,
                 qe_host_actor,
+                stats_actor,
             )
         });
         // Arm the launch bridge (bounded handshake) while the actor starts; `spawn` returns only once
@@ -1025,6 +1059,9 @@ impl Core {
         let bus_bridge_state = arm_bus_bridge(&tx, &bus_bridge, &qe_host);
         Core {
             tx: tx.clone(),
+            reads,
+            stats,
+            team_publishes,
             pty,
             log_root: crate::event_log::log_root_for(&actor::sidecar_base(&log_path)),
             bus_bridge_state,
@@ -1084,6 +1121,13 @@ impl Core {
     /// The standing reason while QE acceptance is off for engine-originated launches, else `None`.
     pub fn qe_acceptance_off(&self) -> Option<String> {
         self.qe_host.get()
+    }
+
+    /// (core#1390) The actor's per-command timing — p50/p99/max per command variant over its last
+    /// runs, the slow commands (at or past `WICKED_ACTOR_SLOW_MS`, default 1000) — and how many
+    /// commands waited behind it. Read without the actor: it answers while the actor is busy.
+    pub fn actor_stats(&self) -> actor_stats::ActorStatsView {
+        self.stats.view(actor_stats::slow_threshold_from_env())
     }
 
     /// Liveness probe — emits a `Heartbeat` to subscribers and waits for the actor to ack.
@@ -1705,6 +1749,9 @@ impl Core {
     /// The agent session ids currently on the store (lightweight; use [`sessions_detail`] for the
     /// full project list).
     pub fn sessions(&self) -> anyhow::Result<Vec<String>> {
+        if let Some(ids) = self.reads.read(actor::list_sessions) {
+            return Ok(ids);
+        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::Sessions(reply))
@@ -1764,6 +1811,22 @@ impl Core {
     /// `GET /api/v1/runs/:id/team` (`{transport, reason}`). `Ok(None)` for a run that is not a
     /// team run; `Err` for an unknown run.
     pub fn run_team(&self, run_id: &str) -> anyhow::Result<Option<RunTeamView>> {
+        // Off the actor (core#1390), as the actor's own `RunTeam` arm reads it; an unknown run is
+        // the actor's answer (its error) to give.
+        if let Some(Some(view)) = self.reads.read(|s| {
+            domain::get_session(s, run_id)?
+                .map(|session| {
+                    let units = domain::session_units(s, run_id)?;
+                    Ok(team::publish::run_team_view(
+                        &session,
+                        &units,
+                        self.team_publishes,
+                    ))
+                })
+                .transpose()
+        }) {
+            return Ok(view);
+        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::RunTeam {
@@ -1879,6 +1942,13 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// TEST-ONLY (core#1390): park the actor on one command until `release` fires (or drops);
+    /// `entered` fires once it is parked. Stands in for a long command.
+    #[cfg(test)]
+    pub(crate) fn hold_actor(&self, entered: Sender<()>, release: Receiver<()>) {
+        let _ = self.tx.send(Command::HoldActor { entered, release });
+    }
+
     /// TEST-ONLY: how many `confirm_gate` replies the actor holds for the team publisher.
     #[cfg(test)]
     pub(crate) fn held_team_replies(&self) -> usize {
@@ -1903,7 +1973,14 @@ impl Core {
     }
 
     /// Every session + its ordered units — the read the UI builds its project list from.
+    ///
+    /// Answered off the actor from the read model (core#1390) — one read transaction, so the
+    /// sessions and their units come from one committed state — and through the actor only when
+    /// this store has none.
     pub fn sessions_detail(&self) -> anyhow::Result<Vec<SessionView>> {
+        if let Some(views) = self.reads.read(actor::list_projects) {
+            return Ok(views);
+        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::Projects(reply))
@@ -1917,6 +1994,12 @@ impl Core {
     /// status/`denial` (or [`Core::unit_transcript`]) to distinguish partial from resolved; `None`
     /// only when no output was ever stored (never ran, or denied before any output existed).
     pub fn work_output(&self, unit_id: &str) -> Option<String> {
+        if let Some(out) = self
+            .reads
+            .read(|s| Ok(domain::get_unit_transcript(s, unit_id).and_then(|t| t.output)))
+        {
+            return out;
+        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::WorkOutput(unit_id.to_string(), reply))
@@ -1943,6 +2026,12 @@ impl Core {
         unit_id: &str,
         attempt: Option<u32>,
     ) -> Option<domain::UnitTranscript> {
+        if let Some(t) = self
+            .reads
+            .read(|s| Ok(domain::get_unit_transcript_at(s, unit_id, attempt)))
+        {
+            return t;
+        }
         let (reply, rx) = channel();
         self.tx
             .send(Command::UnitTranscript(unit_id.to_string(), attempt, reply))
