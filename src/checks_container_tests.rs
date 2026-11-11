@@ -717,8 +717,60 @@ mod live {
         admin.owner = crate::k8s::owner_id(&home);
         let guard = Cluster(admin.clone());
         crate::k8s::cluster::install(&admin, &home).expect("cluster install");
+        // Each live test its own home: the first noted would otherwise win for the process.
+        crate::k8s::forget_engine_home_for_test();
         crate::k8s::note_engine_home(&home);
         guard
+    }
+
+    #[test]
+    fn k8s_live_studios_vitest_runs_in_a_floor_pod() {
+        // core#1424: Vite writes node_modules/.vite-temp (its config bundle) and .vite; on a
+        // read-only node_modules claim it could not start. A clean, committed studio checkout at
+        // WICKED_K8S_LIVE_STUDIO; its own `test` script (vitest run) must pass in a floor pod.
+        if !enabled("k8s_live_studios_vitest_runs_in_a_floor_pod") {
+            return;
+        }
+        let Some(dir) = std::env::var_os("WICKED_K8S_LIVE_STUDIO").map(PathBuf::from) else {
+            eprintln!("SKIP: set WICKED_K8S_LIVE_STUDIO to a studio checkout");
+            return;
+        };
+        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+        let _cluster = cluster();
+        // spawn-audit: test-only — reads the checkout's head commit.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        // The full suite (a power run's hand-off): the whole `vitest run`, not only the tests
+        // related to a change.
+        test_seam::set_mode(Some(Mode::Container));
+        let run = format!("live-studio-{}", std::process::id());
+        crate::power::set_full_suite(&run, true);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(head.clone()),
+            git_dir: Some(dir.join(".git")),
+            run_id: Some(run.clone()),
+            ..Default::default()
+        };
+        let r = run_floor(&dir, &ctx);
+        crate::power::set_full_suite(&run, false);
+        test_seam::set_mode(None);
+        crate::repo_checks::remove_check_scratch(&dir, &run);
+        let names: Vec<&str> = r.checks.iter().map(|c| c.name.as_str()).collect();
+        let test = r
+            .checks
+            .iter()
+            // The package's own `test` script (`npm run test` -> `vitest run`).
+            .find(|c| {
+                c.argv.first().is_some_and(|a| a == "npm") && c.argv.iter().any(|a| a == "test")
+            })
+            .unwrap_or_else(|| panic!("no vitest run among {names:?}: {:?}", r.sandbox_error));
+        assert!(test.passed(), "{test:#?}");
+        assert!(test.stdout_tail.contains("Test Files"), "{test:#?}");
     }
 
     /// PARITY B13 on pods, one install for every case: a passing floor runs with no network in

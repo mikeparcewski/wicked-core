@@ -1664,6 +1664,13 @@ impl ChecksFloor {
         // own scratch: the addon is built there by the `native-build` check and goes with the
         // pod. The claim stays read-only and unbuilt.
         for m in plan.nm.iter().filter(|m| m.failed.is_none()) {
+            // (core#1424) The tool caches inside the read-only claim are this pod's own.
+            for d in crate::k8s::render::NM_WRITABLE {
+                pod.empty.push((
+                    format!("{}/{d}", nm_path(&work, &m.dir)),
+                    crate::k8s::render::NM_WRITABLE_SIZE.into(),
+                ));
+            }
             for n in &m.native {
                 pod.empty.push((
                     format!("{}/{n}/build", nm_path(&work, &m.dir)),
@@ -2256,6 +2263,12 @@ impl Filler<'_> {
                 )
             })
             .collect();
+        // (core#1424) The mount points of the floor's and seats' writable tool caches.
+        let writable: String = crate::k8s::render::NM_WRITABLE
+            .iter()
+            .map(|d| format!("node_modules/{d}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mark = format!("{OOM_BEFORE_MARK} touch {FILL_DIR}/{COMPLETE}");
         // A claim already complete is a hit; one without its marker is a fill that died, emptied
         // and filled again. A node_modules the tree tracks is not the install's: removed before
@@ -2267,7 +2280,7 @@ impl Filler<'_> {
              find . -mindepth 1 -name node_modules -prune -exec rm -rf {{}} +; \
              echo WICKED-FILL-START; \
              if ! {cmd} > {FILL_DIR}/{INSTALL_LOG} 2>&1; then tail -n 60 {FILL_DIR}/{INSTALL_LOG}; exit 3; fi; \
-             mkdir -p node_modules; {addons}\
+             mkdir -p node_modules {writable}; {addons}\
              find node_modules -mindepth 1 -maxdepth 1 -exec cp -a -t {FILL_DIR} {{}} + ; \
              find . -path ./node_modules -prune -o -type d -name node_modules -prune -print0 \
                | tar --null -T - -c -f {FILL_DIR}/{NESTED_TAR}; \

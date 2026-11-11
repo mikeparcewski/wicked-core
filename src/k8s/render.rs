@@ -387,6 +387,14 @@ pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
 /// view init as the pod's uid, so the tree root is the seat's own, as on the replica.
 pub(crate) const VIEW_TREE: &str = "tree";
 
+/// The dirs inside a read-only `node_modules` claim that a floor or seat pod gets writable, its
+/// own and in memory (core#1424): the caches JavaScript tools write there (Vite's config bundle
+/// and dependency cache, the shared `.cache` of babel, eslint and others). The fill makes them
+/// empty in the claim, as mount points.
+pub(crate) const NM_WRITABLE: [&str; 3] = [".vite-temp", ".vite", ".cache"];
+/// The size limit of each [`NM_WRITABLE`] dir (charged to the pod's memory limit).
+pub(crate) const NM_WRITABLE_SIZE: &str = "512Mi";
+
 /// The init container that copies a read-only unit's replica tree into its view (no link
 /// followed; tracked content under any name, `target/` included, review r1).
 fn view_init(floor_image: &str, sub: &str) -> Value {
@@ -533,9 +541,19 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
             .and_then(Value::as_array_mut)
         {
             m.push(json!({"name": "deps", "mountPath": at.to_string_lossy(), "readOnly": true}));
+            // The tool caches inside it are the pod's own and writable (core#1424: Vite bundles
+            // its config into node_modules/.vite-temp), over the read-only claim.
+            for (i, d) in NM_WRITABLE.iter().enumerate() {
+                m.push(json!({"name": format!("nmw{i}"),
+                    "mountPath": at.join(d).to_string_lossy()}));
+            }
         }
         extra_volumes.push(json!({"name": "deps",
             "persistentVolumeClaim": {"claimName": claim, "readOnly": true}}));
+        for i in 0..NM_WRITABLE.len() {
+            extra_volumes.push(json!({"name": format!("nmw{i}"),
+                "emptyDir": {"medium": "Memory", "sizeLimit": NM_WRITABLE_SIZE}}));
+        }
     }
     if let Some(v) = spec["volumes"].as_array_mut() {
         v.extend(extra_volumes);

@@ -274,6 +274,14 @@ pub(crate) fn note_engine_home(home: &Path) {
     }
 }
 
+/// Forget the noted home (live tests: each installs into its own throwaway home).
+#[cfg(test)]
+pub(crate) fn forget_engine_home_for_test() {
+    if let Ok(mut g) = ENGINE_HOME.lock() {
+        *g = None;
+    }
+}
+
 /// The daemon's operational home as noted by its actor, else the worker home base (a floor run
 /// outside a daemon).
 pub(crate) fn engine_home() -> Option<PathBuf> {
