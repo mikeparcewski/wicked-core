@@ -2845,6 +2845,39 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.38** — 2026-11-11 — patch release on main a82ac4f, carrying 6 PRs since 0.15.37: #1399, #1403, #1404,
+  #1405, #1407 and #1412.
+  - **A targeted re-run with no targeted command is refused, never a test waiver (#1403, closes #1392).** A timed-out
+    floor's report names what a `targeted` re-run would run (`targeted_test`, read before the first check runs); the
+    gate refuses `targeted` when there is none and stays open with the alternatives named, and a targeted re-run that
+    still finds no targeted command fails closed (`not_run`, denied). `accept_partial` remains the explicit waiver: its
+    floor note leads with "tests waived by the operator (`accept_partial`)", and the gate and delivery receipts record
+    `skipped[] {instrument: repo_checks, reason: waived_by_operator}`.
+  - **The checks floor and seat images carry Python's test toolchain (#1404, closes #1401).** `python3-pytest`,
+    `python3-yaml` and `python3-zstandard` from the Debian archive the images already use (plus `jq` in the checks
+    image and `python3-venv` in the seat image): no PyPI, no new registry.
+  - **The checks floor and seat images run Node 24, pinned 24.22.2 (#1412).** Up from 22: crew's SQLite uploads need
+    Node 24.12 or later. The checks image, the seat image and the seat builder's default base pin the one release; a
+    test holds it to crew's uploads requirement and every product repo's `engines.node`.
+  - **The checks floor can build an allowlisted native addon (#1405, closes #1393).** `"native_rebuild":
+    ["better-sqlite3"]` in `.wicked/checks.json` (allowlist `NATIVE_REBUILD_ALLOW`; any other name, a non-npm install
+    or a missing package.json is a detection error) adds a `native-build` provisioning check after the scripts-off
+    install: the floor npm's own node-gyp against the floor's node headers, offline, no npm lifecycle, onto a private
+    tmpfs in the checks container; the shared read-only `node_modules` cache stays unbuilt. Never compared with the
+    base, never reused from a journal.
+  - **Run reads are served off the engine's actor, and every actor command is timed (#1407, #1390 part 1).**
+    `sessions`, `sessions_detail` and `run_team` (crew's GET /runs, the stall watchdog's `listExecuting`, the run's
+    team) are answered on the caller's thread from a read-only SQLite connection, one read transaction each, pinned
+    between two actor commands when the actor gets there within 100 ms. Decisions stay on the actor; an in-memory or
+    `postgres://` store, `WICKED_READ_MODEL=off`, a read error or a stopped actor keeps the read on the actor. The actor
+    logs commands at or past `WICKED_ACTOR_SLOW_MS` (default 1000) and `actorStats()` (new napi method, synchronous,
+    never queued) reports the running command, the backlog and p50/p99/max per variant. `tests/load_actor.rs`
+    (`#[ignore]`) is the load harness.
+  - **Lockfile:** #1399 re-stamped the 0.15.37 platform lock entries.
+  - One binding method added (`actorStats()`, #1407); no `LaunchSpec` field change; gate protocol 3 is unchanged.
+    Wire: `RepoChecksReport` gains the optional `targeted_test`. The checks-floor and seat Dockerfiles changed (#1404,
+    #1412), so their content-hash image tags change and each image is rebuilt once on first use; the seat package pins
+    are unchanged.
 - **core-ts 0.15.37** — 2026-11-10 — patch release on main d79ea7d, carrying 4 PRs since 0.15.36: #1385, #1386, #1389
   and #1391.
   - **Docker running out of address pools is named, and the engine sweeps the networks it leaks (#1385, #1377,
