@@ -310,6 +310,9 @@ pub(crate) struct Seat {
     pub(crate) mounted: Vec<PathBuf>,
     pub(crate) unit_label: String,
     pub(crate) settled: Mutex<bool>,
+    /// The run's node_modules claim is mounted: every `node_modules` path of the tree is the
+    /// engine's, never the seat's, and never comes back (B-3 review r2).
+    pub(crate) deps: bool,
 }
 
 /// Live seats by id.
@@ -1284,6 +1287,7 @@ pub(crate) fn arm(
         mounted,
         unit_label: unit_label.clone(),
         settled: Mutex::new(false),
+        deps: s.deps.is_some(),
     });
     // Owned from here: every way out before the caller holds the seat reaps it (review r1: an
     // API error while waiting, or an apply whose reply was lost, leaked the Sandbox).
@@ -1881,6 +1885,9 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            entries.retain(|e| !in_node_modules(&e.path));
+        }
         checked.push((want, entries));
     }
     let tree_back = back
@@ -1936,6 +1943,9 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
         let retained = retained_links(&entries, &base);
         let (writes, mut deletes) = delta(&want.host, &base, entries)?;
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            deletes.retain(|d| !in_node_modules(d));
+        }
         // The pod's `ls-files -c -o --exclude-standard` lists every tracked file, ignored or
         // not, so a tracked path it does not list was deleted (codex b2-seat #10). Only an
         // untracked one the host's ignore rules now match is no deletion (the safe side).
@@ -2448,6 +2458,11 @@ fn fetch_commits(
     Ok(Some((new, refname)))
 }
 
+/// Whether a tree path lies in a `node_modules` (any depth; folded as the host compares).
+pub(crate) fn in_node_modules(rel: &str) -> bool {
+    rel.split('/').any(|c| sync::fold(c) == "node_modules")
+}
+
 /// The in-pod script that unpacks the fill's nested `node_modules` archive into `tree` (pure).
 pub(crate) fn nested_unpack_script(tree: &Path) -> String {
     let t = format!("'{}'", tree.to_string_lossy().replace('\'', "'\\''"));
@@ -2455,8 +2470,8 @@ pub(crate) fn nested_unpack_script(tree: &Path) -> String {
     // replica kept from an earlier seat could carry a planted `.bin` shim), as `npm ci` empties
     // them; the root one is the read-only claim and is left alone.
     format!(
-        "set -e; cd {t}; /floor/busybox find . -path ./node_modules -prune -o -type d -name node_modules -prune -exec /floor/busybox rm -rf {{}} \\; ; \
-         a=./node_modules/{n}; [ -f \"$a\" ] || exit 0; /floor/busybox tar -x -f \"$a\"",
+        "set -e; cd {t}; F=/floor/busybox; $F find . -path ./node_modules -prune -o -name node_modules -prune -exec $F rm -rf {{}} \\; ; [ -z \"$($F find . -path ./node_modules -prune -o -name node_modules -print)\" ] || {{ echo 'wicked-seat: an earlier node_modules could not be removed' >&2; exit 1; }}; \
+         a=./node_modules/{n}; [ -f \"$a\" ] || exit 0; $F tar -x -f \"$a\"",
         n = crate::checks_container::NESTED_TAR
     )
 }
@@ -2550,6 +2565,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         mounted: vec![tree.to_path_buf()],
         unit_label: "u".into(),
         settled: Mutex::new(false),
+        deps: false,
     })
 }
 

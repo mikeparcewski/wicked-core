@@ -3673,6 +3673,13 @@ pub(crate) fn arm_noting(
 /// A container memory limit (`3g`, `512m`) as a Kubernetes quantity (`3Gi`, `512Mi`).
 pub(crate) fn k8s_memory(m: &str) -> String {
     let m = m.trim();
+    // `6gb` / `512mb` / `64kb` (accepted by the floor's memory setting, B-3 review r2).
+    let m = match m.char_indices().last() {
+        Some((i, 'b' | 'B')) if m[..i].chars().last().is_some_and(|c| "gGmMkK".contains(c)) => {
+            &m[..i]
+        }
+        _ => m,
+    };
     match m.char_indices().last() {
         Some((i, 'g' | 'G')) => format!("{}Gi", &m[..i]),
         Some((i, 'm' | 'M')) => format!("{}Mi", &m[..i]),

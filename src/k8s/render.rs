@@ -853,9 +853,30 @@ pub(crate) fn floor_pod(f: &FloorPod) -> Result<Value, String> {
         }
         let mut cmd = vec![json!("/busybox"), json!("mkdir"), json!("-p")];
         cmd.extend(f.mkdirs.iter().map(|d| json!(d)));
+        // Only the top-level scratch dirs (B-3 review r2): a deeper scratch mount (a native
+        // addon's `build/`) would make its parents as root before this container runs.
+        let tops: Vec<&String> = f
+            .empty
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| {
+                !f.empty
+                    .iter()
+                    .any(|(q, _)| q != *p && p.starts_with(&format!("{q}/")))
+                    && !f
+                        .claims
+                        .iter()
+                        .any(|(_, q, _)| p.starts_with(&format!("{q}/")))
+            })
+            .collect();
         let scratch: Vec<Value> = mounts
             .iter()
             .filter(|m| m["name"].as_str().is_some_and(|n| n.starts_with('e')))
+            .filter(|m| {
+                m["mountPath"]
+                    .as_str()
+                    .is_some_and(|p| tops.iter().any(|t| t.as_str() == p))
+            })
             .cloned()
             .collect();
         init.push(json!({

@@ -899,3 +899,62 @@ fn k8s_a_pod_that_cannot_start_says_why() {
         {"state": {"terminated": {"reason": "Error", "exitCode": 1}}}]}});
     assert!(floor::stuck(&p).is_some());
 }
+
+// ── B-3 review r2 folds ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_every_node_modules_of_a_provisioned_tree_is_the_engines() {
+    assert!(seat::in_node_modules("node_modules/x"));
+    assert!(seat::in_node_modules("packages/a/node_modules/.bin/tsc"));
+    assert!(seat::in_node_modules("tests/fixtures/Node_Modules/p.js"));
+    assert!(!seat::in_node_modules("src/node_modules_helper.rs"));
+    // Emptied whatever it is (a link included), and the seat does not start if one survives.
+    let s = seat::nested_unpack_script(Path::new("/w/t"));
+    assert!(!s.contains("-type d"), "a planted link must go too: {s}");
+    assert!(s.contains("could not be removed") && s.contains("exit 1"));
+}
+
+#[test]
+fn k8s_every_accepted_memory_spelling_renders_as_a_quantity() {
+    use crate::container_floor::k8s_memory;
+    assert_eq!(k8s_memory("6g"), "6Gi");
+    assert_eq!(k8s_memory("6gb"), "6Gi");
+    assert_eq!(k8s_memory("512MB"), "512Mi");
+    assert_eq!(k8s_memory("64kb"), "64Ki");
+}
+
+#[test]
+fn k8s_the_parent_maker_never_mounts_a_deep_scratch_dir() {
+    let mut s = floor_pod_spec("floor");
+    s.empty.push((
+        "/work/head/pkg/node_modules/better-sqlite3/build".into(),
+        "1Gi".into(),
+    ));
+    let p = render::floor_pod(&s).unwrap();
+    let mk = &p["spec"]["initContainers"][1];
+    assert_eq!(mk["name"], "mkdirs");
+    let paths: Vec<&str> = mk["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["mountPath"].as_str())
+        .collect();
+    assert!(paths.contains(&"/work/head"));
+    assert!(
+        !paths.iter().any(|p| p.contains("better-sqlite3")),
+        "{paths:?}"
+    );
+    // The main container gets it, over the read-only claim.
+    let main: Vec<&str> = p["spec"]["containers"][0]["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["mountPath"].as_str())
+        .collect();
+    let claim = main
+        .iter()
+        .position(|p| *p == "/work/head/pkg/node_modules")
+        .unwrap();
+    let build = main.iter().position(|p| p.ends_with("/build")).unwrap();
+    assert!(claim < build, "the build dir lands over the claim");
+}

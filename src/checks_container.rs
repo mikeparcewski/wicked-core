@@ -2538,12 +2538,14 @@ pub(crate) fn seat_node_modules(
             "the repository does not ignore node_modules (the seat's would be written back)".into(),
         ));
     }
+    // Every node_modules of the seat's tree is the engine's (B-3 review r2): one the repository
+    // tracks, at any depth, would be emptied before the seat starts.
     if entries
         .iter()
-        .any(|e| e.path == "node_modules" || e.path.starts_with("node_modules/"))
+        .any(|e| crate::k8s::seat::in_node_modules(&e.path))
     {
         return Ok(SeatNm::Skip(
-            "the repository tracks files under node_modules".into(),
+            "the repository tracks files under a node_modules".into(),
         ));
     }
     let lock =

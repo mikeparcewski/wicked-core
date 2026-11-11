@@ -127,6 +127,13 @@ impl Place {
                 ip.chars()
                     .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
             });
+        // Fail closed (B-3 review r2): no node address, no proof.
+        let Some(host_ip) = host_ip else {
+            return Err(
+                "the floor pod's node address could not be read; the checks do not run here".into(),
+            );
+        };
+        let host_ip = Some(host_ip);
         let script = offline_script(host_ip.as_deref());
         let start = Instant::now();
         let mut last = String::new();
