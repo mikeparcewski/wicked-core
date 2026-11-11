@@ -48,6 +48,7 @@ mod codex_skills;
 mod command;
 mod consent_plan;
 mod container_floor;
+mod k8s;
 mod copilot_account;
 mod decision;
 mod deliver_lift;

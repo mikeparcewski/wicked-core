@@ -332,6 +332,27 @@ pub(crate) enum FloorUnarmed {
     /// Container floor: the seat's command line is larger than a Linux exec takes, and no file
     /// could carry it (core#1228).
     ArgvTooLong,
+    /// Kubernetes runner: no kubectl, no cluster context configured for this daemon, or the
+    /// context names no cluster (core#1383).
+    NoCluster,
+    /// Kubernetes runner: the cluster is configured but its API server did not answer.
+    ClusterUnreachable,
+    /// Kubernetes runner: the agent-sandbox controller is absent, or not the pinned version.
+    ControllerMissing,
+    /// Kubernetes runner: the seat's pod is waiting for room (its namespace quota or the node's
+    /// memory): a wait, never the seat's failure.
+    AdmissionPending,
+    /// Kubernetes runner: the seat's image is not in the cluster's image store (pods never pull).
+    ImageUnavailable,
+    /// Kubernetes runner: the cluster refused the pod or one of its policies (PodSecurity,
+    /// admission, a policy the engine requires that did not apply).
+    PolicyRefused,
+    /// Kubernetes runner: the exec stream to the seat was lost before the CLI's exit code was
+    /// known: never read as the CLI's own result.
+    ExecStreamLost,
+    /// Kubernetes runner: the cluster sets no pids limit on pods (`pids.max` is `max`), so a seat
+    /// could fork without bound (PARITY B2).
+    PidsUnlimited,
 }
 
 impl FloorUnarmed {
@@ -419,6 +440,41 @@ impl FloorUnarmed {
                 "argv_too_long: the seat's command line is larger than a container can pass to \
                  it"
             }
+            FloorUnarmed::NoCluster => {
+                "no_cluster: governed runs need a local Kubernetes cluster and none is configured \
+                 for this daemon — install Rancher Desktop or Docker Desktop with Kubernetes on, run \
+                 `wicked-core cluster install`, or set WICKED_K8S_CONTEXT to the cluster's context"
+            }
+            FloorUnarmed::ClusterUnreachable => {
+                "cluster_unreachable: the daemon's Kubernetes cluster did not answer (`kubectl \
+                 version` failed) — start it (Rancher Desktop, Docker Desktop) and retry"
+            }
+            FloorUnarmed::ControllerMissing => {
+                "controller_missing: the cluster answers but the agent-sandbox controller is not \
+                 installed at the pinned version — run `wicked-core cluster install`"
+            }
+            FloorUnarmed::AdmissionPending => {
+                "admission_pending: the seat's pod is waiting for room in the cluster (the run's \
+                 quota or the node's memory); it starts when other work ends"
+            }
+            FloorUnarmed::ImageUnavailable => {
+                "image_unavailable: the seat's image is not in the cluster's image store (pods never \
+                 pull from a registry) — `wicked-core seat-image build <cli>` builds it into the \
+                 store the cluster shares"
+            }
+            FloorUnarmed::PolicyRefused => {
+                "policy_refused: the cluster refused the seat's pod or a policy it needs (its error \
+                 follows) — fix what it names, then retry"
+            }
+            FloorUnarmed::ExecStreamLost => {
+                "exec_stream_lost: the connection to the seat's pod was lost before its CLI \
+                 finished, so the unit has no result; it is re-run, never read as the CLI's exit"
+            }
+            FloorUnarmed::PidsUnlimited => {
+                "pids_unlimited: the cluster sets no process limit on pods, so a seat could fork \
+                 without bound — set the kubelet's pod-max-pids (Rancher Desktop: a k3s argument), \
+                 then retry"
+            }
         }
     }
 
@@ -443,6 +499,14 @@ impl FloorUnarmed {
             FloorUnarmed::AgentSignedOut => "agent_signed_out",
             FloorUnarmed::NeedsContainerFloor => "needs_container_floor",
             FloorUnarmed::ArgvTooLong => "argv_too_long",
+            FloorUnarmed::NoCluster => "no_cluster",
+            FloorUnarmed::ClusterUnreachable => "cluster_unreachable",
+            FloorUnarmed::ControllerMissing => "controller_missing",
+            FloorUnarmed::AdmissionPending => "admission_pending",
+            FloorUnarmed::ImageUnavailable => "image_unavailable",
+            FloorUnarmed::PolicyRefused => "policy_refused",
+            FloorUnarmed::ExecStreamLost => "exec_stream_lost",
+            FloorUnarmed::PidsUnlimited => "pids_unlimited",
         }
     }
 }
