@@ -310,6 +310,9 @@ pub(crate) struct Seat {
     pub(crate) mounted: Vec<PathBuf>,
     pub(crate) unit_label: String,
     pub(crate) settled: Mutex<bool>,
+    /// The run's node_modules claim is mounted: every `node_modules` path of the tree is the
+    /// engine's, never the seat's, and never comes back (B-3 review r2).
+    pub(crate) deps: bool,
 }
 
 /// Live seats by id.
@@ -953,6 +956,8 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) deadline: Duration,
     /// `seat`, or `judge` for an engine-internal session.
     pub(crate) role: &'a str,
+    /// The run's read-only `node_modules` claim for the tree (B14), when one was filled.
+    pub(crate) deps: Option<&'a str>,
 }
 
 /// The pod's state as the bound-pod gate reads it (pure).
@@ -1260,6 +1265,7 @@ pub(crate) fn arm(
         deadline_secs: secs,
         scope: scope.clone(),
         view: s.view.then(|| s.tree.to_path_buf()),
+        deps: s.deps.map(|c| (c.to_string(), s.tree.to_path_buf())),
     };
     let doc = render::seat_sandbox(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     let mounted: Vec<PathBuf> = pod_mounts.iter().map(|m| m.path.clone()).collect();
@@ -1281,6 +1287,7 @@ pub(crate) fn arm(
         mounted,
         unit_label: unit_label.clone(),
         settled: Mutex::new(false),
+        deps: s.deps.is_some(),
     });
     // Owned from here: every way out before the caller holds the seat reaps it (review r1: an
     // API error while waiting, or an apply whose reply was lost, leaked the Sandbox).
@@ -1326,6 +1333,38 @@ pub(crate) fn arm(
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
         reap(&id);
         return Err(e);
+    }
+    // The nested workspace node_modules the fill archived (B14): unpacked into the seat's tree
+    // before its CLI starts. Ignored by git, so never written back.
+    if s.deps.is_some() {
+        let script = nested_unpack_script(s.tree);
+        let r = kube.call(
+            Some(&ns),
+            &[
+                "exec",
+                "-c",
+                "seat",
+                sandbox.as_str(),
+                "--",
+                "/floor/busybox",
+                "sh",
+                "-c",
+                &script,
+            ],
+            None,
+            Duration::from_secs(120),
+        );
+        // A seat never starts on half its dependencies (review r1).
+        if !r.ok() {
+            reap(&id);
+            return Err((
+                FloorUnarmed::ClusterUnreachable,
+                format!(
+                    "the seat's nested node_modules could not be unpacked: {}",
+                    r.err_text()
+                ),
+            ));
+        }
     }
     guard.0 = None;
     let mut wrapper = kube.head(Some(&ns));
@@ -1846,6 +1885,9 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            entries.retain(|e| !in_node_modules(&e.path));
+        }
         checked.push((want, entries));
     }
     let tree_back = back
@@ -1901,6 +1943,9 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
         let retained = retained_links(&entries, &base);
         let (writes, mut deletes) = delta(&want.host, &base, entries)?;
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            deletes.retain(|d| !in_node_modules(d));
+        }
         // The pod's `ls-files -c -o --exclude-standard` lists every tracked file, ignored or
         // not, so a tracked path it does not list was deleted (codex b2-seat #10). Only an
         // untracked one the host's ignore rules now match is no deletion (the safe side).
@@ -2393,11 +2438,13 @@ fn fetch_commits(
         "-z",
         &format!("{base}..{new}"),
     ])?;
-    if let Some(p) = changed
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .find(|p| p.split('/').any(sync::is_git_name) || masks.iter().any(|m| sync::under(p, m)))
-    {
+    if let Some(p) = changed.split('\0').filter(|p| !p.is_empty()).find(|p| {
+        p.split('/').any(sync::is_git_name)
+                || masks.iter().any(|m| sync::under(p, m))
+                // The run's dependency tree is the engine's (codex b3-floor #6): a commit may
+                // not track it, as no file write of it comes back.
+                || (seat.deps && in_node_modules(p))
+    }) {
         return Err(format!(
             "the unit's commits change `{p}`, a path the seat may not write; they are kept at {refname}"
         ));
@@ -2411,6 +2458,24 @@ fn fetch_commits(
     )
     .map_err(|e| format!("the unit's commits were refused: {e}; they are kept at {refname}"))?;
     Ok(Some((new, refname)))
+}
+
+/// Whether a tree path lies in a `node_modules` (any depth; folded as the host compares).
+pub(crate) fn in_node_modules(rel: &str) -> bool {
+    rel.split('/').any(|c| sync::fold(c) == "node_modules")
+}
+
+/// The in-pod script that unpacks the fill's nested `node_modules` archive into `tree` (pure).
+pub(crate) fn nested_unpack_script(tree: &Path) -> String {
+    let t = format!("'{}'", tree.to_string_lossy().replace('\'', "'\\''"));
+    // Every nested node_modules already in the tree goes first (review r1: an ignored one the
+    // replica kept from an earlier seat could carry a planted `.bin` shim), as `npm ci` empties
+    // them; the root one is the read-only claim and is left alone.
+    format!(
+        "set -e; cd {t}; F=/floor/busybox; $F find . -path ./node_modules -prune -o -name node_modules -prune -exec $F rm -rf {{}} \\; ; [ -z \"$($F find . -path ./node_modules -prune -o -name node_modules -print)\" ] || {{ echo 'wicked-seat: an earlier node_modules could not be removed' >&2; exit 1; }}; \
+         a=./node_modules/{n}; [ -f \"$a\" ] || exit 0; $F tar -x -f \"$a\"",
+        n = crate::checks_container::NESTED_TAR
+    )
 }
 
 /// The `bundle` base that says the host tree has no commit: the pod codec answers nothing when
@@ -2502,6 +2567,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         mounted: vec![tree.to_path_buf()],
         unit_label: "u".into(),
         settled: Mutex::new(false),
+        deps: false,
     })
 }
 

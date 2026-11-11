@@ -364,6 +364,9 @@ pub(crate) struct SeatPod {
     /// [`VIEW_SOURCE`], and an init container copies it into an emptyDir at the tree's own
     /// path: the unit's writes land in that throwaway view and go with the pod.
     pub(crate) view: Option<PathBuf>,
+    /// PARITY B14: the run's `node_modules` cache claim, mounted read-only at
+    /// `<tree>/node_modules` (`(claim, tree)`), filled once per run by a fill pod.
+    pub(crate) deps: Option<(String, PathBuf)>,
 }
 
 /// Where a read-only unit's replica tree is mounted read-only (the view's source).
@@ -383,6 +386,14 @@ pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
 /// pod refused a tree mounted there ("dubious ownership", phase C); this dir is made by the
 /// view init as the pod's uid, so the tree root is the seat's own, as on the replica.
 pub(crate) const VIEW_TREE: &str = "tree";
+
+/// The dirs inside a read-only `node_modules` claim that a floor or seat pod gets writable, its
+/// own and in memory (core#1424): the caches JavaScript tools write there (Vite's config bundle
+/// and dependency cache, the shared `.cache` of babel, eslint and others). The fill makes them
+/// empty in the claim, as mount points.
+pub(crate) const NM_WRITABLE: [&str; 3] = [".vite-temp", ".vite", ".cache"];
+/// The size limit of each [`NM_WRITABLE`] dir (charged to the pod's memory limit).
+pub(crate) const NM_WRITABLE_SIZE: &str = "512Mi";
 
 /// The init container that copies a read-only unit's replica tree into its view (no link
 /// followed; tracked content under any name, `target/` included, review r1).
@@ -523,6 +534,27 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
             {"name": "replica", "persistentVolumeClaim": {"claimName": REPLICA_PVC}},
         ],
     });
+    if let Some((claim, tree)) = &s.deps {
+        let at = tree.join("node_modules");
+        if let Some(m) = spec
+            .pointer_mut("/containers/0/volumeMounts")
+            .and_then(Value::as_array_mut)
+        {
+            m.push(json!({"name": "deps", "mountPath": at.to_string_lossy(), "readOnly": true}));
+            // The tool caches inside it are the pod's own and writable (core#1424: Vite bundles
+            // its config into node_modules/.vite-temp), over the read-only claim.
+            for (i, d) in NM_WRITABLE.iter().enumerate() {
+                m.push(json!({"name": format!("nmw{i}"),
+                    "mountPath": at.join(d).to_string_lossy()}));
+            }
+        }
+        extra_volumes.push(json!({"name": "deps",
+            "persistentVolumeClaim": {"claimName": claim, "readOnly": true}}));
+        for i in 0..NM_WRITABLE.len() {
+            extra_volumes.push(json!({"name": format!("nmw{i}"),
+                "emptyDir": {"medium": "Memory", "sizeLimit": NM_WRITABLE_SIZE}}));
+        }
+    }
     if let Some(v) = spec["volumes"].as_array_mut() {
         v.extend(extra_volumes);
     }
@@ -751,6 +783,165 @@ pub(crate) fn sync_pod(
     })
 }
 
+/// The role of a cache fill pod: the only floor pod with the network ([`fill_egress`]).
+pub(crate) const FILL_ROLE: &str = "fill";
+
+/// Everything one checks-floor pod (a floor side, a cache fill or a tool probe) is created with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FloorPod {
+    pub(crate) name: String,
+    pub(crate) namespace: String,
+    pub(crate) owner: String,
+    pub(crate) run_label: String,
+    /// `floor`, [`FILL_ROLE`] or `probe`.
+    pub(crate) role: String,
+    /// The checks-floor image.
+    pub(crate) image: String,
+    /// The seat floor image (the PID 1 loop's busybox).
+    pub(crate) floor_image: String,
+    pub(crate) memory_limit: String,
+    pub(crate) memory_request: String,
+    pub(crate) env: Vec<(String, String)>,
+    /// Scratch dirs, in memory: (mount path, size limit).
+    pub(crate) empty: Vec<(String, String)>,
+    /// Claims of the namespace: (claim, mount path, read-only).
+    pub(crate) claims: Vec<(String, String, bool)>,
+    /// Directories made inside the scratch dirs before the pod's container starts, as the pod's
+    /// user: the parents of a claim mounted inside a scratch dir (a nested package's
+    /// `node_modules`), which the runtime would otherwise make as root, unwritable to the checks.
+    pub(crate) mkdirs: Vec<String>,
+    pub(crate) deadline_secs: u64,
+}
+
+/// A checks-floor pod (PARITY B13): the checks image idling under the engine's PID 1 loop, no
+/// network but what its role's policy grants (none for `floor` and `probe`), restricted, no
+/// service-account token, the exit-code dir in memory, and each claim at its path.
+pub(crate) fn floor_pod(f: &FloorPod) -> Result<Value, String> {
+    let mut mounts = vec![
+        json!({"name": "floor", "mountPath": FLOOR_DIR, "readOnly": true}),
+        json!({"name": "rc", "mountPath": super::floor::RC_DIR}),
+    ];
+    let mut volumes = vec![
+        json!({"name": "floor", "emptyDir": {"sizeLimit": "64Mi"}}),
+        json!({"name": "rc", "emptyDir": {"medium": "Memory", "sizeLimit": "1Mi"}}),
+    ];
+    let mut paths: Vec<&str> = vec![FLOOR_DIR, super::floor::RC_DIR];
+    for (i, (path, size)) in f.empty.iter().enumerate() {
+        paths.push(path);
+        let name = format!("e{i}");
+        mounts.push(json!({"name": name, "mountPath": path}));
+        // In memory, like the Docker floor's tmpfs (review r1): charged to the pod's memory cap,
+        // so a check cannot fill the node's disk through unlinked or unaccounted files.
+        volumes.push(json!({"name": name, "emptyDir": {"medium": "Memory", "sizeLimit": size}}));
+    }
+    for (i, (claim, path, ro)) in f.claims.iter().enumerate() {
+        paths.push(path);
+        let name = format!("c{i}");
+        mounts.push(json!({"name": name, "mountPath": path, "readOnly": ro}));
+        volumes.push(
+            json!({"name": name, "persistentVolumeClaim": {"claimName": claim, "readOnly": ro}}),
+        );
+    }
+    // Shallower first: a scratch dir mounted inside a claim (a native addon's `build/` inside a
+    // read-only `node_modules`, core#1393) lands over it, never under it.
+    mounts.sort_by_key(|m| {
+        m["mountPath"]
+            .as_str()
+            .map(|p| p.split('/').filter(|c| !c.is_empty()).count())
+            .unwrap_or(0)
+    });
+    let mut seen = std::collections::HashSet::new();
+    for p in &paths {
+        if !p.starts_with('/') || p.split('/').any(|c| c == "..") || !seen.insert(*p) {
+            return Err(format!("`{p}` cannot be a floor pod mount"));
+        }
+    }
+    let env: Vec<Value> = f
+        .env
+        .iter()
+        .map(|(k, v)| json!({"name": k, "value": v}))
+        .collect();
+    let mut init = vec![floor_init(&f.floor_image)];
+    if !f.mkdirs.is_empty() {
+        for d in &f.mkdirs {
+            let inside = f.empty.iter().any(|(p, _)| d.starts_with(&format!("{p}/")));
+            if !inside || d.split('/').any(|c| c == "..") {
+                return Err(format!("`{d}` is not inside a scratch dir of the pod"));
+            }
+        }
+        let mut cmd = vec![json!("/busybox"), json!("mkdir"), json!("-p")];
+        cmd.extend(f.mkdirs.iter().map(|d| json!(d)));
+        // Only the top-level scratch dirs (B-3 review r2): a deeper scratch mount (a native
+        // addon's `build/`) would make its parents as root before this container runs.
+        let tops: Vec<&String> = f
+            .empty
+            .iter()
+            .map(|(p, _)| p)
+            .filter(|p| {
+                !f.empty
+                    .iter()
+                    .any(|(q, _)| q != *p && p.starts_with(&format!("{q}/")))
+                    && !f
+                        .claims
+                        .iter()
+                        .any(|(_, q, _)| p.starts_with(&format!("{q}/")))
+            })
+            .collect();
+        let scratch: Vec<Value> = mounts
+            .iter()
+            .filter(|m| m["name"].as_str().is_some_and(|n| n.starts_with('e')))
+            .filter(|m| {
+                m["mountPath"]
+                    .as_str()
+                    .is_some_and(|p| tops.iter().any(|t| t.as_str() == p))
+            })
+            .cloned()
+            .collect();
+        init.push(json!({
+            "name": "mkdirs",
+            "image": f.floor_image,
+            "imagePullPolicy": "Never",
+            "command": cmd,
+            "securityContext": hardened_context(),
+            "resources": {"requests": {"memory": "16Mi", "cpu": "10m"}, "limits": {"memory": "64Mi"}},
+            "volumeMounts": scratch,
+        }));
+    }
+    Ok(json!({
+        "apiVersion": "v1",
+        "kind": "Pod",
+        "metadata": meta(&f.name, Some(&f.namespace), &f.owner, &[
+            (RUN_LABEL, &f.run_label), (ROLE_LABEL, &f.role), (super::BOOT_LABEL, super::boot_id()),
+        ]),
+        "spec": {
+            "automountServiceAccountToken": false,
+            "enableServiceLinks": false,
+            "hostNetwork": false,
+            "hostPID": false,
+            "hostIPC": false,
+            "restartPolicy": "Never",
+            "terminationGracePeriodSeconds": 1,
+            "activeDeadlineSeconds": f.deadline_secs,
+            "securityContext": pod_context(POD_UID),
+            "initContainers": init,
+            "containers": [{
+                "name": super::floor::CONTAINER,
+                "image": f.image,
+                "imagePullPolicy": "Never",
+                "command": IDLE_COMMAND,
+                "env": env,
+                "securityContext": hardened_context(),
+                "resources": {
+                    "requests": {"memory": f.memory_request, "cpu": "100m"},
+                    "limits": {"memory": f.memory_limit},
+                },
+                "volumeMounts": mounts,
+            }],
+            "volumes": volumes,
+        }
+    }))
+}
+
 /// Every object of a run namespace, in apply order (the namespace first).
 /// The annotation holding a run namespace's exact run id (a label value may be sanitized; the
 /// sweep asks the engine about the exact id, review r1 P1).
@@ -779,6 +970,7 @@ pub(crate) fn run_namespace_docs(
         limit_range(ns, owner),
         default_deny(ns, owner),
         seat_egress(ns, owner, daemon_ns, seat_gateway_ports()),
+        fill_egress(ns, owner),
         pvc(ns, owner, REPLICA_PVC, replica_size),
     ]
 }

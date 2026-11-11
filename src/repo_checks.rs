@@ -10636,7 +10636,10 @@ pub(crate) fn run_one_with(
     // check during which the container ran out of memory or stopped answering did not run to a
     // verdict (floor infrastructure, never a failure of the change), nor did one after which the
     // copied tree no longer holds what was copied in — whatever its exit code.
-    if let Some(why) = container.as_deref().and_then(|f| f.after(tree)) {
+    if let Some(why) = container
+        .as_deref()
+        .and_then(|f| f.after(tree, result.exit_code))
+    {
         result.spawn_error = Some(why);
     }
     // BOUNDED: the group is dead, but a detached descendant may still hold the pipe — take what

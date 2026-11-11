@@ -48,6 +48,7 @@ fn seat() -> SeatPod {
         deadline_secs: 3600,
         scope: None,
         view: None,
+        deps: None,
     }
 }
 
@@ -285,7 +286,13 @@ fn k8s_the_run_network_policy_allows_only_gateway_ports() {
         .iter()
         .filter(|d| d["kind"] == "NetworkPolicy")
         .collect();
-    assert_eq!(policies.len(), 2, "default-deny plus the seat egress only");
+    // B-3: plus the fill pods' internet egress, selected by their role alone (pinned by
+    // `k8s_only_a_fill_pod_has_the_network_and_the_policy_names_it`).
+    assert_eq!(
+        policies.len(),
+        3,
+        "default-deny, the seat egress and the fill egress only"
+    );
     let egress = policies
         .iter()
         .find(|d| d["metadata"]["name"] == "seat-egress-gateway-only")
@@ -688,4 +695,332 @@ fn k8s_shutdown_times_are_rfc3339_utc() {
     assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
     assert_eq!(rfc3339(1_762_819_200), "2025-11-11T00:00:00Z");
     assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+}
+
+// ── B-3: the checks floor on pods (PARITY B13, B14) ───────────────────────────────────────────
+
+fn floor_pod_spec(role: &str) -> render::FloorPod {
+    render::FloorPod {
+        name: "wfloor-run-head-abc-0".into(),
+        namespace: "wicked-run-x".into(),
+        owner: "wabc".into(),
+        run_label: "run".into(),
+        role: role.into(),
+        image: "wicked-checks-floor:1".into(),
+        floor_image: "wicked-floor:1".into(),
+        memory_limit: "6Gi".into(),
+        memory_request: "1Gi".into(),
+        env: vec![("CI".into(), "1".into())],
+        empty: vec![
+            ("/work/head".into(), "16Gi".into()),
+            ("/tmp".into(), "8Gi".into()),
+        ],
+        claims: vec![
+            (
+                "wfloor-nm-k".into(),
+                "/work/head/pkg/node_modules".into(),
+                true,
+            ),
+            (
+                "wfloor-target-k-head".into(),
+                "/wicked/target".into(),
+                false,
+            ),
+        ],
+        mkdirs: vec!["/work/head/pkg".into()],
+        deadline_secs: 60,
+    }
+}
+
+#[test]
+fn k8s_a_floor_pod_is_restricted_offline_and_mounts_caches_read_only() {
+    let p = render::floor_pod(&floor_pod_spec("floor")).unwrap();
+    let spec = &p["spec"];
+    assert_eq!(spec["automountServiceAccountToken"], false);
+    assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
+    let c = &spec["containers"][0];
+    assert_eq!(c["name"], floor::CONTAINER);
+    assert_eq!(c["imagePullPolicy"], "Never");
+    assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
+    assert_eq!(c["command"][0], "/floor/busybox", "the PID 1 loop (B-1)");
+    // The floor role has no egress policy of its own: the namespace's deny-all holds it.
+    assert_eq!(p["metadata"]["labels"][ROLE_LABEL], "floor");
+    let vols = spec["volumes"].as_array().unwrap();
+    let mounts = c["volumeMounts"].as_array().unwrap();
+    let nm = mounts
+        .iter()
+        .find(|m| m["mountPath"] == "/work/head/pkg/node_modules")
+        .unwrap();
+    assert_eq!(nm["readOnly"], true);
+    let nm_vol = vols.iter().find(|v| v["name"] == nm["name"]).unwrap();
+    assert_eq!(nm_vol["persistentVolumeClaim"]["readOnly"], true);
+    let target = mounts
+        .iter()
+        .find(|m| m["mountPath"] == "/wicked/target")
+        .unwrap();
+    assert_eq!(target["readOnly"], false);
+    // The rc dir is in memory; the nested package's parent is made as the pod's user first.
+    let rc = vols.iter().find(|v| v["name"] == "rc").unwrap();
+    assert_eq!(rc["emptyDir"]["medium"], "Memory");
+    let mk = &spec["initContainers"][1];
+    assert_eq!(mk["name"], "mkdirs");
+    assert_eq!(mk["command"][3], "/work/head/pkg");
+}
+
+#[test]
+fn k8s_only_a_fill_pod_has_the_network_and_the_policy_names_it() {
+    let docs = render::run_namespace_docs("ns", "o", "run", "dns", &RunBudget::default(), "1Gi");
+    let fill = docs
+        .iter()
+        .find(|d| d["metadata"]["name"] == "fill-egress-internet")
+        .expect("the run namespace carries the fill policy");
+    assert_eq!(
+        fill["spec"]["podSelector"]["matchLabels"][ROLE_LABEL],
+        render::FILL_ROLE
+    );
+    let p = render::floor_pod(&floor_pod_spec(render::FILL_ROLE)).unwrap();
+    assert_eq!(p["metadata"]["labels"][ROLE_LABEL], render::FILL_ROLE);
+}
+
+#[test]
+fn k8s_a_floor_pod_refuses_overlapping_or_escaping_mounts() {
+    let mut s = floor_pod_spec("floor");
+    s.claims.push(("x".into(), "/tmp".into(), true));
+    assert!(render::floor_pod(&s).is_err(), "two mounts at one path");
+    let mut s = floor_pod_spec("floor");
+    s.mkdirs = vec!["/etc/x".into()];
+    assert!(render::floor_pod(&s).is_err(), "a dir outside the scratch");
+    let mut s = floor_pod_spec("floor");
+    s.claims[0].1 = "/work/../etc".into();
+    assert!(render::floor_pod(&s).is_err());
+}
+
+#[test]
+fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
+    let a = floor::check_argv(
+        "0123abcd",
+        "/work/head/pkg",
+        &[("A".into(), "b c".into())],
+        &["npm".into(), "test".into()],
+    );
+    assert_eq!(a[0], "/bin/sh");
+    assert!(
+        a[2].contains("/wicked-rc/rc-$id"),
+        "each attempt its own file"
+    );
+    assert!(a[2].contains("kill -9 -1") && a[2].ends_with("exit $rc"));
+    assert_eq!(
+        &a[4..],
+        [
+            "0123abcd",
+            "/work/head/pkg",
+            "/usr/bin/env",
+            "--",
+            "A=b c",
+            "/bin/sh",
+            "-c",
+            "\"$@\"",
+            "wicked-argv",
+            "npm",
+            "test"
+        ]
+    );
+    assert_ne!(floor::rc_id(), floor::rc_id());
+}
+
+/// Review r1: `env A=b -- cmd` runs `--`; the assignments go after `--`. Executed, not read.
+#[cfg(unix)]
+#[test]
+fn k8s_the_wrapper_env_line_runs_the_check_with_its_environment() {
+    use wicked_apps_core::HardenedCommand as _;
+    if !std::path::Path::new("/usr/bin/env").exists() {
+        return;
+    }
+    let a = floor::check_argv(
+        "x",
+        "/",
+        &[("WICKED_T".into(), "ok".into())],
+        &[
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf %s \"$WICKED_T\"".into(),
+        ],
+    );
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(o.stdout, b"ok");
+}
+
+#[test]
+fn k8s_a_floor_pod_is_proven_offline_including_its_node() {
+    let s = floor::offline_script(Some("192.168.5.15"));
+    assert!(s.contains("nc_ 1.1.1.1 443 net"));
+    assert!(
+        s.contains("nc_ 192.168.5.15 10250 node"),
+        "the node's kubelet port listens"
+    );
+    let p = render::floor_pod(&floor_pod_spec("floor")).unwrap();
+    let scratch = p["spec"]["volumes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|v| v["name"].as_str().is_some_and(|n| n.starts_with('e')))
+        .all(|v| v["emptyDir"]["medium"] == "Memory");
+    assert!(scratch, "scratch is in memory, charged to the pod's cap");
+}
+
+#[test]
+fn k8s_a_check_exit_code_stands_only_when_the_pod_agrees() {
+    assert_eq!(floor::rc_verdict(Some(0), Some("0\n")), None);
+    assert_eq!(floor::rc_verdict(Some(7), Some("7")), None);
+    // kubectl's own failure (a lost stream) is never the check's result.
+    assert!(floor::rc_verdict(Some(1), None).is_some());
+    assert!(floor::rc_verdict(Some(1), Some("0")).is_some());
+    assert!(floor::rc_verdict(Some(0), Some("garbage")).is_some());
+    // No code seen (a deadline or a signal): judged by the caller.
+    assert_eq!(floor::rc_verdict(None, None), None);
+}
+
+#[test]
+fn k8s_a_pod_that_cannot_start_says_why() {
+    let p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"state": {"waiting": {"reason": "ErrImageNeverPull", "message": "img not present"}}}]}});
+    assert!(floor::stuck(&p).unwrap().contains("ErrImageNeverPull"));
+    let p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"state": {"waiting": {"reason": "ContainerCreating"}}}]}});
+    assert_eq!(floor::stuck(&p), None, "still starting");
+    let p = json!({"status": {"phase": "Failed"}});
+    assert!(floor::stuck(&p).is_some());
+    // A finished init container is a step done (seen live under load).
+    let p = json!({"status": {"phase": "Pending", "initContainerStatuses": [
+        {"state": {"terminated": {"reason": "Completed", "exitCode": 0}}}]}});
+    assert_eq!(floor::stuck(&p), None);
+    let p = json!({"status": {"phase": "Pending", "initContainerStatuses": [
+        {"state": {"terminated": {"reason": "Error", "exitCode": 1}}}]}});
+    assert!(floor::stuck(&p).is_some());
+}
+
+// ── B-3 review r2 folds ───────────────────────────────────────────────────────────────────────
+
+#[test]
+fn k8s_every_node_modules_of_a_provisioned_tree_is_the_engines() {
+    assert!(seat::in_node_modules("node_modules/x"));
+    assert!(seat::in_node_modules("packages/a/node_modules/.bin/tsc"));
+    assert!(seat::in_node_modules("tests/fixtures/Node_Modules/p.js"));
+    assert!(!seat::in_node_modules("src/node_modules_helper.rs"));
+    // Emptied whatever it is (a link included), and the seat does not start if one survives.
+    let s = seat::nested_unpack_script(Path::new("/w/t"));
+    assert!(!s.contains("-type d"), "a planted link must go too: {s}");
+    assert!(s.contains("could not be removed") && s.contains("exit 1"));
+}
+
+#[test]
+fn k8s_every_accepted_memory_spelling_renders_as_a_quantity() {
+    use crate::container_floor::k8s_memory;
+    assert_eq!(k8s_memory("6g"), "6Gi");
+    assert_eq!(k8s_memory("6gb"), "6Gi");
+    assert_eq!(k8s_memory("512MB"), "512Mi");
+    assert_eq!(k8s_memory("64kb"), "64Ki");
+}
+
+#[test]
+fn k8s_the_parent_maker_never_mounts_a_deep_scratch_dir() {
+    let mut s = floor_pod_spec("floor");
+    s.empty.push((
+        "/work/head/pkg/node_modules/better-sqlite3/build".into(),
+        "1Gi".into(),
+    ));
+    let p = render::floor_pod(&s).unwrap();
+    let mk = &p["spec"]["initContainers"][1];
+    assert_eq!(mk["name"], "mkdirs");
+    let paths: Vec<&str> = mk["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["mountPath"].as_str())
+        .collect();
+    assert!(paths.contains(&"/work/head"));
+    assert!(
+        !paths.iter().any(|p| p.contains("better-sqlite3")),
+        "{paths:?}"
+    );
+    // The main container gets it, over the read-only claim.
+    let main: Vec<&str> = p["spec"]["containers"][0]["volumeMounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["mountPath"].as_str())
+        .collect();
+    let claim = main
+        .iter()
+        .position(|p| *p == "/work/head/pkg/node_modules")
+        .unwrap();
+    let build = main.iter().position(|p| p.ends_with("/build")).unwrap();
+    assert!(claim < build, "the build dir lands over the claim");
+}
+
+/// codex b3-floor #5: an executable whose name holds `=` runs (and fails), never passes as one
+/// more assignment `env` would print.
+#[cfg(unix)]
+#[test]
+fn k8s_a_check_named_with_an_equals_sign_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    use wicked_apps_core::HardenedCommand as _;
+    if !std::path::Path::new("/usr/bin/env").exists() {
+        return;
+    }
+    let d = std::env::temp_dir().join(format!("wicked-eq-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&d).unwrap();
+    let exe = d.join("check=fail");
+    std::fs::write(&exe, "#!/bin/sh\nexit 9\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let a = floor::check_argv("x", "/", &[], &[exe.to_string_lossy().into_owned()]);
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(9),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    // An argv starting `--` is a program, never `exec`'s option: it does not pass (codex r2).
+    let a = floor::check_argv("x", "/", &[], &["--".into()]);
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn k8s_a_deleted_namespace_forgets_its_filled_claims() {
+    crate::checks_container::mark_filled_for_test("wicked-run-x/deps-1");
+    crate::checks_container::mark_filled_for_test("wicked-run-y/deps-1");
+    crate::checks_container::forget_namespace("wicked-run-x");
+    assert!(!crate::checks_container::filled_for_test(
+        "wicked-run-x/deps-1"
+    ));
+    assert!(crate::checks_container::filled_for_test(
+        "wicked-run-y/deps-1"
+    ));
+}
+
+#[test]
+fn k8s_a_commit_into_the_runs_node_modules_is_refused_for_a_deps_seat() {
+    assert!(crate::k8s::seat::in_node_modules(
+        "pkg/node_modules/x/index.js"
+    ));
+    assert!(crate::k8s::seat::in_node_modules("Node_Modules/x"));
+    assert!(!crate::k8s::seat::in_node_modules(
+        "src/node_modules_util.rs"
+    ));
 }

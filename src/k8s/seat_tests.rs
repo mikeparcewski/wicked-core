@@ -642,6 +642,7 @@ fn seat_pod(view: Option<PathBuf>, scope: Option<String>) -> SeatPod {
         deadline_secs: 60,
         scope,
         view,
+        deps: None,
     }
 }
 
@@ -2612,4 +2613,32 @@ fn k8s_a_read_only_view_copy_fails_when_either_side_fails() {
     let pod = render::seat_pod_spec(&seat_pod(Some(PathBuf::from("/w/t")), None)).unwrap();
     let init = pod.to_string();
     assert!(init.contains("set -o pipefail;"), "{init}");
+}
+
+/// core#1424: a seat on the run's read-only `node_modules` claim gets the tool caches inside it
+/// writable and its own (Vite's config bundle goes to node_modules/.vite-temp).
+#[test]
+fn k8s_a_deps_seat_writes_its_tool_caches_over_the_read_only_claim() {
+    let mut s = seat_pod(None, None);
+    s.deps = Some(("deps-1".into(), PathBuf::from("/home/u/wt")));
+    let pod = render::seat_pod_spec(&s).unwrap();
+    let mounts = pod
+        .pointer("/containers/0/volumeMounts")
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let at = |p: &str| mounts.iter().find(|m| m["mountPath"] == p).cloned();
+    assert_eq!(at("/home/u/wt/node_modules").unwrap()["readOnly"], true);
+    for d in render::NM_WRITABLE {
+        let m = at(&format!("/home/u/wt/node_modules/{d}")).expect(d);
+        assert_ne!(m["readOnly"], true, "{d}");
+        let vol = pod["volumes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == m["name"])
+            .unwrap();
+        assert_eq!(vol["emptyDir"]["medium"], "Memory");
+    }
+    assert!(render::NM_WRITABLE.contains(&".vite-temp"));
 }

@@ -576,7 +576,7 @@ fn a_pax_record_counts_its_own_length() {
 /// The container floor end to end, against the real runtime and image (opt-in: it needs a
 /// container runtime and builds the checks image on first use, so CI's default suite leaves it to
 /// this env switch; run it with `WICKED_TEST_CONTAINER_FLOOR=1 cargo test --lib
-/// checks_container::tests::live::` — 3 tests; they serialize on one lock). One fixture repository per case: a package with no
+/// checks_container::tests::live::` with `WICKED_K8S_ADMIN_CONTEXT` set — one test). One fixture repository per case: a package with no
 /// dependencies (its `npm ci` makes no node_modules), whose scripts are the checks.
 #[cfg(unix)]
 mod live {
@@ -684,14 +684,116 @@ mod live {
         r
     }
 
+    /// The cluster the floor's pods run on for these tests: installed into a throwaway home with
+    /// the admin context `WICKED_K8S_ADMIN_CONTEXT` (B-1 `cluster install`), the floor then on
+    /// the engine's own account; uninstalled on drop.
+    struct Cluster(crate::k8s::Kube);
+    impl Drop for Cluster {
+        fn drop(&mut self) {
+            match crate::k8s::cluster::uninstall(&self.0, false) {
+                Ok(gone) => eprintln!("uninstalled: {gone:?}"),
+                Err(e) => eprintln!("UNINSTALL FAILED: {e}"),
+            }
+        }
+    }
+
+    fn cluster() -> Cluster {
+        let ctx = std::env::var("WICKED_K8S_ADMIN_CONTEXT")
+            .expect("the live floor needs WICKED_K8S_ADMIN_CONTEXT");
+        let home = std::env::temp_dir().join(format!(
+            "wicked-k8s-floor-live-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let mut admin = crate::k8s::resolve_settings(
+            &home,
+            None,
+            None,
+            Some(&ctx),
+            std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+            crate::validator::find_on_path,
+        )
+        .expect("kubectl and the admin context");
+        admin.owner = crate::k8s::owner_id(&home);
+        let guard = Cluster(admin.clone());
+        crate::k8s::cluster::install(&admin, &home).expect("cluster install");
+        // Each live test its own home: the first noted would otherwise win for the process.
+        crate::k8s::forget_engine_home_for_test();
+        crate::k8s::note_engine_home(&home);
+        guard
+    }
+
     #[test]
-    fn live_a_passing_floor_runs_in_the_container_with_no_network() {
-        if !enabled("live_a_passing_floor_runs_in_the_container_with_no_network") {
+    fn k8s_live_studios_vitest_runs_in_a_floor_pod() {
+        // core#1424: Vite writes node_modules/.vite-temp (its config bundle) and .vite; on a
+        // read-only node_modules claim it could not start. A clean, committed studio checkout at
+        // WICKED_K8S_LIVE_STUDIO; its own `test` script (vitest run) must pass in a floor pod.
+        if !enabled("k8s_live_studios_vitest_runs_in_a_floor_pod") {
+            return;
+        }
+        let Some(dir) = std::env::var_os("WICKED_K8S_LIVE_STUDIO").map(PathBuf::from) else {
+            eprintln!("SKIP: set WICKED_K8S_LIVE_STUDIO to a studio checkout");
+            return;
+        };
+        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+        let _cluster = cluster();
+        // spawn-audit: test-only — reads the checkout's head commit.
+        let head = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
+        // The full suite (a power run's hand-off): the whole `vitest run`, not only the tests
+        // related to a change.
+        test_seam::set_mode(Some(Mode::Container));
+        let run = format!("live-studio-{}", std::process::id());
+        crate::power::set_full_suite(&run, true);
+        let ctx = FloorContext {
+            stage: FloorStage::Creator,
+            base_head: Some(head.clone()),
+            git_dir: Some(dir.join(".git")),
+            run_id: Some(run.clone()),
+            ..Default::default()
+        };
+        let r = run_floor(&dir, &ctx);
+        crate::power::set_full_suite(&run, false);
+        test_seam::set_mode(None);
+        crate::repo_checks::remove_check_scratch(&dir, &run);
+        let names: Vec<&str> = r.checks.iter().map(|c| c.name.as_str()).collect();
+        let test = r
+            .checks
+            .iter()
+            // The package's own `test` script (`npm run test` -> `vitest run`).
+            .find(|c| {
+                c.argv.first().is_some_and(|a| a == "npm") && c.argv.iter().any(|a| a == "test")
+            })
+            .unwrap_or_else(|| panic!("no vitest run among {names:?}: {:?}", r.sandbox_error));
+        // The suite ran (Vite bundled its config and the workers started), and nothing failed on
+        // a read-only node_modules. Studio's own tests that need a `.git` (the floor's copy has
+        // none, by design) are the studio's to answer, not this guard's (live 2026-11-11: 8955
+        // passed, 2 failed for want of git history).
+        let all = format!("{}{}", test.stdout_tail, test.stderr_tail);
+        assert!(all.contains("Test Files"), "{test:#?}");
+        for bad in ["EROFS", "read-only file system", ".vite-temp"] {
+            assert!(!all.contains(bad), "{bad}: {test:#?}");
+        }
+    }
+
+    /// PARITY B13 on pods, one install for every case: a passing floor runs with no network in
+    /// its copy (no `.git`, the marker set); a check that rewrites the tree stands for nothing; an
+    /// OOM kill is floor infrastructure whatever the exit code; a check's own exit code survives
+    /// the exec transport. Run: `WICKED_TEST_CONTAINER_FLOOR=1 WICKED_K8S_ADMIN_CONTEXT=<ctx>
+    /// cargo test --lib checks_container::tests::live:: -- --test-threads 1`.
+    #[test]
+    fn k8s_live_the_checks_floor_runs_on_pods() {
+        if !enabled("k8s_live_the_checks_floor_runs_on_pods") {
             return;
         }
         let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
-        // `test` passes only when the network is unreachable and it runs as the checks' user in
-        // the copy (no .git) with the marker set.
+        let _cluster = cluster();
+
+        // 1. Passing, offline, in the copy, as the checks.
         let (dir, head) = fixture(
             "pass",
             &[("test", "node t.js")],
@@ -714,14 +816,8 @@ mod live {
         assert_eq!(runner.network, "none");
         assert!(runner.containers.len() == 1, "{runner:?}");
         let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn live_a_check_that_rewrites_the_tree_stands_for_nothing() {
-        if !enabled("live_a_check_that_rewrites_the_tree_stands_for_nothing") {
-            return;
-        }
-        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
+        // 2. A check that rewrites the tree.
         let (dir, head) = fixture(
             "mutate",
             &[
@@ -738,7 +834,12 @@ mod live {
             .checks
             .iter()
             .find(|c| c.name == "lint")
-            .expect("lint ran");
+            .unwrap_or_else(|| {
+                panic!(
+                    "lint ran: {:#?} {:?} {:?}",
+                    r.checks, r.sandbox_error, r.runner
+                )
+            });
         assert!(
             lint.spawn_error
                 .as_deref()
@@ -751,16 +852,20 @@ mod live {
             "the test never passes on the rewritten copy"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
 
-    #[test]
-    fn live_an_oom_kill_is_floor_infrastructure_whatever_the_exit_code() {
-        if !enabled("live_an_oom_kill_is_floor_infrastructure_whatever_the_exit_code") {
-            return;
-        }
-        let _one = ONE.lock().unwrap_or_else(|p| p.into_inner());
-        // A child that outgrows the 1g cap is killed; the check itself exits 0 (it tolerates the
-        // death), and the floor still refuses to stand on it.
+        // 3. The exit code is the check's own, through the exec transport (B13).
+        let (dir, head) = fixture("rc", &[("test", "node -e \"process.exit(7)\"")], &[]);
+        let r = floor(&dir, &head);
+        let t = r
+            .checks
+            .iter()
+            .find(|c| c.name == "test")
+            .unwrap_or_else(|| panic!("test ran: {:#?} {:?}", r.checks, r.sandbox_error));
+        assert_eq!(t.exit_code, Some(7), "{t:#?}");
+        assert!(t.spawn_error.is_none(), "{t:#?}");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // 4. An OOM kill under a check that exits 0.
         std::env::set_var(super::super::MEMORY_ENV, "1g");
         let (dir, head) = fixture(
             "oom",
@@ -776,7 +881,12 @@ mod live {
             .checks
             .iter()
             .find(|c| c.name == "test")
-            .expect("test ran");
+            .unwrap_or_else(|| {
+                panic!(
+                    "test ran: {:#?} {:?} {:?}",
+                    r.checks, r.sandbox_error, r.runner
+                )
+            });
         assert_eq!(t.exit_code, Some(0));
         assert!(
             t.spawn_error

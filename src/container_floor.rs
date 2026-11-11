@@ -3618,6 +3618,8 @@ pub(crate) fn arm_noting(
         .iter()
         .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
         .collect();
+    // The run's node_modules cache for this tree, when the unit's provisioning filled one (B14).
+    let deps = crate::checks_container::seat_claim(run_id, &tree);
     let arm_spec = crate::k8s::seat::ArmSpec {
         run_id,
         ord,
@@ -3640,6 +3642,7 @@ pub(crate) fn arm_noting(
         // lowers it): the pod outlives no turn the engine would still wait for (review r4).
         deadline: crate::workflow::unit_timeout_ceiling(),
         role,
+        deps: deps.as_deref(),
     };
     let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;
     // The gate hook judges this unit as a pod seat's (B17).
@@ -3670,6 +3673,13 @@ pub(crate) fn arm_noting(
 /// A container memory limit (`3g`, `512m`) as a Kubernetes quantity (`3Gi`, `512Mi`).
 pub(crate) fn k8s_memory(m: &str) -> String {
     let m = m.trim();
+    // `6gb` / `512mb` / `64kb` (accepted by the floor's memory setting, B-3 review r2).
+    let m = match m.char_indices().last() {
+        Some((i, 'b' | 'B')) if m[..i].chars().last().is_some_and(|c| "gGmMkK".contains(c)) => {
+            &m[..i]
+        }
+        _ => m,
+    };
     match m.char_indices().last() {
         Some((i, 'g' | 'G')) => format!("{}Gi", &m[..i]),
         Some((i, 'm' | 'M')) => format!("{}Mi", &m[..i]),

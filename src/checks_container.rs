@@ -2,6 +2,14 @@
 //! ([`crate::repo_checks`]) run in a fresh Linux container per floor side instead of inside the
 //! host's OS sandbox (`sandbox-exec` on macOS).
 //!
+//! **On pods (k8s-swap B-3, core#1383).** Each side's "container" is now a pod of the run's
+//! namespace ([`crate::k8s::floor`]): every `docker exec` below is a `kubectl exec`, the caches
+//! are the run's claims filled by fill pods (once per run: the engine's account has no
+//! PersistentVolume verbs, so a claim cannot be shared across run namespaces), and a check's exit
+//! code stands only when the pod's rc file agrees ([`crate::k8s::floor::rc_verdict`]). The image
+//! is still built by the container CLI (D2: builder only). The Docker volume, eviction and sweep
+//! helpers below are unused until B-6 deletes them.
+//!
 //! ## Why
 //!
 //! On a macOS host every process a check spawns pays for endpoint-security scanning and the
@@ -87,6 +95,10 @@
 //! floor does not loosen it) or the network leaves itself out under it with a disclosed line; the
 //! report says so ([`PLATFORM_SCOPE`]). The repository's CI covers them.
 
+// k8s-swap B-3 (D7 train): the Docker volume, eviction and sweep helpers this module still
+// carries are unused once the floor runs on pods; B-6 deletes them. Until then allowed dead.
+#![allow(dead_code)]
+
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -129,7 +141,7 @@ const CARGO_HOME_DIR: &str = "/wicked/cargo-home";
 const FILL_DIR: &str = "/wicked/vol";
 const CARGO_HOME_VOLUME: &str = "wfloor-cargo-home";
 const COMPLETE: &str = ".wicked-complete";
-const NESTED_TAR: &str = ".wicked-nested.tar";
+pub(crate) const NESTED_TAR: &str = ".wicked-nested.tar";
 const INSTALL_LOG: &str = ".wicked-install.log";
 /// The install every `node_modules` volume is filled with, whatever argv the repository detected:
 /// a fixed, trusted command (a repository argv like `--ignore-scripts=false` never reaches it).
@@ -1081,6 +1093,8 @@ struct Live {
     dead: Option<String>,
     /// What every copied path holds, for the after-check comparison.
     expect: Vec<(String, Expect)>,
+    /// The exit-code file id of the check last handed out ([`crate::k8s::floor::check_argv`]).
+    rc: Option<String>,
 }
 
 /// Why a container floor could not be prepared: `auto` falls back on these only.
@@ -1109,7 +1123,12 @@ impl Fill {
 /// A container floor for one floor run: the head prepared, containers started on first use.
 #[derive(Debug)]
 pub(crate) struct ChecksFloor {
+    /// The image builder (D2: the container CLI builds images only; it runs no check).
     rt: Runtime,
+    /// Where this floor's pods run (PARITY B13).
+    place: crate::k8s::floor::Place,
+    /// The seat floor image: the pods' PID 1 loop.
+    floor_image: String,
     tag: String,
     image_id: String,
     git_dir: PathBuf,
@@ -1260,7 +1279,18 @@ impl ChecksFloor {
             "sh",
         ];
         cmd.extend(tools.iter().copied());
-        let (_, missing) = probe_run(&rt, &image_id, &[], &cmd).map_err(no)?;
+        // The cluster the floor's pods run on: the daemon's own (its state home holds the
+        // kubeconfig `cluster install` wrote), answering, with a pod pids limit (B2).
+        let floor_image =
+            crate::container_floor::ensure_floor_image(&rt).map_err(|e| no(e.to_string()))?;
+        let home = crate::k8s::engine_home()
+            .ok_or_else(|| no("no state home for the cluster settings".into()))?;
+        let kube = crate::k8s::kube_for(&home).map_err(|(_, e)| no(e))?;
+        crate::k8s::cluster::probe_cached(&kube).map_err(|(_, e)| no(e))?;
+        crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image).map_err(|(_, e)| no(e))?;
+        let place = crate::k8s::floor::Place::for_floor(kube, ctx.run_id.as_deref())
+            .map_err(|e| no(format!("the run's namespace: {e}")))?;
+        let missing = probe_tools(&place, &tag, &floor_image, &image_id, &cmd).map_err(no)?;
         if missing.contains("<no OOM accounting>") {
             return Err(no(
                 "the container runtime exposes no OOM kill count (cgroup memory events)".into(),
@@ -1286,7 +1316,6 @@ impl ChecksFloor {
             .and_then(Path::file_name)
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
-        maintain(&rt, cache, &image_id);
         // The package dirs whose lockfile the floor mounts a node_modules for, and the cargo
         // workspaces it fetches: the root and every detected check's directory.
         let mut dirs: Vec<String> = vec![String::new()];
@@ -1295,9 +1324,15 @@ impl ChecksFloor {
                 dirs.push(c.dir.clone());
             }
         }
-        let runtime = format!("{} ({server})", rt.cli.display());
+        let runtime = format!(
+            "kubernetes {} (images built by {} {server})",
+            place.kube.context,
+            rt.cli.display()
+        );
         let floor = ChecksFloor {
             rt,
+            place,
+            floor_image,
             tag: tag.clone(),
             image_id: image_id.clone(),
             git_dir,
@@ -1596,8 +1631,10 @@ impl ChecksFloor {
             .run_label
             .chars()
             .filter(char::is_ascii_alphanumeric)
+            .map(|c| c.to_ascii_lowercase())
             .take(8)
             .collect();
+        // A pod name: lowercase, digits and `-` only.
         let name = format!(
             "wfloor-{run8}-{}-{}-{n}",
             side(tree),
@@ -1607,25 +1644,53 @@ impl ChecksFloor {
             ])[..6]
         );
         let work = Self::work(tree);
+        let mut pod = self.place.pod(&name, "floor", &self.tag, &self.floor_image);
+        pod.memory_limit = crate::container_floor::k8s_memory(&self.memory);
+        pod.memory_request = "1Gi".into();
+        pod.env = self.env(plan.cargo);
+        pod.empty = vec![
+            (work.clone(), "8Gi".into()),
+            ("/tmp".into(), "8Gi".into()),
+            (HOME.into(), "2Gi".into()),
+        ];
+        // Every node_modules in place, read-only (relative workspace links resolve against its
+        // package); the parents of a nested one are made as the checks' user first.
+        for m in plan.nm.iter().filter(|m| m.failed.is_none()) {
+            pod.claims
+                .push((m.volume.clone(), nm_path(&work, &m.dir), true));
+        }
+        pod.mkdirs = nested_parents(&work, &plan.nm);
+        // (core#1393) A declared native addon's `build/` (made empty by the fill) is this pod's
+        // own scratch: the addon is built there by the `native-build` check and goes with the
+        // pod. The claim stays read-only and unbuilt.
+        for m in plan.nm.iter().filter(|m| m.failed.is_none()) {
+            // (core#1424) The tool caches inside the read-only claim are this pod's own.
+            for d in crate::k8s::render::NM_WRITABLE {
+                pod.empty.push((
+                    format!("{}/{d}", nm_path(&work, &m.dir)),
+                    crate::k8s::render::NM_WRITABLE_SIZE.into(),
+                ));
+            }
+            for n in &m.native {
+                pod.empty.push((
+                    format!("{}/{n}/build", nm_path(&work, &m.dir)),
+                    "1Gi".into(),
+                ));
+            }
+        }
         if plan.cargo {
-            // Made with its labels (a volume a mount creates has none), leased, stamped.
+            // The run's target claim for this leaf and side: warm across the leaf's floors.
             let target = target_volume(&self.leaf, tree);
-            let _lock = lock_volume(&target)?;
-            let warm = volume_exists(&self.rt, &target);
-            rt_run(
-                &self.rt,
-                &[
-                    "volume",
-                    "create",
-                    "--label",
-                    &format!("{LABEL}.kind=target"),
-                    "--label",
-                    &format!("{LABEL}.leaf={}", leaf_key(&self.leaf)),
-                    &target,
-                ],
-                PROBE,
-            )?;
-            lease(&target, &self.leases);
+            let warm = self
+                .place
+                .kube
+                .get_json(Some(&self.place.ns), "pvc", &target)
+                .ok()
+                .flatten()
+                .is_some();
+            self.place
+                .claim(&target, "64Gi")
+                .map_err(|e| format!("the cargo target claim: {e}"))?;
             if let Ok(mut r) = self.record.lock() {
                 r.caches.push(CacheUse {
                     kind: "cargo-target".into(),
@@ -1634,100 +1699,20 @@ impl ChecksFloor {
                     fill_ms: None,
                 });
             }
-            stamp(&self.cache, &target, &self.repo);
+            pod.claims
+                .push((CARGO_HOME_VOLUME.into(), CARGO_HOME_DIR.into(), true));
+            pod.claims.push((target, TARGET_DIR.into(), false));
         }
-        let mut args: Vec<String> = ["run", "-d", "--rm", "--name", &name]
-            .map(String::from)
-            .to_vec();
-        args.extend([
-            "--label".into(),
-            format!("{LABEL}={}", self.run_label),
-            "--label".into(),
-            format!("{LABEL}.pid={}", std::process::id()),
-            "--read-only".into(),
-            "--network".into(),
-            "none".into(),
-            "--cap-drop".into(),
-            "ALL".into(),
-            "--security-opt".into(),
-            "no-new-privileges".into(),
-            "--init".into(),
-            "--pids-limit".into(),
-            "8192".into(),
-            "--user".into(),
-            IDLE_USER.into(),
-            "--memory".into(),
-            self.memory.clone(),
-            "--memory-swap".into(),
-            self.memory.clone(),
-            "--tmpfs".into(),
-            // 0755: the engine's root exec (no capabilities) must traverse it to open the parents
-            // the runtime made for a subdirectory package's mount point.
-            format!("{work}:rw,exec,uid=1000,gid=1000,mode=0755,size=8g"),
-            "--tmpfs".into(),
-            "/tmp:rw,exec,mode=1777,size=8g".into(),
-            "--tmpfs".into(),
-            format!("{HOME}:rw,exec,uid=1000,gid=1000,mode=0700,size=2g"),
-        ]);
-        // Every node_modules in place (relative workspace links resolve against its package).
-        for m in plan.nm.iter().filter(|m| m.failed.is_none()) {
-            args.extend([
-                "--mount".into(),
-                format!(
-                    "type=volume,src={},dst={},readonly",
-                    m.volume,
-                    nm_path(&work, &m.dir)
-                ),
-            ]);
-            // (core#1393) A declared native addon's `build/` (made empty by the fill) is this
-            // container's own: the addon is built there by the floor's `native-build` check and
-            // goes with the container. The shared volume stays read-only and unbuilt.
-            for n in &m.native {
-                args.extend([
-                    "--tmpfs".into(),
-                    format!(
-                        "{}/{n}/build:rw,exec,uid=1000,gid=1000,mode=0755,size=1g",
-                        nm_path(&work, &m.dir)
-                    ),
-                ]);
-            }
-        }
-        if plan.cargo {
-            args.extend([
-                "--mount".into(),
-                format!("type=volume,src={CARGO_HOME_VOLUME},dst={CARGO_HOME_DIR},readonly"),
-                "--mount".into(),
-                format!(
-                    "type=volume,src={},dst={TARGET_DIR}",
-                    target_volume(&self.leaf, tree)
-                ),
-            ]);
-        }
-        for (k, v) in self.env(plan.cargo) {
-            args.extend(["-e".into(), format!("{k}={v}")]);
-        }
-        args.extend([self.image_id.clone(), "sleep".into(), "infinity".into()]);
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        if let Err(e) = rt_run(&self.rt, &refs, START) {
-            // A start whose answer was lost may still have made the container: it is removed by
-            // its name either way.
+        self.place
+            .start(&pod)
+            .map_err(|e| format!("the floor pod did not start: {e}"))?;
+        // No repository code runs in a pod not proven offline, its node included (review r1).
+        if let Err(e) = self.place.prove_offline(&name) {
             self.remove(&name);
-            return Err(format!("the floor container did not start: {e}"));
+            return Err(e);
         }
-        // From here on the container is ours to remove, whatever fails.
-        let copied = (|| {
-            // The runtime made a subdirectory package's mount point's parents as root: open them
-            // to the checks' user (an owner may chmod without any capability), or the copy cannot
-            // write into them.
-            let parents = nested_parents(&work, &plan.nm);
-            if !parents.is_empty() {
-                let mut a: Vec<&str> = vec!["exec", "-u", "0", &name, "chmod", "0777"];
-                a.extend(parents.iter().map(String::as_str));
-                rt_run(&self.rt, &a, REAP)?;
-            }
-            self.copy_in(tree, &name, &plan)
-        })();
-        let expect = match copied {
+        // From here on the pod is ours to remove, whatever fails.
+        let expect = match self.copy_in(tree, &name, &plan) {
             Ok(x) => x,
             Err(e) => {
                 self.remove(&name);
@@ -1744,6 +1729,7 @@ impl ChecksFloor {
             export,
             dead: None,
             expect,
+            rc: None,
         })
     }
 
@@ -1804,22 +1790,17 @@ impl ChecksFloor {
                 sh_quote(&d)
             ));
         }
-        let mut c = self.rt.cmd();
-        c.args(["exec", "-i", "-u", CHECKS_USER, name, "sh", "-c", &script]);
+        let mut c = self.place.exec(name, true);
+        c.args(["sh", "-c", &script]);
         let mut held = Vec::new();
-        let fed = run_fed(c, self.rt.bound(COPY), |w| {
+        let fed = run_fed(c, COPY, |w| {
             held = write_tree_tar(&self.git_dir, &entries, &times, w)?;
             Ok(())
         })
         .map_err(|e| format!("the tree copy-in: {e}"))?;
         match fed.status {
             Some(s) if s.success() && fed.fed.is_ok() => {}
-            None => {
-                return Err(format!(
-                    "the tree copy-in ran past {:?}",
-                    self.rt.bound(COPY)
-                ))
-            }
+            None => return Err(format!("the tree copy-in ran past {COPY:?}")),
             Some(s) => {
                 return Err(format!(
                     "the tree copy-in failed ({s}{}): {}",
@@ -1883,21 +1864,10 @@ for d in dirs:
 print(json.dumps({'dirs':dirs,'files':files}))
 "#;
         let work = Self::work(tree);
-        let mut c = self.rt.cmd();
-        c.args([
-            "exec",
-            "-i",
-            "-u",
-            CHECKS_USER,
-            name,
-            "python3",
-            "-I",
-            "-c",
-            SCRIPT,
-            &work,
-        ]);
+        let mut c = self.place.exec(name, true);
+        c.args(["python3", "-I", "-c", SCRIPT, &work]);
         c.args(nm.iter().map(|m| m.dir.as_str()));
-        let fed = run_fed(c, self.rt.bound(VERIFY), |_| Ok(()))?;
+        let fed = run_fed(c, VERIFY, |_| Ok(()))?;
         if !fed.status.is_some_and(|s| s.success()) {
             return Err(format!(
                 "the unpacked node_modules could not be read: {}",
@@ -1928,7 +1898,7 @@ print(json.dumps({'dirs':dirs,'files':files}))
     }
 
     fn remove(&self, name: &str) {
-        let _ = rt_run(&self.rt, &["rm", "--force", name], REAP);
+        self.place.delete(name);
     }
 
     /// The `docker exec` for one check: `root` must be the floor's head worktree (a head check) or
@@ -1973,7 +1943,10 @@ print(json.dumps({'dirs':dirs,'files':files}))
         if slot.is_none() {
             *slot = Some(self.start(tree, export)?);
         }
-        let l = slot.as_ref().expect("started above");
+        let l = slot.as_mut().expect("started above");
+        let rc_id = crate::k8s::floor::rc_id();
+        l.rc = Some(rc_id.clone());
+        let l = &*l;
         if let Some(why) = &l.dead {
             return Err(why.clone());
         }
@@ -2014,9 +1987,8 @@ print(json.dumps({'dirs':dirs,'files':files}))
                      install container:\n{log}"
                 ),
             ];
-            let mut c = self.rt.cmd();
-            c.args(["exec", "-u", CHECKS_USER, "-w", &cwd]);
-            c.arg(&l.name).args(reaping(&argv));
+            let mut c = self.place.exec(&l.name, false);
+            c.args(crate::k8s::floor::check_argv(&rc_id, &cwd, &[], &argv));
             return Ok(c);
         }
         let argv: Vec<String> = match fill {
@@ -2045,12 +2017,12 @@ print(json.dumps({'dirs':dirs,'files':files}))
             ],
             None => argv.to_vec(),
         };
-        let mut c = self.rt.cmd();
-        c.args(["exec", "-u", CHECKS_USER, "-w", &cwd]);
-        for (k, v) in extra_env {
-            c.args(["-e", &format!("{k}={v}")]);
-        }
-        c.arg(&l.name).args(reaping(&argv));
+        // The fixed wrapper enters `cwd`, sets the guide's environment, ends what the check left
+        // running and writes its exit code for [`ChecksFloor::after`] (B13).
+        let mut c = self.place.exec(&l.name, false);
+        c.args(crate::k8s::floor::check_argv(
+            &rc_id, &cwd, extra_env, &argv,
+        ));
         Ok(c)
     }
 
@@ -2058,7 +2030,9 @@ print(json.dumps({'dirs':dirs,'files':files}))
     /// can stand as evidence. `Some(reason)` when the container ran out of memory during it,
     /// stopped answering, or the copied tree no longer holds what was copied in — whatever the
     /// check's exit code.
-    pub(crate) fn after(&self, tree: Tree) -> Option<String> {
+    /// `seen` = the exit code kubectl reported for the check (`None`: it ran past its deadline
+    /// or was ended by a signal); it stands only when the check's own exit-code file agrees.
+    pub(crate) fn after(&self, tree: Tree, seen: Option<i32>) -> Option<String> {
         let Ok(mut live) = self.live.lock() else {
             return Some("floor infrastructure: the container floor's state is poisoned".into());
         };
@@ -2066,27 +2040,37 @@ print(json.dumps({'dirs':dirs,'files':files}))
         if let Some(why) = &l.dead {
             return Some(why.clone());
         }
-        let _ = rt_run(
-            &self.rt,
-            &[
-                "exec",
-                "-u",
-                CHECKS_USER,
-                &l.name,
-                "sh",
-                "-c",
-                "kill -9 -1 2>/dev/null; exit 0",
-            ],
+        // A client killed at the deadline leaves the check running in the pod: ended here.
+        let _ = self.place.run(
+            &l.name,
+            &["sh", "-c", "kill -9 -1 2>/dev/null; exit 0"],
             REAP,
         );
+        // This check's own file only (review r1): a file an earlier check left can never stand
+        // for one whose exec never started.
+        let rc = match l.rc.take() {
+            Some(id) => self
+                .place
+                .run(
+                    &l.name,
+                    &[
+                        "sh",
+                        "-c",
+                        "f=/wicked-rc/rc-$1; cat \"$f\" 2>/dev/null; rm -f \"$f\"; exit 0",
+                        "rc",
+                        &id,
+                    ],
+                    REAP,
+                )
+                .ok(),
+            None => None,
+        };
+        let lost =
+            crate::k8s::floor::rc_verdict(seen, rc.as_deref().filter(|r| !r.trim().is_empty()));
         // The OOM counter (cgroup v2 `memory.events`, else v1 `memory.oom_control`; preparing the
         // floor refused a runtime with neither); an exec that fails is a container that stopped
         // answering.
-        let events = match rt_run(
-            &self.rt,
-            &["exec", "-u", CHECKS_USER, &l.name, "sh", "-c", OOM_READ],
-            REAP,
-        ) {
+        let events = match self.place.run(&l.name, &["sh", "-c", OOM_READ], REAP) {
             Ok(e) => e,
             Err(e) => {
                 let why = format!(
@@ -2123,7 +2107,7 @@ print(json.dumps({'dirs':dirs,'files':files}))
         if let Some(why) = &changed {
             l.dead = Some(why.clone());
         }
-        changed.or(oom)
+        changed.or(oom).or(lost)
     }
 
     /// The paths of the copy that no longer hold what was copied in (at most 20 named, then a
@@ -2176,22 +2160,9 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
 "#;
         let body = serde_json::to_vec(expect).map_err(|e| e.to_string())?;
         let work = Self::work(tree);
-        let mut c = self.rt.cmd();
-        c.args([
-            "exec",
-            "-i",
-            "-u",
-            CHECKS_USER,
-            name,
-            "python3",
-            "-I",
-            "-c",
-            SCRIPT,
-            &work,
-        ]);
-        let fed = run_fed(c, self.rt.bound(VERIFY), |w| {
-            w.write_all(&body).map_err(|e| e.to_string())
-        })?;
+        let mut c = self.place.exec(name, true);
+        c.args(["python3", "-I", "-c", SCRIPT, &work]);
+        let fed = run_fed(c, VERIFY, |w| w.write_all(&body).map_err(|e| e.to_string()))?;
         if !fed.status.is_some_and(|s| s.success()) {
             return Err(format!(
                 "the comparison did not finish: {}",
@@ -2214,44 +2185,17 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
         Ok(paths)
     }
 
-    /// Whether `url` answers over HTTPS from a container on the runtime's default network (what an
-    /// install container has): asked of the network, in the image, by a named throwaway container.
-    fn reachable(&self, url: &str) -> bool {
-        let name = unique_name("netprobe");
-        let pid_label = format!("{LABEL}.pid={}", std::process::id());
-        let probe = format!(
-            "fetch({url:?},{{signal:AbortSignal.timeout(15000)}}).then(r=>process.exit(r.status<500?0:1),()=>process.exit(1))"
-        );
-        let ok = rt_run(
-            &self.rt,
-            &[
-                "run",
-                "--rm",
-                "--name",
-                &name,
-                "--read-only",
-                "--cap-drop",
-                "ALL",
-                "--user",
-                CHECKS_USER,
-                "--label",
-                LABEL,
-                "--label",
-                &pid_label,
-                &self.image_id,
-                "node",
-                "-e",
-                &probe,
-            ],
-            START,
-        )
-        .is_ok();
-        let _ = rt_run(&self.rt, &["rm", "--force", &name], REAP);
-        ok
+    /// The fill side of this floor (B14).
+    fn filler(&self) -> Filler<'_> {
+        Filler {
+            place: &self.place,
+            tag: &self.tag,
+            floor_image: &self.floor_image,
+            memory: &self.memory,
+            git_dir: &self.git_dir,
+        }
     }
 
-    /// Fill `volume` with the `node_modules` of [`NPM_FILL`] in `dir` (once per key), and lease it
-    /// for this floor.
     fn fill_nm(
         &self,
         entries: &[Entry],
@@ -2259,32 +2203,42 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
         volume: &str,
         native: &[&str],
     ) -> Result<Fill, String> {
-        let _lock = lock_volume(volume)?;
-        lease(volume, &self.leases);
-        stamp(&self.cache, volume, &self.repo);
-        let exists = volume_exists(&self.rt, volume);
-        if exists && volume_has(&self.rt, &self.image_id, volume, COMPLETE)? {
+        self.filler().fill_nm(entries, dir, volume, native)
+    }
+
+    fn fill_cargo(&self, entries: &[Entry], dir: &str, marker: &str) -> Result<Fill, String> {
+        self.filler().fill_cargo(entries, dir, marker)
+    }
+}
+
+/// What a cache fill needs (B14): the place, the images, the memory cap and the git dir the
+/// tree is read from. A floor's ([`ChecksFloor::filler`]) or a seat's ([`seat_node_modules`]).
+pub(crate) struct Filler<'a> {
+    pub(crate) place: &'a crate::k8s::floor::Place,
+    pub(crate) tag: &'a str,
+    pub(crate) floor_image: &'a str,
+    pub(crate) memory: &'a str,
+    pub(crate) git_dir: &'a Path,
+}
+
+impl Filler<'_> {
+    /// Fill the run's claim `volume` with the `node_modules` of [`NPM_FILL`] in `dir` (once per
+    /// key and run, in a fill pod: B14).
+    fn fill_nm(
+        &self,
+        entries: &[Entry],
+        dir: &str,
+        volume: &str,
+        native: &[&str],
+    ) -> Result<Fill, String> {
+        let key = format!("{}/{volume}", self.place.ns);
+        let _lock = lock_volume(&format!("{}-{volume}", self.place.ns))?;
+        if filled(&key) {
             return Ok(Fill::Hit);
         }
-        // A volume without its marker is a fill that died: start again from an empty one. One
-        // the runtime will not remove (a container still mounts it) is never filled in place.
-        if exists {
-            rt_run(&self.rt, &["volume", "rm", "--force", volume], REAP)
-                .map_err(|e| format!("an unfinished {volume} could not be removed: {e}"))?;
-        }
-        rt_run(
-            &self.rt,
-            &[
-                "volume",
-                "create",
-                "--label",
-                &format!("{LABEL}.kind=nm"),
-                "--label",
-                &format!("{LABEL}.repo={}", self.repo),
-                volume,
-            ],
-            PROBE,
-        )?;
+        self.place
+            .claim(volume, "16Gi")
+            .map_err(|e| format!("the node_modules claim: {e}"))?;
         let pkg = sh_quote(&if dir.is_empty() {
             "/work/t".to_string()
         } else {
@@ -2309,168 +2263,155 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
                 )
             })
             .collect();
+        // (core#1424) The mount points of the floor's and seats' writable tool caches.
+        let writable: String = crate::k8s::render::NM_WRITABLE
+            .iter()
+            .map(|d| format!("node_modules/{d}"))
+            .collect::<Vec<_>>()
+            .join(" ");
         let mark = format!("{OOM_BEFORE_MARK} touch {FILL_DIR}/{COMPLETE}");
-        // A node_modules the tree tracks is not the install's: removed before it, so the nested
-        // archive holds npm's output only. Nested dirs are archived NUL-delimited, verbatim.
+        // A claim already complete is a hit; one without its marker is a fill that died, emptied
+        // and filled again. A node_modules the tree tracks is not the install's: removed before
+        // it, so the nested archive holds npm's output only.
         let script = format!(
-            "set -e; mkdir -p /work/t; tar -x -f - -C /work/t; cd {pkg}; \
+            "set -e; if [ -f {FILL_DIR}/{COMPLETE} ]; then echo WICKED-HIT; exit 0; fi; \
+             find {FILL_DIR} -mindepth 1 -delete; \
+             mkdir -p /work/t; tar -x -f - -C /work/t; cd {pkg}; \
              find . -mindepth 1 -name node_modules -prune -exec rm -rf {{}} +; \
              echo WICKED-FILL-START; \
              if ! {cmd} > {FILL_DIR}/{INSTALL_LOG} 2>&1; then tail -n 60 {FILL_DIR}/{INSTALL_LOG}; exit 3; fi; \
-             mkdir -p node_modules; {addons}cp -a node_modules/. {FILL_DIR}/; \
+             mkdir -p node_modules {writable}; {addons}\
+             find node_modules -mindepth 1 -maxdepth 1 -exec cp -a -t {FILL_DIR} {{}} + ; \
              find . -path ./node_modules -prune -o -type d -name node_modules -prune -print0 \
                | tar --null -T - -c -f {FILL_DIR}/{NESTED_TAR}; \
              {mark}"
         );
-        match self.run_install(
+        let got = self.run_install(
             entries,
-            &[format!("type=volume,src={volume},dst={FILL_DIR}")],
+            volume,
             &[
                 // Nothing the repository's `.npmrc` names runs here: scripts off, and the programs
                 // npm may start pinned to the image's own (environment values win over `.npmrc`).
                 // A git dependency (whose `prepare` npm runs regardless) was refused above.
-                "npm_config_ignore_scripts=true".to_string(),
-                "npm_config_git=/usr/bin/git".to_string(),
-                "npm_config_script_shell=/bin/sh".to_string(),
-                "npm_config_shell=/bin/sh".to_string(),
+                ("npm_config_ignore_scripts", "true"),
+                ("npm_config_git", "/usr/bin/git"),
+                ("npm_config_script_shell", "/bin/sh"),
+                ("npm_config_shell", "/bin/sh"),
             ],
             &script,
-        )? {
-            None => Ok(Fill::Filled),
-            // Whether the network failed is asked of the network, never read from the install's
-            // log (repository-controlled text).
-            Some(log) if !self.reachable("https://registry.npmjs.org/") => Err(format!(
-                "the npm registry could not be reached from the install container: {}",
-                tail(log.as_bytes(), 6)
-            )),
-            // The repository's own install failed: evidence, not a reason to change floors. The
-            // volume stays unmarked, so the next floor tries again.
-            Some(log) => Ok(Fill::Failed(log)),
+            "https://registry.npmjs.org/",
+            "the npm registry",
+        )?;
+        if matches!(got, Fill::Hit | Fill::Filled) {
+            mark_filled(&key);
         }
+        Ok(got)
     }
 
-    /// Fetch `dir`'s Cargo.lock into the shared cargo home (once per lockfile, `marker`). The copy
-    /// leaves out every `.cargo` directory and `rust-toolchain` file, and every compiler wrapper is
-    /// overridden, so cargo runs no repository-configured program while it has the network and the
-    /// shared cargo home.
+    /// Fetch `dir`'s Cargo.lock into the run's cargo home claim (once per lockfile, `marker`).
+    /// The copy leaves out every `.cargo` directory and `rust-toolchain` file, and every compiler
+    /// wrapper is overridden, so cargo runs no repository-configured program while it has the
+    /// network.
     fn fill_cargo(&self, entries: &[Entry], dir: &str, marker: &str) -> Result<Fill, String> {
-        let _lock = lock_volume(CARGO_HOME_VOLUME)?;
-        let file = format!(".wicked-fetched/{marker}");
-        if volume_exists(&self.rt, CARGO_HOME_VOLUME)
-            && volume_has(&self.rt, &self.image_id, CARGO_HOME_VOLUME, &file)?
-        {
+        let key = format!("{}/{CARGO_HOME_VOLUME}/{marker}", self.place.ns);
+        let _lock = lock_volume(&format!("{}-{CARGO_HOME_VOLUME}", self.place.ns))?;
+        if filled(&key) {
             return Ok(Fill::Hit);
         }
-        if !volume_exists(&self.rt, CARGO_HOME_VOLUME) {
-            rt_run(
-                &self.rt,
-                &[
-                    "volume",
-                    "create",
-                    "--label",
-                    &format!("{LABEL}.kind=cargo-home"),
-                    CARGO_HOME_VOLUME,
-                ],
-                PROBE,
-            )?;
-        }
+        self.place
+            .claim(CARGO_HOME_VOLUME, "32Gi")
+            .map_err(|e| format!("the cargo home claim: {e}"))?;
+        let file = format!(".wicked-fetched/{marker}");
         let pkg = sh_quote(&if dir.is_empty() {
             "/work/t".to_string()
         } else {
             format!("/work/t/{dir}")
         });
         let script = format!(
-            "set -e; mkdir -p /work/t; tar -x -f - -C /work/t; cd {pkg}; echo WICKED-FILL-START; \
+            "set -e; if [ -f {FILL_DIR}/{file} ]; then echo WICKED-HIT; exit 0; fi; \
+             mkdir -p /work/t; tar -x -f - -C /work/t; cd {pkg}; echo WICKED-FILL-START; \
              if ! cargo fetch --locked --config 'build.rustc=\"rustc\"' \
                --config 'build.rustc-wrapper=\"\"' --config 'build.rustc-workspace-wrapper=\"\"' \
                > /tmp/fetch.log 2>&1; then tail -n 60 /tmp/fetch.log; exit 3; fi; \
              {OOM_BEFORE_MARK} mkdir -p {FILL_DIR}/.wicked-fetched; touch {FILL_DIR}/{file}"
         );
         let filtered = cargo_fill_entries(entries);
-        match self.run_install(
+        let got = self.run_install(
             &filtered,
-            &[format!(
-                "type=volume,src={CARGO_HOME_VOLUME},dst={FILL_DIR}"
-            )],
-            &[format!("CARGO_HOME={FILL_DIR}")],
+            CARGO_HOME_VOLUME,
+            &[("CARGO_HOME", FILL_DIR)],
             &script,
-        )? {
-            None => Ok(Fill::Filled),
-            Some(log) if !self.reachable("https://index.crates.io/config.json") => Err(format!(
-                "the cargo registry could not be reached from the install container: {}",
-                tail(log.as_bytes(), 6)
-            )),
-            // The lockfile does not resolve (or another input of the repository's): the checks
-            // then fail offline on it, which is the floor's evidence.
-            Some(log) => Ok(Fill::Failed(log)),
+            "https://index.crates.io/config.json",
+            "the cargo registry",
+        )?;
+        if matches!(got, Fill::Hit | Fill::Filled) {
+            mark_filled(&key);
         }
+        Ok(got)
     }
 
-    /// Run an install container over `entries` with `script`, the tree streamed in: `Ok(None)` on
-    /// success, `Ok(Some(log))` when the install itself failed (the script's exit 3, after its
-    /// `WICKED-FILL-START` line), `Err` for anything else (the runtime, the copy, the deadline).
-    /// The container is named and labelled, and removed on every path but success.
+    /// Run a fill pod (the network, the claim `claim` read-write at [`FILL_DIR`]) over `entries`
+    /// with `script`, the tree streamed in: `Hit` when the claim was already complete, `Filled`
+    /// on success, `Failed(log)` when the install itself failed (the script's exit 3, after its
+    /// `WICKED-FILL-START` line) and `reach` answers from the pod, `Err` for anything else (the
+    /// cluster, the copy, the deadline, an unreachable registry). The pod goes on every path.
     fn run_install(
         &self,
         entries: &[Entry],
-        mounts: &[String],
-        env: &[String],
+        claim: &str,
+        env: &[(&str, &str)],
         script: &str,
-    ) -> Result<Option<String>, String> {
-        let name = unique_name("install");
-        let mut args: Vec<String> = [
-            "run",
-            "--rm",
-            "-i",
-            "--name",
+        reach: &str,
+        what: &str,
+    ) -> Result<Fill, String> {
+        // One fill pod per claim, named for it (review r1): an earlier fill of the claim that
+        // outlived its client is deleted and waited out before this one writes.
+        let name = format!("fill-{claim}");
+        if let Err(e) = self
+            .place
+            .kube
+            .delete_owned(Some(&self.place.ns), "pod", &name, true)
+        {
+            return Err(format!(
+                "an earlier fill of {claim} could not be ended: {e}"
+            ));
+        }
+        let mut pod = self.place.pod(
             &name,
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--init",
-            "--pids-limit",
-            "8192",
-            "--user",
-            CHECKS_USER,
-            "--memory",
-            &self.memory,
-            "--memory-swap",
-            &self.memory,
-            "--tmpfs",
-            "/work:rw,exec,uid=1000,gid=1000,mode=0700,size=8g",
-            "--tmpfs",
-            "/tmp:rw,exec,mode=1777,size=4g",
-            "--tmpfs",
-            "/home/floor:rw,exec,uid=1000,gid=1000,mode=0700,size=2g",
-            "-e",
-            "HOME=/home/floor",
-            "-e",
-            "TMPDIR=/tmp",
-            "-e",
-            "CI=1",
-            "-e",
-            "NO_COLOR=1",
-            "-e",
-            "npm_config_cache=/home/floor/.npm",
-            "-e",
-            "npm_config_update_notifier=false",
+            crate::k8s::render::FILL_ROLE,
+            self.tag,
+            self.floor_image,
+        );
+        pod.memory_limit = crate::container_floor::k8s_memory(self.memory);
+        pod.memory_request = "512Mi".into();
+        pod.empty = vec![
+            ("/work".into(), "8Gi".into()),
+            ("/tmp".into(), "4Gi".into()),
+            ("/home/floor".into(), "2Gi".into()),
+        ];
+        pod.claims = vec![(claim.to_string(), FILL_DIR.into(), false)];
+        pod.env = [
+            ("HOME", "/home/floor"),
+            ("TMPDIR", "/tmp"),
+            ("CI", "1"),
+            ("NO_COLOR", "1"),
+            ("npm_config_cache", "/home/floor/.npm"),
+            ("npm_config_update_notifier", "false"),
         ]
-        .map(String::from)
-        .to_vec();
-        args.extend([
-            "--label".into(),
-            format!("{LABEL}=install"),
-            "--label".into(),
-            format!("{LABEL}.pid={}", std::process::id()),
-        ]);
-        for m in mounts {
-            args.extend(["--mount".into(), m.clone()]);
+        .iter()
+        .chain(env.iter())
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+        self.place
+            .start(&pod)
+            .map_err(|e| format!("the install pod: {e}"))?;
+        struct Gone<'a>(&'a crate::k8s::floor::Place, &'a str);
+        impl Drop for Gone<'_> {
+            fn drop(&mut self) {
+                self.0.delete(self.1);
+            }
         }
-        for e in env {
-            args.extend(["-e".into(), e.clone()]);
-        }
+        let _gone = Gone(self.place, &name);
         // The installer's own OOM count, read before it exits: an install that ran out of memory
         // is infrastructure whether npm then exited 0 or not.
         let wrapped = format!(
@@ -2478,19 +2419,13 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
              || cat /sys/fs/cgroup/memory/memory.oom_control) 2>/dev/null | sed -n 's/^oom_kill //p')\"; \
              exit $rc"
         );
-        args.extend([self.image_id.clone(), "sh".into(), "-c".into(), wrapped]);
         let times = vec![0u64; entries.len()];
-        let mut c = self.rt.cmd();
-        c.args(&args);
-        let fed = match run_fed(c, self.rt.bound(FILL), |w| {
-            write_tree_tar(&self.git_dir, entries, &times, w).map(drop)
-        }) {
-            Ok(f) => f,
-            Err(e) => {
-                self.remove(&name);
-                return Err(format!("the install container: {e}"));
-            }
-        };
+        let mut c = self.place.exec(&name, true);
+        c.args(["sh", "-c", &wrapped]);
+        let fed = run_fed(c, FILL, |w| {
+            write_tree_tar(self.git_dir, entries, &times, w).map(drop)
+        })
+        .map_err(|e| format!("the install pod: {e}"))?;
         let out = String::from_utf8_lossy(&fed.out).into_owned();
         let oom = out
             .lines()
@@ -2499,41 +2434,307 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
             .and_then(|n| n.trim().parse::<u64>().ok())
             .unwrap_or(0);
         if oom > 0 {
-            self.remove(&name);
             return Err(format!(
-                "the install container ran out of memory (cap {}, {MEMORY_ENV})",
+                "the install pod ran out of memory (cap {}, {MEMORY_ENV})",
                 self.memory
             ));
         }
         match fed.status {
-            Some(s) if s.success() => fed.fed.map(|()| None),
+            // A complete claim answers before it reads the tree (the feed then sees a closed pipe).
+            Some(s) if s.success() && out.lines().any(|l| l.trim() == "WICKED-HIT") => {
+                Ok(Fill::Hit)
+            }
+            Some(s) if s.success() => fed.fed.map(|()| Fill::Filled),
             Some(s) if s.code() == Some(3) && out.contains("WICKED-FILL-START") => {
-                self.remove(&name);
                 let log = out
                     .split_once("WICKED-FILL-START")
                     .map(|(_, l)| l.trim().to_string())
                     .unwrap_or_default();
-                Ok(Some(log))
+                // Whether the network failed is asked of the network, never read from the
+                // install's log (repository-controlled text).
+                if self.reachable(&name, reach) {
+                    Ok(Fill::Failed(log))
+                } else {
+                    Err(format!(
+                        "{what} could not be reached from the install pod: {}",
+                        tail(log.as_bytes(), 6)
+                    ))
+                }
             }
-            None => {
-                self.remove(&name);
-                Err(format!(
-                    "the install container ran past {:?}",
-                    self.rt.bound(FILL)
-                ))
-            }
-            Some(s) => {
-                self.remove(&name);
-                Err(format!(
-                    "the install container failed ({s}): {}",
-                    tail(
-                        format!("{out}\n{}", String::from_utf8_lossy(&fed.err)).as_bytes(),
-                        8
-                    )
-                ))
-            }
+            None => Err(format!("the install pod ran past {FILL:?}")),
+            Some(s) => Err(format!(
+                "the install pod failed ({s}): {}",
+                tail(
+                    format!("{out}\n{}", String::from_utf8_lossy(&fed.err)).as_bytes(),
+                    8
+                )
+            )),
         }
     }
+
+    /// Whether `url` answers over HTTPS from the fill pod `pod` (its network is the install's).
+    fn reachable(&self, pod: &str, url: &str) -> bool {
+        let probe = format!(
+            "fetch({url:?},{{signal:AbortSignal.timeout(15000)}}).then(r=>process.exit(r.status<500?0:1),()=>process.exit(1))"
+        );
+        self.place.run(pod, &["node", "-e", &probe], START).is_ok()
+    }
+}
+
+/// The seats' `node_modules` (core#1155 on pods, PARITY B14): `(run id, tree, claim)` of every
+/// tree whose run claim [`provision_seat_node_modules`] filled, read by the seat arm
+/// ([`seat_claim`]) to mount it read-only at `<tree>/node_modules`.
+static SEAT_NM: Mutex<Vec<(String, PathBuf, String)>> = Mutex::new(Vec::new());
+
+/// The run's `node_modules` claim for `tree`, if this unit's provisioning filled one.
+pub(crate) fn seat_claim(run_id: &str, tree: &Path) -> Option<String> {
+    let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+    SEAT_NM.lock().ok().and_then(|m| {
+        m.iter()
+            .find(|(r, t, _)| r == run_id && *t == tree)
+            .map(|(_, _, c)| c.clone())
+    })
+}
+
+fn remember_seat_claim(run_id: &str, tree: &Path, claim: Option<String>) {
+    let tree = tree.canonicalize().unwrap_or_else(|_| tree.to_path_buf());
+    if let Ok(mut m) = SEAT_NM.lock() {
+        m.retain(|(r, t, _)| !(r == run_id && *t == tree));
+        if let Some(c) = claim {
+            m.push((run_id.to_string(), tree, c));
+        }
+    }
+}
+
+/// What a seat tree's `node_modules` fill decided.
+#[derive(Debug)]
+pub(crate) enum SeatNm {
+    /// The run's claim holds this tree's install (`hit`: already filled).
+    Claim { claim: String, hit: bool },
+    /// Not filled, on purpose (the reason).
+    Skip(String),
+    /// The repository's own install failed (its log).
+    Failed(String),
+}
+
+/// Fill the run's read-only `node_modules` claim for a seat's `tree` (B14), keyed exactly as
+/// the floor's (the checks image, the lockfile and every manifest of the tree's content
+/// snapshot), in a fill pod that runs no repository code. Instead of an `npm ci` into the host
+/// worktree: the pod seat's copy of the tree leaves git-ignored files out.
+pub(crate) fn seat_node_modules(
+    run_id: &str,
+    tree: &Path,
+    git_dir: &Path,
+) -> Result<SeatNm, String> {
+    let snap = crate::worktree_guard::snapshot_through(tree, git_dir)
+        .map_err(|e| format!("the tree could not be snapshotted: {e}"))?;
+    let entries = ls_tree(git_dir, &snap.tree)?;
+    // npm's own choice of lockfile, as the floor makes it (review r1): a shrinkwrap wins.
+    let Some(lock) = ["npm-shrinkwrap.json", "package-lock.json"]
+        .into_iter()
+        .find_map(|f| entries.iter().find(|e| e.path == f))
+    else {
+        return Ok(SeatNm::Skip("no package-lock.json to install from".into()));
+    };
+    if lock.is_link() {
+        return Ok(SeatNm::Skip(format!("{} is a link", lock.path)));
+    }
+    let lock_name = lock.path.clone();
+    // The engine's node_modules never ride the write-back (review r1): only where the
+    // repository ignores them, at the root and nested.
+    let probe = [
+        "node_modules/.wicked".to_string(),
+        "a/node_modules/.wicked".to_string(),
+    ];
+    if crate::k8s::seat::host_ignored(tree, &probe)?.len() != probe.len() {
+        return Ok(SeatNm::Skip(
+            "the repository does not ignore node_modules (the seat's would be written back)".into(),
+        ));
+    }
+    // Every node_modules of the seat's tree is the engine's (B-3 review r2): one the repository
+    // tracks, at any depth, would be emptied before the seat starts.
+    if entries
+        .iter()
+        .any(|e| crate::k8s::seat::in_node_modules(&e.path))
+    {
+        return Ok(SeatNm::Skip(
+            "the repository tracks files under a node_modules".into(),
+        ));
+    }
+    let lock =
+        read_blob(git_dir, &snap.tree, &lock_name).ok_or("the lockfile could not be read")?;
+    if let Some(dep) = git_dependency(&lock) {
+        return Ok(SeatNm::Skip(format!(
+            "the lockfile installs a git dependency ({dep}), whose `prepare` npm runs even with \
+             scripts off"
+        )));
+    }
+    let tag = image_tag();
+    let rt = crate::container_floor::runtime().map_err(|e| e.describe().to_string())?;
+    if !crate::container_floor::image_present(&rt, &tag) {
+        crate::container_floor::build_image(&rt, DOCKERFILE, &tag, &[])?;
+    }
+    let floor_image = crate::container_floor::ensure_floor_image(&rt)?;
+    let home = crate::k8s::engine_home().ok_or("no state home for the cluster settings")?;
+    let kube = crate::k8s::kube_for(&home).map_err(|(_, e)| e)?;
+    let (ns, _, run) = crate::k8s::seat::place(&kube, run_id);
+    crate::k8s::cluster::ensure_run(
+        &kube,
+        &run,
+        &crate::k8s::render::RunBudget::default(),
+        "20Gi",
+    )?;
+    let place = crate::k8s::floor::Place {
+        kube,
+        ns,
+        run,
+        owned: false,
+    };
+    let (memory, _, _) = memory_and_jobs(
+        std::env::var(MEMORY_ENV).ok().as_deref(),
+        crate::container_floor::seat_cpus(),
+    )?;
+    // A declared native addon is built per floor (core#1393); a seat's copy has it unbuilt
+    // (core#1406), so its claim is the plain install's.
+    let volume = nm_volume(
+        &tag,
+        "",
+        &lock,
+        &npm_inputs(&entries, &lock, &snap.tree),
+        &[],
+    );
+    let filler = Filler {
+        place: &place,
+        tag: &tag,
+        floor_image: &floor_image,
+        memory: &memory,
+        git_dir,
+    };
+    Ok(match filler.fill_nm(&entries, "", &volume, &[])? {
+        Fill::Hit => SeatNm::Claim {
+            claim: volume,
+            hit: true,
+        },
+        Fill::Filled => SeatNm::Claim {
+            claim: volume,
+            hit: false,
+        },
+        Fill::Failed(log) => SeatNm::Failed(log),
+    })
+}
+
+/// [`seat_node_modules`] as the seats' dependency provisioning ([`crate::seat_deps`]'s result
+/// shape), remembered for the seat arm.
+pub(crate) fn provision_seat_node_modules(
+    run_id: &str,
+    tree: &Path,
+    git_dir: Option<&Path>,
+) -> crate::seat_deps::Provisioned {
+    use crate::seat_deps::Provisioned;
+    remember_seat_claim(run_id, tree, None);
+    if !std::fs::symlink_metadata(tree.join("package.json")).is_ok_and(|m| m.is_file()) {
+        return Provisioned::NotNode;
+    }
+    if tree.join("pnpm-lock.yaml").exists() || tree.join("yarn.lock").exists() {
+        return Provisioned::Skipped(
+            "the repository uses pnpm or yarn; the engine installs npm lockfiles only".into(),
+        );
+    }
+    let Some(git_dir) = git_dir else {
+        return Provisioned::Skipped(
+            "the unit carries no pinned git dir to read the tree from".into(),
+        );
+    };
+    let started = Instant::now();
+    match seat_node_modules(run_id, tree, git_dir) {
+        Ok(SeatNm::Claim { claim, hit }) => {
+            let platform = format!("linux pods, the run's read-only cache {claim}");
+            remember_seat_claim(run_id, tree, Some(claim));
+            if hit {
+                Provisioned::AlreadyFor(platform)
+            } else {
+                Provisioned::Installed {
+                    platform,
+                    argv: NPM_FILL.iter().map(|s| s.to_string()).collect(),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                    restored: Vec::new(),
+                }
+            }
+        }
+        Ok(SeatNm::Skip(why)) => Provisioned::Skipped(why),
+        Ok(SeatNm::Failed(log)) => Provisioned::Failed(log),
+        Err(e) => Provisioned::Skipped(format!(
+            "the run's node_modules cache could not be filled: {e}"
+        )),
+    }
+}
+
+/// The run claims this process has seen complete (`<ns>/<claim>[/<marker>]`): a later floor of
+/// the run mounts them without a fill pod. A claim deleted with its namespace goes with the run.
+static FILLED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+fn filled(key: &str) -> bool {
+    FILLED.lock().is_ok_and(|f| f.iter().any(|k| k == key))
+}
+
+/// Forget every completed claim of namespace `ns` (codex b3-floor #10): it was deleted, and a
+/// namespace of the same name later is new storage.
+pub(crate) fn forget_namespace(ns: &str) {
+    if let Ok(mut f) = FILLED.lock() {
+        let pre = format!("{ns}/");
+        f.retain(|k| !k.starts_with(&pre));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mark_filled_for_test(key: &str) {
+    mark_filled(key)
+}
+
+#[cfg(test)]
+pub(crate) fn filled_for_test(key: &str) -> bool {
+    filled(key)
+}
+
+fn mark_filled(key: &str) {
+    if let Ok(mut f) = FILLED.lock() {
+        if !f.iter().any(|k| k == key) {
+            f.push(key.to_string());
+        }
+    }
+}
+
+/// The tools of `cmd`'s probe the checks image lacks (and `<no OOM accounting>` when its pods
+/// count no OOM kill), asked once per image in a probe pod with no network.
+fn probe_tools(
+    place: &crate::k8s::floor::Place,
+    tag: &str,
+    floor_image: &str,
+    image_id: &str,
+    cmd: &[&str],
+) -> Result<String, String> {
+    static SEEN: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    let key = format!("{image_id}\u{1f}{}", cmd.join("\u{1f}"));
+    if let Some(m) = SEEN
+        .lock()
+        .ok()
+        .and_then(|s| s.iter().find(|(k, _)| *k == key).map(|(_, m)| m.clone()))
+    {
+        return Ok(m);
+    }
+    let name = unique_name("probe");
+    let mut pod = place.pod(&name, "probe", tag, floor_image);
+    pod.empty = vec![("/tmp".into(), "64Mi".into())];
+    place
+        .start(&pod)
+        .map_err(|e| format!("the checks image probe: {e}"))?;
+    let out = place.run(&name, cmd, PROBE * 2);
+    place.delete(&name);
+    let missing = out.map_err(|e| format!("the checks image probe: {e}"))?;
+    if let Ok(mut s) = SEEN.lock() {
+        s.push((key, missing.clone()));
+    }
+    Ok(missing)
 }
 
 impl Drop for ChecksFloor {
@@ -2548,9 +2749,17 @@ impl Drop for ChecksFloor {
                 let _ = std::fs::remove_file(p);
             }
         }
-        // The leaf was retired while this floor held its target volumes: they go now.
+        // The leaf was retired while this floor held its target claims: they go now (the rest
+        // go with the run's namespace).
         if std::fs::symlink_metadata(&self.leaf).is_err() {
-            remove_leaf_volumes(&self.leaf);
+            for tree in [Tree::Head, Tree::Base] {
+                let _ = self.place.kube.delete_owned(
+                    Some(&self.place.ns),
+                    "pvc",
+                    &target_volume(&self.leaf, tree),
+                    false,
+                );
+            }
         }
     }
 }
@@ -3119,6 +3328,19 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
     let t = Instant::now();
     let report = crate::repo_checks::run_floor(&worktree, &ctx);
+    // The made-up namespace goes before any output is written (codex r2): a closed stdout
+    // cannot skip it.
+    if made_up {
+        crate::repo_checks::remove_check_scratch(&worktree, &run_id);
+        // The namespace this invocation made up goes with it (codex b3-floor #3): nothing else
+        // ever ends a run of that id.
+        if let Some(kube) = crate::k8s::engine_home().and_then(|h| crate::k8s::kube_for(&h).ok()) {
+            if let Err(e) = crate::k8s::cluster::delete_run(&kube, &run_id, false) {
+                eprintln!("wicked-core floor run: the run namespace was not deleted: {e}");
+            }
+            forget_namespace(&crate::k8s::run_namespace_name(&kube.owner, &run_id));
+        }
+    }
     eprintln!(
         "wicked-core floor run: {} in {:.1}s",
         if report.passed { "PASSED" } else { "FAILED" },
@@ -3130,9 +3352,6 @@ pub fn run_cli(args: &[String]) -> i32 {
     );
     if full {
         crate::power::set_full_suite(&run_id, false);
-    }
-    if made_up {
-        crate::repo_checks::remove_check_scratch(&worktree, &run_id);
     }
     if report.passed {
         0
