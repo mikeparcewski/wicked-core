@@ -65,6 +65,18 @@ Two release tracks share this file, newest entry first regardless of track:
   holds a repository's own minimum. Core's own kinds (`requirements_target`, `requirements_graph`, `domain`,
   `requirement`) are now known and skipped; any other unknown kind still warns.
 
+- **The requirements share counts only real behaviour (wicked-core#1375, #1235).** A requirements-graph measurement on
+  AutoGPT's backend found about 30% of the units the share counted were not behaviour: stub bodies, empty and
+  field-only classes, constructors that only store their arguments, and test helpers in `billing_e2e/`. Estate
+  (≥0.35.2) now records the body shape on each function, method, constructor, class and struct it inspects
+  (`metadata.behaviour`: `real`, `stub`, `data` or `test_support`). The share leaves `stub` and `data` units out of the
+  denominator as structural, and `test_support` units (Rust `#[cfg(test)]` modules and `#[test]` functions in product
+  files included) as not product. An absent, `real` or unknown value still counts. The test-directory rule changes on
+  every graph, with or without the key: it now also matches named kinds of test (`integration_tests/`, `unit-tests/`,
+  `load_test/`) and test-helper segments (`test_utils/`), and a `*_e2e/` directory when most code files directly in it
+  are tests by name (AutoGPT's `executor/billing_e2e/`). An arbitrary `*_tests/` or `*_e2e/` (`ab_tests/`,
+  `crypto_e2e/`) stays product. On the AutoGPT slice (the measured map's graph) the share moves from 66% (765/1,158) to
+  71%. No wire change: `behavior_bearing` shrinks and `not_product` grows by the test-support count.
 - **A unit's dispatch reads its worktree off the actor, once (wicked-core#1390, part 2).** A dispatch used to take up
   to four git snapshots of the run's worktree on the actor thread (the baseline, the tree a new author starts on, the
   QE floor note's tree, the editor-conformance tree), plus an Apps publish's and a walkthrough's tree reads, a QE
