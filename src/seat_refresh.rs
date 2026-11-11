@@ -40,6 +40,9 @@
 
 // Native Windows has no container floor: only the refresher's pure half compiles there.
 #![cfg_attr(not(unix), allow(dead_code))]
+// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
+#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -1304,6 +1307,8 @@ mod live {
 }
 
 #[cfg(unix)]
+#[allow(unused_imports)]
+// `start` (the refresher container) is B-4's to move onto the cluster.
 pub(crate) use live::{refresh, resolve_copilot, start};
 #[cfg(all(unix, test))]
 pub(crate) use live::{renew_on_host, request_argv};

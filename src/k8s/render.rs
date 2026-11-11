@@ -346,6 +346,44 @@ pub(crate) struct SeatPod {
     /// The pod's own deadline (`activeDeadlineSeconds`): the kubelet kills it past this, even
     /// with no controller or API server left.
     pub(crate) deadline_secs: u64,
+    /// The replica sub-directory every path of this pod lives under (a one-shot engine session's
+    /// own scope in the shared session namespace); `None` = the replica's root.
+    pub(crate) scope: Option<String>,
+    /// PARITY B17: a read-only unit's tree. The replica's copy is mounted read-only at
+    /// [`VIEW_SOURCE`], and an init container copies it into an emptyDir at the tree's own
+    /// path: the unit's writes land in that throwaway view and go with the pod.
+    pub(crate) view: Option<PathBuf>,
+}
+
+/// Where a read-only unit's replica tree is mounted read-only (the view's source).
+pub(crate) const VIEW_SOURCE: &str = "/wicked-ro";
+
+/// The replica sub-path of `p` under an optional `scope`.
+pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
+    let sub = replica_sub_path(p)?;
+    Some(match scope {
+        Some(s) => format!("{s}/{sub}"),
+        None => sub,
+    })
+}
+
+/// The init container that copies a read-only unit's replica tree into its view (no link
+/// followed; the top-level `target` build dir stays out: a read-only posture builds into its own
+/// scratch).
+fn view_init(floor_image: &str, sub: &str) -> Value {
+    json!({
+        "name": "view",
+        "image": floor_image,
+        "imagePullPolicy": "Never",
+        "command": ["/busybox", "sh", "-c",
+            "cd /wicked-ro && /busybox tar -cf - --exclude ./target . | /busybox tar -C /wicked-view -xf -"],
+        "securityContext": hardened_context(),
+        "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},
+        "volumeMounts": [
+            {"name": "replica", "mountPath": VIEW_SOURCE, "subPath": sub, "readOnly": true},
+            {"name": "view", "mountPath": "/wicked-view"},
+        ],
+    })
 }
 
 /// The init container that copies the engine's trusted launcher files out of the floor image
@@ -373,9 +411,34 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         json!({"name": "canary", "mountPath": "/wicked-canary"}),
         json!({"name": "unit", "mountPath": UNIT_DIR}),
     ];
-    let reserved = [FLOOR_DIR, "/tmp", "/home/seat", "/wicked-canary", UNIT_DIR];
-    for m in &s.mounts {
-        let sub = replica_sub_path(&m.path)
+    let reserved = [
+        FLOOR_DIR,
+        "/tmp",
+        "/home/seat",
+        "/wicked-canary",
+        UNIT_DIR,
+        VIEW_SOURCE,
+    ];
+    let mut init = vec![floor_init(&s.floor_image)];
+    let mut extra_volumes = Vec::new();
+    if let Some(tree) = &s.view {
+        let sub = scoped_sub_path(s.scope.as_deref(), tree)
+            .ok_or_else(|| format!("{} cannot be a replica path", tree.display()))?;
+        mounts.push(
+            json!({"name": "replica", "mountPath": VIEW_SOURCE, "subPath": sub, "readOnly": true}),
+        );
+        mounts.push(json!({"name": "view", "mountPath": tree.to_string_lossy()}));
+        init.push(view_init(&s.floor_image, &sub));
+        extra_volumes.push(json!({"name": "view", "emptyDir": {"sizeLimit": "8Gi"}}));
+    }
+    // Shallower first, so a deeper mount lands over its parent.
+    let mut plan: Vec<&ReplicaMount> = s.mounts.iter().collect();
+    plan.sort_by_key(|m| m.path.components().count());
+    for m in plan {
+        if s.view.as_ref() == Some(&m.path) {
+            continue;
+        }
+        let sub = scoped_sub_path(s.scope.as_deref(), &m.path)
             .ok_or_else(|| format!("{} cannot be a replica path", m.path.display()))?;
         if reserved.iter().any(|r| {
             m.path == Path::new(r) || m.path.starts_with(r) || Path::new(r).starts_with(&m.path)
@@ -403,7 +466,7 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         // Kubelet-enforced, independent of the controller and the engine (review r1 P2).
         "activeDeadlineSeconds": s.deadline_secs,
         "securityContext": pod_context(POD_UID),
-        "initContainers": [floor_init(&s.floor_image)],
+        "initContainers": init,
         "containers": [{
             "name": "seat",
             "image": s.image,
@@ -433,6 +496,9 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
             {"name": "replica", "persistentVolumeClaim": {"claimName": REPLICA_PVC}},
         ],
     });
+    if let Some(v) = spec["volumes"].as_array_mut() {
+        v.extend(extra_volumes);
+    }
     if let Some(ip) = &s.gateway_ip {
         spec["hostAliases"] = json!([{"ip": ip, "hostnames": ["agw"]}]);
     }

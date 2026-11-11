@@ -46,6 +46,8 @@ fn seat() -> SeatPod {
         gateway_ip: Some("10.43.0.50".into()),
         shutdown_time: "2026-11-11T05:00:00Z".into(),
         deadline_secs: 3600,
+        scope: None,
+        view: None,
     }
 }
 

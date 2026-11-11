@@ -22,15 +22,20 @@
 //! The parity contract this module is held to is `PARITY.md` of the k8s-swap lane, mirrored in
 //! the module tests (each test names its row).
 
-// B-1 of the stacked k8s-swap series: the seat, floor and login paths are pointed at this
-// module in B-2..B-4 (the series lands as one train, D7); this allowance goes with B-2.
+// `cluster install`/`uninstall`, the boot sweep and the token renewal are wired to the CLI and the
+// daemon's boot in B-5 of the stacked k8s-swap series (D7 train); the allowance goes with it.
 #![allow(dead_code)]
 
 pub(crate) mod cluster;
+pub(crate) mod gw;
 pub(crate) mod render;
+pub(crate) mod seat;
+pub(crate) mod sync;
 
 #[cfg(test)]
 mod live;
+#[cfg(test)]
+mod seat_tests;
 #[cfg(test)]
 mod tests;
 

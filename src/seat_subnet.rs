@@ -11,6 +11,10 @@
 //! its network is removed (the reap, or the sweep). `WICKED_SEAT_SUBNET_POOL=runtime` keeps the
 //! runtime's own pools.
 
+// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
+#![allow(dead_code)]
+
 use std::net::Ipv4Addr;
 
 /// The pool seat subnets are cut from (an IPv4 CIDR), or `runtime` for the runtime's own pools.

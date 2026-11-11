@@ -220,6 +220,8 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         gateway_ip: Some(gw.service_ip.clone()),
         shutdown_time: rfc3339_after(Duration::from_secs(15 * 60)),
         deadline_secs: 15 * 60,
+        scope: None,
+        view: None,
     };
     let t_seat = std::time::Instant::now();
     engine
@@ -364,4 +366,305 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
         "[{:>5.1}s] run namespace deleted",
         t0.elapsed().as_secs_f64()
     );
+}
+
+/// Run a finalized seat command to its end, as `run_bounded` does (stdin closed).
+fn run_seat(cmd: std::process::Command) -> (i32, String, String) {
+    let mut cmd = cmd;
+    cmd.stdin(std::process::Stdio::null());
+    let out = cmd.output().expect("the kubectl client ran");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The seat argv a unit runs: the pod wrapper, the launcher under Landlock over `mounts`, then
+/// `script` in the seat image's own shell.
+fn seat_cmd(
+    wrapper: &[String],
+    cwd: &std::path::Path,
+    script: &str,
+    env: &[(&str, &str)],
+) -> std::process::Command {
+    let mut c = std::process::Command::new(&wrapper[0]);
+    c.args(&wrapper[1..])
+        .args(["/bin/sh", "-c", script])
+        .current_dir(cwd);
+    for (k, v) in env {
+        c.env(k, v);
+    }
+    c
+}
+
+/// B-2 end to end on a real cluster (PARITY A2, A3, A12, B5, B8, B9, B11, B15, B17): the gateway on
+/// its writer sidecar (publish, a unit key served then refused); a creator seat pod armed from a
+/// real git worktree, its unit env over stdin (never on the argv), its change, deletion and
+/// commit written back byte-identical with the host HEAD fast-forwarded; a planted `.git` hook
+/// never coming back; a read-only unit's writes succeeding in the pod and vanishing; and a lost
+/// exec stream read as no result, never an exit code.
+#[test]
+fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
+    let Some((admin_ctx, seat_image)) = live() else {
+        return;
+    };
+    let t0 = std::time::Instant::now();
+    let say = |m: &str| eprintln!("[{:>5.1}s] {m}", t0.elapsed().as_secs_f64());
+    let home = std::env::temp_dir().join(format!(
+        "wicked-k8s-live2-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let home = home.canonicalize().unwrap();
+    let mut admin = resolve_settings(
+        &home,
+        None,
+        None,
+        Some(&admin_ctx),
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        crate::validator::find_on_path,
+    )
+    .expect("kubectl and the admin context");
+    admin.owner = owner_id(&home);
+    let _cleanup = Uninstall(admin.clone());
+    let rt = crate::container_floor::runtime().expect("the image builder answers");
+    let floor = crate::container_floor::ensure_floor_image(&rt).expect("the floor image");
+    let sync_image = crate::checks_container::image_tag();
+    if !crate::container_floor::image_present(&rt, &sync_image) {
+        crate::container_floor::build_image(
+            &rt,
+            crate::checks_container::DOCKERFILE,
+            &sync_image,
+            &[],
+        )
+        .expect("the sync image");
+    }
+    cluster::install(&admin, &home).expect("cluster install");
+    let engine = resolve_settings(
+        &home,
+        None,
+        None,
+        None,
+        None,
+        crate::validator::find_on_path,
+    )
+    .expect("the engine's own kubeconfig");
+    cluster::probe_cached(&engine).expect("probe");
+    cluster::ensure_pids_limited(&engine, &floor).expect("pids");
+    say("installed");
+
+    // B8, B9: the gateway on its writer; a unit key is served before a seat starts, refused after.
+    let gdir = home.join("gateway");
+    std::fs::create_dir_all(&gdir).unwrap();
+    let gw = super::gw::ensure(&engine, &gdir).expect("the gateway serves");
+    say(&format!("gateway {} at {}", gw.pod, gw.service_ip));
+    let key = crate::seat_gateway::UnitKey::new("live2", "live2#1", "codex");
+    let t_key = std::time::Instant::now();
+    super::gw::register_live(&gw, key.clone()).expect("the key is served");
+    say(&format!(
+        "key register -> served in {:.2}s",
+        t_key.elapsed().as_secs_f64()
+    ));
+    super::gw::deregister_live(&gw, &key.key).expect("the key is refused");
+    gw.write_file(super::gw::Volume::Broker, "live-probe", b"secret-bytes")
+        .expect("a broker write");
+    let back = gw
+        .read_broker(&[("live-probe", false), ("missing-file", true)])
+        .expect("a broker read");
+    assert_eq!(
+        back,
+        vec![("live-probe".to_string(), b"secret-bytes".to_vec())]
+    );
+
+    // A real worktree: one commit, a file to change, one to delete, an ignored build dir.
+    let tree = home.join("repo");
+    std::fs::create_dir_all(&tree).unwrap();
+    let git = |args: &[&str]| {
+        let o = super::sync::git(&tree).args(args).output().unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(tree.join(".gitignore"), "target/\n").unwrap();
+    std::fs::write(tree.join("a.txt"), "before\n").unwrap();
+    std::fs::write(tree.join("gone.txt"), "x\n").unwrap();
+    std::fs::write(tree.join(".env"), "HOST_SECRET=1\n").unwrap();
+    git(&["add", "-A"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-qm",
+        "base",
+    ]);
+    let base = git(&["rev-parse", "HEAD"]);
+    let landrun = |rw: bool| -> Vec<String> {
+        let mut v: Vec<String> = vec![
+            "/floor/launch".into(),
+            "/wicked-canary/probe".into(),
+            "--".into(),
+        ];
+        v.extend(crate::container_floor::landrun_prefix(
+            &[crate::container_floor::Mount::Bind {
+                path: tree.clone(),
+                rw,
+            }],
+            crate::container_floor::GATEWAY_PORTS,
+            &[],
+        ));
+        v
+    };
+    let mounts = vec![
+        super::seat::PlanMount::Bind {
+            path: tree.clone(),
+            rw: true,
+        },
+        super::seat::PlanMount::Mask {
+            path: tree.join(".env"),
+        },
+    ];
+    let spec = |view: bool, run: &'static str, ord: u32| super::seat::ArmSpec {
+        run_id: run,
+        ord,
+        cli: "codex",
+        image: &seat_image,
+        floor_image: &floor,
+        sync_image: &sync_image,
+        workdir: &tree,
+        tree: &tree,
+        view,
+        mounts: &mounts,
+        protected: &[],
+        write_roots: if view {
+            &[]
+        } else {
+            std::slice::from_ref(&tree)
+        },
+        seat_dirs: &[],
+        seed_base: None,
+        memory: "1Gi",
+        gateway_ip: Some(&gw.service_ip),
+        deadline: Duration::from_secs(600),
+        role: "seat",
+    };
+
+    // B11: a creator unit.
+    let t_arm = std::time::Instant::now();
+    let (seat, wrapper) = super::seat::arm(&engine, &spec(false, "live2-run", 1), landrun(true))
+        .expect("the seat arms");
+    say(&format!(
+        "creator seat armed in {:.2}s (namespace, sync pod, copy-in, pod, deny check)",
+        t_arm.elapsed().as_secs_f64()
+    ));
+    let script = "set -e; test ! -e .env; test \"$UNIT_SECRET\" = s3cr3t; \
+                  echo after > a.txt; rm gone.txt; echo new > new.txt; mkdir -p target; echo o > target/out.o; \
+                  printf '#!/bin/sh\\necho pwned\\n' > .git/hooks/post-commit; chmod +x .git/hooks/post-commit; \
+                  git add -A; git -c user.name=seat -c user.email=s@s commit -qm unit; echo > .env; echo done";
+    let cmd = seat_cmd(&wrapper, &tree, script, &[("UNIT_SECRET", "s3cr3t")]);
+    let (fin, seat2) = super::seat::finalize(&cmd)
+        .expect("finalize")
+        .expect("a pod seat");
+    let argv: Vec<String> = fin
+        .get_args()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !argv.iter().any(|a| a.contains("s3cr3t")),
+        "a secret rode the exec argv"
+    );
+    assert!(
+        fin.get_envs().all(|(k, _)| k != "UNIT_SECRET"),
+        "a secret is in kubectl's env"
+    );
+    assert_eq!(seat2.id, seat.id);
+    let (code, out, err) = run_seat(fin);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(err.contains("floor canary passed"), "{err}");
+    let code = super::seat::settle(&seat, super::seat::Ending::Exited(code)).expect("settled");
+    assert_eq!(code, 0);
+    say("creator unit settled");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("a.txt")).unwrap(),
+        "after\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("new.txt")).unwrap(),
+        "new\n"
+    );
+    assert!(!tree.join("gone.txt").exists(), "a deleted file came back");
+    assert!(
+        !tree.join("target").exists(),
+        "ignored build output came back"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join(".env")).unwrap(),
+        "HOST_SECRET=1\n",
+        "a mask was written"
+    );
+    assert!(
+        !tree.join(".git/hooks/post-commit").exists(),
+        "a planted hook came back"
+    );
+    let head = git(&["rev-parse", "HEAD"]);
+    assert_ne!(head, base);
+    assert_eq!(
+        git(&["rev-parse", "HEAD^"]),
+        base,
+        "not a fast-forward of the base"
+    );
+    assert_eq!(
+        git(&["status", "--porcelain"]),
+        "",
+        "the host index does not match the commit"
+    );
+    let pods = engine
+        .list_owned(Some(&seat.ns), "pods", &[(UNIT_LABEL, &seat.unit_label)])
+        .unwrap();
+    assert!(pods.is_empty(), "the seat pod outlived its settle");
+
+    // B17: a read-only unit writes freely in its view; nothing comes back.
+    let before = git(&["rev-parse", "HEAD^{tree}"]);
+    let (ro, wrapper) = super::seat::arm(&engine, &spec(true, "live2-run", 2), landrun(true))
+        .expect("the view arms");
+    let cmd = seat_cmd(&wrapper, &tree, "set -e; touch x; echo z > a.txt; python3 -c 'open(\"p\",\"w\").write(\"p\")' 2>/dev/null || true; cat a.txt", &[]);
+    let (fin, _) = super::seat::finalize(&cmd).unwrap().unwrap();
+    let (code, out, err) = run_seat(fin);
+    assert_eq!(code, 0, "{out}\n{err}");
+    assert!(out.contains('z'), "the view was not writable: {out}");
+    super::seat::settle(&ro, super::seat::Ending::Exited(code)).expect("settled");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("a.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(!tree.join("x").exists() && !tree.join("p").exists());
+    assert_eq!(git(&["rev-parse", "HEAD^{tree}"]), before);
+    assert_eq!(git(&["status", "--porcelain"]), "");
+    say("read-only unit settled; host unchanged");
+
+    // A3: a stream lost before the CLI ends (the client killed) is no result.
+    let (lost, wrapper) =
+        super::seat::arm(&engine, &spec(false, "live2-run", 3), landrun(true)).expect("arms");
+    let cmd = seat_cmd(&wrapper, &tree, "sleep 30", &[]);
+    let (mut fin, _) = super::seat::finalize(&cmd).unwrap().unwrap();
+    fin.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    let mut child = fin.spawn().unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    let _ = child.kill();
+    let code = child.wait().unwrap().code().unwrap_or(-1);
+    let r = super::seat::settle(&lost, super::seat::Ending::Exited(code));
+    assert!(
+        r.as_ref().is_err_and(|e| e.starts_with("exec_stream_lost")),
+        "{r:?}"
+    );
+    say("a lost stream read as no result");
+    assert!(cluster::delete_run(&engine, "live2-run", true).unwrap());
 }

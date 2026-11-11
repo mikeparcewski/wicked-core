@@ -3,7 +3,11 @@
 //! Login uses the gateway's external bridge; a login auth-host allowlist is a later slice.
 //! Broker expiry is reported in Unix seconds (Claude stores milliseconds).
 
-#![cfg_attr(not(unix), allow(dead_code))] // agy lg-r1 A7
+#![cfg_attr(not(unix), allow(dead_code))]
+// agy lg-r1 A7
+// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
+#![allow(dead_code)]
 
 use std::path::Path;
 
@@ -23,7 +27,7 @@ const GATEWAY_DIR_ENV: &str = "WICKED_SEAT_GATEWAY_DIR";
 #[cfg(unix)]
 const TIMEOUT: Duration = Duration::from_secs(15);
 // Bound credential reads as well as runtime execution. No untrusted file can fill a pipe forever.
-const MAX_FILE_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: usize = 1024 * 1024;
 
 fn supported_cli(cli: &str) -> bool {
     matches!(
@@ -857,7 +861,7 @@ fn credential_paths(cli: &str) -> &'static [&'static str] {
     }
 }
 
-fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
+pub(crate) fn broker_files(cli: &str) -> Result<&'static [&'static str], String> {
     match cli {
         "claude" => Ok(&[
             "anthropic.token",
@@ -1615,7 +1619,7 @@ pub(crate) fn read_broker_record(
 
 /// Pure status parser. Route entries need only nonempty presence markers; retained JSON is
 /// read for expiry. Empty route files created at gateway initialization mean signed out.
-fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> BrokerStatus {
+pub(crate) fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64) -> BrokerStatus {
     if let Err(e) = broker_files(cli) {
         return BrokerStatus::Unknown(e);
     }
@@ -1844,7 +1848,7 @@ fn volume_exists(rt: &Runtime, volume: &str) -> Result<bool, String> {
 
 /// Broker files read whole by a status reading (retained OAuth records and route literals);
 /// every other broker file is read as a presence marker only.
-fn is_archive(name: &str) -> bool {
+pub(crate) fn is_archive(name: &str) -> bool {
     matches!(
         name,
         "claude.credentials.json"
@@ -2099,7 +2103,7 @@ pub(crate) fn signin_pending(dir: &Path, cli: &str) -> bool {
         .is_ok_and(|b| b == b"sign-in incomplete")
 }
 
-fn publication_status(dir: &Path, cli: &str, status: BrokerStatus) -> BrokerStatus {
+pub(crate) fn publication_status(dir: &Path, cli: &str, status: BrokerStatus) -> BrokerStatus {
     if signout_path(dir, cli).exists() {
         BrokerStatus::Unknown("sign-out incomplete".into())
     } else if crate::seat_gateway::unsettled_path(dir, cli).exists()

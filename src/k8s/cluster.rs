@@ -40,6 +40,24 @@ pub(crate) fn check_manifest(manifest: &str) -> Result<(), String> {
 
 /// Whether the cluster can run seats now: the API server answers, the controller runs the
 /// pinned image, and its CRDs are present. The `Err` is the refusal kind and its detail.
+/// [`probe`], with a pass kept for a minute per context (a seat arm probes the cluster once,
+/// not once per call). A failure is never kept.
+pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
+    static LAST: std::sync::Mutex<Option<(Kube, std::time::Instant)>> = std::sync::Mutex::new(None);
+    if let Ok(last) = LAST.lock() {
+        if let Some((k, at)) = last.as_ref() {
+            if k == kube && at.elapsed() < Duration::from_secs(60) {
+                return Ok(());
+            }
+        }
+    }
+    probe(kube)?;
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((kube.clone(), std::time::Instant::now()));
+    }
+    Ok(())
+}
+
 pub(crate) fn probe(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
     if !kube.answers() {
         return Err((
