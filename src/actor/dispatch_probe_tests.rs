@@ -53,6 +53,7 @@ impl StepRunner for Seat {
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    // spawn-audit: test-only — a git fixture building the test's repository; it reads no engine state.
     let out = std::process::Command::new("git")
         .args(args)
         .current_dir(dir)

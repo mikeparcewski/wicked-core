@@ -933,7 +933,7 @@ fn planning_and_a_late_distribution_never_drop_an_accepted_block() {
 const SEAT_BUILDERS: &[(&str, &str, usize, &str)] = &[
     (
         "actor.rs",
-        "dispatch_unit",
+        "dispatch_unit_with",
         1,
         "published; the unit runs under the per-unit Stamping runner",
     ),
