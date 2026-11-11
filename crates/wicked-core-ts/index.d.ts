@@ -366,6 +366,13 @@ export declare class Core {
    * smoke does) rather than assuming it precedes the method's resolution.
    */
   subscribe(callback: (err: Error | null, eventJson: string) => void): Subscription
+  /**
+   * (core#1390) The engine actor's timing as JSON: `{ backlog, max_backlog, slow_threshold_ms,
+   * commands: [{ command, count, p50_ms, p99_ms, max_ms }], slow: [{ command, ms, backlog,
+   * at_ms }] }`. Synchronous and never queued behind the actor, so it answers while the actor is
+   * busy — which is when it is worth reading.
+   */
+  actorStats(): string
   /** Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`). */
   ping(): Promise<string>
   /**

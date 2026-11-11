@@ -573,6 +573,9 @@ pub(crate) fn sidecar_base(path: &str) -> String {
     }
 }
 
+/// (core#1390) The most commands moved off the channel per turn of the actor loop.
+const BACKLOG_DRAIN: usize = 256;
+
 /// Channel-silence window that counts as "idle" for the WAL checkpoint (the `recv_timeout` on the
 /// actor loop). Small enough to notice idleness promptly; the min interval below (not this tick)
 /// bounds how often a checkpoint actually runs.
@@ -799,7 +802,10 @@ pub(crate) fn run(
     write_reg: WriteReg,
     team_link: crate::team::publish::TeamLink,
     qe_host: crate::assurance::HostQeAcceptance,
+    stats: Arc<crate::actor_stats::ActorStats>,
 ) {
+    // (core#1390) However this thread ends, its core's reads stop answering from the store.
+    let _stopped = crate::actor_stats::StopGuard(&stats);
     // DES-TEAMING-002 P1: this thread's link to the team publisher. The actor never opens the
     // bus; it sends the publisher requests and waits for acknowledgements as commands.
     team_gate::install(team_link);
@@ -1222,6 +1228,14 @@ pub(crate) fn run(
     // harmlessly; the store-side `wal_autocheckpoint` bound is the backstop.
     let wal_min_interval = wal_checkpoint_min_interval();
     let mut last_wal_checkpoint = std::time::Instant::now();
+    // (core#1390) Per-command timing + the backlog. Commands already sent are moved off the
+    // channel into `backlog` in arrival order and taken from its front, so the order
+    // they run in is the channel's order exactly; only the count of those waiting becomes visible.
+    let slow_threshold = crate::actor_stats::slow_threshold_from_env();
+    stats.set_slow_threshold(slow_threshold);
+    // Startup (redrive, orphan reports, the WAL sidecars) is done: reads may pin between commands.
+    stats.started_up();
+    let mut backlog: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     loop {
         // (DES-TEAMING-002 P1, review of #623 round 4) A held `confirm_gate` reply never outlives
@@ -1230,6 +1244,12 @@ pub(crate) fn run(
         // terminal path) or whose answer no longer waits on the publisher is answered from the
         // run's durable status. The one call site.
         if !team_replies.is_empty() {
+            let _timed = crate::actor_stats::Timed::start(
+                &stats,
+                "SettleHeldReplies",
+                backlog.len(),
+                slow_threshold,
+            );
             team_gate::settle_held_replies(&store, &mut team_replies);
         }
         // Loop-mode selection: the knob decides ONCE, at actor start, whether this loop ever
@@ -1239,26 +1259,38 @@ pub(crate) fn run(
         // to the original `while let Ok(cmd) = rx.recv()` head; no timing test can pin "never
         // wakes" without sleeping, so the equivalence is by construction here rather than by test
         // (the knob parse itself is pinned in `wal_checkpoint_min_interval_honors_the_env_knob`).
-        let cmd = match wal_min_interval {
-            None => match rx.recv() {
-                Ok(cmd) => cmd,
-                // Unreachable in practice (the actor holds `self_tx`, so the channel can't
-                // close; `Shutdown` is the real exit) — the old `while let Ok(..)` behavior.
-                Err(_) => break,
-            },
-            Some(interval) => match rx.recv_timeout(WAL_IDLE_TICK) {
-                Ok(cmd) => cmd,
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    if in_flight.is_empty() && last_wal_checkpoint.elapsed() >= interval {
-                        checkpoint_wals(&mut store, memory.as_mut(), knowledge.as_mut());
-                        last_wal_checkpoint = std::time::Instant::now();
+        // How many commands waited for the actor when it became free (the one it runs next
+        // included) — after a long command, the queue that built up behind it. Bounded per turn,
+        // so a sustained producer can never hold the oldest command back.
+        backlog.extend(rx.try_iter().take(BACKLOG_DRAIN));
+        stats.set_backlog(backlog.len());
+        let cmd = if let Some(cmd) = backlog.pop_front() {
+            cmd
+        } else {
+            match wal_min_interval {
+                None => match rx.recv() {
+                    Ok(cmd) => cmd,
+                    // Unreachable in practice (the actor holds `self_tx`, so the channel can't
+                    // close; `Shutdown` is the real exit) — the old `while let Ok(..)` behavior.
+                    Err(_) => break,
+                },
+                Some(interval) => match rx.recv_timeout(WAL_IDLE_TICK) {
+                    Ok(cmd) => cmd,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        if in_flight.is_empty() && last_wal_checkpoint.elapsed() >= interval {
+                            checkpoint_wals(&mut store, memory.as_mut(), knowledge.as_mut());
+                            last_wal_checkpoint = std::time::Instant::now();
+                        }
+                        continue;
                     }
-                    continue;
-                }
-                // Same unreachable-in-practice defensive break as the blocking arm.
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            },
+                    // Same unreachable-in-practice defensive break as the blocking arm.
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+            }
         };
+        // Dropped at the end of this iteration, whichever way the arm leaves it.
+        let _timed =
+            crate::actor_stats::Timed::start(&stats, cmd.name(), backlog.len(), slow_threshold);
         match cmd {
             Command::Ping(reply) => {
                 emit(&mut subscribers, CoreEvent::Heartbeat);
@@ -4291,6 +4323,11 @@ pub(crate) fn run(
             Command::HeldTeamReplies { reply } => {
                 let _ = reply.send(team_replies.len());
             }
+            #[cfg(test)]
+            Command::HoldActor { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(std::time::Duration::from_secs(60));
+            }
             Command::PowerCheckpoint {
                 run_id,
                 ord,
@@ -4468,6 +4505,9 @@ pub(crate) fn run(
                 );
             }
             Command::Shutdown => {
+                // (core#1390) From here every read goes to the actor and fails "stopped", exactly
+                // as a read queued behind this command did — it waits for the channel to close.
+                stats.mark_stopped();
                 crate::power::unregister_actor(process_gen);
                 subscribers.close_asks();
                 // Stop ACP workers before dropping the actor channel. Ordinary prompt waits
@@ -20183,7 +20223,7 @@ fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Op
 }
 
 /// Read the agent session ids on the store (by their session-node names).
-fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
+pub(crate) fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
     let query = SymbolQuery {
         kinds: vec![NodeKind::Other(AGENT_SESSION.to_string())],
         ..Default::default()
@@ -20196,7 +20236,7 @@ fn list_sessions(store: &impl GraphRead) -> anyhow::Result<Vec<String>> {
 }
 
 /// Read every session + its ordered units (the UI's project list).
-fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionView>> {
+pub(crate) fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionView>> {
     // One unit scan for the whole fold (wicked-crew#944): a per-session `session_units` here
     // re-parsed every unit on the store once per session. Sessions are read first, and a store
     // with none reads no units, as before.
@@ -20215,7 +20255,7 @@ fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate::SessionVie
 }
 
 #[cfg(test)]
-mod sessions_detail_fold_tests {
+pub(crate) mod sessions_detail_fold_tests {
     //! wicked-crew#944: the sessions-detail fold behind every run read (`GET /runs`, `GET
     //! /runs/:id`) must scan the unit nodes ONCE, not once per session.
     use super::list_projects;
@@ -20223,7 +20263,7 @@ mod sessions_detail_fold_tests {
     use crate::scope::EntityMode;
     use wicked_apps_core::{open_store, ToNode};
 
-    fn session(id: &str) -> AgentSession {
+    pub(crate) fn session(id: &str) -> AgentSession {
         AgentSession {
             intent_amendments: Vec::new(),
             id: id.into(),

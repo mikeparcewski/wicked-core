@@ -1351,6 +1351,15 @@ impl Core {
         })
     }
 
+    /// (core#1390) The engine actor's timing as JSON: `{ backlog, max_backlog, slow_threshold_ms,
+    /// commands: [{ command, count, p50_ms, p99_ms, max_ms }], slow: [{ command, ms, backlog,
+    /// at_ms }] }`. Synchronous and never queued behind the actor, so it answers while the actor is
+    /// busy — which is when it is worth reading.
+    #[napi]
+    pub fn actor_stats(&self) -> napi::Result<String> {
+        serde_json::to_string(&self.inner.actor_stats()).map_err(err)
+    }
+
     /// Liveness probe — emits a `Heartbeat` to subscribers and resolves once the actor acks (`"ok"`).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn ping(&self) -> AsyncTask<CoreTask> {
