@@ -604,9 +604,10 @@ pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, Strin
 /// The daemon's gateway for a sign-in (the `seat-login` CLI, B-4), never taking the daemon's
 /// ownership: no config or boot token is published, no unit key is touched, and a quarantined
 /// gateway is never restarted (its rotation is the daemon's to finish). `provision`: a first
-/// sign-in applies the daemon's objects as [`ensure`] would (same boot token, the host ports the
-/// egress policy already grants), so the broker's storage exists before any run; the gateway
-/// container keeps waiting for the daemon's first config. Without `provision`, `Ok(None)` when
+/// sign-in creates the daemon's objects as [`ensure`] would (same boot token, the host ports the
+/// egress policy already grants) when there is no gateway yet, so the broker's storage exists
+/// before any run; the gateway container keeps waiting for the daemon's first config. An
+/// existing gateway is never re-applied (a quarantine landing meanwhile stands). Without `provision`, `Ok(None)` when
 /// the daemon has no gateway yet (nothing was ever signed in on this cluster).
 pub(crate) fn attach(
     kube: &Kube,
@@ -630,7 +631,8 @@ pub(crate) fn attach(
     };
     let refused = || {
         gwerr(
-            "the gateway is stopped after a revocation it could not confirm; the daemon restarts              it before its next seat. Start a run, then sign in again"
+            "the gateway is stopped after a revocation it could not confirm; the daemon \
+             restarts it before its next seat; start a run, then try again"
                 .into(),
         )
     };

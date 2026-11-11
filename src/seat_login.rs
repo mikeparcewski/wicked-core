@@ -1708,7 +1708,8 @@ pub(crate) fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64
 /// transport is [`crate::k8s::login::K8sIo`], and [`DockerIo`] is the container floor's, kept
 /// until the Docker path is deleted (B-6).
 ///
-/// Every method is called with the broker's mutation lock held, except where a caller says so.
+/// The mutating methods are called with the broker's mutation lock held; a status read
+/// (`broker_status`) and [`BrokerIo::prepare_login`] run without it.
 #[cfg(unix)]
 pub(crate) trait BrokerIo {
     /// Whether the broker's storage exists (none = nothing was ever signed in).
@@ -3289,7 +3290,20 @@ fn dispatch(verb: &str, cli: &str) -> Result<i32, String> {
     // The seats run on the daemon's cluster (k8s-swap): so do their sign-ins. A status read never
     // starts anything; every other verb may provision the gateway's storage on a first sign-in,
     // never taking the daemon's ownership (`k8s::gw::attach`).
-    let io = crate::k8s::login::K8sIo::for_dir(dir, verb != "status")?;
+    let io = match crate::k8s::login::K8sIo::for_dir(dir, verb != "status") {
+        Ok(io) => io,
+        // A status read always answers a status (review B-4 pi #9): a cluster that cannot be read
+        // now, or a gateway stopped after a revocation, is Unknown, never an error with no JSON.
+        Err(e) if verb == "status" => {
+            let status = publication_status(dir, cli, BrokerStatus::Unknown(e));
+            println!(
+                "{}",
+                serde_json::to_string(&status).map_err(|_| "could not encode broker status")?
+            );
+            return Ok(1);
+        }
+        Err(e) => return Err(e),
+    };
     let io: &dyn BrokerIo = &io;
     match verb {
         "argv" => {
