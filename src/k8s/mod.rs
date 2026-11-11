@@ -22,7 +22,9 @@
 //! The parity contract this module is held to is `PARITY.md` of the k8s-swap lane, mirrored in
 //! the module tests (each test names its row).
 
-#![cfg_attr(not(unix), allow(dead_code))]
+// B-1 of the stacked k8s-swap series: the seat, floor and login paths are pointed at this
+// module in B-2..B-4 (the series lands as one train, D7); this allowance goes with B-2.
+#![allow(dead_code)]
 
 pub(crate) mod cluster;
 pub(crate) mod render;
@@ -526,8 +528,18 @@ pub(crate) fn run_bounded(mut cmd: Command, stdin: Option<&[u8]>, limit: Duratio
         });
         rx
     };
-    let out = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
-    let err = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
     let start = Instant::now();
     let code = loop {
         match child.try_wait() {

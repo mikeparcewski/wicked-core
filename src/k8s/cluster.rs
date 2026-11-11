@@ -153,24 +153,24 @@ pub(crate) fn install_docs(owner: &str) -> Vec<Value> {
                            "name": format!("wicked-engine-{owner}")},
                "subjects": [{"kind": "ServiceAccount", "name": ENGINE_SA, "namespace": ns}]}),
         json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicy",
-               "metadata": {"name": format!("wicked-engine-owns-{owner}"), "labels": labels},
-               "spec": {
-                   "failurePolicy": "Fail",
-                   "matchConstraints": {"resourceRules": [{
-                       "apiGroups": ["*"], "apiVersions": ["*"],
-                       "operations": ["CREATE", "UPDATE", "DELETE"], "resources": ["*"],
-                   }]},
-                   "matchConditions": [{"name": "the-engine-account",
-                                        "expression": format!("request.userInfo.username == '{user}'")}],
-                   "variables": [{"name": "o",
-                                  "expression": "request.operation == 'DELETE' ? oldObject : object"}],
-                   "validations": [{
-                       "expression": format!(
-                           "(has(request.subResource) && request.subResource != '') || variables.o == null || ({})",
-                           cel_owner.replace("o.metadata", "variables.o.metadata")),
-                       "message": format!("the wicked engine may only change objects labelled {OWNER_LABEL}={owner}"),
-                   }],
-               }}),
+        "metadata": {"name": format!("wicked-engine-owns-{owner}"), "labels": labels},
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": {"resourceRules": [{
+                "apiGroups": ["*"], "apiVersions": ["*"],
+                "operations": ["CREATE", "UPDATE", "DELETE"], "resources": ["*"],
+            }]},
+            "matchConditions": [{"name": "the-engine-account",
+                                 "expression": format!("request.userInfo.username == '{user}'")}],
+            "variables": [{"name": "o",
+                           "expression": "request.operation == 'DELETE' ? oldObject : object"}],
+            "validations": [{
+                "expression": format!(
+                    "(has(request.subResource) && request.subResource != '') || variables.o == null || ({})",
+                    cel_owner.replace("o.metadata", "variables.o.metadata")),
+                "message": format!("the wicked engine may only change objects labelled {OWNER_LABEL}={owner}"),
+            }],
+        }}),
         json!({"apiVersion": "admissionregistration.k8s.io/v1", "kind": "ValidatingAdmissionPolicyBinding",
                "metadata": {"name": format!("wicked-engine-owns-{owner}"), "labels": labels},
                "spec": {"policyName": format!("wicked-engine-owns-{owner}"),
@@ -222,7 +222,10 @@ pub(crate) fn install(admin: &Kube, home: &Path) -> Result<PathBuf, String> {
         Duration::from_secs(180),
     );
     if !r.ok() {
-        return Err(format!("the agent-sandbox manifest did not apply: {}", r.err_text()));
+        return Err(format!(
+            "the agent-sandbox manifest did not apply: {}",
+            r.err_text()
+        ));
     }
     let rollout = admin.call(
         Some(AGENT_SANDBOX_NAMESPACE),
@@ -335,7 +338,16 @@ pub(crate) fn uninstall(admin: &Kube, controller: bool) -> Result<Vec<String>, S
     ] {
         let r = admin.call(
             None,
-            &["delete", kind, "-l", &sel, "--ignore-not-found", "--wait=true", "-o", "name"],
+            &[
+                "delete",
+                kind,
+                "-l",
+                &sel,
+                "--ignore-not-found",
+                "--wait=true",
+                "-o",
+                "name",
+            ],
             None,
             Duration::from_secs(300),
         );
@@ -432,7 +444,11 @@ pub(crate) fn writer_running(pods: &[Value]) -> Option<String> {
 
 /// Wait until the gateway serves (its pod Running and every container ready) and answer how
 /// seats reach it.
-pub(crate) fn gateway_ready(kube: &Kube, ns: &str, limit: Duration) -> Result<DaemonGateway, String> {
+pub(crate) fn gateway_ready(
+    kube: &Kube,
+    ns: &str,
+    limit: Duration,
+) -> Result<DaemonGateway, String> {
     let svc = kube
         .get_json(Some(ns), "service", render::GATEWAY_NAME)?
         .ok_or("the gateway Service is missing")?;
@@ -517,7 +533,11 @@ pub(crate) enum SweepAction {
 
 /// Pure half of [`sweep`]: decide per namespace. `live` answers whether a run id is still
 /// executing in this engine. A namespace without this daemon's labels is never in the list.
-pub(crate) fn sweep_plan(namespaces: &[Value], owner: &str, live: &dyn Fn(&str) -> bool) -> Vec<SweepAction> {
+pub(crate) fn sweep_plan(
+    namespaces: &[Value],
+    owner: &str,
+    live: &dyn Fn(&str) -> bool,
+) -> Vec<SweepAction> {
     namespaces
         .iter()
         .filter(|n| super::is_owned_by(n, owner))
@@ -602,7 +622,10 @@ static PIDS_VERDICT: std::sync::Mutex<Option<(String, std::time::Instant, u32)>>
 /// ([`render::pids_probe_pod`]) in the daemon namespace, cached for an hour per context. Only a
 /// pass is cached, so a fixed cluster is seen at the next arm. `Err` = refuse every seat with
 /// [`FloorUnarmed::PidsUnlimited`].
-pub(crate) fn ensure_pids_limited(kube: &Kube, floor_image: &str) -> Result<u32, (FloorUnarmed, String)> {
+pub(crate) fn ensure_pids_limited(
+    kube: &Kube,
+    floor_image: &str,
+) -> Result<u32, (FloorUnarmed, String)> {
     if let Some((ctx, at, n)) = PIDS_VERDICT.lock().ok().and_then(|g| g.clone()) {
         if ctx == kube.context && at.elapsed() < PIDS_PROBE_EVERY {
             return Ok(n);
