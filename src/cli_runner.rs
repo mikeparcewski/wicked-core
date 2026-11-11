@@ -2195,11 +2195,7 @@ fn run_rule_check_with(
             preset: launch_preset(&gov.db_path, &input.run_id),
             builds_mcp_server: crate::steering_packs::builds_mcp_server(
                 wd,
-                &change
-                    .paths
-                    .iter()
-                    .map(|(p, _)| p.clone())
-                    .collect::<Vec<_>>(),
+                &change.paths,
                 &change.diff,
             ),
         };

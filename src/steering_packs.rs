@@ -125,7 +125,7 @@ fn sdk_named(text: &str) -> bool {
     static SDK: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     SDK.get_or_init(|| {
         regex::Regex::new(
-            r#"(?i)(@modelcontextprotocol/|\bfastmcp\b|\bmcp-framework\b|\brmcp\b|\brust[-_]mcp[-_]sdk\b|mark3labs/mcp-go|modelcontextprotocol/go-sdk)"#,
+            r#"(?i)(@modelcontextprotocol(/|\\u002f|\\x2f|%2f)|\bfastmcp\b|\bmcp-framework\b|\brmcp\b|\brust[-_]mcp[-_]sdk\b|mark3labs/mcp-go|modelcontextprotocol/go-sdk)"#,
         )
         .expect("a valid pattern")
     })
@@ -160,16 +160,30 @@ fn manifest_names_mcp(name: &str, text: &str) -> Option<bool> {
     if sdk_named(text) {
         return Some(true);
     }
+    // (review r2 on #1427) package.json is read decoded too (an escaped name is the same name);
+    // one the detector cannot parse is undecided.
+    if name == "package.json" {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
+            return None;
+        };
+        let named = [
+            "dependencies",
+            "devDependencies",
+            "peerDependencies",
+            "optionalDependencies",
+        ]
+        .iter()
+        .filter_map(|k| v.get(*k).and_then(|d| d.as_object()))
+        .flat_map(|d| d.keys())
+        .any(|k| sdk_named(k) || k == "mcp-framework" || k == "fastmcp");
+        return Some(named);
+    }
     match name {
         "pyproject.toml" | "requirements.txt" if python_requires_mcp(text) => Some(true),
         // An included requirements file is not read here: undecided.
-        "requirements.txt"
-            if text
-                .lines()
-                .any(|l| l.trim_start().starts_with("-r") || l.trim_start().starts_with("-c")) =>
-        {
-            None
-        }
+        // An option line (`-r`, `--requirement`, `-c`, `--constraint`, `-e`, …) may pull in
+        // requirements this read does not follow: undecided.
+        "requirements.txt" if text.lines().any(|l| l.trim_start().starts_with('-')) => None,
         _ => Some(false),
     }
 }
@@ -178,7 +192,19 @@ fn manifest_names_mcp(name: &str, text: &str) -> Option<bool> {
 /// the Python one. A removed line counts: a change that deletes a manifest or an import is still
 /// work on an MCP server.
 fn diff_names_mcp(diff: &str) -> bool {
-    diff.lines().any(|l| sdk_named(l) || python_imports_mcp(l))
+    diff.lines().any(|l| {
+        // A Python requirement line, added or removed, with its diff prefix stripped.
+        let body = l
+            .strip_prefix('+')
+            .or_else(|| l.strip_prefix('-'))
+            .unwrap_or(l);
+        sdk_named(l)
+            || python_imports_mcp(l)
+            || (!l.starts_with("+++")
+                && !l.starts_with("---")
+                && python_requires_mcp(body)
+                && body.trim_start().starts_with("mcp"))
+    })
 }
 
 /// Read one manifest under `wd` whole, contained in the worktree. `Ok(None)` = it does not exist;
@@ -186,7 +212,13 @@ fn diff_names_mcp(diff: &str) -> bool {
 fn read_manifest(wd_real: &std::path::Path, file: &std::path::Path) -> Result<Option<String>, ()> {
     let real = match std::fs::canonicalize(file) {
         Ok(r) => r,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        // Absent, unless a link sits there whose target cannot be read here (review r2).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return match std::fs::symlink_metadata(file) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                _ => Err(()),
+            };
+        }
         Err(_) => return Err(()),
     };
     // A link (of the file or of a directory above it) that leaves the worktree is not read.
@@ -203,16 +235,24 @@ fn read_manifest(wd_real: &std::path::Path, file: &std::path::Path) -> Result<Op
     std::fs::File::open(&real)
         .and_then(|f| f.take(MANIFEST_CAP + 1).read_to_end(&mut bytes))
         .map_err(|_| ())?;
+    // (review r2) A byte-order mark is stripped; bytes that are not UTF-8 text (UTF-16, binary)
+    // cannot be read safely here: undecided.
+    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    if body.contains(&0) {
+        return Err(());
+    }
+    let Ok(text) = std::str::from_utf8(body) else {
+        return Err(());
+    };
     if bytes.len() as u64 > MANIFEST_CAP {
-        // Not read whole: a positive in what was read still counts, an absence proves nothing.
-        let head = String::from_utf8_lossy(&bytes);
-        return if sdk_named(&head) || python_requires_mcp(&head) {
-            Ok(Some(head.into_owned()))
+        // Not read whole: only an SDK name in what was read counts; an absence proves nothing.
+        return if sdk_named(text) {
+            Ok(Some(text.to_string()))
         } else {
             Err(())
         };
     }
-    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    Ok(Some(text.to_string()))
 }
 
 /// (core#1414) Whether the change at `wd` is in a codebase that builds an MCP server: a manifest at
@@ -222,12 +262,21 @@ fn read_manifest(wd_real: &std::path::Path, file: &std::path::Path) -> Result<Op
 /// nothing. Only paths inside the worktree are looked at.
 pub(crate) fn builds_mcp_server(
     wd: &std::path::Path,
-    paths: &[String],
+    changed: &[(String, bool)],
     diff: &str,
 ) -> Option<bool> {
     if diff_names_mcp(diff) {
         return Some(true);
     }
+    // (review r2 on #1427) A manifest the change deletes or renames away is not on disk to read,
+    // and a rename-only diff carries none of its text: undecided.
+    let gone_manifest = changed
+        .iter()
+        .any(|(p, present)| !present && MANIFESTS.contains(&p.rsplit('/').next().unwrap_or(p)));
+    if gone_manifest {
+        return None;
+    }
+    let paths: Vec<&String> = changed.iter().map(|(p, _)| p).collect();
     let wd_real = std::fs::canonicalize(wd).ok()?;
     let mut dirs: std::collections::BTreeSet<std::path::PathBuf> =
         std::collections::BTreeSet::new();
@@ -699,7 +748,7 @@ mod tests {
             r#"{"name":"crew","dependencies":{"fastify":"4","mcp-proxy-lite":"1"}}"#,
         )
         .unwrap();
-        let paths = vec!["packages/crew/src/tracker.ts".to_string()];
+        let paths = vec![("packages/crew/src/tracker.ts".to_string(), true)];
         assert_eq!(
             builds_mcp_server(&d, &paths, "+const x = 1;\n"),
             Some(false)
@@ -712,7 +761,7 @@ mod tests {
         .unwrap();
         assert_eq!(builds_mcp_server(&d, &paths, ""), Some(true));
         // A manifest beside an unrelated path is not read for this change.
-        let other = vec!["docs/readme.md".to_string()];
+        let other = vec![("docs/readme.md".to_string(), true)];
         assert_eq!(builds_mcp_server(&d, &other, ""), Some(false));
 
         for (name, text, want) in [
@@ -747,7 +796,7 @@ mod tests {
             let d = scope_dir("eco");
             std::fs::write(d.join(name), text).unwrap();
             assert_eq!(
-                builds_mcp_server(&d, &["src/a.rs".to_string()], ""),
+                builds_mcp_server(&d, &[("src/a.rs".to_string(), true)], ""),
                 Some(want),
                 "{name}: {text}"
             );
@@ -782,7 +831,10 @@ mod tests {
             "-r requirements/server.txt\nhttpx\n",
         )
         .unwrap();
-        assert_eq!(builds_mcp_server(&d, &["src/a.py".to_string()], ""), None);
+        assert_eq!(
+            builds_mcp_server(&d, &[("src/a.py".to_string(), true)], ""),
+            None
+        );
         // A manifest past the read cap is not read whole: an absence proves nothing.
         let d = scope_dir("big");
         let big = format!(
@@ -790,9 +842,12 @@ mod tests {
             "x".repeat(MANIFEST_CAP as usize + 16)
         );
         std::fs::write(d.join("package.json"), big).unwrap();
-        assert_eq!(builds_mcp_server(&d, &["src/a.ts".to_string()], ""), None);
+        assert_eq!(
+            builds_mcp_server(&d, &[("src/a.ts".to_string(), true)], ""),
+            None
+        );
         // A path that climbs out of the worktree names none of its directories.
-        let up = vec!["../outside/src/a.ts".to_string()];
+        let up = vec![("../outside/src/a.ts".to_string(), true)];
         assert_eq!(builds_mcp_server(&scope_dir("up"), &up, ""), Some(false));
     }
 
@@ -812,7 +867,7 @@ mod tests {
         .unwrap();
         std::os::unix::fs::symlink("real.json", wt.join("server/package.json")).unwrap();
         assert_eq!(
-            builds_mcp_server(&wt, &["server/index.ts".to_string()], ""),
+            builds_mcp_server(&wt, &[("server/index.ts".to_string(), true)], ""),
             Some(true)
         );
         let outside = d.join("outside");
@@ -822,9 +877,73 @@ mod tests {
         std::fs::remove_file(wt.join("server/real.json")).unwrap();
         std::os::unix::fs::symlink(&outside, wt.join("lib")).unwrap();
         assert_eq!(
-            builds_mcp_server(&wt, &["lib/index.ts".to_string()], ""),
+            builds_mcp_server(&wt, &[("lib/index.ts".to_string(), true)], ""),
             None
         );
+    }
+
+    /// (review r2 on #1427) Partial or hidden manifest evidence is undecided, never a "builds none":
+    /// a deleted or renamed-away manifest, an option line, a dangling link, non-UTF-8 bytes. And the
+    /// decoded and removed spellings count.
+    #[test]
+    fn hidden_or_partial_manifest_evidence_is_undecided_and_decoded_spellings_count() {
+        let d = scope_dir("gone");
+        let gone = vec![
+            ("requirements.txt".to_string(), false),
+            ("requirements-server.txt".to_string(), true),
+            ("src/a.py".to_string(), true),
+        ];
+        assert_eq!(builds_mcp_server(&d, &gone, ""), None);
+        let removed = "--- a/requirements.txt\n+++ /dev/null\n-mcp[cli]>=1.12\n";
+        assert_eq!(builds_mcp_server(&d, &[], removed), Some(true));
+        for (text, want) in [
+            ("--requirement requirements/server.txt\n", None),
+            ("--constraint=constraints.txt\nhttpx\n", None),
+            ("\u{feff}mcp>=1.12\n", Some(true)),
+        ] {
+            let d = scope_dir("opts");
+            std::fs::write(d.join("requirements.txt"), text).unwrap();
+            assert_eq!(
+                builds_mcp_server(&d, &[("src/a.py".to_string(), true)], ""),
+                want,
+                "{text:?}"
+            );
+        }
+        let d = scope_dir("utf16");
+        let utf16: Vec<u8> = [0xFF, 0xFE]
+            .into_iter()
+            .chain("mcp>=1.12\n".encode_utf16().flat_map(|u| u.to_le_bytes()))
+            .collect();
+        std::fs::write(d.join("requirements.txt"), utf16).unwrap();
+        assert_eq!(
+            builds_mcp_server(&d, &[("src/a.py".to_string(), true)], ""),
+            None
+        );
+        let d = scope_dir("escaped");
+        std::fs::write(
+            d.join("package.json"),
+            r#"{"dependencies":{"@modelcontextprotocol\u002fsdk":"^1.20.0"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            builds_mcp_server(&d, &[("src/a.ts".to_string(), true)], ""),
+            Some(true)
+        );
+        let d = scope_dir("badjson");
+        std::fs::write(d.join("package.json"), "{ not json").unwrap();
+        assert_eq!(
+            builds_mcp_server(&d, &[("src/a.ts".to_string(), true)], ""),
+            None
+        );
+        #[cfg(unix)]
+        {
+            let d = scope_dir("dangling");
+            std::os::unix::fs::symlink("../shared/package.json", d.join("package.json")).unwrap();
+            assert_eq!(
+                builds_mcp_server(&d, &[("src/a.ts".to_string(), true)], ""),
+                None
+            );
+        }
     }
 
     /// (core#1414) A manifest that exists and cannot be read leaves the fit unknown: nothing is
@@ -839,7 +958,7 @@ mod tests {
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
         // Root can read anything; the case only exists for an ordinary user.
         let readable = std::fs::read(&f).is_ok();
-        let got = builds_mcp_server(&d, &["src/a.ts".to_string()], "");
+        let got = builds_mcp_server(&d, &[("src/a.ts".to_string(), true)], "");
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
         if !readable {
             assert_eq!(got, None);
