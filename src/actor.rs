@@ -11679,9 +11679,18 @@ fn dispatch_probe_job(
     let requirements = agent
         && session.base_commit.is_some()
         && (unit.role == crate::workflow::PhaseRole::Evaluator || qe_unit);
-    // An Apps publish's produce step: its dispatch guard reads the tree (`apps::dispatch_refusal`).
+    // An Apps publish's produce step: its dispatch guard reads the tree (`apps::dispatch_refusal`);
+    // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
-    if !(baseline || new_author.is_some() || qe_unit || editor || requirements || publish_tree) {
+    let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
+    if !(baseline
+        || new_author.is_some()
+        || qe_unit
+        || editor
+        || requirements
+        || publish_tree
+        || walkthrough)
+    {
         return None;
     }
     Some(dispatch_probe::ProbeJob {
@@ -12815,7 +12824,15 @@ fn dispatch_unit_with(
                     &session,
                     unit,
                     &units,
-                    walkthrough_tree(&*store, &session),
+                    // (core#1390) The probe's read of the tree, when the dispatch has one.
+                    match probe.as_ref() {
+                        Some(p) => p
+                            .snapshot
+                            .as_ref()
+                            .map(|s| s.tree.clone())
+                            .map_err(String::clone),
+                        None => walkthrough_tree(&*store, &session),
+                    },
                 )
             })
             .flatten();
@@ -13308,6 +13325,7 @@ fn dispatch_unit_with(
                     // actor; a Tool unit carries no author probe, so no failure tree.
                     worktree_clean: tool_worktree_clean,
                     tree_after_failure: None,
+                    phase_scope: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal

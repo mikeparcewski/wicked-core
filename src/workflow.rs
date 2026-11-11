@@ -424,6 +424,18 @@ pub struct UnitEvidence {
     /// unproductive-author retraction. `None` = not read here; the fold then reads it itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tree_after_failure: Option<PostStepTree>,
+    /// (core#1390) A pre-build unit's phase-scope observation (core#283), read on the worker thread
+    /// after the step. `None` = not read here; the fold then reads it itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_scope: Option<PhaseScopeRead>,
+}
+
+/// (core#1390) What the worker read for the fold's phase-scope warning ([`UnitEvidence::phase_scope`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PhaseScopeRead {
+    /// The warning, when the unit's worktree contribution touched non-documentation files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warning: Option<String>,
 }
 
 /// (core#1390) A tree read on the worker thread after a step ([`UnitEvidence::tree_after_failure`]).

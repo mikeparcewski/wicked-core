@@ -4666,6 +4666,16 @@ fn run_unit_and_judge_on(
     let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
     evidence.worktree_clean = worktree_clean;
     evidence.tree_after_failure = tree_after_failure;
+    if input.unit.pre_build_scope {
+        if let Some(wd) = input.workdir.as_deref() {
+            evidence.phase_scope = Some(crate::workflow::PhaseScopeRead {
+                warning: crate::actor::phase_scope_warning(
+                    &input.unit,
+                    Some(&wd.to_string_lossy()),
+                ),
+            });
+        }
+    }
     (output, verdict, evidence)
 }
 
@@ -6058,6 +6068,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         // Read by `run_unit_and_judge_on`, after every way out of this function.
         worktree_clean: None,
         tree_after_failure: None,
+        phase_scope: None,
     };
     (output, agent_verdict, evidence)
 }

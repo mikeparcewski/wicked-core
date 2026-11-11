@@ -462,6 +462,10 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
     );
     assert_eq!(output.status, StepStatus::Ok, "the runner's own status");
     assert_eq!(evidence.worktree_clean, Some(true));
+    assert_eq!(
+        evidence.phase_scope, None,
+        "not a pre-build unit: no phase-scope read"
+    );
     let tree = evidence
         .tree_after_failure
         .expect("the fold will fail this attempt: its tree is read on the worker");
@@ -521,6 +525,55 @@ fn a_repository_reregistered_while_the_probe_ran_is_probed_again() {
         probes() >= 2,
         "the stale read was not taken: the dispatch probed again ({} answers)",
         probes()
+    );
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// (review of #1411) A pre-build unit's phase-scope observation is read on the worker and handed
+/// to the fold with the result.
+#[test]
+fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
+    let f = fixture("scope");
+    let repo = f.dir.join("repo");
+    std::fs::write(repo.join("src/jumped.ts"), "export const j = 1;\n").unwrap();
+    let mut unit = crate::domain::WorkUnit::pending("s:s1", "s", 1, "design it");
+    unit.pre_build_scope = true;
+    let input = StepInput {
+        run_id: "s".into(),
+        unit_ix: 0,
+        attempt: 0,
+        unit,
+        workflow_id: "wf".into(),
+        entity_mode: crate::EntityMode::Shared,
+        workdir: Some(repo.clone()),
+        governance: None,
+        prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
+        required_skills: Vec::new(),
+    };
+    let runner: Arc<dyn StepRunner> = Arc::new(Seat::default());
+    let (_, _, evidence) = crate::cli_runner::run_unit_and_judge(
+        &runner,
+        &input,
+        None,
+        &|_: &str| {},
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+    );
+    let read = evidence.phase_scope.expect("read on the worker");
+    assert!(
+        read.warning
+            .as_deref()
+            .is_some_and(|w| w.contains("jumped.ts")),
+        "the non-doc contribution is named: {read:?}"
     );
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
