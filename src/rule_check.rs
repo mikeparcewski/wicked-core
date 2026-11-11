@@ -966,11 +966,16 @@ fn no_source_code(change: &Change) -> Option<String> {
     let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
     let known_non_code = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
-        // (core#1381 review) MDX is markdown that carries imports, exports and JSX: code.
+        // (core#1381 review) MDX is markdown that carries imports, exports and JSX: code. A
+        // build file or a dependency manifest that ends in `.txt` is not text either.
+        let build_or_manifest = name == "cmakelists.txt"
+            || (name.starts_with("requirements") && name.ends_with(".txt"))
+            || name.starts_with("constraints") && name.ends_with(".txt");
         (language_of(p).is_some_and(|l| l == "markdown") && !name.ends_with(".mdx"))
-            || [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
-                .iter()
-                .any(|e| name.ends_with(e))
+            || (!build_or_manifest
+                && [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
+                    .iter()
+                    .any(|e| name.ends_with(e)))
             || matches!(
                 name.as_str(),
                 "license" | "changelog" | "readme" | ".gitignore"
@@ -2810,12 +2815,29 @@ const SUBSTANCE_NOTE: &str = "  Judged here: its substance only (the change uses
                               pinning them. A change that adds or changes logic is judged, never \
                               N/A.\n";
 /// (core#1381) How the record call labels the reviewer's own output.
-const REVIEWER_RECORD_LABEL: &str = "the reviewer of this step (its own output at this gate)";
+const REVIEWER_RECORD_LABEL: &str =
+    "the reviewer of this step (its STACK-CHECK lines at this gate)";
 
-/// (core#1381) The reviewer's record the record call reads: its output, when it has any text.
-fn reviewer_record<'a>(input: &CheckInput<'a>) -> Option<&'a str> {
-    input.reviewer_record.filter(|t| !t.trim().is_empty())
+/// (core#1381) The reviewer's record the record call reads: ONLY its `STACK-CHECK:` lines (the
+/// governed-worker skill's E5 asks the reviewer for one), each at the start of a line (list or
+/// quote gutters aside); `None` when it wrote none. A bare "kept" anywhere in its output is never
+/// a record, and the rest of its output (a BROKEN line it later drops, say) never moves the record
+/// evidence key, so a dispute on unchanged code still carries (review on #1426).
+fn reviewer_record(input: &CheckInput<'_>) -> Option<String> {
+    let lines: Vec<&str> = input
+        .reviewer_record?
+        .lines()
+        .map(|l| {
+            l.trim_start_matches([' ', '\t', '-', '*', '>', '`'])
+                .trim_end()
+        })
+        .filter(|l| l.starts_with(STACK_CHECK_MARK) && l.len() > STACK_CHECK_MARK.len())
+        .collect();
+    (!lines.is_empty()).then(|| lines.join("\n"))
 }
+
+/// The line a stack check is recorded on (`assumptions::STACK_CHECK_CONVENTION`).
+const STACK_CHECK_MARK: &str = "STACK-CHECK:";
 
 /// …and its record judge: the record clause only.
 const RECORD_NOTE: &str = "  Judged here: its record clause only (the records state what was \
@@ -2962,7 +2984,8 @@ pub fn check(
             None => parts.push(b"\0unreadable"),
         }
         // (core#1381) The reviewer's record is evidence the record call reads.
-        if let Some(t) = reviewer_record(input) {
+        let reviewer = reviewer_record(input);
+        if let Some(t) = &reviewer {
             parts.push(b"\0reviewer");
             parts.push(t.as_bytes());
         }
@@ -3849,7 +3872,8 @@ fn run_pool(
                 // One call never mixes subjects (the schedule groups them).
                 let subject = pending[batch[0]].subject;
                 let records = input.creator_records.unwrap_or(&[]);
-                let reviewer = reviewer_record(input);
+                let reviewer_owned = reviewer_record(input);
+                let reviewer = reviewer_owned.as_deref();
                 let engine = input.engine_record.unwrap_or("");
                 // The records a record call cut (a cut record proves presence, never absence).
                 let mut cut_records: Vec<usize> = Vec::new();

@@ -3803,9 +3803,8 @@ fn a_review_judge_rules_on_the_change_and_keeps_unknown_for_what_it_touches() {
 const REC_NO_CHECK: &str = "Changed src/add.rs to take two arguments and return their sum; the \
                             tests in tests/add.rs pass (cargo test: exit 0).";
 /// The reviewer's own output, which records the check it made.
-const REVIEWER_CHECKED: &str =
-    "Reviewed src/add.rs. STACK-CHECK: looked at the std::ops::Add docs \
-                                at the pinned toolchain :: offers the + operator this change \
+const REVIEWER_CHECKED: &str = "Reviewed src/add.rs.\n- STACK-CHECK: looked at the std::ops::Add \
+                                docs at the pinned toolchain :: offers the + operator this change \
                                 already uses; nothing is rebuilt.\nRULE POL-2101: KEPT — no \
                                 duplicate\nVERDICT: PASS";
 
@@ -3901,16 +3900,40 @@ fn core1381_a_reviewer_record_never_unbreaks_the_rule() {
     assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken);
     assert!(r.denial().is_some());
 
-    let rec_b = "BROKEN — RECORD 1 and RECORD 2 never say what was looked at";
+    // A reviewer that only claims the rule is kept wrote no STACK-CHECK line: no reviewer record
+    // is shown at all, and the creator's missing check breaks the rule.
+    let rec_b = "BROKEN — RECORD 1 never says what was looked at";
     let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
     let r = run_pol_2101(
         &change(),
         &judge,
         &record(REC_NO_CHECK),
-        Some("Reviewed src/add.rs: fine.\nRULE POL-2101: KEPT — no duplicate\nVERDICT: PASS"),
+        Some("Reviewed src/add.rs: fine, it checked the stack.\nRULE POL-2101: KEPT — no duplicate\nVERDICT: PASS"),
     );
     assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
     assert!(r.denial().is_some());
+    assert!(judge
+        .of(Asked::Record)
+        .iter()
+        .all(|p| !p.contains("the reviewer of this step")));
+}
+
+/// (review on #1426) Only the reviewer's STACK-CHECK lines are its record: what else it writes
+/// (a BROKEN it later drops, say) never moves the evidence key, so a dispute on unchanged code and
+/// an unchanged recorded check still carries; a changed check line does move it.
+#[test]
+fn core1381_only_the_reviewers_stack_check_lines_key_the_record() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_k = "KEPT — \"looked at the std::ops::Add docs at the pinned toolchain\"";
+    let key = |reviewer: &str| {
+        let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_k)]);
+        let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(reviewer));
+        row_of(&r, "POL-2101").evidence_key.clone().expect("a key")
+    };
+    let with_broken = format!("{REVIEWER_CHECKED}\nRULE POL-2101: BROKEN — src/add.rs rebuilds +");
+    assert_eq!(key(REVIEWER_CHECKED), key(&with_broken));
+    let other = REVIEWER_CHECKED.replace("nothing is rebuilt", "Add is reused");
+    assert_ne!(key(REVIEWER_CHECKED), key(&other));
 }
 
 /// A BROKEN that names only the reviewer's record, or that rests on a reviewer record the prompt
@@ -3933,7 +3956,7 @@ fn core1381_a_broken_needs_a_whole_creator_record_and_a_whole_reviewer_record() 
         "{r:?}"
     );
 
-    let long = format!("{}{}", "x".repeat(RECORD_CAP * 9), REVIEWER_CHECKED);
+    let long = format!("STACK-CHECK: looked at {}", "x".repeat(RECORD_CAP * 9));
     let rec_b = "BROKEN — RECORD 1 never says what was looked at";
     let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
     let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(&long));
@@ -3989,6 +4012,20 @@ fn core1381_pol_2101_is_not_applicable_by_fact_on_a_change_with_no_code() {
     let r = run_pol_2101(&mdx, &judge, &record(REC_NO_CHECK), None);
     assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
     assert!(r.denial().is_some());
+    // (review) A build file or a dependency manifest that ends in `.txt` is not text.
+    for (path, body) in [
+        ("CMakeLists.txt", "+function(my_join out a b)\n"),
+        ("requirements.txt", "+leftpad-py==1.0\n"),
+    ] {
+        let c = change_of(&format!("--- a/{path}\n+++ b/{path}\n{body}"), &[path]);
+        let judge = PackJudge::with(&[("POL-2101", "BROKEN — it rebuilds a built-in")], &[], &[]);
+        let r = run_pol_2101(&c, &judge, &record(REC_NO_CHECK), None);
+        assert_eq!(
+            row_of(&r, "POL-2101").status,
+            RuleStatus::Broken,
+            "{path}: {r:?}"
+        );
+    }
     // A source file in the change: judged as before.
     let judge = PackJudge::with(&[("POL-2101", "BROKEN — x")], &[], &[]);
     let r = run_pol_2101(&change(), &judge, &record(REC_GOOD), None);
