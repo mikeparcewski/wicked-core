@@ -28,8 +28,6 @@ use super::{cluster, label_value, Kube};
 pub(crate) const CONTAINER: &str = "checks";
 /// The in-memory dir the check wrapper writes its exit code to.
 pub(crate) const RC_DIR: &str = "/wicked-rc";
-/// The check wrapper's exit-code file.
-pub(crate) const RC_FILE: &str = "/wicked-rc/rc";
 /// How long a floor or fill pod may take to be admitted and start.
 pub(crate) const POD_START: Duration = Duration::from_secs(120);
 

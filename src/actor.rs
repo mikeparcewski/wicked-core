@@ -1127,6 +1127,15 @@ pub(crate) fn run(
             }
         }
     }
+    // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
+    // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
+    // skips it (liveness unknown).
+    match crate::domain::all_sessions(&store) {
+        Ok(sessions) => crate::k8s::boot_sweep(partition_sessions_for_reap(&sessions).0),
+        Err(e) => {
+            eprintln!("wicked-core: skipping the cluster boot sweep: cannot read sessions ({e})")
+        }
+    }
     // (DES-TEAMING-002 §8.8) A member turn's read-only view is removed when the turn ends; one an
     // engine crash mid-turn left behind goes here, once per process (only views past the age
     // threshold that no live turn holds, so another engine's live views on the same temp dir
@@ -10040,6 +10049,8 @@ fn remove_run_floor_cache(workdir: Option<&str>, run_id: &str) {
         }
         crate::repo_checks::remove_check_scratch(std::path::Path::new(wd), run_id);
     }
+    // k8s-swap B-5: the run's namespace (pods, replica, per-run cache claims) goes with it.
+    crate::k8s::release_run(run_id);
 }
 
 /// core#290 — the other half of [`reap_terminal_worktree`]: give a resuming run its worktree BACK.

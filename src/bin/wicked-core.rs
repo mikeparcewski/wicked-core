@@ -217,6 +217,16 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
          absolute gateway directory. Needs a container runtime (Unix host).",
     ),
     (
+        "cluster",
+        "wicked-core cluster install --admin-context <ctx> [--home <dir>] | cluster uninstall \
+         --admin-context <ctx> [--home <dir>] [--controller] | cluster status [--json] [--home <dir>]\n  \
+         Install the pinned agent-sandbox controller and this daemon's scoped engine account on a \
+         local Kubernetes cluster (the governed seats, the checks floor and the model gateway run \
+         there), refusing a cluster without a pod pids limit or enforced NetworkPolicy; remove \
+         them; or report the cluster, the controller, the gateway, run namespaces and pending pods \
+         as JSON. The current kubectl context is never used.",
+    ),
+    (
         "gate-hook",
         "wicked-core gate-hook [--protocol-version]\n  \
          The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
@@ -352,6 +362,14 @@ fn main() {
             return;
         }
         std::process::exit(wicked_core::seat_image_main(&args[2..]));
+    }
+
+    // The daemon's cluster: no store, no actor.
+    if args.get(1).map(String::as_str) == Some("cluster") {
+        if handled_help("cluster", &args) {
+            return;
+        }
+        std::process::exit(wicked_core::cluster_main(&args[2..]));
     }
 
     // Login handoff addresses runtime volumes only: no store, no actor.

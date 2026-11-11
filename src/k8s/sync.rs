@@ -435,6 +435,7 @@ pub(crate) fn digest(e: &Entry) -> [u8; 32] {
 /// The write-back's checks on one root's entries (untrusted: they came from a seat's replica).
 /// `skip` = relative paths the seat could never write on the host (masks, nested roots): their
 /// entries are dropped, never applied. `Err` names the first refused entry.
+#[cfg(test)]
 pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, String> {
     check_entries_against(root, skip, &std::collections::HashMap::new())
 }
@@ -501,6 +502,7 @@ pub(crate) fn check_entries_against(
 
 /// The host files of a root that the write-back deletes: those `listed` on the host and absent
 /// from the replica's `entries`, except what the seat could never see (`skip`).
+#[cfg(test)]
 pub(crate) fn deletions(listed: &[String], entries: &[Entry], skip: &[String]) -> Vec<String> {
     let have: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     listed
@@ -751,11 +753,6 @@ pub(crate) fn nested(root: &Path, others: &[PathBuf]) -> Vec<String> {
         .filter(|r| !r.is_empty())
         .map(str::to_string)
         .collect()
-}
-
-/// The replica path of a host path: the path without its leading `/`.
-pub(crate) fn replica_path(p: &Path) -> Option<String> {
-    super::render::replica_sub_path(p)
 }
 
 /// What one root's write-back did.

@@ -375,7 +375,7 @@ pub(crate) fn one_shot_scope(run_id: &str) -> Option<String> {
 pub(crate) fn place(kube: &Kube, run_id: &str) -> (String, Option<String>, String) {
     match one_shot_scope(run_id) {
         Some(scope) => (
-            super::run_namespace_name(&kube.owner, "sessions"),
+            super::run_namespace_name(&kube.owner, super::SESSIONS_RUN),
             Some(scope),
             "sessions".to_string(),
         ),
@@ -2569,14 +2569,4 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         settled: Mutex::new(false),
         deps: false,
     })
-}
-
-/// A replica entry kind for the tests' fixtures.
-#[cfg(test)]
-pub(crate) fn file(path: &str, data: &[u8]) -> Entry {
-    Entry {
-        kind: sync::Kind::File,
-        path: path.into(),
-        data: data.to_vec(),
-    }
 }
