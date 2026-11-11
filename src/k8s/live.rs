@@ -191,7 +191,7 @@ fn k8s_live_the_cluster_round_trip_holds_every_pod_layer_row() {
     // A run namespace and one seat.
     let run = format!("live-{}", uuid::Uuid::new_v4().simple());
     let ns = cluster::ensure_run(&engine, &run, &RunBudget::default(), "1Gi").expect("run ns");
-    let tree = PathBuf::from("/Users/live/.wicked/repos/x/wt").join(&run);
+    let tree = PathBuf::from("/home/live/.wicked/repos/x/wt").join(&run);
     let sb = SeatPod {
         name: "seat-1".into(),
         namespace: ns.clone(),

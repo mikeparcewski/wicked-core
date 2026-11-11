@@ -29,14 +29,14 @@ fn seat() -> SeatPod {
         role: "seat".into(),
         image: "wicked-seat-codex:abc".into(),
         floor_image: "wicked-floor:def".into(),
-        workdir: PathBuf::from("/Users/op/.wicked/repos/x/wt/run-1"),
+        workdir: PathBuf::from("/home/op/.wicked/repos/x/wt/run-1"),
         mounts: vec![
             ReplicaMount {
-                path: PathBuf::from("/Users/op/.wicked/repos/x/wt/run-1"),
+                path: PathBuf::from("/home/op/.wicked/repos/x/wt/run-1"),
                 rw: true,
             },
             ReplicaMount {
-                path: PathBuf::from("/Users/op/.wicked/skills/snap"),
+                path: PathBuf::from("/home/op/.wicked/skills/snap"),
                 rw: false,
             },
         ],
@@ -131,9 +131,9 @@ fn k8s_no_configured_cluster_is_no_cluster_never_the_current_context() {
 
 #[test]
 fn k8s_names_are_dns_labels_and_label_values_never_collide() {
-    let owner = owner_id(Path::new("/Users/op/.wicked"));
+    let owner = owner_id(Path::new("/home/op/.wicked"));
     assert!(owner.len() == 13 && owner.starts_with('w'));
-    assert_ne!(owner, owner_id(Path::new("/Users/op/.wicked-dev")));
+    assert_ne!(owner, owner_id(Path::new("/home/op/.wicked-dev")));
     let ns = run_namespace_name(&owner, "9dda9f62-1234-4abc-8def-0123456789ab");
     assert!(ns.len() <= 63, "{ns}");
     assert!(ns
@@ -214,14 +214,14 @@ fn k8s_replica_paths_mount_at_their_host_paths_with_their_access() {
     let mounts = spec["containers"][0]["volumeMounts"].as_array().unwrap();
     let tree = mounts
         .iter()
-        .find(|m| m["mountPath"] == "/Users/op/.wicked/repos/x/wt/run-1")
+        .find(|m| m["mountPath"] == "/home/op/.wicked/repos/x/wt/run-1")
         .unwrap();
     assert_eq!(tree["name"], render::REPLICA_PVC);
-    assert_eq!(tree["subPath"], "Users/op/.wicked/repos/x/wt/run-1");
+    assert_eq!(tree["subPath"], "home/op/.wicked/repos/x/wt/run-1");
     assert_eq!(tree["readOnly"], false);
     let skills = mounts
         .iter()
-        .find(|m| m["mountPath"] == "/Users/op/.wicked/skills/snap")
+        .find(|m| m["mountPath"] == "/home/op/.wicked/skills/snap")
         .unwrap();
     assert_eq!(skills["readOnly"], true);
     for bad in ["/tmp/x", "/floor", "/", "/a/../b", "rel/x"] {
