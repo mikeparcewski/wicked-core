@@ -5,12 +5,13 @@
 # (`containers/floor.Dockerfile`): nothing of a seat runs here, and no seat runs this.
 # Built by the engine from this file alone (no build context), tagged by this file's hash, so an
 # edit (a toolchain bump) is a new image.
-#   node 22 + npm (the base), rust (pinned, with rustfmt and clippy), and the tools the suites spawn
+#   node 24 + npm (the base, pinned to a release: crew's uploads need Node 24.12 or later, and CI
+#   runs 24; the file keeps its historical name), rust (pinned, with rustfmt and clippy), and the tools the suites spawn
 #   that a slim base lacks: procps (`ps`), unzip, python3, git, a C toolchain for build scripts.
 #   Python suites (core#1401: wicked-garden's `python3 -m pytest`) get pytest, PyYAML and zstandard,
 #   and jq (the seat image has it; suites shell out to it), from Debian's own archive, the source
 #   every package here comes from: no PyPI, no new registry.
-ARG BASE=node:22-trixie-slim
+ARG BASE=node:24.22.2-trixie-slim
 FROM ${BASE}
 ARG RUST_TOOLCHAIN=1.99.1
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
