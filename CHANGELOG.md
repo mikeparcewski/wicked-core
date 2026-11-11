@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Requirements carry a business domain, not just their directory (reqgraph Fix B).** A requirement's domain is
+  its package directory (`<dir>::REQ-NNN`), which fit a product owner's view on 57% of the rows measured on AutoGPT.
+  wicked-garden's extractor now proposes the repository's business domains from code evidence and writes each rule's
+  pick on its code node as a `business_domain` annotation. `domain-graph` reads it: each requirement carries an
+  optional `business_domain` `{id, name, confidence}` (the highest-confidence pick that parses; anything malformed is
+  ignored, never repaired), and `metadata.business_domains[]` lists each area with its purpose, its requirement count
+  and the package directories it spans, which maps the unchanged requirement keys to the business area. Keys,
+  `SatisfiedBy` edges, overrides and coverage do not move: the annotation is not an accounting type. Domain-model
+  documents stay `1.1.0` (both fields optional, 1.1.0 only); the schema bundle is 1.3.1. The page review also judges
+  the proposed domains and the picks.
+- **domain-graph no longer warns about its own nodes (wicked-core#1376).** The coverage classifier's
+  unknown-kind warning skipped nothing, so every build printed it twice for `requirements_target`, the node that
+  holds a repository's own minimum. Core's own kinds (`requirements_target`, `requirements_graph`, `domain`,
+  `requirement`) are now known and skipped; any other unknown kind still warns.
+
 - **A unit's dispatch reads its worktree off the actor, once (wicked-core#1390, part 2).** A dispatch used to take up
   to four git snapshots of the run's worktree on the actor thread (the baseline, the tree a new author starts on, the
   QE floor note's tree, the editor-conformance tree), plus an Apps publish's and a walkthrough's tree reads, a QE
