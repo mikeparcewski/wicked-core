@@ -53,10 +53,21 @@ pub(crate) fn mark_with(name: &str, detail: Option<String>) {
     });
 }
 
-/// The phases so far and the arm's whole time (ms), ending the clock. `None` when none ran.
+/// The phases so far (the time since the last mark as `unmarked`) and the arm's whole time (ms),
+/// ending the clock. `None` when none ran.
 pub(crate) fn take() -> Option<(Vec<Phase>, u64)> {
     CLOCK.with(|c| {
-        c.borrow_mut().take().map(|clock| {
+        c.borrow_mut().take().map(|mut clock| {
+            // The time after the last mark (a phase that failed, or the arm's tail) is said too
+            // (codex r1 #12): a refused arm shows where its time went.
+            let rest = clock.last.elapsed().as_millis() as u64;
+            if rest > 0 {
+                clock.phases.push(Phase {
+                    name: "unmarked".to_string(),
+                    ms: rest,
+                    detail: None,
+                });
+            }
             let total = clock.start.elapsed().as_millis() as u64;
             (clock.phases, total)
         })
@@ -76,15 +87,18 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         mark("first");
         mark_with("second", Some("3 entries".into()));
+        std::thread::sleep(std::time::Duration::from_millis(5));
         let (phases, total) = take().expect("a clock ran");
+        // The time after the last mark is said as `unmarked` (a phase that failed).
         assert_eq!(
             phases.iter().map(|p| p.name.as_str()).collect::<Vec<_>>(),
-            vec!["first", "second"]
+            vec!["first", "second", "unmarked"]
         );
         assert!(phases[0].ms >= 20, "{phases:?}");
         assert!(phases[1].ms < phases[0].ms, "{phases:?}");
         assert_eq!(phases[1].detail.as_deref(), Some("3 entries"));
-        assert!(total >= phases[0].ms + phases[1].ms);
+        assert!(phases[2].ms >= 5, "{phases:?}");
+        assert!(total >= phases[0].ms + phases[1].ms + phases[2].ms);
         // Taken once: the clock ended.
         assert!(take().is_none());
         // Another thread's arm never sees this one's clock.
@@ -95,6 +109,6 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert!(take().unwrap().0.is_empty());
+        assert!(take().unwrap().0.iter().all(|p| p.name == "unmarked"));
     }
 }

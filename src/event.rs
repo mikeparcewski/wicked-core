@@ -1554,9 +1554,11 @@ pub enum CoreEvent {
         secs: u64,
     },
     /// Where the engine's arm of a unit's seat spent its time (k8s-final: phase C measured 51 s from
-    /// dispatch to the seat pod's creation, and nothing said where it went). Emitted once per arm,
-    /// whether it armed (`ok`) or was refused; `phases` in order, each charged the time since the
-    /// previous one ended, `totalMs` the whole arm. Additive: a new frame.
+    /// dispatch to the seat pod's creation, and nothing said where it went). Emitted once per arm:
+    /// `ok` = the seat pod armed (a later admission check may still refuse the unit, and says so
+    /// itself), else the arm was refused; `phases` in order, each charged the time since the
+    /// previous one ended (the time after the last as `unmarked`), `totalMs` the whole arm.
+    /// Additive: a new frame.
     SeatArmTimed {
         session: String,
         ord: u32,
