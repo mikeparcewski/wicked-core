@@ -305,10 +305,44 @@ pub(crate) fn kube_for(home: &Path) -> Result<Kube, (FloorUnarmed, String)> {
     )
 }
 
+/// Each run's arm epoch behind its lifecycle lock (codex b5 #9/#10): every arm of the run bumps
+/// it under the lock (so it waits out a namespace deletion in flight), and a release scheduled
+/// at an earlier epoch is void, so a run resumed after it ended never loses its new namespace.
+static LIFE: std::sync::Mutex<
+    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<u64>>>>,
+> = std::sync::Mutex::new(None);
+
+fn life(run_id: &str) -> std::sync::Arc<std::sync::Mutex<u64>> {
+    let mut g = LIFE.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .entry(run_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The run's arm epoch now (0 = never armed by this process).
+pub(crate) fn run_epoch(run_id: &str) -> u64 {
+    *life(run_id).lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The run arms (a seat or a floor is about to use its namespace): waits out a release in
+/// flight, then voids every release scheduled before now.
+pub(crate) fn arming(run_id: &str) {
+    let l = life(run_id);
+    let mut g = l.lock().unwrap_or_else(|p| p.into_inner());
+    *g += 1;
+}
+
 /// A run reached a terminal state (B-5; called off the actor thread with every terminal
-/// transition): its namespace goes, with its pods, replica and per-run cache claims. A resumed
-/// run gets a new one. Nothing happens when the daemon has no cluster configured.
-pub(crate) fn release_run(run_id: &str) {
+/// transition, `epoch` read when it did): its namespace goes, with its pods, replica and per-run
+/// cache claims, and is waited out, unless the run armed again since. A resumed run gets a new
+/// one. Nothing happens when the daemon has no cluster configured.
+pub(crate) fn release_run(run_id: &str, epoch: u64) {
+    let l = life(run_id);
+    let g = l.lock().unwrap_or_else(|p| p.into_inner());
+    if *g != epoch {
+        return;
+    }
     let Some(home) = engine_home() else {
         return;
     };
@@ -319,9 +353,11 @@ pub(crate) fn release_run(run_id: &str) {
     {
         return;
     }
-    if let Err(e) = cluster::delete_run(&kube, run_id, false) {
+    if let Err(e) = cluster::delete_run(&kube, run_id, true) {
         eprintln!("wicked-core: run {run_id}'s namespace was not deleted: {e}");
     }
+    crate::checks_container::forget_namespace(&run_namespace_name(&kube.owner, run_id));
+    drop(g);
 }
 
 /// The daemon's boot sweep (B-5), off the actor thread: the namespaces of runs that are not
@@ -347,7 +383,9 @@ pub(crate) fn boot_sweep(live: std::collections::HashSet<String>) {
             if cluster::probe_cached(&kube).is_err() {
                 return;
             }
-            let is_live = |run: &str| run == SESSIONS_RUN || live.contains(run);
+            // A run that armed in this process since boot is live too (codex b5 #10).
+            let is_live =
+                |run: &str| run == SESSIONS_RUN || live.contains(run) || run_epoch(run) > 0;
             match cluster::sweep(&kube, &is_live, Some(&started)) {
                 Ok(done) if !done.is_empty() => {
                     eprintln!("wicked-core: the boot sweep removed {}", done.join(", "))

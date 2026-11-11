@@ -1024,3 +1024,39 @@ fn k8s_a_commit_into_the_runs_node_modules_is_refused_for_a_deps_seat() {
         "src/node_modules_util.rs"
     ));
 }
+
+// ── codex per-module round (b5): folds ──────────────────────────────────────────────────────
+
+#[test]
+fn k8s_a_release_scheduled_before_a_rearm_is_void() {
+    let run = format!("epoch-{}", uuid::Uuid::new_v4().simple());
+    let before = super::run_epoch(&run);
+    super::arming(&run);
+    assert_eq!(super::run_epoch(&run), before + 1);
+    // Scheduled at the old epoch: returns at once, touching nothing (no cluster is configured
+    // in a unit test, and none is asked).
+    super::release_run(&run, before);
+}
+
+#[test]
+fn k8s_only_the_engines_own_kubeconfig_is_renewed() {
+    let mut k = kube();
+    k.context = super::OWN_CONTEXT.into();
+    k.kubeconfig = Some(PathBuf::from("/operator/.kube/config"));
+    assert!(
+        !cluster::renews(&k),
+        "an operator file with a context named wicked"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_install_refuses_a_linked_credential_dir() {
+    let home =
+        std::env::temp_dir().join(format!("wicked-k8s-home-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&home).unwrap();
+    std::os::unix::fs::symlink("/tmp", home.join("k8s")).unwrap();
+    let e = super::cli::install_for_test(&home).unwrap_err();
+    assert!(e.contains("a link is refused"), "{e}");
+    let _ = std::fs::remove_dir_all(&home);
+}

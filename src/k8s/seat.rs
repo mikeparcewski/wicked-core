@@ -446,9 +446,22 @@ fn ensure_sync(
     floor: &str,
 ) -> Result<(), (FloorUnarmed, String)> {
     clear_sync_suspect(kube, ns).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+    // Only a sync pod of this boot is used (codex b5 #10): a predecessor's may still run a codec
+    // its engine left, and the boot sweep removes it; it is replaced here, never shared.
     let running = |kube: &Kube| -> Result<bool, String> {
         let pods = kube.list_owned(Some(ns), "pods", &[(ROLE_LABEL, "sync")])?;
-        Ok(cluster::running_pod(&pods).as_deref() == Some("sync"))
+        let ours: Vec<Value> = pods
+            .into_iter()
+            .filter(|p| {
+                p.pointer(&format!(
+                    "/metadata/labels/{}",
+                    super::BOOT_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                    == Some(super::boot_id())
+            })
+            .collect();
+        Ok(cluster::running_pod(&ours).as_deref() == Some("sync"))
     };
     if running(kube).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))? {
         return Ok(());
@@ -1198,6 +1211,7 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
+    super::arming(s.run_id);
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
     ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;

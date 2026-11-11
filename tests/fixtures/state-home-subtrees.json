@@ -77,6 +77,13 @@
       "worker_read": "none (a container seat reaches the gateway only over its network; the container floor covers this directory even inside a mounted checkout)"
     },
     {
+      "name": "k8s",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/k8s/mod.rs own_kubeconfig — <state home>/k8s/kubeconfig, the engine's own cluster credential (a scoped service-account token) that `wicked-core cluster install --home <state home>` writes (0600) and `cluster uninstall` removes",
+      "worker_read": "none (seat pods reach no host path; the floor covers this directory like the gateway's, and a seat-writable tree over it is refused)"
+    },
+    {
       "name": "learn-schedules.json",
       "kind": "file",
       "owner": "crew",

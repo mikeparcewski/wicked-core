@@ -158,7 +158,14 @@ fn status(home: &Path) -> (Value, i32) {
         let dep = kube.get_json(Some(&ns), "deployment", render::GATEWAY_NAME)?;
         let gw_pods = kube.list_owned(Some(&ns), "pods", &[(ROLE_LABEL, "gateway")])?;
         let runs = kube.list_owned(None, "namespaces", &[(ROLE_LABEL, "run")])?;
-        let pods = kube.list_owned(None, "pods", &[])?;
+        // Every owned namespace's pods (codex b5 #15): no namespace means the context's default
+        // one, where none of this daemon's pods live.
+        let mut pods = kube.list_owned(Some(&ns), "pods", &[])?;
+        for r in &runs {
+            if let Some(n) = r.pointer("/metadata/name").and_then(Value::as_str) {
+                pods.extend(kube.list_owned(Some(n), "pods", &[])?);
+            }
+        }
         Ok(status_doc(
             &kube.context,
             cluster::controller_ready(&kube),
@@ -180,25 +187,95 @@ fn status(home: &Path) -> (Value, i32) {
 
 /// Install, then prove the cluster can hold seats (pids limit + enforced NetworkPolicy); a
 /// cluster that cannot is refused and left as it was found (the controller stays: it is shared).
+/// A daemon already installed there (its credential or namespace exists) is never torn down by
+/// a failed reinstall (codex b5 #4): its runs, claims and gateway stay, and the failure says so.
 fn install(a: &Args, home: &Path) -> Result<Value, String> {
+    // The engine's credential dir is the state home's own: a link there is refused, never
+    // followed (codex b5 #2).
+    let dir = home.join("k8s");
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(format!(
+            "{} is not a directory (a link is refused); remove it and install again",
+            dir.display()
+        ));
+    }
     let admin = admin(a, home)?;
-    let path = cluster::install(&admin, home)?;
-    let refuse = |why: String| {
-        let _ = std::fs::remove_file(&path);
-        let _ = cluster::uninstall(&admin, false);
-        why
+    let own = super::own_kubeconfig(home);
+    let existed = own.is_file()
+        || admin
+            .get_json(None, "namespace", &daemon_namespace_name(&admin.owner))
+            .ok()
+            .flatten()
+            .is_some();
+    // Undo a fresh install; report what could not be undone (codex b5 #6).
+    let undo = |why: String| -> String {
+        if existed {
+            return format!("{why}; the existing installation was left as it was");
+        }
+        let mut left = Vec::new();
+        if let Err(e) = cluster::uninstall(&admin, false) {
+            left.push(format!("cluster objects ({e})"));
+        }
+        match std::fs::remove_file(&own) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                left.push(format!("{} ({e})", own.display()))
+            }
+            _ => {}
+        }
+        if left.is_empty() {
+            format!("{why}; nothing of this daemon was left on the cluster")
+        } else {
+            format!("{why}; could not remove: {}", left.join(", "))
+        }
     };
-    let engine = super::kube_for(home).map_err(|(_, e)| refuse(e))?;
+    let path = cluster::install(&admin, home).map_err(undo)?;
+    // The proof runs on the credential just written, whatever the environment names (codex b5
+    // #7): the cluster certified is the one installed into.
+    let engine = super::resolve_settings(
+        home,
+        std::env::var(super::KUBECTL_ENV).ok().as_deref(),
+        Some(&path.to_string_lossy()),
+        Some(super::OWN_CONTEXT),
+        std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .as_deref(),
+        crate::validator::find_on_path,
+    )
+    .map_err(|(_, e)| undo(e))?;
     let rt = crate::container_floor::runtime()
-        .map_err(|w| refuse(format!("an image builder is required: {}", w.describe())))?;
-    let floor = crate::container_floor::ensure_floor_image(&rt).map_err(refuse)?;
+        .map_err(|w| undo(format!("an image builder is required: {}", w.describe())))?;
+    let floor = crate::container_floor::ensure_floor_image(&rt).map_err(undo)?;
     let pids = cluster::ensure_pids_limited(&engine, &floor).map_err(|(why, e)| {
-        refuse(format!(
-            "{}: {e}; this cluster cannot hold governed seats, so nothing of this daemon was left on it",
+        undo(format!(
+            "{}: {e}; this cluster cannot hold governed seats",
             why.as_str()
         ))
     })?;
     Ok(json!({"installed": true, "kubeconfig": path, "podPidsLimit": pids}))
+}
+
+/// [`install`] with no admin choice (tests: refusals before any cluster call).
+#[cfg(test)]
+pub(crate) fn install_for_test(home: &Path) -> Result<Value, String> {
+    let a = parse(&["install", "--admin-context", "none"].map(String::from))?;
+    install(&a, home)
+}
+
+/// After a successful uninstall: this daemon's own credential goes with its cluster objects
+/// (codex b5 #8), and its dir when empty; an admin config named on the command line is never
+/// touched.
+fn forget_credential(home: &Path) -> Result<(), String> {
+    let own = super::own_kubeconfig(home);
+    match std::fs::remove_file(&own) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("{}: {e}", own.display()))
+        }
+        _ => {}
+    }
+    if let Some(d) = own.parent() {
+        let _ = std::fs::remove_dir(d);
+    }
+    Ok(())
 }
 
 /// The CLI entry: exit 0 done, 1 refused or failed, 2 bad arguments.
@@ -237,7 +314,10 @@ pub fn cluster_main(args: &[String]) -> i32 {
                 1
             }
         },
-        _ => match admin(&a, &home).and_then(|k| cluster::uninstall(&k, a.controller)) {
+        _ => match admin(&a, &home)
+            .and_then(|k| cluster::uninstall(&k, a.controller))
+            .and_then(|done| forget_credential(&home).map(|()| done))
+        {
             Ok(done) => {
                 println!("{}", json!({"removed": done}));
                 0

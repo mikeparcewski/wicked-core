@@ -53,7 +53,7 @@ pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
     // The engine's own token is renewed while the cluster answers (B-5): a 30-day TokenRequest,
     // renewed inside its last week. Only the engine's own context (an operator's kubeconfig is
     // never rewritten); a failed renewal is reported and the old token used until it expires.
-    if kube.context == super::OWN_CONTEXT {
+    if renews(kube) {
         if let Err(e) = renew_token_if_due(kube) {
             eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
         }
@@ -62,6 +62,17 @@ pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
         *last = Some((kube.clone(), std::time::Instant::now()));
     }
     Ok(())
+}
+
+/// Whether `kube`'s credential is the engine's own, the one renewal may rewrite (codex b5 #3):
+/// its context AND its file, `<state home>/k8s/kubeconfig` as `cluster install` wrote it. An
+/// operator's kubeconfig with a context of the same name is never rewritten.
+pub(crate) fn renews(kube: &Kube) -> bool {
+    kube.context == super::OWN_CONTEXT
+        && kube
+            .kubeconfig
+            .as_deref()
+            .is_some_and(|k| super::engine_home().is_some_and(|h| super::own_kubeconfig(&h) == k))
 }
 
 /// Whether the cluster can run seats now: the API server answers, the controller runs the
