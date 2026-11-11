@@ -3004,6 +3004,8 @@ impl GatewayLease {
     /// Revoke the seat's key and return what the gateway recorded for it (model requests:
     /// status, model, tool calls, text, usage — never a credential).
     pub(crate) fn release(mut self) -> Vec<crate::seat_gateway::GatewayRecord> {
+        // The gateway pod as it runs now, not as it ran at arm (review r6 #15).
+        self.gw = self.gw.current();
         let records = self.gw.records(&self.since, &self.unit);
         self.revoke();
         records
@@ -3017,6 +3019,7 @@ impl GatewayLease {
         if key.is_empty() {
             return;
         }
+        self.gw = self.gw.current();
         let mut last = String::new();
         for _ in 0..REVOKE_ATTEMPTS {
             match crate::k8s::gw::deregister_live(&self.gw, &key) {

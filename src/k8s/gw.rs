@@ -261,6 +261,27 @@ impl Gw {
         }
     }
 
+    /// This gateway as it runs now (review r6 #15): the pod is looked up again by its labels (a
+    /// quarantine or an eviction replaces it), the serving pod first, else the one whose writer
+    /// runs; unchanged when none can be read.
+    pub(crate) fn current(&self) -> Gw {
+        let pods =
+            match self
+                .kube
+                .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
+            {
+                Ok(p) => p,
+                Err(_) => return self.clone(),
+            };
+        match cluster::running_pod(&pods).or_else(|| cluster::writer_running(&pods)) {
+            Some(pod) => Gw {
+                pod,
+                ..self.clone()
+            },
+            None => self.clone(),
+        }
+    }
+
     /// The gateway's access-log records for `unit` since `since` (unix seconds).
     pub(crate) fn records(&self, since: &str, unit: &str) -> Vec<GatewayRecord> {
         let since = since

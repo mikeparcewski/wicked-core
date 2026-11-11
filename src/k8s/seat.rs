@@ -21,7 +21,7 @@
 //! runs; the CLI's exit code comes back through `/wicked-unit/rc`, so a lost stream is
 //! `exec_stream_lost`, never an exit code (A3).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
@@ -39,10 +39,10 @@ use crate::worker_sandbox::FloorUnarmed;
 /// exec's argv, which is a URL query on the API server), its working directory entered, the
 /// launcher run, its exit code written where [`settle`] reads it.
 pub(crate) const WRAPPER: &str = "set -u; u=/wicked-unit; \
-[ -f $u/env ] || { echo 'wicked-seat: the unit env is missing' >&2; exit 125; }; \
+[ -f $u/env ] || { echo 'wicked-seat: the unit env is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 . $u/env; /floor/busybox rm -f $u/env; \
-[ $# -gt 0 ] || { echo 'wicked-seat: the unit argv is missing' >&2; exit 125; }; \
-cd \"$WICKED_UNIT_CWD\" || { echo 'wicked-seat: the unit directory is missing' >&2; exit 125; }; \
+[ $# -gt 0 ] || { echo 'wicked-seat: the unit argv is missing' >&2; echo 125 > $u/rc; exit 125; }; \
+cd \"$WICKED_UNIT_CWD\" || { echo 'wicked-seat: the unit directory is missing' >&2; echo 125 > $u/rc; exit 125; }; \
 unset WICKED_UNIT_CWD; \"$@\"; rc=$?; \
 echo $rc > $u/rc.tmp && /floor/busybox mv $u/rc.tmp $u/rc; exit $rc";
 
@@ -55,6 +55,17 @@ const POD_START: Duration = Duration::from_secs(150);
 const CALL: Duration = Duration::from_secs(60);
 /// The largest copy-in or write-back the engine moves in one stream.
 const STREAM_LIMIT: u64 = sync::MAX_STREAM;
+/// The most a seat cache may carry into a replica (review r6 #1): a cache is a speed-up, so a
+/// larger one is left out (the seat starts with it empty), never a refusal of the unit.
+const SEED_LIMIT: u64 = 256 * 1024 * 1024;
+
+/// The seat-cache roots already seeded, per namespace (`<ns>\0<replica path>`): the codec skips a
+/// seed root the replica holds, so the host does not read or send it again (review r6 #1).
+static SEEDED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+
+fn seeded_key(ns: &str, replica: &str) -> String {
+    format!("{ns}\0{replica}")
+}
 /// The replica's shallow history.
 const REPLICA_DEPTH: &str = "50";
 
@@ -85,7 +96,8 @@ pub(crate) enum PlanMount {
 /// back, and the pod's mounts. `tree` = the unit's worktree; `view` = a read-only unit (its tree is
 /// a throwaway view); `protected` = the repository boundary (absent from the pod, with every
 /// git-state path under it); `write_roots` = the unit's admitted write roots (written back);
-/// `seed_base` = the seat caches' base (seeded once, never written back).
+/// `seed_base` = the seat caches' base (seeded once per replica, never written back). Only the
+/// tree (a creator's) and the admitted write roots come back (review r6).
 pub(crate) fn plan(
     tree: &Path,
     view: bool,
@@ -166,7 +178,12 @@ pub(crate) fn plan(
         } else {
             Mode::Plain
         };
-        let back = *rw && !seed && !(view && path == tree);
+        // What comes back (review r6 #1, #8): a creator's tree and the unit's admitted write
+        // roots, nothing else. Seat homes, caches and scratch (a fenced unit's `CARGO_TARGET_DIR`)
+        // stay in the replica: they are not the unit's result, a parallel unit of the same CLI
+        // rewrites the same home, and nothing a seat leaves there reaches the host.
+        let admitted = path == tree || write_roots.iter().any(|w| path.starts_with(w));
+        let back = *rw && !seed && !(view && path == tree) && admitted;
         if path == tree {
             skip.push(".git".into());
         }
@@ -184,11 +201,12 @@ pub(crate) fn plan(
     for (dir, (mut names, rw)) in file_roots {
         names.sort();
         names.dedup();
+        let admitted = write_roots.iter().any(|w| dir.starts_with(w));
         roots.push(PlanRoot {
             host: dir,
             mode: Mode::Files,
             skip: Vec::new(),
-            back: rw,
+            back: rw && admitted,
             files: names,
             masks: Vec::new(),
         });
@@ -328,7 +346,18 @@ pub(crate) fn one_shot_scope(run_id: &str) -> Option<String> {
     ["council-", "validator-", "triage-", "member-", "send-back-"]
         .iter()
         .any(|p| run_id.starts_with(p))
-        .then(|| format!("s-{}", label_value(run_id)))
+        // A digest of the exact id, never a label (labels can collide, review r6 #16).
+        .then(|| {
+            use sha2::{Digest, Sha256};
+            let d = Sha256::digest(run_id.as_bytes());
+            format!(
+                "s-{}",
+                d[..12]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<String>()
+            )
+        })
 }
 
 /// The namespace a run's pods live in: its own, or the daemon's shared session namespace for a
@@ -420,7 +449,10 @@ fn codec(
     ]);
     a.extend(args);
     let r = kube.call_capped(Some(ns), &a, stdin, limit, STREAM_LIMIT);
-    if !r.ok() {
+    // Only a client that was killed (a timeout or the output cap: no exit code) can leave a codec
+    // running; the codec's own refusal ended it, and resetting the shared pod then would end
+    // every other unit's codec in the namespace (review r6 #7).
+    if resets_sync(r.code) {
         // A client that gave up may leave its codec running in the sync pod, still writing the
         // replica (review r5): the pod goes, and every process with it, before the replica is
         // used again (the next arm makes a new sync pod).
@@ -429,6 +461,12 @@ fn codec(
         }
     }
     r
+}
+
+/// Whether a codec call's ending leaves a codec that may still be running (pure): only a client
+/// that was killed (no exit code). A codec that refused exited itself (review r6 #7).
+pub(crate) fn resets_sync(code: Option<i32>) -> bool {
+    code.is_none()
 }
 
 /// The host's side of a tree root's `.git` for the replica: a shallow clone of the tree's HEAD,
@@ -561,6 +599,7 @@ pub(crate) fn copy_in_stream(
     tree: &Path,
     roots: &[PlanRoot],
     with_git: bool,
+    seeded: &HashSet<String>,
 ) -> Result<(Vec<u8>, Value, Option<String>, Baseline), String> {
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
@@ -569,8 +608,24 @@ pub(crate) fn copy_in_stream(
     // The bytes read so far (review r3): a root over the stream's limit is refused as it is read,
     // never after the whole of it is in memory.
     let mut budget: u64 = 0;
+    let mut seed_used: u64 = 0;
     for r in roots {
         let replica = replica_of(scope, &r.host)?;
+        if r.mode == Mode::Seed {
+            // Sent once per replica, outside the unit's budget: an oversized cache is left out.
+            let entries = if seeded.contains(&replica) {
+                Vec::new()
+            } else {
+                seed_entries(&r.host, &r.skip, &mut seed_used)
+            };
+            stream.push(Root {
+                replica: replica.clone(),
+                mode: r.mode,
+                entries,
+            });
+            plan_roots.push((replica, r.clone()));
+            continue;
+        }
         let rels: Vec<String> = if r.mode == Mode::Files {
             r.files.clone()
         } else {
@@ -668,6 +723,28 @@ pub(crate) fn copy_in_stream(
     Ok((sync::encode(&stream), plan, base, baseline))
 }
 
+/// A seat cache's entries for its first copy into a replica; empty (with a note) when the caches
+/// of one copy-in (`used` so far) would pass [`SEED_LIMIT`].
+fn seed_entries(host: &Path, skip: &[String], used: &mut u64) -> Vec<Entry> {
+    let mut size: u64 = 0;
+    let mut out = Vec::new();
+    for p in sync::host_plain_listing(host, skip) {
+        size += sync::entry_size(host, &p).max(p.len() as u64);
+        if *used + size > SEED_LIMIT {
+            eprintln!(
+                "wicked-core: the seat cache {} is over {SEED_LIMIT} bytes; the seat starts with it empty",
+                host.display()
+            );
+            return Vec::new();
+        }
+        if let Some(e) = sync::read_host_entry(host, &p) {
+            out.push(e);
+        }
+    }
+    *used += size;
+    out
+}
+
 /// Copy `roots` into the replica through the sync pod.
 fn copy_in(
     kube: &Kube,
@@ -677,9 +754,18 @@ fn copy_in(
     roots: &[PlanRoot],
     with_git: bool,
 ) -> Result<(Option<String>, Baseline), (FloorUnarmed, String)> {
-    let (body, plan, base, baseline) = copy_in_stream(scope, tree, roots, with_git)
+    let seeded: HashSet<String> = {
+        let g = SEEDED.lock().unwrap_or_else(|p| p.into_inner());
+        roots
+            .iter()
+            .filter(|r| r.mode == Mode::Seed)
+            .filter_map(|r| replica_of(scope, &r.host).ok())
+            .filter(|rep| g.as_ref().is_some_and(|s| s.contains(&seeded_key(ns, rep))))
+            .collect()
+    };
+    let (body, plan, base, baseline) = copy_in_stream(scope, tree, roots, with_git, &seeded)
         .map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    if body.len() as u64 > STREAM_LIMIT {
+    if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::RootUnresolvable,
             format!("the unit's copy-in is larger than {STREAM_LIMIT} bytes"),
@@ -701,6 +787,14 @@ fn copy_in(
                 r.err_text()
             ),
         ));
+    }
+    if let Ok(mut g) = SEEDED.lock() {
+        let set = g.get_or_insert_with(HashSet::new);
+        for r in roots.iter().filter(|r| r.mode == Mode::Seed) {
+            if let Ok(rep) = replica_of(scope, &r.host) {
+                set.insert(seeded_key(ns, &rep));
+            }
+        }
     }
     Ok((base, baseline))
 }
@@ -890,20 +984,8 @@ fn deny_check(
     // The pod's own node on every port the seat's Landlock grants (review r5: NetworkPolicy
     // does not portably cover traffic to the local node), so a node-local listener on such a
     // port is refused here, at arm time, on the cluster as it is.
-    let host_ip = kube
-        .get_json(Some(ns), "pod", pod)
-        .ok()
-        .flatten()
-        .and_then(|p| {
-            p.pointer("/status/hostIP")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .filter(|ip| {
-            ip.chars()
-                .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
-        });
-    let script = deny_script(online, host_ip.as_deref());
+    let host_ip = node_address(kube.get_json(Some(ns), "pod", pod).ok().flatten().as_ref())?;
+    let script = deny_script(online, Some(&host_ip));
     let start = Instant::now();
     let mut last = String::new();
     while start.elapsed() < Duration::from_secs(20) {
@@ -924,7 +1006,7 @@ fn deny_check(
             Duration::from_secs(15),
         );
         let out = String::from_utf8_lossy(&r.stdout).to_string();
-        if r.ok() && deny_holds(&out, online, host_ip.is_some()) {
+        if r.ok() && deny_holds(&out, online, true) {
             return Ok(());
         }
         last = if r.ok() {
@@ -941,6 +1023,28 @@ fn deny_check(
             last.trim()
         ),
     ))
+}
+
+/// The node address a seat pod's deny check probes (pure). Without one the node probe cannot
+/// run: the arm is refused, never the probe skipped (review r6 #9).
+pub(crate) fn node_address(pod: Option<&Value>) -> Result<String, (FloorUnarmed, String)> {
+    pod.and_then(|p| p.pointer("/status/hostIP"))
+        .and_then(Value::as_str)
+        .filter(|ip| {
+            !ip.is_empty()
+                && ip
+                    .chars()
+                    .all(|c| c.is_ascii_hexdigit() || c == '.' || c == ':')
+        })
+        .map(str::to_string)
+        .ok_or_else(|| {
+            (
+                FloorUnarmed::PolicyRefused,
+                "the seat pod's node address could not be read, so its isolation from the node \
+                 could not be checked"
+                    .into(),
+            )
+        })
 }
 
 /// Arm one seat pod: the run's namespace and sync pod, the copy-in, the Sandbox, the bound-pod
@@ -969,6 +1073,7 @@ pub(crate) fn arm(
         s.write_roots,
         s.seed_base,
     );
+    clear_stale(kube, &ns)?;
     let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
     let id = uuid::Uuid::new_v4().simple().to_string();
     let sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
@@ -1204,7 +1309,7 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
     let homes: Vec<PlanRoot> = seat
         .roots
         .iter()
-        .filter(|r| seat.seat_dirs.contains(&r.host))
+        .filter(|r| seat.seat_dirs.contains(&r.host) && r.mode != Mode::Seed)
         .cloned()
         .collect();
     if !homes.is_empty() {
@@ -1269,18 +1374,20 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
 /// Delete the seat's Sandbox (grace 0) and wait until its pod is gone; unregister it. `Err` when
 /// the pod could not be confirmed gone (then nothing of the unit may be read back).
 pub(crate) fn delete_pod(seat: &Seat) -> Result<(), String> {
-    seat.kube.delete_owned(
-        Some(&seat.ns),
-        "sandboxes.agents.x-k8s.io",
-        &seat.sandbox,
-        false,
-    )?;
+    delete_seat_pod(&seat.kube, &seat.ns, Some(&seat.sandbox), &seat.pod)
+}
+
+/// [`delete_pod`] by name: the Sandbox (when the pod has one), then the pod waited out.
+fn delete_seat_pod(kube: &Kube, ns: &str, sandbox: Option<&str>, pod: &str) -> Result<(), String> {
+    if let Some(sandbox) = sandbox {
+        kube.delete_owned(Some(ns), "sandboxes.agents.x-k8s.io", sandbox, false)?;
+    }
     let start = Instant::now();
     loop {
-        match seat.kube.get_json(Some(&seat.ns), "pod", &seat.pod)? {
+        match kube.get_json(Some(ns), "pod", pod)? {
             None => return Ok(()),
             Some(_) if start.elapsed() > Duration::from_secs(90) => {
-                return Err(format!("the seat pod {} was not gone in time", seat.pod))
+                return Err(format!("the seat pod {pod} was not gone in time"))
             }
             Some(p) => {
                 if p.pointer("/metadata/deletionTimestamp").is_none()
@@ -1289,9 +1396,9 @@ pub(crate) fn delete_pod(seat: &Seat) -> Result<(), String> {
                     // The controller has not taken it down: the pod itself is deleted, never
                     // forced (review r1: a forced delete removes the object while its processes
                     // may still run; an ordinary one is gone only once the kubelet stopped them).
-                    let _ = seat.kube.call(
-                        Some(&seat.ns),
-                        &["delete", "pod", seat.pod.as_str(), "--wait=false"],
+                    let _ = kube.call(
+                        Some(ns),
+                        &["delete", "pod", pod, "--wait=false"],
                         None,
                         CALL,
                     );
@@ -1310,11 +1417,84 @@ pub(crate) fn reap(id: &str) {
         if !*settled {
             if let Err(e) = delete_pod(&seat) {
                 eprintln!("wicked-core: seat pod {} not reaped: {e}", seat.pod);
+                unreaped(&seat);
             }
             *settled = true;
         }
     }
     unregister(id);
+}
+
+/// Seat pods of this engine whose deletion was not confirmed (`(namespace, sandbox, pod)`): the
+/// next arm in their namespace deletes them before any copy-in (review r6 #6).
+static UNREAPED: std::sync::Mutex<Vec<(String, String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn unreaped(seat: &Seat) {
+    if let Ok(mut u) = UNREAPED.lock() {
+        u.push((seat.ns.clone(), seat.sandbox.clone(), seat.pod.clone()));
+    }
+}
+
+/// Before a copy-in into `ns`'s replica (review r6 #6): no seat or judge pod may still be able to
+/// write it except a live seat of this engine. A pod this engine could not confirm gone, and any
+/// seat pod an earlier engine left (another boot), is deleted and waited out; if that cannot be
+/// confirmed, the arm is refused (its write-back could carry another unit's writes).
+fn clear_stale(kube: &Kube, ns: &str) -> Result<(), (FloorUnarmed, String)> {
+    let refused = |e: String| {
+        (
+            FloorUnarmed::ClusterUnreachable,
+            format!("an earlier seat pod in this namespace could not be confirmed gone: {e}"),
+        )
+    };
+    let pending: Vec<(String, String, String)> = {
+        let mut u = UNREAPED.lock().unwrap_or_else(|p| p.into_inner());
+        let (mine, rest): (Vec<_>, Vec<_>) = u.drain(..).partition(|(n, _, _)| n == ns);
+        *u = rest;
+        mine
+    };
+    for (i, (n, sandbox, pod)) in pending.iter().enumerate() {
+        if let Err(e) = delete_seat_pod(kube, n, Some(sandbox), pod) {
+            if let Ok(mut u) = UNREAPED.lock() {
+                u.extend(pending[i..].iter().cloned());
+            }
+            return Err(refused(e));
+        }
+    }
+    let pods = kube.list_owned(Some(ns), "pods", &[]).map_err(refused)?;
+    for p in stale_seat_pods(&pods, super::boot_id()) {
+        delete_seat_pod(kube, ns, p.1.as_deref(), &p.0).map_err(refused)?;
+    }
+    Ok(())
+}
+
+/// The seat and judge pods of `pods` another engine boot created (pure): `(pod, its Sandbox)`.
+pub(crate) fn stale_seat_pods(pods: &[Value], boot: &str) -> Vec<(String, Option<String>)> {
+    pods.iter()
+        .filter(|p| {
+            let label = |k: &str| {
+                p.pointer("/metadata/labels")
+                    .and_then(|l| l.get(k))
+                    .and_then(Value::as_str)
+            };
+            matches!(label(super::ROLE_LABEL), Some("seat") | Some("judge"))
+                && label(super::BOOT_LABEL) != Some(boot)
+        })
+        .filter_map(|p| {
+            let name = p.pointer("/metadata/name")?.as_str()?.to_string();
+            let sandbox = p
+                .pointer("/metadata/ownerReferences")
+                .and_then(Value::as_array)
+                .and_then(|o| {
+                    o.iter()
+                        .find(|r| r.get("kind").and_then(Value::as_str) == Some("Sandbox"))
+                })
+                .and_then(|r| r.get("name"))
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            Some((name, sandbox))
+        })
+        .collect()
 }
 
 /// How a seat's unit ended, for [`settle`].
@@ -1372,6 +1552,9 @@ pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
         Ending::TimedOut | Ending::Cancelled => Ok(-1),
     };
     let gone = delete_pod(seat);
+    if gone.is_err() {
+        unreaped(seat);
+    }
     *settled = true;
     drop(settled);
     unregister(&seat.id);
@@ -1427,8 +1610,13 @@ pub(crate) fn write_back(seat: &Seat) -> Result<(), String> {
         if &got.replica != replica {
             return Err("the write-back's roots are out of order".into());
         }
-        let mut entries = sync::check_entries(got, &want.skip)
-            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        let empty = HashMap::new();
+        let mut entries = sync::check_entries_against(
+            got,
+            &want.skip,
+            baseline.get(&want.host).unwrap_or(&empty),
+        )
+        .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
@@ -1806,6 +1994,12 @@ pub(crate) fn drop_scope(run_id: &str) {
         return;
     };
     let (ns, _, _) = place(&kube, run_id);
+    if let Ok(mut g) = SEEDED.lock() {
+        if let Some(set) = g.as_mut() {
+            let prefix = seeded_key(&ns, &format!("{scope}/"));
+            set.retain(|k| !k.starts_with(&prefix));
+        }
+    }
     let r = kube.call(
         Some(&ns),
         &[

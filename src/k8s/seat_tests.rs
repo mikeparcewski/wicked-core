@@ -410,7 +410,9 @@ fn k8s_the_replica_plan_leaves_the_clone_out_and_comes_back_only_for_write_roots
     assert_eq!(by(&cache).mode, Mode::Seed);
     assert!(!by(&cache).back, "a cache came back");
     assert!(!by(&skills).back, "a read root came back");
-    assert!(by(&home).back);
+    // Review r6 #1/#8: a seat home (and any other writable dir that is not the tree or an
+    // admitted root, such as a fenced unit's scratch) stays in the replica.
+    assert!(!by(&home).back, "a seat home came back");
     // B17: the same plan, read-only: the tree is a view and never comes back; the notes still do.
     let (roots, pod) = seat::plan(
         &tree,
@@ -1272,7 +1274,8 @@ fn k8s_a_tree_with_no_commit_still_sends_an_empty_git_root_that_replaces_a_plant
         &[],
         None,
     );
-    let (body, plan, base, _) = seat::copy_in_stream(None, &host, &roots, true).unwrap();
+    let (body, plan, base, _) =
+        seat::copy_in_stream(None, &host, &roots, true, &Default::default()).unwrap();
     assert!(base.is_none(), "an unborn tree has no base");
     let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
     assert_eq!(decoded[0].mode, Mode::Git);
@@ -1356,7 +1359,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
         files: Vec::new(),
         masks: Vec::new(),
     };
-    let e = seat::copy_in_stream(None, &host, &[r], false).unwrap_err();
+    let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
     assert!(e.contains("larger than"), "{e}");
     assert!(
         sync::read_host_entry(&host, "big.bin").is_none(),
@@ -1722,5 +1725,249 @@ fn k8s_a_name_the_stream_cannot_carry_refuses_the_copy_in() {
         return;
     }
     assert!(sync::host_tree_listing(&host).is_err());
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+// ── Review r6 (pi) ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn git_in(dir: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .hardened()
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "core.fsmonitor=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// r6 #3: content the seat left exactly as the host gave it is the host's own: a case pair on a
+/// case-sensitive host and a tracked absolute link are written back unchanged. The same entries
+/// new or changed by the seat are still refused.
+#[test]
+fn k8s_unchanged_host_content_never_refuses_a_write_back() {
+    let a = entry(Kind::File, "xt_TCPMSS.c", b"upper");
+    let b = entry(Kind::File, "xt_tcpmss.c", b"lower");
+    let l = entry(Kind::Link, "abs", b"/etc/hosts");
+    let r = Root {
+        replica: "t".into(),
+        mode: Mode::Tree,
+        entries: vec![a.clone(), b.clone(), l.clone()],
+    };
+    let base: std::collections::HashMap<String, [u8; 32]> = [&a, &b, &l]
+        .iter()
+        .map(|e| (e.path.clone(), sync::digest(e)))
+        .collect();
+    assert_eq!(
+        sync::check_entries_against(&r, &[], &base).unwrap().len(),
+        3
+    );
+    // New (no baseline) or changed: refused as before.
+    assert!(sync::check_entries(&r, &[]).is_err());
+    let mut changed = base.clone();
+    changed.insert("abs".into(), [0; 32]);
+    assert!(sync::check_entries_against(&r, &[], &changed).is_err());
+    let mut changed = base;
+    changed.insert("xt_tcpmss.c".into(), [0; 32]);
+    assert!(sync::check_entries_against(&r, &[], &changed).is_err());
+}
+
+/// r6 #2: a repository a seat cloned into its tree (listed by git as `dir/`) neither breaks the
+/// pack nor survives the next copy-in.
+#[cfg(unix)]
+#[test]
+fn k8s_an_embedded_repo_neither_breaks_the_codec_nor_persists() {
+    let replica = tmp("replica-embedded");
+    let tree = "home/u/wt";
+    let t = replica.join(tree);
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("a.txt"), "a").unwrap();
+    git_in(&t, &["add", "a.txt"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    std::fs::create_dir_all(t.join("sub")).unwrap();
+    git_in(&t.join("sub"), &["init", "-q"]);
+    std::fs::write(t.join("sub/x"), "x").unwrap();
+    let plan = json!([[tree, "tree", [".git"]]]).to_string();
+    let packed = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let roots = sync::decode(&mut packed.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["a.txt"]);
+    // The next copy-in mirrors the tree: the embedded repo goes.
+    let stream = sync::encode(&[Root {
+        replica: tree.into(),
+        mode: Mode::Tree,
+        entries: vec![entry(Kind::File, "a.txt", b"a")],
+    }]);
+    let out = codec(&replica, &["unpack", &plan], &stream);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        !t.join("sub").exists(),
+        "an embedded repo survived the copy-in"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// r6 #13: a seat-written alternates file (another scope's objects) refuses the bundle.
+#[cfg(unix)]
+#[test]
+fn k8s_a_bundle_refuses_a_git_dir_naming_another_object_store() {
+    let replica = tmp("replica-alternates");
+    let t = replica.join("wt");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    git_in(&t, &["commit", "-q", "--allow-empty", "-m", "base"]);
+    let base = String::from_utf8(
+        std::process::Command::new("git")
+            .hardened()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&t)
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    git_in(&t, &["commit", "-q", "--allow-empty", "-m", "seat"]);
+    std::fs::write(
+        t.join(".git/objects/info/alternates"),
+        "/replica/other/.git/objects\n",
+    )
+    .unwrap();
+    let out = codec(&replica, &["bundle", "wt", &base], b"");
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("another object store"));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// r6 #6: a seat or judge pod another engine boot created is stale; this boot's and other roles'
+/// are not. Its Sandbox is named so it can be deleted with it.
+#[test]
+fn k8s_a_dead_engines_seat_pods_are_found_before_a_copy_in() {
+    let pod = |name: &str, role: &str, boot: &str| {
+        json!({"metadata": {"name": name,
+            "labels": {super::ROLE_LABEL: role, super::BOOT_LABEL: boot},
+            "ownerReferences": [{"kind": "Sandbox", "name": format!("sbx-{name}")}]}})
+    };
+    let pods = vec![
+        pod("a", "seat", "old"),
+        pod("b", "seat", "now"),
+        pod("c", "judge", "old"),
+        pod("d", "sync", "old"),
+        json!({"metadata": {"name": "e", "labels": {super::ROLE_LABEL: "seat"}}}),
+    ];
+    assert_eq!(
+        seat::stale_seat_pods(&pods, "now"),
+        vec![
+            ("a".to_string(), Some("sbx-a".to_string())),
+            ("c".to_string(), Some("sbx-c".to_string())),
+            ("e".to_string(), None),
+        ]
+    );
+}
+
+/// r6 #7: only a killed client resets the shared sync pod; a codec's own refusal does not.
+#[test]
+fn k8s_a_codec_refusal_never_resets_the_shared_sync_pod() {
+    assert!(seat::resets_sync(None));
+    assert!(!seat::resets_sync(Some(1)));
+    assert!(!seat::resets_sync(Some(0)));
+}
+
+/// r6 #9: no node address, no arm (the node probe is never skipped).
+#[test]
+fn k8s_a_seat_without_a_readable_node_address_is_refused() {
+    assert!(seat::node_address(None).is_err());
+    assert!(seat::node_address(Some(&json!({"status": {}}))).is_err());
+    assert!(seat::node_address(Some(&json!({"status": {"hostIP": "1.2.3.4; x"}}))).is_err());
+    assert_eq!(
+        seat::node_address(Some(&json!({"status": {"hostIP": "192.168.5.15"}}))).unwrap(),
+        "192.168.5.15"
+    );
+}
+
+/// r6 #16: a one-shot scope is a digest of the exact session id, so two ids one label would
+/// collapse get different scopes.
+#[test]
+fn k8s_one_shot_scopes_never_collide_on_a_label() {
+    // The literal label of one id is itself a valid id with the same label.
+    let lit = super::label_value("validator-a b");
+    assert_eq!(super::label_value(&lit), lit);
+    let a = seat::one_shot_scope("validator-a b").unwrap();
+    let b = seat::one_shot_scope(&lit).unwrap();
+    assert_ne!(a, b);
+    assert_eq!(a, seat::one_shot_scope("validator-a b").unwrap());
+    assert!(seat::one_shot_scope("run-1").is_none());
+}
+
+/// r6 #5: a wrapper setup failure writes its rc, so it is the unit's failure (exit 125), never a
+/// lost stream.
+#[test]
+fn k8s_a_wrapper_setup_failure_is_an_exit_code_not_a_lost_stream() {
+    assert_eq!(
+        seat::WRAPPER.matches("echo 125 > $u/rc; exit 125").count(),
+        3
+    );
+    assert_eq!(seat::exit_code(125, Some("125\n")), Some(125));
+}
+
+/// r6 #1: a seat cache already in the replica is not read or sent again (the codec keeps it).
+#[cfg(unix)]
+#[test]
+fn k8s_a_seeded_cache_is_not_sent_again() {
+    let host = tmp("seed-host");
+    let cache = host.join("cache/claude");
+    std::fs::create_dir_all(&cache).unwrap();
+    std::fs::write(cache.join("blob"), vec![7u8; 4096]).unwrap();
+    let root = PlanRoot {
+        host: cache.clone(),
+        mode: Mode::Seed,
+        skip: Vec::new(),
+        back: false,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let rep = seat::replica_of(None, &cache).unwrap();
+    let first = seat::copy_in_stream(
+        None,
+        &host,
+        std::slice::from_ref(&root),
+        false,
+        &Default::default(),
+    )
+    .unwrap();
+    let again = seat::copy_in_stream(
+        None,
+        &host,
+        std::slice::from_ref(&root),
+        false,
+        &[rep].into_iter().collect(),
+    )
+    .unwrap();
+    let decode = |b: &[u8]| sync::decode(&mut &b[..], sync::MAX_STREAM).unwrap();
+    assert_eq!(decode(&first.0)[0].entries.len(), 1);
+    assert!(decode(&again.0)[0].entries.is_empty());
     let _ = std::fs::remove_dir_all(&host);
 }

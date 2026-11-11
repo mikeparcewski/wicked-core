@@ -408,22 +408,40 @@ pub(crate) fn digest(e: &Entry) -> [u8; 32] {
 /// `skip` = relative paths the seat could never write on the host (masks, nested roots): their
 /// entries are dropped, never applied. `Err` names the first refused entry.
 pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, String> {
+    check_entries_against(root, skip, &std::collections::HashMap::new())
+}
+
+/// [`check_entries`] against the copy-in `baseline` (path -> digest; review r6 #3): an entry the
+/// seat left exactly as the host gave it is the host's own content, so the fold, link and
+/// file-or-directory checks judge only what the seat added or changed (a case-sensitive host's
+/// `a.c`/`A.c` pair, or a tracked absolute link, is written back unchanged, never refused). The
+/// name checks apply to every entry; how changed links resolve against the host is checked again
+/// at preflight.
+pub(crate) fn check_entries_against(
+    root: &Root,
+    skip: &[String],
+    baseline: &std::collections::HashMap<String, [u8; 32]>,
+) -> Result<Vec<Entry>, String> {
+    let unchanged = |e: &Entry| baseline.get(&e.path) == Some(&digest(e));
     let mut out = Vec::with_capacity(root.entries.len());
-    let mut seen = std::collections::HashSet::new();
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     for e in &root.entries {
         let parts = components(&e.path)?;
         if parts.iter().any(|c| is_git_name(c)) {
             return Err(format!("`{}` is inside a git dir", e.path));
         }
-        if !seen.insert(fold(&e.path)) {
-            return Err(format!(
-                "`{}` appears twice (or twice in a spelling the host folds together)",
-                e.path
-            ));
+        let same = unchanged(e);
+        if let Some(other_same) = seen.insert(fold(&e.path), same) {
+            if !(same && other_same) {
+                return Err(format!(
+                    "`{}` appears twice (or twice in a spelling the host folds together)",
+                    e.path
+                ));
+            }
         }
         match e.kind {
             Kind::Other => return Err(format!("`{}` is not a regular file or a symlink", e.path)),
-            Kind::Link if !link_stays_inside(&e.path, &e.data) => {
+            Kind::Link if !same && !link_stays_inside(&e.path, &e.data) => {
                 return Err(format!("`{}` is a symlink that leaves its root", e.path))
             }
             _ => {}
@@ -433,15 +451,19 @@ pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, 
         }
         out.push(e.clone());
     }
-    links_stay_inside(&out)?;
+    let changed: Vec<Entry> = out.iter().filter(|e| !unchanged(e)).cloned().collect();
+    links_stay_inside(&changed)?;
     // A path cannot be both a file and the parent of another entry: every ancestor of every
-    // entry is checked against the whole set (review r4: `A`, `A-`, `a/b` are not adjacent).
+    // entry is checked against the whole set (review r4: `A`, `A-`, `a/b` are not adjacent), when
+    // either of the two is the seat's.
     let paths: std::collections::HashSet<String> = out.iter().map(|e| fold(&e.path)).collect();
+    let changed_paths: std::collections::HashSet<String> =
+        changed.iter().map(|e| fold(&e.path)).collect();
     for p in &paths {
         let parts: Vec<&str> = p.split('/').collect();
         for i in 1..parts.len() {
             let anc = parts[..i].join("/");
-            if paths.contains(&anc) {
+            if paths.contains(&anc) && (changed_paths.contains(p) || changed_paths.contains(&anc)) {
                 return Err(format!("`{anc}` is a file and a directory"));
             }
         }
@@ -1030,14 +1052,18 @@ def entries(f):
         dl = struct.unpack(">Q", rd(f, 8))[0]; d = rd(f, dl)
         if k == b"E": return
         yield k, p.decode("utf-8"), d
-def tree_list(root):
+def tree_list(root, repos=None):
     if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"):
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
         try: return [p for p in plain_list(fd) if not under(p, ".git")]
         finally: os.close(fd)
     r = git(root, "ls-files", "-z", "-c", "-o", "--exclude-standard")
     if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
-    return sorted(set(x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x))
+    out = sorted(set(x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x))
+    # An untracked embedded repository is listed as `dir/` (review r6 #2): it is not a file of the
+    # tree, never written back, and the mirror removes it (`repos`).
+    if repos is not None: repos.extend(x[:-1] for x in out if x.endswith("/"))
+    return [x for x in out if not x.endswith("/")]
 def plain_list(rootfd):
     out = []
     def walk(fd, pre):
@@ -1102,7 +1128,16 @@ def unpack(plan):
                 finally: os.close(pfd)
             return
         if m in ("tree", "plain"):
-            have = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
+            repos = []
+            have = tree_list(R + "/" + r, repos) if m == "tree" else plain_list(rootfd)
+            for rel in repos:
+                if rel in wrote or any(under(rel, s) for s in skip): continue
+                if any(c == ".git" for c in rel.split("/")): continue
+                fd, name = parent(rootfd, rel, False)
+                if fd is None: continue
+                try: remove_any(fd, name)
+                except FileNotFoundError: pass
+                finally: os.close(fd)
             have = [h for h in have if not (m == "tree" and under(h, ".git"))]
             for rel in have:
                 if rel in wrote or any(under(rel, s) for s in skip): continue
@@ -1168,6 +1203,10 @@ def pack(plan):
     put(out, b"E", "", b""); out.flush()
 def bundle(tree, base):
     root = R + "/" + tree
+    # A seat-written link to another replica scope's objects (review r6 #13): refused before git
+    # reads the dir, so a bundle never packs objects the seat could not see.
+    for rel in (".git/objects/info/alternates", ".git/objects/info/http-alternates", ".git/commondir"):
+        if os.path.lexists(root + "/" + rel): die("the replica's git dir names another object store")
     head = git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
     if base == "-":
         if head.returncode == 0: die("the seat made a first commit in a tree with no history")
