@@ -3918,6 +3918,41 @@ fn core1381_a_reviewer_record_never_unbreaks_the_rule() {
         .all(|p| !p.contains("the reviewer of this step")));
 }
 
+/// (review on #1426, r3) A quoted or fenced STACK-CHECK line is evidence the reviewer cites, not
+/// its own check; and a reviewer capture the runner cut proves no check absent.
+#[test]
+fn core1381_a_quoted_check_is_not_the_reviewers_and_a_cut_capture_proves_nothing_absent() {
+    let sub_k = "KEPT — src/add.rs uses the language's own + operator";
+    let rec_b = "BROKEN — RECORD 1 never says what was looked at";
+    let quoted =
+        "The builder claimed this; I did not verify it.\n> STACK-CHECK: looked at the docs :: \
+                  offers +\n```\nSTACK-CHECK: looked at x :: offers y\n```\nVERDICT: PASS";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(quoted));
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
+    assert!(judge
+        .of(Asked::Record)
+        .iter()
+        .all(|p| !p.contains("the reviewer of this step")));
+    let cut = "Reviewed src/add.rs … (output truncated)";
+    let judge = PackJudge::with(&[("POL-2101", sub_k)], &[], &[("POL-2101", rec_b)]);
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(cut));
+    assert_eq!(
+        row_of(&r, "POL-2101").status,
+        RuleStatus::Unchecked,
+        "{r:?}"
+    );
+    assert!(r.denial().is_none());
+    // A substance BROKEN still denies on a cut capture.
+    let judge = PackJudge::with(
+        &[("POL-2101", "BROKEN — rebuilds +")],
+        &[],
+        &[("POL-2101", rec_b)],
+    );
+    let r = run_pol_2101(&change(), &judge, &record(REC_NO_CHECK), Some(cut));
+    assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken);
+}
+
 /// (review on #1426) Only the reviewer's STACK-CHECK lines are its record: what else it writes
 /// (a BROKEN it later drops, say) never moves the evidence key, so a dispute on unchanged code and
 /// an unchanged recorded check still carries; a changed check line does move it.
@@ -3978,7 +4013,7 @@ fn core1381_a_broken_needs_a_whole_creator_record_and_a_whole_reviewer_record() 
 fn core1381_pol_2101_is_not_applicable_by_fact_on_a_change_with_no_code() {
     let docs = change_of(
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-Hi\n+Hello\n",
-        &["README.md", "docs/guide.md", "notes.txt"],
+        &["README.md", "docs/guide.md", "docs/arch.rst"],
     );
     let judge = PackJudge::with(
         &[("POL-2101", "BROKEN — x")],
@@ -4012,10 +4047,14 @@ fn core1381_pol_2101_is_not_applicable_by_fact_on_a_change_with_no_code() {
     let r = run_pol_2101(&mdx, &judge, &record(REC_NO_CHECK), None);
     assert_eq!(row_of(&r, "POL-2101").status, RuleStatus::Broken, "{r:?}");
     assert!(r.denial().is_some());
-    // (review) A build file or a dependency manifest that ends in `.txt` is not text.
+    // (review) A `.txt` may be a build include or a requirements file, and a lockfile is a
+    // dependency change: judged, never N/A by fact.
     for (path, body) in [
         ("CMakeLists.txt", "+function(my_join out a b)\n"),
         ("requirements.txt", "+leftpad-py==1.0\n"),
+        ("requirements/prod.txt", "+leftpad-py==1.0\n"),
+        ("cmake/helpers.txt", "+function(my_join out a b)\n"),
+        ("Cargo.lock", "+name = \"leftpad\"\n"),
     ] {
         let c = change_of(&format!("--- a/{path}\n+++ b/{path}\n{body}"), &[path]);
         let judge = PackJudge::with(&[("POL-2101", "BROKEN — it rebuilds a built-in")], &[], &[]);

@@ -966,16 +966,11 @@ fn no_source_code(change: &Change) -> Option<String> {
     let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
     let known_non_code = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
-        // (core#1381 review) MDX is markdown that carries imports, exports and JSX: code. A
-        // build file or a dependency manifest that ends in `.txt` is not text either.
-        let build_or_manifest = name == "cmakelists.txt"
-            || (name.starts_with("requirements") && name.ends_with(".txt"))
-            || name.starts_with("constraints") && name.ends_with(".txt");
+        // (core#1381 review) MDX is markdown that carries imports, exports and JSX: code.
         (language_of(p).is_some_and(|l| l == "markdown") && !name.ends_with(".mdx"))
-            || (!build_or_manifest
-                && [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
-                    .iter()
-                    .any(|e| name.ends_with(e)))
+            || [".txt", ".rst", ".png", ".jpg", ".jpeg", ".gif", ".lock"]
+                .iter()
+                .any(|e| name.ends_with(e))
             || matches!(
                 name.as_str(),
                 "license" | "changelog" | "readme" | ".gitignore"
@@ -993,6 +988,30 @@ fn no_source_code(change: &Change) -> Option<String> {
             )
         },
     )
+}
+
+/// (core#1381) Why POL-2101 has no subject, when every changed file is prose or an image: markdown
+/// (never MDX), reStructuredText, an image, or a license/readme/changelog. Stricter than
+/// [`no_source_code`] on purpose (review on #1426): a `.txt` may be a build include or a
+/// requirements file and a lockfile is a dependency change, so those reach the judges.
+fn docs_only(change: &Change) -> Option<String> {
+    let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
+    let prose = |p: &str| {
+        let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
+        let stem = name.split('.').next().unwrap_or(&name).to_string();
+        (language_of(p).is_some_and(|l| l == "markdown") && !name.ends_with(".mdx"))
+            || [".rst", ".png", ".jpg", ".jpeg", ".gif"]
+                .iter()
+                .any(|e| name.ends_with(e))
+            || matches!(stem.as_str(), "license" | "changelog" | "readme")
+                && !name.ends_with(".mdx")
+    };
+    (!changed.is_empty() && changed.iter().all(|p| prose(p))).then(|| {
+        format!(
+            "the change touches no source code ({})",
+            list_paths(&changed)
+        )
+    })
 }
 
 /// Decide `check:test-fails-on-base` from the change alone where it can: no source change is not
@@ -2824,16 +2843,33 @@ const REVIEWER_RECORD_LABEL: &str =
 /// a record, and the rest of its output (a BROKEN line it later drops, say) never moves the record
 /// evidence key, so a dispute on unchanged code still carries (review on #1426).
 fn reviewer_record(input: &CheckInput<'_>) -> Option<String> {
-    let lines: Vec<&str> = input
-        .reviewer_record?
-        .lines()
-        .map(|l| {
-            l.trim_start_matches([' ', '\t', '-', '*', '>', '`'])
-                .trim_end()
-        })
-        .filter(|l| l.starts_with(STACK_CHECK_MARK) && l.len() > STACK_CHECK_MARK.len())
-        .collect();
+    // (review on #1426) The reviewer's own attestation only: a line inside a code fence or a quote
+    // (`>`) is evidence it cites (a creator's line, say), never its own check.
+    let mut fenced = false;
+    let mut lines: Vec<&str> = Vec::new();
+    for raw in input.reviewer_record?.lines() {
+        let t = raw.trim_start();
+        if t.starts_with("```") || t.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        let l = t.trim_start_matches(['-', '*', ' ', '\t']).trim_end();
+        if l.starts_with(STACK_CHECK_MARK) && l.len() > STACK_CHECK_MARK.len() {
+            lines.push(l);
+        }
+    }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// (review on #1426) Whether the runner cut the reviewer's capture: its STACK-CHECK line may be in
+/// what was cut, so the record cannot be proven absent.
+fn reviewer_cut(input: &CheckInput<'_>) -> bool {
+    input
+        .reviewer_record
+        .is_some_and(|t| t.contains(CAPTURE_CUT_MARK))
 }
 
 /// The line a stack check is recorded on (`assumptions::STACK_CHECK_CONVENTION`).
@@ -3098,7 +3134,7 @@ pub fn check(
         // (core#1381) …and a change that touches no source code (docs, text, images only) uses
         // and rebuilds no capability of a stack: not applicable, by that fact, with no judge asked.
         if pack == Some(PackKind::WorkWithRecord) {
-            if let Some(why) = no_source_code(input.change) {
+            if let Some(why) = docs_only(input.change) {
                 rows.insert(
                     rule.id.clone(),
                     row(RuleStatus::NotApplicable, RuleHow::Fact, why, None, None),
@@ -3989,6 +4025,7 @@ fn run_pool(
                                     .iter()
                                     .any(|n| *n <= records.len() && !cut_records.contains(n))
                                 && (reviewer.is_none() || !cut_records.contains(&shown))
+                                && !reviewer_cut(input)
                         };
                         let mut a = answered.lock().unwrap();
                         let mut w = why.lock().unwrap();
