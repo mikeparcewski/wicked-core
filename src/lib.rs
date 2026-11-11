@@ -70,6 +70,7 @@ mod image_keep;
 mod index_budget;
 mod install_fence;
 mod interaction;
+mod k8s;
 mod knowledge;
 #[cfg(test)]
 mod lockstep;

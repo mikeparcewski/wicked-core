@@ -9,3 +9,6 @@ crates/wicked-core-ts/types-test/** text eol=lf
 # Regression fixtures are parsed byte-for-byte by tests that also pin recorded wording; a CRLF
 # checkout must not change what they contain (F-4R2-004 fixture, finding_045 corpus).
 tests/fixtures/** text eol=lf
+# The pinned agent-sandbox release manifest is checked by its sha256 (src/k8s/cluster.rs): never
+# convert its line endings (a Windows checkout would change the bytes and fail the pin).
+containers/k8s/*.yaml -text
