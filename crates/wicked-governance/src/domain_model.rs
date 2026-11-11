@@ -3543,6 +3543,41 @@ mod tests {
                 model.metadata.business_domains
             );
             assert_eq!(keys(&read), keys(&before));
+
+            // codex r1 (P3): a behaviour carrying ONLY a business domain stays unmapped: it is
+            // listed as such, emits no requirement and does not move the share.
+            let lonely = node(&mut s, "lonely", NodeKind::Function, "be/executor/run.py");
+            s.annotate(
+                &lonely.symbol,
+                pick("a", "usage-billing", "Usage billing", 0.9),
+            )
+            .unwrap();
+            let c = cov(&s);
+            assert_eq!(
+                (
+                    c.behavior_bearing,
+                    c.resolved,
+                    c.risk_flagged,
+                    c.unaccounted
+                ),
+                (
+                    cov_before.behavior_bearing + 1,
+                    cov_before.resolved,
+                    cov_before.risk_flagged,
+                    cov_before.unaccounted + 1
+                )
+            );
+            assert!(c
+                .unaccounted_nodes
+                .iter()
+                .any(|n| n.name.as_deref() == Some("lonely")));
+            let partial = build_at(&s, 80);
+            assert!(partial
+                .domains
+                .values()
+                .flat_map(|d| d.requirements.values())
+                .all(|r| r.title != "lonely"));
+            assert_eq!(partial.metadata.business_domains[0].requirements, 2);
         }
 
         /// core#1376: core's own bookkeeping kinds never draw the unknown-kind warning; a kind

@@ -127,7 +127,8 @@ unit's source and name worklist units, and the units whose source shows a rule g
 composed by a script from names rather than read from the source, most of them describe code \
 instead of requirements, or most sourced product-code units were left empty while their source \
 shows a rule (a page that states almost nothing is not sound, however correct its few rules \
-are).";
+are), or its `business_domains` hold a domain the cited code does not show or one named after a \
+directory (a stored catalog is never replaced, so an unsound one must not pass).";
 
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
