@@ -513,6 +513,7 @@ fn an_earlier_gates_council_ruling_is_reused_only_on_equal_keys() {
                 instructions: None,
                 engine_record: None,
                 creator_records: None,
+                reviewer_record: None,
                 no_agent_code: false,
                 stage: CheckStage::Review,
                 deliver_tokens: &[],

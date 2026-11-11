@@ -26,6 +26,18 @@ say why the built-in does not fit (for example, a feature missing at the pinned 
 measured defect, or a policy conflict). A reviewer flags every piece of custom code that duplicates a built-in as
 a finding, whether or not it carries a reason, and judges whether the stated reason holds.
 
+How the engine records and judges the check (core#1381). A code-writing step is asked for one
+output line, `STACK-CHECK: looked at <docs or source> :: offers <what it provides for this job, or
+nothing this change needs>`. The record clause is kept when every code-writing step's record
+states the check, or when the reviewer of the step records the check it made itself. Either way, a
+duplicated built-in found in the change still breaks the rule.
+
+When it does not apply: the rule is about using a library, API or framework capability, so a change
+that neither uses nor rebuilds one is not in scope. A change that touches only docs, text or images
+is ruled not applicable by that fact. A change that only edits text, string literals, prompts,
+comments, or the test assertions that pin them, is ruled not applicable by the judge. A change
+that adds or changes logic is always judged.
+
 ## Rules
 
 - `POL-2101` (error): The user and steering policies choose the framework or library; agents

@@ -7776,11 +7776,32 @@ fn tokenize(s: &str) -> Vec<String> {
 /// (QE acceptance) The garden skill whose `accept` action is the three-agent acceptance pipeline.
 pub(crate) const QE_SKILL: &str = "wicked-garden-qe";
 
+/// (core#1381) Whether `unit` is an agent step that writes code: a creator, or a phase that declares
+/// `executes_code` — the predicate `cli_runner::creator_records` reads POL-2101's records by. Never a
+/// tool step or an engine-internal judge/triage prompt.
+fn writes_code(unit: &WorkUnit) -> bool {
+    unit.tool_cmd.is_none()
+        && !is_engine_internal(unit)
+        && (unit.role == crate::workflow::PhaseRole::Creator || unit.executes_code)
+}
+
 pub(crate) fn skill_prompt(
     unit: &WorkUnit,
     layout: Option<&str>,
     form: SkillForm,
     skills: Option<&SkillsSnapshot>,
+) -> String {
+    compose_skill_prompt(unit, layout, form, skills, true)
+}
+
+/// [`skill_prompt`], with the stack-check line (core#1381) only when `stack_check` (the pty line
+/// never carries it, [`pty_unit_prompt`]).
+fn compose_skill_prompt(
+    unit: &WorkUnit,
+    layout: Option<&str>,
+    form: SkillForm,
+    skills: Option<&SkillsSnapshot>,
+    stack_check: bool,
 ) -> String {
     let phase = match unit.skill_ref.as_deref() {
         Some(skill) if !skill.is_empty() => {
@@ -7844,6 +7865,11 @@ pub(crate) fn skill_prompt(
         "{lead}{qe}{layout}{}",
         crate::assumptions::PROMPT_CONVENTION
     );
+    // (core#1381) A code-writing agent unit records its stack check on one line (POL-2101's record
+    // clause reads exactly these units' outputs). Before the VERDICT line, which reads last.
+    if stack_check && writes_code(unit) {
+        prompt.push_str(crate::assumptions::STACK_CHECK_CONVENTION);
+    }
     // L1↔L4 contract (des-adjudicated §4.1): an Evaluator work unit's prompt ends with the one
     // VERDICT line L1's fold parses — on every `SkillForm`, both carriers (`unit_prompt` is the one
     // composer). NOT a `tool_cmd` unit (a scripted step emits no verdict) and NOT engine-internal
@@ -8165,12 +8191,16 @@ pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<Stri
     }
     // `+ 1` for the newline the runner appends to submit the turn — it occupies the same buffer.
     let mut unit = author_directed(input);
-    let mut plain = skill_prompt(&unit, None, form, None);
+    // (core#1381) The pty line carries no stack-check line: its one 1000-byte line is the task's
+    // budget (the carrier is not a production binding), and the governed-worker skill's C8 asks for
+    // the same line.
+    let stack_check = false;
+    let mut plain = compose_skill_prompt(&unit, None, form, None, stack_check);
     // (xreview on #1211) The QE unit's floor note is optional evidence: a pty turn that would not fit
     // with it runs without it, never refused for it.
     if plain.len() + 1 > PTY_PROMPT_LIMIT && unit.qe_floor_note.is_some() {
         unit.to_mut().qe_floor_note = None;
-        plain = skill_prompt(&unit, None, form, None);
+        plain = compose_skill_prompt(&unit, None, form, None, stack_check);
     }
     // FINDING-011: a pty turn is submitted line-based — the runner appends one `\n` to end the turn,
     // so ANY newline the prompt itself carries submits the turn EARLY. The worker then gets only the
@@ -8211,7 +8241,13 @@ pub(crate) fn pty_unit_prompt(input: &StepInput, form: SkillForm) -> Result<Stri
                 .as_deref()
                 .and_then(|d| crate::repo::worktree_layout_within(d, budget))
         });
-    Ok(skill_prompt(&unit, layout.as_deref(), form, None))
+    Ok(compose_skill_prompt(
+        &unit,
+        layout.as_deref(),
+        form,
+        None,
+        stack_check,
+    ))
 }
 
 /// Map a dash-form `skill_ref` onto the name the running CLI invokes it by (core#396).
@@ -13294,6 +13330,63 @@ mod tests {
         crate::gate_hook::gov_run_dir(run_id)
     }
 
+    /// (core#1381) A code-writing agent unit (a creator, or an `executes_code` phase) is asked for
+    /// the one-line stack check POL-2101's record clause reads; a neutral or evaluator unit that
+    /// writes no code, a tool step and an engine-internal prompt are not. The evaluator's VERDICT
+    /// line still reads last.
+    #[test]
+    fn a_code_writing_unit_is_asked_for_the_stack_check_line() {
+        use crate::workflow::PhaseRole;
+        let line = crate::assumptions::STACK_CHECK_CONVENTION;
+        assert!(!line.contains('\n'), "single-line by pty contract");
+        let claude = SkillForm::ClaudePlugin;
+        let mut u = WorkUnit::pending("s:build", "s", 1, "add SSO login");
+        u.role = PhaseRole::Creator;
+        let p = skill_prompt(&u, None, claude, None);
+        assert!(p.ends_with(line), "{p}");
+        assert!(p.contains("STACK-CHECK: looked at"), "{p}");
+        u.role = PhaseRole::Neutral;
+        assert!(!skill_prompt(&u, None, claude, None).contains(line));
+        u.executes_code = true;
+        assert!(skill_prompt(&u, None, claude, None).ends_with(line));
+        u.role = PhaseRole::Evaluator;
+        let p = skill_prompt(&u, None, claude, None);
+        assert!(p.contains(line), "{p}");
+        assert!(
+            p.ends_with(crate::assumptions::EVALUATOR_VERDICT_CONVENTION),
+            "the VERDICT line reads last: {p}"
+        );
+        u.executes_code = false;
+        assert!(!skill_prompt(&u, None, claude, None).contains(line));
+        let mut tool = WorkUnit::pending("s:build", "s", 1, "run the build");
+        tool.role = PhaseRole::Creator;
+        tool.tool_cmd = Some(vec!["npm".into(), "test".into()]);
+        assert!(!skill_prompt(&tool, None, claude, None).contains(line));
+        let mut judge = WorkUnit::pending("validator-agent", "validator", 1, "judge this");
+        judge.role = PhaseRole::Creator;
+        assert!(!skill_prompt(&judge, None, claude, None).contains(line));
+        // The pty line keeps its task budget: no stack-check line there.
+        let mut creator = WorkUnit::pending("s:build", "s", 1, "add SSO login");
+        creator.role = PhaseRole::Creator;
+        let input = StepInput {
+            run_id: "s".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit: creator,
+            workflow_id: "wf".into(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let p = pty_unit_prompt(&input, claude).expect("fits");
+        assert!(!p.contains(line), "{p}");
+    }
+
     #[test]
     fn skill_prompt_leads_with_the_headless_slash_form() {
         let appendix = crate::assumptions::PROMPT_CONVENTION;
@@ -13768,6 +13861,12 @@ mod tests {
             } else {
                 ""
             };
+            // (core#1381) …and a Creator's with the stack-check line.
+            let verdict = if role == PhaseRole::Creator {
+                crate::assumptions::STACK_CHECK_CONVENTION
+            } else {
+                verdict
+            };
             assert_eq!(
                 skill_prompt(&u, None, SkillForm::ClaudePlugin, None),
                 format!(
@@ -13820,7 +13919,8 @@ mod tests {
             format!(
                 "Invoke your skill \"wicked-garden:governed-worker\" (via the Skill tool) and follow \
                  its §creator section; then: Invoke your skill \"wicked-garden:domain\" (via the \
-                 Skill tool) and complete this task under its instructions: triage the report{appendix}"
+                 Skill tool) and complete this task under its instructions: triage the report{appendix}{}",
+                crate::assumptions::STACK_CHECK_CONVENTION
             )
         );
         // The layout map still sits between the task and the appendix.
@@ -13867,7 +13967,10 @@ mod tests {
         none.base_skill_ref = Some(String::new());
         assert_eq!(
             skill_prompt(&none, None, SkillForm::ClaudePlugin, None),
-            format!("triage the report{appendix}")
+            format!(
+                "triage the report{appendix}{}",
+                crate::assumptions::STACK_CHECK_CONVENTION
+            )
         );
         assert!(base_skill_directive(&none, SkillForm::ClaudePlugin, None).is_none());
         for internal in ["validator", "triage"] {

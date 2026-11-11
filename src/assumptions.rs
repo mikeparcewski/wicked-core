@@ -48,6 +48,18 @@ pub const PROMPT_CONVENTION: &str = " ||| CONVENTION (external transformations):
      confidence=<known|needs-research> :: <the transformation logic as you understand it; \
      when unsure, use confidence=needs-research and state what needs human research>";
 
+/// (core#1381) The stack-check line a CODE-WRITING agent unit records (wicked-core POL-2101: check
+/// what the chosen stack already provides before writing code, and record the check in the step
+/// output). Appended by `execute_wrapped::skill_prompt` to every agent unit that writes code (a
+/// creator, or a phase that declares `executes_code`: the same steps whose records POL-2101's record
+/// clause reads, `cli_runner::creator_records`), never to an engine-internal or tool unit. Without it
+/// a builder did the check and left no sentence a judge could cite, so the rule broke on the record
+/// alone. SINGLE-LINE by the same pty contract as [`PROMPT_CONVENTION`].
+pub const STACK_CHECK_CONVENTION: &str = " ||| STACK CHECK (rule POL-2101): before writing code, \
+     check what the chosen stack already provides at its pinned version, and record it on one \
+     output line: STACK-CHECK: looked at <docs or source> :: offers <what it provides for this job, \
+     or nothing this change needs>";
+
 /// The evaluator VERDICT contract line (L1↔L4 cross-lane contract; des-adjudicated §4.1). Appended
 /// by `execute_wrapped::skill_prompt` to EVERY Evaluator-role work unit's prompt (all three
 /// `SkillForm`s, both carriers) and to no other role, so a seat whose garden skill text is not loaded

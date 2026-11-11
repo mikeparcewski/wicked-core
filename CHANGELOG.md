@@ -14,6 +14,20 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **POL-2101 no longer breaks on a missing record line when the check was made (wicked-core#1381).** The
+  stack-builtins rule was disputed or broken on nearly every governed run because the builder's output had no
+  stack-check sentence, even when the rule judge found no duplicated built-in. Three changes. A code-writing agent
+  unit's prompt now asks for one line, `STACK-CHECK: looked at <docs or source> :: offers <what it provides for this
+  job, or nothing this change needs>` (the governed-worker skill asks for the same line). The rule's record call is
+  also shown the reviewer's own output at the gate, and the record clause is kept when every code-writing step's
+  record states the check or the reviewer's record does. A KEPT must quote one of them. A BROKEN must name a creator
+  record shown whole, and it counts only when the reviewer's record was shown whole too. The substance half is
+  unchanged, so a duplicated built-in still breaks the rule (deny-dominates), and so does a code step that left no
+  record at all. The rule is now NOT_APPLICABLE by fact on a change that touches only docs, text or images, and the
+  substance judge is told that a text, literal, prompt or comment-only edit is N/A while a change to logic is always
+  judged. The rule statement is unchanged, so stores seeded before this keep the record split. The pack doc gains a
+  "when it does not apply" paragraph.
+
 - **Requirements carry a business domain, not just their directory (reqgraph Fix B).** A requirement's domain is
   its package directory (`<dir>::REQ-NNN`), which fit a product owner's view on 57% of the rows measured on AutoGPT.
   wicked-garden's extractor now proposes the repository's business domains from code evidence and writes each rule's
