@@ -16,6 +16,8 @@ struct MemIo {
     /// When set: the gateway dir whose mutation lock must be held at `open_login` and free at
     /// `prepare_login` (review B-4 #3).
     lock_dir: RefCell<Option<std::path::PathBuf>>,
+    /// When set: `open_login` starts the pod, then fails; `remove_login` fails (codex b4-r2 #2).
+    fail_open_and_remove: RefCell<bool>,
 }
 
 impl MemIo {
@@ -127,6 +129,9 @@ impl BrokerIo for MemIo {
             );
         }
         self.pods.borrow_mut().insert(session.into());
+        if *self.fail_open_and_remove.borrow() {
+            return Err("injected: the login pod did not become ready".into());
+        }
         Ok(vec!["exec".into(), session.into(), cli.into()])
     }
     fn read_login(&self, session: &str, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
@@ -146,6 +151,9 @@ impl BrokerIo for MemIo {
         Ok(())
     }
     fn remove_login(&self, session: &str) -> Result<(), String> {
+        if *self.fail_open_and_remove.borrow() {
+            return Err("injected: the cluster is unreachable".into());
+        }
         self.pods.borrow_mut().remove(session);
         self.stores.borrow_mut().remove(session);
         Ok(())
@@ -282,5 +290,26 @@ fn a_login_starts_inside_its_sessions_transaction() {
     *io.lock_dir.borrow_mut() = Some(dir.clone());
     prepare_login_argv(&io, &dir, "claude").unwrap();
     assert!(io.log.borrow().contains(&"prepare claude".to_string()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// codex b4-r2 #2: a login that failed to start and whose cleanup failed too keeps its session
+/// marker, so the next sign-in still finds and clears its pod and store.
+#[test]
+fn a_failed_login_whose_cleanup_fails_keeps_its_session_marker() {
+    let (io, dir) = (MemIo::default(), temp_dir());
+    *io.fail_open_and_remove.borrow_mut() = true;
+    let e = prepare_login_argv(&io, &dir, "claude").unwrap_err();
+    assert!(e.contains("could not be cleaned up"), "{e}");
+    let left = read_session(&dir, "claude")
+        .unwrap()
+        .expect("the marker stays");
+    assert!(io.pods.borrow().contains(&left));
+    *io.fail_open_and_remove.borrow_mut() = false;
+    prepare_login_argv(&io, &dir, "claude").unwrap();
+    assert!(
+        !io.pods.borrow().contains(&left),
+        "the next sign-in cleared it"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }

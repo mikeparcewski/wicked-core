@@ -254,6 +254,20 @@ impl Gw {
         }
     }
 
+    /// Whether the gateway Deployment is scaled to zero (no gateway starts on its own); `false`
+    /// when it cannot be read.
+    pub(crate) fn scaled_down(&self) -> bool {
+        self.kube
+            .get_json(Some(&self.ns), "deployment", render::GATEWAY_NAME)
+            .ok()
+            .flatten()
+            .and_then(|d| {
+                d.pointer("/spec/replicas")
+                    .and_then(serde_json::Value::as_u64)
+            })
+            == Some(0)
+    }
+
     /// Whether a gateway serves now, for a sign-out's confirmation ([`serving_state`]).
     pub(crate) fn serving_state(&self) -> Option<bool> {
         self.kube

@@ -3171,9 +3171,18 @@ fn prepare_login_argv(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<Vec<St
         Ok(argv) => Ok(argv),
         Err(e) => {
             // A login that did not start is discarded with its store, inside the transaction.
-            let _ = discard_login(io, dir, cli, &volume);
-            let _ = crate::seat_refresh::remove_private_file(&session_path(dir, cli));
-            Err(e)
+            // Its session marker goes only once that is done (codex b4-r2 #2): it is how a
+            // sign-out or the next sign-in finds a pod and store a failed cleanup left.
+            match discard_login(io, dir, cli, &volume) {
+                Ok(()) => {
+                    let _ = crate::seat_refresh::remove_private_file(&session_path(dir, cli));
+                    Err(e)
+                }
+                Err(c) => Err(format!(
+                    "{e}; its login could not be cleaned up ({c}), and is left for the next \
+                     sign-in or sign-out to clear"
+                )),
+            }
         }
     }
 }

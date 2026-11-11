@@ -323,6 +323,7 @@ impl BrokerIo for K8sIo {
             dir,
             cli,
             gw.serving_state(),
+            gw.scaled_down(),
             || gw.publish(),
             |key, accepted| gw.confirm_key(key, accepted),
         )
