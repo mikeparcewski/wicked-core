@@ -1330,27 +1330,56 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
 /// Keyed by the repository and the run's worktree name. Across daemons, the checks above stand.
 struct TreeLock(String);
 
-fn tree_locks() -> &'static (std::sync::Mutex<HashSet<String>>, std::sync::Condvar) {
-    static LOCKS: std::sync::OnceLock<(std::sync::Mutex<HashSet<String>>, std::sync::Condvar)> =
+/// Per tree: the next ticket to hand out and the ticket now holding the tree.
+type TreeQueues = std::collections::HashMap<String, (u64, u64)>;
+
+fn tree_locks() -> &'static (std::sync::Mutex<TreeQueues>, std::sync::Condvar) {
+    static LOCKS: std::sync::OnceLock<(std::sync::Mutex<TreeQueues>, std::sync::Condvar)> =
         std::sync::OnceLock::new();
     LOCKS.get_or_init(|| {
         (
-            std::sync::Mutex::new(HashSet::new()),
+            std::sync::Mutex::new(TreeQueues::new()),
             std::sync::Condvar::new(),
         )
     })
 }
 
+/// (core#1429) A place in a tree's queue, taken now and waited for later: first come, first
+/// served. The actor takes one for a cancel's reap BEFORE the cancel replies, so a relaunch of the
+/// same run id, which can only come after that reply, mints after the reap (review on #1433).
+pub(crate) struct TreeTicket {
+    key: String,
+    ticket: u64,
+}
+
+fn tree_key(repo_root: &str, run_id: &str) -> String {
+    format!("{repo_root}\0{}", sanitize_worktree_id(run_id))
+}
+
+pub(crate) fn reserve_tree(repo_root: &str, run_id: &str) -> TreeTicket {
+    let key = tree_key(repo_root, run_id);
+    let (held, _) = tree_locks();
+    let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
+    let e = map.entry(key.clone()).or_insert((0, 0));
+    let ticket = e.0;
+    e.0 += 1;
+    TreeTicket { key, ticket }
+}
+
+impl TreeTicket {
+    fn wait(self) -> TreeLock {
+        let (held, freed) = tree_locks();
+        let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
+        while map.get(&self.key).is_some_and(|e| e.1 != self.ticket) {
+            map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
+        }
+        TreeLock(self.key)
+    }
+}
+
 impl TreeLock {
     fn take(repo_root: &str, run_id: &str) -> Self {
-        let key = format!("{repo_root}\0{}", sanitize_worktree_id(run_id));
-        let (held, freed) = tree_locks();
-        let mut set = held.lock().unwrap_or_else(|p| p.into_inner());
-        while set.contains(&key) {
-            set = freed.wait(set).unwrap_or_else(|p| p.into_inner());
-        }
-        set.insert(key.clone());
-        TreeLock(key)
+        reserve_tree(repo_root, run_id).wait()
     }
 }
 
@@ -1363,9 +1392,14 @@ pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {
 impl Drop for TreeLock {
     fn drop(&mut self) {
         let (held, freed) = tree_locks();
-        held.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.0);
+        let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(e) = map.get_mut(&self.0) {
+            e.1 += 1;
+            if e.1 == e.0 {
+                map.remove(&self.0);
+            }
+        }
+        drop(map);
         freed.notify_all();
     }
 }
@@ -1839,7 +1873,12 @@ pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
 /// named leftover rather than a silent leak; a clean tree adds nothing the branch doesn't already
 /// carry, and goes. The branch itself is never touched either way.
 pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
-    let _tree = TreeLock::take(repo_root, run_id);
+    reap_worktree_with(reserve_tree(repo_root, run_id), repo_root, run_id)
+}
+
+/// [`reap_worktree_if_clean`] in the place `ticket` holds in the tree's queue (core#1429).
+pub(crate) fn reap_worktree_with(ticket: TreeTicket, repo_root: &str, run_id: &str) -> bool {
+    let _tree = ticket.wait();
     let wt = worktree_path(repo_root, run_id);
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable, and the
@@ -4252,6 +4291,36 @@ mod tests {
             }
             std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (core#1429, review on #1433) A tree's queue is first come, first served: a reap whose place
+    /// was taken before a relaunch's mint runs first, whichever thread wakes first, so the mint
+    /// never adopts a tree the reap then deletes.
+    #[test]
+    fn a_reserved_reap_runs_before_a_later_mint_of_the_same_tree() {
+        let root = git_repo("reap-fifo");
+        let p = root.to_str().unwrap().to_string();
+        let wt = create_worktree(&p, "run-again").unwrap();
+        let held = hold_tree_for_test(&p, "run-again");
+        let ticket = reserve_tree(&p, "run-again");
+        let mint = std::thread::spawn({
+            let p = p.clone();
+            move || create_worktree(&p, "run-again").map(|_| ())
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let reap = std::thread::spawn({
+            let p = p.clone();
+            move || reap_worktree_with(ticket, &p, "run-again")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(held);
+        assert!(reap.join().unwrap(), "the clean tree is reaped");
+        mint.join().unwrap().unwrap();
+        assert!(
+            is_live_worktree(&wt),
+            "the relaunch minted after the reap: its tree is live"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

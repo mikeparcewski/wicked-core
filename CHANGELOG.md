@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A Stop no longer holds the engine while its worktree is deleted (wicked-core#1429).** On the dev daemon one gate
+  answer took 175 s: a Stop cancels the run, and the cancel reaped the run's worktree on the engine's single actor
+  thread, deleting its `node_modules` file by file while every other run's reads, gate answers and step results
+  waited. The reap now runs on its own thread. The cancel waits at most 500 ms for it: a quick reap's
+  `worktreeRetained` is still said before `runCancelled`, and a slower one says it when it ends. A relaunch of the
+  same run id waits its turn on the tree, so it never adopts a tree being deleted. The load harness
+  (`tests/load_actor.rs`, `WICKED_LOAD_GATES=1`) now answers gates at N runs, including Stops over trees with a
+  3,000-file dependency directory, and asserts no actor command takes a second. Crew's stall-watchdog list already
+  reads the off-actor read model (#1407); its timeouts during the stall were the binding's worker pool waiting behind
+  blocked calls (crew#1495).
+
 - **The boot reaper removes only worktrees its own daemon minted (wicked-core#1373).** Two daemons on one host (a
   stable daemon and a test rig, each with its own state home) can register the same checkout. Restarting either one
   force-removed the other's live, parked and retained worktrees, uncommitted work included, because a run id its own

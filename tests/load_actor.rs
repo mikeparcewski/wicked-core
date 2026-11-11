@@ -20,6 +20,12 @@
 //! Run:
 //! `WICKED_LOAD_RUNS=10 WICKED_LOAD_FILES=1300 WICKED_LOAD_SECS=120 \
 //!  cargo test --test load_actor -- --ignored --nocapture`
+//! (core#1429) `WICKED_LOAD_GATES=1` pauses every unit at a gate (`human_confirm: all`) and a gate
+//! thread answers them: Approve, and Stop (a cancel) at the second gate of every third run, after
+//! writing `WICKED_LOAD_IGNORED` (3000) ignored files under the run's `node_modules/`, so a Stop
+//! reaps a tree with a dependency directory, as a studio run's is. The run then ASSERTS that
+//! no actor command took a second or more (`gate` samples time each answer).
+//!
 //! Knobs: `WICKED_LOAD_RUNS` (3), `WICKED_LOAD_FILES` (1300), `WICKED_LOAD_UNITS` (4),
 //! `WICKED_LOAD_SECS` (60), `WICKED_LOAD_STEP_MS` (500-3000, as `lo-hi`), and
 //! `WICKED_LOAD_REPORT` (a path the JSON report is also written to). `WICKED_READ_MODEL=off`
@@ -169,6 +175,7 @@ fn make_repo(root: &Path, files: u64) {
         std::fs::write(dir.join(format!("f{i:05}.ts")), &body).unwrap();
     }
     std::fs::write(root.join("README.md"), "load\n").unwrap();
+    std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
     git(root, &["add", "-A"]);
     git(root, &["commit", "-qm", "init"]);
 }
@@ -189,6 +196,7 @@ fn workflow(units: u64) -> String {
 }
 
 fn spec(run: &str, repo_ref: &str) -> LaunchSpec {
+    let gated = knob("WICKED_LOAD_GATES", 0) == 1;
     LaunchSpec {
         base_ref: None,
         project_id: None,
@@ -196,7 +204,11 @@ fn spec(run: &str, repo_ref: &str) -> LaunchSpec {
         clis: vec![cli("a"), cli("b")],
         entity_mode: EntityMode::Shared,
         session_id: run.into(),
-        human_confirm: HumanConfirm::None,
+        human_confirm: if gated {
+            HumanConfirm::All
+        } else {
+            HumanConfirm::None
+        },
         auto_deliver: false,
         repo_ref: Some(repo_ref.to_string()),
         workflow: Some("load-chain".into()),
@@ -296,6 +308,22 @@ fn actor_latency_under_concurrent_runs() {
     let files = knob("WICKED_LOAD_FILES", 1300);
     let units = knob("WICKED_LOAD_UNITS", 4);
     let secs = knob("WICKED_LOAD_SECS", 60);
+    let gated = knob("WICKED_LOAD_GATES", 0) == 1;
+    // (review on #1433) The bound is asserted over every command of the window: each one over a
+    // second is kept on the slow list, which no faster run evicts as the per-variant ring would.
+    if gated && std::env::var_os("WICKED_ACTOR_SLOW_MS").is_none() {
+        std::env::set_var("WICKED_ACTOR_SLOW_MS", "1000");
+    }
+    // (review r2 on #1433) A gated run measures Stops over populated trees: never zero files.
+    assert!(
+        !gated || knob("WICKED_LOAD_IGNORED", 3000) > 0,
+        "WICKED_LOAD_GATES=1 needs WICKED_LOAD_IGNORED > 0"
+    );
+    let ignored = if gated {
+        knob("WICKED_LOAD_IGNORED", 3000)
+    } else {
+        0
+    };
     let (lo_ms, hi_ms) = std::env::var("WICKED_LOAD_STEP_MS")
         .ok()
         .and_then(|v| {
@@ -440,6 +468,82 @@ fn actor_latency_under_concurrent_runs() {
         }));
     }
 
+    // (core#1429) The gate answers: every open gate is approved, except the second gate of every
+    // third run, which is a Stop (a cancel through the gate, the path that held the actor 175 s).
+    let gates_seen: Arc<Mutex<BTreeMap<String, u32>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let stopped = Arc::new(AtomicU64::new(0));
+    if gated {
+        let (core, samples, stop, live, gates_seen, stopped) = (
+            core.clone(),
+            samples.clone(),
+            stop.clone(),
+            live.clone(),
+            gates_seen.clone(),
+            stopped.clone(),
+        );
+        threads.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let views = core.sessions_detail().unwrap_or_default();
+                let ids: Vec<String> = live.lock().unwrap().clone();
+                for v in views.iter().filter(|v| {
+                    ids.contains(&v.session.id) && v.session.status == SessionStatus::AwaitingHuman
+                }) {
+                    let id = v.session.id.clone();
+                    let n: u64 = id
+                        .rsplit('-')
+                        .next()
+                        .and_then(|x| x.parse().ok())
+                        .unwrap_or(0);
+                    let k = {
+                        let mut g = gates_seen.lock().unwrap();
+                        let e = g.entry(id.clone()).or_insert(0);
+                        *e += 1;
+                        *e
+                    };
+                    // A Stop reaps a populated tree: an installed dependency directory, ignored
+                    // (so the tree stays clean and the reap deletes it), written here while the
+                    // run waits at its gate (a read-only phase's seat cannot write it).
+                    let stop_here = n.is_multiple_of(3) && k == 2;
+                    if stop_here {
+                        let wd = v
+                            .session
+                            .workdir
+                            .as_deref()
+                            .expect("a run on a repo has a tree");
+                        for i in 0..ignored {
+                            let dir = std::path::Path::new(wd)
+                                .join(format!("node_modules/p{:03}", i / 100));
+                            std::fs::create_dir_all(&dir).expect("the fixture's dependency dir");
+                            std::fs::write(
+                                dir.join(format!("i{i:05}.js")),
+                                "module.exports = 1;\n",
+                            )
+                            .expect("a fixture dependency file");
+                        }
+                    }
+                    let decision = if stop_here {
+                        wicked_core::HumanDecision::Reject
+                    } else {
+                        wicked_core::HumanDecision::Approve {
+                            amend: None,
+                            amend_scope: Default::default(),
+                        }
+                    };
+                    let t = Instant::now();
+                    let res = core.confirm_gate(&id, decision);
+                    samples.add(
+                        if res.is_ok() { "gate" } else { "gate_refused" },
+                        t.elapsed(),
+                    );
+                    if stop_here && matches!(res, Ok(SessionStatus::Cancelled)) {
+                        stopped.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }));
+    }
+
     // Keep N runs live for the window: replace each run that ends.
     let window = Instant::now();
     while window.elapsed() < Duration::from_secs(secs) {
@@ -458,13 +562,12 @@ fn actor_latency_under_concurrent_runs() {
             .filter(|id| {
                 views.iter().any(|v| {
                     &v.session.id == *id
-                        && matches!(
+                        && (matches!(
                             v.session.status,
                             SessionStatus::Completed
                                 | SessionStatus::Failed
                                 | SessionStatus::Cancelled
-                                | SessionStatus::AwaitingHuman
-                        )
+                        ) || (!gated && v.session.status == SessionStatus::AwaitingHuman))
                 })
             })
             .cloned()
@@ -473,6 +576,8 @@ fn actor_latency_under_concurrent_runs() {
             let v = views.iter().find(|v| v.session.id == id).unwrap();
             match v.session.status {
                 SessionStatus::Completed => finished.fetch_add(1, Ordering::Relaxed),
+                // (core#1429) A Stop the gate thread gave.
+                SessionStatus::Cancelled if gated => stopped.load(Ordering::Relaxed),
                 _ => {
                     let why = core
                         .run_events(&id)
@@ -514,6 +619,8 @@ fn actor_latency_under_concurrent_runs() {
         "launched": launched.load(Ordering::Relaxed),
         "completed": finished.load(Ordering::Relaxed),
         "not_completed": failed.load(Ordering::Relaxed),
+        "gates": gated,
+        "stops": stopped.load(Ordering::Relaxed),
         "loadavg": load1,
         "latency": samples.summary(),
         "actor": {
@@ -530,4 +637,16 @@ fn actor_latency_under_concurrent_runs() {
     }
     drop(core);
     let _ = std::fs::remove_dir_all(&base);
+    // (core#1429) With gates answered (Stops included), no actor command takes a second.
+    if gated {
+        assert!(
+            stopped.load(Ordering::Relaxed) > 0,
+            "the window Stopped no run over a populated tree: {text}"
+        );
+        assert!(
+            stats.slow_threshold_ms <= 1000 && stats.slow.is_empty(),
+            "an actor command took a second or more: {:?}",
+            stats.slow
+        );
+    }
 }
