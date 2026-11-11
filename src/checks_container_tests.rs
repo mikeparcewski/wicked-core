@@ -28,12 +28,17 @@ fn the_memory_cap_sizes_the_cargo_jobs_one_per_two_gigabytes() {
 
 #[test]
 fn a_node_modules_volume_is_keyed_by_every_install_input() {
-    let a = nm_volume("img:1", "", b"lock-a", b"in");
-    assert_eq!(a, nm_volume("img:1", "", b"lock-a", b"in"));
-    assert_ne!(a, nm_volume("img:1", "", b"lock-b", b"in"));
-    assert_ne!(a, nm_volume("img:2", "", b"lock-a", b"in"));
-    assert_ne!(a, nm_volume("img:1", "pkg", b"lock-a", b"in"));
-    assert_ne!(a, nm_volume("img:1", "", b"lock-a", b"other"));
+    let a = nm_volume("img:1", "", b"lock-a", b"in", &[]);
+    assert_eq!(a, nm_volume("img:1", "", b"lock-a", b"in", &[]));
+    assert_ne!(a, nm_volume("img:1", "", b"lock-b", b"in", &[]));
+    assert_ne!(a, nm_volume("img:2", "", b"lock-a", b"in", &[]));
+    assert_ne!(a, nm_volume("img:1", "pkg", b"lock-a", b"in", &[]));
+    assert_ne!(a, nm_volume("img:1", "", b"lock-a", b"other", &[]));
+    // (core#1393) A volume whose addons were built is never the one without.
+    assert_ne!(
+        a,
+        nm_volume("img:1", "", b"lock-a", b"in", &["better-sqlite3"])
+    );
     assert!(a.starts_with("wfloor-nm-") && a.len() == "wfloor-nm-".len() + 16);
 }
 
@@ -156,6 +161,7 @@ fn a_nested_package_s_mount_point_parents_are_listed_outermost_first() {
         dir: dir.into(),
         volume: "v".into(),
         failed: None,
+        native: Vec::new(),
     };
     assert_eq!(
         nested_parents(

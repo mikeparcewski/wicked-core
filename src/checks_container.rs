@@ -31,7 +31,10 @@
 //!   an install container fills: it alone has the network, and it runs a fixed
 //!   `npm ci --ignore-scripts` or a `cargo fetch --locked` with the repository's `.cargo`
 //!   configuration left out of its copy and every compiler wrapper overridden, so it executes no
-//!   repository code.
+//!   repository code. A repository's declared `native_rebuild` (core#1393) changes only that the
+//!   fill makes each addon's empty `build/`; the addon is built per floor, in the checks container
+//!   (offline, where the repository's code runs anyway), on a private tmpfs over that `build/`,
+//!   and never written to the shared volume.
 //! * **Hardened**: a read-only root filesystem, every capability dropped, `no-new-privileges`, an
 //!   init, a pids limit and a memory cap (`--memory` = `--memory-swap`, [`MEMORY_ENV`]). The checks
 //!   run as uid 1000; the container's own idle process runs as another uid, so the engine can end
@@ -49,7 +52,7 @@
 //!
 //! | Cache | Volume | Filled by | Mounted in the checks |
 //! |---|---|---|---|
-//! | `node_modules` | `wfloor-nm-<key>`, key = sha256 of the image, the package dir, the lockfile, every `package.json` / `.npmrc` / `npm-shrinkwrap.json` of the tree (and the whole tree when the lockfile installs a local `file:` package) | an install container, `npm ci --ignore-scripts` | read-only, in place at `<side>/<dir>/node_modules`; nested workspace `node_modules` unpacked from a tar in the volume |
+//! | `node_modules` | `wfloor-nm-<key>`, key = sha256 of the image, the package dir, the lockfile, every `package.json` / `.npmrc` / `npm-shrinkwrap.json` of the tree (and the whole tree when the lockfile installs a local `file:` package) | an install container, `npm ci --ignore-scripts` (a declared `native_rebuild`, core#1393, also makes each addon's empty `build/`; the names join the key) | read-only, each declared addon's `build/` a private tmpfs the `native-build` check builds it on, in place at `<side>/<dir>/node_modules`; nested workspace `node_modules` unpacked from a tar in the volume |
 //! | cargo registry | `wfloor-cargo-home` (shared) | `cargo fetch --locked`, once per workspace lockfile | read-only, `CARGO_NET_OFFLINE=true` |
 //! | cargo target | `wfloor-target-<run leaf>-<side>` | the floor itself | read-write, removed with the run's check-scratch leaf |
 //!
@@ -451,8 +454,25 @@ pub(crate) fn cargo_inputs(entries: &[Entry], tree: &str) -> Vec<u8> {
 
 /// The `node_modules` volume for an `npm ci` in `dir` over `lock` and the tree's `inputs`
 /// ([`npm_inputs`]).
-pub(crate) fn nm_volume(image: &str, dir: &str, lock: &[u8], inputs: &[u8]) -> String {
-    let argv = NPM_FILL.join("\u{1f}");
+///
+/// (core#1393) The declared native addons are part of the key when there are any (a volume with
+/// built bindings is never the one without), and leave it as it was when there are none.
+pub(crate) fn nm_volume(
+    image: &str,
+    dir: &str,
+    lock: &[u8],
+    inputs: &[u8],
+    native: &[&str],
+) -> String {
+    let mut argv = NPM_FILL.join("\u{1f}");
+    if !native.is_empty() {
+        argv.push('\u{1e}');
+        argv.push_str("native_rebuild");
+        for n in native {
+            argv.push('\u{1f}');
+            argv.push_str(n);
+        }
+    }
     format!(
         "wfloor-nm-{}",
         key16(&[
@@ -1035,6 +1055,9 @@ struct NmMount {
     volume: String,
     /// The install failed on the repository's own inputs: its log, shown by the install check.
     failed: Option<String>,
+    /// (core#1393) The declared native addons (`native_rebuild`) installed at its top: each gets a
+    /// private tmpfs on its `build/` in the checks container, where the `native-build` check builds it.
+    native: Vec<&'static str>,
 }
 
 /// What one side's container is made from.
@@ -1408,9 +1431,28 @@ impl ChecksFloor {
                         rel(dir, lock_name)
                     ));
                 }
-                let volume = nm_volume(&self.tag, dir, &lock, &npm_inputs(&entries, &lock, &id));
+                // (core#1393) The addons the package's own `.wicked/checks.json` declares, read from
+                // the tree the floor judges (validated against the allowlist, as the host floor's
+                // detection does; a config that does not parse is not "none").
+                let native = match read_blob(
+                    &self.git_dir,
+                    &id,
+                    &rel(dir, crate::repo_checks::CONFIG_PATH),
+                ) {
+                    Some(raw) => {
+                        crate::repo_checks::native_rebuild_in(&String::from_utf8_lossy(&raw))?
+                    }
+                    None => Vec::new(),
+                };
+                let volume = nm_volume(
+                    &self.tag,
+                    dir,
+                    &lock,
+                    &npm_inputs(&entries, &lock, &id),
+                    &native,
+                );
                 let t = Instant::now();
-                let filled = self.fill_nm(&entries, dir, &volume)?;
+                let filled = self.fill_nm(&entries, dir, &volume, &native)?;
                 caches.push(CacheUse {
                     kind: "node_modules".into(),
                     volume: volume.clone(),
@@ -1419,6 +1461,7 @@ impl ChecksFloor {
                 });
                 nm.push(NmMount {
                     dir: dir.clone(),
+                    native: native.clone(),
                     volume,
                     failed: match filled {
                         Fill::Failed(log) => Some(log),
@@ -1636,6 +1679,18 @@ impl ChecksFloor {
                     nm_path(&work, &m.dir)
                 ),
             ]);
+            // (core#1393) A declared native addon's `build/` (made empty by the fill) is this
+            // container's own: the addon is built there by the floor's `native-build` check and
+            // goes with the container. The shared volume stays read-only and unbuilt.
+            for n in &m.native {
+                args.extend([
+                    "--tmpfs".into(),
+                    format!(
+                        "{}/{n}/build:rw,exec,uid=1000,gid=1000,mode=0755,size=1g",
+                        nm_path(&work, &m.dir)
+                    ),
+                ]);
+            }
         }
         if plan.cargo {
             args.extend([
@@ -1938,6 +1993,32 @@ print(json.dumps({'dirs':dirs,'files':files}))
                     .and_then(|p| p.nm.into_iter().find(|m| m.dir == dir))
             })
             .flatten();
+        // (core#1393) The native build of a package whose fill FAILED says so and fails, whatever
+        // the copied tree holds: its addon was never mounted from a fill that met the declaration.
+        let failed_fill = (check == crate::repo_checks::NATIVE_BUILD_CHECK)
+            .then(|| {
+                self.plan(tree)
+                    .ok()
+                    .and_then(|p| p.nm.into_iter().find(|m| m.dir == dir))
+                    .and_then(|m| m.failed)
+            })
+            .flatten();
+        if let Some(log) = failed_fill {
+            let argv = vec![
+                "sh".to_string(),
+                "-c".into(),
+                "printf '%s\\n' \"$1\"; exit 1".into(),
+                "native-build".into(),
+                format!(
+                    "wicked-core: the dependency fill this native build needs failed in the \
+                     install container:\n{log}"
+                ),
+            ];
+            let mut c = self.rt.cmd();
+            c.args(["exec", "-u", CHECKS_USER, "-w", &cwd]);
+            c.arg(&l.name).args(reaping(&argv));
+            return Ok(c);
+        }
         let argv: Vec<String> = match fill {
             Some(NmMount {
                 failed: Some(log), ..
@@ -2171,7 +2252,13 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
 
     /// Fill `volume` with the `node_modules` of [`NPM_FILL`] in `dir` (once per key), and lease it
     /// for this floor.
-    fn fill_nm(&self, entries: &[Entry], dir: &str, volume: &str) -> Result<Fill, String> {
+    fn fill_nm(
+        &self,
+        entries: &[Entry],
+        dir: &str,
+        volume: &str,
+        native: &[&str],
+    ) -> Result<Fill, String> {
         let _lock = lock_volume(volume)?;
         lease(volume, &self.leases);
         stamp(&self.cache, volume, &self.repo);
@@ -2204,6 +2291,25 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
             format!("/work/t/{dir}")
         });
         let cmd = NPM_FILL.join(" ");
+        // (core#1393) Each declared native addon must be installed at the top of this
+        // `node_modules`; its empty `build/` is made here, the mount point the checks container
+        // puts a private tmpfs on, where the addon is built per floor (the `native-build` check).
+        // Nothing is built in this (shared) volume, and nothing of the repository runs.
+        let addons: String = native
+            .iter()
+            .map(|n| {
+                let n = sh_quote(n);
+                // A link (a workspace or `file:` package) is refused: its `build/` is not the
+                // installed dependency's, and a mount there would follow the link.
+                format!(
+                    "if test -L node_modules/{n} || ! test -f node_modules/{n}/package.json; then \
+                     echo \"wicked-core: native_rebuild names {n}, which this lockfile does not \
+                     install as a dependency at the top of node_modules\"; exit 3; fi; \
+                     mkdir -p node_modules/{n}/build; "
+                )
+            })
+            .collect();
+        let mark = format!("{OOM_BEFORE_MARK} touch {FILL_DIR}/{COMPLETE}");
         // A node_modules the tree tracks is not the install's: removed before it, so the nested
         // archive holds npm's output only. Nested dirs are archived NUL-delimited, verbatim.
         let script = format!(
@@ -2211,10 +2317,10 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
              find . -mindepth 1 -name node_modules -prune -exec rm -rf {{}} +; \
              echo WICKED-FILL-START; \
              if ! {cmd} > {FILL_DIR}/{INSTALL_LOG} 2>&1; then tail -n 60 {FILL_DIR}/{INSTALL_LOG}; exit 3; fi; \
-             mkdir -p node_modules; cp -a node_modules/. {FILL_DIR}/; \
+             mkdir -p node_modules; {addons}cp -a node_modules/. {FILL_DIR}/; \
              find . -path ./node_modules -prune -o -type d -name node_modules -prune -print0 \
                | tar --null -T - -c -f {FILL_DIR}/{NESTED_TAR}; \
-             {OOM_BEFORE_MARK} touch {FILL_DIR}/{COMPLETE}"
+             {mark}"
         );
         match self.run_install(
             entries,

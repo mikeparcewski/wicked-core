@@ -14,6 +14,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The checks floor can build an allowlisted native addon (wicked-core#1393).** The floor installs with scripts
+  off (`npm ci --ignore-scripts`), so `better-sqlite3` had no binding, and wicked-interactive's bus and SSE tests
+  failed or hung for an environment reason. A repository can now declare `"native_rebuild": ["better-sqlite3"]` in
+  `.wicked/checks.json`. Each name must be on the engine's allowlist (`NATIVE_REBUILD_ALLOW`, currently
+  `better-sqlite3`). Any other name, a non-npm install, or a missing package.json is a detection error on every
+  checkout.
+  - The install is unchanged. A new provisioning check, `native-build`, runs right after it. It calls the
+    node-gyp that ships with the floor's own npm directly (`configure` then `build`), against the floor's own
+    node headers. Nothing is downloaded, and no npm lifecycle runs, so no `.npmrc`, no root or package scripts,
+    and no `.bin` shims. The check fails unless a `build/Release/*.node` was built.
+  - The check runs where the repository's checks already run. In the container floor that is the offline
+    checks container, building onto a private tmpfs over the addon's `build/`. The shared, read-only
+    `node_modules` cache stays unbuilt. Its fill only creates the empty `build/` mount point, and the names
+    join its key.
+  - Like `install`, `native-build` is never compared with the base and never reused from a journal. The base
+    runs its own `native-build` after its install.
+  - Verified in the checks-floor image, offline and as uid 1000, with the cache read-only: the binding built
+    in 44 s and loaded.
+
 - **The checks floor and seat images run Node 24 (pinned 24.22.2), up from 22.** crew's SQLite uploads need
   Node 24.12 or 25.1 or later, so nine crew tests always failed in the floor, on the base and the change alike.
   The checks image, the seat image and the seat builder's default base now pin one Node release. A test asserts

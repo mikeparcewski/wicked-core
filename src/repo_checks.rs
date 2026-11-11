@@ -103,7 +103,10 @@
 //! `generated` (core#1173: `[{"paths": [...], "command": [...]}]`, the files the repository
 //! generates and the command that regenerates each set; the floor runs none of them, and the
 //! deliver lift regenerates a declared file that conflicts beside a changelog, see
-//! [`crate::deliver_lift`]). The
+//! [`crate::deliver_lift`]) and `native_rebuild` (core#1393: dependencies on
+//! [`NATIVE_REBUILD_ALLOW`] whose native addon the `native-build` check builds right after the
+//! scripts-off install, with the floor's own node-gyp, per floor, where the checks run — never
+//! into the shared dependency cache; [`native_build_argv`]). The
 //! floor PREFERS `test_targeted` — at the creator stage always, at verify unless `full: true` —
 //! substituting `{files}` (the paths the change touched relative to the base commit, one argv
 //! element each) and `{base}` (the base commit id) so a runner's own change-aware mode can be used
@@ -447,8 +450,8 @@ pub struct RepoCheck {
 impl RepoCheck {
     fn base_timeout(&self) -> Duration {
         match self.timeout_s {
-            Some(s) if self.name != "install" => Duration::from_secs(s),
-            _ if self.name == "install" => INSTALL_TIMEOUT,
+            Some(s) if !is_provisioning(&self.name) => Duration::from_secs(s),
+            _ if is_provisioning(&self.name) => INSTALL_TIMEOUT,
             _ => CHECK_TIMEOUT,
         }
     }
@@ -937,6 +940,16 @@ pub struct FloorJournal {
 /// The check that provisions the tree's dependencies: never reused from a journal.
 const PROVISIONING_CHECK: &str = "install";
 
+/// (core#1393) The check that builds the declared native addons (`native_rebuild`) after the
+/// install.
+pub(crate) const NATIVE_BUILD_CHECK: &str = "native-build";
+
+/// The checks that PROVISION the tree rather than check it: never reused from a journal (their
+/// receipt is not their output) and never compared with the base.
+pub(crate) fn is_provisioning(name: &str) -> bool {
+    name == PROVISIONING_CHECK || name == NATIVE_BUILD_CHECK
+}
+
 /// (J4) What a floor took from the interrupted one ([`RepoChecksReport::resumed`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1102,7 +1115,7 @@ fn write_creator_record(logs: &Path, record: &CreatorFloorRecord) {
 /// a result stands in for running the check again. The `install` check never does: its receipt is
 /// not its output (`node_modules`, a venv), and a guarded floor runs on a fresh checkout.
 fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
-    check.name != PROVISIONING_CHECK && run.argv == check.argv && finished_whole(run, logs)
+    !is_provisioning(&check.name) && run.argv == check.argv && finished_whole(run, logs)
 }
 
 /// Did `run` finish (not a timeout, not a spawn or could-not-run failure, a decision recorded)
@@ -1338,7 +1351,7 @@ impl OpenJournal {
     /// `install` check always runs again: its receipt is not its output (`node_modules`, a venv),
     /// and a guarded floor runs on a fresh checkout that has none of it (xreview).
     fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<CheckRun> {
-        if check.name == PROVISIONING_CHECK {
+        if is_provisioning(&check.name) {
             return None;
         }
         let at = self
@@ -2253,6 +2266,83 @@ struct ChecksConfig {
     /// which checks retry their own failures ([`floor_scoped`]). Keyed by check name.
     #[serde(default)]
     rerun: std::collections::BTreeMap<String, floor_scoped::RerunEntry>,
+    /// (core#1393) Dependencies whose native addon the floor builds after its install (which runs
+    /// with scripts off): each must be on [`NATIVE_REBUILD_ALLOW`]. Built by the `native-build`
+    /// check ([`native_build_argv`]) where the checks run, never by an npm lifecycle script.
+    #[serde(default)]
+    native_rebuild: Vec<String>,
+}
+
+/// (core#1393) The dependencies a repository may ask the floor to build natively
+/// (`native_rebuild`). The list bounds WHAT is built; it is not a trust decision about the
+/// package's contents: the build runs where the repository's own checks run (their sandbox, or the
+/// offline checks container), so whatever a lockfile installs under the name runs with exactly the
+/// trust its tests already have, and nothing of it reaches the shared dependency cache.
+pub const NATIVE_REBUILD_ALLOW: &[&str] = &["better-sqlite3"];
+
+/// (core#1393) The validated `native_rebuild` of a config: each name on [`NATIVE_REBUILD_ALLOW`],
+/// returned as the allowlist's own spelling (never repository text), sorted and deduplicated.
+fn native_rebuild_of(names: &[String]) -> Result<Vec<&'static str>, String> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for n in names {
+        let Some(known) = NATIVE_REBUILD_ALLOW.iter().find(|k| **k == n.as_str()) else {
+            return Err(format!(
+                "`{CONFIG_PATH}` `native_rebuild` names `{}`, which is not on the floor's \
+                 native-rebuild allowlist ({})",
+                n.chars().take(64).collect::<String>(),
+                NATIVE_REBUILD_ALLOW.join(", ")
+            ));
+        };
+        out.push(known);
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
+/// (core#1393) The `native_rebuild` a raw [`CONFIG_PATH`] declares (the container floor reads the
+/// config from the tree's blob, not the filesystem). A config that does not parse is an error.
+pub(crate) fn native_rebuild_in(raw: &str) -> Result<Vec<&'static str>, String> {
+    native_rebuild_of(&parse_config(raw)?.native_rebuild)
+}
+
+/// (core#1393) The `native-build` check for `names` ([`native_rebuild_of`]: the allowlist's own
+/// spelling, so the shell line is the engine's). For each addon, in `node_modules/<name>`: when no
+/// built binding is there yet, the node-gyp that ships with the floor's own npm (found by the
+/// absolute path of `npm` on the floor's PATH, never a `node_modules/.bin` shim) runs `configure`
+/// and `build` against the headers of the floor's own node (`--nodedir`: nothing is downloaded,
+/// so it runs offline in the container floor). No npm lifecycle, so no `.npmrc`, no root or
+/// package scripts and no `prebuild-install` download. It then requires a built
+/// `build/Release/*.node`: a build that produced none fails the check, never a silent pass. It runs
+/// where the repository's own checks run (their sandbox, or the checks container, whose writes to
+/// the addon go to a private tmpfs) — the allowlist bounds what is built, not who is trusted.
+pub(crate) fn native_build_argv(names: &[&str]) -> Vec<String> {
+    let mut script = String::from(
+        "set -e; gyp_of() { npm=\"$(readlink -f \"$(command -v npm)\")\"; \
+         d=\"$(dirname \"$(dirname \"$npm\")\")\"; \
+         for g in \"$d/node_modules/node-gyp/bin/node-gyp.js\" \
+         \"$(dirname \"$d\")/node-gyp/bin/node-gyp.js\"; do \
+         if test -f \"$g\"; then echo \"$g\"; return 0; fi; done; \
+         echo \"wicked-core: no node-gyp beside npm ($npm)\" >&2; return 1; }; \
+         node=\"$(readlink -f \"$(command -v node)\")\"; \
+         nodedir=\"$(dirname \"$(dirname \"$node\")\")\"; ",
+    );
+    for n in names {
+        script.push_str(&format!(
+            "test -f node_modules/{n}/package.json || {{ echo \"wicked-core: native_rebuild: {n} \
+             is not installed at the top of node_modules\"; exit 1; }}; \
+             if test -L node_modules/{n}; then echo \"wicked-core: native_rebuild: \
+             node_modules/{n} is a link (a workspace or local package), not an installed \
+             dependency\"; exit 1; fi; \
+             if ! ls node_modules/{n}/build/Release/*.node >/dev/null 2>&1; then \
+             gyp=\"$(gyp_of)\"; (cd node_modules/{n} && \"$node\" \"$gyp\" configure \
+             --release --nodedir=\"$nodedir\" && \"$node\" \"$gyp\" build --release); fi; \
+             ls node_modules/{n}/build/Release/*.node >/dev/null 2>&1 || {{ echo \"wicked-core: \
+             native_rebuild: {n} built no binding\"; exit 1; }}; echo \"wicked-core: {n}: \
+             binding built\"; "
+        ));
+    }
+    vec!["sh".into(), "-c".into(), script]
 }
 
 /// (core#1173) One `generated` entry of [`CONFIG_PATH`] as written:
@@ -2341,6 +2431,7 @@ fn parse_config(raw: &str) -> Result<ChecksConfig, String> {
     }
     generated_of(&cfg)?;
     floor_scoped::rerun_of(&cfg.rerun)?;
+    native_rebuild_of(&cfg.native_rebuild)?;
     Ok(cfg)
 }
 
@@ -2555,9 +2646,14 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
             // same argv and dir is that install, run once, there.
             let mut first: Vec<RepoCheck> = Vec::new();
             let mut rest: Vec<RepoCheck> = Vec::new();
+            // (core#1393) A covered directory's declared native build is provisioning the guide
+            // does not know about: it is kept, right after that directory's install.
+            let mut native: Vec<RepoCheck> = Vec::new();
             for mut c in detected {
                 if !covered.contains(&c.dir) {
                     rest.push(c);
+                } else if c.name == NATIVE_BUILD_CHECK {
+                    native.push(c);
                 } else if let Some(why) = stale.as_deref() {
                     c.source = format!(
                         "{} — run beside the base's stale build guide ({why})",
@@ -2572,7 +2668,19 @@ pub(crate) fn detect_with(worktree: &Path, ctx: &FloorContext) -> Result<Vec<Rep
                     }
                 }
             }
-            first.into_iter().chain(guided).chain(rest).collect()
+            let mut out: Vec<RepoCheck> = first.into_iter().chain(guided).collect();
+            for n in native {
+                // After the last install of its directory (the stale union's detected one, or the
+                // guide's), else before everything of that directory.
+                let at = out
+                    .iter()
+                    .rposition(|c| c.name == PROVISIONING_CHECK && c.dir == n.dir)
+                    .map(|i| i + 1)
+                    .or_else(|| out.iter().position(|c| c.dir == n.dir))
+                    .unwrap_or(out.len());
+                out.insert(at, n);
+            }
+            out.into_iter().chain(rest).collect()
         }
         None => detected,
     })
@@ -2775,6 +2883,7 @@ pub(crate) fn subdir_packages(
 /// One package's checks — the root's, or (core#817) a subdirectory package's.
 fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
     let cfg = read_config(worktree)?.unwrap_or_default();
+    let native = native_rebuild_of(&cfg.native_rebuild)?;
     let r_typecheck = resolve(&cfg.typecheck, "typecheck")?;
     let r_lint = resolve(&cfg.lint, "lint")?;
     let r_test = resolve(&cfg.test, "test")?;
@@ -2832,6 +2941,14 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     let mut cargo_fmt: Option<RepoCheck> = None;
     let mut cargo: Option<RepoCheck> = None;
     let mut node_test_script: Option<(&'static str, String)> = None;
+    // (core#1393) The declared native addons' build, right after the install.
+    let mut native_build: Option<RepoCheck> = None;
+    let has_package = probe(worktree, "package.json")?.is_some();
+    if !native.is_empty() && !has_package {
+        return Err(format!(
+            "`{CONFIG_PATH}` `native_rebuild` needs a package.json beside it"
+        ));
+    }
     if let Some(probed) = probe(worktree, "package.json")? {
         let is_file = probed.is_file();
         let Some(mut file) = probed.file.filter(|_| is_file) else {
@@ -2849,6 +2966,16 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             Some(_) => return Err("`package.json` `scripts` is not an object".to_string()),
         };
         let pm = package_manager(worktree)?;
+        // (core#1393) Validated whatever the tree's install state, so the same declaration is
+        // never accepted on one checkout and refused on another.
+        if !native.is_empty()
+            && (matches!(pm, "pnpm" | "yarn") || probe(worktree, "package-lock.json")?.is_none())
+        {
+            return Err(format!(
+                "`{CONFIG_PATH}` `native_rebuild` is supported for an npm install from \
+                 package-lock.json only"
+            ));
+        }
         node_test_script = scripts
             .and_then(|m| m.get("test"))
             .and_then(|v| v.as_str())
@@ -2857,7 +2984,18 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
             .into_iter()
             .filter(|k| scripts.is_some_and(|m| m.get(*k).and_then(|v| v.as_str()).is_some()))
             .collect();
-        if !wanted.is_empty() || configured_node {
+        // A declaration alone emits it: one that cannot be met (nothing installed) fails visibly.
+        if !native.is_empty() {
+            native_build = Some(RepoCheck {
+                name: NATIVE_BUILD_CHECK.into(),
+                argv: native_build_argv(&native),
+                source: format!("{CONFIG_PATH} native_rebuild ({})", native.join(", ")),
+                timeout_s: None,
+                dir: String::new(),
+            });
+        }
+        // (core#1393) A native declaration needs the dependencies it builds, check scripts or not.
+        if !wanted.is_empty() || configured_node || !native.is_empty() {
             // PROVISIONING (F-E2E-029): presence of `node_modules/` is not an install — see
             // `node_modules_gap`. The gap names the first declared dependency that is missing, so
             // the `install` check's `source` says WHY it ran.
@@ -3033,13 +3171,22 @@ fn detect_package(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>,
     // The formatter runs right after `install` and BEFORE every other check (core#551 review): a
     // formatting diff is the cheapest, most deterministic denial, and CI runs it first too. A test
     // that fails earlier would otherwise skip it and hide the "format first" denial.
-    let mut out: Vec<RepoCheck> = [install, cargo_fmt, typecheck, lint, test, cargo, e2e]
-        .into_iter()
-        .flatten()
-        .chain(journeys)
-        .collect();
+    let mut out: Vec<RepoCheck> = [
+        install,
+        native_build,
+        cargo_fmt,
+        typecheck,
+        lint,
+        test,
+        cargo,
+        e2e,
+    ]
+    .into_iter()
+    .flatten()
+    .chain(journeys)
+    .collect();
     if let Some(t) = cfg.timeout_s {
-        for c in out.iter_mut().filter(|c| c.name != "install") {
+        for c in out.iter_mut().filter(|c| !is_provisioning(&c.name)) {
             c.timeout_s = Some(t);
         }
     }
@@ -5647,7 +5794,7 @@ fn run_detected(
                 d.reason = Some(why);
             }
         } else {
-            let compare = check.name != "install" && !is_formatter_check(&check.name);
+            let compare = !is_provisioning(&check.name) && !is_formatter_check(&check.name);
             // With exclusion off the base runs plainly: no results, no list, no alone runs.
             let excluding = gcheck.as_ref().ok().copied().filter(|_| exclude);
             // (power-speed) A decision that cannot exclude is decided by the head's own runs, so
@@ -6011,8 +6158,12 @@ fn package_coverage_note(
     let bare: Vec<String> = pkgs
         .dirs
         .into_iter()
-        // An install alone checks nothing.
-        .filter(|d| !detected.iter().any(|c| &c.dir == d && c.name != "install"))
+        // An install (or a native build) alone checks nothing.
+        .filter(|d| {
+            !detected
+                .iter()
+                .any(|c| &c.dir == d && !is_provisioning(&c.name))
+        })
         .map(|d| format!("{d}/"))
         .collect();
     (!bare.is_empty()).then(|| {
@@ -6987,7 +7138,7 @@ impl FloorCheckout {
         let installs: Vec<RepoCheck> = detect_with(&self.dir, &ctx)
             .map_err(|e| format!("the checkout's checks could not be detected: {e}"))?
             .into_iter()
-            .filter(|c| c.name == PROVISIONING_CHECK)
+            .filter(|c| is_provisioning(&c.name))
             .collect();
         let commands = sets.iter().map(|g| RepoCheck {
             name: "regenerate".to_string(),
@@ -7767,6 +7918,28 @@ impl BaseTree {
             if !r.passed() {
                 return fail(format!(
                     "the base's dependency install did not pass ({})",
+                    r.summary()
+                ));
+            }
+        }
+        // (core#1393) The base's declared native addons are built too, so both sides run the
+        // check with the same bindings.
+        if let Some(build) = detected.iter().find(|c| c.name == NATIVE_BUILD_CHECK) {
+            let build = RepoCheck {
+                dir: check.dir.clone(),
+                ..build.clone()
+            };
+            let r = run_held(
+                &self.dir,
+                Some(&self.held),
+                &build,
+                sandbox,
+                scratch,
+                Tree::Base,
+            );
+            if !r.passed() {
+                return fail(format!(
+                    "the base's native addon build did not pass ({})",
                     r.summary()
                 ));
             }
@@ -10724,6 +10897,242 @@ pub(crate) mod tests {
                 .collect::<Vec<_>>(),
             vec!["typecheck", "test"]
         );
+    }
+
+    /// core#1393: an allowlisted `native_rebuild` adds a `native-build` check right after the
+    /// (unchanged, scripts-off) install, whatever the tree's install state; it is provisioning
+    /// (never compared with the base, never reused from a journal, the install's bound). A name off
+    /// the allowlist, a non-npm install or no package.json is a detection error, on every checkout.
+    #[test]
+    fn a_declared_native_addon_gets_a_native_build_check_after_the_install() {
+        let wt = scratch("native-build");
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"scripts":{"test":"node --test"},"dependencies":{"better-sqlite3":"12.0.0"}}"#,
+        )
+        .unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"native_rebuild":["better-sqlite3","better-sqlite3"]}"#,
+        )
+        .unwrap();
+        let detected = detect(&wt).unwrap();
+        let names: Vec<&str> = detected.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["install", NATIVE_BUILD_CHECK, "test"],
+            "{detected:?}"
+        );
+        assert_eq!(
+            detected[0].argv,
+            s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
+            "the install is unchanged (the container floor fills it from its cache)"
+        );
+        assert_eq!(detected[1].argv, native_build_argv(&["better-sqlite3"]));
+        assert_eq!(
+            detected[1].source,
+            ".wicked/checks.json native_rebuild (better-sqlite3)"
+        );
+        assert!(is_provisioning(NATIVE_BUILD_CHECK) && is_provisioning("install"));
+        assert!(!is_provisioning("test"));
+        assert_eq!(detected[1].base_timeout(), INSTALL_TIMEOUT);
+        // Provisioned already: no install, the build check still runs (it skips a built binding).
+        std::fs::create_dir_all(wt.join("node_modules/better-sqlite3")).unwrap();
+        std::fs::write(
+            wt.join("node_modules/better-sqlite3/package.json"),
+            r#"{"name":"better-sqlite3","version":"12.0.0"}"#,
+        )
+        .unwrap();
+        let detected = detect(&wt).unwrap();
+        assert_eq!(detected[0].name, NATIVE_BUILD_CHECK, "{detected:?}");
+        // Off the allowlist: fail-closed, never "skip it".
+        std::fs::write(wt.join(CONFIG_PATH), r#"{"native_rebuild":["left-pad"]}"#).unwrap();
+        let err = detect(&wt).expect_err("off the allowlist");
+        assert!(
+            err.contains("not on the floor's native-rebuild allowlist"),
+            "{err}"
+        );
+        assert!(native_rebuild_in(r#"{"native_rebuild":["x; rm -rf /"]}"#).is_err());
+        // A non-npm install cannot honour it — refused with node_modules present or not.
+        std::fs::write(
+            wt.join(CONFIG_PATH),
+            r#"{"native_rebuild":["better-sqlite3"]}"#,
+        )
+        .unwrap();
+        std::fs::remove_file(wt.join("package-lock.json")).unwrap();
+        std::fs::write(wt.join("pnpm-lock.yaml"), "").unwrap();
+        let err = detect(&wt).expect_err("pnpm, provisioned");
+        assert!(
+            err.contains("npm install from package-lock.json only"),
+            "{err}"
+        );
+        std::fs::remove_dir_all(wt.join("node_modules")).unwrap();
+        let err = detect(&wt).expect_err("pnpm, unprovisioned");
+        assert!(
+            err.contains("npm install from package-lock.json only"),
+            "{err}"
+        );
+        // A declaration alone emits the build, with no check scripts (it fails visibly when
+        // nothing is installed, never silently skipped).
+        std::fs::remove_file(wt.join("pnpm-lock.yaml")).unwrap();
+        std::fs::write(wt.join("package-lock.json"), "{}").unwrap();
+        std::fs::write(
+            wt.join("package.json"),
+            r#"{"dependencies":{"better-sqlite3":"12.0.0"}}"#,
+        )
+        .unwrap();
+        let names: Vec<String> = detect(&wt).unwrap().into_iter().map(|c| c.name).collect();
+        assert_eq!(
+            names,
+            vec!["install".to_string(), NATIVE_BUILD_CHECK.to_string()],
+            "a declaration alone provisions and builds"
+        );
+        std::fs::remove_file(wt.join("package.json")).unwrap();
+        let err = detect(&wt).expect_err("no package.json");
+        assert!(err.contains("needs a package.json"), "{err}");
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// core#1393 (review r3): the generated script, executed against stub `npm` / `node` /
+    /// node-gyp: it builds an unbuilt addon (configure, then build), skips a built one without
+    /// looking for node-gyp, and fails — visibly — on a build that leaves no binding, a failed
+    /// node-gyp, a linked addon, a missing addon and a missing node-gyp.
+    #[cfg(unix)]
+    #[test]
+    fn the_native_build_script_builds_skips_and_fails_visibly() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = scratch("native-build-exec");
+        let bin = root.join("bin");
+        let npm_dir = root.join("lib/node_modules/npm");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(npm_dir.join("bin")).unwrap();
+        std::fs::create_dir_all(npm_dir.join("node_modules/node-gyp/bin")).unwrap();
+        std::fs::write(npm_dir.join("bin/npm-cli.js"), "").unwrap();
+        // npm's CLI is executable, as every install ships it (`command -v npm` needs that).
+        std::fs::set_permissions(
+            npm_dir.join("bin/npm-cli.js"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        let gyp = npm_dir.join("node_modules/node-gyp/bin/node-gyp.js");
+        std::fs::write(&gyp, "").unwrap();
+        symlink(npm_dir.join("bin/npm-cli.js"), bin.join("npm")).unwrap();
+        let log = root.join("node.log");
+        // The stub node: logs its argv; `build` writes a binding unless NO_BINDING, and any call
+        // fails under GYP_FAILS.
+        let node = bin.join("node");
+        std::fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n[ -n \"$GYP_FAILS\" ] && exit 7\n\
+                 if [ \"$2\" = build ] && [ -z \"$NO_BINDING\" ]; then mkdir -p build/Release && \
+                 : > build/Release/x.node; fi\nexit 0\n",
+                log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let argv = native_build_argv(&["better-sqlite3"]);
+        let tree = root.join("tree");
+        let addon = tree.join("node_modules/better-sqlite3");
+        let run = |env: &[(&str, &str)]| -> (i32, String) {
+            let _ = std::fs::remove_file(&log);
+            let mut c = std::process::Command::new(&argv[0]);
+            c.hardened()
+                .args(&argv[1..])
+                .current_dir(&tree)
+                .env_clear()
+                .env("PATH", format!("{}:/usr/bin:/bin", bin.display()));
+            for (k, v) in env {
+                c.env(k, v);
+            }
+            let out = c.output().unwrap();
+            let calls = std::fs::read_to_string(&log).unwrap_or_default();
+            (
+                out.status.code().unwrap_or(-1),
+                format!(
+                    "{}{}{calls}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            )
+        };
+        // Not installed.
+        std::fs::create_dir_all(tree.join("node_modules")).unwrap();
+        let (rc, out) = run(&[]);
+        assert!(rc != 0 && out.contains("is not installed"), "{rc} {out}");
+        // Installed, unbuilt: configure then build, then the binding is required and present.
+        std::fs::create_dir_all(&addon).unwrap();
+        std::fs::write(addon.join("package.json"), "{}").unwrap();
+        let (rc, out) = run(&[]);
+        assert_eq!(rc, 0, "{out}");
+        assert!(
+            out.contains("configure --release --nodedir=") && out.contains(" build --release"),
+            "{out}"
+        );
+        assert!(out.contains(&gyp.display().to_string()), "{out}");
+        assert!(addon.join("build/Release/x.node").is_file());
+        // Built: skipped — node (and node-gyp) never run.
+        let (rc, out) = run(&[]);
+        assert_eq!(rc, 0, "{out}");
+        assert!(!out.contains("configure"), "{out}");
+        // A build that leaves no binding, and a failing node-gyp: both fail.
+        std::fs::remove_dir_all(addon.join("build")).unwrap();
+        let (rc, out) = run(&[("NO_BINDING", "1")]);
+        assert!(rc != 0 && out.contains("built no binding"), "{rc} {out}");
+        let (rc, _) = run(&[("GYP_FAILS", "1")]);
+        assert_ne!(rc, 0);
+        // No node-gyp beside npm (nor beside its directory): fails.
+        std::fs::remove_file(&gyp).unwrap();
+        let (rc, out) = run(&[]);
+        assert_ne!(rc, 0, "{out}");
+        std::fs::write(&gyp, "").unwrap();
+        // A linked addon (a workspace or file: package under the name): refused.
+        std::fs::remove_dir_all(&addon).unwrap();
+        std::fs::create_dir_all(tree.join("packages/x")).unwrap();
+        std::fs::write(tree.join("packages/x/package.json"), "{}").unwrap();
+        symlink(tree.join("packages/x"), &addon).unwrap();
+        let (rc, out) = run(&[]);
+        assert!(rc != 0 && out.contains("is a link"), "{rc} {out}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1393: the build runs the node-gyp beside the floor's own npm against its own node's
+    /// headers — no npm lifecycle (so no `.npmrc`, root or package scripts, or `.bin` shims) —
+    /// and fails unless a binding was built.
+    #[test]
+    fn the_native_build_runs_node_gyp_directly_and_requires_a_binding() {
+        let argv = native_build_argv(&["better-sqlite3"]);
+        assert_eq!(&argv[..2], &["sh", "-c"]);
+        let script = &argv[2];
+        for want in [
+            "command -v npm",
+            "readlink -f",
+            "/node_modules/node-gyp/bin/node-gyp.js",
+            "configure --release --nodedir=",
+            "build --release",
+            "node_modules/better-sqlite3/build/Release/*.node",
+            "built no binding",
+            // Debian packages node-gyp beside npm, not inside it.
+            "/node-gyp/bin/node-gyp.js",
+            "$(dirname \"$d\")",
+            // A workspace or local package under the name is refused.
+            "test -L node_modules/better-sqlite3",
+        ] {
+            assert!(script.contains(want), "{want}: {script}");
+        }
+        for never in [
+            "npm rebuild",
+            "npm run",
+            "npm install",
+            "npx",
+            ".bin/",
+            "prebuild-install",
+        ] {
+            assert!(!script.contains(never), "{never}: {script}");
+        }
     }
 
     #[test]
