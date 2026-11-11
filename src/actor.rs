@@ -18234,6 +18234,16 @@ fn floor_rerun_request(
             }
             waive
         }
+        // (core#1392) Offered only when the floor named a targeted command to run: with none, a
+        // `targeted` re-run would run no tests at all, so it is refused here and the gate stays
+        // open (a report from before the field existed names none: refused too, fail-closed).
+        crate::repo_checks::FloorRerunMode::Targeted if report.targeted_test.is_none() => {
+            anyhow::bail!(
+                "unit {}: {}",
+                unit.ord,
+                crate::repo_checks::NO_TARGETED_COMMAND
+            )
+        }
         // (core#782) Never an answer of its own: an approve with a note arms it.
         crate::repo_checks::FloorRerunMode::FloorFix => {
             anyhow::bail!("`floor_fix` is armed by an approve with a note, not as an action")

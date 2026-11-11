@@ -870,6 +870,12 @@ pub struct RepoChecksReport {
     /// (core#469) Detected checks the operator WAIVED for this unit (never run, never counted).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub waived: Vec<String>,
+    /// (core#1392) On a floor that did not FINISH: the source of the test command an operator's
+    /// `targeted` re-run would run (`.wicked/checks.json test_targeted`, or the derived set's
+    /// source), read before the first check ran. `None` when there is none — the gate then refuses
+    /// `targeted` instead of letting it waive the tests — and on every other floor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub targeted_test: Option<String>,
     /// (core#469) The operator's re-run of THIS floor, armed at the escalation gate and read by
     /// the unit's next dispatch (`WorkUnit::repo_checks` is where the gate finds the floor it
     /// answers). Consumed there: the re-run's own report replaces this one on the unit.
@@ -1664,11 +1670,20 @@ impl RepoChecksReport {
                 // (core#469) A TIMEOUT is a check that did not finish, not one that failed: say
                 // so, and say what the gate can do about it.
                 if c.did_not_finish() {
+                    // (core#1392) Say what `targeted` would run, or that it is not offered.
+                    let targeted = match &self.targeted_test {
+                        Some(src) => format!("re-run with the targeted tests (`{src}`)"),
+                        None => format!(
+                            "declare a targeted test command (`test_targeted` in \
+                             `{CONFIG_PATH}`; none is declared, so a targeted re-run is not \
+                             offered)"
+                        ),
+                    };
                     return format!(
                         "{line}. This check did not FINISH — the change is unverified by it, not \
-                         refuted: extend the bound (`timeout_s` in `{CONFIG_PATH}`), declare a \
-                         targeted test command (`test_targeted`), or accept typecheck + lint + \
-                         targeted as this unit's floor at the gate"
+                         refuted: extend the bound (`timeout_s` in `{CONFIG_PATH}`), {targeted}, \
+                         or accept the checks that finished as this unit's floor at the gate \
+                         (the rest are then waived by you, labelled)"
                     );
                 }
                 // (DES-FLOOR-V2) What the decision established, from exit codes only.
@@ -4929,6 +4944,7 @@ fn runner_refused(worktree: &Path, ctx: &FloorContext, why: String) -> RepoCheck
         Err(e) => (Vec::new(), Some(e)),
     };
     RepoChecksReport {
+        targeted_test: None,
         detected,
         checks: Vec::new(),
         skipped: Vec::new(),
@@ -5057,6 +5073,7 @@ fn scratch_refused(
     e: &std::io::Error,
 ) -> RepoChecksReport {
     RepoChecksReport {
+        targeted_test: None,
         detected: detect_with(worktree, ctx).unwrap_or_default(),
         checks: Vec::new(),
         skipped: Vec::new(),
@@ -5158,6 +5175,7 @@ pub(crate) fn run_with_sandbox_ctx(
                     Err(e) => (Vec::new(), Some(e)),
                 };
                 return RepoChecksReport {
+                    targeted_test: None,
                     detected,
                     checks: Vec::new(),
                     skipped: Vec::new(),
@@ -5254,6 +5272,9 @@ struct FloorInputs {
     e2e_paths: Option<Vec<String>>,
     /// (core#1198) Each detected check's `rerun` entry, by `(dir, name)`, read before any check ran.
     reruns: std::collections::HashMap<(String, String), floor_scoped::RerunDecl>,
+    /// (core#1392) What an operator's `targeted` re-run of this floor would run
+    /// ([`targeted_selection`]'s source), read before any check ran.
+    targeted_test: Option<String>,
 }
 
 /// One pass of the floor over the detected checks ([`run_with_sandbox_ctx`]). With no `frozen`
@@ -5289,6 +5310,7 @@ fn run_detected(
                 Err(e) => {
                     return (
                         RepoChecksReport {
+                            targeted_test: None,
                             detected: Vec::new(),
                             checks: Vec::new(),
                             skipped: Vec::new(),
@@ -5321,6 +5343,7 @@ fn run_detected(
                     Err(e) => {
                         return (
                             RepoChecksReport {
+                                targeted_test: None,
                                 detected: Vec::new(),
                                 checks: Vec::new(),
                                 skipped: Vec::new(),
@@ -5391,6 +5414,12 @@ fn run_detected(
                     reruns.insert((c.dir.clone(), c.name.clone()), d);
                 }
             }
+            // (core#1392) What a `targeted` re-run would run, read here, before the first check
+            // runs: the gate offers `targeted` only when this names a command.
+            let targeted_test = targeted_selection(worktree, ctx)
+                .ok()
+                .flatten()
+                .map(|c| c.source);
             FloorInputs {
                 detected,
                 waived,
@@ -5405,6 +5434,7 @@ fn run_detected(
                 package_note,
                 e2e_paths,
                 reruns,
+                targeted_test,
             }
         }
     };
@@ -5423,6 +5453,7 @@ fn run_detected(
         package_note,
         e2e_paths,
         reruns,
+        targeted_test,
     } = inputs;
     let baseline_diff_for =
         |dir: &str| dir.is_empty() || package_baseline.get(dir).copied().unwrap_or(false);
@@ -5935,8 +5966,12 @@ fn run_detected(
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
     };
+    // (core#1392) Only a floor that did not FINISH offers `targeted`, so only it says what that runs.
+    let targeted_test =
+        targeted_test.filter(|_| checks.iter().any(|c| c.did_not_finish() && c.denies()));
     (
         RepoChecksReport {
+            targeted_test,
             passed,
             detected,
             checks,
@@ -6062,8 +6097,38 @@ fn e2e_paths(worktree: &Path, ctx: &FloorContext) -> Option<Vec<String>> {
     Some(e2e)
 }
 
+/// The check name a targeted test command runs under.
+const TARGETED_CHECK: &str = "test_targeted";
+
+/// (core#1392) Why a `targeted` re-run cannot run on a tree with no targeted test command.
+pub const NO_TARGETED_COMMAND: &str =
+    "a `targeted` re-run needs a targeted test command, and this \
+     tree has none (no `test_targeted` in `.wicked/checks.json`, and none the floor can derive) — \
+     it would run no tests, so it is not run: extend the bound, accept the partial floor (the \
+     tests are then waived by you, labelled), give your own judgment, or declare `test_targeted`";
+
+/// The check set a `targeted` re-run runs: the creator-stage selection, without a power run's
+/// full-suite policy, which would hand back the full set and waive every test (xreview on #1184).
+fn targeted_checks(worktree: &Path, ctx: &FloorContext) -> Result<Vec<RepoCheck>, String> {
+    detect_with(
+        worktree,
+        &FloorContext {
+            stage: FloorStage::Creator,
+            run_id: None,
+            ..ctx.clone()
+        },
+    )
+}
+
+/// (core#1392) The targeted test check a `targeted` re-run would run on this tree, if any.
+fn targeted_selection(worktree: &Path, ctx: &FloorContext) -> Result<Option<RepoCheck>, String> {
+    Ok(targeted_checks(worktree, ctx)?
+        .into_iter()
+        .find(|c| c.name == TARGETED_CHECK))
+}
+
 /// Is `name` one of the floor's TEST-set checks (the ones a `targeted` re-run replaces)?
-fn is_test_set_check(name: &str) -> bool {
+pub(crate) fn is_test_set_check(name: &str) -> bool {
     matches!(name, "test" | "cargo-test" | "e2e") || name.starts_with(JOURNEY_PREFIX)
 }
 
@@ -6092,18 +6157,8 @@ fn apply_rerun(
             Vec::new(),
         )),
         FloorRerunMode::Targeted => {
-            // The operator asked for the TARGETED set: the creator-stage selection without a power
-            // run's full-suite policy, which would hand back the full set and waive every test
-            // (xreview on #1184).
-            let creator = detect_with(
-                worktree,
-                &FloorContext {
-                    stage: FloorStage::Creator,
-                    run_id: None,
-                    ..ctx.clone()
-                },
-            )?;
-            if creator.iter().any(|c| c.name == "test_targeted") {
+            let creator = targeted_checks(worktree, ctx)?;
+            if creator.iter().any(|c| c.name == TARGETED_CHECK) {
                 // The full test set the targeted command stands in for is disclosed as waived.
                 let waived = detected
                     .iter()
@@ -6114,10 +6169,10 @@ fn apply_rerun(
                     .collect();
                 Ok((creator, waived))
             } else {
-                let (run, waived): (Vec<RepoCheck>, Vec<RepoCheck>) = detected
-                    .into_iter()
-                    .partition(|c| !is_test_set_check(&c.name));
-                Ok((run, waived.into_iter().map(|c| c.name).collect()))
+                // (core#1392) Never "fewer tests" turned into "no tests": with no targeted command
+                // the re-run does not run, and the floor denies (fail-closed). The gate refuses
+                // this answer first (`targeted_test` names nothing); this holds if it is reached.
+                Err(NO_TARGETED_COMMAND.to_string())
             }
         }
         FloorRerunMode::AcceptPartial => {
@@ -7029,6 +7084,7 @@ impl FloorCheckout {
 pub(crate) fn apps_repository_report(worktree: &Path) -> RepoChecksReport {
     let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
     RepoChecksReport {
+        targeted_test: None,
         detected: Vec::new(),
         checks: Vec::new(),
         skipped: vec![
@@ -7066,6 +7122,7 @@ pub(crate) fn guarded_checkout_refused(
 ) -> RepoChecksReport {
     let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
     RepoChecksReport {
+        targeted_test: None,
         detected: detect_with(worktree, ctx).unwrap_or_default(),
         checks: Vec::new(),
         skipped: Vec::new(),
@@ -10770,6 +10827,7 @@ pub(crate) mod tests {
     #[test]
     fn a_failed_install_is_reported_as_a_provisioning_finding_not_a_verdict() {
         let report = RepoChecksReport {
+            targeted_test: None,
             detected: vec![RepoCheck {
                 name: "install".into(),
                 argv: s(&["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]),
@@ -12987,6 +13045,7 @@ exit 1
             .is_some_and(|e| e.contains("not on PATH")));
         assert_eq!(skipped, vec!["test"]);
         let report = RepoChecksReport {
+            targeted_test: None,
             detected: checks,
             checks: runs,
             skipped,
@@ -13262,6 +13321,7 @@ exit 1
         );
         assert!(r.summary().contains("TIMED OUT"), "{}", r.summary());
         let report = RepoChecksReport {
+            targeted_test: None,
             detected: vec![slow.clone()],
             checks: vec![r],
             skipped: vec!["cargo-test".into()],
@@ -13299,6 +13359,21 @@ exit 1
         assert!(
             !denial.contains("repo checks floor failed:"),
             "a timeout is never worded as a failure: {denial}"
+        );
+        // (core#1392) The denial says whether a targeted re-run is offered, and what it runs.
+        assert!(
+            denial.contains("none is declared, so a targeted re-run is not offered"),
+            "{denial}"
+        );
+        let with = RepoChecksReport {
+            targeted_test: Some(format!("{CONFIG_PATH} test_targeted")),
+            ..report
+        };
+        assert!(
+            with.denial_reason()
+                .contains("re-run with the targeted tests (`.wicked/checks.json test_targeted`)"),
+            "{}",
+            with.denial_reason()
         );
     }
 
@@ -14617,6 +14692,7 @@ exit 1
     fn report_of(checks: Vec<CheckRun>, skipped: &[&str]) -> RepoChecksReport {
         let passed = !checks.iter().any(|c| c.denies());
         RepoChecksReport {
+            targeted_test: None,
             detected: Vec::new(),
             checks,
             skipped: skipped.iter().map(|s| s.to_string()).collect(),
@@ -14703,19 +14779,17 @@ exit 1
             "{run:?}"
         );
 
-        let (run, waived) = apply_rerun(
+        // (core#1392) No targeted command: the re-run is refused (fail-closed), never a waiver of
+        // every test, and the floor names no targeted command for the gate to offer.
+        let err = apply_rerun(
             &wt,
             &ctx,
             &rerun(FloorRerunMode::Targeted, &[]),
             detected.clone(),
         )
-        .unwrap();
-        assert_eq!(names(&run), vec!["lint"]);
-        assert_eq!(
-            waived,
-            vec!["test"],
-            "no targeted command: the test set is waived"
-        );
+        .expect_err("no targeted command: not run");
+        assert_eq!(err, NO_TARGETED_COMMAND);
+        assert_eq!(targeted_selection(&wt, &ctx).unwrap(), None);
 
         let (run, waived) = apply_rerun(
             &wt,
@@ -14735,6 +14809,11 @@ exit 1
         .unwrap();
         let detected = detect_with(&wt, &ctx).unwrap();
         assert_eq!(names(&detected), vec!["lint", "test"], "verify, full: true");
+        assert_eq!(
+            targeted_selection(&wt, &ctx).unwrap().map(|c| c.source),
+            Some(format!("{CONFIG_PATH} test_targeted")),
+            "the declared targeted command is what the gate offers"
+        );
         let (run, waived) = apply_rerun(
             &wt,
             &ctx,

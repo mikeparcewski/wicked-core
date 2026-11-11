@@ -194,6 +194,9 @@ pub const SKIP_NOT_APPLICABLE: &str = "not_applicable";
 /// (QE acceptance) A waived or skipped QE acceptance on a receipt's `skipped[]`.
 pub const SKIP_QE_WAIVED: &str = "qe_waived_by_score";
 pub const SKIP_QE_OPERATOR: &str = "qe_skipped_by_operator";
+/// (core#1392) Floor checks the operator waived at the gate (`accept_partial`), on `skipped[]`
+/// under `repo_checks` with the label as its detail.
+pub const SKIP_WAIVED_BY_OPERATOR: &str = "waived_by_operator";
 
 /// [`QeAcceptance::status`].
 pub const QE_REQUIRED: &str = "required";

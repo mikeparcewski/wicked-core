@@ -2106,12 +2106,17 @@ pub(crate) fn apply_and_finish_unit(
                  and only this floor judged the fixed tree"
                 .to_string(),
         ),
-        (None, Some(r)) if !r.waived.is_empty() => Some(format!(
-            "the operator's `{}` re-run waived {} for this unit — unverified by the floor, not \
-             refuted",
-            r.rerun.map(|m| m.as_wire()).unwrap_or("floor"),
-            r.waived.join(", ")
-        )),
+        // (core#1392) An operator's waiver leads with its label: the operator, not the floor,
+        // accepted the unrun checks.
+        (None, Some(r)) if !r.waived.is_empty() => Some(match operator_waiver(r) {
+            Some(label) => format!("{label} for this unit — unverified by the floor, not refuted"),
+            None => format!(
+                "the operator's `{}` re-run waived {} for this unit, in favour of the targeted \
+                 tests (`test_targeted`)",
+                r.rerun.map(|m| m.as_wire()).unwrap_or("floor"),
+                r.waived.join(", ")
+            ),
+        }),
         _ => None,
     };
     // (core#546 / core#553) What the floor could not test on this host — the nested-sandbox env
@@ -2261,6 +2266,11 @@ pub(crate) fn apply_and_finish_unit(
                 ))),
                 None => None,
             },
+            checks_waived: evidence
+                .repo_checks
+                .as_ref()
+                .or(carried.as_ref())
+                .and_then(operator_waiver),
             judge: agent_verdict,
             judge_skipped: evidence.judge_skipped.as_deref(),
             rules: evidence.rule_check.as_ref(),
@@ -3396,12 +3406,32 @@ pub(crate) fn carried_floor_override(
     })
 }
 
+/// (core#1392) The label of floor checks the OPERATOR waived (`accept_partial`, named at the
+/// gate): "tests waived by the operator (`accept_partial`): test". `None` when nothing was waived,
+/// or the waived set was replaced by checks that ran (a `targeted` re-run's full suite).
+pub(crate) fn operator_waiver(r: &crate::repo_checks::RepoChecksReport) -> Option<String> {
+    if r.waived.is_empty() || r.rerun != Some(crate::repo_checks::FloorRerunMode::AcceptPartial) {
+        return None;
+    }
+    let tests = r
+        .waived
+        .iter()
+        .all(|w| crate::repo_checks::is_test_set_check(w));
+    Some(format!(
+        "{} waived by the operator (`accept_partial`): {}",
+        if tests { "tests" } else { "checks" },
+        r.waived.join(", ")
+    ))
+}
+
 /// What the fold observed, for [`gate_receipt`].
 struct GateFacts<'a> {
     /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
     pinned: Option<Result<(), String>>,
     /// `None`: the floor did not apply; `Some(Ok)`: checks executed; `Some(Err((reason, detail)))`.
     checks: Option<Result<(), (&'static str, Option<String>)>>,
+    /// (core#1392) The operator's waiver of floor checks this gate stood on ([`operator_waiver`]).
+    checks_waived: Option<String>,
     judge: Option<&'a crate::validator::AgentVerdict>,
     judge_skipped: Option<&'a str>,
     /// (DES-RULE-CHECK-001 S2) The review step's rule check, when it ran.
@@ -3479,6 +3509,11 @@ fn gate_receipt(
         Some(Ok(())) => r.ran(a::REPO_CHECKS),
         Some(Err((reason, detail))) => r.skip(a::REPO_CHECKS, reason, detail),
         None => {}
+    }
+    // (core#1392) Checks the operator waived are on the receipt too, so the delivery receipt
+    // (which aggregates every gate's) carries the label to the delivery.
+    if let Some(w) = f.checks_waived {
+        r.skip(a::REPO_CHECKS, a::SKIP_WAIVED_BY_OPERATOR, Some(w));
     }
     match (f.judge, f.judge_skipped) {
         // A judge RAN only when a seat answered: the bus path's transport failure and an
@@ -6834,3 +6869,31 @@ mod judge_absent_behind_floor_tests {
 #[cfg(test)]
 #[path = "pipeline_rule_check_tests.rs"]
 mod rule_check_fold_tests;
+
+#[cfg(test)]
+mod operator_waiver_tests {
+    use super::operator_waiver;
+    use crate::repo_checks::{red_report, FloorRerunMode};
+
+    /// core#1392: only the operator's `accept_partial` is labelled a waiver BY THE OPERATOR; a
+    /// `targeted` re-run's replaced full suite (the targeted tests ran) and an ordinary floor are
+    /// not, and the label says tests or checks by what was waived.
+    #[test]
+    fn only_an_accept_partial_waiver_is_labelled_the_operators() {
+        let mut r = red_report(&["a"], None);
+        assert_eq!(operator_waiver(&r), None, "nothing waived");
+        r.waived = vec!["test".into()];
+        r.rerun = Some(FloorRerunMode::Targeted);
+        assert_eq!(operator_waiver(&r), None, "the targeted tests ran");
+        r.rerun = Some(FloorRerunMode::AcceptPartial);
+        assert_eq!(
+            operator_waiver(&r).as_deref(),
+            Some("tests waived by the operator (`accept_partial`): test")
+        );
+        r.waived = vec!["test".into(), "lint".into()];
+        assert_eq!(
+            operator_waiver(&r).as_deref(),
+            Some("checks waived by the operator (`accept_partial`): test, lint")
+        );
+    }
+}

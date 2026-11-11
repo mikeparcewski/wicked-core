@@ -9889,6 +9889,7 @@ mod tests {
         unit.skill_ref = Some("wicked-garden-qe-tester".into());
         unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
         unit.repo_checks = Some(crate::repo_checks::RepoChecksReport {
+            targeted_test: None,
             requested_rerun: Some(crate::repo_checks::FloorRerun {
                 mode: crate::repo_checks::FloorRerunMode::FloorFix,
                 waive: Vec::new(),
