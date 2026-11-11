@@ -770,6 +770,7 @@ mod tests {
         assert_eq!(out.status.code(), Some(46));
         assert!(out.stdout.is_empty());
         let fifo = base.join("claude/fifo");
+        // spawn-audit: test-only — makes a fifo fixture in the test's own temp dir.
         assert!(std::process::Command::new("mkfifo")
             .arg(&fifo)
             .status()
