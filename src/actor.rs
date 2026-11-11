@@ -10001,7 +10001,9 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
-        if let Some(repo) = repo {
+        // A run that armed again since it ended keeps its tree (codex r2): its live edits
+        // may sit in the replica only.
+        if let Some(repo) = repo.filter(|_| crate::k8s::run_epoch(&rid) == epoch) {
             crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid);
         }
     });
@@ -10013,7 +10015,9 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     let epoch = crate::k8s::run_epoch(&rid);
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
-        if let Some(repo) = repo {
+        // A run that armed again since it ended keeps its tree (codex r2): its live edits
+        // may sit in the replica only.
+        if let Some(repo) = repo.filter(|_| crate::k8s::run_epoch(&rid) == epoch) {
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
         }
     });

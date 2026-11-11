@@ -3460,7 +3460,9 @@ pub(crate) fn arm_noting(
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
     // way: never in a replica, and a seat-writable tree over it is refused.
-    let engine_k8s = gateway_dir.and_then(Path::parent).map(|h| h.join("k8s"));
+    // From the state home the cluster settings were read from (codex r2: an offline seat has
+    // no gateway dir, and is covered all the same).
+    let engine_k8s = Some(home.join("k8s"));
     cover_gateway_dir(&mut mounts, engine_k8s.as_deref())
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // core#1228: a prompt too long for one exec argument rides a private read-only file.

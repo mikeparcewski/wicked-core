@@ -1060,3 +1060,16 @@ fn k8s_install_refuses_a_linked_credential_dir() {
     assert!(e.contains("a link is refused"), "{e}");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// codex r2: the actor reads a run's epoch without waiting behind a deletion in flight.
+#[test]
+fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
+    let run = format!("epoch-nb-{}", uuid::Uuid::new_v4().simple());
+    super::arming(&run);
+    let l = super::life(&run);
+    let _held = l.0.lock().unwrap(); // a release in flight
+    let (tx, rx) = std::sync::mpsc::channel();
+    let r = run.clone();
+    std::thread::spawn(move || tx.send(super::run_epoch(&r)).unwrap());
+    assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(1));
+}

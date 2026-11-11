@@ -471,7 +471,16 @@ fn ensure_sync(
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
     if let Some(p) = existing {
         // A sync pod that ended (or a predecessor's): replaced.
-        if p.pointer("/status/phase").and_then(Value::as_str) != Some("Pending") {
+        // A Pending pod is kept only when it is this boot's (codex r2): an earlier boot's holds
+        // the name and is replaced whatever its phase.
+        let this_boot = p
+            .pointer(&format!(
+                "/metadata/labels/{}",
+                super::BOOT_LABEL.replace('/', "~1")
+            ))
+            .and_then(Value::as_str)
+            == Some(super::boot_id());
+        if p.pointer("/status/phase").and_then(Value::as_str) != Some("Pending") || !this_boot {
             kube.delete_owned(Some(ns), "pod", "sync", true)
                 .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
         }
@@ -1214,7 +1223,13 @@ pub(crate) fn arm(
     super::arming(s.run_id);
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
-    ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
+    // The sync pod is inspected and replaced under the namespace's arm lock (codex r2): two
+    // arms never delete each other's replacement.
+    {
+        let arming = arm_lock(&ns);
+        let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
+    }
     let (roots, pod_mounts) = plan(
         s.tree,
         s.view,

@@ -201,11 +201,12 @@ fn install(a: &Args, home: &Path) -> Result<Value, String> {
     }
     let admin = admin(a, home)?;
     let own = super::own_kubeconfig(home);
+    // Absence only from a lookup that answered (codex r2): a lookup that failed stops the
+    // install before any change, never reads as "nothing installed" (and an undo).
     let existed = own.is_file()
         || admin
             .get_json(None, "namespace", &daemon_namespace_name(&admin.owner))
-            .ok()
-            .flatten()
+            .map_err(|e| format!("the cluster could not be read before installing: {e}"))?
             .is_some();
     // Undo a fresh install; report what could not be undone (codex b5 #6).
     let undo = |why: String| -> String {
@@ -265,6 +266,14 @@ pub(crate) fn install_for_test(home: &Path) -> Result<Value, String> {
 /// (codex b5 #8), and its dir when empty; an admin config named on the command line is never
 /// touched.
 fn forget_credential(home: &Path) -> Result<(), String> {
+    let dir = home.join("k8s");
+    // A link there is never followed (codex r2): its target is not this daemon's.
+    if std::fs::symlink_metadata(&dir).is_ok_and(|m| !m.file_type().is_dir()) {
+        return Err(format!(
+            "{} is not a directory; it was left as it is",
+            dir.display()
+        ));
+    }
     let own = super::own_kubeconfig(home);
     match std::fs::remove_file(&own) {
         Err(e) if e.kind() != std::io::ErrorKind::NotFound => {

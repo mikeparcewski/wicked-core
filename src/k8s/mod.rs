@@ -305,14 +305,16 @@ pub(crate) fn kube_for(home: &Path) -> Result<Kube, (FloorUnarmed, String)> {
     )
 }
 
-/// Each run's arm epoch behind its lifecycle lock (codex b5 #9/#10): every arm of the run bumps
-/// it under the lock (so it waits out a namespace deletion in flight), and a release scheduled
-/// at an earlier epoch is void, so a run resumed after it ended never loses its new namespace.
-static LIFE: std::sync::Mutex<
-    Option<std::collections::HashMap<String, std::sync::Arc<std::sync::Mutex<u64>>>>,
-> = std::sync::Mutex::new(None);
+/// Each run's arm epoch and its lifecycle lock (codex b5 #9/#10): every arm of the run takes the
+/// lock (so it waits out a namespace deletion in flight) and bumps the epoch, and a release
+/// scheduled at an earlier epoch is void, so a run resumed after it ended never loses its new
+/// namespace. The epoch is read without the lock (codex r2): the actor never waits behind a
+/// deletion.
+type Life = std::sync::Arc<(std::sync::Mutex<()>, std::sync::atomic::AtomicU64)>;
+static LIFE: std::sync::Mutex<Option<std::collections::HashMap<String, Life>>> =
+    std::sync::Mutex::new(None);
 
-fn life(run_id: &str) -> std::sync::Arc<std::sync::Mutex<u64>> {
+fn life(run_id: &str) -> Life {
     let mut g = LIFE.lock().unwrap_or_else(|p| p.into_inner());
     g.get_or_insert_with(std::collections::HashMap::new)
         .entry(run_id.to_string())
@@ -320,17 +322,17 @@ fn life(run_id: &str) -> std::sync::Arc<std::sync::Mutex<u64>> {
         .clone()
 }
 
-/// The run's arm epoch now (0 = never armed by this process).
+/// The run's arm epoch now (0 = never armed by this process); never blocks.
 pub(crate) fn run_epoch(run_id: &str) -> u64 {
-    *life(run_id).lock().unwrap_or_else(|p| p.into_inner())
+    life(run_id).1.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The run arms (a seat or a floor is about to use its namespace): waits out a release in
 /// flight, then voids every release scheduled before now.
 pub(crate) fn arming(run_id: &str) {
     let l = life(run_id);
-    let mut g = l.lock().unwrap_or_else(|p| p.into_inner());
-    *g += 1;
+    let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// A run reached a terminal state (B-5; called off the actor thread with every terminal
@@ -339,8 +341,8 @@ pub(crate) fn arming(run_id: &str) {
 /// one. Nothing happens when the daemon has no cluster configured.
 pub(crate) fn release_run(run_id: &str, epoch: u64) {
     let l = life(run_id);
-    let g = l.lock().unwrap_or_else(|p| p.into_inner());
-    if *g != epoch {
+    let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {
         return;
     }
     let Some(home) = engine_home() else {
