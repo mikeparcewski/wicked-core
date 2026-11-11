@@ -1894,7 +1894,9 @@ fn k8s_a_dead_engines_seat_pods_are_found_before_a_copy_in() {
 #[test]
 fn k8s_a_codec_refusal_never_resets_the_shared_sync_pod() {
     assert!(seat::resets_sync(None));
-    assert!(!seat::resets_sync(Some(1)));
+    // r7 #6: a cut exec stream exits 1 while the remote codec may still run.
+    assert!(seat::resets_sync(Some(1)));
+    assert!(!seat::resets_sync(Some(3)));
     assert!(!seat::resets_sync(Some(0)));
 }
 
@@ -1972,4 +1974,50 @@ fn k8s_a_seeded_cache_is_not_sent_again() {
     assert_eq!(decode(&first.0)[0].entries.len(), 1);
     assert!(decode(&again.0)[0].entries.is_empty());
     let _ = std::fs::remove_dir_all(&host);
+}
+
+/// r7 #1: a seat home keeps what the CLI wrote in earlier units (its sessions, so a resume finds
+/// them): the copy-in writes the engine's files over it and never mirrors it.
+#[cfg(unix)]
+#[test]
+fn k8s_a_seat_home_keeps_its_sessions_across_units() {
+    let replica = tmp("replica-home");
+    let home = "home/u/.wicked-container/run/claude";
+    std::fs::create_dir_all(replica.join(home).join("sessions")).unwrap();
+    std::fs::write(replica.join(home).join("sessions/s1.jsonl"), "turn 1").unwrap();
+    let stream = sync::encode(&[Root {
+        replica: home.into(),
+        mode: Mode::Home,
+        entries: vec![entry(Kind::File, "settings.json", b"{}")],
+    }]);
+    let plan = json!([[home, "home", []]]).to_string();
+    let out = codec(&replica, &["unpack", &plan], &stream);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read(replica.join(home).join("settings.json")).unwrap(),
+        b"{}"
+    );
+    assert!(
+        replica.join(home).join("sessions/s1.jsonl").exists(),
+        "a session was mirrored away"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// r7 #8: a `.git` that is a file (a gitfile naming a sibling scope) refuses the bundle.
+#[cfg(unix)]
+#[test]
+fn k8s_a_bundle_refuses_a_gitfile() {
+    let replica = tmp("replica-gitfile");
+    let t = replica.join("wt");
+    std::fs::create_dir_all(&t).unwrap();
+    std::fs::write(t.join(".git"), "gitdir: /replica/other/.git\n").unwrap();
+    let out = codec(&replica, &["bundle", "wt", &"a".repeat(40)], b"");
+    assert_eq!(out.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not a directory"));
+    let _ = std::fs::remove_dir_all(&replica);
 }

@@ -299,6 +299,8 @@ pub(crate) struct Seat {
     pub(crate) baseline: Mutex<Baseline>,
     /// The unit's seat homes, re-synced right before the CLI starts (placeholder files).
     pub(crate) seat_dirs: Vec<PathBuf>,
+    /// Writable dirs that neither come back nor stay (fenced scratch): removed at settle.
+    pub(crate) scratch: Vec<PathBuf>,
     /// The canonical spelling of every path the pod mounts (env values are re-spelled to it).
     pub(crate) mounted: Vec<PathBuf>,
     pub(crate) unit_label: String,
@@ -449,9 +451,9 @@ fn codec(
     ]);
     a.extend(args);
     let r = kube.call_capped(Some(ns), &a, stdin, limit, STREAM_LIMIT);
-    // Only a client that was killed (a timeout or the output cap: no exit code) can leave a codec
-    // running; the codec's own refusal ended it, and resetting the shared pod then would end
-    // every other unit's codec in the namespace (review r6 #7).
+    // Only a client that was cut off or killed can leave a codec running; the codec's own refusal
+    // ended it, and resetting the shared pod then would end every other unit's codec in the
+    // namespace (review r6 #7, r7 #6).
     if resets_sync(r.code) {
         // A client that gave up may leave its codec running in the sync pod, still writing the
         // replica (review r5): the pod goes, and every process with it, before the replica is
@@ -466,7 +468,9 @@ fn codec(
 /// Whether a codec call's ending leaves a codec that may still be running (pure): only a client
 /// that was killed (no exit code). A codec that refused exited itself (review r6 #7).
 pub(crate) fn resets_sync(code: Option<i32>) -> bool {
-    code.is_none()
+    // A codec ends 0 (done) or 3 (refused, its own `die`); anything else is a client whose stream
+    // was cut or killed, whose remote codec may still run (review r7 #6).
+    !matches!(code, Some(0) | Some(3))
 }
 
 /// The host's side of a tree root's `.git` for the replica: a shallow clone of the tree's HEAD,
@@ -768,7 +772,10 @@ fn copy_in(
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::RootUnresolvable,
-            format!("the unit's copy-in is larger than {STREAM_LIMIT} bytes"),
+            format!(
+                "the unit's copy-in is larger than {} bytes",
+                STREAM_LIMIT + SEED_LIMIT
+            ),
         ));
     }
     let plan = plan.to_string();
@@ -1073,8 +1080,32 @@ pub(crate) fn arm(
         s.write_roots,
         s.seed_base,
     );
+    // Seat homes stay in the replica (review r7 #1); the unit's other writable dirs that do not
+    // come back (fenced scratch) are removed from it when the unit settles (review r7 #3).
+    let mut roots = roots;
+    for r in roots.iter_mut() {
+        if r.mode == Mode::Plain && s.seat_dirs.contains(&r.host) {
+            r.mode = Mode::Home;
+            r.back = false;
+        }
+    }
+    let scratch: Vec<PathBuf> = pod_mounts
+        .iter()
+        .filter(|m| m.rw)
+        .filter(|m| {
+            roots
+                .iter()
+                .any(|r| r.host == m.path && r.mode == Mode::Plain && !r.back)
+        })
+        .map(|m| m.path.clone())
+        .collect();
+    // One arm at a time copies into a namespace's replica (review r7 #7): the stale-pod check and
+    // the copy-in see the same pods.
+    let arming = arm_lock(&ns);
+    let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
     clear_stale(kube, &ns)?;
     let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
+    drop(_arming);
     let id = uuid::Uuid::new_v4().simple().to_string();
     let sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
     let unit_label = label_value(&format!("{}-{}", s.ord, &id[..10]));
@@ -1119,6 +1150,7 @@ pub(crate) fn arm(
         base,
         baseline: Mutex::new(baseline),
         seat_dirs: s.seat_dirs.to_vec(),
+        scratch,
         mounted,
         unit_label: unit_label.clone(),
         settled: Mutex::new(false),
@@ -1277,7 +1309,7 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         .filter(|h| {
             seat.roots
                 .iter()
-                .any(|r| r.back && Path::new(h).starts_with(&r.host))
+                .any(|r| (r.back || r.mode == Mode::Home) && Path::new(h).starts_with(&r.host))
         })
         .unwrap_or_else(|| "/home/seat".into());
     vars.push(("HOME".into(), home));
@@ -1415,14 +1447,61 @@ pub(crate) fn reap(id: &str) {
     if let Some(seat) = lookup(id) {
         let mut settled = seat.settled.lock().unwrap_or_else(|p| p.into_inner());
         if !*settled {
-            if let Err(e) = delete_pod(&seat) {
-                eprintln!("wicked-core: seat pod {} not reaped: {e}", seat.pod);
-                unreaped(&seat);
+            match delete_pod(&seat) {
+                Ok(()) => drop_scratch(&seat),
+                Err(e) => {
+                    eprintln!("wicked-core: seat pod {} not reaped: {e}", seat.pod);
+                    unreaped(&seat);
+                }
             }
             *settled = true;
         }
     }
     unregister(id);
+}
+
+/// The per-namespace arm lock ([`arm`], review r7 #7).
+fn arm_lock(ns: &str) -> Arc<Mutex<()>> {
+    static LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+    let mut g = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(HashMap::new)
+        .entry(ns.to_string())
+        .or_default()
+        .clone()
+}
+
+/// Remove a settled unit's scratch from the replica (review r7 #3): a fenced unit's
+/// `CARGO_TARGET_DIR` and caches would otherwise fill the run's replica unit by unit.
+fn drop_scratch(seat: &Seat) {
+    for p in &seat.scratch {
+        let Ok(rep) = replica_of(seat.scope.as_deref(), p) else {
+            continue;
+        };
+        let target = format!("/replica/{rep}");
+        let r = seat.kube.call(
+            Some(&seat.ns),
+            &[
+                "exec",
+                "-c",
+                "sync",
+                "sync",
+                "--",
+                "/floor/busybox",
+                "rm",
+                "-rf",
+                &target,
+            ],
+            None,
+            CALL,
+        );
+        if !r.ok() {
+            eprintln!(
+                "wicked-core: the unit scratch {target} in {} was not removed: {}",
+                seat.ns,
+                r.err_text()
+            );
+        }
+    }
 }
 
 /// Seat pods of this engine whose deletion was not confirmed (`(namespace, sandbox, pod)`): the
@@ -1560,9 +1639,13 @@ pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
     unregister(&seat.id);
     gone.map_err(|e| format!("{}: {e}", FloorUnarmed::ExecStreamLost.describe()))?;
     let code = code?;
-    if ending != Ending::Cancelled {
-        write_back(seat)?;
-    }
+    let back = if ending != Ending::Cancelled {
+        write_back(seat)
+    } else {
+        Ok(())
+    };
+    drop_scratch(seat);
+    back?;
     Ok(code)
 }
 
@@ -2057,6 +2140,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         base: None,
         baseline: Mutex::new(Baseline::new()),
         seat_dirs: Vec::new(),
+        scratch: Vec::new(),
         mounted: vec![tree.to_path_buf()],
         unit_label: "u".into(),
         settled: Mutex::new(false),

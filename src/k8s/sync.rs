@@ -44,6 +44,10 @@ pub(crate) enum Mode {
     Seed,
     /// Single files of a directory, named one by one (bound files: launch settings, a prompt).
     Files,
+    /// A seat home (review r7 #1): the engine's files copied in over what the replica holds, never
+    /// mirrored (the CLI's sessions of earlier units stay, so a resume finds them), never written
+    /// back. Per run and posture, like the session it serves.
+    Home,
 }
 
 impl Mode {
@@ -54,6 +58,7 @@ impl Mode {
             Mode::Plain => "plain",
             Mode::Seed => "seed",
             Mode::Files => "files",
+            Mode::Home => "home",
         }
     }
     fn parse(s: &[u8]) -> Option<Self> {
@@ -63,6 +68,7 @@ impl Mode {
             b"plain" => Some(Mode::Plain),
             b"seed" => Some(Mode::Seed),
             b"files" => Some(Mode::Files),
+            b"home" => Some(Mode::Home),
             _ => None,
         }
     }
@@ -1205,6 +1211,12 @@ def bundle(tree, base):
     root = R + "/" + tree
     # A seat-written link to another replica scope's objects (review r6 #13): refused before git
     # reads the dir, so a bundle never packs objects the seat could not see.
+    # The git dir itself must be a real directory with nothing linked in (review r7 #8): a gitfile
+    # or a link could name a sibling scope's repository.
+    g = root + "/.git"
+    if os.path.islink(g) or not os.path.isdir(g): die("the replica's git dir is not a directory")
+    for rel in ("objects", "refs", "HEAD", "objects/info", "objects/pack"):
+        if os.path.islink(g + "/" + rel): die("the replica's git dir names another object store")
     for rel in (".git/objects/info/alternates", ".git/objects/info/http-alternates", ".git/commondir"):
         if os.path.lexists(root + "/" + rel): die("the replica's git dir names another object store")
     head = git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
@@ -1223,8 +1235,13 @@ def bundle(tree, base):
             try: os.unlink(f)
             except FileNotFoundError: pass
 op = sys.argv[1]
-if op == "unpack": unpack(json.loads(sys.argv[2]))
-elif op == "pack": pack(json.loads(sys.argv[2]))
-elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
-else: die("unknown op")
+# Every ending is an exit code the engine reads (review r7 #6): 0 done, 3 refused; anything else
+# (a cut stream, a kill) is a client that may have left this codec running.
+try:
+    if op == "unpack": unpack(json.loads(sys.argv[2]))
+    elif op == "pack": pack(json.loads(sys.argv[2]))
+    elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
+    else: die("unknown op")
+except SystemExit: raise
+except BaseException as e: die("internal error: " + type(e).__name__)
 "#;
