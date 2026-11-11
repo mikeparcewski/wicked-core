@@ -2784,6 +2784,31 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.37** — 2026-11-10 — patch release on main d79ea7d, carrying 4 PRs since 0.15.36: #1385, #1386, #1389
+  and #1391.
+  - **Docker running out of address pools is named, and the engine sweeps the networks it leaks (#1385, #1377,
+    #1356).** A failed seat network create is classified: `address_pools_exhausted` (with list-and-remove advice),
+    `container_runtime_down` only when the runtime is unreachable, otherwise `seat_network_unavailable` with the
+    runtime's own error; both new kinds are an infrastructure `failure` gate (no bench, no failover, no runtime wait).
+    The arming sweep runs at the first arm and then at most hourly, prunes unused seat networks after 1 hour, and
+    removes a gateway's external bridge only when it is labelled, dangling, unattached, an hour old, its gateway
+    directory is gone and its gateway container definitively does not exist. Networks the engine did not create are
+    never touched.
+  - **A skip's judge-only re-run no longer re-judges the process rules; a disputed rule no council can take says why
+    (#1386, closes #1378 and #1379).** The step record names the reviewed attempt on a judge-only re-run, so the
+    process rows come back from the cache. POL-2101's combined row records `recordUnsettled` and the hold reads
+    `record_unsettled: …`; a council short of seats says who could sit and who the parties are (`seats_benched: …`)
+    and records them in `council.eligible`. Who may sit, council size, the evidence bar and deny-dominates are
+    unchanged.
+  - **Seat networks take a /26 from a wicked-owned subnet pool (#1389, #1377 follow-up).** `WICKED_SEAT_SUBNET_POOL`
+    (default `10.213.0.0/16`) cut into `WICKED_SEAT_SUBNET_PREFIX` slots (default `/26`, 24..=28): 1024 seat networks
+    instead of Docker's ~31 default pools. A slot that overlaps a runtime network or a host route is skipped; the
+    choice is made under a host-wide lock; a full pool is `address_pools_exhausted`. `WICKED_SEAT_SUBNET_POOL=runtime`
+    keeps the runtime's own pools. A malformed pool or prefix, or a pool wider than a /12, is refused.
+  - **Lockfile:** #1391 re-stamped the 0.15.36 platform lock entries.
+  - No binding method, `LaunchSpec` field or gate-protocol change. The seat and floor Dockerfiles, the seat package
+    pins and the base image are unchanged since 0.15.36, so the seat and floor image tags and gate protocol 3 are
+    unchanged.
 - **core-ts 0.15.36** — 2026-11-10 — patch release on main 12714c1, carrying 2 PRs since 0.15.35: #1371 and #1384.
   - **Every index is bounded by a budget sized from the code (#1384, wicked-crew#1481).** `max(120 s, files × 0.30 s) ×
     1.15`, files = what `git ls-files` lists for the tree, replaces the fixed 120 s on a launch's base re-index and the
