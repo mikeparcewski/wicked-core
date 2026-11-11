@@ -89,13 +89,26 @@ pub(crate) fn resolve_spec(spec: String) -> String {
         .unwrap_or(spec)
 }
 
+/// The path the read model opens for `spec`: an ABSOLUTE SQLite file path only. A path that could
+/// not be resolved (a non-UTF-8 working directory) would follow the process's working directory and
+/// could open another store, so such a store is read through the actor.
+fn read_path(spec: &str) -> Option<String> {
+    if !readable_spec(spec) {
+        return None;
+    }
+    let resolved = resolve_spec(spec.to_string());
+    std::path::Path::new(&resolved)
+        .is_absolute()
+        .then_some(resolved)
+}
+
 impl ReadModel {
     /// The read model for the store the actor opens at `spec`.
     pub(crate) fn for_store(spec: &str, actor: Arc<crate::actor_stats::ActorStats>) -> Self {
         let off =
             std::env::var("WICKED_READ_MODEL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
         Self {
-            path: (!off && readable_spec(spec)).then(|| resolve_spec(spec.to_string())),
+            path: (!off).then(|| read_path(spec)).flatten(),
             conn: Mutex::new(None),
             actor,
             budget: QUIET_BUDGET,
@@ -191,6 +204,10 @@ mod tests {
     fn only_a_sqlite_file_has_a_read_model() {
         assert!(readable_spec("/state/core.db"));
         assert!(readable_spec("relative/core.db"));
+        assert!(
+            read_path("relative/core.db").is_some_and(|p| std::path::Path::new(&p).is_absolute())
+        );
+        assert_eq!(read_path(":memory:"), None);
         assert!(!readable_spec("file:review?mode=memory&cache=shared"));
         assert!(!readable_spec("file:/state/core.db"));
         assert_eq!(
