@@ -54,12 +54,21 @@ pub(crate) struct ReadModel {
     /// TEST-ONLY: runs once, between a read's quiet moment and its snapshot pin.
     #[cfg(test)]
     after_quiet: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// TEST-ONLY: runs once, right after a read pins its snapshot.
+    #[cfg(test)]
+    after_pin: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// TEST-ONLY: snapshots given up because a command began before the pin.
+    #[cfg(test)]
+    retries: std::sync::atomic::AtomicUsize,
 }
 
 /// Whether a store spec can be read through a read-only SQLite connection.
 fn readable_spec(spec: &str) -> bool {
+    // A SQLite `file:` URI keeps its own semantics (a shared in-memory db, query parameters): the
+    // read-only opener takes a plain path, so those stores are read through the actor.
     !(spec.is_empty()
         || spec == ":memory:"
+        || spec.starts_with("file:")
         || spec.starts_with("postgres://")
         || spec.starts_with("postgresql://"))
 }
@@ -72,8 +81,11 @@ pub(crate) fn resolve_spec(spec: String) -> String {
     if !readable_spec(&spec) {
         return spec;
     }
+    // A path that does not resolve to UTF-8 (a non-UTF-8 working directory) is kept as given, so
+    // the actor opens what it always did; the read model then reads that same spec.
     std::path::absolute(&spec)
-        .map(|p| p.to_string_lossy().into_owned())
+        .ok()
+        .and_then(|p| p.to_str().map(str::to_string))
         .unwrap_or(spec)
 }
 
@@ -89,6 +101,10 @@ impl ReadModel {
             budget: QUIET_BUDGET,
             #[cfg(test)]
             after_quiet: Mutex::new(None),
+            #[cfg(test)]
+            after_pin: Mutex::new(None),
+            #[cfg(test)]
+            retries: Default::default(),
         }
     }
 
@@ -129,6 +145,10 @@ impl ReadModel {
                 *slot = None;
                 return None;
             }
+            #[cfg(test)]
+            if let Some(hook) = self.after_pin.lock().unwrap().take() {
+                hook();
+            }
             // An actor that took `Shutdown` while this read waited answers it itself (stopped).
             if self.actor.is_stopped() {
                 let _ = store.commit_batch();
@@ -143,6 +163,9 @@ impl ReadModel {
                 _ => break,
             }
             // A command began before the pin: let it finish and pin again (within the budget).
+            #[cfg(test)]
+            self.retries
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if store.commit_batch().is_err() {
                 *slot = None;
                 return None;
@@ -168,6 +191,13 @@ mod tests {
     fn only_a_sqlite_file_has_a_read_model() {
         assert!(readable_spec("/state/core.db"));
         assert!(readable_spec("relative/core.db"));
+        assert!(!readable_spec("file:review?mode=memory&cache=shared"));
+        assert!(!readable_spec("file:/state/core.db"));
+        assert_eq!(
+            resolve_spec("file:review?mode=memory&cache=shared".into()),
+            "file:review?mode=memory&cache=shared",
+            "a SQLite URI is handed to the actor untouched"
+        );
         assert!(!readable_spec(":memory:"));
         assert!(!readable_spec(""));
         assert!(!readable_spec("postgres://h/db"));
@@ -185,6 +215,7 @@ mod tests {
 
     #[test]
     fn a_command_that_begins_before_the_pin_is_waited_out_and_its_whole_write_read() {
+        use std::sync::mpsc::channel;
         use wicked_apps_core::ToNode;
         let dir = std::env::temp_dir().join(format!(
             "wicked-read-model-gen-{}-{}",
@@ -203,23 +234,39 @@ mod tests {
         actor.started_up();
         let mut rm = ReadModel::for_store(&path, actor.clone());
         rm.budget = Duration::from_secs(30);
-        // Right after the read sees the actor quiet, a command begins and commits HALF its write
-        // (run-b) before the read pins; it commits the rest (run-c) 30 ms later.
-        let (began_tx, began) = std::sync::mpsc::channel();
+        // The schedule, forced step by step: the read sees the actor quiet; THEN a command begins
+        // and commits half its write (run-b); the read pins on that; THEN the command commits the
+        // rest (run-c) and ends. Every wait is bounded, so a broken read fails rather than hangs.
+        let bound = Duration::from_secs(20);
+        let (go_tx, go) = channel::<()>();
+        let (half_tx, half) = channel::<()>();
+        let (pinned_tx, pinned) = channel::<()>();
         let (a2, p2) = (actor.clone(), path.clone());
         let writer = std::thread::spawn(move || {
             let mut w = wicked_apps_core::open_store(Some(&p2)).unwrap();
+            go.recv_timeout(bound).expect("go");
             let _cmd = crate::actor_stats::Timed::start(&a2, "Test", 0, Duration::from_secs(3600));
             crate::domain::put_nodes(&mut w, &[session("run-b").to_node()]).unwrap();
-            began_tx.send(()).unwrap();
-            std::thread::sleep(Duration::from_millis(30));
+            half_tx.send(()).unwrap();
+            let _ = pinned.recv_timeout(bound);
             crate::domain::put_nodes(&mut w, &[session("run-c").to_node()]).unwrap();
         });
-        *rm.after_quiet.lock().unwrap() = Some(Box::new(move || began.recv().unwrap()));
+        *rm.after_quiet.lock().unwrap() = Some(Box::new(move || {
+            go_tx.send(()).unwrap();
+            half.recv_timeout(bound).expect("half written");
+        }));
+        *rm.after_pin.lock().unwrap() = Some(Box::new(move || {
+            let _ = pinned_tx.send(());
+        }));
         let n = rm
             .read(|s| Ok(crate::domain::all_sessions(s)?.len()))
             .expect("read");
         writer.join().unwrap();
+        assert_eq!(
+            rm.retries.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the snapshot pinned mid-command was given up"
+        );
         assert_eq!(
             n, 3,
             "never the half-written state: the read waited the command out"

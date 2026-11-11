@@ -56,8 +56,8 @@ pub(crate) struct ActorStats {
     finished: AtomicU64,
     /// The actor's loop has ended (shutdown, an early return, or a panic unwinding it).
     stopped: std::sync::atomic::AtomicBool,
-    /// The slow threshold the actor runs with (ms), captured once at its start.
-    slow_ms: AtomicU64,
+    /// The slow threshold the actor runs with (ms), captured once at its start; `None` until then.
+    slow_ms: Mutex<Option<u64>>,
 }
 
 /// Marks the actor stopped when dropped: held for the whole of the actor thread's run, so every way
@@ -142,8 +142,7 @@ impl ActorStats {
 
     /// The slow threshold the actor captured at its start (reported by [`ActorStats::view`]).
     pub(crate) fn set_slow_threshold(&self, slow: Duration) {
-        self.slow_ms
-            .store(slow.as_millis() as u64, Ordering::SeqCst);
+        *self.slow_ms.lock().unwrap_or_else(|p| p.into_inner()) = Some(slow.as_millis() as u64);
     }
 
     /// The actor took `Shutdown` (or its thread ended): no read is answered off it from now on.
@@ -247,10 +246,11 @@ impl ActorStats {
             running,
             backlog: self.backlog.load(Ordering::Relaxed),
             max_backlog: self.max_backlog.load(Ordering::Relaxed),
-            slow_threshold_ms: match self.slow_ms.load(Ordering::SeqCst) {
-                0 => slow.as_millis() as u64,
-                captured => captured,
-            },
+            slow_threshold_ms: self
+                .slow_ms
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or(slow.as_millis() as u64),
             commands,
             slow: inner.slow.iter().cloned().collect(),
         }
@@ -373,6 +373,18 @@ mod tests {
         let v = s.view(Duration::from_secs(3600));
         let p = &v.commands[0];
         assert_eq!((p.count, p.max_ms, p.p99_ms), (2 * RING as u64, 1, 1));
+    }
+
+    #[test]
+    fn the_reported_threshold_is_the_captured_one_even_zero() {
+        let s = ActorStats::default();
+        assert_eq!(
+            s.view(Duration::from_millis(1000)).slow_threshold_ms,
+            1000,
+            "not captured"
+        );
+        s.set_slow_threshold(Duration::ZERO);
+        assert_eq!(s.view(Duration::from_millis(1000)).slow_threshold_ms, 0);
     }
 
     #[test]
