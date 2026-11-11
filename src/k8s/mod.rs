@@ -27,6 +27,7 @@
 #![allow(dead_code)]
 
 pub(crate) mod cluster;
+pub(crate) mod floor;
 pub(crate) mod gw;
 pub(crate) mod render;
 pub(crate) mod seat;
@@ -258,6 +259,29 @@ pub(crate) fn resolve_settings(
         context,
         owner: owner_id(home),
     })
+}
+
+/// The operational home the daemon's actor runs on (first noted wins: one daemon per process).
+static ENGINE_HOME: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Note the daemon's operational home (the actor, at start), for engine work that has no runner
+/// at hand: the checks floor's pods must carry the same owner as the seats' (B-3).
+pub(crate) fn note_engine_home(home: &Path) {
+    if let Ok(mut g) = ENGINE_HOME.lock() {
+        if g.is_none() {
+            *g = Some(home.to_path_buf());
+        }
+    }
+}
+
+/// The daemon's operational home as noted by its actor, else the worker home base (a floor run
+/// outside a daemon).
+pub(crate) fn engine_home() -> Option<PathBuf> {
+    ENGINE_HOME
+        .lock()
+        .ok()
+        .and_then(|g| g.clone())
+        .or_else(|| wicked_apps_core::spawn::worker_home_base().ok())
 }
 
 /// The engine's cluster for the daemon whose operational home is `home`, from the environment.

@@ -642,6 +642,7 @@ fn seat_pod(view: Option<PathBuf>, scope: Option<String>) -> SeatPod {
         deadline_secs: 60,
         scope,
         view,
+        deps: None,
     }
 }
 

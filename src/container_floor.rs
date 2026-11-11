@@ -3618,6 +3618,8 @@ pub(crate) fn arm_noting(
         .iter()
         .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
         .collect();
+    // The run's node_modules cache for this tree, when the unit's provisioning filled one (B14).
+    let deps = crate::checks_container::seat_claim(run_id, &tree);
     let arm_spec = crate::k8s::seat::ArmSpec {
         run_id,
         ord,
@@ -3640,6 +3642,7 @@ pub(crate) fn arm_noting(
         // lowers it): the pod outlives no turn the engine would still wait for (review r4).
         deadline: crate::workflow::unit_timeout_ceiling(),
         role,
+        deps: deps.as_deref(),
     };
     let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;
     // The gate hook judges this unit as a pod seat's (B17).

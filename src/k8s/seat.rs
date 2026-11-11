@@ -953,6 +953,8 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) deadline: Duration,
     /// `seat`, or `judge` for an engine-internal session.
     pub(crate) role: &'a str,
+    /// The run's read-only `node_modules` claim for the tree (B14), when one was filled.
+    pub(crate) deps: Option<&'a str>,
 }
 
 /// The pod's state as the bound-pod gate reads it (pure).
@@ -1260,6 +1262,7 @@ pub(crate) fn arm(
         deadline_secs: secs,
         scope: scope.clone(),
         view: s.view.then(|| s.tree.to_path_buf()),
+        deps: s.deps.map(|c| (c.to_string(), s.tree.to_path_buf())),
     };
     let doc = render::seat_sandbox(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     let mounted: Vec<PathBuf> = pod_mounts.iter().map(|m| m.path.clone()).collect();
@@ -1326,6 +1329,33 @@ pub(crate) fn arm(
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
         reap(&id);
         return Err(e);
+    }
+    // The nested workspace node_modules the fill archived (B14): unpacked into the seat's tree
+    // before its CLI starts. Ignored by git, so never written back.
+    if s.deps.is_some() {
+        let script = nested_unpack_script(s.tree);
+        let r = kube.call(
+            Some(&ns),
+            &[
+                "exec",
+                "-c",
+                "seat",
+                sandbox.as_str(),
+                "--",
+                "/floor/busybox",
+                "sh",
+                "-c",
+                &script,
+            ],
+            None,
+            Duration::from_secs(120),
+        );
+        if !r.ok() {
+            eprintln!(
+                "wicked-core: the seat's nested node_modules were not unpacked: {}",
+                r.err_text()
+            );
+        }
     }
     guard.0 = None;
     let mut wrapper = kube.head(Some(&ns));
@@ -2411,6 +2441,15 @@ fn fetch_commits(
     )
     .map_err(|e| format!("the unit's commits were refused: {e}; they are kept at {refname}"))?;
     Ok(Some((new, refname)))
+}
+
+/// The in-pod script that unpacks the fill's nested `node_modules` archive into `tree` (pure).
+pub(crate) fn nested_unpack_script(tree: &Path) -> String {
+    let t = format!("'{}'", tree.to_string_lossy().replace('\'', "'\\''"));
+    format!(
+        "a={t}/node_modules/{n}; [ -f \"$a\" ] || exit 0; cd {t} && /floor/busybox tar -x -f \"$a\"",
+        n = crate::checks_container::NESTED_TAR
+    )
 }
 
 /// The `bundle` base that says the host tree has no commit: the pod codec answers nothing when

@@ -48,6 +48,7 @@ fn seat() -> SeatPod {
         deadline_secs: 3600,
         scope: None,
         view: None,
+        deps: None,
     }
 }
 
@@ -285,7 +286,13 @@ fn k8s_the_run_network_policy_allows_only_gateway_ports() {
         .iter()
         .filter(|d| d["kind"] == "NetworkPolicy")
         .collect();
-    assert_eq!(policies.len(), 2, "default-deny plus the seat egress only");
+    // B-3: plus the fill pods' internet egress, selected by their role alone (pinned by
+    // `k8s_only_a_fill_pod_has_the_network_and_the_policy_names_it`).
+    assert_eq!(
+        policies.len(),
+        3,
+        "default-deny, the seat egress and the fill egress only"
+    );
     let egress = policies
         .iter()
         .find(|d| d["metadata"]["name"] == "seat-egress-gateway-only")
@@ -688,4 +695,156 @@ fn k8s_shutdown_times_are_rfc3339_utc() {
     assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
     assert_eq!(rfc3339(1_762_819_200), "2025-11-11T00:00:00Z");
     assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
+}
+
+// ── B-3: the checks floor on pods (PARITY B13, B14) ───────────────────────────────────────────
+
+fn floor_pod_spec(role: &str) -> render::FloorPod {
+    render::FloorPod {
+        name: "wfloor-run-head-abc-0".into(),
+        namespace: "wicked-run-x".into(),
+        owner: "wabc".into(),
+        run_label: "run".into(),
+        role: role.into(),
+        image: "wicked-checks-floor:1".into(),
+        floor_image: "wicked-floor:1".into(),
+        memory_limit: "6Gi".into(),
+        memory_request: "1Gi".into(),
+        env: vec![("CI".into(), "1".into())],
+        empty: vec![
+            ("/work/head".into(), "16Gi".into()),
+            ("/tmp".into(), "8Gi".into()),
+        ],
+        claims: vec![
+            (
+                "wfloor-nm-k".into(),
+                "/work/head/pkg/node_modules".into(),
+                true,
+            ),
+            (
+                "wfloor-target-k-head".into(),
+                "/wicked/target".into(),
+                false,
+            ),
+        ],
+        mkdirs: vec!["/work/head/pkg".into()],
+        deadline_secs: 60,
+    }
+}
+
+#[test]
+fn k8s_a_floor_pod_is_restricted_offline_and_mounts_caches_read_only() {
+    let p = render::floor_pod(&floor_pod_spec("floor")).unwrap();
+    let spec = &p["spec"];
+    assert_eq!(spec["automountServiceAccountToken"], false);
+    assert_eq!(spec["securityContext"]["runAsNonRoot"], true);
+    let c = &spec["containers"][0];
+    assert_eq!(c["name"], floor::CONTAINER);
+    assert_eq!(c["imagePullPolicy"], "Never");
+    assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
+    assert_eq!(c["command"][0], "/floor/busybox", "the PID 1 loop (B-1)");
+    // The floor role has no egress policy of its own: the namespace's deny-all holds it.
+    assert_eq!(p["metadata"]["labels"][ROLE_LABEL], "floor");
+    let vols = spec["volumes"].as_array().unwrap();
+    let mounts = c["volumeMounts"].as_array().unwrap();
+    let nm = mounts
+        .iter()
+        .find(|m| m["mountPath"] == "/work/head/pkg/node_modules")
+        .unwrap();
+    assert_eq!(nm["readOnly"], true);
+    let nm_vol = vols.iter().find(|v| v["name"] == nm["name"]).unwrap();
+    assert_eq!(nm_vol["persistentVolumeClaim"]["readOnly"], true);
+    let target = mounts
+        .iter()
+        .find(|m| m["mountPath"] == "/wicked/target")
+        .unwrap();
+    assert_eq!(target["readOnly"], false);
+    // The rc dir is in memory; the nested package's parent is made as the pod's user first.
+    let rc = vols.iter().find(|v| v["name"] == "rc").unwrap();
+    assert_eq!(rc["emptyDir"]["medium"], "Memory");
+    let mk = &spec["initContainers"][1];
+    assert_eq!(mk["name"], "mkdirs");
+    assert_eq!(mk["command"][3], "/work/head/pkg");
+}
+
+#[test]
+fn k8s_only_a_fill_pod_has_the_network_and_the_policy_names_it() {
+    let docs = render::run_namespace_docs("ns", "o", "run", "dns", &RunBudget::default(), "1Gi");
+    let fill = docs
+        .iter()
+        .find(|d| d["metadata"]["name"] == "fill-egress-internet")
+        .expect("the run namespace carries the fill policy");
+    assert_eq!(
+        fill["spec"]["podSelector"]["matchLabels"][ROLE_LABEL],
+        render::FILL_ROLE
+    );
+    let p = render::floor_pod(&floor_pod_spec(render::FILL_ROLE)).unwrap();
+    assert_eq!(p["metadata"]["labels"][ROLE_LABEL], render::FILL_ROLE);
+}
+
+#[test]
+fn k8s_a_floor_pod_refuses_overlapping_or_escaping_mounts() {
+    let mut s = floor_pod_spec("floor");
+    s.claims.push(("x".into(), "/tmp".into(), true));
+    assert!(render::floor_pod(&s).is_err(), "two mounts at one path");
+    let mut s = floor_pod_spec("floor");
+    s.mkdirs = vec!["/etc/x".into()];
+    assert!(render::floor_pod(&s).is_err(), "a dir outside the scratch");
+    let mut s = floor_pod_spec("floor");
+    s.claims[0].1 = "/work/../etc".into();
+    assert!(render::floor_pod(&s).is_err());
+}
+
+#[test]
+fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
+    let a = floor::check_argv(
+        "/work/head/pkg",
+        &[("A".into(), "b c".into())],
+        &["npm".into(), "test".into()],
+    );
+    assert_eq!(a[0], "/bin/sh");
+    assert!(a[2].starts_with("rm -f /wicked-rc/rc;"));
+    assert!(a[2].contains("kill -9 -1") && a[2].ends_with("exit $rc"));
+    assert_eq!(
+        &a[4..],
+        [
+            "/work/head/pkg",
+            "/usr/bin/env",
+            "A=b c",
+            "--",
+            "npm",
+            "test"
+        ]
+    );
+}
+
+#[test]
+fn k8s_a_check_exit_code_stands_only_when_the_pod_agrees() {
+    assert_eq!(floor::rc_verdict(Some(0), Some("0\n")), None);
+    assert_eq!(floor::rc_verdict(Some(7), Some("7")), None);
+    // kubectl's own failure (a lost stream) is never the check's result.
+    assert!(floor::rc_verdict(Some(1), None).is_some());
+    assert!(floor::rc_verdict(Some(1), Some("0")).is_some());
+    assert!(floor::rc_verdict(Some(0), Some("garbage")).is_some());
+    // No code seen (a deadline or a signal): judged by the caller.
+    assert_eq!(floor::rc_verdict(None, None), None);
+}
+
+#[test]
+fn k8s_a_pod_that_cannot_start_says_why() {
+    let p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"state": {"waiting": {"reason": "ErrImageNeverPull", "message": "img not present"}}}]}});
+    assert!(floor::stuck(&p).unwrap().contains("ErrImageNeverPull"));
+    let p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"state": {"waiting": {"reason": "ContainerCreating"}}}]}});
+    assert_eq!(floor::stuck(&p), None, "still starting");
+    let p = json!({"status": {"phase": "Failed"}});
+    assert!(floor::stuck(&p).is_some());
+    // A finished init container is a step done (seen live under load).
+    let p = json!({"status": {"phase": "Pending", "initContainerStatuses": [
+        {"state": {"terminated": {"reason": "Completed", "exitCode": 0}}}]}});
+    assert_eq!(floor::stuck(&p), None);
+    let p = json!({"status": {"phase": "Pending", "initContainerStatuses": [
+        {"state": {"terminated": {"reason": "Error", "exitCode": 1}}}]}});
+    assert!(floor::stuck(&p).is_some());
 }

@@ -819,6 +819,10 @@ pub(crate) fn run(
     // (wicked-crew#524 follow-up): the same derivation the ACP runner uses for worker launches.
     let operational_home: Option<std::path::PathBuf> =
         crate::state_home::operational_home_of_db(&path);
+    // The checks floor's pods run under the same cluster owner as the seats (k8s-swap B-3).
+    if let Some(h) = &operational_home {
+        crate::k8s::note_engine_home(h);
+    }
     let mut store: AnyStore = match open_store_any(Some(&path)) {
         Ok(s) => s,
         Err(e) => {

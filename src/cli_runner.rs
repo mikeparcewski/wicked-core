@@ -4794,12 +4794,23 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 "dependencies: checking the worktree's node_modules for the seats",
                 FLOOR_HEARTBEAT_EVERY,
                 || {
-                    crate::seat_deps::provision(
-                        wd,
-                        git_dir,
-                        &input.run_id,
-                        &crate::seat_deps::SeatPlatform::for_seats(),
-                    )
+                    // Pod seats (k8s-swap B-3): the run's read-only cache claim, filled in a
+                    // fill pod and mounted at the tree's node_modules; never an install into
+                    // the host worktree, which the pod's copy of the tree leaves out.
+                    if crate::container_floor::container_mode() {
+                        crate::checks_container::provision_seat_node_modules(
+                            &input.run_id,
+                            wd,
+                            git_dir,
+                        )
+                    } else {
+                        crate::seat_deps::provision(
+                            wd,
+                            git_dir,
+                            &input.run_id,
+                            &crate::seat_deps::SeatPlatform::for_seats(),
+                        )
+                    }
                 },
             );
             if let Some(note) = provisioned.note() {
