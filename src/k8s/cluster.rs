@@ -166,7 +166,7 @@ pub(crate) fn install_docs(owner: &str) -> Vec<Value> {
                                   "expression": "request.operation == 'DELETE' ? oldObject : object"}],
                    "validations": [{
                        "expression": format!(
-                           "request.subResource != '' || variables.o == null || ({})",
+                           "(has(request.subResource) && request.subResource != '') || variables.o == null || ({})",
                            cel_owner.replace("o.metadata", "variables.o.metadata")),
                        "message": format!("the wicked engine may only change objects labelled {OWNER_LABEL}={owner}"),
                    }],
@@ -345,6 +345,7 @@ pub(crate) fn uninstall(admin: &Kube, controller: bool) -> Result<Vec<String>, S
         gone.extend(
             String::from_utf8_lossy(&r.stdout)
                 .lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with("No resources"))
                 .map(str::to_string),
         );
     }
@@ -389,32 +390,51 @@ pub(crate) fn daemon_docs(g: &GatewaySpec, host: &[HostPort]) -> Vec<Value> {
     ]
 }
 
-/// Apply the daemon's gateway and wait until its pod runs; answer how seats reach it.
-pub(crate) fn ensure_gateway(
-    kube: &Kube,
-    g: &GatewaySpec,
-    host: &[HostPort],
-) -> Result<DaemonGateway, String> {
-    kube.apply(&daemon_docs(g, host))?;
-    let rollout = kube.call(
-        Some(&g.namespace),
-        &[
-            "rollout",
-            "status",
-            &format!("deployment/{}", render::GATEWAY_NAME),
-            "--timeout=90s",
-        ],
-        None,
-        Duration::from_secs(100),
-    );
-    if !rollout.ok() {
-        return Err(format!(
-            "the gateway did not become ready: {}",
-            rollout.err_text()
-        ));
+/// Apply the daemon's gateway objects (idempotent). The gateway container waits for its first
+/// config: publish it through [`writer_pod`], then [`gateway_ready`].
+pub(crate) fn apply_gateway(kube: &Kube, g: &GatewaySpec, host: &[HostPort]) -> Result<(), String> {
+    kube.apply(&daemon_docs(g, host))
+}
+
+/// The gateway pod whose writer sidecar is running (waited for, bounded): the pod every config
+/// publish, credential write and probe is exec'd into.
+pub(crate) fn writer_pod(kube: &Kube, ns: &str, limit: Duration) -> Result<String, String> {
+    let start = std::time::Instant::now();
+    loop {
+        let pods = kube.list_owned(Some(ns), "pods", &[(ROLE_LABEL, "gateway")])?;
+        if let Some(p) = writer_running(&pods) {
+            return Ok(p);
+        }
+        if start.elapsed() > limit {
+            return Err("the gateway's writer did not start".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Pure half of [`writer_pod`]: the first undeleted pod whose `writer` init container runs.
+pub(crate) fn writer_running(pods: &[Value]) -> Option<String> {
+    pods.iter()
+        .find(|p| {
+            p.pointer("/metadata/deletionTimestamp").is_none()
+                && p.pointer("/status/initContainerStatuses")
+                    .and_then(Value::as_array)
+                    .is_some_and(|cs| {
+                        cs.iter().any(|c| {
+                            c.get("name").and_then(Value::as_str) == Some("writer")
+                                && c.pointer("/state/running").is_some()
+                        })
+                    })
+        })
+        .and_then(|p| p.pointer("/metadata/name").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
+/// Wait until the gateway serves (its pod Running and every container ready) and answer how
+/// seats reach it.
+pub(crate) fn gateway_ready(kube: &Kube, ns: &str, limit: Duration) -> Result<DaemonGateway, String> {
     let svc = kube
-        .get_json(Some(&g.namespace), "service", render::GATEWAY_NAME)?
+        .get_json(Some(ns), "service", render::GATEWAY_NAME)?
         .ok_or("the gateway Service is missing")?;
     let service_ip = svc
         .pointer("/spec/clusterIP")
@@ -422,13 +442,21 @@ pub(crate) fn ensure_gateway(
         .filter(|ip| !ip.is_empty() && *ip != "None")
         .ok_or("the gateway Service has no cluster IP")?
         .to_string();
-    let pods = kube.list_owned(Some(&g.namespace), "pods", &[(ROLE_LABEL, "gateway")])?;
-    let pod = running_pod(&pods).ok_or("no gateway pod is running")?;
-    Ok(DaemonGateway {
-        namespace: g.namespace.clone(),
-        service_ip,
-        pod,
-    })
+    let start = std::time::Instant::now();
+    loop {
+        let pods = kube.list_owned(Some(ns), "pods", &[(ROLE_LABEL, "gateway")])?;
+        if let Some(pod) = running_pod(&pods) {
+            return Ok(DaemonGateway {
+                namespace: ns.to_string(),
+                service_ip,
+                pod,
+            });
+        }
+        if start.elapsed() > limit {
+            return Err("the gateway did not become ready".into());
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// The name of the first pod of `pods` that is Running with every container ready and is not

@@ -176,9 +176,11 @@ fn k8s_the_seat_pod_spec_is_restricted_and_hardened() {
     assert_eq!(sc["readOnlyRootFilesystem"], true);
     assert_eq!(sc["capabilities"]["drop"], json!(["ALL"]));
     assert_eq!(c["imagePullPolicy"], "Never");
-    // PID 1 is tini then an idle sleep: never the CLI (the policy lands after start, F1).
+    // PID 1 is the engine's idle loop from the trusted floor files: never the CLI (the policy
+    // lands after start, F1), never the seat image's own entrypoint.
     assert_eq!(c["command"], json!(render::IDLE_COMMAND));
-    assert_eq!(c["command"][0], "/floor/tini");
+    assert_eq!(c["command"][0], "/floor/busybox");
+    assert!(!render::IDLE_COMMAND.join(" ").contains("codex"));
     assert_eq!(c["resources"]["limits"]["memory"], "3Gi");
     assert_eq!(c["resources"]["requests"]["memory"], "768Mi");
     // The floor files come from the engine's image, read-only.
@@ -295,7 +297,13 @@ fn k8s_the_run_network_policy_allows_only_gateway_ports() {
 #[test]
 fn k8s_the_broker_is_writable_only_in_the_writer_and_the_service_hides_readiness() {
     let d = render::gateway_deployment(&gw());
-    let cs = d["spec"]["template"]["spec"]["containers"].as_array().unwrap();
+    let cs: Vec<Value> = d["spec"]["template"]["spec"]["containers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(d["spec"]["template"]["spec"]["initContainers"].as_array().unwrap())
+        .cloned()
+        .collect();
     let mount = |c: &Value, path: &str| -> Value {
         c["volumeMounts"]
             .as_array()
@@ -311,7 +319,8 @@ fn k8s_the_broker_is_writable_only_in_the_writer_and_the_service_hides_readiness
     assert_eq!(mount(gateway, "/cfg")["readOnly"], true);
     assert!(mount(writer, "/broker").get("readOnly").is_none());
     assert_eq!(d["spec"]["template"]["spec"]["automountServiceAccountToken"], false);
-    for c in cs {
+    assert_eq!(writer["restartPolicy"], "Always", "the writer is a native sidecar");
+    for c in &cs {
         assert_eq!(c["securityContext"]["readOnlyRootFilesystem"], true);
     }
     let svc = render::gateway_service(&gw(), render::seat_gateway_ports());
@@ -509,4 +518,11 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
         .as_str()
         .unwrap()
         .contains("-lt 4160"));
+}
+
+#[test]
+fn k8s_shutdown_times_are_rfc3339_utc() {
+    assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
+    assert_eq!(rfc3339(1_762_819_200), "2025-11-11T00:00:00Z");
+    assert_eq!(rfc3339(951_782_400), "2000-02-29T00:00:00Z");
 }

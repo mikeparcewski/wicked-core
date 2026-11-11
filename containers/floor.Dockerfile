@@ -7,14 +7,9 @@
 #   /launch   the launcher (busybox sh): canaries, then landrun, then the CLI
 #   /busybox  busybox 1.37 (musl, static)
 #   /landrun  landrun v0.1.17 built static from source (the release asset links glibc)
-#   /tini     tini (static), a pod's PID 1: it reaps zombies, and as its namespace's init a seat's or a
-#             check's `kill -9 -1` cannot stop it (the Kubernetes runner, core#1383)
 # Built by the engine from this file alone (no build context), tagged by this file's hash.
 FROM golang:1.25-alpine AS landrun
 RUN CGO_ENABLED=0 GOFLAGS=-trimpath go install -ldflags='-s -w' github.com/zouuup/landrun/cmd/landrun@v0.1.17
-
-FROM alpine:3.22 AS tini
-RUN apk add --no-cache tini-static
 
 FROM busybox:1.37-musl AS launch
 RUN cat > /launch <<'EOF'
@@ -65,5 +60,4 @@ FROM scratch
 COPY --from=launch /bin/busybox /busybox
 COPY --from=landrun /go/bin/landrun /landrun
 COPY --from=launch /launch /launch
-COPY --from=tini /sbin/tini-static /tini
 LABEL wicked.floor=1
