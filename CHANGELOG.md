@@ -2937,8 +2937,8 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
-- **core-ts 0.15.39** — 2026-11-11 — patch release on main 57aac79, carrying 7 PRs since 0.15.38: #1411, #1416, #1425,
-  #1426, #1427, #1428 and #1431.
+- **core-ts 0.15.39** — 2026-11-11 — patch release on main a5dddf6, carrying 8 PRs since 0.15.38: #1411, #1416, #1425,
+  #1426, #1427, #1428, #1431 and #1433.
   - **The requirements share counts only real behaviour (#1428, closes #1375 and #1235).** The share reads estate's
     `metadata.behaviour` on each definition: `stub` and `data` units leave the denominator as structural,
     `test_support` units (Rust `#[cfg(test)]` modules and `#[test]` functions in product files included) as not
@@ -2965,6 +2965,11 @@ Two release tracks share this file, newest entry first regardless of track:
     carries its daemon's id in its git admin dir (`wicked-daemon`, a store digest, no path); an unknown-run tree is
     force-removed only when the marker is the reaper's own; an unmarked tree (another daemon's, or one minted before
     this release) is kept and reported.
+  - **A Stop no longer holds the engine while its worktree is deleted (#1433, #1429).** A cancel's clean-only reap
+    runs on its own thread; the cancel waits at most 500 ms for it, so a quick reap's `worktreeRetained` still comes
+    before `runCancelled` and a slower one's comes after it, when the reap ends. A relaunch of the same run id waits
+    its turn on the tree. `tests/load_actor.rs` (`WICKED_LOAD_GATES=1`) answers gates at N runs, Stops included, and
+    asserts no actor command takes a second.
   - **A dispatch reads its worktree off the actor, once (#1411, #1390 part 2).**
   - **Lockfile:** #1416 re-stamped the 0.15.38 platform lock entries.
   - **Upgrade notes.** The behaviour half of #1428 needs a graph indexed by **wicked-estate 0.35.2 or later** (the
@@ -2974,7 +2979,8 @@ Two release tracks share this file, newest entry first regardless of track:
     later** (the extractor that writes the annotation); otherwise it is absent. No binding method change, no
     `LaunchSpec` field change; gate protocol 3 is unchanged; no Dockerfile change, so the checks-floor and seat image
     tags are unchanged. Wire: the requirements graph gains the optional `business_domain` and
-    `metadata.business_domains`.
+    `metadata.business_domains`. Event order (#1433): a cancel whose reap runs past 500 ms emits its `worktreeRetained`
+    after `runCancelled`; a consumer must not assume `worktreeRetained` precedes the cancel.
 - **core-ts 0.15.38** — 2026-11-11 — patch release on main a82ac4f, carrying 6 PRs since 0.15.37: #1399, #1403, #1404,
   #1405, #1407 and #1412.
   - **A targeted re-run with no targeted command is refused, never a test waiver (#1403, closes #1392).** A timed-out
