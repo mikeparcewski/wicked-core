@@ -353,16 +353,18 @@ mod tests {
             .unwrap_err()
             .contains("--admin-context is required"));
         assert!(parse(&s(&["uninstall", "--controller"])).is_err());
+        // An absolute path on this platform (`/s` is relative on Windows).
+        let abs = std::env::temp_dir().join("s");
         let a = parse(&s(&[
             "install",
             "--admin-context",
             "rancher-desktop",
             "--home",
-            "/s",
+            &abs.to_string_lossy(),
         ]))
         .unwrap();
         assert_eq!(a.admin_context.as_deref(), Some("rancher-desktop"));
-        assert_eq!(a.home, Some(PathBuf::from("/s")));
+        assert_eq!(a.home, Some(abs));
         assert!(parse(&s(&["install", "--admin-context", "x", "--home", "rel"])).is_err());
         assert!(parse(&s(&["status", "--controller"])).is_err());
         assert!(parse(&s(&["status", "--json"])).unwrap().json);
