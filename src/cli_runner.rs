@@ -6048,6 +6048,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         demo_take: None,
         editor_conformance: None,
         draft_render: None,
+        worktree_clean: None,
+        tree_after_failure: None,
     };
     (output, agent_verdict, evidence)
 }

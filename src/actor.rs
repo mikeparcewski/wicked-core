@@ -35,7 +35,9 @@ use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
+mod dispatch_probe;
 mod power_gate;
+pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
 mod team_gate;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
@@ -3863,6 +3865,72 @@ pub(crate) fn run(
                     }
                 }
             }
+            Command::DispatchProbed {
+                run_id,
+                unit_ix,
+                probe,
+            } => {
+                // (core#1390) Only the run's live probe goes on, and only while the run still waits
+                // on it: same attempt, same unit at the index, not ended. Anything else moved the
+                // run on while the probe ran, and the probe is dropped.
+                if !dispatch_probe::take_current(&run_id, &probe) {
+                    continue;
+                }
+                let live = match crate::domain::get_session(&store, &run_id) {
+                    Ok(Some(s)) => {
+                        !matches!(
+                            s.status,
+                            SessionStatus::Completed
+                                | SessionStatus::Cancelled
+                                | SessionStatus::Failed
+                        ) && s.attempt == probe.attempt
+                    }
+                    _ => false,
+                };
+                let same_unit = crate::domain::session_units(&store, &run_id)
+                    .ok()
+                    .and_then(|u| u.get(unit_ix).map(|u| u.id == probe.unit_id))
+                    .unwrap_or(false);
+                if !(live && same_unit) {
+                    continue;
+                }
+                match dispatch_unit_with(
+                    &mut store,
+                    &mut subscribers,
+                    &runner,
+                    &self_tx,
+                    &run_id,
+                    unit_ix,
+                    &lifecycle_maps,
+                    &actor_maps,
+                    process_gen,
+                    is_acp,
+                    Some(probe),
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        in_flight.remove(&run_id);
+                        if let Err(e) =
+                            finalize_run(&mut store, &mut subscribers, &runner, &self_tx, &run_id)
+                        {
+                            emit_run_error(&mut subscribers, &run_id, e);
+                        }
+                    }
+                    // The guard is checked again on this pass (deny-dominates: no unit runs past
+                    // a plan held while the probe ran). The plan's release dispatches the unit.
+                    Err(e) if e.downcast_ref::<team_gate::DispatchHeld>().is_some() => {
+                        eprintln!(
+                            "wicked-core: run {run_id}: the dispatch of unit {unit_ix} waits: {e}"
+                        );
+                    }
+                    Err(e) => {
+                        // No worker will post a result: the run fails, as a dispatch error on the
+                        // first pass failed it.
+                        in_flight.remove(&run_id);
+                        fail_run_by_id(&mut store, &mut subscribers, &runner, &self_tx, &run_id, e);
+                    }
+                }
+            }
             Command::ReassignReady {
                 run_id,
                 ord,
@@ -6233,6 +6301,10 @@ fn apply_step_result(
     let run_id = output.run_id.clone();
     let mut session = crate::domain::get_session(store, &run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
+    // (core#1390) What the worker thread read of the tree after the step, so the fold below runs no
+    // git on the actor; absent (an older payload, a path that does not read it), the fold reads it.
+    let post_clean = evidence.worktree_clean;
+    let post_failure_tree = evidence.tree_after_failure.clone();
 
     // Load units early so both discard guards can gate on tool_cmd.is_some(); fail-open (.ok())
     // so a DB error here still lets the terminal guard return Ok(Stale) rather than Err.
@@ -7119,14 +7191,17 @@ fn apply_step_result(
             .filter(|p| p.seat == failed_cli && p.attempt == output.attempt)
             .map(|p| p.git_dir.clone());
         if let Some(git_dir) = probe_git_dir {
-            let tree_now = session.workdir.as_deref().and_then(|wd| {
-                crate::worktree_guard::snapshot_through(
-                    std::path::Path::new(wd),
-                    std::path::Path::new(&git_dir),
-                )
-                .ok()
-                .map(|snap| snap.tree)
-            });
+            let tree_now = match post_failure_tree.as_ref().filter(|t| t.git_dir == git_dir) {
+                Some(read) => read.tree.clone(),
+                None => session.workdir.as_deref().and_then(|wd| {
+                    crate::worktree_guard::snapshot_through(
+                        std::path::Path::new(wd),
+                        std::path::Path::new(&git_dir),
+                    )
+                    .ok()
+                    .map(|snap| snap.tree)
+                }),
+            };
             let had = unit.authored_by.contains(&failed_cli);
             if crate::domain::retract_unproductive_author(
                 unit,
@@ -7859,7 +7934,10 @@ fn apply_step_result(
     // baseline (`evidence.tree_changed`), not only a worktree clean at HEAD — a creator whose
     // writes were all denied passed its gate because EARLIER phases had already changed the
     // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
-    let clean = worktree_is_clean(session.workdir.as_deref());
+    let clean = match post_clean {
+        Some(clean) if session.workdir.is_some() => clean,
+        _ => worktree_is_clean(session.workdir.as_deref()),
+    };
     // (j4-gates, core#1113; core#1142) When the unit's own floor already ran on its tree and
     // FAILED naming its tests, a retry that changes nothing is an answer, not missing work: the failures may be
     // the base's, load flakes, or outside the change, and the worker said why. The reply is
@@ -11468,9 +11546,83 @@ fn dispatch_unit(
     run_id: &str,
     unit_ix: usize,
     elicitation_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) -> anyhow::Result<bool> {
+    dispatch_unit_with(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        run_id,
+        unit_ix,
+        elicitation_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+        None,
+    )
+}
+
+/// (core#1390) What this dispatch must read of the run's worktree, handed to the probe thread; `None`
+/// when it reads nothing (no worktree, no registered repository, or no read this unit takes), and
+/// the dispatch then goes on at once, on the actor, as before.
+fn dispatch_probe_job(
+    store: &dyn GraphRead,
+    session: &AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+    new_author: &Option<(String, Vec<String>)>,
+) -> Option<dispatch_probe::ProbeJob> {
+    let workdir = std::path::PathBuf::from(session.workdir.as_deref()?);
+    let repo = crate::repo::get_repo(store, session.repo_ref.as_deref()?)
+        .ok()
+        .flatten()?;
+    let agent = unit.tool_cmd.is_none();
+    let qe_unit = crate::qe_acceptance::is_qe_unit(unit);
+    let baseline = agent && unit.worktree_baseline.is_none();
+    let editor = agent
+        && units
+            .iter()
+            .any(|u| u.ord < unit.ord && u.editor_conformance.is_some());
+    let score_qe = qe_unit && session.assurance.qe.as_ref().is_some_and(|q| !q.fixed());
+    let requirements = agent
+        && session.base_commit.is_some()
+        && (unit.role == crate::workflow::PhaseRole::Evaluator || qe_unit);
+    if !(baseline || new_author.is_some() || qe_unit || editor || requirements) {
+        return None;
+    }
+    Some(dispatch_probe::ProbeJob {
+        run_id: session.id.clone(),
+        unit_ix: units.iter().position(|u| u.id == unit.id)?,
+        attempt: session.attempt,
+        unit: unit.clone(),
+        session: session.clone(),
+        workdir,
+        repo,
+        new_author: new_author.clone(),
+        score_qe,
+        requirements,
+    })
+}
+
+/// [`dispatch_unit`], with the worktree reads it needs: `None` on the first pass, which starts the
+/// off-actor probe when the unit needs one and returns `Ok(true)` (the dispatch is under way);
+/// `Some` on the second pass, from [`Command::DispatchProbed`] (core#1390, [`dispatch_probe`]).
+#[allow(clippy::too_many_arguments)]
+fn dispatch_unit_with(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    run_id: &str,
+    unit_ix: usize,
+    elicitation_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     _actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
     is_acp: bool,
+    probe: Option<Box<DispatchProbe>>,
 ) -> anyhow::Result<bool> {
     let session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
@@ -11677,6 +11829,22 @@ fn dispatch_unit(
     // guard on `worktree_guarded`, the tree-changed floor on `default_floor`), so taking it here
     // adds the pin (the dependency install's git dir with it), the seat secret scan, an author
     // probe taken from it and the clear-and-retake on an approved gate; no guard, floor or judge.
+    // (core#1390) The worktree reads below — the baseline, the author's start tree, the QE floor
+    // note's tree, the editor-conformance tree, the QE score and the requirements record — run off
+    // the actor: the first pass hands them to the probe thread and returns; the second pass, back
+    // with the probe, reads them from it.
+    let probe = match probe {
+        Some(p) => Some(p),
+        None => {
+            if let Some(job) = dispatch_probe_job(&*store, &session, &units, &unit, &new_author) {
+                dispatch_probe::start(self_tx, job);
+                return Ok(true);
+            }
+            None
+        }
+    };
+    // The first pass stamped the author; this pass sees the stamp already made.
+    let new_author = new_author.or_else(|| probe.as_ref().and_then(|p| p.new_author.clone()));
     let mut baseline_fresh = false;
     if unit.tool_cmd.is_none() && unit.worktree_baseline.is_none() {
         if let Some(wd) = session.workdir.as_deref() {
@@ -11693,12 +11861,13 @@ fn dispatch_unit(
                 .as_deref()
                 .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
                 .map(|r| r.root_path);
-            let snap = match repo_root {
-                Some(root) => crate::worktree_guard::snapshot(
+            let snap = match (repo_root, probe.as_ref()) {
+                (Some(_), Some(p)) => p.snapshot.clone().map_err(anyhow::Error::msg),
+                (Some(root), None) => crate::worktree_guard::snapshot(
                     std::path::Path::new(wd),
                     std::path::Path::new(&root),
                 ),
-                None => Err(anyhow::anyhow!(
+                (None, _) => Err(anyhow::anyhow!(
                     "the run has no registered repository to pin the worktree's git dir from"
                 )),
             };
@@ -11725,6 +11894,8 @@ fn dispatch_unit(
             let git_dir = b.git_dir.clone()?;
             let tree = if baseline_fresh {
                 Some(b.tree.clone())
+            } else if let Some(p) = probe.as_ref() {
+                p.tree().map(str::to_string)
             } else {
                 crate::worktree_guard::snapshot_through(
                     std::path::Path::new(wd),
@@ -11738,6 +11909,10 @@ fn dispatch_unit(
         // (agy review on #1135) A unit with no baseline (no default floor) gets a snapshot of its
         // own, pinned to the registered repository exactly as a baseline is.
         let tree = from_baseline.or_else(|| {
+            if let Some(p) = probe.as_ref() {
+                let snap = p.snapshot.as_ref().ok()?;
+                return Some((snap.tree.clone(), snap.git_dir.clone()?));
+            }
             let root = session
                 .repo_ref
                 .as_deref()
@@ -11776,8 +11951,16 @@ fn dispatch_unit(
                 .as_deref()
                 .map(|g| (b.tree.as_str(), std::path::Path::new(g)))
         });
-        let decided =
-            crate::qe_acceptance::on_dispatch(&session, &unit, repo_root.as_deref(), baseline);
+        let scored = probe
+            .as_ref()
+            .and_then(|p| p.qe_score_for(unit.ord, session.base_commit.as_deref(), baseline));
+        let decided = crate::qe_acceptance::on_dispatch_with(
+            &session,
+            &unit,
+            repo_root.as_deref(),
+            baseline,
+            scored,
+        );
         let mut qe = session.assurance.qe.clone();
         if let crate::qe_acceptance::Dispatched::Decided(d) = decided {
             let mut fresh = session.clone();
@@ -11820,6 +12003,9 @@ fn dispatch_unit(
         // restart's redispatch, so it may not be the tree this attempt starts on. No reading, no note.
         stamped.qe_floor_note = if qe_unit {
             let fresh = match (session.workdir.as_deref(), unit.worktree_baseline.as_ref()) {
+                (Some(_), Some(_)) if probe.is_some() => probe
+                    .as_ref()
+                    .and_then(|p| p.snapshot.as_ref().ok().cloned()),
                 (Some(wd), Some(b)) => b.git_dir.as_deref().and_then(|g| {
                     crate::worktree_guard::snapshot_through(
                         std::path::Path::new(wd),
@@ -12067,6 +12253,9 @@ fn dispatch_unit(
                 .any(|u| u.ord < unit.ord && u.editor_conformance.is_some())
                 .then(|| {
                     let wd = session.workdir.as_deref()?;
+                    if let Some(p) = probe.as_ref() {
+                        return p.tree().map(str::to_string);
+                    }
                     let root = session
                         .repo_ref
                         .as_deref()
@@ -12136,11 +12325,21 @@ fn dispatch_unit(
             // The files the work under review changed: the tree this dispatch snapshotted (pinned
             // git dir, fresh index) against the run's immutable base, never the worktree's live
             // index or branch list (codex r1).
+            let probed = probe
+                .as_ref()
+                .and_then(|p| p.requirements_for(&snap.tree, base));
             let read =
-                crate::worktree_guard::paths_since_commit(std::path::Path::new(wd), snap, base)
+                match probed {
+                    Some(r) => r.map_err(anyhow::Error::msg),
+                    None => crate::worktree_guard::paths_since_commit(
+                        std::path::Path::new(wd),
+                        snap,
+                        base,
+                    )
                     .and_then(|files| {
                         crate::repo::requirements_evidence(&*store, repo_ref, &files, Some(base))
-                    });
+                    }),
+                };
             match read {
                 Ok(Some(text)) => {
                     let label = format!(
@@ -13013,6 +13212,9 @@ fn dispatch_unit(
                     demo_take,
                     editor_conformance: conformance_rec,
                     draft_render: render_rec,
+                    // A Tool unit's fold reads the tree itself (cheap here: no author probe).
+                    worktree_clean: None,
+                    tree_after_failure: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -13103,6 +13305,29 @@ fn dispatch_unit(
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
         );
+        // (core#1390) The tree reads the fold needs, taken here on the worker thread instead of on
+        // the actor: nothing else changes this run's tree between now and the fold.
+        let mut evidence = evidence;
+        if let Some(wd) = input.workdir.as_deref() {
+            let wd_str = wd.to_string_lossy();
+            evidence.worktree_clean = Some(worktree_is_clean(Some(&wd_str)));
+            if output.status != crate::workflow::StepStatus::Ok {
+                evidence.tree_after_failure = input
+                    .unit
+                    .author_probe
+                    .as_ref()
+                    .filter(|p| p.attempt == output.attempt)
+                    .map(|p| crate::workflow::PostStepTree {
+                        git_dir: p.git_dir.clone(),
+                        tree: crate::worktree_guard::snapshot_through(
+                            wd,
+                            std::path::Path::new(&p.git_dir),
+                        )
+                        .ok()
+                        .map(|snap| snap.tree),
+                    });
+            }
+        }
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,

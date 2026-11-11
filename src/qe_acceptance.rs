@@ -165,11 +165,36 @@ pub(crate) enum Dispatched {
 /// The decision a dispatch of `unit` makes, from the session as persisted. `tree` is the tree the
 /// unit starts on (its dispatch baseline) and `git_dir` the registered repo's pinned git dir;
 /// `repo_root` is the registered repo, whose code graph is read at the run's base commit.
+#[cfg(test)]
 pub(crate) fn on_dispatch(
     session: &AgentSession,
     unit: &WorkUnit,
     repo_root: Option<&Path>,
     baseline: Option<(&str, &Path)>,
+) -> Dispatched {
+    on_dispatch_with(session, unit, repo_root, baseline, None)
+}
+
+/// The diff score [`on_dispatch`] would compute for `session`'s QE unit `ord` on `baseline`
+/// (`tree`, pinned `git_dir`) — the code-graph and git reads, run ahead on the dispatch probe
+/// thread (core#1390). It depends only on these inputs and the run's base commit.
+pub(crate) fn score_ahead(
+    session: &AgentSession,
+    ord: u32,
+    repo_root: Option<&Path>,
+    baseline: Option<(&str, &Path)>,
+) -> QeAcceptance {
+    decide(session, ord, repo_root, baseline)
+}
+
+/// [`on_dispatch`] with a score already computed by [`score_ahead`] on the same inputs; `None`
+/// computes it here.
+pub(crate) fn on_dispatch_with(
+    session: &AgentSession,
+    unit: &WorkUnit,
+    repo_root: Option<&Path>,
+    baseline: Option<(&str, &Path)>,
+    scored: Option<QeAcceptance>,
 ) -> Dispatched {
     let Some(current) = session.assurance.qe.as_ref() else {
         return Dispatched::Unchanged;
@@ -217,7 +242,10 @@ pub(crate) fn on_dispatch(
             tree: None,
         }
     } else {
-        decide(session, unit.ord, repo_root, baseline)
+        match scored {
+            Some(d) => d,
+            None => decide(session, unit.ord, repo_root, baseline),
+        }
     };
     if decided == *current {
         Dispatched::Unchanged

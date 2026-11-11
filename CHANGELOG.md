@@ -14,6 +14,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A unit's dispatch reads its worktree off the actor, once (wicked-core#1390, part 2).** A dispatch used to take up
+  to four git snapshots of the run's worktree on the actor thread: the baseline, the tree a new author starts on, the
+  QE floor note's tree and the editor-conformance tree. It also scored a QE unit's diff and read a reviewer's
+  requirements record there (the code graph and git history). Each snapshot re-hashes every tracked file; on the dev
+  host one took 30–45 s for a 1,300-file worktree, and every read and gate answer of every run waited behind it.
+  Now the dispatch hands those reads to a probe thread and returns. The thread takes ONE snapshot, which serves all
+  four uses: no worker of the run is live in between, and a tree id is the content's. It then scores the QE unit and
+  reads the requirements record on that snapshot and posts `DispatchProbed`. The actor runs the dispatch again with
+  the probe in hand, deciding everything on the store as it stands then. It re-checks the dispatch guard (a plan held
+  meanwhile waits for its release), and drops the probe when the run ended, moved to another attempt or unit, or was
+  dispatched again. A probe result is used only when it was computed on the inputs the dispatch has; otherwise the
+  dispatch reads it itself, as before. After a step, the worker thread reads whether the worktree is clean, and (for
+  a failed attempt with an author probe) the tree it left, so the fold runs no git on the actor. A probe thread that
+  panics still answers, with no tree, so the unit's guarded gate fails closed rather than the run waiting forever.
+
 - **Run reads no longer wait behind the engine's single-writer actor; the actor's slow commands are named (wicked-core#1390,
   part 1).** `sessions`, `sessions_detail` (crew's GET /runs and the stall watchdog's `listExecuting`) and `run_team`
   are answered on the caller's thread from a read-only SQLite connection, each inside

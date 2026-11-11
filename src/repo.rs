@@ -619,6 +619,19 @@ pub(crate) fn requirements_evidence(
     let Some(repo) = get_repo(daemon, repo_ref)? else {
         return Ok(None);
     };
+    requirements_evidence_for(&repo, files, base_commit)
+}
+
+/// [`requirements_evidence`] for a repo already read from the daemon store — the half that opens
+/// the code graph and runs git, so it can run off the actor (core#1390).
+pub(crate) fn requirements_evidence_for(
+    repo: &RepoEntry,
+    files: &[String],
+    base_commit: Option<&str>,
+) -> anyhow::Result<Option<String>> {
+    if files.is_empty() {
+        return Ok(None);
+    }
     if repo.code_graph_db.is_empty() || !Path::new(&repo.code_graph_db).exists() {
         return Ok(None);
     }
