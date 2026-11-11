@@ -14,6 +14,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The checks floor image and the seat images carry Python's test toolchain (wicked-core#1401).** wicked-garden's
+  suite runs `python3 -m pytest`, and neither image had pytest, so every garden run's floor failed with "No Python
+  with pytest found" and the operator had to approve the gate as their own judgment. Both images now install
+  `python3-pytest`, `python3-yaml` and `python3-zstandard` (the checks image also gets `jq`, which the seat image
+  already had; the seat image also gets `python3-venv`) from the Debian
+  archive the images already use: no PyPI, no installer script, no new registry. Image tags are content hashes, so
+  each image is rebuilt once on first use.
+
 - **Seat networks take a /26 from a wicked-owned pool instead of a whole default address pool (wicked-core#1377
   follow-up).** Docker's default address pools hold about 31 networks, and each seat network took one, so a host
   capped out at about three concurrent runs. Each seat network is now created with an explicit subnet from
