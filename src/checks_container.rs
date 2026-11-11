@@ -1,103 +1,19 @@
-//! The CONTAINER checks floor (DES-FLOOR-CONTAINER): the repository's own checks
-//! ([`crate::repo_checks`]) run in a fresh Linux container per floor side instead of inside the
-//! host's OS sandbox (`sandbox-exec` on macOS).
+//! The repository checks floor on Kubernetes pods ([`crate::k8s::floor`]).
 //!
-//! **On pods (k8s-swap B-3, core#1383).** Each side's "container" is now a pod of the run's
-//! namespace ([`crate::k8s::floor`]): every `docker exec` below is a `kubectl exec`, the caches
-//! are the run's claims filled by fill pods (once per run: the engine's account has no
-//! PersistentVolume verbs, so a claim cannot be shared across run namespaces), and a check's exit
-//! code stands only when the pod's rc file agrees ([`crate::k8s::floor::rc_verdict`]). The image
-//! is still built by the container CLI (D2: builder only). The Docker volume, eviction and sweep
-//! helpers below are unused until B-6 deletes them.
+//! Each floor side runs in a fresh pod in the run's namespace. The engine streams a verified
+//! copy of the pinned tree into it, executes checks through `kubectl exec`, and verifies the
+//! tree after each check. The pod's rc file must agree with the command's exit status.
 //!
-//! ## Why
+//! Fill pods prepare dependency caches on claims in the run's namespace; checks run offline
+//! with a read-only root and a memory cap. OOM kills are infrastructure failures, never
+//! failures of the change. Cache keys, tree serialization, and floor reports live here.
 //!
-//! On a macOS host every process a check spawns pays for endpoint-security scanning and the
-//! sandbox profile. The same crew test file ran in 17 s in a Linux container and 260 s on the macOS
-//! floor; crew's whole suite took 2.5 min in a container against 8.6-18 min on the macOS floor, and
-//! a power run's three full-suite floors took 79-123 min each under host load (re-time 3).
+//! The container CLI only builds the checks image into the cluster's shared image store
+//! (`imagePullPolicy: Never`). Install the local Rancher Desktop or Docker Desktop Kubernetes
+//! cluster once with `wicked-core cluster install --admin-context <ctx> --home <state home>`.
 //!
-//! ## What a container floor is
-//!
-//! * **One fresh container per floor side.** The head's checks run in one container, started at
-//!   the floor's first head check. The base comparison runs in a container of its own, made fresh
-//!   for every base export the floor takes, so nothing the head ran can reach the base's tree,
-//!   dependencies or build output. Every check is a `docker exec` into its side's container
-//!   ([`ChecksFloor::command`]); the floor's decision logic (base comparison, retries, exclusions)
-//!   is unchanged: only the spawn differs.
-//! * **The tree is a copy, streamed in.** The engine writes a tar of the floor's tree itself, from
-//!   `git ls-tree` and `git cat-file --batch` over the pinned git dir ([`write_tree_tar`]): no bind
-//!   mount of the worktree (a mount would be a write path back to the host), and not `git archive`,
-//!   which runs the smudge filters a repository's configuration names. The head is the tree the
-//!   floor judges (a guarded checkout's tree, else the worktree's content snapshot); the base is
-//!   the run base commit. A check's writes land in the container and go with it.
-//! * **The copy is verified after every check** ([`ChecksFloor::after`]): every tracked file must
-//!   still hold the bytes (or link target) that were copied in. A check that rewrote one has run
-//!   the later checks on another tree, so its result is no evidence for this one (the host floor's
-//!   worktree guard makes the same comparison).
-//! * **No network while checks run** (`--network none`). Dependencies come from cache volumes that
-//!   an install container fills: it alone has the network, and it runs a fixed
-//!   `npm ci --ignore-scripts` or a `cargo fetch --locked` with the repository's `.cargo`
-//!   configuration left out of its copy and every compiler wrapper overridden, so it executes no
-//!   repository code. A repository's declared `native_rebuild` (core#1393) changes only that the
-//!   fill makes each addon's empty `build/`; the addon is built per floor, in the checks container
-//!   (offline, where the repository's code runs anyway), on a private tmpfs over that `build/`,
-//!   and never written to the shared volume.
-//! * **Hardened**: a read-only root filesystem, every capability dropped, `no-new-privileges`, an
-//!   init, a pids limit and a memory cap (`--memory` = `--memory-swap`, [`MEMORY_ENV`]). The checks
-//!   run as uid 1000; the container's own idle process runs as another uid, so the engine can end
-//!   everything a check left running (`kill -9 -1` as the checks' user) without stopping the
-//!   container.
-//! * **An OOM kill is floor infrastructure.** The container's cgroup `memory.events` `oom_kill`
-//!   count is read after every check; a check during which it rose is `could_not_run` with the
-//!   reason, whatever its exit code, never a failure of the change (so it is never retried as a
-//!   failing set or compared with the base). A check can only turn its own result into that
-//!   denial; it can never turn it into a pass.
-//! * **Never a seat container.** Its own image ([`DOCKERFILE`], `wicked-checks-floor:<hash>`), its
-//!   own label ([`LABEL`]), no seat home, cache, network or gateway.
-//!
-//! ## Caches
-//!
-//! | Cache | Volume | Filled by | Mounted in the checks |
-//! |---|---|---|---|
-//! | `node_modules` | `wfloor-nm-<key>`, key = sha256 of the image, the package dir, the lockfile, every `package.json` / `.npmrc` / `npm-shrinkwrap.json` of the tree (and the whole tree when the lockfile installs a local `file:` package) | an install container, `npm ci --ignore-scripts` (a declared `native_rebuild`, core#1393, also makes each addon's empty `build/`; the names join the key) | read-only, each declared addon's `build/` a private tmpfs the `native-build` check builds it on, in place at `<side>/<dir>/node_modules`; nested workspace `node_modules` unpacked from a tar in the volume |
-//! | cargo registry | `wfloor-cargo-home` (shared) | `cargo fetch --locked`, once per workspace lockfile | read-only, `CARGO_NET_OFFLINE=true` |
-//! | cargo target | `wfloor-target-<run leaf>-<side>` | the floor itself | read-write, removed with the run's check-scratch leaf |
-//!
-//! A target volume is per check-scratch leaf and side (core#480's reasons: cargo decides
-//! freshness by mtime): warm across the floors of one leaf (a live worktree), cold for each fresh
-//! guarded checkout, exactly as the host floor's leaf. The copy-in keeps each file's mtime from the
-//! leaf's previous copy when its blob is unchanged and stamps a changed one later than any earlier
-//! build could have run ([`Mtimes`]), so cargo rebuilds what changed and nothing reads as fresh
-//! that is not. `node_modules` and target volumes are held to the check cache's caps against the
-//! runtime VM's disk ([`evict`]); a volume a floor holds is never evicted (a lease, taken under
-//! the same lock the eviction takes). The shared cargo registry is outside those caps.
-//!
-//! ## Which floor runs ([`RUNNER_ENV`])
-//!
-//! `WICKED_FLOOR_RUNNER=auto|container|sandbox`, default `auto`. `auto` runs the container floor
-//! on a macOS host whose container runtime answers and whose floor can be prepared, and otherwise
-//! the host sandbox floor, with the reason on the report (`floorRunner.fallbackReason`). It falls
-//! back only for what the container cannot do (no runtime, no image, an install it cannot fill
-//! offline, a tool the image lacks, a check that needs `.git` or writes a results file); a
-//! dependency install that FAILS on the repository's own inputs is not a reason to pick another
-//! floor, and stays the floor's evidence. On a Linux host `auto` keeps the native `bwrap` floor:
-//! the macOS costs this removes do not exist there. `container` refuses the floor (fail-closed)
-//! instead of falling back; `sandbox` never tries the container. A test harness (this crate's
-//! unit tests, and any test binary that armed the hermetic emit spool) runs the host floor unless
-//! the switch is set. Which one ran is on every report and `repoChecksEvaluated`
-//! (`floorRunner.runner`: `container` | `macos-sandbox` | `linux-bwrap` | `none`).
-//!
-//! ## What the container floor does not run
-//!
-//! Inside the container the checks see [`MARKER_ENV`]`=container`. A test that needs an OS write
-//! boundary armed INSIDE the floor (`bwrap` cannot arm under the runtime's default seccomp, and the
-//! floor does not loosen it) or the network leaves itself out under it with a disclosed line; the
-//! report says so ([`PLATFORM_SCOPE`]). The repository's CI covers them.
-
-// k8s-swap B-3 (D7 train): the Docker volume, eviction and sweep helpers this module still
-// carries are unused once the floor runs on pods; B-6 deletes them. Until then allowed dead.
-#![allow(dead_code)]
+//! [`RUNNER_ENV`] selects `auto|container|sandbox`: auto tries pods on macOS, with the host
+//! sandbox as fallback; Linux auto keeps bwrap. Explicit container mode fails closed.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -118,8 +34,6 @@ pub(crate) const RUNNER_ENV: &str = "WICKED_FLOOR_RUNNER";
 pub(crate) const MEMORY_ENV: &str = "WICKED_FLOOR_MEMORY";
 /// Set to `container` inside the floor container, so a check can tell where it runs.
 pub(crate) const MARKER_ENV: &str = "WICKED_CHECKS_FLOOR";
-/// The label on every floor container and volume.
-pub(crate) const LABEL: &str = "wicked.checks-floor";
 /// The checks floor image, built by the engine from this file alone.
 pub(crate) const DOCKERFILE: &str = include_str!("../containers/checks/node22-rust.Dockerfile");
 /// The default memory cap.
@@ -130,11 +44,6 @@ pub(crate) const PLATFORM_SCOPE: &str = "the checks ran in a Linux container wit
      network inside the floor leave themselves out (WICKED_CHECKS_FLOOR=container); the \
      repository's CI covers them on its own platforms";
 
-/// The uid:gid the checks run as (the image's `node` user).
-const CHECKS_USER: &str = "1000:1000";
-/// The uid:gid of the container's own idle process: not the checks' user, so the checks' user's
-/// `kill -9 -1` never reaches it.
-const IDLE_USER: &str = "65534:65534";
 const HOME: &str = "/home/floor";
 const TARGET_DIR: &str = "/wicked/target";
 const CARGO_HOME_DIR: &str = "/wicked/cargo-home";
@@ -154,10 +63,6 @@ const COPY: Duration = Duration::from_secs(300);
 const VERIFY: Duration = Duration::from_secs(120);
 const FILL: Duration = crate::repo_checks::INSTALL_TIMEOUT;
 const REAP: Duration = Duration::from_secs(20);
-/// How often the eviction and sweep pass runs at most (per process).
-const MAINTAIN_EVERY: Duration = Duration::from_secs(10 * 60);
-/// node_modules volumes kept per repository, newest first, whatever the caps.
-const NM_KEEP: usize = 3;
 /// A changed file's mtime is stamped this far past the copy, so it is later than any build an
 /// earlier copy of the leaf could have run (the VM's clock may trail the host's a little).
 const MTIME_MARGIN_S: u64 = 2;
@@ -977,18 +882,18 @@ fn tail(bytes: &[u8], lines: usize) -> String {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Volume locks, leases and use stamps.
+// Claim fill locks.
 // ---------------------------------------------------------------------------------------------
 
-/// Where every engine on this host takes its volume locks and leases. Volume names are global to
-/// the runtime, so two daemons with different worker homes must share these (the user's temp dir:
-/// the runtime is the user's).
+/// Where engines on this host serialize fills of the same claim.
 fn lock_dir() -> PathBuf {
     std::env::temp_dir().join("wicked-checks-floor-locks")
 }
 
-/// An exclusive lock on `volume` for this process: a fill, a lease, or an eviction of it.
-struct VolumeLock(#[allow(dead_code)] std::fs::File);
+/// An exclusive lock on a claim fill for this process.
+struct VolumeLock {
+    _file: std::fs::File,
+}
 
 fn lock_volume(volume: &str) -> Result<VolumeLock, String> {
     let dir = lock_dir();
@@ -1000,60 +905,7 @@ fn lock_volume(volume: &str) -> Result<VolumeLock, String> {
         .open(dir.join(format!("{volume}.lock")))
         .map_err(|e| e.to_string())?;
     f.lock().map_err(|e| e.to_string())?;
-    Ok(VolumeLock(f))
-}
-
-/// Take a lease on `volume` for this floor (call under its [`lock_volume`]): the eviction pass,
-/// which takes the same lock, never removes a leased volume.
-fn lease(volume: &str, held: &Mutex<Vec<PathBuf>>) {
-    static SEQ: AtomicU32 = AtomicU32::new(0);
-    let path = lock_dir().join(format!(
-        "{volume}.lease-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    ));
-    if std::fs::write(&path, b"").is_ok() {
-        if let Ok(mut h) = held.lock() {
-            h.push(path);
-        }
-    }
-}
-
-/// Whether a live process holds a lease on `volume` (dead holders' leases are cleared).
-fn leased(volume: &str) -> bool {
-    let prefix = format!("{volume}.lease-");
-    let Ok(rd) = std::fs::read_dir(lock_dir()) else {
-        return false;
-    };
-    let mut live = false;
-    for e in rd.flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        let Some(rest) = n.strip_prefix(&prefix) else {
-            continue;
-        };
-        let pid = rest.split('-').next().and_then(|p| p.parse::<i32>().ok());
-        match pid {
-            Some(p) if pid_alive(p) => live = true,
-            _ => {
-                let _ = std::fs::remove_file(e.path());
-            }
-        }
-    }
-    live
-}
-
-/// Where the engine keeps the container floor's use stamps: a dot directory of the check cache
-/// holding files only (the cap pass treats a directory there as a repository group and its
-/// subdirectories as run leaves; this one has none).
-fn state_dir(cache: &Path) -> PathBuf {
-    cache.join(".checks-floor")
-}
-
-/// Mark `volume` used now (its LRU order for [`evict`]).
-fn stamp(cache: &Path, volume: &str, repo: &str) {
-    let dir = state_dir(cache);
-    let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{volume}.used")), repo);
+    Ok(VolumeLock { _file: f })
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1120,7 +972,7 @@ impl Fill {
     }
 }
 
-/// A container floor for one floor run: the head prepared, containers started on first use.
+/// One checks floor run: the head prepared, pods started on first use.
 #[derive(Debug)]
 pub(crate) struct ChecksFloor {
     /// The image builder (D2: the container CLI builds images only; it runs no check).
@@ -1139,14 +991,11 @@ pub(crate) struct ChecksFloor {
     jobs: u32,
     run_label: String,
     leaf: PathBuf,
-    cache: PathBuf,
-    repo: String,
     dirs: Vec<String>,
     plans: Mutex<[Option<Result<SidePlan, String>>; 2]>,
     seq: AtomicU32,
     live: Mutex<[Option<Live>; 2]>,
     record: Arc<Mutex<FloorRunner>>,
-    leases: Mutex<Vec<PathBuf>>,
 }
 
 fn idx(tree: Tree) -> usize {
@@ -1167,7 +1016,6 @@ impl ChecksFloor {
         ctx: &crate::repo_checks::FloorContext,
         tree: Option<&str>,
         leaf: &Path,
-        cache: &Path,
         detected: &[RepoCheck],
     ) -> Result<Self, Unavailable> {
         let no = Unavailable;
@@ -1236,23 +1084,13 @@ impl ChecksFloor {
         let (memory, _, jobs) =
             memory_and_jobs(std::env::var(MEMORY_ENV).ok().as_deref(), cpus).map_err(no)?;
         let tag = image_tag();
-        let mut built = false;
         if !crate::container_floor::image_present(&rt, &tag) {
             static BUILD: Mutex<()> = Mutex::new(());
             let _one = BUILD.lock();
             if !crate::container_floor::image_present(&rt, &tag) {
                 eprintln!("wicked-core: building the checks floor image {tag} (first use)");
                 crate::container_floor::build_image(&rt, DOCKERFILE, &tag, &[]).map_err(no)?;
-                // Held at once, past the per-process memo (it is a new image).
-                if let Err(e) = crate::image_keep::hold_now(&rt, &[&tag]) {
-                    eprintln!("wicked-core: could not hold {tag} against image cleanup: {e}");
-                }
-                built = true;
             }
-        }
-        // Held against the runtime's image cleanup (a kubelet's image GC), like the seat images.
-        if !built {
-            let _ = crate::image_keep::hold(&rt, &[&tag]);
         }
         let image_id = rt_run(
             &rt,
@@ -1311,11 +1149,6 @@ impl ChecksFloor {
             }
         };
         let run_label = ctx.run_id.clone().unwrap_or_else(|| "no-run".to_string());
-        let repo = leaf
-            .parent()
-            .and_then(Path::file_name)
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_default();
         // The package dirs whose lockfile the floor mounts a node_modules for, and the cargo
         // workspaces it fetches: the root and every detected check's directory.
         let mut dirs: Vec<String> = vec![String::new()];
@@ -1343,8 +1176,6 @@ impl ChecksFloor {
             jobs,
             run_label,
             leaf: leaf.to_path_buf(),
-            cache: cache.to_path_buf(),
-            repo,
             dirs,
             plans: Mutex::new([None, None]),
             seq: AtomicU32::new(0),
@@ -1365,7 +1196,6 @@ impl ChecksFloor {
                 copy_in_ms: Some(0),
                 platform_scope: Some(PLATFORM_SCOPE.to_string()),
             })),
-            leases: Mutex::new(Vec::new()),
         };
         // The head's caches now: what the container cannot fill is a reason to fall back; what
         // fails on the repository's own inputs is the floor's evidence (`SidePlan` keeps it).
@@ -1390,7 +1220,7 @@ impl ChecksFloor {
     }
 
     /// The record, readable after the floor is gone (the scratch that owns the floor drops it,
-    /// with its containers and leases, before its leaf can be retired).
+    /// with its pods, before its leaf can be retired).
     pub(crate) fn record_handle(&self) -> Arc<Mutex<FloorRunner>> {
         self.record.clone()
     }
@@ -1901,9 +1731,9 @@ print(json.dumps({'dirs':dirs,'files':files}))
         self.place.delete(name);
     }
 
-    /// The `docker exec` for one check: `root` must be the floor's head worktree (a head check) or
-    /// the base export (a base check, whose identity picks the base container: a fresh export is a
-    /// fresh container). `Err` is a reason the check could not run.
+    /// The pod exec for one check: `root` must be the floor's head worktree (a head check) or the
+    /// base export (a base check, whose identity picks the base pod: a fresh export is a fresh
+    /// pod). `Err` is a reason the check could not run.
     pub(crate) fn command(
         &self,
         tree: Tree,
@@ -2744,11 +2574,6 @@ impl Drop for ChecksFloor {
                 self.remove(&l.name);
             }
         }
-        if let Ok(mut leases) = self.leases.lock() {
-            for p in leases.drain(..) {
-                let _ = std::fs::remove_file(p);
-            }
-        }
         // The leaf was retired while this floor held its target claims: they go now (the rest
         // go with the run's namespace).
         if std::fs::symlink_metadata(&self.leaf).is_err() {
@@ -2816,25 +2641,6 @@ fn nested_parents(work: &str, nm: &[NmMount]) -> Vec<String> {
         }
     }
     out
-}
-
-/// The check's argv inside a shell that, once the check's own process exits, ends everything
-/// else the checks' user runs in the container and exits with the check's code. The runtime's
-/// `exec` returns only when its output streams close, and a process a test left behind (holding
-/// stdout) would otherwise hold the check open long after it finished — the host floor ends the
-/// check's process group at its exit for the same reason. `kill -1` never reaches the shell
-/// itself or the container's idle process (another user).
-pub(crate) fn reaping(argv: &[String]) -> Vec<String> {
-    let mut v: Vec<String> = [
-        "sh",
-        "-c",
-        "\"$@\"; rc=$?; kill -9 -1 2>/dev/null; exit $rc",
-        "wicked-check",
-    ]
-    .map(String::from)
-    .to_vec();
-    v.extend(argv.iter().cloned());
-    v
 }
 
 /// In a fill script, before its completion marker: an install that saw an OOM kill marks
@@ -2911,368 +2717,8 @@ fn unique_name(kind: &str) -> String {
     )
 }
 
-/// Run `cmd` in a throwaway, hardened, offline container of `image` (named, pid-labelled, removed
-/// whatever happens): `Ok((exit code, stdout))` when the runtime ran it, `Err` when it did not.
-fn probe_run(
-    rt: &Runtime,
-    image: &str,
-    mounts: &[String],
-    cmd: &[&str],
-) -> Result<(i32, String), String> {
-    let name = unique_name("probe");
-    let pid_label = format!("{LABEL}.pid={}", std::process::id());
-    let mut args: Vec<&str> = vec![
-        "run",
-        "--rm",
-        "--name",
-        &name,
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        CHECKS_USER,
-        "--label",
-        LABEL,
-        "--label",
-        &pid_label,
-    ];
-    for m in mounts {
-        args.extend(["--mount", m.as_str()]);
-    }
-    args.push(image);
-    args.extend(cmd);
-    let mut c = rt.cmd();
-    c.args(&args);
-    let out = output_within(c, rt.bound(START));
-    let _ = rt_run(rt, &["rm", "--force", &name], REAP);
-    let o = out.ok_or_else(|| format!("a probe container did not answer within {START:?}"))?;
-    match o.status.code() {
-        // The runtime's own failure (the container never ran the command).
-        Some(125) | None => Err(format!(
-            "a probe container did not start: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        Some(code) => Ok((code, String::from_utf8_lossy(&o.stdout).trim().to_string())),
-    }
-}
-
-/// Whether `volume` holds `file` (a complete fill's marker), read through a throwaway container:
-/// `Err` when the runtime could not say (never read as "missing").
-fn volume_has(rt: &Runtime, image: &str, volume: &str, file: &str) -> Result<bool, String> {
-    let mount = format!("type=volume,src={volume},dst={FILL_DIR},readonly");
-    let path = format!("{FILL_DIR}/{file}");
-    match probe_run(rt, image, &[mount], &["test", "-f", &path])? {
-        (0, _) => Ok(true),
-        (1, _) => Ok(false),
-        (code, _) => Err(format!("reading {volume} exited {code}")),
-    }
-}
-
-fn volume_exists(rt: &Runtime, volume: &str) -> bool {
-    rt_run(
-        rt,
-        &["volume", "inspect", "--format", "{{.Name}}", volume],
-        PROBE,
-    )
-    .is_ok()
-}
-
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-// ---------------------------------------------------------------------------------------------
-// Maintenance: the sweep of containers a dead engine left, and volume eviction.
-// ---------------------------------------------------------------------------------------------
-
-/// At most once per [`MAINTAIN_EVERY`]: remove floor containers whose engine process is gone, and
-/// hold the floor's volumes to the check cache's caps.
-fn maintain(rt: &Runtime, cache: &Path, image: &str) {
-    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
-    {
-        let Ok(mut last) = LAST.lock() else { return };
-        if last.is_some_and(|t| t.elapsed() < MAINTAIN_EVERY) {
-            return;
-        }
-        *last = Some(Instant::now());
-    }
-    sweep(rt);
-    evict(rt, cache, image, crate::repo_checks::CacheCaps::from_env());
-}
-
-/// Remove floor containers (checks, install and probe containers alike) labelled with an engine
-/// pid that is no longer alive.
-fn sweep(rt: &Runtime) {
-    let Ok(list) = rt_run(
-        rt,
-        &[
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label={LABEL}.pid"),
-            "--format",
-            &format!("{{{{.Names}}}}\t{{{{.Label \"{LABEL}.pid\"}}}}"),
-        ],
-        PROBE,
-    ) else {
-        return;
-    };
-    for line in list.lines() {
-        let mut f = line.split('\t');
-        let (Some(name), Some(pid)) = (f.next(), f.next()) else {
-            continue;
-        };
-        let Ok(pid) = pid.trim().parse::<i32>() else {
-            continue;
-        };
-        if pid as u32 == std::process::id() || pid_alive(pid) {
-            continue;
-        }
-        eprintln!("wicked-core: removing checks floor container {name} (its engine {pid} is gone)");
-        let _ = rt_run(rt, &["rm", "--force", name], REAP);
-    }
-}
-
-#[cfg(unix)]
-fn pid_alive(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    unsafe {
-        libc::kill(pid, 0) == 0
-            || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-}
-
-#[cfg(not(unix))]
-fn pid_alive(_pid: i32) -> bool {
-    true
-}
-
-/// One floor volume the eviction pass may remove.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VolumeUse {
-    pub(crate) name: String,
-    pub(crate) repo: String,
-    pub(crate) bytes: u64,
-    pub(crate) used: SystemTime,
-}
-
-/// The volumes to remove, oldest use first: every one idle past the TTL; `node_modules` volumes
-/// beyond the newest [`NM_KEEP`] of a repository; then by least recent use until the total fits
-/// `total_cap` and each repository fits `repo_cap`. The shared cargo home is never on the list,
-/// nor a `protected` volume (a live floor leases it): it still counts against the caps, so the
-/// pass takes the next candidate instead.
-pub(crate) fn eviction_plan(
-    mut vols: Vec<VolumeUse>,
-    now: SystemTime,
-    ttl: Duration,
-    total_cap: u64,
-    repo_cap: u64,
-    protected: &std::collections::HashSet<String>,
-) -> Vec<String> {
-    vols.retain(|v| v.name != CARGO_HOME_VOLUME);
-    vols.sort_by_key(|v| std::cmp::Reverse(v.used));
-    let mut out: Vec<String> = Vec::new();
-    let mut nm_seen: std::collections::HashMap<String, usize> = Default::default();
-    for v in &vols {
-        let idle = now.duration_since(v.used).unwrap_or_default() > ttl;
-        let over_keep = v.name.starts_with("wfloor-nm-") && {
-            let n = nm_seen.entry(v.repo.clone()).or_default();
-            *n += 1;
-            *n > NM_KEEP
-        };
-        if (idle || over_keep) && !protected.contains(&v.name) {
-            out.push(v.name.clone());
-        }
-    }
-    let kept: Vec<&VolumeUse> = vols.iter().filter(|v| !out.contains(&v.name)).collect();
-    let mut total: u64 = kept.iter().map(|v| v.bytes).sum();
-    let mut per_repo: std::collections::HashMap<&str, u64> = Default::default();
-    for v in &kept {
-        *per_repo.entry(v.repo.as_str()).or_default() += v.bytes;
-    }
-    for v in kept.iter().rev() {
-        let repo_over = per_repo.get(v.repo.as_str()).copied().unwrap_or(0) > repo_cap;
-        if (total <= total_cap && !repo_over) || protected.contains(&v.name) {
-            continue;
-        }
-        out.push(v.name.clone());
-        total = total.saturating_sub(v.bytes);
-        if let Some(r) = per_repo.get_mut(v.repo.as_str()) {
-            *r = r.saturating_sub(v.bytes);
-        }
-    }
-    out
-}
-
-/// Hold the floor's volumes to the caps, measured in the runtime VM ([`eviction_plan`]). Each
-/// removal is taken under the volume's lock and skipped while any live floor leases it.
-fn evict(rt: &Runtime, cache: &Path, image: &str, caps: crate::repo_checks::CacheCaps) {
-    let dir = state_dir(cache);
-    let Ok(rd) = std::fs::read_dir(&dir) else {
-        return;
-    };
-    let mut stamps: Vec<(String, String, SystemTime)> = Vec::new();
-    for e in rd.flatten() {
-        let n = e.file_name().to_string_lossy().into_owned();
-        let Some(vol) = n.strip_suffix(".used") else {
-            continue;
-        };
-        let used = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(SystemTime::UNIX_EPOCH);
-        let repo = std::fs::read_to_string(e.path()).unwrap_or_default();
-        stamps.push((vol.to_string(), repo, used));
-    }
-    if stamps.is_empty() {
-        return;
-    }
-    let sizes = volume_sizes(rt);
-    let vols: Vec<VolumeUse> = stamps
-        .iter()
-        .filter(|(n, ..)| sizes.contains_key(n))
-        .map(|(n, r, u)| VolumeUse {
-            name: n.clone(),
-            repo: r.clone(),
-            bytes: sizes[n],
-            used: *u,
-        })
-        .collect();
-    // The VM's own disk, read inside a throwaway container (its root is on the VM's disk).
-    let space = probe_run(rt, image, &[], &["df", "-B1", "--output=size,avail", "/"])
-        .ok()
-        .filter(|(code, _)| *code == 0)
-        .and_then(|(_, o)| {
-            let l = o.lines().nth(1)?;
-            let mut f = l.split_whitespace();
-            Some(crate::repo_checks::VolumeSpace {
-                total: f.next()?.parse().ok()?,
-                free: f.next()?.parse().ok()?,
-            })
-        });
-    let bytes: u64 = vols.iter().map(|v| v.bytes).sum();
-    let total_cap = crate::repo_checks::effective_total_cap(caps, bytes, space);
-    let protected: std::collections::HashSet<String> = vols
-        .iter()
-        .filter(|v| leased(&v.name))
-        .map(|v| v.name.clone())
-        .collect();
-    let plan = eviction_plan(
-        vols,
-        SystemTime::now(),
-        crate::repo_checks::CHECK_CACHE_IDLE_TTL,
-        total_cap,
-        caps.repo,
-        &protected,
-    );
-    for v in plan {
-        let Ok(_lock) = lock_volume(&v) else { continue };
-        if leased(&v) {
-            continue;
-        }
-        if rt_run(rt, &["volume", "rm", &v], REAP).is_ok() {
-            eprintln!("wicked-core: checks floor — removed cache volume {v} (cap / idle)");
-            let _ = std::fs::remove_file(dir.join(format!("{v}.used")));
-        }
-    }
-    // Stamps of volumes the runtime no longer has, a day after their last use (a stamp can be
-    // written before its volume is made).
-    let day = Duration::from_secs(24 * 60 * 60);
-    for (n, _, used) in stamps {
-        let old = SystemTime::now().duration_since(used).unwrap_or_default() > day;
-        if old && !sizes.contains_key(&n) && !volume_exists(rt, &n) {
-            let _ = std::fs::remove_file(dir.join(format!("{n}.used")));
-        }
-    }
-}
-
-/// The floor volumes' sizes, from `system df -v`.
-fn volume_sizes(rt: &Runtime) -> std::collections::HashMap<String, u64> {
-    let mut out = std::collections::HashMap::new();
-    let Ok(raw) = rt_run(
-        rt,
-        &["system", "df", "-v", "--format", "{{json .Volumes}}"],
-        START,
-    ) else {
-        return out;
-    };
-    let Ok(list) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
-        return out;
-    };
-    for v in list {
-        let Some(name) = v.get("Name").and_then(|n| n.as_str()) else {
-            continue;
-        };
-        if !name.starts_with("wfloor-") {
-            continue;
-        }
-        let size = v
-            .get("Size")
-            .and_then(|s| s.as_str())
-            .map(parse_size)
-            .unwrap_or(0);
-        out.insert(name.to_string(), size);
-    }
-    out
-}
-
-/// A runtime's human size (`13.2GB`, `336MB`, `5.4GiB`, `0B`) in bytes.
-pub(crate) fn parse_size(s: &str) -> u64 {
-    let s = s.trim();
-    let split = s
-        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
-        .unwrap_or(s.len());
-    let (n, unit) = s.split_at(split);
-    let n: f64 = n.parse().unwrap_or(0.0);
-    let mul = match unit.trim().to_ascii_uppercase().as_str() {
-        "B" | "" => 1.0,
-        "KB" | "K" => 1e3,
-        "MB" | "M" => 1e6,
-        "GB" | "G" => 1e9,
-        "TB" | "T" => 1e12,
-        "KIB" => 1024.0,
-        "MIB" => 1024.0 * 1024.0,
-        "GIB" => 1024.0 * 1024.0 * 1024.0,
-        "TIB" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => 1.0,
-    };
-    (n * mul) as u64
-}
-
-/// Remove the cargo target volumes of a check-scratch leaf that is being removed (the leaf
-/// removal [`crate::repo_checks`] makes on a run's end, a guarded checkout dropped, or the cap
-/// pass). Only when a container floor ever stamped them, so a host with no container floor never
-/// probes a runtime here. A volume a live floor leases (or still mounts) is kept, its stamp left
-/// for the idle pass.
-pub(crate) fn remove_leaf_volumes(leaf: &Path) {
-    let Some(cache) = leaf.parent().and_then(Path::parent) else {
-        return;
-    };
-    let dir = state_dir(cache);
-    let names: Vec<String> = [Tree::Head, Tree::Base]
-        .into_iter()
-        .map(|t| target_volume(leaf, t))
-        .filter(|v| dir.join(format!("{v}.used")).exists())
-        .collect();
-    if names.is_empty() {
-        return;
-    }
-    let Ok(rt) = crate::container_floor::runtime() else {
-        return;
-    };
-    for v in names {
-        let Ok(_lock) = lock_volume(&v) else { continue };
-        if leased(&v) {
-            continue;
-        }
-        if rt_run(&rt, &["volume", "rm", "--force", &v], REAP).is_ok() {
-            let _ = std::fs::remove_file(dir.join(format!("{v}.used")));
-        }
-    }
 }
 
 /// `wicked-core floor run --repo <worktree> --base <commit> [--stage creator|verify] [--run <id>]
@@ -3370,7 +2816,8 @@ pub(crate) mod test_seam {
     pub(crate) fn mode() -> Option<Mode> {
         MODE.with(Cell::get)
     }
-    #[allow(dead_code)]
+    // Its callers are the Unix-only live tests (B-6 review r2: Windows clippy).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_mode(m: Option<Mode>) {
         MODE.with(|c| c.set(m));
     }

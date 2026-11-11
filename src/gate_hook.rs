@@ -103,7 +103,7 @@ pub const ESTATE_READONLY_ENV: &str = "WICKED_ESTATE_READONLY";
 /// hand-off since the CLI-registered estate MCP was deleted) after `hardened()` stripped it; `WICKED_HOME` /
 /// `WICKED_MEMORY_DB` pin the memory + knowledge stores garden's `mem` backend reads and reach a
 /// HOST seat by plain inheritance (neither is in `ENGINE_INTERNAL_ENV`). A CONTAINER seat gets only
-/// what the carrier set explicitly (`container_floor::finalize`), so neither reaches it, and no
+/// what the carrier set explicitly (`k8s::seat`), so neither reaches it, and no
 /// host store is mounted in: its estate channel is crew's relay, pinned by [`ESTATE_BROKER_ENV`]
 /// (core#1018).
 pub(crate) const ESTATE_STORE_PIN_ENV: [&str; 3] =

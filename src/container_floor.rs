@@ -1,59 +1,17 @@
-//! The container seat floor: a governed seat runs its CLI inside a hardened OCI container
-//! (operator decision 2026-10-13 — a container runtime is REQUIRED for governed runs; the macOS
-//! Seatbelt floor in [`crate::worker_sandbox`] is the labelled interim fallback until this path is
-//! proven).
+//! Shared seat image builders, mount planning, and launch policy for the Kubernetes runner.
 //!
-//! **Glue, not a runtime.** The engine does not talk to a container API. It renders one wrapper
-//! argv for the runtime's own CLI (`docker`, `podman` or `nerdctl`: one flag dialect), exactly as
-//! it renders `sandbox-exec` / `bwrap` today, so the seat stays an ordinary child of the existing
-//! spawn path: stdio streaming, the exit code, the process group, the deadline and the cancel kill
-//! are unchanged. The one addition is the reap ([`reap`]): killing the client does not stop the
-//! container, so the runner removes it by name.
+//! Seats run as pods on a local Kubernetes cluster (Rancher Desktop or Docker Desktop
+//! Kubernetes), installed once with `wicked-core cluster install --admin-context <ctx>
+//! --home <state home>`. The container CLI (`docker`, `nerdctl`, or `podman`) never runs a
+//! seat: it builds images into the store shared with the cluster (pods use `imagePullPolicy:
+//! Never`) and inspects a seat image before an arm ([`inspect_seat_image`]: a short-lived helper
+//! that runs only the floor's own busybox over the image as data).
 //!
-//! **What the container is.** One image per CLI, built from an in-repo Dockerfile on an OSS base
-//! (`containers/seats/<cli>.Dockerfile`, tagged by the file's hash so an edit rebuilds); the
-//! operator's uid (`--user`), `no-new-privileges`, every capability dropped, a read-only root
-//! filesystem with a tmpfs `/tmp` and `HOME`, a pids limit, and an internal network of its own
-//! (one per seat container, named after it: seats sharing a network could reach each other) whose
-//! only egress is the model gateway attached to it. Every host path is bind-mounted at the
-//! SAME absolute path, so the unit's cwd, its argv paths and its env paths need no translation.
-//! The `HOME` tmpfs (512 MB) holds no package cache: cargo's home and the npm / pip / go caches
-//! are the seat's persistent cache dir on the host ([`crate::worker_sandbox::seat_cache_dir`],
-//! keyed by toolchain in [`crate::worker_sandbox::SEAT_TOOLCHAIN_CACHES`]), bound read-write like
-//! any seat dir, with each variable passed by name to the runtime and to landrun ([`finalize`]).
-//! The toolchains' build settings ride the same way, from the table beside it
-//! ([`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`]): cargo runs one job per runtime CPU
-//! ([`seat_cpus`]) up to two, with no debuginfo for the dev and test profiles and no incremental
-//! state, so a cargo repository's tests build within a seat's memory limit; a variable the operator
-//! sets in the daemon's environment is passed with the operator's value instead.
+//! The mount plan comes from [`SeatFloor`]: writable roots, read views, pinned launch files,
+//! and secret masks. [`crate::k8s::seat`] carries it into the pod along with the trusted floor
+//! image and Landlock policy. A pod that cannot start refuses the unit.
 //!
-//! **The mounts are the floor.** They are rendered from the step-0 [`SeatFloor`] the interim floor
-//! renders its profile from (one root computation, two renderers): the writable roots read-write,
-//! the repository boundary read-only, the unit's own tree and git state read-write again, the
-//! pinned launch files read-only, and every secret mask that falls under a mount covered (tmpfs
-//! over a directory, `/dev/null` over a file). Nothing else of the host exists inside, so this is
-//! a read jail as well as a write floor: a sibling worktree, the operator's other CLI homes and the
-//! credential files are absent rather than denied. The unit's READ roots (its skills snapshot, the
-//! repo graph's key dir, the launch's read extras — [`crate::gate_hook::READ_ROOTS_ENV`]) and the
-//! absolute paths its argv names are mounted read-only when the floor arms ([`add_read_roots`],
-//! [`mount_argv_paths`]); [`finalize`] adds no mount.
-//!
-//! **Landlock inside the seat.** The image's entry requires a TCP-capable Landlock ABI and checks
-//! a writable canary tmpfs before entering `landrun`, then requires an out-of-tree write to fail
-//! inside the CLI's own domain.
-//! Landlock admits writes and execution in the writable mounts, `/home/seat` and `/tmp`, reads
-//! and execution in the image and read mounts, and TCP connects only to the gateway ports.
-//! A failed canary refuses the CLI even when `--best-effort` degraded to no enforcement.
-//!
-//! **Fail closed.** A governed unit whose container cannot start — no runtime, the engine not
-//! answering, no seat image, native Windows — is refused with the reason (the failover ladder moves
-//! the work), never run on the host.
-//!
-//! Opt-in until the shadow proof (slice C5): [`SEAT_FLOOR_ENV`]` = container`.
-
-// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
-// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
-#![allow(dead_code)]
+//! `wicked-core seat-image build|status` builds or inspects the required images.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -87,16 +45,6 @@ pub(crate) const SEAT_LABEL: &str = "wicked.seat";
 const DEFAULT_BASE: &str = "node:24.22.2-trixie-slim";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
-const REAP_TIMEOUT: Duration = Duration::from_secs(20);
-const SWEEP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
-/// (core#1377) An engine network nothing is attached to is swept once it is this old. A seat's
-/// network is attached within the seconds its unit takes to arm, and a gateway's bridge within its
-/// start; one left empty this long is a crashed or removed owner's. Every engine network takes one
-/// of the runtime's few address pools (Docker: 31), so 24 hours let them run out.
-const NETWORK_SWEEP_AGE: Duration = Duration::from_secs(60 * 60);
-/// (core#1377) How often an arming engine sweeps again: once per process let a long-lived daemon
-/// pile its leftovers up.
-const SWEEP_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
 /// ChatGPT 4002, pi 4003, opencode 4004, Claude OAuth 4005, the subscription routes 4006-4012
 /// ([`crate::seat_credentials::SUBSCRIPTION_ROUTES`]), agy's Gemini API key 4013
@@ -320,14 +268,6 @@ impl Runtime {
         Runtime {
             cli,
             answer_bound: Some(crate::test_env::PATIENT),
-        }
-    }
-
-    /// A test stand-in that stalls on purpose: every caller's own deadline holds.
-    pub(crate) fn stalling(cli: PathBuf) -> Self {
-        Runtime {
-            cli,
-            answer_bound: None,
         }
     }
 }
@@ -597,8 +537,8 @@ fn probe_runtime(choice: Option<&str>) -> Result<Runtime, FloorUnarmed> {
 
 /// The CPUs a seat container can use: the runtime engine's (`<cli> info --format {{.NCPU}}`,
 /// docker and nerdctl), which under a VM runtime (Docker Desktop, Rancher Desktop, colima) is the
-/// VM's, not the host's. A seat container carries no CPU limit of its own ([`run_argv`] sets
-/// `--memory`, never `--cpus`). When the runtime does not answer it (podman's template differs, a
+/// VM's, not the host's. Shared seat build settings cap the resulting job count separately.
+/// When the runtime does not answer (podman's template differs, a
 /// probe that times out), the host's parallelism stands in. Probed once per runtime CLI for the
 /// process, whatever the answer, so a runtime that cannot answer is not asked again at every
 /// spawn; [`runtime`] itself is cached once it answers.
@@ -651,15 +591,6 @@ pub(crate) fn seat_clis() -> impl Iterator<Item = &'static str> {
     SEAT_PACKAGES.iter().map(|(k, _)| *k)
 }
 
-/// The base image the seat images build on ([`BASE_IMAGE_ENV`], else the default).
-fn base_image() -> String {
-    std::env::var(BASE_IMAGE_ENV)
-        .ok()
-        .map(|b| b.trim().to_string())
-        .filter(|b| !b.is_empty())
-        .unwrap_or_else(|| DEFAULT_BASE.to_string())
-}
-
 /// 12 hex of sha256 over `parts` (NUL-separated): an image tag that changes with its inputs.
 fn content_tag(parts: &[&str]) -> String {
     use sha2::{Digest, Sha256};
@@ -707,22 +638,11 @@ pub(crate) fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
         .and_then(|o| valid_image_id(String::from_utf8_lossy(&o.stdout).trim()))
 }
 
-/// [`image_id`] for the image holders ([`crate::image_keep`]).
-pub(crate) fn image_id_of(rt: &Runtime, tag: &str) -> Option<String> {
-    image_id(rt, tag)
-}
-
 /// An immutable local image id as the runtime spells it: docker's `sha256:<64 hex>` or podman's
 /// bare `<64 hex>` (codex ln-r2). Kept in that spelling for the runtime's own later commands.
 fn valid_image_id(id: &str) -> Option<String> {
     let hex = id.strip_prefix("sha256:").unwrap_or(id);
     (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())).then(|| id.to_string())
-}
-
-/// [`image_present`], putting back a tag a runtime's cleanup removed while its holder kept the
-/// image ([`crate::image_keep::restore`]).
-pub(crate) fn image_present_or_restored(rt: &Runtime, tag: &str) -> bool {
-    image_present(rt, tag) || crate::image_keep::restore(rt, tag)
 }
 
 pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
@@ -766,7 +686,7 @@ impl SeatBase {
 }
 
 /// [`build_seat_image`] on `base`: an operator base that is missing is rebuilt from its recipe
-/// first (and held at once); a missing operator base with no recipe fails naming the base and the
+/// first; a missing operator base with no recipe fails naming the base and the
 /// fix. The default base is a registry image the build pulls.
 fn build_seat_image_on(
     rt: &Runtime,
@@ -775,12 +695,8 @@ fn build_seat_image_on(
     base: &SeatBase,
 ) -> Result<String, String> {
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
-    if base.operator {
-        if image_present_or_restored(rt, &base.image) {
-            // Held before the build, whatever the build does: a local-only base must not be
-            // left to the image cleanup while a seat image builds on it.
-            let _ = crate::image_keep::hold_now(rt, &[&base.image]);
-        } else if let Some(recipe) = &base.recipe {
+    if base.operator && !image_present(rt, &base.image) {
+        if let Some(recipe) = &base.recipe {
             rebuild_base(rt, &base.image, recipe)?;
         }
     }
@@ -818,8 +734,6 @@ pub(crate) fn rebuild_base(rt: &Runtime, base: &str, recipe: &Path) -> Result<()
         recipe.display()
     );
     build_image(rt, &df, base, &[])?;
-    // Held at once: a seat build that fails after this must not leave the new base unheld.
-    let _ = crate::image_keep::hold_now(rt, &[base]);
     Ok(())
 }
 
@@ -841,11 +755,9 @@ pub(crate) fn ensure_floor_image(rt: &Runtime) -> Result<String, String> {
         if !image_present(rt, &tag) {
             eprintln!("wicked-core: building floor image {tag} (first use)");
             build_image(rt, FLOOR_DOCKERFILE, &tag, &[])?;
-            let _ = crate::image_keep::hold_now(rt, &[&tag]);
             return Ok(tag);
         }
     }
-    let _ = crate::image_keep::hold(rt, &[&tag]);
     Ok(tag)
 }
 
@@ -1006,35 +918,6 @@ pub(crate) fn check_seat_image(facts: &ImageFacts, dests: &[PathBuf]) -> Result<
     Ok(())
 }
 
-/// The seat network sidecar's Dockerfile (alpine + iptables; see the file).
-const NETNS_DOCKERFILE: &str = include_str!("../containers/seats/netns.Dockerfile");
-
-/// The sidecar image's tag (its Dockerfile's hash).
-pub(crate) fn netns_image_tag() -> String {
-    format!("wicked-seat-netns:{}", content_tag(&[NETNS_DOCKERFILE]))
-}
-
-/// The sidecar image, built on first use (tagged by its Dockerfile's hash).
-pub(crate) fn ensure_netns_image(rt: &Runtime) -> Result<String, String> {
-    let tag = netns_image_tag();
-    if !image_present(rt, &tag) {
-        static BUILD: Mutex<()> = Mutex::new(());
-        let _one = BUILD.lock();
-        if !image_present(rt, &tag) {
-            build_image(
-                rt,
-                NETNS_DOCKERFILE,
-                &tag,
-                &["BASE=alpine:3.22".to_string()],
-            )?;
-            let _ = crate::image_keep::hold_now(rt, &[&tag]);
-            return Ok(tag);
-        }
-    }
-    let _ = crate::image_keep::hold(rt, &[&tag]);
-    Ok(tag)
-}
-
 /// Build `df` alone (no build context) as `tag`, streaming the runtime's progress to the engine's
 /// stderr. `Err` carries the runtime's last words.
 pub(crate) fn build_image(
@@ -1145,305 +1028,30 @@ fn ensure_seat_image_with(
     base: &SeatBase,
 ) -> Result<(String, Option<Duration>), String> {
     if let Some(img) = over {
-        // An operator's own seat image does not build on the seat base: only it is held (its
-        // tag put back first if a cleanup took the tag but the holder kept the image).
-        if !image_present(rt, &img) {
-            let _ = crate::image_keep::restore(rt, &img);
-        }
-        let _ = crate::image_keep::hold(rt, &[&img]);
         return Ok((img, None));
     }
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
     static BUILD: Mutex<()> = Mutex::new(());
     let tag = seat_image_tag(cli, &base.image).expect("package exists");
-    if image_present_or_restored(rt, &tag) {
-        hold_seat_images(rt, &tag, base, false);
+    if image_present(rt, &tag) {
         return Ok((tag, None));
     }
     let start = Instant::now();
     let _one = BUILD.lock();
     if image_present(rt, &tag) {
         // Another unit built it while this one waited.
-        hold_seat_images(rt, &tag, base, false);
         let waited = start.elapsed();
         return Ok((tag, (waited >= BUILD_WAIT_NOTE).then_some(waited)));
     }
     eprintln!("wicked-core: building seat image {tag} (it is not on the container runtime)");
     let built = build_seat_image_on(rt, cli, package, base)?;
-    hold_seat_images(rt, &built, base, true);
     Ok((built, Some(start.elapsed())))
-}
-
-/// Hold `seat` and the operator's seat base against the runtime's image cleanup
-/// ([`crate::image_keep`]); `built` holds at once, past the per-process memo. Best effort.
-fn hold_seat_images(rt: &Runtime, seat: &str, base: &SeatBase, built: bool) {
-    let mut refs = vec![seat];
-    if base.operator {
-        refs.push(&base.image);
-    }
-    let _ = if built {
-        crate::image_keep::hold_now(rt, &refs)
-    } else {
-        crate::image_keep::hold(rt, &refs)
-    };
 }
 
 /// Whether seats run with no network at all ([`NETWORK_ENV`]` = none`).
 pub(crate) fn offline_seats() -> bool {
     std::env::var(NETWORK_ENV).is_ok_and(|v| v.trim() == "none")
-}
-
-/// Create seat `name`'s own internal network (named after the container, labelled for the
-/// sweep), or `none` for an offline seat. An internal network has no route out: the only egress
-/// a seat gets is the gateway the engine attaches to it. Its subnet is a small slot of the
-/// engine's own pool ([`crate::seat_subnet`]), free of the runtime's networks and the host's
-/// routes, so one seat network no longer takes a whole default address pool.
-pub(crate) fn ensure_seat_network(rt: &Runtime, name: &str) -> Result<String, String> {
-    if offline_seats() {
-        return Ok("none".into());
-    }
-    let plan = crate::seat_subnet::plan()
-        .map_err(|e| format!("could not create the seat network `{name}`: {e}"))?;
-    ensure_seat_network_with(
-        rt,
-        name,
-        plan,
-        &crate::seat_subnet::host_routes,
-        &subnet_lock_path(),
-    )
-}
-
-/// The host-wide lock engines hold while they choose a seat subnet and create its network, so
-/// two daemons never pick the same free slot at once (a runtime such as nerdctl does not refuse
-/// the second one itself).
-fn subnet_lock_path() -> PathBuf {
-    PathBuf::from("/tmp/wicked-seat-subnet.lock")
-}
-
-/// Create the host lock file readable and writable by every user when it is missing, whatever
-/// the creating daemon's umask, so a lock file one user's engine made never shuts another's out.
-/// Never follows a link; an existing file is left as it is. Best effort.
-fn shared_lock_file(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        if let Ok(f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-        {
-            let _ = f.set_permissions(std::fs::Permissions::from_mode(0o666));
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
-/// How long a seat network create waits for another engine's choice of subnet.
-const SUBNET_LOCK_WAIT: Duration = Duration::from_secs(60);
-
-/// [`ensure_seat_network`] on `plan`, with `routes` the host's routes and `lock` the host lock.
-pub(crate) fn ensure_seat_network_with(
-    rt: &Runtime,
-    name: &str,
-    plan: crate::seat_subnet::Plan,
-    routes: &dyn Fn() -> Result<Vec<crate::seat_subnet::Cidr>, String>,
-    lock: &Path,
-) -> Result<String, String> {
-    use crate::seat_subnet as sn;
-    let refused = |why: String| format!("could not create the seat network `{name}`: {why}");
-    let (pool, prefix) = match plan {
-        sn::Plan::Runtime => return create_seat_network(rt, name, None),
-        sn::Plan::Pool { pool, prefix } => (pool, prefix),
-    };
-    shared_lock_file(lock);
-    let _held =
-        crate::cli_runner::HostCouncilLock::acquire_until(lock, Instant::now() + SUBNET_LOCK_WAIT)
-            .map_err(|e| {
-                refused(match e {
-                    crate::cli_runner::SlotRefused::Busy => format!(
-                        "another engine held the seat subnet lock ({}) for {}s",
-                        lock.display(),
-                        SUBNET_LOCK_WAIT.as_secs()
-                    ),
-                    crate::cli_runner::SlotRefused::Unavailable(why) => {
-                        format!("the seat subnet lock cannot be taken ({why})")
-                    }
-                })
-            })?;
-    let host = routes().map_err(refused)?;
-    let mut tried = 0;
-    let mut last = None;
-    // Slots the runtime refused as overlapping stay out of every later pass (the conflict may be
-    // one the listing cannot see).
-    let mut refused_slots: Vec<sn::Cidr> = Vec::new();
-    // A second pass on a fresh listing when every slot the first one tried was refused: what is
-    // left then is either a free slot or an exhausted pool, said as such.
-    for _pass in 0..2 {
-        let mut taken = retrying(&mut || runtime_subnets(rt)).map_err(refused)?;
-        taken.extend(host.iter().copied());
-        taken.extend(refused_slots.iter().copied());
-        let free = sn::candidates(pool, prefix, &taken, sn::seed_of(name), sn::MAX_TRIES);
-        if free.is_empty() {
-            return Err(refused(format!(
-                "the seat subnet pool {pool} is fully subnetted (no /{prefix} in it is free of \
-                 the runtime's networks and the host's routes) — remove unused networks, or set \
-                 {} to a larger or other range",
-                sn::POOL_ENV
-            )));
-        }
-        for slot in free {
-            tried += 1;
-            match create_seat_network(rt, name, Some(slot)) {
-                Err(e) if sn::is_overlap_refusal(&e) => {
-                    refused_slots.push(slot);
-                    last = Some(e);
-                }
-                other => return other,
-            }
-        }
-    }
-    Err(format!(
-        "{} (the runtime refused {tried} free-looking /{prefix} slots of the seat subnet pool \
-         {pool} as overlapping)",
-        last.unwrap_or_default()
-    ))
-}
-
-/// The names of the runtime's networks now.
-fn runtime_network_names(rt: &Runtime) -> Result<Vec<String>, String> {
-    let mut ls = rt.cmd();
-    ls.args(["network", "ls", "--format", "{{.Name}}"]);
-    match output_within(ls, rt.bound(PROBE_TIMEOUT)) {
-        Some(o) if o.status.success() => Ok(String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .map(str::to_string)
-            .collect()),
-        Some(o) => Err(format!(
-            "the runtime did not list its networks: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        )),
-        None => Err("the runtime did not list its networks in time".into()),
-    }
-}
-
-/// Every IPv4 subnet the runtime's networks hold now, from their inspection JSON (docker, podman
-/// and nerdctl alike), in bounded batches. A network that is not in its batch's answer is asked
-/// again alone; it drops out only when a fresh listing no longer has it (it was removed). Any
-/// network that still exists and cannot be read refuses the whole answer.
-fn runtime_subnets(rt: &Runtime) -> Result<Vec<crate::seat_subnet::Cidr>, String> {
-    let names = runtime_network_names(rt)?;
-    let inspect =
-        |batch: &[String]| -> Result<Vec<(String, Vec<crate::seat_subnet::Cidr>)>, String> {
-            let mut c = rt.cmd();
-            c.args(["network", "inspect"]);
-            c.args(batch);
-            let o = output_within(c, rt.bound(PROBE_TIMEOUT))
-                .ok_or("the runtime did not answer the inspection of its networks")?;
-            crate::seat_subnet::networks_in(&String::from_utf8_lossy(&o.stdout)).ok_or_else(|| {
-                format!(
-                    "the runtime's network inspection could not be read: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                )
-            })
-        };
-    let mut subnets = Vec::new();
-    let mut missing = Vec::new();
-    for batch in names.chunks(100) {
-        // A batch whose answer is not JSON at all (one name gone, on a runtime that then prints
-        // nothing): each of its names is asked alone below.
-        let got = inspect(batch).unwrap_or_default();
-        for n in batch {
-            match got.iter().find(|(name, _)| name == n) {
-                Some((_, s)) => subnets.extend(s.iter().copied()),
-                None => missing.push(n.clone()),
-            }
-        }
-    }
-    if !missing.is_empty() {
-        let now = runtime_network_names(rt)?;
-        // `host` and `none` are pseudo-networks some runtimes (nerdctl) list and never inspect:
-        // they hold no subnet.
-        for n in missing
-            .iter()
-            .filter(|n| now.contains(n) && !matches!(n.as_str(), "host" | "none"))
-        {
-            let one = inspect(std::slice::from_ref(n))?;
-            let (_, s) = one
-                .iter()
-                .find(|(name, _)| name == n)
-                .ok_or_else(|| format!("the runtime's network `{n}` could not be inspected"))?;
-            subnets.extend(s.iter().copied());
-        }
-    }
-    Ok(subnets)
-}
-
-/// One seat network create on `subnet` (`None`: the runtime's own pools). Retried (e2e-1105
-/// 09:02Z): one slow answer on a loaded host was `container_runtime_down` for the seat, and a
-/// judge went unchecked. A create that timed out may have landed: the retry then reads "already
-/// exists" for this unit's own network name, which is the success it looks like. A slot the
-/// runtime refuses as overlapping is answered at once, never retried.
-fn create_seat_network(
-    rt: &Runtime,
-    name: &str,
-    subnet: Option<crate::seat_subnet::Cidr>,
-) -> Result<String, String> {
-    let subnet = subnet.map(|c| c.to_string());
-    retrying(&mut || {
-        let mut create = rt.cmd();
-        create.args([
-            "network",
-            "create",
-            "--internal",
-            "--label",
-            &format!("{SEAT_LABEL}=1"),
-        ]);
-        if let Some(s) = &subnet {
-            create.args(["--subnet", s]);
-        }
-        create.arg(name);
-        match output_within(create, rt.bound(PROBE_TIMEOUT)) {
-            Some(o) if o.status.success() => Ok(Ok(name.to_string())),
-            Some(o)
-                if String::from_utf8_lossy(&o.stderr).contains("already exists")
-                    && own_seat_network(rt, name) =>
-            {
-                Ok(Ok(name.to_string()))
-            }
-            Some(o) => {
-                let e = format!(
-                    "could not create the seat network `{name}`: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                );
-                if crate::seat_subnet::is_overlap_refusal(&e) {
-                    Ok(Err(e))
-                } else {
-                    Err(e)
-                }
-            }
-            None => Err(format!("creating the seat network `{name}` timed out")),
-        }
-    })
-    .and_then(|r| r)
-}
-
-/// Whether the network `name` that already exists is this engine's own seat network: internal and
-/// carrying the seat label (a create that timed out but landed). Anything else is never adopted.
-fn own_seat_network(rt: &Runtime, name: &str) -> bool {
-    let mut inspect = rt.cmd();
-    inspect.args([
-        "network",
-        "inspect",
-        "--format",
-        &format!("{{{{.Internal}}}} {{{{index .Labels \"{SEAT_LABEL}\"}}}}"),
-        name,
-    ]);
-    output_within(inspect, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| {
-        o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true 1"
-    })
 }
 
 /// One mount of the container's filesystem, rendered as a `--mount` value.
@@ -1461,22 +1069,6 @@ impl Mount {
     fn dst(&self) -> &Path {
         match self {
             Mount::Bind { path, .. } | Mount::NullFile { path } | Mount::Tmpfs { path } => path,
-        }
-    }
-
-    fn render(&self) -> String {
-        // `--mount` values are comma-separated key=value pairs: a path with a comma or a quote
-        // would split, so such a path is refused by [`mount_plan`] before it gets here.
-        match self {
-            Mount::Bind { path, rw } => format!(
-                "type=bind,src={p},dst={p}{}",
-                if *rw { "" } else { ",readonly" },
-                p = path.display()
-            ),
-            Mount::NullFile { path } => {
-                format!("type=bind,src=/dev/null,dst={},readonly", path.display())
-            }
-            Mount::Tmpfs { path } => format!("type=tmpfs,dst={},tmpfs-size=1m", path.display()),
         }
     }
 }
@@ -1536,8 +1128,8 @@ pub(crate) fn mount_plan(f: &SeatFloor) -> Result<Vec<Mount>, String> {
     if f.tree.is_dir() && !out.iter().any(|o| f.tree.starts_with(o.dst())) {
         put(&mut out, bind(&f.tree, false))?;
     }
-    // EVERY existing mask, not only those under a mount yet: a read path [`finalize`] mounts
-    // later (a read root, an argv path) may be an ancestor, and the runtime mounts the deeper
+    // Every existing mask: a read root or argv path added to the plan may be an ancestor.
+    // The pod mounts the deeper
     // mask over it (mounts apply in destination-depth order).
     let masks: Vec<Mount> = f
         .masks
@@ -1557,45 +1149,6 @@ pub(crate) fn mount_plan(f: &SeatFloor) -> Result<Vec<Mount>, String> {
     }
     Ok(out)
 }
-
-/// The facts one seat container is launched with.
-#[derive(Debug, Clone)]
-pub(crate) struct ContainerLaunch<'a> {
-    pub(crate) runtime: &'a Path,
-    pub(crate) image: &'a str,
-    pub(crate) name: &'a str,
-    pub(crate) network: &'a str,
-    pub(crate) workdir: &'a Path,
-    /// `uid:gid` the seat runs as (the operator's, so its writes land owned by them).
-    pub(crate) user: &'a str,
-    pub(crate) mounts: &'a [Mount],
-    /// The floor image (the trusted launcher), mounted read-only at [`FLOOR_DIR`].
-    pub(crate) floor: &'a str,
-    pub(crate) memory: &'a str,
-    /// The only TCP destination ports the CLI may connect to.
-    pub(crate) gateway_ports: &'a [u16],
-    /// Loopback ports the seat serves itself (opencode's pinned server): bind AND connect.
-    pub(crate) own_ports: &'a [u16],
-}
-
-/// The options of ours that take a value, and those that do not: [`finalize`] walks the wrapper
-/// with exactly this table to find where the image (and so the CLI argv) begins.
-const VALUE_OPTS: &[&str] = &[
-    "--name",
-    "--label",
-    "--user",
-    "--tmpfs",
-    "--cap-drop",
-    "--security-opt",
-    "--pids-limit",
-    "--memory",
-    "--network",
-    "--workdir",
-    "--mount",
-    "--env",
-    "--entrypoint",
-];
-const FLAG_OPTS: &[&str] = &["--rm", "--interactive", "--init", "--read-only"];
 
 /// The memory limit selected by the operator, or the default when unset or blank.
 fn memory_from(choice: Option<&str>) -> &str {
@@ -1660,125 +1213,6 @@ pub(crate) fn landrun_prefix(
     out
 }
 
-/// The wrapper argv that runs a seat in a container and then under Landlock: the CLI argv
-/// follows it. Pure (no runtime call), so the hardening is pinned by tests.
-pub(crate) fn run_argv(l: &ContainerLaunch<'_>) -> Vec<String> {
-    let mut w: Vec<String> = vec![
-        l.runtime.to_string_lossy().into_owned(),
-        "run".into(),
-        "--rm".into(),
-        "--interactive".into(),
-        "--init".into(),
-        "--name".into(),
-        l.name.into(),
-        "--label".into(),
-        format!("{SEAT_LABEL}=1"),
-        "--user".into(),
-        l.user.into(),
-        "--read-only".into(),
-        // `exec`: the runtime's tmpfs default is noexec, and CLIs run code from both (copilot
-        // unpacks its native addon into `$HOME/.cache`; test runners exec from `$TMPDIR`).
-        "--tmpfs".into(),
-        "/tmp:rw,exec,mode=1777,size=2g".into(),
-        "--tmpfs".into(),
-        "/home/seat:rw,exec,mode=1777,size=512m".into(),
-        // Writable before Landlock, denied afterwards: a read-only root cannot fake a pass.
-        "--tmpfs".into(),
-        "/wicked-canary:rw,noexec,mode=1777,size=1m".into(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--security-opt".into(),
-        "no-new-privileges".into(),
-        "--pids-limit".into(),
-        "4096".into(),
-        "--memory".into(),
-        l.memory.into(),
-        "--network".into(),
-        l.network.into(),
-        "--workdir".into(),
-        l.workdir.to_string_lossy().into_owned(),
-        "--env".into(),
-        SEAT_HOME_ENV.into(),
-        "--env".into(),
-        "TMPDIR=/tmp".into(),
-        "--env".into(),
-        "LANG=C.UTF-8".into(),
-    ];
-    for m in l.mounts {
-        w.push("--mount".into());
-        w.push(m.render());
-    }
-    // The engine's trusted launcher, read-only from its floor image: the entrypoint, so the
-    // seat image's own entrypoint never runs (a custom or operator image cannot run code before
-    // the canary and Landlock hold).
-    w.push("--mount".into());
-    w.push(format!("type=image,src={},dst={FLOOR_DIR}", l.floor));
-    w.push("--entrypoint".into());
-    w.push(SEAT_ENTRY.into());
-    w.push(l.image.into());
-    w.extend([CANARY_FILE.into(), "--".into()]);
-    w.extend(landrun_prefix(l.mounts, l.gateway_ports, l.own_ports));
-    w
-}
-
-/// The index of the image in a wrapper [`run_argv`] rendered (the first argument our option
-/// table does not consume), or `None` when `args` is not one of ours.
-fn image_index(args: &[String]) -> Option<usize> {
-    if args.first().map(String::as_str) != Some("run") {
-        return None;
-    }
-    let mut i = 1;
-    let mut ours = false;
-    while i < args.len() {
-        let a = args[i].as_str();
-        if VALUE_OPTS.contains(&a) {
-            if a == "--label"
-                && args.get(i + 1).map(String::as_str) == Some(&format!("{SEAT_LABEL}=1"))
-            {
-                ours = true;
-            }
-            i += 2;
-        } else if FLAG_OPTS.contains(&a) {
-            i += 1;
-        } else {
-            return ours.then_some(i);
-        }
-    }
-    None
-}
-
-/// The end of our landrun options, walking their dialect rather than searching the CLI's argv
-/// (a prompt may contain `--`, `landrun` or the entry's name).
-fn landrun_end(args: &[String], img: usize) -> Option<usize> {
-    let head = args.get(img + 1..img + 4)?;
-    if head != [CANARY_FILE, "--", LANDRUN] {
-        return None;
-    }
-    // The launcher must be ours: the floor mount and the entrypoint precede the image.
-    if !args[..img]
-        .windows(2)
-        .any(|w| w == ["--entrypoint", SEAT_ENTRY])
-    {
-        return None;
-    }
-    let mut i = img + 4;
-    while let Some(a) = args.get(i) {
-        match a.as_str() {
-            "--best-effort" | "--ignore-missing" => i += 1,
-            "--ro" | "--rox" | "--rw" | "--rwx" | "--connect-tcp" | "--bind-tcp" | "--env" => {
-                args.get(i + 1)?;
-                i += 2;
-            }
-            "--" => {
-                return (args.get(i + 1..i + 5)? == [SEAT_ENTRY, "--check", CANARY_FILE, "--"])
-                    .then_some(i);
-            }
-            _ => return None,
-        }
-    }
-    None
-}
-
 /// Removes a directory the container floor allocated for one unit (its fenced scratch) when
 /// dropped, however the unit ends.
 #[derive(Debug)]
@@ -1790,7 +1224,7 @@ impl Drop for RemoveOnDrop {
     }
 }
 
-/// Reaps a seat container when dropped (the end of the run, however it ends).
+/// Reaps a seat pod when dropped (the end of the run, however it ends).
 #[derive(Debug)]
 pub(crate) struct ReapOnDrop(pub(crate) Option<SeatContainer>);
 
@@ -1802,165 +1236,15 @@ impl Drop for ReapOnDrop {
     }
 }
 
-/// A seat container to reap: the runtime CLI that launched it and its name.
+/// The seat pod identity to reap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeatContainer {
-    pub(crate) runtime: PathBuf,
     pub(crate) name: String,
 }
-
-/// The seat container a `cmd` (one [`run_argv`] rendered) launches, for the reap: the reap uses
-/// the same runtime CLI, never a fresh probe (the operator's choice may have changed since).
-pub(crate) fn seat_container(cmd: &Command) -> Option<SeatContainer> {
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let img = image_index(&args)?;
-    // Only the complete wrapper `run_argv` renders (the seat entry + landrun after the image):
-    // a label alone never makes a command ours to reap.
-    landrun_end(&args, img)?;
-    args[..img]
-        .windows(2)
-        .find(|w| w[0] == "--name")
-        .map(|w| SeatContainer {
-            runtime: PathBuf::from(cmd.get_program()),
-            name: w[1].clone(),
-        })
-}
-
-/// Environment variables never passed into a seat: the image's own `PATH` (the host's points at
-/// host binaries) and the host's temp / home spelling the container replaces.
-const HOST_ONLY_ENV: &[&str] = &[
-    "PATH",
-    "HOME",
-    "TMPDIR",
-    "PWD",
-    "OLDPWD",
-    "SHELL",
-    "DYLD_LIBRARY_PATH",
-    "DYLD_INSERT_LIBRARIES",
-];
-
-/// Whether `cmd` runs agy — on the host, or as the CLI of a seat container [`run_argv`] rendered
-/// — and so must get its stdin as a pipe the engine closes at once, never `/dev/null`: headless
-/// agy with `/dev/null` on stdin waits out its 60 s sign-in prompt whatever `--print-timeout`
-/// says, while on a pipe it fails fast ("authentication required", exit 1) or runs (measured on
-/// 1.4.2). A seat container's runtime client passes its own stdin through (`--interactive`).
+/// Whether the seat CLI needs stdin as a pipe, closed by the runner.
 pub(crate) fn stdin_must_be_a_pipe(cmd: &Command) -> bool {
-    let is_agy = |b: &str| home_is_config_home(b);
-    if is_agy(&cmd.get_program().to_string_lossy()) {
-        return true;
-    }
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    image_index(&args)
-        .and_then(|img| landrun_end(&args, img))
-        .and_then(|end| args.get(end + 5))
-        .is_some_and(|cli| is_agy(cli))
+    home_is_config_home(&cmd.get_program().to_string_lossy())
 }
-
-/// Make a seat `cmd` (one [`run_argv`] rendered, then given its env by the carrier) complete:
-/// every variable the carrier set explicitly is passed in by NAME to both the runtime and
-/// landrun (`--env KEY`: each reads its own environment, so no value is on a command line). It adds
-/// NO mount: the unit's read roots are mounted when the floor arms ([`arm`], [`add_read_roots`]),
-/// where the claude seat's fence is narrowed to the mount set; a mount added here (a read-root link
-/// re-resolved after arming) would land past that fence. Any other command is returned unchanged.
-pub(crate) fn finalize(cmd: Command) -> Command {
-    let args: Vec<String> = cmd
-        .get_args()
-        .map(|a| a.to_string_lossy().into_owned())
-        .collect();
-    let Some(img) = image_index(&args) else {
-        return cmd;
-    };
-    let Some(land_end) = landrun_end(&args, img) else {
-        return cmd;
-    };
-    let mut existing: Vec<PathBuf> = Vec::new();
-    for w in args[..img].windows(2) {
-        if w[0] == "--mount" {
-            if let Some(dst) = w[1].split(',').find_map(|kv| kv.strip_prefix("dst=")) {
-                existing.push(PathBuf::from(dst));
-            }
-        }
-    }
-    let mut extra: Vec<String> = Vec::new();
-    let mut land_extra: Vec<String> = Vec::new();
-    let mut envs: Vec<(String, Option<std::ffi::OsString>)> = Vec::new();
-    let mut carrier_path: Option<std::ffi::OsString> = None;
-    // Only the variables the carrier set EXPLICITLY reach the seat. Nothing the daemon merely
-    // inherited does — by design: a seat's model credentials come from the gateway's broker,
-    // never from the daemon's environment (an inherited OPENAI_API_KEY stays on the host).
-    for (k, v) in cmd.get_envs() {
-        let key = k.to_string_lossy().into_owned();
-        envs.push((key.clone(), v.map(|v| v.to_os_string())));
-        let Some(v) = v else { continue };
-        if key == "PATH" {
-            carrier_path = Some(v.to_os_string());
-        }
-        if !HOST_ONLY_ENV.contains(&key.as_str()) {
-            extra.push("--env".into());
-            extra.push(key.clone());
-            if !args[img + 3..land_end]
-                .windows(2)
-                .any(|w| w == ["--env", &key])
-            {
-                land_extra.extend(["--env".into(), key]);
-            }
-        }
-    }
-    // The seat's PATH: the carrier's entries that exist inside (a mounted skills snapshot's
-    // `scripts`, where garden's launcher lives), then the image's own. Host-only entries go.
-    if let Some(p) = &carrier_path {
-        extra.push("--env".into());
-        extra.push(format!("PATH={}", container_path(p, &existing)));
-    }
-    // A CLI whose configuration home IS its home (agy) runs with the carrier's seat home.
-    let mut head = args[..img].to_vec();
-    if let Some(home) = carrier_home(&args, img, land_end, &envs, &existing) {
-        if let Some(h) = head.iter_mut().find(|a| *a == SEAT_HOME_ENV) {
-            *h = format!("HOME={home}");
-        }
-    }
-    // The seat command was hardened where the carrier built it; re-harden the rebuilt one too.
-    let mut out = Command::new(cmd.get_program());
-    out.hardened();
-    out.args(&head);
-    out.args(&extra);
-    out.args(&args[img..land_end]);
-    out.args(&land_extra);
-    // Mounts sit at canonical paths; a host alias the launch spelled (`/tmp` for `/private/tmp`
-    // on macOS) does not exist inside, so env values are re-spelled (argv path options were
-    // re-spelled at arm time, [`mount_argv_paths`], where the prompt is known).
-    out.args(&args[land_end..]);
-    if let Some(dir) = cmd.get_current_dir() {
-        out.current_dir(dir);
-    }
-    for (k, v) in envs {
-        // A carrier's `HOME` names the seat's home inside the container (rendered on the wrapper
-        // above, never passed by name); the runtime client keeps the daemon's own, where its
-        // configuration and context live (with the seat's, Rancher Desktop's client lost its
-        // socket: "failed to connect to the docker API at unix:///var/run/docker.sock").
-        if k == "HOME" {
-            continue;
-        }
-        match v {
-            Some(v) => {
-                out.env(k, canonical_spelling(&v, &existing));
-            }
-            None => {
-                out.env_remove(k);
-            }
-        }
-    }
-    out
-}
-
-/// The seat's default home: a tmpfs ([`run_argv`]).
-const SEAT_HOME_ENV: &str = "HOME=/home/seat";
 
 /// Whether `cli`'s configuration home IS its process home: agy publishes no configuration-home
 /// variable (its `~/.gemini` and `~/.config/antigravity` are its whole state, conversations
@@ -1968,44 +1252,6 @@ const SEAT_HOME_ENV: &str = "HOME=/home/seat";
 /// configuration home with its own variable.
 fn home_is_config_home(cli: &str) -> bool {
     wicked_apps_core::spawn::SeatCli::from_binary(cli) == wicked_apps_core::spawn::SeatCli::Agy
-}
-
-/// The `HOME` a seat of a CLI whose home is its configuration home ([`home_is_config_home`]) runs
-/// with: the one the carrier set (the engine-owned seat home of the run and posture, at its
-/// mounted spelling), only when the deepest mount over it is a WRITABLE bind. `None` keeps the
-/// tmpfs home: another CLI, no carrier home, or a home the container does not mount writable (it
-/// would not exist, a mask or read-only bind covers it, or agy could not write its state there).
-fn carrier_home(
-    args: &[String],
-    img: usize,
-    land_end: usize,
-    envs: &[(String, Option<std::ffi::OsString>)],
-    mounts: &[PathBuf],
-) -> Option<String> {
-    let cli = args.get(land_end + 5)?;
-    if !home_is_config_home(cli) {
-        return None;
-    }
-    let home = envs
-        .iter()
-        .rev()
-        .find(|(k, _)| k == "HOME")
-        .and_then(|(_, v)| v.as_ref())?;
-    let home = PathBuf::from(canonical_spelling(home, mounts));
-    // The deepest mount over the home decides (a deeper read-only bind or a mask wins).
-    let deepest = args[..img]
-        .windows(2)
-        .filter(|w| w[0] == "--mount")
-        .filter_map(|w| {
-            let dst = w[1].split(',').find_map(|kv| kv.strip_prefix("dst="))?;
-            home.starts_with(dst)
-                .then(|| (Path::new(dst).components().count(), w[1].as_str()))
-        })
-        .max_by_key(|(depth, _)| *depth);
-    let writable =
-        deepest.is_some_and(|(_, m)| m.starts_with("type=bind,") && !m.ends_with(",readonly"));
-    (home.is_absolute() && writable && mountable(&home))
-        .then(|| home.to_string_lossy().into_owned())
 }
 
 /// The devices a seat's CLI must open read-write beyond `/dev/null`: agy's shell tool runs every
@@ -2017,25 +1263,6 @@ pub(crate) fn seat_devices(cli: &str) -> &'static [&'static str] {
         wicked_apps_core::spawn::SeatCli::Agy => &["/dev/ptmx", "/dev/pts"],
         _ => &[],
     }
-}
-
-/// Add `cli`'s [`seat_devices`] to the Landlock policy of a wrapper [`run_argv`] rendered, among
-/// landrun's own options (before its `--`). `Err` when `wrapper` is not one of ours.
-pub(crate) fn grant_seat_devices(wrapper: &mut Vec<String>, cli: &str) -> Result<(), String> {
-    let devices = seat_devices(cli);
-    if devices.is_empty() {
-        return Ok(());
-    }
-    let args = wrapper.get(1..).unwrap_or_default();
-    let end = image_index(args)
-        .and_then(|img| landrun_end(args, img))
-        .ok_or("the seat wrapper is not the engine's; no device grant")?;
-    // `end` indexes `args` (the wrapper minus the runtime): landrun's `--` sits at `end + 1`.
-    let at = end + 1;
-    for d in devices.iter().rev() {
-        wrapper.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
-    }
-    Ok(())
 }
 
 /// `v` (a path or a path list) with each absolute entry whose canonical form is mounted
@@ -2153,313 +1380,6 @@ pub(crate) fn mount_argv_paths(mounts: &mut Vec<Mount>, argv: &mut [String], pro
     }
 }
 
-/// Remove seat container `name` (after its client exited or was killed: a killed client leaves
-/// the container running). Best effort and bounded; `--rm` already removed a container whose
-/// client saw it exit.
-pub(crate) fn reap(seat: &SeatContainer) {
-    let rt = Runtime {
-        cli: seat.runtime.clone(),
-        answer_bound: None,
-    };
-    let name = seat.name.as_str();
-    let mut c = rt.cmd();
-    c.args(["rm", "--force", name, &netns_name(name)]);
-    let _ = output_within(c, REAP_TIMEOUT);
-    // Detach whatever else is attached (the gateway) so the network can go.
-    let mut members = rt.cmd();
-    members.args([
-        "network",
-        "inspect",
-        "--format",
-        "{{range .Containers}}{{.Name}} {{end}}",
-        name,
-    ]);
-    if let Some(o) = output_within(members, PROBE_TIMEOUT).filter(|o| o.status.success()) {
-        for m in String::from_utf8_lossy(&o.stdout).split_whitespace() {
-            let mut d = rt.cmd();
-            d.args(["network", "disconnect", "--force", name, m]);
-            let _ = output_within(d, REAP_TIMEOUT);
-        }
-    }
-    // Its own network goes with it. The runtime detaches the container's endpoint asynchronously
-    // after `--rm`, so a first removal can find it still in use: retry briefly. An offline seat
-    // has no network of its own (`network inspect` fails at once and the loop ends).
-    let start = Instant::now();
-    loop {
-        let mut n = rt.cmd();
-        n.args(["network", "rm", name]);
-        if output_within(n, REAP_TIMEOUT).is_some_and(|o| o.status.success()) {
-            return;
-        }
-        let mut i = rt.cmd();
-        i.args(["network", "inspect", "--format", "{{.Name}}", name]);
-        let exists = output_within(i, PROBE_TIMEOUT).is_some_and(|o| o.status.success());
-        if !exists || start.elapsed() > REAP_TIMEOUT {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(250));
-    }
-}
-
-/// The runtime's own prune commands for what a crashed engine left behind: stopped seat
-/// containers older than `container_age`, and unused seat networks (`wicked.seat=1`) older than
-/// `network_age`. A live seat is never touched (prune skips running containers and networks in
-/// use).
-pub(crate) fn sweep_argv(container_age: Duration, network_age: Duration) -> [Vec<String>; 2] {
-    let until = |d: Duration| format!("until={}h", (d.as_secs() / 3600).max(1));
-    let label = format!("label={SEAT_LABEL}=1");
-    [
-        vec![
-            "container".into(),
-            "prune".into(),
-            "--force".into(),
-            "--filter".into(),
-            label.clone(),
-            "--filter".into(),
-            until(container_age),
-        ],
-        vec![
-            "network".into(),
-            "prune".into(),
-            "--force".into(),
-            "--filter".into(),
-            label,
-            "--filter".into(),
-            until(network_age),
-        ],
-    ]
-}
-
-/// Run [`sweep_argv`], then [`sweep_gateway_bridges`], best effort and bounded. [`arm`] calls it
-/// at its first arming and then at most every [`SWEEP_EVERY`] ([`sweep_due`]).
-pub(crate) fn sweep(rt: &Runtime) {
-    for argv in sweep_argv(SWEEP_AGE, NETWORK_SWEEP_AGE) {
-        let mut c = rt.cmd();
-        c.args(&argv);
-        let _ = output_within(c, rt.bound(REAP_TIMEOUT));
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let _ = sweep_gateway_bridges(rt, NETWORK_SWEEP_AGE, now);
-}
-
-/// Whether the sweep is due: never run (`last` is `None`), or last run `every` or longer ago.
-/// Marks it run when it is.
-fn sweep_due(last: &mut Option<Instant>, now: Instant, every: Duration) -> bool {
-    let due = last.is_none_or(|at| now.saturating_duration_since(at) >= every);
-    if due {
-        *last = Some(now);
-    }
-    due
-}
-
-/// The gateway container an external bridge belongs to: `wicked-agw-<12 hex>-ext` is
-/// `wicked-agw-<12 hex>`'s ([`crate::seat_gateway::Gateway::for_dir`]). Any other name is none.
-pub(crate) fn gateway_of_bridge(network: &str) -> Option<&str> {
-    let gw = network.strip_suffix("-ext")?;
-    let hex = gw.strip_prefix("wicked-agw-")?;
-    (hex.len() == 12
-        && hex
-            .bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
-    .then_some(gw)
-}
-
-/// (core#1377) The whole gateway-bridge sweep's bound: it runs on an arming unit's thread, so a
-/// runtime that stops answering mid-sweep costs at most this, and the rest waits for a later sweep.
-const GATEWAY_SWEEP_BUDGET: Duration = Duration::from_secs(45);
-
-/// (core#1377) Remove the external bridges whose daemon is gone, and answer their names. A
-/// gateway's bridge outlives its container and its daemon (a test or proof daemon whose state
-/// home was deleted, a runtime cleanup), and nothing else removed it. A bridge goes only when ALL
-/// hold: it carries the gateway label and a gateway bridge's name; the runtime lists it as
-/// dangling and shows no container on it; it was created at least `older_than` before
-/// `now_unix`; it is labelled with the gateway directory it serves ([`crate::seat_gateway::DIR_LABEL`]),
-/// that directory hashes to the bridge's name, and it no longer exists on this host (no daemon
-/// can start a gateway on a directory that is gone, so none is about to use the bridge); and the
-/// runtime answers definitively that its gateway container does not exist. A bridge with no
-/// directory label (made before it existed) is never removed. Each network is inspected and
-/// removed by its full ID, so a same-named network created meanwhile is never the one removed.
-/// Any answer it cannot read keeps the network (a runtime that cannot list dangling networks,
-/// such as nerdctl, sweeps none), and the sweep stops at the first command that does not answer,
-/// within about [`GATEWAY_SWEEP_BUDGET`].
-pub(crate) fn sweep_gateway_bridges(
-    rt: &Runtime,
-    older_than: Duration,
-    now_unix: u64,
-) -> Vec<String> {
-    let started = Instant::now();
-    let run = |argv: &[&str]| -> Option<std::process::Output> {
-        let left = GATEWAY_SWEEP_BUDGET.checked_sub(started.elapsed())?;
-        let mut c = rt.cmd();
-        c.args(argv);
-        output_within(c, rt.bound(PROBE_TIMEOUT.min(left)))
-    };
-    let label = format!("label={}=1", crate::seat_gateway::GATEWAY_LABEL);
-    let Some(listed) = run(&[
-        "network",
-        "ls",
-        "--filter",
-        &label,
-        "--filter",
-        "dangling=true",
-        "--no-trunc",
-        "--format",
-        "{{.ID}} {{.Name}}",
-    ])
-    .filter(|o| o.status.success()) else {
-        eprintln!(
-            "wicked-core: the gateway-bridge sweep could not list this runtime's dangling gateway \
-             networks; none is removed"
-        );
-        return Vec::new();
-    };
-    let listed = String::from_utf8_lossy(&listed.stdout).into_owned();
-    let mut removed = Vec::new();
-    for line in listed.lines() {
-        let mut f = line.split_whitespace();
-        let (Some(id), Some(net), None) = (f.next(), f.next(), f.next()) else {
-            continue;
-        };
-        let Some(gw) = gateway_of_bridge(net) else {
-            continue;
-        };
-        let Some(inspected) = run(&[
-            "network",
-            "inspect",
-            "--format",
-            &format!(
-                "{{{{len .Containers}}}} {{{{.Created.Unix}}}} {{{{index .Labels \"{}\"}}}} \
-                 {{{{.Name}}}} {{{{.ID}}}} {{{{index .Labels \"{}\"}}}}",
-                crate::seat_gateway::GATEWAY_LABEL,
-                crate::seat_gateway::DIR_LABEL
-            ),
-            id,
-        ]) else {
-            break;
-        };
-        let out = String::from_utf8_lossy(&inspected.stdout).into_owned();
-        // Five space-free fields, then the directory label (a path may hold spaces).
-        let mut f = out.trim().splitn(6, ' ');
-        let ours_old_and_empty = inspected.status.success()
-            && f.next().and_then(|n| n.parse::<u64>().ok()) == Some(0)
-            && f.next()
-                .and_then(|c| c.parse::<u64>().ok())
-                .is_some_and(|c| now_unix.saturating_sub(c) >= older_than.as_secs())
-            && f.next() == Some("1")
-            && f.next() == Some(net)
-            && f.next() == Some(id)
-            && f.next().is_some_and(|d| dir_gone(d, gw));
-        if !ours_old_and_empty {
-            continue;
-        }
-        let Some(gateway) = run(&["container", "inspect", "--format", "{{.Name}}", gw]) else {
-            break;
-        };
-        // Only the runtime's own definitive answer: a transport error ("connect: no such file or
-        // directory") says nothing about the container.
-        let err = String::from_utf8_lossy(&gateway.stderr);
-        let gateway_absent = !gateway.status.success()
-            && err.to_ascii_lowercase().contains("no such container")
-            && !runtime_unreachable(&err);
-        if !gateway_absent {
-            continue;
-        }
-        // Read again right before the removal: a daemon starting on that directory recreates it
-        // first. (A start between this read and the removal fails once, recoverably: the next
-        // start makes a fresh bridge, which the sweep never takes while it is young.) The runtime
-        // refuses to remove a network in use: the last guard against a gateway that attached.
-        let dir_label = out.trim().splitn(6, ' ').nth(5).unwrap_or("");
-        if !dir_gone(dir_label, gw) {
-            continue;
-        }
-        match run(&["network", "rm", id]) {
-            Some(o) if o.status.success() => removed.push(net.to_string()),
-            Some(_) => {}
-            None => break,
-        }
-    }
-    removed
-}
-
-/// Whether `dir` (a bridge's directory label) is the gateway directory `gw` is named after and
-/// no longer exists on this host. Anything short of a definitive "not found" keeps the bridge.
-fn dir_gone(dir: &str, gw: &str) -> bool {
-    let p = Path::new(dir);
-    p.is_absolute()
-        && crate::seat_gateway::gateway_name(p) == gw
-        && std::fs::symlink_metadata(p).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
-}
-
-/// (core#1356) Whether a network create failed because the runtime has no address pool left:
-/// Docker's "all predefined address pools have been fully subnetted", podman's and nerdctl's
-/// "could not find free subnet" / "failed to find free subnet".
-pub(crate) fn pools_exhausted(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    e.contains("fully subnetted") || e.contains("find free subnet")
-}
-
-/// (core#1356) Whether a runtime error says its CLI could not reach the engine at all (Docker's
-/// "Cannot connect to the Docker daemon", a refused or missing socket, podman's "unable to connect
-/// to Podman"). Such a failure is the runtime's outage even when the engine answers again by the
-/// time it is probed, so the unit still rides the runtime wait and re-runs.
-pub(crate) fn runtime_unreachable(err: &str) -> bool {
-    let e = err.to_ascii_lowercase();
-    [
-        "cannot connect to the docker daemon",
-        "is the docker daemon running",
-        "unable to connect to podman",
-        "connection refused",
-        "connect: no such file or directory",
-        "error during connect",
-        "could not reach the container runtime",
-        "trying to connect to the docker daemon",
-    ]
-    .iter()
-    .any(|m| e.contains(m))
-}
-
-/// (core#1356) What a failed seat-network create is: the address pools ran out, the runtime is
-/// down (`runtime_down`, a fresh liveness probe, asked only when the error names no pool), or the
-/// runtime answers and the network failed for the reason its error gives. Before this, every such
-/// failure read as `container_runtime_down`, and the B4 pilot waited out host load while Docker
-/// answered in a quarter second.
-pub(crate) fn network_failure_kind(
-    err: &str,
-    runtime_down: &mut dyn FnMut() -> bool,
-) -> FloorUnarmed {
-    if pools_exhausted(err) {
-        FloorUnarmed::AddressPoolsExhausted
-    } else if runtime_unreachable(err) || runtime_down() {
-        FloorUnarmed::ContainerRuntimeDown
-    } else {
-        FloorUnarmed::SeatNetworkUnavailable
-    }
-}
-
-/// The runtime CLI's own failure code (`docker run` / `podman run` / `nerdctl run`): the
-/// container never started, so nothing of the seat ran.
-const RUNTIME_START_FAILED: i32 = 125;
-
-/// A seat client's stderr, with a leading line naming the cause when the container itself never
-/// started (exit 125: the image, a mount source the runtime's VM does not share, the engine).
-pub(crate) fn explain_start_failure(name: &str, code: i32, err: String) -> String {
-    if code != RUNTIME_START_FAILED {
-        return err;
-    }
-    let hint = if err.contains("bind source path does not exist") {
-        " — a mounted host path is not visible to the container runtime (share it with the \
-         runtime's VM, e.g. Rancher Desktop / Colima / Podman machine mounts)"
-    } else {
-        ""
-    };
-    format!(
-        "wicked-core: seat container {name} did not start (runtime exit {RUNTIME_START_FAILED}){hint}\n{err}"
-    )
-}
-
 /// The CLI argv rewritten for the image: the host's resolved binary path (`argv[0]`, and every
 /// later argument spelling the same path, as the opencode pinned-server script does) becomes the
 /// CLI's name on the image's `PATH`.
@@ -2490,20 +1410,6 @@ pub(crate) fn with_seat_args(mut argv: Vec<String>, seat_args: Vec<String>) -> V
     let at = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
     argv.splice(at..at, seat_args);
     argv
-}
-
-/// The operator's `uid:gid` (the seat's writes land owned by them).
-fn operator_user() -> String {
-    #[cfg(unix)]
-    {
-        // SAFETY: getuid/getgid have no preconditions and cannot fail.
-        let (u, g) = unsafe { (libc::getuid(), libc::getgid()) };
-        format!("{u}:{g}")
-    }
-    #[cfg(not(unix))]
-    {
-        "1000:1000".to_string()
-    }
 }
 
 /// One seat's gateway identity: its unit key, its env, and its placeholder credential files.
@@ -2936,14 +1842,14 @@ pub(crate) fn write_seat_files(
     Ok(())
 }
 
-/// A seat armed in the container floor: the wrapper, the argv to run after it, the runtime that
-/// armed it (by file name: `docker`, `podman`, `nerdctl`). Its `Debug` names the env's
+/// A seat armed as a pod: the wrapper (`kubectl exec` into the seat pod), the argv to run after
+/// it, and the tool that runs it (`kubectl`). Its `Debug` names the env's
 /// variables, never their values (a unit key, a claude seat's pass-through token).
 pub(crate) struct ArmedContainer {
     pub(crate) wrapper: Vec<String>,
     pub(crate) argv: Vec<String>,
     pub(crate) tool: &'static str,
-    /// Removes the seat's container and network on every path out of the unit (held by the
+    /// Reaps the seat's pod on every path out of the unit (held by the
     /// caller until the unit ends; `run_bounded`'s own reap makes it a no-op on the normal path).
     pub(crate) cleanup: ReapOnDrop,
     /// The env the seat reaches the gateway with (its placeholder key, the model base URLs,
@@ -3098,33 +2004,6 @@ fn placeholder_handoff(
     }
     let env = crate::seat_gateway::seat_env_for_sign_in(cli, &sign_in, &key.bearer);
     (key, env, files)
-}
-
-fn tool_name(cli: &Path) -> &'static str {
-    match cli.file_stem().and_then(|s| s.to_str()) {
-        Some("podman") => "podman",
-        Some("nerdctl") => "nerdctl",
-        _ => "docker",
-    }
-}
-
-/// A container name for one spawn: `wicked-seat-<cli>-<run id prefix>-<ord>-<nonce>`, limited to
-/// the characters every runtime accepts.
-pub(crate) fn container_name(cli: &str, run_id: &str, ord: u32) -> String {
-    let clean = |s: &str, n: usize| -> String {
-        s.chars()
-            .filter(|c| c.is_ascii_alphanumeric())
-            .take(n)
-            .collect::<String>()
-            .to_ascii_lowercase()
-    };
-    let nonce = uuid::Uuid::new_v4().simple().to_string();
-    format!(
-        "wicked-seat-{}-{}-{ord}-{}",
-        clean(cli, 12),
-        clean(run_id, 8),
-        &nonce[..8]
-    )
 }
 
 /// The longest prompt passed to a seat container as an argument (core#1228). Linux refuses to
@@ -3321,38 +2200,7 @@ fn carry_prompt_in_file_at(
     Ok(Some(CarriedPrompt { file, _dir: guard }))
 }
 
-/// Arm the container floor for one governed seat spawn: resolve the floor (the step-0
-/// computation), find the runtime, the seat image and the network, and render the wrapper. `Err`
-/// names why the unit cannot run in a container; the caller refuses it (fail closed).
-/// `read_view` is a team member turn's repository view, mounted read-only ([`add_read_view`]).
-/// [`arm_noting`] with no build note (the tests' spelling; unix-only tests).
-#[cfg(test)]
-#[cfg_attr(not(unix), allow(dead_code))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn arm(
-    inp: &crate::worker_sandbox::FloorInputs,
-    argv: &[String],
-    run_id: &str,
-    ord: u32,
-    read_roots: &[PathBuf],
-    read_view: Option<&Path>,
-    prompt: Option<&str>,
-    gateway_dir: Option<&Path>,
-) -> Result<ArmedContainer, (FloorUnarmed, String)> {
-    arm_noting(
-        inp,
-        argv,
-        run_id,
-        ord,
-        read_roots,
-        read_view,
-        prompt,
-        gateway_dir,
-        &mut |_, _| {},
-    )
-}
-
-/// [`arm`], calling `on_built(image, waited)` as soon as the seat image had to be built for this
+/// Arm a seat pod, calling `on_built(image, waited)` as soon as its image had to be built for this
 /// unit (it was missing), whatever the rest of the arming decides.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn arm_noting(
@@ -3608,18 +2456,7 @@ pub(crate) fn arm_noting(
             rw: true,
         });
     }
-    let mut landrun: Vec<String> = vec![SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()];
-    landrun.extend(landrun_prefix(&land_mounts, GATEWAY_PORTS, &own_ports));
-    if let Some(at) = landrun.iter().position(|a| a == "--").and_then(|first| {
-        landrun[first + 1..]
-            .iter()
-            .position(|a| a == "--")
-            .map(|i| first + 1 + i)
-    }) {
-        for d in seat_devices(cli).iter().rev() {
-            landrun.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
-        }
-    }
+    let landrun = seat_launch_policy(cli, landrun_prefix(&land_mounts, GATEWAY_PORTS, &own_ports));
     let protected: Vec<PathBuf> = spec.protected.clone();
     let plan_mounts = crate::k8s::seat::plan_mounts(&mounts);
     // Canonical, like the mount plan's paths (review r2: macOS spells a worker home under /var
@@ -3674,7 +2511,6 @@ pub(crate) fn arm_noting(
     let mut env = env;
     env.push((crate::gate_hook::SEAT_POD_ENV.to_string(), "1".to_string()));
     let cleanup = ReapOnDrop(Some(SeatContainer {
-        runtime: kube.kubectl.clone(),
         name: seat.id.clone(),
     }));
     let argv = with_seat_args(image_argv(&argv, cli), seat_args);
@@ -3693,6 +2529,25 @@ pub(crate) fn arm_noting(
         copilot_account,
         view,
     })
+}
+
+/// The launcher argv a seat pod runs under (pure): the floor entry and canary, then the Landlock
+/// policy `prefix`, with `cli`'s devices (agy's pseudo-terminal) granted read-write before
+/// landrun's own `--` separator.
+pub(crate) fn seat_launch_policy(cli: &str, prefix: Vec<String>) -> Vec<String> {
+    let mut landrun: Vec<String> = vec![SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()];
+    landrun.extend(prefix);
+    if let Some(at) = landrun.iter().position(|a| a == "--").and_then(|first| {
+        landrun[first + 1..]
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| first + 1 + i)
+    }) {
+        for d in seat_devices(cli).iter().rev() {
+            landrun.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
+        }
+    }
+    landrun
 }
 
 /// A container memory limit (`3g`, `512m`) as a Kubernetes quantity (`3Gi`, `512Mi`).
@@ -3883,105 +2738,6 @@ pub(crate) fn trust_pin(p: &Path) -> Result<(), String> {
                 .map_err(|e| format!("pinned launch file {}: {e}", p.display()))
         }
     }
-}
-
-/// The seat's network sidecar container name.
-pub(crate) fn netns_name(seat: &str) -> String {
-    format!("{seat}-netns")
-}
-
-/// `container`'s address on `network`.
-pub(crate) fn gateway_ip(rt: &Runtime, container: &str, network: &str) -> Result<String, String> {
-    let mut c = rt.cmd();
-    c.args([
-        "inspect",
-        "--format",
-        &format!("{{{{(index .NetworkSettings.Networks \"{network}\").IPAddress}}}}"),
-        container,
-    ]);
-    let o = output_within(c, rt.bound(PROBE_TIMEOUT)).ok_or("inspecting the gateway timed out")?;
-    let ip = String::from_utf8_lossy(&o.stdout).trim().to_string();
-    if o.status.success() && ip.parse::<std::net::IpAddr>().is_ok() {
-        Ok(ip)
-    } else {
-        Err(format!("the gateway has no address on {network}"))
-    }
-}
-
-/// The sidecar's argv: on the seat network, only the capabilities iptables needs, and the
-/// allowed gateway endpoints as arguments.
-pub(crate) fn netns_argv(
-    rt: &Path,
-    image: &str,
-    seat: &str,
-    network: &str,
-    gw_ip: &str,
-) -> Vec<String> {
-    let mut v: Vec<String> = [
-        "run",
-        "-d",
-        "--rm",
-        "--name",
-        &netns_name(seat),
-        "--label",
-        &format!("{SEAT_LABEL}=1"),
-        "--network",
-        network,
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--cap-add",
-        "NET_ADMIN",
-        "--cap-add",
-        "NET_RAW",
-        "--security-opt",
-        "no-new-privileges",
-        "--pids-limit",
-        "16",
-        "--memory",
-        "32m",
-        image,
-        "wicked-netns",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    v.extend(GATEWAY_PORTS.iter().map(|p| format!("{gw_ip}:{p}")));
-    v.insert(0, rt.to_string_lossy().into_owned());
-    v
-}
-
-/// Start seat `seat`'s sidecar and wait for its rules to be in place (fail closed).
-pub(crate) fn start_netns_sidecar(
-    rt: &Runtime,
-    seat: &str,
-    network: &str,
-    gw_ip: &str,
-) -> Result<(), String> {
-    let image = ensure_netns_image(rt)?;
-    let argv = netns_argv(&rt.cli, &image, seat, network, gw_ip);
-    let mut c = rt.cmd();
-    c.args(&argv[1..]);
-    let o = output_within(c, rt.bound(PROBE_TIMEOUT))
-        .ok_or("starting the network sidecar timed out")?;
-    if !o.status.success() {
-        return Err(format!(
-            "the network sidecar did not start: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        ));
-    }
-    let start = Instant::now();
-    while start.elapsed() < PROBE_TIMEOUT {
-        let mut l = rt.cmd();
-        l.args(["logs", &netns_name(seat)]);
-        if output_within(l, rt.bound(PROBE_TIMEOUT))
-            .is_some_and(|o| String::from_utf8_lossy(&o.stdout).contains("wicked-netns-ready"))
-        {
-            return Ok(());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Err("the network sidecar's rules did not come up".into())
 }
 
 /// Mount the unit's read roots (its governance read roots, its skills delivery) read-only when
@@ -4256,11 +3012,10 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         .map(String::as_str)
         .filter(|c| seat_package(c).is_none() && image_override(c).is_none())
         .collect();
-    let usage =
-        "usage: wicked-core seat-image build [<cli>…|all] | seat-image hold [<cli>…|all] | \
+    let usage = "usage: wicked-core seat-image build [<cli>…|all] | \
                  seat-image status [--json] [<cli>…]";
     match args.first().map(String::as_str) {
-        Some("build" | "hold" | "status") if !unknown.is_empty() => {
+        Some("build" | "status") if !unknown.is_empty() => {
             eprintln!(
                 "wicked-core seat-image: no seat image is defined for {}",
                 unknown.join(", ")
@@ -4269,21 +3024,6 @@ pub fn seat_image_main(args: &[String]) -> i32 {
         }
         Some("build") => {
             let mut rc = 0;
-            // What only the operator can rebuild is held before anything builds (a build can push
-            // the disk past the cleanup line): the seat base and their own seat images.
-            if crate::image_keep::supported(&rt) {
-                let mut first: Vec<String> = configured_base().into_iter().collect();
-                first.extend(wanted.iter().filter_map(|c| image_override(c)));
-                let present: Vec<&str> = first
-                    .iter()
-                    .map(String::as_str)
-                    .filter(|r| image_present_or_restored(&rt, r))
-                    .collect();
-                if let Err(e) = crate::image_keep::hold_now(&rt, &present) {
-                    eprintln!("not held against image cleanup: {e}");
-                    rc = 1;
-                }
-            }
             match ensure_floor_image(&rt) {
                 Ok(tag) => println!("floor: {tag}"),
                 Err(e) => {
@@ -4292,7 +3032,7 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                 }
             }
             for cli in &wanted {
-                // The operator's own image is never built: it is held when it is there.
+                // The operator's own image is inspected, never built.
                 if let Some(img) = image_override(cli) {
                     if !image_present(&rt, &img) {
                         eprintln!(
@@ -4308,14 +3048,6 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                 match build_seat_image(&rt, cli) {
                     Ok(tag) => {
                         println!("{cli}: built {tag}");
-                        // Held at once: the next seat's build must not leave this one to the
-                        // image cleanup.
-                        if crate::image_keep::supported(&rt) {
-                            if let Err(e) = crate::image_keep::hold_now(&rt, &[&tag]) {
-                                eprintln!("{cli}: built, but not held against image cleanup: {e}");
-                                rc = 1;
-                            }
-                        }
                     }
                     Err(e) => {
                         eprintln!("{cli}: {e}");
@@ -4323,28 +3055,8 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                     }
                 }
             }
-            // Then every image the seats use that is there now is held (built or not). A runtime
-            // that cannot hold images keeps its builds' exit code: holding is said, not failed.
-            if crate::image_keep::supported(&rt) {
-                if let Err(e) = hold_present(&rt, &wanted) {
-                    eprintln!("not held against image cleanup: {e}");
-                    rc = 1;
-                }
-            } else {
-                println!(
-                    "not held against image cleanup: holders protect images only on the docker CLI (moby); {} is not",
-                    rt.cli.display()
-                );
-            }
             rc
         }
-        Some("hold") => match hold_present(&rt, &wanted) {
-            Ok(()) => 0,
-            Err(e) => {
-                eprintln!("seat-image hold: {e}");
-                1
-            }
-        },
         Some("status") => {
             let st = match image_status(&rt, &wanted) {
                 Ok(st) => st,
@@ -4358,28 +3070,13 @@ pub fn seat_image_main(args: &[String]) -> i32 {
                 return 0;
             }
             println!("runtime: {}", rt.cli.display());
-            let word = |present: bool, held: bool| match (present, held, st.hold_supported) {
-                (true, true, _) => "present, held",
-                (true, false, true) => "present, not held",
-                (true, false, false) => "present (holding not supported on this runtime)",
-                _ => "missing",
-            };
+            let word = |present: bool| if present { "present" } else { "missing" };
             if let Some(b) = &st.base {
-                println!("base: {} {}", b.image, word(b.present, b.held));
+                println!("base: {} {}", b.image, word(b.present));
             }
-            println!(
-                "floor: {} {}",
-                st.floor.image,
-                word(st.floor.present, st.floor.held)
-            );
+            println!("floor: {} {}", st.floor.image, word(st.floor.present));
             for s in &st.seats {
-                println!("{}: {} {}", s.cli, s.image, word(s.present, s.held));
-            }
-            if let Some(d) = &st.disk {
-                println!(
-                    "runtime disk: {}% used ({} of {} bytes free)",
-                    d.used_pct, d.avail_bytes, d.total_bytes
-                );
+                println!("{}: {} {}", s.cli, s.image, word(s.present));
             }
             0
         }
@@ -4388,38 +3085,6 @@ pub fn seat_image_main(args: &[String]) -> i32 {
             2
         }
     }
-}
-
-/// Hold every image the seats of `clis` use that is on the runtime now (their seat images or the
-/// operator's own, the operator base, the floor, netns and checks images), saying each; an image
-/// that is not there is said as missing. `Err` when holding is not supported or failed.
-fn hold_present(rt: &Runtime, clis: &[String]) -> Result<(), String> {
-    if !crate::image_keep::supported(rt) {
-        return Err(format!(
-            "holders protect images only on the docker CLI (moby); {} is not",
-            rt.cli.display()
-        ));
-    }
-    let mut refs: Vec<String> = clis
-        .iter()
-        .filter_map(|cli| image_override(cli).or_else(|| seat_image_tag(cli, &base_image())))
-        .collect();
-    refs.extend(configured_base());
-    refs.push(floor_image_tag());
-    refs.push(netns_image_tag());
-    refs.push(crate::checks_container::image_tag());
-    let (present, missing): (Vec<&str>, Vec<&str>) = refs
-        .iter()
-        .map(String::as_str)
-        .partition(|r| image_present_or_restored(rt, r));
-    for m in &missing {
-        println!("missing (not held): {m}");
-    }
-    crate::image_keep::hold_now(rt, &present)?;
-    for p in &present {
-        println!("held: {p}");
-    }
-    Ok(())
 }
 
 /// [`BASE_IMAGE_ENV`], when the operator set one.
@@ -4436,8 +3101,6 @@ fn configured_base() -> Option<String> {
 pub(crate) struct ImageState {
     pub(crate) image: String,
     pub(crate) present: bool,
-    /// A holder container keeps it ([`crate::image_keep`]).
-    pub(crate) held: bool,
 }
 
 /// One seat CLI's image in [`ImageStatus`].
@@ -4447,23 +3110,11 @@ pub(crate) struct SeatImageState {
     pub(crate) cli: String,
     pub(crate) image: String,
     pub(crate) present: bool,
-    pub(crate) held: bool,
     /// The operator's own image (`WICKED_SEAT_IMAGE_<CLI>`): the engine never builds it.
     pub(crate) operator_image: bool,
 }
 
-/// The runtime VM's disk, read inside a throwaway container (its root is on that disk).
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct RuntimeDisk {
-    pub(crate) total_bytes: u64,
-    pub(crate) avail_bytes: u64,
-    /// `(total - available) / total`, rounded up: the reading a kubelet's image GC compares to its
-    /// threshold.
-    pub(crate) used_pct: u64,
-}
-
-/// `seat-image status --json`: what the seats need, whether it is there and held, and the disk.
+/// `seat-image status --json`: the images seats need and whether they are present.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ImageStatus {
@@ -4473,31 +3124,8 @@ pub(crate) struct ImageStatus {
     /// Whether the operator base has a recipe the engine can rebuild it from: [`BASE_DOCKERFILE_ENV`]
     /// names a readable file (false with no operator base).
     pub(crate) base_recipe: bool,
-    /// Whether this runtime's holders protect its images (the docker CLI; [`crate::image_keep`]).
-    pub(crate) hold_supported: bool,
     pub(crate) floor: ImageState,
     pub(crate) seats: Vec<SeatImageState>,
-    /// `null` when the probe container could not run (no floor image yet, a runtime error).
-    pub(crate) disk: Option<RuntimeDisk>,
-    /// Kubernetes' default `imageGCHighThresholdPercent`: past it a kubelet deletes unheld images.
-    pub(crate) image_gc_high_pct: u64,
-}
-
-/// Parse `df -P -k /` (POSIX, 1024-byte blocks) into a [`RuntimeDisk`].
-pub(crate) fn parse_df(out: &str) -> Option<RuntimeDisk> {
-    let line = out.lines().nth(1)?;
-    let f: Vec<&str> = line.split_whitespace().collect();
-    let total: u64 = f.get(1)?.parse().ok()?;
-    let avail: u64 = f.get(3)?.parse().ok()?;
-    if total == 0 {
-        return None;
-    }
-    let used = total.saturating_sub(avail);
-    Some(RuntimeDisk {
-        total_bytes: total * 1024,
-        avail_bytes: avail * 1024,
-        used_pct: (used * 100).div_ceil(total),
-    })
 }
 
 /// What a status reads from the engine's configuration (the env, unless a test gives it).
@@ -4537,24 +3165,8 @@ fn image_status_with(
     clis: &[String],
     cfg: &StatusConfig,
 ) -> Result<ImageStatus, String> {
-    // The three runtime reads at once (a status answers inside a Nerve Center probe's bound): the
-    // holders, the images, and the VM disk (read in a throwaway floor container).
     let floor_tag = floor_image_tag();
-    let (holders, listing, disk) = std::thread::scope(|sc| {
-        let holders = sc.spawn(|| crate::image_keep::list(rt));
-        let disk = sc.spawn(|| runtime_disk(rt, &floor_tag));
-        let listing = list_images(rt);
-        (
-            holders
-                .join()
-                .unwrap_or_else(|_| Err("listing holders failed".into())),
-            listing,
-            disk.join().ok().flatten(),
-        )
-    });
-    let listed = listing?;
-    // A holder listing that failed is not "nothing is held": the status says it could not tell.
-    let holders = holders?;
+    let listed = list_images(rt)?;
     let base_image = cfg.base.clone().unwrap_or_else(|| DEFAULT_BASE.to_string());
     // `operator`: a reference the operator wrote (an id, a digest, `docker.io/…`), which the
     // listing may spell differently: inspected alone when the listing has no match.
@@ -4579,7 +3191,6 @@ fn image_status_with(
         ImageState {
             image: image.to_string(),
             present: id.is_some(),
-            held: id.is_some_and(|id| crate::image_keep::holds(&holders, image, &id)),
         }
     };
     let floor = state(&floor_tag, false);
@@ -4594,22 +3205,16 @@ fn image_status_with(
                 cli: cli.clone(),
                 image,
                 present: s.present,
-                held: s.held,
                 operator_image: over.is_some(),
             })
         })
         .collect();
-    // A disk reading needs the floor image; one taken while it was missing says nothing.
-    let disk = disk.filter(|_| floor.present);
     Ok(ImageStatus {
         runtime: rt.cli.display().to_string(),
         base_recipe: base.is_some() && cfg.recipe.as_deref().is_some_and(readable_file),
         base,
-        hold_supported: crate::image_keep::supported(rt),
         floor,
         seats,
-        disk,
-        image_gc_high_pct: 85,
     })
 }
 
@@ -4638,30 +3243,6 @@ fn list_images(rt: &Runtime) -> Result<std::collections::HashMap<String, String>
             Some((r.trim().to_string(), valid_image_id(i.trim())?))
         })
         .collect())
-}
-
-/// The runtime VM's disk, read by `df` in a throwaway container of the floor image (its root is on
-/// that disk); `None` when the floor image is not there or the container cannot run.
-fn runtime_disk(rt: &Runtime, floor: &str) -> Option<RuntimeDisk> {
-    let mut c = rt.cmd();
-    c.args([
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--pull",
-        "never",
-        "--entrypoint",
-        "/busybox",
-        floor,
-        "df",
-        "-P",
-        "-k",
-        "/",
-    ]);
-    output_within(c, rt.bound(PROBE_TIMEOUT))
-        .filter(|o| o.status.success())
-        .and_then(|o| parse_df(&String::from_utf8_lossy(&o.stdout)))
 }
 
 /// Native Windows is refused (the floor mounts host paths at the same path, which a Linux
@@ -4921,17 +3502,9 @@ mod tests {
         };
         build_seat_image_on(&rt, "codex", pkg, &base).unwrap();
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
+        // The present base is not rebuilt; the seat image is built on it.
         assert!(!calls.contains("-t seat-base:rust"), "{calls}");
-        // The operator base is held (its holder made) before the seat image builds on it.
-        let held = calls
-            .find("create --name wicked-keep-seat-base-rust-")
-            .expect("the base's holder was made");
-        let built = calls.find("build ").expect("the seat image was built");
-        assert!(held < built, "{calls}");
-        assert!(
-            calls.contains("--label wicked.keep.image=seat-base:rust"),
-            "{calls}"
-        );
+        assert!(calls.contains("build "), "{calls}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -4968,7 +3541,7 @@ mod tests {
     }
 
     #[test]
-    fn status_reads_present_held_and_missing_images_and_the_disk_in_one_pass() {
+    fn status_reads_present_and_missing_images_in_one_listing() {
         let dir = c4_temp();
         let rt = dir.join("docker");
         let claude = seat_image_tag("claude", DEFAULT_BASE).unwrap();
@@ -4980,8 +3553,6 @@ mod tests {
                 "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
                  case \"$1\" in\n\
                  images) printf '{claude}\\t{id}\\n{floor}\\t{id}\\n' ;;\n\
-                 ps) printf 'wicked-keep-x\\t{claude}\\t{id}\\t1\\n' ;;\n\
-                 run) printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\\noverlay 1000 900 100 90%% /\\n' ;;\n\
                  *) exit 1 ;;\n\
                  esac\n",
                 log = dir.join("calls.log").display(),
@@ -4995,11 +3566,9 @@ mod tests {
         };
         let st =
             image_status_with(&rt, &["claude".to_string(), "codex".to_string()], &cfg).unwrap();
-        assert!(st.hold_supported);
-        assert!(st.floor.present && !st.floor.held);
-        assert!(st.seats[0].present && st.seats[0].held, "{:?}", st.seats);
-        assert!(!st.seats[1].present && !st.seats[1].held);
-        assert_eq!(st.disk.as_ref().unwrap().used_pct, 90);
+        assert!(st.floor.present);
+        assert!(st.seats[0].present, "{:?}", st.seats);
+        assert!(!st.seats[1].present);
         let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
         // One listing, no per-image inspect (a missing image costs nothing).
         assert!(!calls.contains("image inspect"), "{calls}");
@@ -5007,7 +3576,7 @@ mod tests {
     }
 
     #[test]
-    fn status_says_it_cannot_tell_when_holders_cannot_be_listed_and_reads_operator_references() {
+    fn status_inspects_operator_references_and_reports_listing_failures() {
         let dir = c4_temp();
         let rt = dir.join("docker");
         let floor = floor_image_tag();
@@ -5018,8 +3587,7 @@ mod tests {
             &format!(
                 "#!/bin/sh\n\
                  case \"$1\" in\n\
-                 images) printf '{floor}\\t{id}\\n' ;;\n\
-                 ps) [ -f '{dir}/ps-fails' ] && {{ echo 'FAKE daemon busy' >&2; exit 1; }}; exit 0 ;;\n\
+                 images) [ ! -f '{dir}/images-fails' ] || {{ echo 'FAKE daemon busy' >&2; exit 1; }}; printf '{floor}\\t{id}\\n' ;;\n\
                  image) echo {id} ;;\n\
                  *) exit 1 ;;\n\
                  esac\n",
@@ -5039,23 +3607,10 @@ mod tests {
         assert!(!st.base_recipe);
         std::fs::write(&recipe, "FROM x\n").unwrap();
         assert!(image_status_with(&rt, &[], &cfg).unwrap().base_recipe);
-        std::fs::write(dir.join("ps-fails"), "").unwrap();
+        std::fs::write(dir.join("images-fails"), "").unwrap();
         let e = image_status_with(&rt, &[], &cfg).unwrap_err();
         assert!(e.contains("FAKE daemon busy"), "{e}");
         std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn the_runtime_disk_reads_as_a_kubelet_reads_it() {
-        let out = "Filesystem 1024-blocks Used Available Capacity Mounted on\n\
-                   overlay 102625208 40367848 56998148 41% /\n";
-        let d = parse_df(out).unwrap();
-        assert_eq!(d.total_bytes, 102625208 * 1024);
-        assert_eq!(d.avail_bytes, 56998148 * 1024);
-        // (total - available) / total, so ext4's reserve counts as used: 45, not df's 41.
-        assert_eq!(d.used_pct, 45);
-        assert!(parse_df("garbage").is_none());
-        assert!(parse_df("h\nx 0 0 0 0% /\n").is_none());
     }
 
     #[test]
@@ -5715,7 +4270,8 @@ mod tests {
         assert!(e.contains("HEALTHCHECK"), "{e}");
     }
 
-    /// LIVE (`WICKED_CONTAINER_LIVE=1`): codex ln-r1's hostile image (`/floor` -> a dir it then
+    /// LIVE (`WICKED_CONTAINER_LIVE=1`; kept by B-6 review: the Kubernetes arm still inspects the
+    /// seat image through the image builder): codex ln-r1's hostile image (`/floor` -> a dir it then
     /// declares as a volume, with its own `launch`) is refused by the engine's inspection, which
     /// runs only the floor's own busybox over the image as data; the engine's seat image passes.
     #[cfg(unix)]
@@ -5874,54 +4430,6 @@ mod tests {
         assert!(floor_image_tag().starts_with("wicked-floor:"));
     }
 
-    #[test]
-    fn the_run_argv_is_hardened_and_ends_with_the_guard() {
-        let mounts = vec![Mount::Bind {
-            path: PathBuf::from("/w/tree"),
-            rw: true,
-        }];
-        let w = run_argv(&ContainerLaunch {
-            runtime: Path::new("/usr/bin/docker"),
-            image: "wicked-seat-claude:abc",
-            name: "wicked-seat-claude-r-1-n",
-            network: "wicked-seat-claude-r-1-n",
-            workdir: Path::new("/w/tree"),
-            user: "502:20",
-            mounts: &mounts,
-            floor: "wicked-floor:t",
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
-        let has = |pair: &[&str]| w.windows(pair.len()).any(|x| x == pair);
-        assert_eq!(w[0], "/usr/bin/docker");
-        assert!(has(&["--user", "502:20"]));
-        assert!(has(&["--cap-drop", "ALL"]));
-        assert!(has(&["--security-opt", "no-new-privileges"]));
-        assert!(has(&["--network", "wicked-seat-claude-r-1-n"]));
-        assert!(has(&["--mount", "type=bind,src=/w/tree,dst=/w/tree"]));
-        assert!(w.contains(&"--read-only".to_string()));
-        assert!(has(&["--tmpfs", "/home/seat:rw,exec,mode=1777,size=512m"]));
-        assert!(!w
-            .iter()
-            .any(|a| a == "--privileged" || a.starts_with("--cap-add")));
-        assert!(has(&["--memory", "3g"]));
-        let img = image_index(&w[1..]).unwrap();
-        assert_eq!(w[img + 1], "wicked-seat-claude:abc");
-        // The trusted launcher: the floor image mounted read-only, its launcher the entrypoint.
-        assert!(has(&[
-            "--mount",
-            "type=image,src=wicked-floor:t,dst=/floor"
-        ]));
-        assert!(has(&["--entrypoint", "/floor/launch"]));
-        assert_eq!(&w[img + 2..img + 5], &[CANARY_FILE, "--", LANDRUN]);
-        assert_eq!(
-            &w[w.len() - 5..],
-            &["--", SEAT_ENTRY, "--check", CANARY_FILE, "--"]
-        );
-        assert_eq!(landrun_end(&w[1..], img), Some(w.len() - 6));
-    }
-
     /// (DES-TEAMING-002 §8.8) A member turn's repository view adds exactly ONE mount: a
     /// read-only bind of the view at its own canonical path (rendered `readonly`, Landlock
     /// read+exec only), leaving every other mount as it was. A read-only bind under the view (an
@@ -5965,35 +4473,10 @@ mod tests {
             ],
             "one read-only bind of the view; the bind under it folded in; nothing else"
         );
-        let argv = run_argv(&ContainerLaunch {
-            runtime: Path::new("docker"),
-            image: "seat",
-            name: "wicked-seat-x",
-            network: "none",
-            workdir: &sandbox,
-            user: "501:20",
-            mounts: &mounts,
-            floor: "floor",
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
+        let policy = landrun_prefix(&mounts, &[], &[]);
         let v = view.display().to_string();
-        let views: Vec<&String> = argv.iter().filter(|a| a.contains(&v)).collect();
-        assert_eq!(
-            views,
-            vec![
-                &format!("type=bind,src={v},dst={v},readonly"),
-                &v, // landrun's path, after `--rox`
-            ],
-            "{argv:?}"
-        );
-        let rox = argv.iter().position(|a| *a == v).unwrap();
-        assert_eq!(
-            argv[rox - 1],
-            "--rox",
-            "Landlock grants it read and exec only"
-        );
+        assert!(policy.windows(2).any(|p| p == ["--rox", &v]));
+        assert!(!policy.windows(2).any(|p| p == ["--rwx", &v]));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -6117,382 +4600,9 @@ mod tests {
     fn container_memory_defaults_and_honours_an_operator_override() {
         assert_eq!(memory_from(None), "3g");
         assert_eq!(memory_from(Some("  ")), "3g");
-        let w = run_argv(&ContainerLaunch {
-            runtime: Path::new("docker"),
-            image: "img",
-            name: "wicked-seat-x",
-            network: "none",
-            workdir: Path::new("/tmp"),
-            user: "1000:1000",
-            mounts: &[],
-            floor: "wicked-floor:t",
-            memory: memory_from(Some(" 6g ")),
-            gateway_ports: &[],
-            own_ports: &[],
-        });
-        assert!(w.windows(2).any(|w| w == ["--memory", "6g"]));
-        assert_eq!(w[image_index(&w[1..]).unwrap() + 1], "img");
-    }
-
-    #[test]
-    fn the_sweep_prunes_only_labelled_seat_leftovers_past_the_age() {
-        let [c, n] = sweep_argv(SWEEP_AGE, NETWORK_SWEEP_AGE);
-        assert_eq!(
-            c,
-            [
-                "container",
-                "prune",
-                "--force",
-                "--filter",
-                "label=wicked.seat=1",
-                "--filter",
-                "until=24h"
-            ]
-        );
-        assert_eq!(n[..2], ["network", "prune"]);
-        assert!(n.contains(&"label=wicked.seat=1".to_string()));
-        // core#1377: an unused seat network goes after an hour, not a day.
-        assert!(n.contains(&"until=1h".to_string()), "{n:?}");
-    }
-
-    /// The seat network is created on a slot of the engine's pool, skipping what the runtime's
-    /// networks hold, and moves to the next slot when the runtime says another engine took it
-    /// (a stand-in runtime; never the host's).
-    #[cfg(unix)]
-    #[test]
-    fn a_seat_network_takes_a_free_pool_slot_and_moves_on_when_one_is_taken() {
-        let dir = tmp("seat-subnet");
-        let log = dir.join("calls.log");
-        let n = dir.join("n");
-        let rt = dir.join("docker");
-        crate::test_env::install_stub(
-            &rt,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
-                 case \"$*\" in\n\
-                 'network ls --format {{{{.Name}}}}') echo bridge; echo other; echo host; echo none ;;\n\
-                 'network inspect bridge other host none') echo '[{{\"Name\":\"bridge\",\"IPAM\":{{\"Config\":[{{\"Subnet\":\"172.17.0.0/16\"}}]}}}},{{\"Name\":\"other\",\"IPAM\":{{\"Config\":[{{\"Subnet\":\"10.213.0.0/18\"}}]}}}}]' ;;\n\
-                 'network create'*) echo x >> '{n}'; if [ $(wc -l < '{n}') -le 1 ]; then \
-                 echo 'Error response from daemon: Pool overlaps with other one on this address space' >&2; exit 1; fi ;;\n\
-                 esac\nexit 0\n",
-                log = log.display(),
-                n = n.display()
-            ),
-        );
-        let plan = crate::seat_subnet::plan_from(None, None).unwrap();
-        let routes = || {
-            Ok(vec![
-                crate::seat_subnet::Cidr::parse("10.213.128.0/17").unwrap()
-            ])
-        };
-        let got = ensure_seat_network_with(
-            &Runtime::answering(rt),
-            "wicked-seat-x-1-abc",
-            plan,
-            &routes,
-            &dir.join("subnet.lock"),
-        )
-        .unwrap();
-        assert_eq!(got, "wicked-seat-x-1-abc");
-        let calls = std::fs::read_to_string(&log).unwrap();
-        let subnets: Vec<crate::seat_subnet::Cidr> = calls
-            .lines()
-            .filter(|l| l.starts_with("network create"))
-            .filter_map(|l| {
-                let w: Vec<&str> = l.split_whitespace().collect();
-                let i = w.iter().position(|a| *a == "--subnet")?;
-                crate::seat_subnet::Cidr::parse(w.get(i + 1)?)
-            })
-            .collect();
-        assert_eq!(subnets.len(), 2, "{calls}");
-        let pool = crate::seat_subnet::Cidr::parse(crate::seat_subnet::DEFAULT_POOL).unwrap();
-        let held = crate::seat_subnet::Cidr::parse("10.213.0.0/18").unwrap();
-        let routed = crate::seat_subnet::Cidr::parse("10.213.128.0/17").unwrap();
-        for s in &subnets {
-            assert_eq!(s.len, crate::seat_subnet::DEFAULT_PREFIX);
-            assert!(
-                pool.overlaps(s) && !held.overlaps(s) && !routed.overlaps(s),
-                "{s} {calls}"
-            );
-        }
-        assert_ne!(subnets[0], subnets[1]);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A pool whose every slot is taken (or routed) is said as exhausted, which the arming reads
-    /// as `address_pools_exhausted`; unreadable host routes refuse the allocation outright.
-    #[cfg(unix)]
-    #[test]
-    fn a_full_seat_pool_is_exhausted_and_unread_routes_refuse() {
-        let dir = tmp("seat-subnet-full");
-        let rt = dir.join("docker");
-        crate::test_env::install_stub(
-            &rt,
-            "#!/bin/sh\ncase \"$*\" in\n'network ls --format {{.Name}}') echo full ;;\n\
-             'network inspect full') echo '[{\"Name\":\"full\",\"IPAM\":{\"Config\":[{\"Subnet\":\"10.213.0.0/24\"}]}}]' ;;\n\
-             'network create'*) echo created ;;\nesac\nexit 0\n",
-        );
-        let rt = Runtime::answering(rt);
-        let lock = dir.join("subnet.lock");
-        let plan = crate::seat_subnet::plan_from(Some("10.213.0.0/24"), Some("26")).unwrap();
-        let none = || Ok(Vec::new());
-        let e = ensure_seat_network_with(&rt, "n", plan, &none, &lock).unwrap_err();
-        assert!(pools_exhausted(&e), "{e}");
-        assert_eq!(
-            network_failure_kind(&e, &mut || false),
-            FloorUnarmed::AddressPoolsExhausted
-        );
-        let plan = crate::seat_subnet::plan_from(Some("10.214.0.0/24"), Some("26")).unwrap();
-        let unread = || Err("the host's routes could not be read".to_string());
-        let e = ensure_seat_network_with(&rt, "n", plan, &unread, &lock).unwrap_err();
-        assert!(
-            e.contains("routes could not be read") && !pools_exhausted(&e),
-            "{e}"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// The seat subnet lock file is made shareable by every user's engine whatever the umask,
-    /// and an existing one (or a link planted at the path) is left as it is.
-    #[cfg(unix)]
-    #[test]
-    fn the_subnet_lock_file_is_shared_and_never_followed() {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tmp("subnet-lock");
-        let lock = dir.join("subnet.lock");
-        shared_lock_file(&lock);
-        let mode = std::fs::metadata(&lock).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o666);
-        let target = dir.join("target");
-        std::fs::write(&target, "").unwrap();
-        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let link = dir.join("link.lock");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-        shared_lock_file(&link);
-        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn the_sweep_runs_at_the_first_arming_and_then_at_most_hourly() {
-        let t0 = Instant::now();
-        let mut last = None;
-        assert!(sweep_due(&mut last, t0, SWEEP_EVERY));
-        assert!(!sweep_due(
-            &mut last,
-            t0 + Duration::from_secs(59 * 60),
-            SWEEP_EVERY
-        ));
-        assert!(sweep_due(&mut last, t0 + SWEEP_EVERY, SWEEP_EVERY));
-        assert!(!sweep_due(&mut last, t0 + SWEEP_EVERY, SWEEP_EVERY));
-    }
-
-    #[test]
-    fn a_pool_exhaustion_is_its_own_kind_and_never_reads_as_runtime_down() {
-        let mut asked = 0;
-        let docker = "could not create the seat network `wicked-seat-x`: Error response from \
-                      daemon: all predefined address pools have been fully subnetted";
-        let mut down = || {
-            asked += 1;
-            true
-        };
-        assert_eq!(
-            network_failure_kind(docker, &mut down),
-            FloorUnarmed::AddressPoolsExhausted
-        );
-        assert_eq!(
-            network_failure_kind(
-                "Error: could not find free subnet from subnet pools",
-                &mut down
-            ),
-            FloorUnarmed::AddressPoolsExhausted
-        );
-        // The pools named: no liveness probe was needed (or could overrule it).
-        assert_eq!(asked, 0);
-        // An error that says the CLI could not reach the engine is the runtime's outage, even
-        // when the engine answers by the time it is probed (it rides the runtime wait).
-        assert_eq!(
-            network_failure_kind(
-                "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the \
-                 docker daemon running?",
-                &mut || false
-            ),
-            FloorUnarmed::ContainerRuntimeDown
-        );
-        // Any other network error: down only when a fresh probe says so.
-        assert_eq!(
-            network_failure_kind("creating the seat network `n` timed out", &mut || true),
-            FloorUnarmed::ContainerRuntimeDown
-        );
-        assert_eq!(
-            network_failure_kind(
-                "could not create the seat network `n`: plugin not found",
-                &mut || false
-            ),
-            FloorUnarmed::SeatNetworkUnavailable
-        );
-        // The refusal names the cause and the remedy, not `<runtime> version`.
-        let d = FloorUnarmed::AddressPoolsExhausted.describe();
-        assert!(d.starts_with("address_pools_exhausted:"), "{d}");
-        assert!(
-            d.contains("docker network rm") && !d.contains("version"),
-            "{d}"
-        );
-        assert_eq!(
-            FloorUnarmed::SeatNetworkUnavailable.as_str(),
-            "seat_network_unavailable"
-        );
-    }
-
-    #[test]
-    fn only_a_gateway_bridge_name_names_a_gateway() {
-        assert_eq!(
-            gateway_of_bridge("wicked-agw-03e179d59030-ext"),
-            Some("wicked-agw-03e179d59030")
-        );
-        for other in [
-            "wicked-agw-03e179d59030",
-            "wicked-agw-03E179D59030-ext",
-            "wicked-agw-03e179d5903-ext",
-            "wicked-agw-03e179d59030x-ext",
-            "wicked-onboarding-dependencies_default",
-            "docling-serve-net",
-            "temporal",
-            "bridge",
-        ] {
-            assert_eq!(gateway_of_bridge(other), None, "{other}");
-        }
-    }
-
-    /// core#1377: the gateway-bridge sweep against a stand-in runtime (never the host's). Of the
-    /// dangling labelled networks it lists, only the old, empty bridge whose labelled gateway
-    /// directory is gone and whose gateway container the runtime says does not exist is removed,
-    /// by its full ID. Every other one stays: a young bridge, a stopped gateway's, one with a
-    /// member, one whose inspection fails, one with no directory label, one whose directory still
-    /// exists (a live daemon's), one labelled with a directory another name hashes from, one
-    /// replaced under the same name, one whose container inspection is a transport error, and a
-    /// name that is not a gateway bridge.
-    #[cfg(unix)]
-    #[test]
-    fn the_gateway_bridge_sweep_removes_only_a_gone_daemons_old_empty_bridge() {
-        let dir = tmp("gw-sweep");
-        let log = dir.join("calls.log");
-        let rt = dir.join("docker");
-        let now: u64 = 1_800_000_000;
-        let (old, young) = (now - 2 * 3600, now - 60);
-        let gone = |t: &str| dir.join(format!("gone-{t}"));
-        let live = dir.join("live-home");
-        std::fs::create_dir_all(&live).unwrap();
-        let name = |p: &Path| crate::seat_gateway::gateway_name(p);
-        let d = |p: &Path| p.display().to_string();
-        // (id, gateway name, inspect answer, container inspect answer)
-        let ok_container = "echo 'Error response from daemon: No such container' >&2; exit 1";
-        let rows: Vec<(String, String, String, String)> = vec![
-            ("dead", gone("dead"), 0, old, "1", None),
-            ("young", gone("young"), 0, young, "1", None),
-            ("stopped", gone("stopped"), 0, old, "1", Some("echo /x")),
-            ("member", gone("member"), 1, old, "1", None),
-            ("unlabelled", gone("unlabelled"), 0, old, "<no value>", None),
-            ("live", live.clone(), 0, old, "1", None),
-            (
-                "unreachable",
-                gone("unreachable"),
-                0,
-                old,
-                "1",
-                Some("echo 'dial unix /var/run/docker.sock: connect: no such file or directory' >&2; exit 1"),
-            ),
-        ]
-        .into_iter()
-        .map(|(id, home, members, created, label, container)| {
-            let gw = name(&home);
-            let dir_label = if id == "unlabelled" { "<no value>".to_string() } else { d(&home) };
-            (
-                format!("id-{id}"),
-                gw.clone(),
-                format!("echo '{members} {created} {label} {gw}-ext id-{id} {dir_label}'"),
-                container.unwrap_or(ok_container).to_string(),
-            )
-        })
-        .collect();
-        let mismatch = name(&gone("mismatch"));
-        let replaced = name(&gone("replaced"));
-        let unreadable = name(&gone("unreadable"));
-        let mut listed: Vec<String> = rows
-            .iter()
-            .map(|r| format!("{} {}-ext", r.0, r.1))
-            .collect();
-        listed.push(format!("id-mismatch {mismatch}-ext"));
-        listed.push(format!("id-replaced {replaced}-ext"));
-        listed.push(format!("id-unreadable {unreadable}-ext"));
-        listed.push("id-foreign wicked-onboarding-dependencies_default".into());
-        let mut cases = String::new();
-        for (id, gw, inspect, container) in &rows {
-            cases.push_str(&format!("*'network inspect'*' {id}') {inspect} ;;\n"));
-            cases.push_str(&format!("*'container inspect'*' {gw}') {container} ;;\n"));
-        }
-        cases.push_str(&format!(
-            "*'network inspect'*' id-mismatch') echo '0 {old} 1 {mismatch}-ext id-mismatch {}' ;;\n",
-            d(&gone("other-home"))
-        ));
-        cases.push_str(&format!(
-            "*'network inspect'*' id-replaced') echo '0 {old} 1 someone-else id-replaced {}' ;;\n",
-            d(&gone("replaced"))
-        ));
-        cases.push_str("*'network inspect'*' id-unreadable') echo boom >&2; exit 1 ;;\n");
-        cases.push_str(&format!("*'container inspect'*) {ok_container} ;;\n"));
-        crate::test_env::install_stub(
-            &rt,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{log}'\n\
-                 case \"$*\" in\n\
-                 'network ls --filter label=wicked.gateway=1 --filter dangling=true --no-trunc --format {{{{.ID}}}} {{{{.Name}}}}') \
-                 printf '%s\\n' {listed} ;;\n\
-                 {cases}\
-                 'network rm '*) ;;\n\
-                 *) echo \"unexpected: $*\" >&2; exit 1 ;;\n\
-                 esac\nexit 0\n",
-                log = log.display(),
-                listed = listed
-                    .iter()
-                    .map(|l| format!("'{l}'"))
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            ),
-        );
-        let removed = sweep_gateway_bridges(&Runtime::answering(rt), NETWORK_SWEEP_AGE, now);
-        assert_eq!(removed, vec![format!("{}-ext", name(&gone("dead")))]);
-        let calls = std::fs::read_to_string(&log).unwrap();
-        let rms: Vec<&str> = calls.lines().filter(|l| l.contains(" rm")).collect();
-        assert_eq!(rms, ["network rm id-dead"], "{calls}");
-        // The foreign network was never even inspected, and nothing was pruned or forced.
-        assert!(!calls.contains("id-foreign"), "{calls}");
-        assert!(
-            !calls.contains("prune") && !calls.contains("--force"),
-            "{calls}"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    /// A runtime that cannot list its networks: nothing is inspected or removed.
-    #[cfg(unix)]
-    #[test]
-    fn a_gateway_bridge_sweep_that_cannot_list_removes_nothing() {
-        let dir = tmp("gw-sweep-down");
-        let log = dir.join("calls.log");
-        let rt = dir.join("docker");
-        crate::test_env::install_stub(
-            &rt,
-            &format!(
-                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\necho 'Cannot connect' >&2; exit 1\n",
-                log.display()
-            ),
-        );
-        assert!(sweep_gateway_bridges(&Runtime::answering(rt), NETWORK_SWEEP_AGE, 1).is_empty());
-        let calls = std::fs::read_to_string(&log).unwrap();
-        assert_eq!(calls.lines().count(), 1, "{calls}");
-        std::fs::remove_dir_all(dir).unwrap();
+        assert_eq!(memory_from(Some(" 6g ")), "6g");
+        assert_eq!(k8s_memory(memory_from(None)), "3Gi");
+        assert_eq!(k8s_memory(memory_from(Some(" 6g "))), "6Gi");
     }
 
     #[test]
@@ -6575,155 +4685,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn finalize_passes_env_by_name_and_adds_no_mount() {
-        let base = tmp("fin");
-        let tree = base.join("wt");
-        let skills = base.join("skills");
-        let settings = base.join("gov").join("settings.json");
-        std::fs::create_dir_all(&tree).unwrap();
-        std::fs::create_dir_all(&skills).unwrap();
-        std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
-        std::fs::write(&settings, "{}").unwrap();
-        let mounts = vec![Mount::Bind {
-            path: tree.clone(),
-            rw: true,
-        }];
-        let w = run_argv(&ContainerLaunch {
-            runtime: Path::new("docker"),
-            image: "img:1",
-            name: "wicked-seat-x",
-            network: "none",
-            workdir: &tree,
-            user: "1:1",
-            mounts: &mounts,
-            floor: "wicked-floor:t",
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
-        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]);
-        cmd.args([
-            "claude",
-            "-p",
-            "/etc/passwd",
-            "--settings",
-            settings.to_str().unwrap(),
-        ]);
-        cmd.env("SECRET_TOKEN", "value-never-on-argv");
-        cmd.env(crate::mcp_gate::TOKEN_ENV, "unit-token-never-on-argv");
-        cmd.env("MCP_TOOL_TIMEOUT", "660000");
-        cmd.env("PATH", "/host/bin");
-        cmd.env("HOME", "/host/home");
-        cmd.env("TMPDIR", "/host/tmp");
-        cmd.env("LANG", "en_US.UTF-8");
-        cmd.env_remove("REMOVED_TOKEN");
-        cmd.env(crate::gate_hook::READ_ROOTS_ENV, &skills);
-        cmd.env(
-            crate::gate_hook::WRITE_ROOTS_ENV,
-            tree.join("sub").as_os_str(),
-        );
-        let fin = finalize(cmd);
-        let args: Vec<String> = fin
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let has = |pair: &[&str]| args.windows(2).any(|x| x == pair);
-        assert!(has(&["--env", "SECRET_TOKEN"]));
-        assert!(!args.iter().any(|a| a.contains("value-never-on-argv")));
-        assert!(!args.iter().any(|a| a.contains("unit-token-never-on-argv")));
-        assert!(!args
-            .iter()
-            .any(|a| a == "/host/home" || a == "/host/tmp" || a == "en_US.UTF-8"));
-        assert!(!has(&["--env", "REMOVED_TOKEN"]));
-        let img = image_index(&args).unwrap();
-        let land_end = landrun_end(&args, img).unwrap();
-        let has_in = |part: &[String], pair: &[&str]| part.windows(2).any(|w| w == pair);
-        for key in [
-            "SECRET_TOKEN",
-            crate::mcp_gate::TOKEN_ENV,
-            "MCP_TOOL_TIMEOUT",
-            crate::gate_hook::READ_ROOTS_ENV,
-            crate::gate_hook::WRITE_ROOTS_ENV,
-        ] {
-            assert!(
-                has_in(&args[..img], &["--env", key]),
-                "runtime receives {key}"
-            );
-            assert!(
-                has_in(&args[img + 3..land_end], &["--env", key]),
-                "landrun receives {key}"
-            );
-        }
-        assert!(
-            !has_in(&args[..img], &["--env", "PATH"]),
-            "the PATH is never passed by name (its host value)"
-        );
-        assert!(
-            args[..img]
-                .iter()
-                .any(|a| a == &format!("PATH={IMAGE_PATH}")),
-            "the seat's PATH = mounted carrier entries + the image's: {args:?}"
-        );
-        assert!(
-            has_in(&args[img + 3..land_end], &["--env", "PATH"]),
-            "landrun forwards the IMAGE path"
-        );
-        for key in ["HOME", "TMPDIR", "LANG"] {
-            assert_eq!(
-                args[img + 3..land_end]
-                    .windows(2)
-                    .filter(|w| *w == ["--env", key])
-                    .count(),
-                1
-            );
-        }
-        assert!(has_in(&args[..img], &["--env", "LANG"]));
-        assert!(!has_in(&args[..img], &["--env", "HOME"]));
-        assert!(!has_in(&args[..img], &["--env", "TMPDIR"]));
-        assert_eq!(
-            &args[land_end + 5..],
-            &[
-                "claude",
-                "-p",
-                "/etc/passwd",
-                "--settings",
-                settings.to_str().unwrap()
-            ]
-        );
-        let ro = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
-        // Read roots and argv path options are mounted at arm time ([`add_read_roots`],
-        // [`mount_argv_paths`]), never here (#1042: past the claude seat's narrowed fence).
-        assert!(!has(&["--mount", &ro(&skills)]), "{args:?}");
-        assert!(!has(&["--mount", &ro(&settings)]), "{args:?}");
-        // A prompt word that happens to be a path is not a mount.
-        assert!(!args.iter().any(|a| a.contains("dst=/etc/passwd")));
-        assert!(!has_in(
-            &args[img + 3..land_end],
-            &["--rox", skills.to_str().unwrap()]
-        ));
-        assert_eq!(
-            args.iter().filter(|a| *a == "--mount").count(),
-            2,
-            "the tree and the floor image only: {args:?}"
-        );
-        assert_eq!(
-            seat_container(&fin),
-            Some(SeatContainer {
-                runtime: PathBuf::from("docker"),
-                name: "wicked-seat-x".into()
-            })
-        );
-        // Not one of ours: unchanged.
-        // spawn-audit: test-only — never spawned; checks a non-seat command is left unchanged.
-        let mut plain = Command::new("claude");
-        plain.args(["run", "--name", "x"]);
-        assert!(seat_container(&plain).is_none());
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     #[cfg(unix)]
     #[test]
     fn the_runtime_cli_runs_with_its_own_dir_first_on_path() {
@@ -6736,183 +4697,14 @@ mod tests {
         assert!(client_path(Path::new("docker"), None).is_none());
     }
 
-    #[test]
-    fn a_container_that_never_started_is_named_as_such() {
-        let e = explain_start_failure(
-            "wicked-seat-x",
-            125,
-            "docker: Error response from daemon: invalid mount config for type \"bind\": bind \
-             source path does not exist: /opt/x"
-                .into(),
-        );
-        assert!(
-            e.starts_with("wicked-core: seat container wicked-seat-x did not start"),
-            "{e}"
-        );
-        assert!(e.contains("not visible to the container runtime"), "{e}");
-        assert!(
-            e.ends_with("/opt/x"),
-            "the runtime's own words are kept: {e}"
-        );
-        assert_eq!(
-            explain_start_failure("x", 1, "cli error".into()),
-            "cli error"
-        );
-    }
-
-    /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise): a seat
-    /// container rendered from a seat floor, run for real. Inside it: the operator's uid, no
-    /// capabilities, no-new-privileges, a read-only root, the tree writable (the write lands on
-    /// the host owned by the operator), the clone read-only, a masked secret empty, a sibling of
-    /// the tree absent, and no network route out. The reap removes the container and its network.
-    #[cfg(unix)]
-    #[test]
-    fn live_a_seat_container_is_the_floor() {
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        let rt = runtime().expect("a container runtime answers");
-        let floor = ensure_floor_image(&rt).expect("the floor image");
-        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        let base = tmp("live");
-        let clone = base.join("clone");
-        let tree = base.join("wt");
-        let sibling = base.join("wt-other");
-        let home = base.join("home");
-        let ssh = home.join(".ssh");
-        for d in [&clone, &tree, &sibling, &home, &ssh] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(clone.join("README"), "clone").unwrap();
-        std::fs::write(sibling.join("other"), "sibling").unwrap();
-        std::fs::write(ssh.join("id_ed25519"), "FAKE-SECRET-CANARY").unwrap();
-        // A mask outside every mount: rendered anyway (a late read path could be its ancestor).
-        let outside_mask = base.join("elsewhere").join(".aws");
-        std::fs::create_dir_all(&outside_mask).unwrap();
-        let token = home.join(".token");
-        std::fs::write(&token, "FAKE-TOKEN-CANARY").unwrap();
-        let spec = SeatFloor {
-            profile: "governed".into(),
-            tree: tree.clone(),
-            writable: vec![tree.clone(), home.clone()],
-            protected: vec![clone.clone()],
-            readmitted: vec![],
-            readmitted_files: vec![],
-            masks: vec![ssh.clone(), token.clone(), outside_mask.clone()],
-            pinned: vec![],
-            net: vec![],
-        };
-        let mounts = mount_plan(&spec).unwrap();
-        let name = container_name("claude", "live", 1);
-        let network = ensure_seat_network(&rt, &name).expect("the seat network");
-        let user = operator_user();
-        let mut w = run_argv(&ContainerLaunch {
-            runtime: &rt.cli,
-            image: &image,
-            name: &name,
-            network: &network,
-            workdir: &tree,
-            user: &user,
-            mounts: &mounts,
-            floor: &floor,
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
-        let script = format!(
-            "id -u; id -g; grep -E '^(CapEff|NoNewPrivs)' /proc/self/status; \
-             echo in-tree > {t}/wrote && echo TREE_OK; \
-             (echo x > {c}/x) 2>/dev/null && echo CLONE_WRITABLE || echo CLONE_RO; \
-             (echo x > /usr/x) 2>/dev/null && echo ROOT_WRITABLE || echo ROOT_RO; \
-             echo SECRET=[$(cat {k}/id_ed25519 2>/dev/null)] TOKEN=[$(cat {tok} 2>/dev/null)]; \
-             test -e {s}/other && echo SIBLING_VISIBLE || echo SIBLING_ABSENT; \
-             (curl -sS --max-time 4 -o /dev/null https://example.com 2>/dev/null) && echo NET_OUT || echo NET_BLOCKED; \
-             echo hello > /tmp/scratch && echo TMP_OK; \
-             (echo x > /wicked-canary/outside) 2>/dev/null && echo LANDLOCK_ESCAPED || echo LANDLOCK_DENIED",
-            t = tree.display(),
-            c = clone.display(),
-            k = ssh.display(),
-            tok = token.display(),
-            s = sibling.display(),
-        );
-        w.extend(["sh".into(), "-c".into(), script]);
-        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]);
-        let out = output_within(cmd, Duration::from_secs(60)).expect("the seat ran");
-        reap(&SeatContainer {
-            runtime: rt.cli.clone(),
-            name: name.clone(),
-        });
-        let so = String::from_utf8_lossy(&out.stdout).to_string();
-        let se = String::from_utf8_lossy(&out.stderr).to_string();
-        eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
-        assert!(out.status.success(), "{so}\n{se}");
-        assert!(
-            se.contains("wicked-seat-launch: floor canary passed"),
-            "{se}"
-        );
-        let (uid, gid) = user.split_once(':').unwrap();
-        let lines: Vec<&str> = so.lines().collect();
-        assert_eq!(lines.first().copied(), Some(uid), "{so}");
-        assert_eq!(lines.get(1).copied(), Some(gid), "{so}");
-        assert!(so.contains("CapEff:\t0000000000000000"), "{so}");
-        assert!(so.contains("NoNewPrivs:\t1"), "{so}");
-        for want in [
-            "TREE_OK",
-            "CLONE_RO",
-            "ROOT_RO",
-            "SECRET=[] TOKEN=[]",
-            "SIBLING_ABSENT",
-            "NET_BLOCKED",
-            "TMP_OK",
-            "LANDLOCK_DENIED",
-        ] {
-            assert!(so.contains(want), "{want} missing:\n{so}");
-        }
-        assert_eq!(
-            std::fs::read_to_string(tree.join("wrote")).unwrap().trim(),
-            "in-tree"
-        );
-        {
-            use std::os::unix::fs::MetadataExt;
-            let md = std::fs::metadata(tree.join("wrote")).unwrap();
-            assert_eq!(
-                md.uid().to_string(),
-                uid,
-                "the write lands owned by the operator"
-            );
-        }
-        assert!(!clone.join("x").exists());
-        // The reap removed the container and its network.
-        let mut ps = rt.cmd();
-        ps.args(["container", "inspect", &name]);
-        assert!(!output_within(ps, PROBE_TIMEOUT).unwrap().status.success());
-        let mut ni = rt.cmd();
-        ni.args(["network", "inspect", &name]);
-        assert!(!output_within(ni, PROBE_TIMEOUT).unwrap().status.success());
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
     /// The seat's floor plan for a Rust-capable seat (claude here; every CLI gets the same cache
-    /// table) under a worker home at `worker`, with `tree` its writable tree: the plan, its
-    /// resolved floor's mounts, and the wrapper [`finalize`] completes from the plan's env plus
-    /// `extra_env`, running `script`. The caller holds the env lock.
-    #[allow(clippy::too_many_arguments)]
+    /// table) under a worker home at `worker`, with `tree` its writable tree. Returns the plan
+    /// and its resolved mounts. The caller holds the environment lock.
     fn cargo_seat(
         worker: &Path,
         tree: &Path,
         read_roots: &[PathBuf],
-        runtime: &Path,
-        image: &str,
-        name: &str,
-        network: &str,
-        floor: &str,
-        memory: &str,
-        extra_env: &[(String, String)],
-        script: &str,
-    ) -> (crate::worker_sandbox::SeatFloorPlan, Vec<Mount>, Command) {
+    ) -> (crate::worker_sandbox::SeatFloorPlan, Vec<Mount>) {
         use wicked_apps_core::spawn::{SeatCli, SeatConfig, WORKER_HOME_ENV};
         let prior = std::env::var_os(WORKER_HOME_ENV);
         std::env::set_var(WORKER_HOME_ENV, worker);
@@ -6941,41 +4733,12 @@ mod tests {
         let spec = crate::worker_sandbox::resolve_seat_floor(&plan.inputs).unwrap();
         let mut mounts = mount_plan(&spec).unwrap();
         add_read_roots(&mut mounts, read_roots);
-        let w = run_argv(&ContainerLaunch {
-            runtime,
-            image,
-            name,
-            network,
-            workdir: tree,
-            user: &operator_user(),
-            mounts: &mounts,
-            floor,
-            memory,
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
-        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]);
-        cmd.args(["sh", "-c", script]);
-        for (k, v) in &plan.env {
-            cmd.env(k, v);
-        }
-        for (k, v) in &plan.build_env {
-            cmd.env(k, v);
-        }
-        for (k, v) in extra_env {
-            cmd.env(k, v);
-        }
-        (plan, mounts, finalize(cmd))
+        (plan, mounts)
     }
 
     /// A Rust-capable seat's cargo cache is the floor's persistent per-seat cache dir on the host,
     /// never the 512 MB tmpfs HOME: the plan points `CARGO_HOME` at `<worker home>/cache/<cli>/cargo`,
-    /// the mount plan binds that cache dir read-write at its host path, and the finalized wrapper
-    /// passes `CARGO_HOME` by name to the runtime AND to landrun, which admits the bind read-write
-    /// (landrun keeps only the variables it is told to: a value the runtime alone got would be
-    /// dropped and cargo would fall back to `$HOME/.cargo`). The value is never on the argv.
+    /// and the mount plan and Landlock policy admit that cache read-write.
     #[test]
     fn a_rust_capable_seats_cargo_cache_is_a_persistent_bind_outside_the_tmpfs_home() {
         let _env = crate::test_env::ENV_LOCK
@@ -6985,19 +4748,7 @@ mod tests {
         let tree = base.join("wt");
         let worker = base.join("worker");
         std::fs::create_dir_all(&tree).unwrap();
-        let (plan, mounts, cmd) = cargo_seat(
-            &worker,
-            &tree,
-            &[],
-            Path::new("docker"),
-            "img:1",
-            "wicked-seat-cargo",
-            "none",
-            "wicked-floor:t",
-            "3g",
-            &[],
-            "cargo fetch",
-        );
+        let (plan, mounts) = cargo_seat(&worker, &tree, &[]);
         let cache = worker.join("cache").join("claude");
         let cargo_home = cache.join("cargo");
         // The table's cargo row is the plan's CARGO_HOME.
@@ -7024,35 +4775,10 @@ mod tests {
             "{mounts:?}"
         );
         assert!(!cargo_home.starts_with("/home/seat"));
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let img = image_index(&args).unwrap();
-        let land = landrun_end(&args, img).unwrap();
-        let has = |range: &[String], pair: &[&str]| range.windows(2).any(|x| x == pair);
-        assert!(has(&args[..img], &["--env", "CARGO_HOME"]), "{args:?}");
-        assert!(has(&args[img..land], &["--env", "CARGO_HOME"]), "{args:?}");
-        let cache_s = cache.to_string_lossy().into_owned();
-        assert!(has(&args[img..land], &["--rwx", &cache_s]), "{args:?}");
-        assert!(args
-            .iter()
-            .any(|a| a == &format!("type=bind,src={cache_s},dst={cache_s}")));
-        assert!(!args
-            .iter()
-            .any(|a| a.contains(&cargo_home.to_string_lossy().into_owned())));
-        // The HOME tmpfs is unchanged: the cache is not made to fit by growing it.
-        assert!(has(
-            &args[..img],
-            &["--tmpfs", "/home/seat:rw,exec,mode=1777,size=512m"]
-        ));
-        assert_eq!(
-            cmd.get_envs()
-                .find(|(k, _)| *k == "CARGO_HOME")
-                .and_then(|(_, v)| v)
-                .map(PathBuf::from),
-            Some(cargo_home)
-        );
+        let policy = landrun_prefix(&mounts, &[], &[]);
+        assert!(policy
+            .windows(2)
+            .any(|p| p == ["--rwx", &cache.to_string_lossy()]));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -7087,10 +4813,8 @@ mod tests {
 
     /// A container seat's cargo runs with the seat build settings ([`SEAT_TOOLCHAIN_BUILD_ENV`],
     /// core#997's end-to-end run): one job per CPU up to two, no debuginfo for the dev and test
-    /// profiles, no incremental state. The plan carries them, the finalized wrapper passes each by
-    /// NAME to the runtime and to landrun (a value only the runtime got would be dropped by
-    /// landrun), and no value is on the argv. A variable the operator set in the daemon's
-    /// environment is passed with the operator's value instead; a blank one is not a choice.
+    /// profiles, no incremental state. The plan carries the settings. An operator's explicit
+    /// value wins; a blank value is not a choice.
     ///
     /// [`SEAT_TOOLCHAIN_BUILD_ENV`]: crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV
     #[test]
@@ -7139,19 +4863,7 @@ mod tests {
         let tree = base.join("wt");
         let worker = base.join("worker");
         std::fs::create_dir_all(&tree).unwrap();
-        let (plan, _, cmd) = cargo_seat(
-            &worker,
-            &tree,
-            &[],
-            Path::new("docker"),
-            "img:1",
-            "wicked-seat-cargo-env",
-            "none",
-            "wicked-floor:t",
-            "3g",
-            &[],
-            "cargo test",
-        );
+        let (plan, _) = cargo_seat(&worker, &tree, &[]);
         let jobs = seat_build_jobs(seat_cpus()).to_string();
         assert_eq!(
             get(&plan.build_env, "CARGO_PROFILE_DEV_DEBUG").as_deref(),
@@ -7160,521 +4872,11 @@ mod tests {
             plan.build_env
         );
         assert_eq!(get(&plan.build_env, "CARGO_BUILD_JOBS"), Some(jobs.clone()));
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let img = image_index(&args).unwrap();
-        let land = landrun_end(&args, img).unwrap();
-        let has = |range: &[String], pair: &[&str]| range.windows(2).any(|x| x == pair);
-        let set = |k: &str| {
-            cmd.get_envs()
-                .find(|(n, _)| *n == k)
-                .and_then(|(_, v)| v)
-                .map(|v| v.to_string_lossy().into_owned())
-        };
-        for (_, var, _) in SEAT_TOOLCHAIN_BUILD_ENV {
-            assert!(
-                has(&args[..img], &["--env", var]),
-                "{var} to the runtime: {args:?}"
-            );
-            assert!(
-                has(&args[img..land], &["--env", var]),
-                "{var} to landrun: {args:?}"
-            );
-            assert_eq!(
-                set(var),
-                get(&plan.build_env, var),
-                "{var} on the client's env"
-            );
-        }
-        assert!(
-            !args
-                .iter()
-                .any(|a| a.starts_with("CARGO_") && a.contains('=')),
-            "no build value on the argv: {args:?}"
-        );
-        assert_eq!(set("CARGO_INCREMENTAL").as_deref(), Some("0"));
-        let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// LIVE (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base;
-    /// skipped otherwise): `cargo fetch --locked` of THIS repository's lockfile in a seat container
-    /// rendered by the engine's own path (seat floor plan, mount plan, wrapper, finalize) with the
-    /// 512 MB tmpfs HOME, through the gateway's egress allowlist. The fetch (~684 MB) succeeds and
-    /// lands in the host cache dir, `HOME` stays near empty, and a second seat fetches the same
-    /// lockfile offline from the cache the first one left.
-    #[cfg(unix)]
-    #[test]
-    fn live_a_seat_fetches_this_repos_lockfile_into_its_persistent_cargo_cache() {
-        let _env = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        let rt = runtime().expect("a container runtime answers");
-        let floor = ensure_floor_image(&rt).expect("the floor image");
-        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        let base = tmp("cargo-live");
-        let tree = base.join("wt");
-        let worker = base.join("worker");
-        let gw_dir = base.join("gateway");
-        std::fs::create_dir_all(&tree).unwrap();
-        std::fs::create_dir_all(&gw_dir).unwrap();
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
-        let run = |argv: &[&str], limit: u64| {
-            let mut c = rt.cmd();
-            c.args(argv);
-            output_within(c, Duration::from_secs(limit)).unwrap()
-        };
-        let prior = std::env::var(crate::seat_gateway::EGRESS_HOSTS_ENV).ok();
-        std::env::set_var(
-            crate::seat_gateway::EGRESS_HOSTS_ENV,
-            "index.crates.io,static.crates.io",
-        );
-        let gw = crate::seat_gateway::ensure_gateway(&rt, &gw_dir);
-        match &prior {
-            Some(v) => std::env::set_var(crate::seat_gateway::EGRESS_HOSTS_ENV, v),
-            None => std::env::remove_var(crate::seat_gateway::EGRESS_HOSTS_ENV),
-        }
-        let gw = gw.expect("the gateway starts");
-        let key = crate::seat_gateway::UnitKey::new("cargo-live", "1", "claude");
-        let env: Vec<(String, String)> = crate::seat_gateway::seat_env_all(&key.key)
-            .into_iter()
-            .chain([("CARGO_NET_RETRY".to_string(), "3".to_string())])
-            .collect();
-        // Shell-quoted: a checkout path may hold spaces or quotes.
-        let repo_q = format!("'{}'", repo.display().to_string().replace('\'', "'\\''"));
-        let script = |offline: bool| {
-            format!(
-                "echo CARGO_HOME=$CARGO_HOME; cargo --version; cd {r} && \
-                 cargo fetch --locked {o} >/tmp/fetch.log 2>&1 && echo FETCH_OK || \
-                 {{ echo FETCH_FAILED; tail -20 /tmp/fetch.log; }}; \
-                 echo HOME_KB=$(du -sk /home/seat | cut -f1); \
-                 echo CACHE_KB=$(du -sk \"$CARGO_HOME\" | cut -f1)",
-                r = repo_q,
-                o = if offline { "--offline" } else { "" },
-            )
-        };
-        let mut outs: Vec<String> = Vec::new();
-        let mut ok = true;
-        for (i, offline) in [false, true].into_iter().enumerate() {
-            let name = container_name("claude", "cargolive", i as u32);
-            let network = ensure_seat_network(&rt, &name).expect("the seat network");
-            crate::seat_gateway::attach(&rt, &gw, &network).unwrap();
-            let ip = gateway_ip(&rt, &gw.name, &network).unwrap();
-            start_netns_sidecar(&rt, &name, &network, &ip).expect("sidecar up");
-            if i == 0 {
-                crate::seat_gateway::register_live(&rt, &gw, &gw_dir, key.clone())
-                    .expect("the unit key is served");
-            }
-            let (_, _, cmd) = cargo_seat(
-                &worker,
-                &tree,
-                std::slice::from_ref(&repo),
-                &rt.cli,
-                &image,
-                &name,
-                &format!("container:{}", netns_name(&name)),
-                &floor,
-                "3g",
-                &env,
-                &script(offline),
-            );
-            let out = output_within(cmd, Duration::from_secs(900));
-            reap(&SeatContainer {
-                runtime: rt.cli.clone(),
-                name: name.clone(),
-            });
-            let (so, se) = out
-                .map(|o| {
-                    (
-                        String::from_utf8_lossy(&o.stdout).to_string(),
-                        String::from_utf8_lossy(&o.stderr).to_string(),
-                    )
-                })
-                .unwrap_or_else(|| (String::new(), "the seat timed out".to_string()));
-            eprintln!("--- seat {i} stdout ---\n{so}--- seat {i} stderr ---\n{se}");
-            ok &= so.contains("FETCH_OK");
-            outs.push(so);
-            if !ok {
-                break;
-            }
-        }
-        run(&["rm", "-f", &gw.name], 60);
-        run(&["network", "rm", &gw.external_network], 60);
-        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        run(&["volume", "rm", &cfg, &broker], 60);
-        let cargo_home = worker.join("cache").join("claude").join("cargo");
-        let persisted = cargo_home.join("registry").join("cache").is_dir();
-        let _ = std::fs::remove_dir_all(&base);
-        let first = outs.first().cloned().unwrap_or_default();
-        assert!(
-            first.contains(&format!("CARGO_HOME={}", cargo_home.display())),
-            "the seat's CARGO_HOME is the host cache dir:\n{first}"
-        );
-        assert!(ok, "both fetches succeed:\n{outs:?}");
-        assert!(
-            persisted,
-            "the registry cache is on the host after the seat"
-        );
-        let kb = |s: &str, tag: &str| -> u64 {
-            s.lines()
-                .find_map(|l| l.strip_prefix(tag))
-                .and_then(|v| v.trim().parse().ok())
-                .unwrap_or_else(|| panic!("no number after {tag} in:\n{s}"))
-        };
-        assert!(
-            kb(&first, "HOME_KB=") < 64 * 1024,
-            "HOME stays near empty:\n{first}"
-        );
-        assert!(
-            kb(&first, "CACHE_KB=") > 512 * 1024,
-            "the fetch would not have fit the HOME tmpfs:\n{first}"
-        );
-    }
-
-    /// LIVE (`WICKED_CONTAINER_LIVE=1`, with `WICKED_SEAT_BASE_IMAGE` naming a Rust toolchain base;
-    /// skipped otherwise), core#997's end-to-end run: THIS repository's lib tests compile in a seat
-    /// container at the engine's default seat memory limit (3g, [`memory_from`]; the run's seat had
-    /// it), rendered by the engine's own path (seat floor plan, mount plan, wrapper, finalize), with
-    /// the seat build settings, and the same compile with cargo's default profile (the settings
-    /// unset inside the seat, its own target dir) has rustc killed. A first seat fetches the
-    /// lockfile through the gateway into the seat's cargo cache; the build seats then run offline
-    /// (`--network none`). The cgroup's peak memory (`memory.peak`, read with `exec` while the seat
-    /// runs; it counts page cache too) is printed for both. `WICKED_LIVE_SEAT_MEMORY` measures
-    /// another limit (the control is then reported, not asserted). Measured on a 2 CPU / 6 GB
-    /// Rancher VM: at 3g the settings build (peak 3072 MiB, the limit, page cache reclaimed) and the
-    /// default profile is killed on the lib test crate; at 4g both build (3188 MiB and 3515 MiB).
-    #[cfg(unix)]
-    #[test]
-    fn live_a_seat_compiles_this_repos_lib_tests_within_the_seat_memory_limit() {
-        let _env = crate::test_env::ENV_LOCK
-            .write()
-            .unwrap_or_else(|p| p.into_inner());
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        // The seat's settings are the table's, not ones this test process inherited.
-        let _clean = BuildEnvCleared::new();
-        let rt = runtime().expect("a container runtime answers");
-        let floor = ensure_floor_image(&rt).expect("the floor image");
-        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        let base = tmp("cargo-build-live");
-        let tree = base.join("wt");
-        let worker = base.join("worker");
-        let gw_dir = base.join("gateway");
-        std::fs::create_dir_all(&tree).unwrap();
-        std::fs::create_dir_all(&gw_dir).unwrap();
-        let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .canonicalize()
-            .unwrap();
-        let repo_q = format!("'{}'", repo.display().to_string().replace('\'', "'\\''"));
-        let run = |argv: &[&str], limit: u64| {
-            let mut c = rt.cmd();
-            c.args(argv);
-            output_within(c, Duration::from_secs(limit))
-        };
-        // The fetch seat: online through the gateway's crates.io allowlist, as in the cache test.
-        let prior = std::env::var(crate::seat_gateway::EGRESS_HOSTS_ENV).ok();
-        std::env::set_var(
-            crate::seat_gateway::EGRESS_HOSTS_ENV,
-            "index.crates.io,static.crates.io",
-        );
-        let gw = crate::seat_gateway::ensure_gateway(&rt, &gw_dir);
-        match &prior {
-            Some(v) => std::env::set_var(crate::seat_gateway::EGRESS_HOSTS_ENV, v),
-            None => std::env::remove_var(crate::seat_gateway::EGRESS_HOSTS_ENV),
-        }
-        let gw = gw.expect("the gateway starts");
-        let key = crate::seat_gateway::UnitKey::new("cargo-build-live", "1", "claude");
-        let env: Vec<(String, String)> = crate::seat_gateway::seat_env_all(&key.key)
-            .into_iter()
-            .chain([("CARGO_NET_RETRY".to_string(), "3".to_string())])
-            .collect();
-        let name = container_name("claude", "buildfetch", 0);
-        let network = ensure_seat_network(&rt, &name).expect("the seat network");
-        crate::seat_gateway::attach(&rt, &gw, &network).unwrap();
-        let ip = gateway_ip(&rt, &gw.name, &network).unwrap();
-        start_netns_sidecar(&rt, &name, &network, &ip).expect("sidecar up");
-        crate::seat_gateway::register_live(&rt, &gw, &gw_dir, key.clone())
-            .expect("the unit key is served");
-        let (_, _, cmd) = cargo_seat(
-            &worker,
-            &tree,
-            std::slice::from_ref(&repo),
-            &rt.cli,
-            &image,
-            &name,
-            &format!("container:{}", netns_name(&name)),
-            &floor,
-            "3g",
-            &env,
-            &format!(
-                "cd {repo_q} && cargo fetch --locked >/tmp/fetch.log 2>&1 && echo FETCH_OK || \
-                 {{ echo FETCH_FAILED; tail -20 /tmp/fetch.log; }}"
-            ),
-        );
-        let fetched = output_within(cmd, Duration::from_secs(900))
-            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-            .unwrap_or_default();
-        reap(&SeatContainer {
-            runtime: rt.cli.clone(),
-            name: name.clone(),
-        });
-        let _ = run(&["rm", "-f", &gw.name], 60);
-        let _ = run(&["network", "rm", &gw.external_network], 60);
-        let (cfg, broker) = crate::seat_gateway::volumes(&gw);
-        let _ = run(&["volume", "rm", &cfg, &broker], 60);
-        assert!(fetched.contains("FETCH_OK"), "the fetch seat: {fetched}");
-
-        // The limit under test: the engine's default, or `WICKED_LIVE_SEAT_MEMORY` to measure another.
-        let measuring = std::env::var("WICKED_LIVE_SEAT_MEMORY")
-            .ok()
-            .filter(|v| !v.trim().is_empty());
-        let memory = memory_from(measuring.as_deref()).to_string();
-        // One offline build seat: `unset` names the variables a control removes inside the seat.
-        let build = |label: &str, unset: &str| -> (String, Option<u64>, Option<u64>) {
-            let name = container_name("claude", label, 0);
-            let target = tree.join(format!("target-{label}"));
-            let (_, _, cmd) = cargo_seat(
-                &worker,
-                &tree,
-                std::slice::from_ref(&repo),
-                &rt.cli,
-                &image,
-                &name,
-                "none",
-                &floor,
-                &memory,
-                &[("CARGO_TARGET_DIR".to_string(), target.display().to_string())],
-                &format!(
-                    "{unset} echo JOBS=$CARGO_BUILD_JOBS DEBUG=$CARGO_PROFILE_DEV_DEBUG/\
-                     $CARGO_PROFILE_TEST_DEBUG INCREMENTAL=$CARGO_INCREMENTAL; \
-                     echo SWAP_KB=$(awk '/^SwapTotal:/ {{print $2}}' /proc/meminfo); \
-                     cd {repo_q} && cargo test --lib --no-run --locked --offline \
-                     >/tmp/build.log 2>&1 && echo BUILD_OK || {{ echo BUILD_FAILED; \
-                     grep -E '^error' /tmp/build.log | cut -c1-120 | tail -3; \
-                     echo KILLED=$(grep -c 'SIGKILL' /tmp/build.log); }}"
-                ),
-            );
-            // The cgroup's peak, read from outside while the seat runs (Landlock denies /sys inside).
-            let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let poll = {
-                let (rt, name, done) = (rt.clone(), name.clone(), done.clone());
-                std::thread::spawn(move || {
-                    let (mut peak, mut ooms) = (None, None);
-                    while !done.load(std::sync::atomic::Ordering::SeqCst) {
-                        let mut c = rt.cmd();
-                        c.args([
-                            "exec",
-                            &name,
-                            "cat",
-                            "/sys/fs/cgroup/memory.peak",
-                            "/sys/fs/cgroup/memory.events",
-                        ]);
-                        if let Some(o) = output_within(c, Duration::from_secs(20)) {
-                            let s = String::from_utf8_lossy(&o.stdout).to_string();
-                            let mut lines = s.lines();
-                            if let Some(p) = lines.next().and_then(|l| l.trim().parse().ok()) {
-                                peak = Some(p);
-                            }
-                            if let Some(n) = s
-                                .lines()
-                                .find_map(|l| l.strip_prefix("oom_kill "))
-                                .and_then(|v| v.trim().parse().ok())
-                            {
-                                ooms = Some(n);
-                            }
-                        }
-                        std::thread::sleep(Duration::from_secs(3));
-                    }
-                    (peak, ooms)
-                })
-            };
-            let out = output_within(cmd, Duration::from_secs(2400));
-            done.store(true, std::sync::atomic::Ordering::SeqCst);
-            reap(&SeatContainer {
-                runtime: rt.cli.clone(),
-                name,
-            });
-            let (peak, ooms) = poll.join().unwrap_or((None, None));
-            let so = out
-                .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-                .unwrap_or_else(|| "the seat timed out".to_string());
-            let _ = std::fs::remove_dir_all(&target);
-            eprintln!(
-                "--- {label}: peak={:?} MiB oom_kill(last read)={ooms:?} ---\n{so}",
-                peak.map(|p| p / (1024 * 1024))
-            );
-            (so, peak, ooms)
-        };
-        let (seat, seat_peak, _) = build("seatbuild", "");
-        let (control, control_peak, control_ooms) = build(
-            "defaultbuild",
-            "unset CARGO_BUILD_JOBS CARGO_PROFILE_DEV_DEBUG CARGO_PROFILE_TEST_DEBUG \
-             CARGO_INCREMENTAL;",
-        );
-        let _ = std::fs::remove_dir_all(&base);
-        eprintln!(
-            "seat build: peak {:?} MiB; default profile: peak {:?} MiB, oom_kill {control_ooms:?}, \
-             {}",
-            seat_peak.map(|p| p / (1024 * 1024)),
-            control_peak.map(|p| p / (1024 * 1024)),
-            if control.contains("BUILD_OK") {
-                "built"
-            } else {
-                "did not build"
-            }
-        );
-        assert!(
-            seat.contains("JOBS=") && !seat.contains("JOBS= ") && seat.contains("DEBUG=0/0"),
-            "the seat carries the build settings: {seat}"
-        );
-        assert!(seat.contains("INCREMENTAL=0"), "{seat}");
-        assert!(
-            seat.contains("BUILD_OK"),
-            "the lib tests compile within {memory} with the seat build settings: {seat}"
-        );
-        // The red control holds where the seat has no swap to spill into (the run's runtime had
-        // none; with swap, `--memory` alone lets a seat use as much again, Docker's default).
-        let swap_kb = control
-            .lines()
-            .find_map(|l| l.strip_prefix("SWAP_KB="))
-            .and_then(|v| v.trim().parse::<u64>().ok());
-        eprintln!("the runtime's swap: {swap_kb:?} kB");
-        if measuring.is_none() && swap_kb == Some(0) {
-            assert!(
-                !control.contains("BUILD_OK")
-                    && control.contains("KILLED=")
-                    && !control.contains("KILLED=0"),
-                "cargo's default profile has rustc killed at the default {memory} limit: {control}"
-            );
-        }
-    }
-
-    /// LIVE (needs a container runtime; `WICKED_CONTAINER_LIVE=1`, skipped otherwise;
-    /// DES-TEAMING-002 §8.8): a team member turn's seat container with its repository view. The
-    /// view is a real checkpoint tree written by `team::Repo::materialize`, mounted by
-    /// [`add_read_view`] into a member turn's floor (its scratch cwd and seat home writable,
-    /// nothing else). Inside: the view's files read; the kernel lists its mount `ro`; overwriting,
-    /// creating, removing and making a directory there all fail; the live worktree it was written from, and a sibling of the
-    /// view, do not exist. On the host the view's file is unchanged.
-    #[cfg(unix)]
-    #[test]
-    fn live_a_member_reads_its_repository_view_and_cannot_write_it() {
-        if std::env::var("WICKED_CONTAINER_LIVE").ok().as_deref() != Some("1") {
-            eprintln!("skipped: set WICKED_CONTAINER_LIVE=1 with a container runtime to run");
-            return;
-        }
-        let rt = runtime().expect("a container runtime answers");
-        let floor = ensure_floor_image(&rt).expect("the floor image");
-        let image = ensure_seat_image(&rt, "claude").expect("the claude seat image");
-        let base = tmp("live-view");
-        let wt = base.join("wt");
-        let sandbox = base.join("sandbox");
-        let home = base.join("home");
-        let view = base.join("view");
-        let sibling = base.join("view-sibling");
-        for d in [&wt, &sandbox, &home, &view, &sibling] {
-            std::fs::create_dir_all(d).unwrap();
-        }
-        std::fs::write(sibling.join("other"), "sibling").unwrap();
-        // The worktree's checkpoint tree, written into the view the way a member turn's is.
-        let git = |args: &[&str]| {
-            crate::worktree_guard::git(&wt, args, &[]).unwrap();
-        };
-        git(&["init", "-q"]);
-        std::fs::create_dir_all(wt.join("src")).unwrap();
-        std::fs::write(wt.join("src/lib.rs"), "fn checkpoint() {}\n").unwrap();
-        let repo = crate::team::Repo {
-            workdir: wt.clone(),
-            git_dir: wt.join(".git"),
-        };
-        let tree = repo.snapshot().unwrap();
-        repo.materialize(&tree, &view, crate::team::REPO_VIEW_MAX_BYTES)
-            .unwrap();
-        let spec = SeatFloor {
-            profile: "member".into(),
-            tree: sandbox.clone(),
-            writable: vec![sandbox.clone(), home.clone()],
-            protected: vec![],
-            readmitted: vec![],
-            readmitted_files: vec![],
-            masks: vec![],
-            pinned: vec![],
-            net: vec![],
-        };
-        let mut mounts = mount_plan(&spec).unwrap();
-        add_read_view(&mut mounts, &view).expect("the view mounts read-only");
-        let name = container_name("claude", "liveview", 1);
-        let user = operator_user();
-        let mut w = run_argv(&ContainerLaunch {
-            runtime: &rt.cli,
-            image: &image,
-            name: &name,
-            network: "none",
-            workdir: &sandbox,
-            user: &user,
-            mounts: &mounts,
-            floor: &floor,
-            memory: "3g",
-            gateway_ports: GATEWAY_PORTS,
-            own_ports: &[],
-        });
-        let script = format!(
-            "echo READ=[$(cat {v}/src/lib.rs)]; \
-             grep -Eq \"^[^ ]+ {v} [^ ]+ ro[, ]\" /proc/self/mounts && echo MOUNT_RO || echo MOUNT_NOT_RO; \
-             (echo x > {v}/src/lib.rs) 2>/dev/null && echo OVERWROTE || echo OVERWRITE_DENIED; \
-             (echo x > {v}/new) 2>/dev/null && echo CREATED || echo CREATE_DENIED; \
-             rm -f {v}/src/lib.rs 2>/dev/null; test -e {v}/src/lib.rs && echo RM_DENIED || echo REMOVED; \
-             mkdir {v}/d 2>/dev/null && echo MKDIR_OK || echo MKDIR_DENIED; \
-             test -e {wt}/src/lib.rs && echo WORKTREE_VISIBLE || echo WORKTREE_ABSENT; \
-             test -e {s}/other && echo SIBLING_VISIBLE || echo SIBLING_ABSENT; \
-             echo ok > {sb}/note && echo SCRATCH_OK",
-            v = view.display(),
-            wt = wt.display(),
-            s = sibling.display(),
-            sb = sandbox.display(),
-        );
-        w.extend(["sh".into(), "-c".into(), script]);
-        // spawn-audit: test-only — renders the wrapper argv; spawned only by the gated live test.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]);
-        let out = output_within(cmd, Duration::from_secs(60)).expect("the seat ran");
-        reap(&SeatContainer {
-            runtime: rt.cli.clone(),
-            name: name.clone(),
-        });
-        let so = String::from_utf8_lossy(&out.stdout).to_string();
-        let se = String::from_utf8_lossy(&out.stderr).to_string();
-        eprintln!("--- seat stdout ---\n{so}--- seat stderr ---\n{se}");
-        assert!(out.status.success(), "{so}\n{se}");
-        for want in [
-            "READ=[fn checkpoint() {}]",
-            "MOUNT_RO",
-            "OVERWRITE_DENIED",
-            "CREATE_DENIED",
-            "RM_DENIED",
-            "MKDIR_DENIED",
-            "WORKTREE_ABSENT",
-            "SIBLING_ABSENT",
-            "SCRATCH_OK",
-        ] {
-            assert!(so.contains(want), "{want} missing:\n{so}");
-        }
         assert_eq!(
-            std::fs::read_to_string(view.join("src/lib.rs")).unwrap(),
-            "fn checkpoint() {}\n",
-            "the view is unchanged on the host"
+            get(&plan.build_env, "CARGO_INCREMENTAL").as_deref(),
+            Some("0")
         );
-        assert!(!view.join("new").exists() && !view.join("d").exists());
-        // Files are written read-only; the dirs are the test's to remove.
+        assert_eq!(plan.build_env.len(), SEAT_TOOLCHAIN_BUILD_ENV.len());
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -7740,8 +4942,7 @@ mod tests {
     }
 
     /// Codex review r1 (P1): a read path never uncovers a mask — every mask is rendered up front,
-    /// and a read root or argv path inside one is never bound (at arm time; `finalize` binds
-    /// nothing, #1042).
+    /// and a read root or argv path inside one is never bound (#1042).
     #[test]
     fn a_late_read_path_never_uncovers_a_mask() {
         let base = tmp("mask");
@@ -7774,38 +4975,18 @@ mod tests {
             ssh.to_string_lossy().into_owned(),
         ];
         mount_argv_paths(&mut mounts, &mut argv, None);
-        let w = run_argv(&ContainerLaunch {
-            runtime: Path::new("docker"),
-            image: "img:1",
-            name: "wicked-seat-m",
-            network: "none",
-            workdir: &tree,
-            user: "1:1",
-            mounts: &mounts,
-            floor: "wicked-floor:t",
-            memory: "1g",
-            gateway_ports: &[],
-            own_ports: &[],
-        });
-        // spawn-audit: test-only — never spawned; inspects the finalized argv.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]).args(&argv);
-        cmd.env(crate::gate_hook::READ_ROOTS_ENV, &home);
-        let fin = finalize(cmd);
-        let args: Vec<String> = fin
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        let bind = |p: &Path| format!("type=bind,src={p},dst={p},readonly", p = p.display());
-        assert!(
-            !args.contains(&bind(&ssh)),
-            "a masked dir is never bound: {args:?}"
-        );
-        // The ancestor may be mounted; the mask over its .ssh stays.
-        assert!(args.contains(&bind(&home)), "{args:?}");
-        assert!(args
+        assert!(mounts.contains(&Mount::Tmpfs { path: ssh.clone() }));
+        assert!(!mounts
             .iter()
-            .any(|a| a == &format!("type=tmpfs,dst={},tmpfs-size=1m", ssh.display())));
+            .any(|m| matches!(m, Mount::Bind { path, .. } if path == &ssh)));
+        assert!(mounts.contains(&Mount::Bind {
+            path: home.clone(),
+            rw: false
+        }));
+        let policy = landrun_prefix(&mounts, &[], &[]);
+        assert!(policy
+            .windows(2)
+            .any(|p| p == ["--ro", &ssh.to_string_lossy()]));
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8063,25 +5244,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// Codex review r4 (P2): a command that merely carries the seat label is not ours to reap.
-    #[test]
-    fn only_the_complete_wrapper_is_reaped() {
-        // spawn-audit: test-only — never spawned.
-        let mut c = Command::new("docker");
-        c.args([
-            "run",
-            "--label",
-            "wicked.seat=1",
-            "--name",
-            "keep",
-            "-d",
-            "alpine",
-            "sleep",
-            "9",
-        ]);
-        assert!(seat_container(&c).is_none());
-    }
-
     /// Codex review r4 (P2): a host alias in an env value or a path option is re-spelled to the
     /// canonical path the mount sits at.
     #[cfg(unix)]
@@ -8166,15 +5328,6 @@ mod tests {
         drop(RemoveOnDrop(d.clone()));
         assert!(!d.exists());
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    #[test]
-    fn container_names_are_unique_and_runtime_safe() {
-        let a = container_name("claude", "run/../ID:1", 3);
-        let b = container_name("claude", "run/../ID:1", 3);
-        assert_ne!(a, b);
-        assert!(a.starts_with("wicked-seat-claude-runid1-3-"), "{a}");
-        assert!(a.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
     }
 }
 

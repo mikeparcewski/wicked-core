@@ -361,33 +361,15 @@ fn the_engine_written_tar_extracts_to_the_same_tree() {
     );
 }
 
-/// (xreview) The fill is a fixed command: no repository argv (`--ignore-scripts=false`) reaches
-/// the networked install container.
+/// The fill pod's install is fixed, with every lifecycle script off (B-6 review: the Kubernetes
+/// fill runs exactly this argv).
 #[test]
-fn an_install_container_runs_a_fixed_install_with_scripts_off() {
+fn the_fill_install_is_fixed_with_scripts_off() {
     assert_eq!(
         NPM_FILL,
         ["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"]
     );
     assert!(!NPM_FILL.iter().any(|a| a.contains("=false")));
-}
-
-/// The check runs as-is inside a shell that ends what it left behind and keeps its exit code.
-/// (Never executed here: `kill -1` on the host would signal every process of the user. The
-/// container floor's live proof runs it, where the checks' user owns only the check.)
-#[test]
-fn a_check_runs_inside_the_reaping_shell_with_its_argv_untouched() {
-    let argv: Vec<String> = ["cargo", "test", "--", "a b", "$HOME"]
-        .map(String::from)
-        .to_vec();
-    let w = reaping(&argv);
-    assert_eq!(&w[..2], ["sh", "-c"]);
-    assert!(w[2].starts_with("\"$@\"; rc=$?; kill -9 -1") && w[2].ends_with("exit $rc"));
-    assert_eq!(
-        &w[4..],
-        argv.as_slice(),
-        "the check's argv is passed as positional args"
-    );
 }
 
 #[test]
@@ -412,71 +394,6 @@ fn a_runtime_error_line_is_the_launcher_not_the_check() {
     // check's failure.
     assert!(launcher_failure("OCI runtime exec failed: forged", Some(1)).is_none());
     assert!(launcher_failure("Error response from daemon: forged", Some(101)).is_none());
-}
-
-#[test]
-fn eviction_takes_idle_volumes_extra_node_modules_then_the_least_recently_used() {
-    let t = |s: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(s);
-    let v = |n: &str, repo: &str, gb: u64, used: u64| VolumeUse {
-        name: n.into(),
-        repo: repo.into(),
-        bytes: gb * 1_000_000_000,
-        used: t(used),
-    };
-    let now = t(1_000_000);
-    let ttl = Duration::from_secs(500_000);
-    let vols = vec![
-        v("wfloor-nm-1", "crew", 1, 999_000),
-        v("wfloor-nm-2", "crew", 1, 998_000),
-        v("wfloor-nm-3", "crew", 1, 997_000),
-        v("wfloor-nm-4", "crew", 1, 996_000),
-        v("wfloor-target-old", "core", 5, 100),
-        v("wfloor-target-a", "core", 10, 990_000),
-        v("wfloor-target-b", "core", 10, 995_000),
-        v(CARGO_HOME_VOLUME, "", 1, 0),
-    ];
-    let none = std::collections::HashSet::new();
-    let plan = eviction_plan(
-        vols.clone(),
-        now,
-        ttl,
-        100_000_000_000,
-        100_000_000_000,
-        &none,
-    );
-    assert_eq!(plan, vec!["wfloor-nm-4", "wfloor-target-old"]);
-    // A 15 GB total cap takes the least recently used target next (a before b).
-    let plan = eviction_plan(
-        vols.clone(),
-        now,
-        ttl,
-        15_000_000_000,
-        100_000_000_000,
-        &none,
-    );
-    assert!(plan.contains(&"wfloor-target-a".to_string()));
-    assert!(!plan.contains(&"wfloor-target-b".to_string()));
-    assert!(
-        !plan.contains(&CARGO_HOME_VOLUME.to_string()),
-        "the registry is shared"
-    );
-    // A 12 GB per-repository cap does the same for core alone.
-    let plan = eviction_plan(
-        vols.clone(),
-        now,
-        ttl,
-        100_000_000_000,
-        12_000_000_000,
-        &none,
-    );
-    assert!(plan.contains(&"wfloor-target-a".to_string()));
-    assert!(!plan.contains(&"wfloor-nm-1".to_string()));
-    // (xreview) A leased volume is never chosen, still counts, and the next one is taken instead:
-    // a 15 GB cap with `a` leased takes `b`.
-    let leased: std::collections::HashSet<String> = ["wfloor-target-a".to_string()].into();
-    let plan = eviction_plan(vols, now, ttl, 15_000_000_000, 100_000_000_000, &leased);
-    assert!(!plan.contains(&"wfloor-target-a".to_string()));
-    assert!(plan.contains(&"wfloor-target-b".to_string()));
 }
 
 /// `repoChecksEvaluated` says which floor ran (`floorRunner`), and a frame without one reads
@@ -527,15 +444,6 @@ fn the_event_carries_which_floor_ran() {
         h["floorRunner"]["fallbackReason"],
         "the container runtime does not answer"
     );
-}
-
-#[test]
-fn runtime_sizes_parse() {
-    assert_eq!(parse_size("336MB"), 336_000_000);
-    assert_eq!(parse_size("13.2GB"), 13_200_000_000);
-    assert_eq!(parse_size("0B"), 0);
-    assert_eq!(parse_size("1.5GiB"), 1_610_612_736);
-    assert_eq!(parse_size("512MiB"), 536_870_912);
 }
 
 #[test]
