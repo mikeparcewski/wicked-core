@@ -365,8 +365,10 @@ pub(crate) fn check_argv(
     v.extend(env.iter().map(|(k, val)| format!("{k}={val}")));
     // A fixed program between the assignments and the repository's argv (codex b3-floor #5):
     // `env` would read an executable named `./check=fail` as one more assignment and pass.
-    // `exec --` (codex r2): an argv starting `--` is a program, never the builtin's option.
-    v.extend(["/bin/sh", "-c", "exec -- \"$@\"", "wicked-argv"].map(String::from));
+    // A plain command, not `exec` (codex r2): `exec` takes `--` as its option in bash, and as a
+    // program in dash, so an argv starting `--` could pass in one shell; as a simple command it
+    // is a program in every shell.
+    v.extend(["/bin/sh", "-c", "\"$@\"", "wicked-argv"].map(String::from));
     v.extend(argv.iter().cloned());
     v
 }

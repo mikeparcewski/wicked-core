@@ -819,7 +819,7 @@ fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
             "A=b c",
             "/bin/sh",
             "-c",
-            "exec -- \"$@\"",
+            "\"$@\"",
             "wicked-argv",
             "npm",
             "test"
