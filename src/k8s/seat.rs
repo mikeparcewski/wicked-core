@@ -2438,11 +2438,13 @@ fn fetch_commits(
         "-z",
         &format!("{base}..{new}"),
     ])?;
-    if let Some(p) = changed
-        .split('\0')
-        .filter(|p| !p.is_empty())
-        .find(|p| p.split('/').any(sync::is_git_name) || masks.iter().any(|m| sync::under(p, m)))
-    {
+    if let Some(p) = changed.split('\0').filter(|p| !p.is_empty()).find(|p| {
+        p.split('/').any(sync::is_git_name)
+                || masks.iter().any(|m| sync::under(p, m))
+                // The run's dependency tree is the engine's (codex b3-floor #6): a commit may
+                // not track it, as no file write of it comes back.
+                || (seat.deps && in_node_modules(p))
+    }) {
         return Err(format!(
             "the unit's commits change `{p}`, a path the seat may not write; they are kept at {refname}"
         ));

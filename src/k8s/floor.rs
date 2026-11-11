@@ -33,6 +33,18 @@ pub(crate) const RC_FILE: &str = "/wicked-rc/rc";
 /// How long a floor or fill pod may take to be admitted and start.
 pub(crate) const POD_START: Duration = Duration::from_secs(120);
 
+/// Floor pods whose deletion was not confirmed: (namespace, pod).
+static UNREAPED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Record a floor pod as not confirmed gone (tests).
+#[cfg(test)]
+pub(crate) fn mark_unreaped(ns: &str, name: &str) {
+    UNREAPED
+        .lock()
+        .unwrap()
+        .push((ns.to_string(), name.to_string()));
+}
+
 /// Where a floor's pods go: the run's namespace, or (no run) one of the floor's own.
 #[derive(Debug)]
 pub(crate) struct Place {
@@ -163,6 +175,7 @@ impl Place {
     /// Create `spec`'s pod and wait until it runs. A pod that does not start is deleted, and
     /// the reason names what held it (an image, a policy, the quota).
     pub(crate) fn start(&self, spec: &FloorPod) -> Result<(), String> {
+        self.reap_earlier()?;
         let doc = render::floor_pod(spec)?;
         if let Err(e) = self.kube.apply(&[doc]) {
             self.delete(&spec.name);
@@ -198,14 +211,48 @@ impl Place {
         ))
     }
 
-    /// Delete pod `name` (this daemon's only), without waiting.
+    /// Delete pod `name` (this daemon's only) and wait until it is gone. A pod not confirmed
+    /// gone is remembered (codex b3-floor #1): repository code may still run in it, writing the
+    /// run's claims, so no further floor pod starts in this namespace until it is.
     pub(crate) fn delete(&self, name: &str) {
-        if let Err(e) = self.kube.delete_owned(Some(&self.ns), "pod", name, false) {
+        if let Err(e) = self.kube.delete_owned(Some(&self.ns), "pod", name, true) {
             eprintln!(
-                "wicked-core: floor pod {name} in {} not deleted: {e}",
+                "wicked-core: floor pod {name} in {} not confirmed gone: {e}",
                 self.ns
             );
+            if let Ok(mut u) = UNREAPED.lock() {
+                u.push((self.ns.clone(), name.to_string()));
+            }
         }
+    }
+
+    /// Every pod of this namespace an earlier floor left unconfirmed, deleted and waited out
+    /// now, or `Err` (the caller starts no pod).
+    pub(crate) fn reap_earlier(&self) -> Result<(), String> {
+        let mine: Vec<String> = UNREAPED
+            .lock()
+            .map(|u| {
+                u.iter()
+                    .filter(|(ns, _)| *ns == self.ns)
+                    .map(|(_, n)| n.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for name in mine {
+            self.kube
+                .delete_owned(Some(&self.ns), "pod", &name, true)
+                .map_err(|e| {
+                    format!(
+                        "an earlier floor pod {name} in {} may still run and is not confirmed \
+                         gone ({e}); no floor starts beside it",
+                        self.ns
+                    )
+                })?;
+            if let Ok(mut u) = UNREAPED.lock() {
+                u.retain(|(ns, n)| !(*ns == self.ns && *n == name));
+            }
+        }
+        Ok(())
     }
 
     /// Ensure the claim `name` exists in this place (idempotent).
@@ -306,6 +353,9 @@ pub(crate) fn check_argv(
     v.push("/usr/bin/env".into());
     v.push("--".into());
     v.extend(env.iter().map(|(k, val)| format!("{k}={val}")));
+    // A fixed program between the assignments and the repository's argv (codex b3-floor #5):
+    // `env` would read an executable named `./check=fail` as one more assignment and pass.
+    v.extend(["/bin/sh", "-c", "exec \"$@\"", "wicked-argv"].map(String::from));
     v.extend(argv.iter().cloned());
     v
 }

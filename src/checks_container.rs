@@ -2664,6 +2664,25 @@ fn filled(key: &str) -> bool {
     FILLED.lock().is_ok_and(|f| f.iter().any(|k| k == key))
 }
 
+/// Forget every completed claim of namespace `ns` (codex b3-floor #10): it was deleted, and a
+/// namespace of the same name later is new storage.
+pub(crate) fn forget_namespace(ns: &str) {
+    if let Ok(mut f) = FILLED.lock() {
+        let pre = format!("{ns}/");
+        f.retain(|k| !k.starts_with(&pre));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn mark_filled_for_test(key: &str) {
+    mark_filled(key)
+}
+
+#[cfg(test)]
+pub(crate) fn filled_for_test(key: &str) -> bool {
+    filled(key)
+}
+
 fn mark_filled(key: &str) {
     if let Ok(mut f) = FILLED.lock() {
         if !f.iter().any(|k| k == key) {
@@ -3310,6 +3329,17 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
     if made_up {
         crate::repo_checks::remove_check_scratch(&worktree, &run_id);
+        // The namespace this invocation made up goes with it (codex b3-floor #3): nothing else
+        // ever ends a run of that id.
+        if let Some(kube) = crate::k8s::engine_home().and_then(|h| crate::k8s::kube_for(&h).ok()) {
+            if let Err(e) = crate::k8s::cluster::delete_run(&kube, &run_id, false) {
+                eprintln!("wicked-core floor run: the run namespace was not deleted: {e}");
+            }
+            forget_namespace(&crate::k8s::run_namespace_name(
+                &kube.owner,
+                &run_id,
+            ));
+        }
     }
     if report.passed {
         0

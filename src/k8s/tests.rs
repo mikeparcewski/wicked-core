@@ -817,6 +817,10 @@ fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
             "/usr/bin/env",
             "--",
             "A=b c",
+            "/bin/sh",
+            "-c",
+            "exec \"$@\"",
+            "wicked-argv",
             "npm",
             "test"
         ]
@@ -957,4 +961,58 @@ fn k8s_the_parent_maker_never_mounts_a_deep_scratch_dir() {
         .unwrap();
     let build = main.iter().position(|p| p.ends_with("/build")).unwrap();
     assert!(claim < build, "the build dir lands over the claim");
+}
+
+/// codex b3-floor #5: an executable whose name holds `=` runs (and fails), never passes as one
+/// more assignment `env` would print.
+#[cfg(unix)]
+#[test]
+fn k8s_a_check_named_with_an_equals_sign_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    use wicked_apps_core::HardenedCommand as _;
+    if !std::path::Path::new("/usr/bin/env").exists() {
+        return;
+    }
+    let d = std::env::temp_dir().join(format!("wicked-eq-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&d).unwrap();
+    let exe = d.join("check=fail");
+    std::fs::write(&exe, "#!/bin/sh\nexit 9\n").unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let a = floor::check_argv("x", "/", &[], &[exe.to_string_lossy().into_owned()]);
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(9),
+        "{}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn k8s_a_deleted_namespace_forgets_its_filled_claims() {
+    crate::checks_container::mark_filled_for_test("wicked-run-x/deps-1");
+    crate::checks_container::mark_filled_for_test("wicked-run-y/deps-1");
+    crate::checks_container::forget_namespace("wicked-run-x");
+    assert!(!crate::checks_container::filled_for_test(
+        "wicked-run-x/deps-1"
+    ));
+    assert!(crate::checks_container::filled_for_test(
+        "wicked-run-y/deps-1"
+    ));
+}
+
+#[test]
+fn k8s_a_commit_into_the_runs_node_modules_is_refused_for_a_deps_seat() {
+    assert!(crate::k8s::seat::in_node_modules(
+        "pkg/node_modules/x/index.js"
+    ));
+    assert!(crate::k8s::seat::in_node_modules("Node_Modules/x"));
+    assert!(!crate::k8s::seat::in_node_modules(
+        "src/node_modules_util.rs"
+    ));
 }
