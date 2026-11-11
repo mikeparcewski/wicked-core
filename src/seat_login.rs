@@ -1742,7 +1742,13 @@ pub(crate) trait BrokerIo {
     fn create_login(&self, session: &str) -> Result<(), String>;
     /// Make `cli`'s configuration homes in the store (after the marker is written).
     fn init_login(&self, dir: &Path, cli: &str, session: &str) -> Result<(), String>;
-    /// Start session `session`'s login and render the argv crew runs in its terminal.
+    /// Everything a login of `cli` needs that may take long or must hold first (an image build, the
+    /// cluster's isolation proof), done BEFORE the session transaction (review B-4 #3, #4).
+    fn prepare_login(&self, _cli: &str) -> Result<(), String> {
+        Ok(())
+    }
+    /// Start session `session`'s login and render the argv crew runs in its terminal (the caller
+    /// holds the mutation lock, so no sign-out or newer sign-in can supersede it meanwhile).
     fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String>;
     /// Read `paths` (relative to the login HOME) from the store: a missing file is skipped; a
     /// link on the way, a non-regular or an oversized file is refused.
@@ -2625,6 +2631,12 @@ fn read_session(dir: &Path, cli: &str) -> Result<Option<String>, String> {
 #[cfg(unix)]
 fn new_session(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<String, String> {
     let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    new_session_locked(io, dir, cli)
+}
+
+/// [`new_session`] for a caller that holds the mutation lock.
+#[cfg(unix)]
+fn new_session_locked(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<String, String> {
     io.cleanup(dir)?;
     complete_sign_out(io, dir, cli)?;
     if signin_pending(dir, cli) && !repair_ingest(io, dir, cli)? {
@@ -3149,8 +3161,20 @@ fn prepare_login_argv(io: &dyn BrokerIo, dir: &Path, cli: &str) -> Result<Vec<St
     // C6: an agent whose credential the broker cannot hold never opens a login (the user would
     // complete a real sign-in only for ingest to discard it).
     broker_files(cli).map_err(|e| format!("{cli} cannot sign in for container seats yet: {e}"))?;
-    let volume = new_session(io, dir, cli)?;
-    io.open_login(cli, &volume)
+    io.prepare_login(cli)?;
+    // One transaction from the session to its started login (review B-4 #3): a sign-out or a newer
+    // sign-in waits, so it can never finish before this login's pod exists and leave it behind.
+    let _lock = crate::seat_refresh::mutation_lock(dir)?;
+    let volume = new_session_locked(io, dir, cli)?;
+    match io.open_login(cli, &volume) {
+        Ok(argv) => Ok(argv),
+        Err(e) => {
+            // A login that did not start is discarded with its store, inside the transaction.
+            let _ = discard_login(io, dir, cli, &volume);
+            let _ = crate::seat_refresh::remove_private_file(&session_path(dir, cli));
+            Err(e)
+        }
+    }
 }
 
 /// The Docker floor's [`prepare_login_argv`] (its tests; B-6 deletes it with them).

@@ -13,6 +13,9 @@ struct MemIo {
     stores: RefCell<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     pods: RefCell<BTreeSet<String>>,
     log: RefCell<Vec<String>>,
+    /// When set: the gateway dir whose mutation lock must be held at `open_login` and free at
+    /// `prepare_login` (review B-4 #3).
+    lock_dir: RefCell<Option<std::path::PathBuf>>,
 }
 
 impl MemIo {
@@ -106,7 +109,23 @@ impl BrokerIo for MemIo {
         self.note(format!("init {cli} {session}"));
         Ok(())
     }
+    fn prepare_login(&self, cli: &str) -> Result<(), String> {
+        if let Some(d) = self.lock_dir.borrow().as_ref() {
+            assert!(
+                crate::seat_refresh::try_mutation_lock(d).unwrap().is_some(),
+                "a login is prepared outside the transaction"
+            );
+        }
+        self.note(format!("prepare {cli}"));
+        Ok(())
+    }
     fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String> {
+        if let Some(d) = self.lock_dir.borrow().as_ref() {
+            assert!(
+                crate::seat_refresh::try_mutation_lock(d).unwrap().is_none(),
+                "a login starts inside the session's transaction"
+            );
+        }
         self.pods.borrow_mut().insert(session.into());
         Ok(vec!["exec".into(), session.into(), cli.into()])
     }
@@ -251,5 +270,17 @@ fn a_new_sign_in_discards_an_abandoned_login_pod_and_store() {
     assert!(!io.pods.borrow().contains(&first));
     assert!(!io.stores.borrow().contains_key(&first));
     assert!(io.pods.borrow().contains(&second));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// B-4 review #3: the login is prepared (image, isolation proof) outside the transaction, and the
+/// session through its started pod is one transaction, so no sign-out or newer sign-in can finish
+/// in between and leave the pod behind.
+#[test]
+fn a_login_starts_inside_its_sessions_transaction() {
+    let (io, dir) = (MemIo::default(), temp_dir());
+    *io.lock_dir.borrow_mut() = Some(dir.clone());
+    prepare_login_argv(&io, &dir, "claude").unwrap();
+    assert!(io.log.borrow().contains(&"prepare claude".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }

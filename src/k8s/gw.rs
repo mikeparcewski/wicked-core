@@ -254,13 +254,12 @@ impl Gw {
         }
     }
 
-    /// Whether a gateway serves now (its pod Running with every container ready): `None` when
-    /// the cluster could not say.
-    pub(crate) fn serving(&self) -> Option<bool> {
+    /// Whether a gateway serves now, for a sign-out's confirmation ([`serving_state`]).
+    pub(crate) fn serving_state(&self) -> Option<bool> {
         self.kube
             .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
             .ok()
-            .map(|pods| cluster::running_pod(&pods).is_some())
+            .and_then(|pods| serving_state(&pods))
     }
 
     /// One exec of `argv` in the gateway pod's `fetch` sidecar (the account reader), with
@@ -364,6 +363,31 @@ impl Gw {
             ));
         }
         out
+    }
+}
+
+/// Whether a gateway serves (pure, review B-4 #5): `Some(true)` a pod serves (a generation can be
+/// confirmed); `Some(false)` no gateway process is alive in any pod (none, or every gateway
+/// container waiting or ended: nothing can still accept a pending key); `None` a gateway process
+/// runs but is not ready (alive, so a pending revocation is never dropped on its account).
+pub(crate) fn serving_state(pods: &[serde_json::Value]) -> Option<bool> {
+    if cluster::running_pod(pods).is_some() {
+        return Some(true);
+    }
+    let alive = pods.iter().any(|p| {
+        p.pointer("/status/containerStatuses")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|cs| {
+                cs.iter().any(|c| {
+                    c.get("name").and_then(serde_json::Value::as_str) == Some("gateway")
+                        && c.pointer("/state/running").is_some()
+                })
+            })
+    });
+    if alive {
+        None
+    } else {
+        Some(false)
     }
 }
 
@@ -625,18 +649,55 @@ pub(crate) fn attach(
         if quarantined(&dep) {
             return Err(refused());
         }
-        let existing = kube
-            .get_json(Some(&ns), "networkpolicy", "gateway-egress")
-            .map_err(unreachable)?;
-        let host: Vec<HostPort> = existing.as_ref().map(render_host_ports).unwrap_or_default();
-        let spec = GatewaySpec {
-            namespace: ns.clone(),
-            owner: kube.owner.clone(),
-            image: crate::seat_gateway::GATEWAY_IMAGE.into(),
-            writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
-            boot: boot_token(dir, false).map_err(gwerr)?,
-        };
-        cluster::apply_gateway(kube, &spec, &host).map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
+        if let Some(d) = &dep {
+            // Never re-applied here (review B-4 #2): only the daemon changes a gateway that
+            // exists, so a quarantine that lands meanwhile is never undone by a sign-in.
+            if !has_login_stores(d) {
+                return Err(gwerr(
+                    "the daemon's gateway predates sign-ins on the cluster; start a run so the \
+                     daemon updates it, then sign in again"
+                        .into(),
+                ));
+            }
+        } else {
+            let existing = kube
+                .get_json(Some(&ns), "networkpolicy", "gateway-egress")
+                .map_err(unreachable)?;
+            let host: Vec<HostPort> = existing.as_ref().map(render_host_ports).unwrap_or_default();
+            let spec = GatewaySpec {
+                namespace: ns.clone(),
+                owner: kube.owner.clone(),
+                image: crate::seat_gateway::GATEWAY_IMAGE.into(),
+                writer_image: crate::seat_gateway::HELPER_IMAGE.into(),
+                boot: boot_token(dir, false).map_err(gwerr)?,
+            };
+            let (deployment, rest): (Vec<_>, Vec<_>) = cluster::daemon_docs(&spec, &host)
+                .into_iter()
+                .partition(|d| d["kind"] == "Deployment");
+            kube.apply(&rest)
+                .map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
+            // Created, never applied: one the daemon made (or quarantined) meanwhile stands.
+            let body =
+                serde_json::to_vec(&render::list(&deployment)).map_err(|e| gwerr(e.to_string()))?;
+            let r = kube.call(
+                None,
+                &["create", "-f", "-"],
+                Some(&body),
+                super::CALL_TIMEOUT,
+            );
+            if !r.ok()
+                && !r.err_text().contains("AlreadyExists")
+                && !r.err_text().contains("already exists")
+            {
+                return Err((FloorUnarmed::PolicyRefused, r.err_text()));
+            }
+            let dep = kube
+                .get_json(Some(&ns), "deployment", render::GATEWAY_NAME)
+                .map_err(unreachable)?;
+            if quarantined(&dep) {
+                return Err(refused());
+            }
+        }
     } else if dep.is_none() {
         return Ok(None);
     }
@@ -648,6 +709,19 @@ pub(crate) fn attach(
         service_ip: String::new(),
         dir: dir.to_path_buf(),
     }))
+}
+
+/// Whether a gateway Deployment mounts the login stores (pure).
+pub(crate) fn has_login_stores(dep: &serde_json::Value) -> bool {
+    dep.pointer("/spec/template/spec/volumes")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|v| {
+            v.iter().any(|x| {
+                x.pointer("/persistentVolumeClaim/claimName")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(render::GATEWAY_LOGINS_PVC)
+            })
+        })
 }
 
 /// The host ports an existing gateway egress policy names (pure).

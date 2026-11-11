@@ -38,6 +38,8 @@ const FETCH_CAP: u64 = 512 * 1024;
 /// daemon that has no gateway yet (then nothing was ever signed in on this cluster).
 pub(crate) struct K8sIo {
     gw: Option<Gw>,
+    /// The seat image the login pod runs, built by [`BrokerIo::prepare_login`].
+    image: std::sync::Mutex<Option<String>>,
 }
 
 /// A refusal of the cluster, as the `seat-login` CLI reports it: the stable kind first (crew
@@ -51,6 +53,7 @@ impl K8sIo {
     pub(crate) fn of(gw: &Gw) -> Self {
         Self {
             gw: Some(gw.clone()),
+            image: std::sync::Mutex::new(None),
         }
     }
 
@@ -69,7 +72,10 @@ impl K8sIo {
     /// [`K8sIo::for_dir`] on a known cluster (the daemon's refresher, once per pass).
     pub(crate) fn attach(kube: &Kube, dir: &Path, provision: bool) -> Result<Self, String> {
         let gw = gw::attach(kube, dir, provision).map_err(described)?;
-        Ok(Self { gw })
+        Ok(Self {
+            gw,
+            image: std::sync::Mutex::new(None),
+        })
     }
 
     fn gw(&self) -> Result<&Gw, String> {
@@ -83,12 +89,14 @@ impl K8sIo {
         Ok(self.gw()?.exec(script, None, STORE_TIMEOUT))
     }
 
+    /// A store script that must succeed. Its diagnostics are never returned (review B-4 #7): they
+    /// name paths inside a store a vendor CLI wrote, and a path can carry a credential.
     fn store_ok(&self, script: &str, what: &str) -> Result<(), String> {
         let r = self.store(script)?;
         if r.ok() {
             Ok(())
         } else {
-            Err(format!("could not {what}: {}", r.err_text()))
+            Err(format!("could not {what} (exit {:?})", r.code))
         }
     }
 }
@@ -134,8 +142,17 @@ pub(crate) fn store_path(path: &str) -> Result<(), String> {
 /// missing path prints nothing; a link on the way exits 46, a non-regular file 45, an oversized
 /// one 66. The store is read only after its login pod is gone (no writer races it).
 pub(crate) fn read_store_script(session: &str, paths: &[&str]) -> Result<String, String> {
+    read_store_script_at(render::LOGINS_DIR, session, paths)
+}
+
+/// [`read_store_script`] under store root `root` (the tests run it against a local dir).
+pub(crate) fn read_store_script_at(
+    root: &str,
+    session: &str,
+    paths: &[&str],
+) -> Result<String, String> {
     session_name(session)?;
-    let base = format!("{}/{session}", render::LOGINS_DIR);
+    let base = format!("{root}/{session}");
     let mut s = format!("set -e; [ -d {base} ] && [ ! -L {base} ] || exit 46;");
     for p in paths {
         store_path(p)?;
@@ -164,6 +181,19 @@ pub(crate) fn read_store_script(session: &str, paths: &[&str]) -> Result<String,
     Ok(s)
 }
 
+/// The writer script that removes session `session`'s store under `root` (pure). A link is
+/// removed, never followed; every directory is first made traversable by its owner (a vendor
+/// CLI that `chmod 000`ed one cannot keep its credential there, review B-4 #6), without
+/// following a link (`find` does not, and `-type d` is never a link).
+pub(crate) fn remove_store_script(root: &str, session: &str) -> Result<String, String> {
+    session_name(session)?;
+    let p = format!("{root}/{session}");
+    Ok(format!(
+        "set -e; if [ -L {p} ]; then rm -f {p}; elif [ -e {p} ]; then \
+         find {p} -type d -exec chmod u+rwx {{}} \\; ; rm -rf {p}; fi"
+    ))
+}
+
 /// The writer script that makes `cli`'s configuration homes in session `session`'s store (each
 /// 0700), seeding copilot's settings (pure).
 pub(crate) fn init_store_script(cli: &str, session: &str) -> Result<String, String> {
@@ -188,7 +218,13 @@ pub(crate) fn init_store_script(cli: &str, session: &str) -> Result<String, Stri
 /// The argv crew's terminal runs for session `session` (pure): `kubectl exec -it` into its
 /// login pod, running the agent's login command. No credential is on it.
 pub(crate) fn login_exec_argv(kube: &Kube, ns: &str, cli: &str, session: &str) -> Vec<String> {
-    let mut argv = kube.head(Some(ns));
+    // The terminal's own `KUBECONFIG` is dropped, as every engine call drops it (review B-4 #1):
+    // with only a context pinned, it could name another cluster with a context of that name.
+    let mut argv: Vec<String> = ["/usr/bin/env", "-u", "KUBECONFIG"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    argv.extend(kube.head(Some(ns)));
     argv.extend(
         ["exec", "-it", session, "-c", "login", "--"]
             .iter()
@@ -286,7 +322,7 @@ impl BrokerIo for K8sIo {
         crate::seat_gateway::confirm_sign_out_with(
             dir,
             cli,
-            gw.serving(),
+            gw.serving_state(),
             || gw.publish(),
             |key, accepted| gw.confirm_key(key, accepted),
         )
@@ -324,13 +360,29 @@ impl BrokerIo for K8sIo {
         self.store_ok(&init_store_script(cli, session)?, "prepare the login store")
     }
 
-    fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String> {
-        session_name(session)?;
+    fn prepare_login(&self, cli: &str) -> Result<(), String> {
         let gw = self.gw()?;
         // The container CLI stays the image builder (PARITY D2); the cluster runs what it built.
         let rt = crate::container_floor::runtime()
             .map_err(|why| format!("an image builder is required: {}", why.describe()))?;
         let image = crate::container_floor::ensure_seat_image(&rt, cli)?;
+        // No vendor CLI starts on a cluster that has not proved it holds pods (review B-4 #4):
+        // the same pids-limit and NetworkPolicy-enforcement probe a seat arm runs.
+        let floor = crate::container_floor::ensure_floor_image(&rt)?;
+        super::cluster::ensure_pids_limited(&gw.kube, &floor).map_err(described)?;
+        *self.image.lock().unwrap_or_else(|p| p.into_inner()) = Some(image);
+        Ok(())
+    }
+
+    fn open_login(&self, cli: &str, session: &str) -> Result<Vec<String>, String> {
+        session_name(session)?;
+        let gw = self.gw()?;
+        let image = self
+            .image
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+            .ok_or("the login was not prepared")?;
         let doc = render::login_pod(&login_pod_spec(gw, cli, session, &image));
         if let Err(e) = gw.kube.apply(&[doc]) {
             let _ = self.stop_login(session);
@@ -390,9 +442,8 @@ impl BrokerIo for K8sIo {
 
     fn remove_login(&self, session: &str) -> Result<(), String> {
         self.stop_login(session)?;
-        let p = format!("{}/{session}", render::LOGINS_DIR);
         self.store_ok(
-            &format!("set -e; if [ -L {p} ]; then rm -f {p}; else rm -rf {p}; fi"),
+            &remove_store_script(render::LOGINS_DIR, session)?,
             "remove the login store",
         )
     }
@@ -616,6 +667,12 @@ mod tests {
     #[test]
     fn k8s_the_login_argv_is_a_pinned_exec_into_the_sessions_pod() {
         let argv = login_exec_argv(&kube(), "wicked-sys-wabc123def456", "copilot", SESSION);
+        // B-4 review #1: the terminal's KUBECONFIG never picks the cluster.
+        assert_eq!(
+            argv[..3],
+            ["/usr/bin/env", "-u", "KUBECONFIG"].map(String::from)
+        );
+        let argv = &argv[3..];
         let head = kube().head(Some("wicked-sys-wabc123def456"));
         assert_eq!(argv[..head.len()], head[..]);
         assert_eq!(
@@ -652,7 +709,12 @@ mod tests {
             before,
             crate::seat_login::BrokerStatus::Unknown(_)
         ));
-        K8sIo { gw: None }.cleanup(&dir).unwrap();
+        K8sIo {
+            gw: None,
+            image: std::sync::Mutex::new(None),
+        }
+        .cleanup(&dir)
+        .unwrap();
         assert_eq!(
             crate::seat_login::publication_status(
                 &dir,
@@ -662,5 +724,134 @@ mod tests {
             crate::seat_login::BrokerStatus::SignedOut
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn sh(script: &str) -> std::process::Output {
+        use wicked_apps_core::HardenedCommand as _;
+        std::process::Command::new("/bin/sh")
+            .hardened()
+            .args(["-c", script])
+            .output()
+            .unwrap()
+    }
+
+    fn store_root() -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("wicked-store-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(d.join(SESSION)).unwrap();
+        d
+    }
+
+    /// B-4 review #8: the store read runs for real (as the writer runs it): a plain file is read,
+    /// a missing one skipped, a link on the way and a fifo refused.
+    #[test]
+    fn k8s_a_login_store_read_runs_and_refuses_links_and_fifos() {
+        let root = store_root();
+        let base = root.join(SESSION);
+        std::fs::create_dir_all(base.join("claude")).unwrap();
+        std::fs::write(base.join("claude/tok"), "abc").unwrap();
+        let r = root.to_str().unwrap();
+        let out = sh(&read_store_script_at(r, SESSION, &["claude/tok", "claude/none"]).unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(
+            gw::parse_read(&out.stdout).unwrap(),
+            vec![("claude/tok".to_string(), b"abc".to_vec())]
+        );
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("tok"), "secret").unwrap();
+        std::os::unix::fs::symlink(&outside, base.join("copilot")).unwrap();
+        let out = sh(&read_store_script_at(r, SESSION, &["copilot/tok"]).unwrap());
+        assert_eq!(out.status.code(), Some(46));
+        assert!(out.stdout.is_empty());
+        let fifo = base.join("claude/fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let out = sh(&read_store_script_at(r, SESSION, &["claude/fifo"]).unwrap());
+        assert_eq!(out.status.code(), Some(45));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// B-4 review #6: a store a vendor CLI locked (`chmod 000` dirs) is still removed, and a store
+    /// that is a link is removed as a link, its target untouched.
+    #[test]
+    fn k8s_a_locked_login_store_is_removed_and_a_link_never_followed() {
+        let root = store_root();
+        let base = root.join(SESSION);
+        std::fs::create_dir_all(base.join("a/b")).unwrap();
+        std::fs::write(base.join("a/b/tok"), "secret").unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(base.join("a/b"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        std::fs::set_permissions(base.join("a"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = root.to_str().unwrap();
+        let out = sh(&remove_store_script(r, SESSION).unwrap());
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(!base.exists());
+        let target = root.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("keep"), "k").unwrap();
+        std::os::unix::fs::symlink(&target, &base).unwrap();
+        let out = sh(&remove_store_script(r, SESSION).unwrap());
+        assert!(out.status.success());
+        assert!(std::fs::symlink_metadata(&base).is_err());
+        assert!(target.join("keep").exists());
+        // Removing what is gone is done.
+        assert!(sh(&remove_store_script(r, SESSION).unwrap())
+            .status
+            .success());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// B-4 review #5: a gateway process that runs but is not ready can still accept a pending key:
+    /// unknown, never "not serving". Only no process alive is "not serving".
+    #[test]
+    fn k8s_an_unready_gateway_is_never_read_as_stopped() {
+        let pod = |state: Value, ready: bool| {
+            json!({"metadata": {"name": "agw-1"}, "status": {"phase": "Running",
+                "conditions": [{"type": "Ready", "status": if ready {"True"} else {"False"}}],
+                "containerStatuses": [{"name": "gateway", "ready": ready, "state": state}]}})
+        };
+        assert_eq!(gw::serving_state(&[]), Some(false));
+        assert_eq!(
+            gw::serving_state(&[pod(json!({"running": {}}), true)]),
+            Some(true)
+        );
+        assert_eq!(
+            gw::serving_state(&[pod(json!({"running": {}}), false)]),
+            None
+        );
+        assert_eq!(
+            gw::serving_state(&[pod(
+                json!({"waiting": {"reason": "PodInitializing"}}),
+                false
+            )]),
+            Some(false)
+        );
+        assert_eq!(
+            gw::serving_state(&[pod(json!({"terminated": {}}), false)]),
+            Some(false)
+        );
+    }
+
+    /// B-4 review #2: a sign-in never re-applies an existing gateway; one without login stores is
+    /// refused with what to do.
+    #[test]
+    fn k8s_a_gateway_without_login_stores_is_named() {
+        let dep = render::gateway_deployment(&spec());
+        assert!(gw::has_login_stores(&dep));
+        let mut old = dep.clone();
+        old["spec"]["template"]["spec"]["volumes"] = json!([]);
+        assert!(!gw::has_login_stores(&old));
     }
 }
