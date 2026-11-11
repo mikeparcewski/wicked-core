@@ -26,7 +26,9 @@ Two release tracks share this file, newest entry first regardless of track:
   meanwhile waits for its release), and drops the probe when the run ended, moved to another attempt or unit, or was
   dispatched again. A probe result is used only when it was computed on the inputs the dispatch has; otherwise the
   dispatch reads it itself, as before. After a step, the worker thread reads whether the worktree is clean, and (for
-  a failed attempt with an author probe) the tree it left, so the fold runs no git on the actor. A probe thread that
+  a failed attempt with an author probe) the tree it left, for every worker path (in-process, bus-mediated, a
+  Tool's thread), so the fold runs no git on the actor for a current payload; an older payload without these reads
+  is folded with the reads taken on the actor, as before. A probe thread that
   panics still answers, with no tree, so the unit's guarded gate fails closed rather than the run waiting forever.
 
 - **Run reads no longer wait behind the engine's single-writer actor; the actor's slow commands are named (wicked-core#1390,

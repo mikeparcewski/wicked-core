@@ -69,6 +69,10 @@ pub(crate) struct DispatchProbe {
     /// ended, relaunched, advanced) is not this dispatch's any more.
     pub(crate) status: crate::domain::SessionStatus,
     pub(crate) cursor: usize,
+    /// What the probe read FROM: the run's worktree and its repository's registration (id, root,
+    /// code graph). The dispatch takes the probe only on these same inputs, and probes again when
+    /// they changed (a repository re-registered meanwhile).
+    pub(crate) inputs: ProbeInputs,
     /// The one snapshot of the worktree, pinned to the registered repository.
     pub(crate) snapshot: Result<WorktreeSnapshot, String>,
     pub(crate) qe: Option<ScoredQe>,
@@ -105,6 +109,26 @@ impl DispatchProbe {
     ) -> Option<Result<Option<String>, String>> {
         let r = self.requirements.as_ref()?;
         (r.tree == tree && r.base_commit == base_commit).then(|| r.record.clone())
+    }
+}
+
+/// The inputs a probe read from ([`DispatchProbe::inputs`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeInputs {
+    pub(crate) workdir: PathBuf,
+    pub(crate) repo_id: String,
+    pub(crate) repo_root: String,
+    pub(crate) code_graph_db: String,
+}
+
+impl ProbeInputs {
+    pub(crate) fn of(workdir: &Path, repo: &RepoEntry) -> Self {
+        Self {
+            workdir: workdir.to_path_buf(),
+            repo_id: repo.id.clone(),
+            repo_root: repo.root_path.clone(),
+            code_graph_db: repo.code_graph_db.clone(),
+        }
     }
 }
 
@@ -157,6 +181,7 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
             job.session.status,
             job.session.unit_ix,
         );
+        let inputs = ProbeInputs::of(&job.workdir, &job.repo);
         // A probe that panics still answers — with no tree, so the dispatch goes on fail-closed
         // (no baseline: a guarded gate denies) rather than leaving the run waiting for ever.
         let probe = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run(seq, job)))
@@ -166,6 +191,7 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
                 attempt,
                 status,
                 cursor,
+                inputs,
                 snapshot: Err("the worktree probe panicked".into()),
                 qe: None,
                 requirements: None,
@@ -246,6 +272,7 @@ fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
         attempt: job.attempt,
         status: job.session.status,
         cursor: job.session.unit_ix,
+        inputs: ProbeInputs::of(&job.workdir, &job.repo),
         snapshot,
         qe,
         requirements,

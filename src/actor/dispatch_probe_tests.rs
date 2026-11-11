@@ -398,3 +398,130 @@ fn post_step_reads_cover_every_attempt_the_fold_treats_as_failed() {
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
 }
+
+/// (review of #1411) Through the shared worker entry point the fold's reads come back with the
+/// result: an Ok step the fold's approval tripwire turns into a failure reads the tree it left.
+#[test]
+fn the_worker_entry_point_returns_the_folds_tree_reads() {
+    struct Refused;
+    impl StepRunner for Refused {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            let line = "ERROR codex_core::tools::router: error=exec_command failed: CreateProcess { message: \"Rejected(\\\"approval request failed\\\")\" }\n";
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: line.repeat(5),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let f = fixture("entry");
+    let repo = f.dir.join("repo");
+    let git_dir = repo.join(".git").to_string_lossy().into_owned();
+    let mut unit = crate::domain::WorkUnit::pending("e:s1", "e", 1, "do it");
+    unit.author_probe = Some(crate::domain::AuthorProbe {
+        seat: "a".into(),
+        attempt: 0,
+        tree: String::new(),
+        git_dir: git_dir.clone(),
+        binaries_before: Vec::new(),
+    });
+    let input = StepInput {
+        run_id: "e".into(),
+        unit_ix: 0,
+        attempt: 0,
+        unit,
+        workflow_id: "wf".into(),
+        entity_mode: crate::EntityMode::Shared,
+        workdir: Some(repo.clone()),
+        governance: None,
+        prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
+        required_skills: Vec::new(),
+    };
+    let runner: Arc<dyn StepRunner> = Arc::new(Refused);
+    let (output, _, evidence) = crate::cli_runner::run_unit_and_judge(
+        &runner,
+        &input,
+        None,
+        &|_: &str| {},
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+    );
+    assert_eq!(output.status, StepStatus::Ok, "the runner's own status");
+    assert_eq!(evidence.worktree_clean, Some(true));
+    let tree = evidence
+        .tree_after_failure
+        .expect("the fold will fail this attempt: its tree is read on the worker");
+    assert_eq!(tree.git_dir, git_dir);
+    assert!(tree.tree.is_some());
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// (review of #1411) A probe read from a repository registration that changed while it ran (the
+/// same repository id re-registered at another root) is not taken: the dispatch probes again.
+#[test]
+fn a_repository_reregistered_while_the_probe_ran_is_probed_again() {
+    let f = fixture("rereg");
+    let run = format!("probe-rereg-{}", std::process::id());
+    let (entered, release) = hold(&run);
+    launch(&f, &run);
+    entered
+        .recv_timeout(Duration::from_secs(60))
+        .expect("the probe is out");
+    // Re-register the same repository name at another root.
+    let other = f.dir.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q"]);
+    git(&other, &["config", "user.email", "t@example.invalid"]);
+    git(&other, &["config", "user.name", "t"]);
+    git(&other, &["config", "commit.gpgsign", "false"]);
+    std::fs::write(other.join("b.txt"), "b\n").unwrap();
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-qm", "b"]);
+    let again = f
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "probe-rereg".into(),
+            root_path: other.to_string_lossy().into_owned(),
+            registered_at: 2,
+        })
+        .expect("re-register");
+    assert_eq!(
+        again.id, f.repo_ref,
+        "the same repository id, at another root"
+    );
+    release.send(()).unwrap();
+    let probes = || {
+        f.core
+            .actor_stats()
+            .commands
+            .iter()
+            .find(|c| c.command == "DispatchProbed")
+            .map_or(0, |c| c.count)
+    };
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while Instant::now() < deadline && probes() < 2 {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        probes() >= 2,
+        "the stale read was not taken: the dispatch probed again ({} answers)",
+        probes()
+    );
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}

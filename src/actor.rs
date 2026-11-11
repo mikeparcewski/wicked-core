@@ -3911,6 +3911,21 @@ pub(crate) fn run(
                 if !still_waiting {
                     continue;
                 }
+                // The worktree and repository registration the probe read from must still be the
+                // run's; if they changed (a repository re-registered meanwhile), the dispatch reads
+                // them again — from the first pass — instead of taking a foreign read.
+                let same_inputs = crate::domain::get_session(&store, &run_id)
+                    .ok()
+                    .flatten()
+                    .and_then(|s| {
+                        let wd = std::path::PathBuf::from(s.workdir?);
+                        let repo = crate::repo::get_repo(&store, s.repo_ref.as_deref()?)
+                            .ok()
+                            .flatten()?;
+                        Some(dispatch_probe::ProbeInputs::of(&wd, &repo))
+                    })
+                    .is_some_and(|now| now == probe.inputs);
+                let probe = same_inputs.then_some(probe);
                 match dispatch_unit_with(
                     &mut store,
                     &mut subscribers,
@@ -3922,7 +3937,7 @@ pub(crate) fn run(
                     &actor_maps,
                     process_gen,
                     is_acp,
-                    Some(probe),
+                    probe,
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -13241,6 +13256,7 @@ fn dispatch_unit_with(
                 launch_seq: my_seq,
             });
             // (SWAP 6) Once the delivery wrote the pull request, its deferred rules are checked.
+            let tool_worktree_clean = workdir.as_deref().map(|wd| worktree_is_clean(Some(wd)));
             let delivery_rule_check = match (&delivery_rules, status, workdir.as_deref()) {
                 (Some(ctx), crate::workflow::StepStatus::Ok, Some(wd)) => {
                     crate::cli_runner::delivery_rule_check(ctx, std::path::Path::new(wd))
@@ -13282,8 +13298,9 @@ fn dispatch_unit_with(
                     demo_take,
                     editor_conformance: conformance_rec,
                     draft_render: render_rec,
-                    // A Tool unit's fold reads the tree itself (cheap here: no author probe).
-                    worktree_clean: None,
+                    // (core#1390) Read here, on the Tool's thread, so the fold runs no git on the
+                    // actor; a Tool unit carries no author probe, so no failure tree.
+                    worktree_clean: tool_worktree_clean,
                     tree_after_failure: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
@@ -20026,8 +20043,6 @@ pub(crate) fn cancel_run(
     run_id: &str,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
 ) -> anyhow::Result<SessionStatus> {
-    // (core#1390) A dispatch probe still out for this run is no longer its dispatch.
-    dispatch_probe::forget(run_id);
     let mut session = crate::domain::get_session(store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     // Already terminal: report the status, do NOT re-emit a terminal event (or re-notify a campaign).
@@ -20088,6 +20103,9 @@ pub(crate) fn cancel_run(
     power_gate::set_outcome(&*store, &mut session, "cancelled");
     session.finished_at = Some(crate::interaction::now_millis());
     put_node(store, session.to_node())?;
+    // (core#1390) Only once the cancel is on the store: a dispatch probe still out for this run is
+    // no longer its dispatch (a cancel that failed before this leaves the probe to land).
+    dispatch_probe::forget(run_id);
     team_gate::run_ended(&*store, run_id, crate::team::events::PathStatus::Cancelled);
     // (core#1122) The floor build cache goes whether or not the repository still resolves (the
     // worktree reap below needs it).
