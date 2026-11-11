@@ -152,6 +152,11 @@ pub(crate) fn default_deny(ns: &str, owner: &str) -> Value {
 /// The roles that may reach the gateway: seats and judges. Floors, sync and fill pods never.
 pub(crate) const GATEWAY_CLIENT_ROLES: &[&str] = &["seat", "judge"];
 
+/// The label saying whether a seat or judge pod may reach the gateway (`online`) or runs with no
+/// network at all (`offline`, `WICKED_SEAT_NETWORK=none`): both gateway policies select
+/// `online` only (review r4: an offline seat could reach a running gateway's CONNECT route by IP).
+pub(crate) const NET_LABEL: &str = "wicked.dev/net";
+
 /// Seats' and judges' only egress: the gateway pods of the daemon namespace, on the seat ports.
 /// No DNS: a seat reaches the gateway by `hostAliases` (closing DNS as a tunnel).
 pub(crate) fn seat_egress(ns: &str, owner: &str, daemon_ns: &str, ports: &[u16]) -> Value {
@@ -160,9 +165,12 @@ pub(crate) fn seat_egress(ns: &str, owner: &str, daemon_ns: &str, ports: &[u16])
         "kind": "NetworkPolicy",
         "metadata": meta("seat-egress-gateway-only", Some(ns), owner, &[]),
         "spec": {
-            "podSelector": {"matchExpressions": [{
-                "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
-            }]},
+            "podSelector": {
+                "matchLabels": {NET_LABEL: "online"},
+                "matchExpressions": [{
+                    "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
+                }],
+            },
             "policyTypes": ["Egress"],
             "egress": [{
                 "to": [{
@@ -197,9 +205,12 @@ pub(crate) fn gateway_ingress(daemon_ns: &str, owner: &str, ports: &[u16]) -> Va
                     "namespaceSelector": {"matchLabels": {
                         OWNER_LABEL: owner, ROLE_LABEL: "run",
                     }},
-                    "podSelector": {"matchExpressions": [{
-                        "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
-                    }]},
+                    "podSelector": {
+                        "matchLabels": {NET_LABEL: "online"},
+                        "matchExpressions": [{
+                            "key": ROLE_LABEL, "operator": "In", "values": GATEWAY_CLIENT_ROLES,
+                        }],
+                    },
                 }],
                 "ports": tcp_ports(ports),
             }]
@@ -346,6 +357,55 @@ pub(crate) struct SeatPod {
     /// The pod's own deadline (`activeDeadlineSeconds`): the kubelet kills it past this, even
     /// with no controller or API server left.
     pub(crate) deadline_secs: u64,
+    /// The replica sub-directory every path of this pod lives under (a one-shot engine session's
+    /// own scope in the shared session namespace); `None` = the replica's root.
+    pub(crate) scope: Option<String>,
+    /// PARITY B17: a read-only unit's tree. The replica's copy is mounted read-only at
+    /// [`VIEW_SOURCE`], and an init container copies it into an emptyDir at the tree's own
+    /// path: the unit's writes land in that throwaway view and go with the pod.
+    pub(crate) view: Option<PathBuf>,
+}
+
+/// Where a read-only unit's replica tree is mounted read-only (the view's source).
+pub(crate) const VIEW_SOURCE: &str = "/wicked-ro";
+
+/// The replica sub-path of `p` under an optional `scope`.
+pub(crate) fn scoped_sub_path(scope: Option<&str>, p: &Path) -> Option<String> {
+    let sub = replica_sub_path(p)?;
+    Some(match scope {
+        Some(s) => format!("{s}/{sub}"),
+        None => sub,
+    })
+}
+
+/// The dir inside a read-only unit's view emptyDir that holds the tree, mounted at the tree's
+/// path by `subPath`. The emptyDir's own root is the kubelet's (`0:<fsGroup>`), so git in the
+/// pod refused a tree mounted there ("dubious ownership", phase C); this dir is made by the
+/// view init as the pod's uid, so the tree root is the seat's own, as on the replica.
+pub(crate) const VIEW_TREE: &str = "tree";
+
+/// The init container that copies a read-only unit's replica tree into its view (no link
+/// followed; tracked content under any name, `target/` included, review r1).
+fn view_init(floor_image: &str, sub: &str) -> Value {
+    json!({
+        "name": "view",
+        "image": floor_image,
+        "imagePullPolicy": "Never",
+        "command": ["/busybox", "sh", "-c",
+            // Both sides' failure fails the init (codex b2-gw #6): a copy cut short never
+            // starts the reviewer on part of the tree.
+            // Made afresh each time (codex r1 #11): a re-run init never fails on, or keeps, the
+            // tree an earlier run left.
+            format!("set -o pipefail; /busybox rm -rf /wicked-view/{VIEW_TREE} && \
+                     /busybox mkdir /wicked-view/{VIEW_TREE} && cd /wicked-ro && \
+                     /busybox tar -cf - . | /busybox tar -C /wicked-view/{VIEW_TREE} -xf -")],
+        "securityContext": hardened_context(),
+        "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},
+        "volumeMounts": [
+            {"name": "replica", "mountPath": VIEW_SOURCE, "subPath": sub, "readOnly": true},
+            {"name": "view", "mountPath": "/wicked-view"},
+        ],
+    })
 }
 
 /// The init container that copies the engine's trusted launcher files out of the floor image
@@ -373,13 +433,43 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         json!({"name": "canary", "mountPath": "/wicked-canary"}),
         json!({"name": "unit", "mountPath": UNIT_DIR}),
     ];
-    let reserved = [FLOOR_DIR, "/tmp", "/home/seat", "/wicked-canary", UNIT_DIR];
-    for m in &s.mounts {
-        let sub = replica_sub_path(&m.path)
+    let reserved = [
+        FLOOR_DIR,
+        "/tmp",
+        "/home/seat",
+        "/wicked-canary",
+        UNIT_DIR,
+        VIEW_SOURCE,
+    ];
+    let mut init = vec![floor_init(&s.floor_image)];
+    let mut extra_volumes = Vec::new();
+    if let Some(tree) = &s.view {
+        let sub = scoped_sub_path(s.scope.as_deref(), tree)
+            .ok_or_else(|| format!("{} cannot be a replica path", tree.display()))?;
+        mounts.push(
+            json!({"name": "replica", "mountPath": VIEW_SOURCE, "subPath": sub, "readOnly": true}),
+        );
+        mounts.push(
+            json!({"name": "view", "mountPath": tree.to_string_lossy(), "subPath": VIEW_TREE}),
+        );
+        init.push(view_init(&s.floor_image, &sub));
+        extra_volumes.push(json!({"name": "view", "emptyDir": {"sizeLimit": "8Gi"}}));
+    }
+    // Shallower first, so a deeper mount lands over its parent.
+    let mut plan: Vec<&ReplicaMount> = s.mounts.iter().collect();
+    plan.sort_by_key(|m| m.path.components().count());
+    for m in plan {
+        if s.view.as_ref() == Some(&m.path) {
+            continue;
+        }
+        let sub = scoped_sub_path(s.scope.as_deref(), &m.path)
             .ok_or_else(|| format!("{} cannot be a replica path", m.path.display()))?;
-        if reserved.iter().any(|r| {
-            m.path == Path::new(r) || m.path.starts_with(r) || Path::new(r).starts_with(&m.path)
-        }) {
+        // A path under `/tmp` may be mounted over the pod's scratch (an engine session's tree
+        // lives there on Linux, review r1); `/tmp` itself and every other reserved path may not.
+        if reserved
+            .iter()
+            .any(|r| Path::new(r).starts_with(&m.path) || (*r != "/tmp" && m.path.starts_with(r)))
+        {
             return Err(format!(
                 "{} would cover a path the pod reserves",
                 m.path.display()
@@ -403,7 +493,7 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
         // Kubelet-enforced, independent of the controller and the engine (review r1 P2).
         "activeDeadlineSeconds": s.deadline_secs,
         "securityContext": pod_context(POD_UID),
-        "initContainers": [floor_init(&s.floor_image)],
+        "initContainers": init,
         "containers": [{
             "name": "seat",
             "image": s.image,
@@ -433,6 +523,9 @@ pub(crate) fn seat_pod_spec(s: &SeatPod) -> Result<Value, String> {
             {"name": "replica", "persistentVolumeClaim": {"claimName": REPLICA_PVC}},
         ],
     });
+    if let Some(v) = spec["volumes"].as_array_mut() {
+        v.extend(extra_volumes);
+    }
     if let Some(ip) = &s.gateway_ip {
         spec["hostAliases"] = json!([{"ip": ip, "hostnames": ["agw"]}]);
     }
@@ -450,6 +543,14 @@ pub(crate) fn seat_sandbox(s: &SeatPod) -> Result<Value, String> {
             (super::UNIT_LABEL, &s.unit_label),
             (super::BOOT_LABEL, &s.boot),
             (ROLE_LABEL, &s.role),
+            (
+                NET_LABEL,
+                if s.gateway_ip.is_some() {
+                    "online"
+                } else {
+                    "offline"
+                },
+            ),
         ],
     );
     Ok(json!({
@@ -480,6 +581,10 @@ pub(crate) struct GatewaySpec {
     pub(crate) owner: String,
     pub(crate) image: String,
     pub(crate) writer_image: String,
+    /// The gateway's boot token: its container starts only once the writer has published a
+    /// config AND this token to `/cfg/boot` (review r1: a gateway re-created after a quarantine
+    /// must never serve the config it was quarantined with).
+    pub(crate) boot: String,
 }
 
 pub(crate) const GATEWAY_NAME: &str = "agw";
@@ -534,7 +639,8 @@ pub(crate) fn gateway_deployment(g: &GatewaySpec) -> Value {
                             "name": "wait-config",
                             "image": g.writer_image,
                             "imagePullPolicy": "IfNotPresent",
-                            "command": ["sh", "-c", "until [ -s /cfg/config.json ]; do sleep 0.2; done"],
+                            "command": ["sh", "-c", "until [ -s /cfg/config.json ] && [ \"$(cat /cfg/boot 2>/dev/null)\" = \"$WICKED_GW_BOOT\" ]; do sleep 0.2; done"],
+                            "env": [{"name": "WICKED_GW_BOOT", "value": g.boot}],
                             "securityContext": hardened_context(),
                             "resources": {
                                 "requests": {"memory": "8Mi", "cpu": "5m"},
@@ -698,12 +804,15 @@ pub(crate) fn pids_probe_pod(
 ) -> Value {
     let limit = POD_PIDS_MAX + PIDS_PROBE_SLACK;
     // First the policy enforcement check (review r1 P1): this pod's namespace denies all egress,
-    // so the API server and the node's kubelet must not answer it; then the fork count. The check
-    // waits 3 s: a new pod's policy lands just after its first instant (PARITY F1, seen again on
-    // this probe: both answered at start), and the verdict is about the policy in force.
+    // so the API server and the node's kubelet must not answer it; then the fork count. A new
+    // pod's policy lands after its first instant (PARITY F1), later under load (B-2 live: still
+    // open after 3 s at load ~60), so the check polls up to ~20 s for every target to close; a
+    // cluster that never enforces still answers open at the end.
     let script = format!(
-        "/busybox sleep 3; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\" \"1.1.1.1 443\"; do \
-         if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then echo net=open; else echo net=closed; fi; done; \
+        "i=0; while :; do r=''; for t in \"$KUBERNETES_SERVICE_HOST 443\" \"$HOST_IP 10250\" \"1.1.1.1 443\"; do \
+         if /busybox nc -w 2 $t </dev/null >/dev/null 2>&1; then r=\"$r open\"; else r=\"$r closed\"; fi; done; \
+         i=$((i+1)); case \"$r\" in *open*) [ $i -lt 10 ] && {{ /busybox sleep 2; continue; }};; esac; break; done; \
+         for n in $r; do echo net=$n; done; \
          i=0; while [ $i -lt {limit} ]; do /busybox sleep 120 & i=$((i+1)); echo $i; done; \
          echo {PIDS_PROBE_UNBOUNDED}"
     );
@@ -743,6 +852,15 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
         .lines()
         .filter_map(|l| l.trim().strip_prefix("net="))
         .collect();
+    // No network answer at all is a probe that did not run to its end (evicted, cut): an
+    // infrastructure failure to retry, never a claim about the cluster's policy (live, B-2).
+    if net.is_empty() {
+        return Err(
+            "the pids-limit probe printed no network answer (its pod was evicted or its log \
+             was cut); retry"
+                .into(),
+        );
+    }
     if net.len() != 3 || net.iter().any(|n| *n != "closed") {
         return Err(format!(
             "the cluster does not enforce NetworkPolicy: a pod in a deny-all namespace reached \

@@ -1,0 +1,1454 @@
+//! The replica sync (PARITY B11, D1): how a unit's host paths reach its run's replica volume and
+//! how a creator's changes come back.
+//!
+//! **One stream format, both directions.** The engine never parses a tar header written by a
+//! seat. Both directions use one framed stream: [`MAGIC`], then roots ([`ROOT`] marker: the
+//! root's replica path and its mode), each followed by its entries (a kind byte, a length-prefixed
+//! path relative to the root, a length-prefixed body), then [`END`]. A stream without its end
+//! marker is truncated and refused whole. The engine side is [`encode_root`] / [`decode`]; the
+//! pod side is [`POD_CODEC`], a fixed Python program run with `python3 -I` in the run's sync pod
+//! (the checks image), which only reads and writes bytes: it never runs repository code.
+//!
+//! **Modes.** `tree` = a unit's worktree: the files git lists (tracked, plus untracked and not
+//! ignored), never anything under `.git`. `git` = the replica's own `.git`, rebuilt by the engine
+//! at every copy-in (a seat's hooks or config never reach a later unit). `plain` = any other
+//! root, copied whole. `seed` = a cache, copied only when the replica has none yet.
+//!
+//! **Write-back is untrusted input.** [`check_entries`] refuses absolute paths, `..`, a `.git`
+//! component (in any case or spelling a case-insensitive file system folds), anything but regular
+//! files and symlinks, and symlinks whose target leaves the root; [`apply`] writes on the host
+//! with a no-follow walk (`openat(O_NOFOLLOW)`, component by component), so a directory the seat
+//! replaced with a link is never followed, and replaces each file by rename, so no partial file
+//! is ever visible.
+
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
+
+/// The stream's first bytes.
+pub(crate) const MAGIC: &[u8] = b"WKS1\n";
+/// Kind byte: a root marker (path = the root's replica path, body = its mode).
+pub(crate) const ROOT: u8 = b'R';
+/// Kind byte: the end of the stream.
+pub(crate) const END: u8 = b'E';
+/// The most bytes one stream may carry (a write-back larger than this is refused, not cut).
+pub(crate) const MAX_STREAM: u64 = 512 << 20;
+/// The most entries one stream may carry.
+pub(crate) const MAX_ENTRIES: usize = 400_000;
+/// The most roots one stream may carry (a unit has a handful).
+pub(crate) const MAX_ROOTS: usize = 4096;
+
+/// A root's sync mode (see the module doc).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Tree,
+    Git,
+    Plain,
+    Seed,
+    /// Single files of a directory, named one by one (bound files: launch settings, a prompt).
+    Files,
+    /// A seat home (review r7 #1): the engine's files copied in over what the replica holds, never
+    /// mirrored (the CLI's sessions of earlier units stay, so a resume finds them), never written
+    /// back. Per run and posture, like the session it serves.
+    Home,
+}
+
+impl Mode {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Mode::Tree => "tree",
+            Mode::Git => "git",
+            Mode::Plain => "plain",
+            Mode::Seed => "seed",
+            Mode::Files => "files",
+            Mode::Home => "home",
+        }
+    }
+    fn parse(s: &[u8]) -> Option<Self> {
+        match s {
+            b"tree" => Some(Mode::Tree),
+            b"git" => Some(Mode::Git),
+            b"plain" => Some(Mode::Plain),
+            b"seed" => Some(Mode::Seed),
+            b"files" => Some(Mode::Files),
+            b"home" => Some(Mode::Home),
+            _ => None,
+        }
+    }
+}
+
+/// What an entry is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// A regular file.
+    File,
+    /// A regular file with its execute bit.
+    Exec,
+    /// A symlink (the body is its target).
+    Link,
+    /// Anything else the pod found (a fifo, a socket, a device): always refused on write-back.
+    Other,
+}
+
+impl Kind {
+    fn byte(self) -> u8 {
+        match self {
+            Kind::File => b'f',
+            Kind::Exec => b'x',
+            Kind::Link => b'l',
+            Kind::Other => b'o',
+        }
+    }
+    fn parse(b: u8) -> Option<Self> {
+        match b {
+            b'f' => Some(Kind::File),
+            b'x' => Some(Kind::Exec),
+            b'l' => Some(Kind::Link),
+            b'o' => Some(Kind::Other),
+            _ => None,
+        }
+    }
+}
+
+/// One file of a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Entry {
+    pub(crate) kind: Kind,
+    /// Relative to its root, `/`-separated, UTF-8.
+    pub(crate) path: String,
+    pub(crate) data: Vec<u8>,
+}
+
+/// One root of a stream and its entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Root {
+    /// The root's path in the replica: its host path without the leading `/`.
+    pub(crate) replica: String,
+    pub(crate) mode: Mode,
+    pub(crate) entries: Vec<Entry>,
+}
+
+fn put(out: &mut dyn Write, kind: u8, path: &[u8], data: &[u8]) -> std::io::Result<()> {
+    out.write_all(&[kind])?;
+    out.write_all(&(path.len() as u32).to_be_bytes())?;
+    out.write_all(path)?;
+    out.write_all(&(data.len() as u64).to_be_bytes())?;
+    out.write_all(data)
+}
+
+/// Write one root and its entries.
+pub(crate) fn encode_root(out: &mut dyn Write, root: &Root) -> std::io::Result<()> {
+    put(
+        out,
+        ROOT,
+        root.replica.as_bytes(),
+        root.mode.as_str().as_bytes(),
+    )?;
+    for e in &root.entries {
+        put(out, e.kind.byte(), e.path.as_bytes(), &e.data)?;
+    }
+    Ok(())
+}
+
+/// A whole stream of `roots`.
+pub(crate) fn encode(roots: &[Root]) -> Vec<u8> {
+    let mut out = MAGIC.to_vec();
+    for r in roots {
+        encode_root(&mut out, r).expect("writing to a Vec");
+    }
+    put(&mut out, END, b"", b"").expect("writing to a Vec");
+    out
+}
+
+fn read_exact_or(r: &mut dyn Read, buf: &mut [u8], what: &str) -> Result<(), String> {
+    r.read_exact(buf)
+        .map_err(|_| format!("the sync stream was truncated ({what})"))
+}
+
+/// Read a whole stream: every root and entry, or `Err` (truncated, oversized, malformed). A
+/// stream is never applied in part.
+pub(crate) fn decode(r: &mut dyn Read, limit: u64) -> Result<Vec<Root>, String> {
+    let mut magic = [0u8; 5];
+    read_exact_or(r, &mut magic, "magic")?;
+    if magic != MAGIC {
+        return Err("the sync stream does not start with its magic".into());
+    }
+    let mut roots: Vec<Root> = Vec::new();
+    let mut total: u64 = 0;
+    let mut count = 0usize;
+    loop {
+        let mut kind = [0u8; 1];
+        read_exact_or(r, &mut kind, "kind")?;
+        let mut len4 = [0u8; 4];
+        read_exact_or(r, &mut len4, "path length")?;
+        let plen = u32::from_be_bytes(len4) as u64;
+        if plen > 64 * 1024 {
+            return Err("a sync path is longer than 64 KiB".into());
+        }
+        let mut path = vec![0u8; plen as usize];
+        read_exact_or(r, &mut path, "path")?;
+        let mut len8 = [0u8; 8];
+        read_exact_or(r, &mut len8, "body length")?;
+        let dlen = u64::from_be_bytes(len8);
+        total = total.saturating_add(dlen).saturating_add(plen + 13);
+        if total > limit {
+            return Err(format!("the sync stream is larger than {limit} bytes"));
+        }
+        let mut data = vec![0u8; dlen as usize];
+        read_exact_or(r, &mut data, "body")?;
+        if kind[0] == END {
+            if !path.is_empty() || !data.is_empty() {
+                return Err("a malformed end marker".into());
+            }
+            return Ok(roots);
+        }
+        let path = String::from_utf8(path).map_err(|_| "a sync path is not UTF-8".to_string())?;
+        if kind[0] == ROOT {
+            // Root records are bounded too (codex b2-sync #18): a stream of tiny roots is
+            // refused as it is read, never allocated by the million.
+            if roots.len() >= MAX_ROOTS {
+                return Err(format!("the sync stream has more than {MAX_ROOTS} roots"));
+            }
+            let mode = Mode::parse(&data).ok_or("a sync root has an unknown mode")?;
+            roots.push(Root {
+                replica: path,
+                mode,
+                entries: Vec::new(),
+            });
+            continue;
+        }
+        let kind = Kind::parse(kind[0]).ok_or("a sync entry has an unknown kind")?;
+        count += 1;
+        if count > MAX_ENTRIES {
+            return Err(format!(
+                "the sync stream has more than {MAX_ENTRIES} entries"
+            ));
+        }
+        let root = roots.last_mut().ok_or("a sync entry precedes every root")?;
+        root.entries.push(Entry { kind, path, data });
+    }
+}
+
+/// Characters a case-insensitive, normalizing file system ignores in a name (HFS+), so `.g\u{200c}it`
+/// would land as `.git` (the class of CVE-2014-9390).
+fn ignorable(c: char) -> bool {
+    matches!(c as u32, 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x206F | 0xFEFF)
+}
+
+/// Whether a path component names a git dir on any host file system.
+pub(crate) fn is_git_name(c: &str) -> bool {
+    let folded: String = c.chars().filter(|c| !ignorable(*c)).collect::<String>();
+    let folded = fold(&folded);
+    let folded = folded.trim_end_matches(['.', ' ']);
+    folded == ".git" || folded == "git~1"
+}
+
+/// A relative path's components, or `Err` when it is absolute, empty or walks up.
+pub(crate) fn components(rel: &str) -> Result<Vec<&str>, String> {
+    if rel.is_empty() || rel.starts_with('/') || rel.contains('\0') || rel.contains('\\') {
+        return Err(format!("`{rel}` is not a relative path"));
+    }
+    let parts: Vec<&str> = rel.split('/').collect();
+    if parts
+        .iter()
+        .any(|c| c.is_empty() || *c == "." || *c == "..")
+    {
+        return Err(format!("`{rel}` is not a plain relative path"));
+    }
+    Ok(parts)
+}
+
+/// Whether `target` (a symlink's text at `rel`) stays inside the root, read lexically.
+pub(crate) fn link_stays_inside(rel: &str, target: &[u8]) -> bool {
+    let Ok(t) = std::str::from_utf8(target) else {
+        return false;
+    };
+    if t.is_empty() || t.starts_with('/') || t.contains('\0') {
+        return false;
+    }
+    let mut depth: Vec<&str> = rel.split('/').collect();
+    depth.pop();
+    for c in t.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                if depth.pop().is_none() {
+                    return false;
+                }
+            }
+            c => depth.push(c),
+        }
+    }
+    true
+}
+
+/// A path as a case-insensitive, normalizing host file system compares it (review r1: a mask
+/// for `.env` must also cover `.ENV`): decomposed (NFD, so `\u{e9}` and `e\u{301}` agree, review
+/// r3), ignorable characters dropped, and case-folded through upper then lower case (so `\u{17f}`,
+/// the long s, folds to `s` as APFS folds it, review r3). Coarser than any one file system's rule
+/// on purpose: two names it folds together are refused or masked, never both written.
+pub(crate) fn fold(p: &str) -> String {
+    use unicode_normalization::UnicodeNormalization as _;
+    p.nfd()
+        .filter(|c| !ignorable(*c))
+        .collect::<String>()
+        .to_uppercase()
+        .to_lowercase()
+}
+
+/// Whether `rel` (under a root) is `prefix` or lies under it, compared folded ([`fold`]).
+pub(crate) fn under(rel: &str, prefix: &str) -> bool {
+    let (rel, prefix) = (fold(rel), fold(prefix));
+    rel == prefix || rel.starts_with(&format!("{prefix}/"))
+}
+
+/// Every link among `entries` resolves inside the root, following the other links of the set
+/// on the way (review r1: `a -> .` and `b -> a/../out` are each lexically inside, together not).
+pub(crate) fn links_stay_inside(entries: &[Entry]) -> Result<(), String> {
+    links_stay_inside_on(None, entries)
+}
+
+/// [`links_stay_inside`], also following the links already on the host under `root` that the
+/// write-back keeps (review r2: an ignored host link `a -> .` the seat never saw).
+pub(crate) fn links_stay_inside_on(root: Option<&Path>, entries: &[Entry]) -> Result<(), String> {
+    links_stay_inside_final(root, entries, &[], &[])
+}
+
+/// [`links_stay_inside_on`] over the tree as the write-back will leave it (review r4): a host
+/// link the same write-back deletes or replaces (by an entry at its path or under it) is not
+/// followed, and no link may lead into `fence` (the root's nested roots and masks, written back
+/// on their own terms), so links checked in two roots can never combine into an escape.
+pub(crate) fn links_stay_inside_final(
+    root: Option<&Path>,
+    entries: &[Entry],
+    deletes: &[String],
+    fence: &[String],
+) -> Result<(), String> {
+    // Host paths the write-back replaces, by their exact spelling (codex b2-sync #3): on a
+    // case-sensitive host `A` replaces nothing at `a`, so a host link at `a` is still followed.
+    let gone: std::collections::HashSet<String> = deletes
+        .iter()
+        .cloned()
+        .chain(entries.iter().map(|e| e.path.clone()))
+        .collect();
+    let ancestors: std::collections::HashSet<String> = entries
+        .iter()
+        .flat_map(|e| {
+            let parts: Vec<String> = e.path.split('/').map(str::to_string).collect();
+            (1..parts.len())
+                .map(|i| parts[..i].join("/"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let links_exact: std::collections::HashSet<String> = entries
+        .iter()
+        .filter(|e| e.kind == Kind::Link)
+        .map(|e| e.path.clone())
+        .collect();
+    let links: std::collections::HashMap<String, String> = entries
+        .iter()
+        .filter(|e| e.kind == Kind::Link)
+        .map(|e| (fold(&e.path), String::from_utf8_lossy(&e.data).into_owned()))
+        .collect();
+    for e in entries.iter().filter(|e| e.kind == Kind::Link) {
+        let mut stack: Vec<String> = e.path.split('/').map(str::to_string).collect();
+        stack.pop();
+        let mut todo: std::collections::VecDeque<String> = String::from_utf8_lossy(&e.data)
+            .split('/')
+            .map(str::to_string)
+            .collect();
+        let mut steps = 0;
+        while let Some(c) = todo.pop_front() {
+            steps += 1;
+            if steps > 4096 {
+                return Err(format!("`{}`: its links do not resolve", e.path));
+            }
+            match c.as_str() {
+                "" | "." => {}
+                ".." => {
+                    if stack.pop().is_none() {
+                        return Err(format!("`{}` resolves outside its root", e.path));
+                    }
+                }
+                _ => {
+                    if c.starts_with('/') {
+                        return Err(format!("`{}` resolves outside its root", e.path));
+                    }
+                    stack.push(c);
+                    let here = fold(&stack.join("/"));
+                    if fence.iter().any(|f| under(&here, f)) {
+                        return Err(format!(
+                            "`{}` leads into `{}`, a root the write-back keeps apart",
+                            e.path,
+                            stack.join("/")
+                        ));
+                    }
+                    let exact = stack.join("/");
+                    let host_link = || {
+                        if gone.contains(&exact) || ancestors.contains(&exact) {
+                            return None;
+                        }
+                        let p = root?.join(stack.join("/"));
+                        std::fs::symlink_metadata(&p)
+                            .ok()
+                            .filter(|m| m.file_type().is_symlink())?;
+                        std::fs::read_link(&p)
+                            .ok()
+                            .map(|t| t.to_string_lossy().into_owned())
+                    };
+                    let seat_link = links.get(&here).cloned();
+                    let host = host_link();
+                    // A seat link and a distinct host link under two spellings of one folded
+                    // name: which one the host resolves is its own rule, so neither is trusted.
+                    if seat_link.is_some() && host.is_some() && !links_exact.contains(&exact) {
+                        return Err(format!(
+                            "`{}` passes `{exact}`, which names both a host link and a link of \
+                             the write-back under another spelling",
+                            e.path
+                        ));
+                    }
+                    let found = seat_link.or(host);
+                    if let Some(t) = found.as_ref() {
+                        if t.starts_with('/') {
+                            return Err(format!("`{}` resolves outside its root", e.path));
+                        }
+                        stack.pop();
+                        for (i, part) in t.split('/').enumerate() {
+                            todo.insert(i, part.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A content digest of one entry (its kind and its bytes), for the copy-in baseline.
+pub(crate) fn digest(e: &Entry) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update([e.kind.byte()]);
+    h.update(&e.data);
+    h.finalize().into()
+}
+
+/// The write-back's checks on one root's entries (untrusted: they came from a seat's replica).
+/// `skip` = relative paths the seat could never write on the host (masks, nested roots): their
+/// entries are dropped, never applied. `Err` names the first refused entry.
+pub(crate) fn check_entries(root: &Root, skip: &[String]) -> Result<Vec<Entry>, String> {
+    check_entries_against(root, skip, &std::collections::HashMap::new())
+}
+
+/// [`check_entries`] against the copy-in `baseline` (path -> digest; review r6 #3): an entry the
+/// seat left exactly as the host gave it is the host's own content, so the fold, link and
+/// file-or-directory checks judge only what the seat added or changed (a case-sensitive host's
+/// `a.c`/`A.c` pair, or a tracked absolute link, is written back unchanged, never refused). The
+/// name checks apply to every entry; how changed links resolve against the host is checked again
+/// at preflight.
+pub(crate) fn check_entries_against(
+    root: &Root,
+    skip: &[String],
+    baseline: &std::collections::HashMap<String, [u8; 32]>,
+) -> Result<Vec<Entry>, String> {
+    let unchanged = |e: &Entry| baseline.get(&e.path) == Some(&digest(e));
+    let mut out = Vec::with_capacity(root.entries.len());
+    let mut seen: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    for e in &root.entries {
+        let parts = components(&e.path)?;
+        if parts.iter().any(|c| is_git_name(c)) {
+            return Err(format!("`{}` is inside a git dir", e.path));
+        }
+        let same = unchanged(e);
+        if let Some(other_same) = seen.insert(fold(&e.path), same) {
+            if !(same && other_same) {
+                return Err(format!(
+                    "`{}` appears twice (or twice in a spelling the host folds together)",
+                    e.path
+                ));
+            }
+        }
+        match e.kind {
+            Kind::Other => return Err(format!("`{}` is not a regular file or a symlink", e.path)),
+            Kind::Link if !same && !link_stays_inside(&e.path, &e.data) => {
+                return Err(format!("`{}` is a symlink that leaves its root", e.path))
+            }
+            _ => {}
+        }
+        if skip.iter().any(|s| under(&e.path, s)) {
+            continue;
+        }
+        out.push(e.clone());
+    }
+    let changed: Vec<Entry> = out.iter().filter(|e| !unchanged(e)).cloned().collect();
+    links_stay_inside(&changed)?;
+    // A path cannot be both a file and the parent of another entry: every ancestor of every
+    // entry is checked against the whole set (review r4: `A`, `A-`, `a/b` are not adjacent), when
+    // either of the two is the seat's.
+    let paths: std::collections::HashSet<String> = out.iter().map(|e| fold(&e.path)).collect();
+    let changed_paths: std::collections::HashSet<String> =
+        changed.iter().map(|e| fold(&e.path)).collect();
+    for p in &paths {
+        let parts: Vec<&str> = p.split('/').collect();
+        for i in 1..parts.len() {
+            let anc = parts[..i].join("/");
+            if paths.contains(&anc) && (changed_paths.contains(p) || changed_paths.contains(&anc)) {
+                return Err(format!("`{anc}` is a file and a directory"));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// The host files of a root that the write-back deletes: those `listed` on the host and absent
+/// from the replica's `entries`, except what the seat could never see (`skip`).
+pub(crate) fn deletions(listed: &[String], entries: &[Entry], skip: &[String]) -> Vec<String> {
+    let have: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    listed
+        .iter()
+        .filter(|p| !have.contains(p.as_str()))
+        .filter(|p| !skip.iter().any(|s| under(p, s)))
+        .filter(|p| components(p).is_ok_and(|c| !c.iter().any(|c| is_git_name(c))))
+        .cloned()
+        .collect()
+}
+
+/// The files of a host `root` git lists (tracked, plus untracked and not ignored), relative.
+/// Run with the engine's hardened git and no fsmonitor; `Err` when git fails.
+pub(crate) fn host_tree_listing(root: &Path) -> Result<Vec<String>, String> {
+    // Not a repository (an engine session's scratch tree): every file but a `.git`. Decided by
+    // the root itself having no `.git` (codex b2-sync #10): a repository git cannot read is
+    // refused, never copied in whole with its ignored files.
+    if std::fs::symlink_metadata(root.join(".git")).is_err() {
+        let inside = git(root)
+            .args(["rev-parse", "--is-inside-work-tree"])
+            .output()
+            .map_err(|e| format!("git rev-parse in {}: {e}", root.display()))?;
+        if !inside.status.success() {
+            return host_plain_listing(root, &[".git".to_string()]);
+        }
+    }
+    let out = git(root)
+        .args(["ls-files", "-z", "-c", "-o", "--exclude-standard"])
+        .output()
+        .map_err(|e| format!("git ls-files: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files in {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    // A name the stream cannot carry refuses the copy-in (review r5): left out, the seat's
+    // `git add -A` would record its deletion.
+    let mut v: Vec<String> = Vec::new();
+    for raw in out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+        match String::from_utf8(raw.to_vec()) {
+            Ok(p) => v.push(p),
+            Err(_) => {
+                return Err(format!(
+                    "`{}` is not a UTF-8 path; the copy-in carries UTF-8 names only",
+                    String::from_utf8_lossy(raw)
+                ))
+            }
+        }
+    }
+    v.sort();
+    v.dedup();
+    Ok(v)
+}
+
+/// The engine's git for a host worktree: no system or global configuration, no fsmonitor, no
+/// prompts (the worktree's own repository configuration is the engine's clone's).
+pub(crate) fn git(dir: &Path) -> std::process::Command {
+    use wicked_apps_core::HardenedCommand;
+    let mut c = std::process::Command::new("git");
+    c.hardened()
+        .arg("-C")
+        .arg(dir)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env(
+            "GIT_CONFIG_GLOBAL",
+            if cfg!(windows) { "NUL" } else { "/dev/null" },
+        )
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_CONFIG_COUNT")
+        .stdin(std::process::Stdio::null());
+    c
+}
+
+/// What reading `rel` under `root` would add to a stream (its size, never following a link), for
+/// a caller's running budget. `0` = gone or not a file or link.
+pub(crate) fn entry_size(root: &Path, rel: &str) -> u64 {
+    std::fs::symlink_metadata(root.join(rel))
+        .map(|m| {
+            if m.file_type().is_file() {
+                m.len()
+            } else {
+                256
+            }
+        })
+        .unwrap_or(0)
+}
+
+/// Read one host file or link for the copy-in, never following a link (codex b2-sync #5/#9):
+/// `Ok(None)` = gone, a directory, or under an ancestor that is not a real directory (not a
+/// file of this root); `Err` = there but unreadable, not a regular file or link, a link whose
+/// target is not UTF-8, or larger than a whole stream. A caller never reads `Err` as absent.
+pub(crate) fn read_host_entry(root: &Path, rel: &str) -> Result<Option<Entry>, String> {
+    let p = root.join(rel);
+    let shown = || p.display().to_string();
+    let md = match std::fs::symlink_metadata(&p) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("`{}` could not be read: {e}", shown())),
+    };
+    // Every ancestor must be a real directory: a link on the way would read another file.
+    let parts = components(rel)?;
+    let mut cur = root.to_path_buf();
+    for c in &parts[..parts.len() - 1] {
+        cur.push(c);
+        match std::fs::symlink_metadata(&cur) {
+            Ok(m) if m.file_type().is_dir() => {}
+            _ => return Ok(None),
+        }
+    }
+    let ft = md.file_type();
+    if ft.is_dir() {
+        return Ok(None);
+    }
+    if ft.is_symlink() {
+        let t = std::fs::read_link(&p).map_err(|e| format!("`{}`: {e}", shown()))?;
+        let t = t
+            .to_str()
+            .ok_or_else(|| format!("`{}` is a link whose target is not UTF-8", shown()))?;
+        return Ok(Some(Entry {
+            kind: Kind::Link,
+            path: rel.to_string(),
+            data: t.as_bytes().to_vec(),
+        }));
+    }
+    if !ft.is_file() {
+        return Err(format!("`{}` is not a regular file or a link", shown()));
+    }
+    // Opened without following a link and without blocking (a fifo swapped in), and judged by
+    // the opened file's own type and size; never more than one stream's worth is read.
+    let f = open_nofollow(&p).map_err(|e| format!("`{}` could not be read: {e}", shown()))?;
+    let fmd = f
+        .metadata()
+        .map_err(|e| format!("`{}` could not be read: {e}", shown()))?;
+    if !fmd.file_type().is_file() {
+        return Err(format!("`{}` is not a regular file", shown()));
+    }
+    if fmd.len() > MAX_STREAM {
+        return Err(format!(
+            "`{}` is larger than the stream's {MAX_STREAM} bytes",
+            shown()
+        ));
+    }
+    let mut data = Vec::new();
+    {
+        use std::io::Read as _;
+        f.take(MAX_STREAM + 1)
+            .read_to_end(&mut data)
+            .map_err(|e| format!("`{}` could not be read: {e}", shown()))?;
+    }
+    if data.len() as u64 > MAX_STREAM {
+        return Err(format!(
+            "`{}` is larger than the stream's {MAX_STREAM} bytes",
+            shown()
+        ));
+    }
+    #[cfg(unix)]
+    let exec = {
+        use std::os::unix::fs::PermissionsExt;
+        fmd.permissions().mode() & 0o111 != 0
+    };
+    #[cfg(not(unix))]
+    let exec = false;
+    Ok(Some(Entry {
+        kind: if exec { Kind::Exec } else { Kind::File },
+        path: rel.to_string(),
+        data,
+    }))
+}
+
+/// Open a file for reading without following a final link and without blocking.
+fn open_nofollow(p: &Path) -> std::io::Result<std::fs::File> {
+    let mut o = std::fs::OpenOptions::new();
+    o.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    o.open(p)
+}
+
+/// Every file and link under a host `root` (no link followed), relative, except under `skip`.
+/// `Err` when a directory or entry cannot be read or a name is not UTF-8 (codex b2-sync #11): a
+/// listing is whole or refused, never silently short. A missing `root` lists nothing.
+pub(crate) fn host_plain_listing(root: &Path, skip: &[String]) -> Result<Vec<String>, String> {
+    fn walk(base: &Path, dir: &Path, skip: &[String], out: &mut Vec<String>) -> Result<(), String> {
+        let rd = match std::fs::read_dir(dir) {
+            Ok(rd) => rd,
+            Err(e) if dir == base && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{} could not be listed: {e}", dir.display())),
+        };
+        for e in rd {
+            let e = e.map_err(|e| format!("{} could not be listed: {e}", dir.display()))?;
+            let p = e.path();
+            let rel = p
+                .strip_prefix(base)
+                .ok()
+                .and_then(|r| r.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| {
+                    format!(
+                        "`{}` is not a UTF-8 path; the stream carries UTF-8 names only",
+                        p.display()
+                    )
+                })?;
+            if skip.iter().any(|s| under(&rel, s)) {
+                continue;
+            }
+            let ft = e
+                .file_type()
+                .map_err(|e| format!("`{}` could not be read: {e}", p.display()))?;
+            // A socket or fifo (a CLI's own IPC) is no file the stream carries: left out.
+            if ft.is_dir() {
+                walk(base, &p, skip, out)?;
+            } else if ft.is_file() || ft.is_symlink() {
+                out.push(rel);
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(root, root, skip, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Paths of `others` that lie strictly under `root`, relative to it (nested roots and masks).
+pub(crate) fn nested(root: &Path, others: &[PathBuf]) -> Vec<String> {
+    others
+        .iter()
+        .filter(|o| o.as_path() != root)
+        .filter_map(|o| o.strip_prefix(root).ok())
+        .filter_map(|r| r.to_str())
+        .filter(|r| !r.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The replica path of a host path: the path without its leading `/`.
+pub(crate) fn replica_path(p: &Path) -> Option<String> {
+    super::render::replica_sub_path(p)
+}
+
+/// What one root's write-back did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub(crate) written: usize,
+    pub(crate) unchanged: usize,
+    pub(crate) deleted: usize,
+}
+
+/// The paths the seat may never write, as the host's own file system resolves them (review r2:
+/// on APFS `.ſsh` names `.ssh`; no case or normalization rule of ours can know that, the inode
+/// can). `Err` names the first of `paths` (relative to `root`) whose path, or any ancestor of
+/// it, is one of `guard`. Run for every root before any is applied (review r3), and for every
+/// path an imported commit changes, which no file write may show (review r3).
+#[cfg(unix)]
+pub(crate) fn guard_refusal<'a>(
+    root: &Path,
+    guard: &[String],
+    paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let guarded: std::collections::HashSet<(u64, u64)> = guard
+        .iter()
+        .filter_map(|g| std::fs::symlink_metadata(root.join(g)).ok())
+        .map(|m| (m.dev(), m.ino()))
+        .collect();
+    if guarded.is_empty() {
+        return Ok(());
+    }
+    let hits = |rel: &str| -> bool {
+        let mut cur = root.to_path_buf();
+        rel.split('/').any(|c| {
+            cur.push(c);
+            std::fs::symlink_metadata(&cur).is_ok_and(|m| guarded.contains(&(m.dev(), m.ino())))
+        })
+    };
+    match paths.into_iter().find(|p| hits(p)) {
+        Some(p) => Err(format!(
+            "`{p}` is a path the seat may not write (it names a masked path on this host)"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Windows hosts run no seat pods (the seat runner is Unix-only).
+#[cfg(not(unix))]
+pub(crate) fn guard_refusal<'a>(
+    _root: &Path,
+    _guard: &[String],
+    _paths: impl IntoIterator<Item = &'a str>,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// Apply checked `entries` and `delete` to the host `root` with a no-follow walk: deletions
+/// first, then each file or link replaced by rename. Never follows a link on the way.
+#[cfg(unix)]
+// `mode_t` is u16 on macOS and u32 on Linux: the casts are needed on one of them.
+#[allow(clippy::unnecessary_cast)]
+pub(crate) fn apply(
+    root: &Path,
+    entries: &[Entry],
+    delete: &[String],
+    guard: &[String],
+) -> Result<Applied, String> {
+    guard_refusal(
+        root,
+        guard,
+        entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .chain(delete.iter().map(String::as_str)),
+    )?;
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    let c = |s: &str| CString::new(s).map_err(|_| format!("`{s}` has a NUL"));
+    let root_c = CString::new(root.as_os_str().as_bytes()).map_err(|_| "root has a NUL")?;
+    // SAFETY: plain libc calls on owned, NUL-terminated strings; every fd opened is closed.
+    let open_dir = |at: i32, name: &CString| unsafe {
+        libc::openat(
+            at,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    let root_fd = unsafe {
+        libc::open(
+            root_c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if root_fd < 0 {
+        return Err(format!(
+            "{} is not a directory the write-back can open",
+            root.display()
+        ));
+    }
+    struct Fd(i32);
+    impl Drop for Fd {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.0) };
+        }
+    }
+    let root_fd = Fd(root_fd);
+    // `Ok(None)` only when the name is not there (codex b2-sync #12): any other failure is an
+    // error, never read as absent.
+    let stat_at = |dir: i32, name: &CString| -> Result<Option<libc::stat>, String> {
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
+        if r == 0 {
+            return Ok(Some(st));
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            _ => Err(format!("{name:?}: {err}")),
+        }
+    };
+    let kind_at = |dir: i32, name: &CString| -> Result<Option<u32>, String> {
+        Ok(stat_at(dir, name)?.map(|st| st.st_mode as u32 & libc::S_IFMT as u32))
+    };
+    // The parent directory of `rel`, walked without following links; `create` makes missing
+    // directories and replaces a file or link standing where a directory belongs.
+    let parent = |rel: &str, create: bool| -> Result<Option<(Fd, CString)>, String> {
+        let parts = components(rel)?;
+        // Close-on-exec from the start and checked (codex b2-sync #12/#19).
+        let d = unsafe { libc::fcntl(root_fd.0, libc::F_DUPFD_CLOEXEC, 0) };
+        if d < 0 {
+            return Err(format!("`{rel}`: {}", std::io::Error::last_os_error()));
+        }
+        let mut fd = Fd(d);
+        for comp in &parts[..parts.len() - 1] {
+            let name = c(comp)?;
+            let mut next = open_dir(fd.0, &name);
+            if next < 0 {
+                let err = std::io::Error::last_os_error();
+                if !create {
+                    // Gone, or not a real directory (a file or a link on the way): nothing of
+                    // the root is there to delete. Any other failure is the write-back's.
+                    return match err.raw_os_error() {
+                        Some(libc::ENOENT) | Some(libc::ENOTDIR) | Some(libc::ELOOP) => Ok(None),
+                        _ => Err(format!("`{rel}`: a directory on the way: {err}")),
+                    };
+                }
+                match kind_at(fd.0, &name)? {
+                    None => {}
+                    Some(k) if k == libc::S_IFDIR as u32 => {
+                        return Err(format!("`{rel}`: a directory on the way cannot be opened"))
+                    }
+                    Some(_) if unsafe { libc::unlinkat(fd.0, name.as_ptr(), 0) } != 0 => {
+                        return Err(format!("`{rel}`: could not replace a file on the way"));
+                    }
+                    Some(_) => {}
+                }
+                if unsafe { libc::mkdirat(fd.0, name.as_ptr(), 0o755) } != 0 {
+                    return Err(format!("`{rel}`: could not create a directory on the way"));
+                }
+                next = open_dir(fd.0, &name);
+                if next < 0 {
+                    return Err(format!("`{rel}`: could not open a directory on the way"));
+                }
+            }
+            fd = Fd(next);
+        }
+        Ok(Some((fd, c(parts[parts.len() - 1])?)))
+    };
+    let mut done = Applied::default();
+    for rel in delete {
+        let Some((dir, name)) = parent(rel, false)? else {
+            continue;
+        };
+        match kind_at(dir.0, &name)? {
+            None => {}
+            Some(k) if k == libc::S_IFDIR as u32 => {}
+            Some(_) => {
+                if unsafe { libc::unlinkat(dir.0, name.as_ptr(), 0) } != 0 {
+                    return Err(format!("could not delete `{rel}`"));
+                }
+                done.deleted += 1;
+            }
+        }
+    }
+    for e in entries {
+        let (dir, name) = parent(&e.path, true)?.expect("created");
+        let existing_st = stat_at(dir.0, &name)?;
+        let existing = existing_st.map(|st| st.st_mode as u32 & libc::S_IFMT as u32);
+        // A replaced file keeps its own permission bits (codex b2-sync #7): only the execute
+        // bits follow the entry, so a private `0600` file never comes back world-readable.
+        let kept_mode: Option<u32> = existing_st
+            .filter(|_| existing == Some(libc::S_IFREG as u32))
+            .map(|st| st.st_mode as u32 & 0o666);
+        if existing == Some(libc::S_IFREG as u32)
+            && e.kind != Kind::Link
+            && existing_st.is_some_and(|st| st.st_size as u64 == e.data.len() as u64)
+        {
+            // Unchanged content and mode: left alone (no mtime churn for build tools). Read no
+            // more than the entry's own length plus one (codex b2-sync #15).
+            let fd = unsafe {
+                libc::openat(
+                    dir.0,
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                )
+            };
+            if fd >= 0 {
+                use std::os::unix::io::FromRawFd;
+                let f = unsafe { std::fs::File::from_raw_fd(fd) };
+                let mut cur = Vec::new();
+                let mode = f
+                    .metadata()
+                    .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()))
+                    .unwrap_or(0);
+                if f.take(e.data.len() as u64 + 1)
+                    .read_to_end(&mut cur)
+                    .is_ok()
+                    && cur == e.data
+                    && ((mode & 0o111 != 0) == (e.kind == Kind::Exec))
+                {
+                    done.unchanged += 1;
+                    continue;
+                }
+            }
+        }
+        if existing == Some(libc::S_IFDIR as u32) && !remove_empty_dirs(dir.0, &name) {
+            return Err(format!(
+                "`{}` replaces a directory that is not empty",
+                e.path
+            ));
+        }
+        let tmp = c(&format!(".wicked-wb-{}", uuid::Uuid::new_v4().simple()))?;
+        match e.kind {
+            Kind::Link => {
+                let target = CString::new(e.data.clone()).map_err(|_| "a link target has a NUL")?;
+                if unsafe { libc::symlinkat(target.as_ptr(), dir.0, tmp.as_ptr()) } != 0 {
+                    return Err(format!("could not write the link `{}`", e.path));
+                }
+            }
+            _ => {
+                let base = kept_mode.unwrap_or(0o644);
+                let mode = if e.kind == Kind::Exec {
+                    base | ((base & 0o444) >> 2)
+                } else {
+                    base
+                };
+                let fd = unsafe {
+                    libc::openat(
+                        dir.0,
+                        tmp.as_ptr(),
+                        libc::O_WRONLY
+                            | libc::O_CREAT
+                            | libc::O_EXCL
+                            | libc::O_NOFOLLOW
+                            | libc::O_CLOEXEC,
+                        mode as libc::c_uint,
+                    )
+                };
+                if fd < 0 {
+                    return Err(format!("could not write `{}`", e.path));
+                }
+                use std::os::unix::io::FromRawFd;
+                let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+                // A replaced file's own mode exactly, whatever the umask; a new file keeps the
+                // umask's say (codex r2: never widened past it).
+                let wrote = match kept_mode {
+                    Some(_) => {
+                        f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(mode as u32))
+                    }
+                    None => Ok(()),
+                }
+                .and_then(|()| f.write_all(&e.data))
+                .and_then(|()| f.sync_data());
+                drop(f);
+                if wrote.is_err() {
+                    unsafe { libc::unlinkat(dir.0, tmp.as_ptr(), 0) };
+                    return Err(format!("could not write `{}`", e.path));
+                }
+            }
+        }
+        if unsafe { libc::renameat(dir.0, tmp.as_ptr(), dir.0, name.as_ptr()) } != 0 {
+            unsafe { libc::unlinkat(dir.0, tmp.as_ptr(), 0) };
+            return Err(format!("could not put `{}` in place", e.path));
+        }
+        done.written += 1;
+    }
+    Ok(done)
+}
+
+/// Remove the directory `name` of `dir` and the empty directories under it, never following a
+/// link; `false` when anything but an empty directory is left in it (review r1: a deletion
+/// empties a nested tree, its directories go before a file takes its place).
+#[cfg(unix)]
+fn remove_empty_dirs(dir: i32, name: &std::ffi::CStr) -> bool {
+    // SAFETY: fd-relative libc calls on NUL-terminated names; every fd opened is closed.
+    unsafe {
+        if libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) == 0 {
+            return true;
+        }
+        let fd = libc::openat(
+            dir,
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return false;
+        }
+        let dup = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0);
+        if dup < 0 {
+            libc::close(fd);
+            return false;
+        }
+        let d = libc::fdopendir(dup);
+        if d.is_null() {
+            libc::close(dup);
+            libc::close(fd);
+            return false;
+        }
+        let mut subdirs: Vec<std::ffi::CString> = Vec::new();
+        loop {
+            let ent = libc::readdir(d);
+            if ent.is_null() {
+                break;
+            }
+            let n = std::ffi::CStr::from_ptr((*ent).d_name.as_ptr());
+            if n.to_bytes() == b"." || n.to_bytes() == b".." {
+                continue;
+            }
+            subdirs.push(n.to_owned());
+        }
+        libc::closedir(d);
+        let ok = subdirs.iter().all(|s| remove_empty_dirs(fd, s));
+        libc::close(fd);
+        ok && libc::unlinkat(dir, name.as_ptr(), libc::AT_REMOVEDIR) == 0
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply(
+    _root: &Path,
+    _entries: &[Entry],
+    _delete: &[String],
+    _guard: &[String],
+) -> Result<Applied, String> {
+    Err("the Kubernetes write-back needs a Unix host".into())
+}
+
+/// The sync pod's half of the stream (run as `python3 -I -c POD_CODEC <op> <plan-json>`): reads
+/// and writes bytes only, with the same no-follow walk, and runs git only as `ls-files`, `bundle`
+/// and `rev-parse` with fsmonitor and hooks off (a seat-written `.git/config` cannot make it run
+/// anything). Ops:
+/// - `unpack <plan>`: the stream on stdin into `/replica`, root by root; `tree` and `plain` roots
+///   are mirrored (a replica file the stream does not carry is deleted; for `tree` only files git
+///   lists, so ignored build output stays), `git` replaces the root whole, `seed` writes only when
+///   the root does not exist yet.
+/// - `pack <plan>`: the roots of the plan (JSON `[[replica, mode, [skip...]], ...]`) as a stream on
+///   stdout: `tree` = what git lists, `plain` = every file and link.
+/// - `bundle <tree> <base>`: the commits on the tree's HEAD since `base`, as a git bundle on
+///   stdout (empty output = none).
+pub(crate) const POD_CODEC: &str = r#"
+import errno, json, os, shutil, stat, struct, subprocess, sys, tempfile
+R = os.environ.get("WICKED_SYNC_ROOT", "/replica")
+# Every git call runs under Landlock (codex b2-seat #1, b2-sync #1/#2): the `.git` it reads is
+# the seat's, and the sync pod mounts every scope of the namespace, so git (and anything a
+# seat-written config makes it run) reads only the unit's own tree and writes only a private
+# temp dir. `--best-effort` lets the launcher use the ABI the kernel has, so before the first
+# git call the jail is PROVEN in force (a file it grants reads, one beside it is refused); a
+# kernel without Landlock refuses the write-back, never runs it open. `-` = no jail (the
+# engine's tests on a host without Landlock only).
+JAIL = os.environ.get("WICKED_SYNC_JAIL", "/floor/landrun")
+PROVEN = False
+def die(m):
+    sys.stderr.write("wicked-sync: " + m + "\n"); sys.exit(3)
+def prove_jail():
+    global PROVEN
+    if JAIL == "-" or PROVEN: return
+    d = tempfile.mkdtemp(prefix="wicked-jail-", dir="/tmp")
+    try:
+        ok = d + "/granted"; bad = d + "-canary"
+        for f in (ok, bad):
+            with open(f, "w") as fh: fh.write("x")
+        probe = ("import sys\nopen(%r).read()\ntry: open(%r).read()\n"
+                 "except PermissionError: sys.exit(7)\nsys.exit(0)") % (ok, bad)
+        r = subprocess.run(jail(d, None, {}) + [sys.executable, "-I", "-c", probe], env={},
+                           stdin=subprocess.DEVNULL, capture_output=True)
+        if r.returncode != 7:
+            die("Landlock is not in force in the sync pod (probe exit %s: %s); the replica is "
+                "not read" % (r.returncode, r.stderr.decode(errors="replace").strip()[-300:]))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+        try: os.unlink(d + "-canary")
+        except FileNotFoundError: pass
+    PROVEN = True
+def jail(root, rw, env):
+    if JAIL == "-": return []
+    a = [JAIL, "--best-effort", "--ignore-missing"]
+    for p in ("/usr", "/bin", "/lib", "/lib64", "/sbin"): a += ["--rox", p]
+    for p in ("/etc", "/proc", "/dev", root): a += ["--ro", p]
+    a += ["--rw", "/dev/null"]
+    if rw: a += ["--rw", rw]
+    for k in sorted(env): a += ["--env", k]
+    return a + ["--"]
+def git(root, *args, rw=None):
+    # The git dir and work tree named, never discovered (a gitfile or a parent repository could
+    # name another scope's), no lazy fetch and no transport at all (a promisor remote's
+    # `core.sshCommand` never runs), no hooks, no fsmonitor.
+    env = {"PATH": "/usr/bin:/bin", "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+           "HOME": rw or "/nonexistent", "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1",
+           "GIT_DIR": root + "/.git", "GIT_WORK_TREE": root, "GIT_CEILING_DIRECTORIES": R,
+           "GIT_ALLOW_PROTOCOL": "none", "GIT_OPTIONAL_LOCKS": "0"}
+    prove_jail()
+    return subprocess.run(jail(root, rw, env) +
+                          ["git", "-c", "core.fsmonitor=false",
+                           "-c", "core.untrackedCache=false", "-c", "core.hooksPath=/dev/null",
+                           "-c", "protocol.allow=never", "-c", "safe.directory=*"] + list(args),
+                          env=env, stdin=subprocess.DEVNULL, capture_output=True)
+def comps(rel):
+    if not rel or rel.startswith("/") or "\0" in rel: die("bad path " + repr(rel))
+    p = rel.split("/")
+    if any(c in ("", ".", "..") for c in p): die("bad path " + repr(rel))
+    return p
+IGN = set(range(0x200B, 0x2010)) | set(range(0x202A, 0x202F)) | set(range(0x2060, 0x2070)) | {0xFEFF}
+try:
+    from unicodedata import normalize as _nfd
+except ImportError:
+    _nfd = lambda form, p: p
+def fold(p): return "".join(c for c in _nfd("NFD", p) if ord(c) not in IGN).upper().lower()
+def under(rel, pre):
+    rel, pre = fold(rel), fold(pre)
+    return rel == pre or rel.startswith(pre + "/")
+skip = []
+def opendir(fd, name): return os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+def remove_any(fd, name):
+    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    if stat.S_ISDIR(st.st_mode): shutil.rmtree(name, dir_fd=fd)
+    else: os.unlink(name, dir_fd=fd)
+def parent(rootfd, rel, create):
+    p = comps(rel); fd = os.dup(rootfd)
+    for c in p[:-1]:
+        try:
+            n = opendir(fd, c)
+        except FileNotFoundError:
+            if not create: os.close(fd); return None, None
+            os.mkdir(c, 0o755, dir_fd=fd); n = opendir(fd, c)
+        except OSError as e:
+            if e.errno not in (errno.ENOTDIR, errno.ELOOP): raise
+            if not create: os.close(fd); return None, None
+            remove_any(fd, c); os.mkdir(c, 0o755, dir_fd=fd); n = opendir(fd, c)
+        os.close(fd); fd = n
+    return fd, p[-1]
+def openroot(rel, create):
+    fd = os.open(R, os.O_RDONLY | os.O_DIRECTORY)
+    for c in comps(rel):
+        try:
+            n = opendir(fd, c)
+        except FileNotFoundError:
+            if not create: os.close(fd); return None
+            os.mkdir(c, 0o755, dir_fd=fd); n = opendir(fd, c)
+        except OSError as e:
+            if e.errno not in (errno.ENOTDIR, errno.ELOOP): raise
+            if not create: os.close(fd); return None
+            remove_any(fd, c); os.mkdir(c, 0o755, dir_fd=fd); n = opendir(fd, c)
+        os.close(fd); fd = n
+    return fd
+def rd(f, n):
+    b = f.read(n)
+    if len(b) != n: die("truncated stream")
+    return b
+def entries(f):
+    if rd(f, 5) != b"WKS1\n": die("bad magic")
+    while True:
+        k = rd(f, 1); pl = struct.unpack(">I", rd(f, 4))[0]; p = rd(f, pl)
+        dl = struct.unpack(">Q", rd(f, 8))[0]; d = rd(f, dl)
+        if k == b"E": return
+        yield k, p.decode("utf-8"), d
+def tree_list(root, repos=None):
+    if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"):
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        try: return [p for p in plain_list(fd) if not under(p, ".git")]
+        finally: os.close(fd)
+    r = git(root, "ls-files", "-z", "-c", "-o", "--exclude-standard")
+    if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
+    out = sorted(set(x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x))
+    # An untracked embedded repository is listed as `dir/` (review r6 #2): it is not a file of the
+    # tree, never written back, and the mirror removes it (`repos`).
+    if repos is not None: repos.extend(x[:-1] for x in out if x.endswith("/"))
+    return [x for x in out if not x.endswith("/")]
+def plain_list(rootfd):
+    out = []
+    def walk(fd, pre):
+        for name in os.listdir(fd):
+            st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            rel = pre + name
+            if stat.S_ISDIR(st.st_mode):
+                n = opendir(fd, name)
+                try: walk(n, rel + "/")
+                finally: os.close(n)
+            else: out.append(rel)
+    walk(rootfd, "")
+    return sorted(out)
+def head(out, k, p, n):
+    p = p.encode("utf-8", "surrogateescape")
+    out.write(k + struct.pack(">I", len(p)) + p + struct.pack(">Q", n))
+def put(out, k, p, d):
+    head(out, k, p, len(d)); out.write(d)
+def isgit(rel): return any(c == ".git" for c in rel.split("/"))
+MAX = 536870912
+SENT = 0
+SEEDING = ".wicked-seeding"
+def emit(out, rootfd, rel):
+    fd, name = parent(rootfd, rel, False)
+    if fd is None: return
+    try:
+        try: st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError: return
+        if stat.S_ISLNK(st.st_mode):
+            put(out, b"l", rel, os.readlink(name, dir_fd=fd).encode("utf-8", "surrogateescape"))
+        elif stat.S_ISREG(st.st_mode):
+            # Never more than the stream may carry (review r4): a sparse multi-gigabyte file a
+            # seat left is refused before it is read, and the read itself is capped.
+            # Streamed in bounded chunks (codex b2-sync #14): a file near the limit is never held
+            # whole in the pod's memory, and the length sent is the opened file's own.
+            global SENT
+            h = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            with os.fdopen(h, "rb") as fh:
+                fs = os.fstat(fh.fileno())
+                if not stat.S_ISREG(fs.st_mode): die("not a regular file: " + rel)
+                n = fs.st_size
+                if n > MAX - SENT: die("the write-back is larger than the stream's limit at " + rel)
+                SENT += n
+                head(out, b"x" if fs.st_mode & 0o111 else b"f", rel, n)
+                left = n
+                while left:
+                    b = fh.read(min(left, 1 << 20))
+                    if not b: die("a file shrank while it was read: " + rel)
+                    out.write(b); left -= len(b)
+        elif stat.S_ISDIR(st.st_mode): return
+        else: put(out, b"o", rel, b"")
+    finally: os.close(fd)
+def unpack(plan):
+    f = sys.stdin.buffer; cur = None; rootfd = None; wrote = set(); mode = None
+    def finish():
+        if cur is None: return
+        r, m, skip = cur
+        # A masked path the replica holds (a seat planted it, or it predates the mask) goes: a
+        # mask is the absence of the path (review r1).
+        masks = plan[r][2]
+        if masks:
+            for rel in plain_list(rootfd):
+                if any(under(rel, mk) for mk in masks):
+                    fd, name = parent(rootfd, rel, False)
+                    if fd is None: continue
+                    try: os.unlink(name, dir_fd=fd)
+                    except FileNotFoundError: pass
+                    finally: os.close(fd)
+        if m == "git" and not wrote:
+            os.close(rootfd)
+            pfd = openroot(os.path.dirname(r), False) if "/" in r else os.open(R, os.O_RDONLY)
+            if pfd is not None:
+                try: remove_any(pfd, os.path.basename(r))
+                except FileNotFoundError: pass
+                finally: os.close(pfd)
+            return
+        if m == "seed":
+            os.close(rootfd)
+            pfd = openroot(os.path.dirname(r), False) if "/" in r else os.open(R, os.O_RDONLY)
+            try:
+                b = os.path.basename(r)
+                os.rename(b + SEEDING, b, src_dir_fd=pfd, dst_dir_fd=pfd)
+            finally: os.close(pfd)
+            return
+        if m in ("tree", "plain"):
+            repos = []
+            have = tree_list(R + "/" + r, repos) if m == "tree" else plain_list(rootfd)
+            for rel in repos:
+                if rel in wrote or any(under(rel, s) for s in skip): continue
+                if any(c == ".git" for c in rel.split("/")): continue
+                fd, name = parent(rootfd, rel, False)
+                if fd is None: continue
+                try: remove_any(fd, name)
+                except FileNotFoundError: pass
+                finally: os.close(fd)
+            have = [h for h in have if not (m == "tree" and under(h, ".git"))]
+            for rel in have:
+                if rel in wrote or any(under(rel, s) for s in skip): continue
+                if m == "tree" and any(c == ".git" for c in rel.split("/")): continue
+                fd, name = parent(rootfd, rel, False)
+                if fd is None: continue
+                try:
+                    st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(st.st_mode): os.unlink(name, dir_fd=fd)
+                except FileNotFoundError: pass
+                finally: os.close(fd)
+        os.close(rootfd)
+    plan = {p[0]: (p[1], p[2], p[3] if len(p) > 3 else []) for p in plan}
+    for k, p, d in entries(f):
+        if k == b"R":
+            finish(); cur = None; wrote = set(); m = d.decode()
+            if p not in plan or plan[p][0] != m: die("root not in plan: " + p)
+            skip = plan[p][1]
+            if m == "git":
+                pfd = openroot(os.path.dirname(p), True) if "/" in p else os.open(R, os.O_RDONLY)
+                try:
+                    try: remove_any(pfd, os.path.basename(p))
+                    except FileNotFoundError: pass
+                finally: os.close(pfd)
+            if m == "seed":
+                ex = openroot(p, False)
+                if ex is not None:
+                    os.close(ex); cur = None; rootfd = None; mode = "skip"; continue
+                # Written to a staging dir and renamed into place whole (codex b2-sync #13): a
+                # cut seed leaves no partial cache a later arm would take as seeded.
+                pfd = openroot(os.path.dirname(p), True) if "/" in p else os.open(R, os.O_RDONLY)
+                try:
+                    try: remove_any(pfd, os.path.basename(p) + SEEDING)
+                    except FileNotFoundError: pass
+                finally: os.close(pfd)
+                rootfd = openroot(p + SEEDING, True); cur = (p, m, skip); mode = m; continue
+            rootfd = openroot(p, True); cur = (p, m, skip); mode = m; continue
+        if mode == "skip": continue
+        if cur is None: die("entry before root")
+        rel = p
+        if mode in ("tree", "plain") and any(c == ".git" for c in comps(rel)): die("entry in .git: " + rel)
+        if mode == "files" and rel not in skip: die("file not in plan: " + rel)
+        fd, name = parent(rootfd, rel, True)
+        try:
+            try: remove_any(fd, name)
+            except FileNotFoundError: pass
+            if k == b"l":
+                os.symlink(d.decode("utf-8", "surrogateescape"), name, dir_fd=fd)
+            else:
+                h = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                            0o755 if k == b"x" else 0o644, dir_fd=fd)
+                with os.fdopen(h, "wb") as fh: fh.write(d)
+        finally: os.close(fd)
+        wrote.add(rel)
+    finish()
+def pack(plan):
+    out = sys.stdout.buffer; out.write(b"WKS1\n")
+    for item in plan:
+        r, m, skip = item[0], item[1], item[2]
+        rootfd = openroot(r, False)
+        put(out, b"R", r, m.encode())
+        if rootfd is None: continue
+        try:
+            if m == "files":
+                for rel in skip: emit(out, rootfd, rel)
+                continue
+            rels = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
+            for rel in rels:
+                if any(under(rel, s) for s in skip): continue
+                # No root but the tree's own `.git` root carries git metadata, either way
+                # (codex b2-sync #17): a plain root's repository stays on the host.
+                if m in ("tree", "plain") and isgit(rel): continue
+                emit(out, rootfd, rel)
+        finally: os.close(rootfd)
+    put(out, b"E", "", b""); out.flush()
+def bundle(tree, base):
+    root = R + "/" + tree
+    # A seat-written link to another replica scope's objects (review r6 #13): refused before git
+    # reads the dir, so a bundle never packs objects the seat could not see.
+    # The git dir itself must be a real directory with nothing linked in (review r7 #8): a gitfile
+    # or a link could name a sibling scope's repository.
+    g = root + "/.git"
+    # A tree with no history on the host was copied in with no `.git` (codex b2-seat #6): still
+    # none = no commits; a `.git` the seat made is read below, and a first commit refused.
+    if base == "-" and not os.path.lexists(g): return
+    if os.path.islink(g) or not os.path.isdir(g): die("the replica's git dir is not a directory")
+    for rel in ("objects", "refs", "HEAD", "objects/info", "objects/pack"):
+        if os.path.islink(g + "/" + rel): die("the replica's git dir names another object store")
+    for rel in (".git/objects/info/alternates", ".git/objects/info/http-alternates", ".git/commondir"):
+        if os.path.lexists(root + "/" + rel): die("the replica's git dir names another object store")
+    head = git(root, "rev-parse", "--verify", "-q", "HEAD^{commit}")
+    if base == "-":
+        if head.returncode == 0: die("the seat made a first commit in a tree with no history")
+        return
+    if head.returncode != 0: die("the replica has no HEAD commit")
+    if head.stdout.decode().strip() == base: return
+    d = tempfile.mkdtemp(prefix="wicked-unit-", dir="/tmp")
+    path = d + "/unit.bundle"
+    try:
+        b = git(root, "bundle", "create", path, "HEAD", "^" + base, rw=d)
+        if b.returncode != 0: die("git bundle failed: " + b.stderr.decode(errors="replace").strip())
+        with open(path, "rb") as fh: shutil.copyfileobj(fh, sys.stdout.buffer)
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+op = sys.argv[1]
+# Every ending is an exit code the engine reads (review r7 #6): 0 done, 3 refused; anything else
+# (a cut stream, a kill) is a client that may have left this codec running.
+try:
+    if op == "unpack": unpack(json.loads(sys.argv[2]))
+    elif op == "pack": pack(json.loads(sys.argv[2]))
+    elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
+    else: die("unknown op")
+except SystemExit: raise
+except BaseException as e: die("internal error: " + type(e).__name__)
+"#;

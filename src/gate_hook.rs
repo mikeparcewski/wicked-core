@@ -170,6 +170,21 @@ pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
 /// the write-root witness ([`compute_witness_roots`]). Unset when the unit was handed no graph.
 pub const GRAPH_WRITE_DIR_ENV: &str = "WICKED_GRAPH_WRITE_DIR";
 
+/// Set (`1`) on a unit whose seat runs as a pod (the Kubernetes runner). Its read-only tree is a
+/// throwaway view in the pod, never written back (PARITY B17): the fenced-posture write scan of
+/// tool calls ([`phase_scope_denial`]) and the post-hoc write-root witness are second mechanisms
+/// for what the view already confines, so they do not run there. The estate verb gate and the
+/// remote-write fence still do: they guard writes that leave the pod.
+///
+/// Unset on the host seat floor (`WICKED_SEAT_FLOOR=host`), where the tree a read-only unit sees
+/// IS the real worktree: there both still run (coord, 2026-11-11), until the host floor is removed.
+pub const SEAT_POD_ENV: &str = "WICKED_SEAT_POD";
+
+/// Whether this hook judges a pod seat's call ([`SEAT_POD_ENV`]).
+fn seat_in_pod() -> bool {
+    std::env::var_os(SEAT_POD_ENV).is_some_and(|v| v == "1")
+}
+
 /// Read [`GRAPH_WRITE_DIR_ENV`] off the hook subprocess's own environment (empty ⇒ none).
 fn graph_write_dir_from_env() -> Option<std::path::PathBuf> {
     std::env::var_os(GRAPH_WRITE_DIR_ENV)
@@ -1293,6 +1308,12 @@ pub(crate) fn phase_scope_denial(
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
     if !(pre_build_scope || posture.fences_writes()) {
+        return None;
+    }
+    // PARITY B17: a pod seat's fenced tree is a throwaway view and its other paths are read-only
+    // mounts or the pod's own scratch; only the admitted roots come back. The pre-build scope
+    // (a creator whose tree IS written back) is still judged.
+    if !pre_build_scope && seat_in_pod() {
         return None;
     }
     // R7/R7b (DES-L4 PR-②; core #483, F-RC1-080): `Bash` is judged by its WRITE TARGETS — a
@@ -5021,7 +5042,14 @@ pub(crate) fn evaluate_tool_call(
     // write roots (write set minus notes root) against the snapshot stored after the LAST allowed
     // Bash call. A mismatch names the changed paths under a typed `witness-deny:` claim.
     // Runs on BOTH carriers: the sidecar is keyed by decisions-dir+phase, which both share.
-    let witness_roots = compute_witness_roots(boundary);
+    // PARITY B17 (coord, 2026-11-11): a pod seat's read-only tree is a throwaway view, so a
+    // mid-turn write there has nowhere to land and the witness does not run. On the host seat
+    // floor the tree is the real worktree, so it still does.
+    let witness_roots = if seat_in_pod() {
+        Vec::new()
+    } else {
+        compute_witness_roots(boundary)
+    };
     let witness_path_buf = write_root_witness_path(decisions_path, phase);
     if write_posture == crate::write_posture::WritePosture::ReadOnly && !witness_roots.is_empty() {
         if let Some(stored) = read_write_root_witness(&witness_path_buf) {
@@ -9107,6 +9135,85 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PARITY B17 (coord, 2026-11-11): the witness is deleted only where the read-only tree is a
+    /// throwaway copy. A pod seat ([`SEAT_POD_ENV`]) mutating its view is not judged; on the host
+    /// seat floor (no pod) the same mutation is still denied and named. Mutation: drop the
+    /// `seat_in_pod()` guard (pod case denied) or run it unconditionally (host case admitted).
+    #[test]
+    fn the_witness_runs_on_the_host_floor_and_not_for_a_pod_seat() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-witness-pod-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let policy_db = base.join("policy.db");
+        drop(open_store(Some(&policy_db.to_string_lossy())).unwrap());
+        let policy_db = policy_db.to_string_lossy().into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        for (in_pod, after_write) in [(false, 2), (true, 0)] {
+            if in_pod {
+                std::env::set_var(SEAT_POD_ENV, "1");
+            } else {
+                std::env::remove_var(SEAT_POD_ENV);
+            }
+            let run_id = format!("witness-pod-{in_pod}-{}-{tid}", std::process::id());
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let dpath = decisions_path_for(&run_id, 0)
+                .to_string_lossy()
+                .into_owned();
+            let bash = || {
+                evaluate_tool_call(
+                    "wicked-agent/witness-pod/shared",
+                    "unit-1",
+                    None,
+                    None,
+                    Some(&policy_db),
+                    &dpath,
+                    &serde_json::json!({ "command": "ls" }),
+                    "Bash",
+                    Some(&boundary),
+                )
+            };
+            assert_eq!(bash(), 0, "in_pod={in_pod}: first Bash admitted");
+            std::fs::write(wt.join(format!("leaked-{in_pod}.rs")), "oops").unwrap();
+            assert_eq!(bash(), after_write, "in_pod={in_pod}");
+            let log = std::fs::read_to_string(&dpath).unwrap_or_default();
+            assert_eq!(
+                log.contains(WITNESS_DENY_PREFIX),
+                !in_pod,
+                "in_pod={in_pod}: {log}"
+            );
+            assert_eq!(
+                write_root_witness_path(&dpath, "unit-1").exists(),
+                !in_pod,
+                "a pod seat never stores a witness snapshot"
+            );
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        }
+        std::env::remove_var(SEAT_POD_ENV);
         let _ = std::fs::remove_dir_all(&base);
     }
 

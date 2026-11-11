@@ -38,6 +38,24 @@ pub(crate) fn check_manifest(manifest: &str) -> Result<(), String> {
     }
 }
 
+/// [`probe`], with a pass kept for a minute per context (a seat arm probes the cluster once,
+/// not once per call). A failure is never kept.
+pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
+    static LAST: std::sync::Mutex<Option<(Kube, std::time::Instant)>> = std::sync::Mutex::new(None);
+    if let Ok(last) = LAST.lock() {
+        if let Some((k, at)) = last.as_ref() {
+            if k == kube && at.elapsed() < Duration::from_secs(60) {
+                return Ok(());
+            }
+        }
+    }
+    probe(kube)?;
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((kube.clone(), std::time::Instant::now()));
+    }
+    Ok(())
+}
+
 /// Whether the cluster can run seats now: the API server answers, the controller runs the
 /// pinned image, and its CRDs are present. The `Err` is the refusal kind and its detail.
 pub(crate) fn probe(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
@@ -919,6 +937,11 @@ pub(crate) fn ensure_pids_limited(
         }
     }
     let ns = daemon_namespace_name(&kube.owner);
+    // The probe proves enforcement against its own namespace's deny-all: applied here, so the
+    // first arm on a fresh install (before the gateway applies the daemon's policies) does not
+    // read a namespace with no policy yet as a cluster that enforces none (B-2 live).
+    kube.apply(&[render::default_deny(&ns, &kube.owner)])
+        .map_err(|e| (FloorUnarmed::PolicyRefused, e))?;
     let name = format!("pids-probe-{}", super::boot_id());
     let infra = |e: String| (FloorUnarmed::PolicyRefused, e);
     let _ = kube.delete_owned(Some(&ns), "pod", &name, true);

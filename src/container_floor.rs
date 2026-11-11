@@ -51,6 +51,10 @@
 //!
 //! Opt-in until the shadow proof (slice C5): [`SEAT_FLOOR_ENV`]` = container`.
 
+// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
@@ -695,7 +699,7 @@ pub(crate) fn image_override(cli: &str) -> Option<String> {
 }
 
 /// The image id `tag` names now, so a run uses exactly what was checked.
-fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
+pub(crate) fn image_id(rt: &Runtime, tag: &str) -> Option<String> {
     let mut c = rt.cmd();
     c.args(["image", "inspect", "--format", "{{.Id}}", tag]);
     output_within(c, rt.bound(PROBE_TIMEOUT))
@@ -979,7 +983,17 @@ pub(crate) fn check_seat_image(facts: &ImageFacts, dests: &[PathBuf]) -> Result<
                 .into(),
         );
     }
-    let reserved = [FLOOR_DIR, "/wicked-canary", "/tmp", "/home/seat"].map(PathBuf::from);
+    // The pod's own mounts too (codex b2-gw #2): its unit dir (env, argv, rc) and a read-only
+    // unit's view source.
+    let reserved = [
+        FLOOR_DIR,
+        "/wicked-canary",
+        "/tmp",
+        "/home/seat",
+        crate::k8s::render::UNIT_DIR,
+        crate::k8s::render::VIEW_SOURCE,
+    ]
+    .map(PathBuf::from);
     for d in reserved.iter().chain(dests) {
         if let Some(link) = d.ancestors().find(|a| facts.symlinks.contains(*a)) {
             return Err(format!(
@@ -1594,7 +1608,11 @@ fn memory_from(choice: Option<&str>) -> &str {
 /// The Landlock policy from the same mounts as the runtime: writable trees are executable too
 /// (test runners exec from them), and read mounts admit executable skills and toolchains. The
 /// entry's second invocation checks enforcement inside this domain before executing the CLI.
-fn landrun_prefix(mounts: &[Mount], gateway_ports: &[u16], own_ports: &[u16]) -> Vec<String> {
+pub(crate) fn landrun_prefix(
+    mounts: &[Mount],
+    gateway_ports: &[u16],
+    own_ports: &[u16],
+) -> Vec<String> {
     let mut out = vec![
         LANDRUN.into(),
         "--best-effort".into(),
@@ -1779,7 +1797,7 @@ pub(crate) struct ReapOnDrop(pub(crate) Option<SeatContainer>);
 impl Drop for ReapOnDrop {
     fn drop(&mut self) {
         if let Some(seat) = self.0.take() {
-            reap(&seat);
+            crate::k8s::seat::reap(&seat.name);
         }
     }
 }
@@ -1994,7 +2012,7 @@ fn carrier_home(
 /// command on a pseudo-terminal, so it needs `/dev/ptmx` and `/dev/pts` (without them every
 /// command fails "failed to create PTY: open /dev/ptmx: permission denied", agy spike). Every
 /// other CLI gets none: the grant is agy's alone.
-fn seat_devices(cli: &str) -> &'static [&'static str] {
+pub(crate) fn seat_devices(cli: &str) -> &'static [&'static str] {
     match wicked_apps_core::spawn::SeatCli::from_binary(cli) {
         wicked_apps_core::spawn::SeatCli::Agy => &["/dev/ptmx", "/dev/pts"],
         _ => &[],
@@ -2022,7 +2040,7 @@ pub(crate) fn grant_seat_devices(wrapper: &mut Vec<String>, cli: &str) -> Result
 
 /// `v` (a path or a path list) with each absolute entry whose canonical form is mounted
 /// re-spelled canonically; anything else (not a path, not mounted) is returned unchanged.
-fn canonical_spelling(v: &std::ffi::OsStr, mounts: &[PathBuf]) -> std::ffi::OsString {
+pub(crate) fn canonical_spelling(v: &std::ffi::OsStr, mounts: &[PathBuf]) -> std::ffi::OsString {
     let parts: Vec<PathBuf> = std::env::split_paths(v).collect();
     if parts.is_empty() || !parts.iter().all(|p| p.is_absolute()) {
         return v.to_os_string();
@@ -2041,7 +2059,7 @@ fn canonical_spelling(v: &std::ffi::OsStr, mounts: &[PathBuf]) -> std::ffi::OsSt
 const IMAGE_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// A seat's PATH: the entries of `carrier` (the carrier's PATH) under a mount, then the image's.
-fn container_path(carrier: &std::ffi::OsStr, mounts: &[PathBuf]) -> String {
+pub(crate) fn container_path(carrier: &std::ffi::OsStr, mounts: &[PathBuf]) -> String {
     let mut out: Vec<String> = std::env::split_paths(carrier)
         .map(|d| crate::worker_sandbox::canon_lenient(&d).unwrap_or(d))
         .filter(|d| mounts.iter().any(|m| d.starts_with(m)))
@@ -2985,9 +3003,7 @@ const REVOKE_ATTEMPTS: usize = 3;
 /// when the unit ends.
 #[derive(Debug)]
 pub(crate) struct GatewayLease {
-    runtime: Runtime,
-    dir: PathBuf,
-    gateway: crate::seat_gateway::Gateway,
+    gw: crate::k8s::gw::Gw,
     key: String,
     /// `<run>#<ord>@<nonce>`: the identity the gateway's records carry for this execution.
     pub(crate) unit: String,
@@ -2998,46 +3014,37 @@ impl GatewayLease {
     /// Revoke the seat's key and return what the gateway recorded for it (model requests:
     /// status, model, tool calls, text, usage — never a credential).
     pub(crate) fn release(mut self) -> Vec<crate::seat_gateway::GatewayRecord> {
-        let records = crate::seat_gateway::collect_unit_records(
-            &self.runtime,
-            &self.gateway,
-            &self.since,
-            &self.unit,
-        );
+        // The gateway pod as it runs now, not as it ran at arm (review r6 #15).
+        self.gw = self.gw.current();
+        let records = self.gw.records(&self.since, &self.unit);
         self.revoke();
         records
     }
 
-    /// Revoke the key once; evidence collection is optional, revocation is not. A revocation
-    /// the gateway does not confirm is retried, and if it still is not confirmed the gateway is
-    /// removed (codex gw-r2 P2): no served policy outlives a key the engine meant to revoke. The
-    /// next unit starts a fresh gateway with no keys.
+    /// Revoke the key once; a revocation the gateway does not confirm is retried, and if it still
+    /// is not confirmed the gateway is stopped (no served policy outlives a key the engine meant
+    /// to revoke; the next arm publishes a config without it before the gateway serves again).
     fn revoke(&mut self) {
         let key = std::mem::take(&mut self.key);
         if key.is_empty() {
             return;
         }
+        self.gw = self.gw.current();
         let mut last = String::new();
         for _ in 0..REVOKE_ATTEMPTS {
-            match crate::seat_gateway::deregister_live(
-                &self.runtime,
-                &self.gateway,
-                &self.dir,
-                &key,
-            ) {
+            match crate::k8s::gw::deregister_live(&self.gw, &key) {
                 Ok(()) => return,
                 Err(e) => last = e,
             }
         }
-        let removed = crate::seat_gateway::quarantine(&self.runtime, &self.gateway);
+        let removed = crate::k8s::gw::quarantine(&self.gw);
         eprintln!(
-            "wicked-core: gateway key for {} not revoked ({last}); gateway {} {}",
+            "wicked-core: gateway key for {} not revoked ({last}); gateway {}",
             self.unit,
-            self.gateway.name,
             if removed {
-                "removed"
+                "stopped"
             } else {
-                "could NOT be removed"
+                "could NOT be stopped"
             }
         );
     }
@@ -3398,33 +3405,49 @@ pub(crate) fn arm_noting(
         .filter_map(|p| p.parent().map(Path::to_path_buf))
         .collect();
     spec.writable.retain(|w| !pin_dirs.contains(w));
+    // The image builder (D2: it builds the seat, floor and sync images into the store the
+    // cluster shares; it never runs a seat).
     let rt = runtime().map_err(|w| (w, String::new()))?;
-    static LAST_SWEEP: Mutex<Option<Instant>> = Mutex::new(None);
-    let due = LAST_SWEEP
-        .lock()
-        .is_ok_and(|mut last| sweep_due(&mut last, Instant::now(), SWEEP_EVERY));
-    if due {
-        sweep(&rt);
-    }
     let (image, built_in) =
         ensure_seat_image_noting(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     if let Some(waited) = built_in {
         on_built(&image, waited);
     }
-    let floor_image = ensure_floor_image(&rt)
-        .and_then(|t| image_id(&rt, &t).ok_or_else(|| format!("floor image {t} vanished")))
-        .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let floor_image = ensure_floor_image(&rt).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let floor_id = image_id(&rt, &floor_image).ok_or_else(|| {
+        (
+            FloorUnarmed::NoSeatImage,
+            format!("floor image {floor_image} vanished"),
+        )
+    })?;
+    let sync_image = crate::checks_container::image_tag();
+    if !image_present(&rt, &sync_image) {
+        build_image(&rt, crate::checks_container::DOCKERFILE, &sync_image, &[])
+            .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    }
     // A seat's only route out is the daemon's model gateway: an engine with no gateway dir (no
-    // state home) runs only offline seats (an `--internal` network alone still reaches the VM
-    // host's services).
+    // state home) runs only offline seats.
     if !offline_seats() && gateway_dir.is_none() {
         return Err((
             FloorUnarmed::GatewayUnavailable,
             format!("no model gateway is configured; set {NETWORK_ENV}=none for an offline seat"),
         ));
     }
-    // The engine's launch files are bound read-only: each must exist before the mounts are
-    // rendered (a fresh phase's floor spec is written after arming).
+    // The engine's cluster: the daemon's own (its state home holds the kubeconfig `cluster
+    // install` wrote), answering, with the pinned controller and a pod pids limit (B2).
+    let home = gateway_dir
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| wicked_apps_core::spawn::worker_home_base().ok())
+        .ok_or_else(|| {
+            (
+                FloorUnarmed::NoCluster,
+                "no state home for the cluster settings".to_string(),
+            )
+        })?;
+    let kube = crate::k8s::kube_for(&home)?;
+    crate::k8s::cluster::probe_cached(&kube)?;
+    crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image)?;
     let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
@@ -3435,16 +3458,12 @@ pub(crate) fn arm_noting(
     }
     cover_gateway_dir(&mut mounts, gateway_dir)
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    // core#1228: a prompt too long for one exec argument rides a private read-only file; the
-    // argv carries a short pointer to it. After every other mount is known (the store must lie
-    // outside all of them) and before the view the claude fence is narrowed to.
+    // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
         Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
             .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
         None => None,
     };
-    // What the seat sees, for the claude fence ([`narrow_fenced_dir`]): the final mounts, and
-    // the unit's working set among them.
     let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
         .chain(spec.protected.iter().cloned())
         .chain(spec.readmitted.iter().cloned())
@@ -3463,53 +3482,20 @@ pub(crate) fn arm_noting(
             inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone()),
         ))
         .collect();
-    let image = inspect_seat_image(&rt, &floor_image, &image)
-        .and_then(|f| check_seat_image(&f, &dests).map(|()| f.id))
+    inspect_seat_image(&rt, &floor_id, &image)
+        .and_then(|f| check_seat_image(&f, &dests))
         .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    let name = container_name(cli, run_id, ord);
-    let network = ensure_seat_network(&rt, &name)
-        .map_err(|e| (network_failure_kind(&e, &mut || !runtime_answers(&rt)), e))?;
-    // Owned from here: whatever happens before the seat runs, its network goes.
-    let cleanup = ReapOnDrop(Some(SeatContainer {
-        runtime: rt.cli.clone(),
-        name: name.clone(),
-    }));
-    // The seat's only egress: the daemon's gateway, attached to its network as `agw`, with a
-    // fresh placeholder key. No gateway dir (an engine with no state home) = no egress at all.
-    gateway_route_defined(cli, gateway_dir.is_some() && network != "none")
-        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    let (env, files, lease, seat_args, copilot_account) =
-        match gateway_dir.filter(|_| network != "none") {
+    let online = gateway_dir.is_some() && !offline_seats();
+    gateway_route_defined(cli, online).map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    let (env, files, lease, seat_args, copilot_account, gateway_ip) =
+        match gateway_dir.filter(|_| online) {
             Some(dir) => {
-                // The gateway's bridge is a network too: out of address pools, or refused by an
-                // answering runtime, it is the host's fault like the seat's own network.
-                let down = |e: String| {
-                    let why = if e.starts_with(crate::seat_gateway::BRIDGE_UNREACHABLE) {
-                        FloorUnarmed::ContainerRuntimeDown
-                    } else if pools_exhausted(&e) {
-                        FloorUnarmed::AddressPoolsExhausted
-                    } else if e.starts_with(crate::seat_gateway::BRIDGE_REFUSED) {
-                        FloorUnarmed::SeatNetworkUnavailable
-                    } else {
-                        FloorUnarmed::GatewayUnavailable
-                    };
-                    (why, e)
-                };
-                let gw = crate::seat_gateway::ensure_gateway(&rt, dir).map_err(down)?;
-                // The broker's one refresher runs beside this daemon's gateway (a credential that
-                // expired between runs is renewed, by its own CLI, before the seat starts).
-                #[cfg(unix)]
-                crate::seat_refresh::start(&rt, &gw, dir);
-                // The agent's sign-in (DES §6): the user signed in once in its login container, and
-                // the broker holds that credential. The seat's placeholder takes its shape and its
-                // requests ride its route; signed out (or expired) = refused before the seat starts.
-                let kind = crate::seat_login::seat_sign_in(&rt, &gw, dir, cli)
+                let gw = crate::k8s::gw::ensure(&kube, dir)?;
+                let down = |e: String| (FloorUnarmed::GatewayUnavailable, e);
+                // The agent's sign-in, read from the broker the gateway alone mounts.
+                let kind = crate::k8s::gw::seat_sign_in(&gw, cli)
                     .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
-                // agy on its Gemini API key: the settings that select it, written by the floor and
-                // mounted read-only (the seat cannot point agy at another provider).
                 if cli == "agy" {
-                    // A sign-in this floor cannot arm reads as signed out; a seat home it
-                    // cannot write, as an unresolvable root.
                     let api_key =
                         kind.kind == Some(crate::seat_credentials::CredentialKind::GeminiApiKey);
                     let settings = agy_floor_settings(&inp.seat_dirs, kind.kind).map_err(|e| {
@@ -3526,18 +3512,10 @@ pub(crate) fn arm_noting(
                         rw: false,
                     });
                 }
-                crate::seat_gateway::attach(&rt, &gw, &network).map_err(down)?;
-                // The seat's namespace: a sidecar allows output only to the gateway's own address on
-                // its ports (an internal network alone still reaches the VM host's services).
-                let gw_ip = gateway_ip(&rt, &gw.name, &network).map_err(down)?;
-                start_netns_sidecar(&rt, &name, &network, &gw_ip).map_err(down)?;
-                // One execution's identity (codex gw-r1 P3): a retry or a reviewer session of the
-                // same unit ordinal never reads another execution's requests as its own.
                 let unit = format!(
                     "{run_id}#{ord}@{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..8]
                 );
-                // The route a sign-in needs on the CLI's own argv (codex + ChatGPT: its provider).
                 let seat_args = crate::seat_gateway::seat_args_for(cli, kind.kind);
                 let copilot_account = (cli == "copilot"
                     && kind
@@ -3548,13 +3526,10 @@ pub(crate) fn arm_noting(
                     && kind.kind == Some(crate::seat_credentials::CredentialKind::ClaudeOauth);
                 let (key, mut env, files) = placeholder_handoff(cli, kind, run_id, &unit);
                 if oauth {
-                    // core#1024: the seat's claude passes the operator's own `claude setup-token`
-                    // token through (the gateway relays it unchanged and renews nothing). It
-                    // reaches the runtime client's environment only: `--env NAME`, never argv.
-                    let token = crate::seat_login::claude_seat_token(&rt, &gw, dir)
+                    // core#1024: the operator's own setup-token, passed through; it reaches the pod
+                    // only in the unit env file, over exec stdin (never an argv).
+                    let token = crate::k8s::gw::claude_seat_token(&gw)
                         .map_err(|e| (FloorUnarmed::AgentSignedOut, e))?;
-                    // The seat-secret guard checks every unit's settled diff, and the delivery,
-                    // for the value this seat now holds (core#1024 follow-up).
                     crate::seat_secret_guard::register(
                         crate::seat_secret_guard::SecretKind::ClaudeSetupToken,
                         &token,
@@ -3565,22 +3540,25 @@ pub(crate) fn arm_noting(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_secs().saturating_sub(1).to_string())
                     .unwrap_or_default();
-                // The lease owns the key BEFORE the first registration step (codex gw-r2 P2): a
-                // failed persist, publish or readiness check drops it, which revokes the key.
+                let ip = gw.service_ip.clone();
                 let lease = GatewayLease {
-                    runtime: rt.clone(),
-                    dir: dir.to_path_buf(),
-                    gateway: gw.clone(),
+                    gw: gw.clone(),
                     key: key.key.clone(),
                     unit,
                     since,
                 };
-                crate::seat_gateway::register_live(&rt, &gw, dir, key.clone()).map_err(down)?;
-                (env, files, Some(lease), seat_args, copilot_account)
+                crate::k8s::gw::register_live(&gw, key.clone()).map_err(down)?;
+                (
+                    env,
+                    files,
+                    Some(lease),
+                    seat_args,
+                    copilot_account,
+                    Some(ip),
+                )
             }
-            None => (Vec::new(), Vec::new(), None, Vec::new(), None),
+            None => (Vec::new(), Vec::new(), None, Vec::new(), None, None),
         };
-    let user = operator_user();
     let workdir = inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone());
     let memory = std::env::var(MEMORY_ENV).ok();
     let own_ports: Vec<u16> = spec
@@ -3591,35 +3569,95 @@ pub(crate) fn arm_noting(
             crate::worker_sandbox::NetGrant::AnyHost { .. } => None,
         })
         .collect();
-    // Online seats join their sidecar's namespace; an offline seat has no network.
-    let seat_network = if network == "none" {
-        network.clone()
+    // B17: a read-only unit's tree is a throwaway view in the pod, writable there.
+    let tree = spec
+        .tree
+        .canonicalize()
+        .unwrap_or_else(|_| spec.tree.clone());
+    let read_only_view = inp.read_only;
+    let mut land_mounts = mounts.clone();
+    if read_only_view {
+        land_mounts.retain(|m| m.dst() != tree.as_path());
+        land_mounts.push(Mount::Bind {
+            path: tree.clone(),
+            rw: true,
+        });
+    }
+    let mut landrun: Vec<String> = vec![SEAT_ENTRY.into(), CANARY_FILE.into(), "--".into()];
+    landrun.extend(landrun_prefix(&land_mounts, GATEWAY_PORTS, &own_ports));
+    if let Some(at) = landrun.iter().position(|a| a == "--").and_then(|first| {
+        landrun[first + 1..]
+            .iter()
+            .position(|a| a == "--")
+            .map(|i| first + 1 + i)
+    }) {
+        for d in seat_devices(cli).iter().rev() {
+            landrun.splice(at..at, ["--rw".to_string(), (*d).to_string()]);
+        }
+    }
+    let protected: Vec<PathBuf> = spec.protected.clone();
+    let plan_mounts = crate::k8s::seat::plan_mounts(&mounts);
+    // Canonical, like the mount plan's paths (review r2: macOS spells a worker home under /var
+    // or /tmp as /private/...).
+    let canon =
+        |p: &Path| crate::worker_sandbox::canon_lenient(p).unwrap_or_else(|| p.to_path_buf());
+    let seed_base =
+        crate::worker_sandbox::seat_cache_dir(wicked_apps_core::spawn::SeatCli::from_binary(cli))
+            .and_then(|d| d.parent().map(Path::to_path_buf))
+            .map(|d| canon(&d));
+    let seat_dirs: Vec<PathBuf> = inp.seat_dirs.iter().map(|d| canon(d)).collect();
+    let scratch_dir: Option<PathBuf> = inp.scratch.as_deref().map(canon);
+    let role = if crate::k8s::seat::one_shot_scope(run_id).is_some() {
+        "judge"
     } else {
-        format!("container:{}", netns_name(&name))
+        "seat"
     };
-    let mut wrapper = run_argv(&ContainerLaunch {
-        runtime: &rt.cli,
+    // In the mount plan's own spelling (review r5: `/tmp/...` names a `/private` path there).
+    let write_roots: Vec<PathBuf> = inp
+        .write_roots
+        .iter()
+        .map(|w| w.canonicalize().unwrap_or_else(|_| w.clone()))
+        .collect();
+    let arm_spec = crate::k8s::seat::ArmSpec {
+        run_id,
+        ord,
+        cli,
         image: &image,
-        name: &name,
-        network: &seat_network,
+        floor_image: &floor_image,
+        sync_image: &sync_image,
         workdir: &workdir,
-        user: &user,
-        mounts: &mounts,
-        floor: &floor_image,
-        memory: memory_from(memory.as_deref()),
-        gateway_ports: GATEWAY_PORTS,
-        own_ports: &own_ports,
-    });
-    grant_seat_devices(&mut wrapper, cli).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+        tree: &tree,
+        view: read_only_view,
+        mounts: &plan_mounts,
+        protected: &protected,
+        write_roots: &write_roots,
+        seat_dirs: &seat_dirs,
+        scratch: scratch_dir.as_deref(),
+        seed_base: seed_base.as_deref(),
+        memory: &k8s_memory(memory_from(memory.as_deref())),
+        gateway_ip: gateway_ip.as_deref(),
+        // The engine's own ceiling for a turn (`WICKED_UNIT_TIMEOUT_SECS`; a unit's budget only
+        // lowers it): the pod outlives no turn the engine would still wait for (review r4).
+        deadline: crate::workflow::unit_timeout_ceiling(),
+        role,
+    };
+    let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;
+    // The gate hook judges this unit as a pod seat's (B17).
+    let mut env = env;
+    env.push((crate::gate_hook::SEAT_POD_ENV.to_string(), "1".to_string()));
+    let cleanup = ReapOnDrop(Some(SeatContainer {
+        runtime: kube.kubectl.clone(),
+        name: seat.id.clone(),
+    }));
     let argv = with_seat_args(image_argv(&argv, cli), seat_args);
-    // Checked on what the container will exec (the seat's own args included); a refusal here
-    // drops the lease (revoking its key) and the container's cleanup with it.
+    // Checked on what the pod will exec (the seat's own args included); a refusal here drops
+    // the lease (revoking its key) and the pod's cleanup with it.
     check_exec_args(&argv).map_err(|e| (FloorUnarmed::ArgvTooLong, e))?;
     Ok(ArmedContainer {
         wrapper,
         argv,
         prompt_file,
-        tool: tool_name(&rt.cli),
+        tool: "kubectl",
         cleanup,
         env,
         files,
@@ -3627,6 +3665,17 @@ pub(crate) fn arm_noting(
         copilot_account,
         view,
     })
+}
+
+/// A container memory limit (`3g`, `512m`) as a Kubernetes quantity (`3Gi`, `512Mi`).
+pub(crate) fn k8s_memory(m: &str) -> String {
+    let m = m.trim();
+    match m.char_indices().last() {
+        Some((i, 'g' | 'G')) => format!("{}Gi", &m[..i]),
+        Some((i, 'm' | 'M')) => format!("{}Mi", &m[..i]),
+        Some((i, 'k' | 'K')) => format!("{}Ki", &m[..i]),
+        _ => m.to_string(),
+    }
 }
 
 /// agy's settings (`~/.gemini/antigravity-cli/settings.json`) for the sign-in its seat runs on,

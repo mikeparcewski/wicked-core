@@ -753,6 +753,9 @@ pub(crate) struct FloorInputs {
     /// The seat's own directories: its configuration home(s), its cache and temp dirs, a check
     /// scratch, and the run's governance-log dir (the gate hook writes its decisions there).
     pub(crate) seat_dirs: Vec<PathBuf>,
+    /// The unit's fenced scratch, when it has one (also among `seat_dirs`): per unit, never
+    /// kept beyond it (a pod seat's replica drops it at settle).
+    pub(crate) scratch: Option<PathBuf>,
     /// Paths no secret mask may cover: the seat's own configuration when it inherits the
     /// operator's (the `WICKED_INHERIT_OPERATOR_CONFIG` hatch).
     pub(crate) unmask: Vec<PathBuf>,
@@ -1429,6 +1432,7 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             write_roots,
             read_only: launch.read_only,
             seat_dirs,
+            scratch: launch.scratch.map(Path::to_path_buf),
             unmask,
             pinned: Vec::new(),
             net,

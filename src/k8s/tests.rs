@@ -46,6 +46,8 @@ fn seat() -> SeatPod {
         gateway_ip: Some("10.43.0.50".into()),
         shutdown_time: "2026-11-11T05:00:00Z".into(),
         deadline_secs: 3600,
+        scope: None,
+        view: None,
     }
 }
 
@@ -55,6 +57,7 @@ fn gw() -> GatewaySpec {
         owner: "wabc123def456".into(),
         image: crate::seat_gateway::GATEWAY_IMAGE.into(),
         writer_image: "busybox:1.37".into(),
+        boot: "boot-1".into(),
     }
 }
 
@@ -230,7 +233,16 @@ fn k8s_replica_paths_mount_at_their_host_paths_with_their_access() {
         .find(|m| m["mountPath"] == "/home/op/.wicked/skills/snap")
         .unwrap();
     assert_eq!(skills["readOnly"], true);
-    for bad in ["/tmp/x", "/floor", "/", "/a/../b", "rel/x"] {
+    // A path under `/tmp` is allowed (an engine session's scratch tree, review r1 of B-2).
+    for bad in [
+        "/tmp",
+        "/floor",
+        "/floor/x",
+        "/wicked-canary",
+        "/",
+        "/a/../b",
+        "rel/x",
+    ] {
         let mut s = seat();
         s.mounts.push(ReplicaMount {
             path: PathBuf::from(bad),
@@ -640,6 +652,12 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     assert!(render::pids_probe_verdict(&format!("{net}1\n2\n3\n")).is_err());
     assert!(render::pids_probe_verdict("").is_err());
     // Review r1 P1: a cluster that lets a deny-all pod reach the API server or the kubelet
+    // An empty log (an evicted probe) is a retry, never a policy verdict.
+    let e = render::pids_probe_verdict("").unwrap_err();
+    assert!(
+        e.contains("retry") && !e.contains("does not enforce"),
+        "{e}"
+    );
     // does not enforce NetworkPolicy: refused, whatever the pids answer.
     let open = format!("net=closed\nnet=closed\nnet=open\n{}{fork}", counts(4094));
     assert!(render::pids_probe_verdict(&open)
@@ -656,7 +674,13 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     let script = pod["spec"]["containers"][0]["command"][3].as_str().unwrap();
     assert!(script.contains("-lt 4160"));
     assert!(script.contains("$KUBERNETES_SERVICE_HOST 443") && script.contains("$HOST_IP 10250"));
-    assert!(script.contains("1.1.1.1 443") && script.starts_with("/busybox sleep 3;"));
+    // The enforcement check polls (a new pod's policy can land late under load), and still
+    // ends on what it saw: a cluster that never closes answers open.
+    assert!(
+        script.contains("1.1.1.1 443")
+            && script.contains("-lt 10")
+            && script.contains("echo net=$n")
+    );
 }
 
 #[test]

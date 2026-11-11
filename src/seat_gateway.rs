@@ -14,7 +14,12 @@
 //! serializes provisioning, startup and key changes. The daemon must pass the same directory
 //! throughout its lifetime (the directory is also the input to [`gateway_name`]).
 
-#![cfg_attr(not(unix), allow(dead_code))] // agy lg-r1 A7: callers remain available.
+#![cfg_attr(not(unix), allow(dead_code))]
+// agy lg-r1 A7: callers remain available.
+// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
+// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead
+// (unix only here: the line above already allows it elsewhere, and a duplicate is an error).
+#![cfg_attr(unix, allow(dead_code))]
 
 use std::fs;
 use std::io::Write;
@@ -110,7 +115,7 @@ fn parse_egress_hosts(raw: &str) -> Vec<String> {
 }
 
 /// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]).
-fn egress_hosts_from_env() -> Vec<String> {
+pub(crate) fn egress_hosts_from_env() -> Vec<String> {
     parse_egress_hosts(&std::env::var(EGRESS_HOSTS_ENV).unwrap_or_default())
 }
 
@@ -765,7 +770,7 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>, S
 }
 
 /// Replace a whole file by a same-directory rename; never truncate the gateway's watched file.
-fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
+pub(crate) fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     let parent = path.parent().ok_or("config file has no parent")?;
     fs::create_dir_all(parent)
         .map_err(|e| format!("could not create {}: {e}", parent.display()))?;
@@ -815,7 +820,7 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<(), String> {
     result
 }
 
-fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
+pub(crate) fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
     let mut config: GatewayConfig =
         read_json(&dir.join("config/gateway.json"))?.unwrap_or_default();
     // An earlier engine's single account was codex's: one representation from here on.
@@ -830,7 +835,7 @@ fn load_config(dir: &Path) -> Result<GatewayConfig, String> {
 }
 
 /// `config` as served: with this process's gate-hook route when the relay was reached.
-fn effective(config: &GatewayConfig) -> GatewayConfig {
+pub(crate) fn effective(config: &GatewayConfig) -> GatewayConfig {
     let mut c = config.clone();
     if c.hook_upstream.is_none() {
         c.hook_upstream = HOOK_UPSTREAM.lock().ok().and_then(|c| c.clone());
@@ -842,11 +847,11 @@ fn effective(config: &GatewayConfig) -> GatewayConfig {
 }
 
 /// Crew's MCP broker as this process's gateway reaches it, probed once (see [`probe_mcp`]).
-static MCP_UPSTREAM: Mutex<Option<String>> = Mutex::new(None);
+pub(crate) static MCP_UPSTREAM: Mutex<Option<String>> = Mutex::new(None);
 
 /// A route probe whose FOUND address is kept for the process; a miss is not (agy gw-r1 F-05: a
 /// transient failure, a cold helper image, must not refuse every later claude unit).
-fn probe_once(
+pub(crate) fn probe_once(
     cell: &Mutex<Option<String>>,
     probe: impl FnOnce() -> Option<String>,
 ) -> Option<String> {
@@ -910,10 +915,10 @@ pub(crate) fn mcp_route_ready() -> bool {
 }
 
 /// The relay's address as this process's gateway reaches it, probed once (see [`probe_hook`]).
-static HOOK_UPSTREAM: Mutex<Option<String>> = Mutex::new(None);
+pub(crate) static HOOK_UPSTREAM: Mutex<Option<String>> = Mutex::new(None);
 
 /// The host aliases the container desktops give for the host's loopback, in probe order.
-const HOST_ALIASES: &[&str] = &[
+pub(crate) const HOST_ALIASES: &[&str] = &[
     "host.lima.internal",
     "host.docker.internal",
     "host.containers.internal",
@@ -960,7 +965,7 @@ pub(crate) fn hook_route_ready() -> bool {
     HOOK_UPSTREAM.lock().is_ok_and(|c| c.is_some())
 }
 
-fn persist_units(dir: &Path, config: &GatewayConfig) -> Result<(), String> {
+pub(crate) fn persist_units(dir: &Path, config: &GatewayConfig) -> Result<(), String> {
     // Authoritative units first; a failed config replacement is reported and a retry re-renders
     // from this list. Successful deregistration guarantees the served config no longer has it.
     atomic_json(&dir.join("config/units.json"), &config.units)?;
@@ -1201,7 +1206,7 @@ pub(crate) fn copilot_wire_api(
 
 // codex lg-r1 #3: seat-login is a separate process; keep publication inside this
 // transaction too. All callers acquire PUBLISH_LOCK -> CONFIG_LOCK -> config/.lock.
-struct ConfigTransaction {
+pub(crate) struct ConfigTransaction {
     _publish: std::sync::MutexGuard<'static, ()>,
     _config: std::sync::MutexGuard<'static, ()>,
     _file: fs::File,
@@ -1215,7 +1220,7 @@ impl Drop for ConfigTransaction {
     }
 }
 
-fn config_transaction(dir: &Path) -> Result<ConfigTransaction, String> {
+pub(crate) fn config_transaction(dir: &Path) -> Result<ConfigTransaction, String> {
     let publishing = PUBLISH_LOCK
         .lock()
         .map_err(|_| "gateway publish lock poisoned")?;
@@ -1257,7 +1262,7 @@ pub(crate) fn register_unit(dir: &Path, unit: UnitKey) -> Result<(), String> {
     register_unit_locked(dir, unit)
 }
 
-fn register_unit_locked(dir: &Path, unit: UnitKey) -> Result<(), String> {
+pub(crate) fn register_unit_locked(dir: &Path, unit: UnitKey) -> Result<(), String> {
     let mut config = load_config(dir)?;
     config.units.retain(|u| u.key != unit.key);
     config.units.push(unit);
@@ -1508,23 +1513,26 @@ pub(crate) fn deregister_unit(dir: &Path, key: &str) -> Result<(), String> {
     deregister_unit_locked(dir, key)
 }
 
-fn deregister_unit_locked(dir: &Path, key: &str) -> Result<(), String> {
+pub(crate) fn deregister_unit_locked(dir: &Path, key: &str) -> Result<(), String> {
     let mut config = load_config(dir)?;
     mark_revoking(dir, [key.to_string()])?;
     config.units.retain(|u| u.key != key);
     persist_units(dir, &config)
 }
 
-fn revoking_path(dir: &Path) -> PathBuf {
+pub(crate) fn revoking_path(dir: &Path) -> PathBuf {
     dir.join("config/revoking.json")
 }
 
-fn load_revoking(dir: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn load_revoking(dir: &Path) -> Result<Vec<String>, String> {
     Ok(read_json(&revoking_path(dir))?.unwrap_or_default())
 }
 
 /// Add `keys` to the pending revocations (callers hold `CONFIG_LOCK`).
-fn mark_revoking(dir: &Path, keys: impl IntoIterator<Item = String>) -> Result<(), String> {
+pub(crate) fn mark_revoking(
+    dir: &Path,
+    keys: impl IntoIterator<Item = String>,
+) -> Result<(), String> {
     let mut pending = load_revoking(dir)?;
     for k in keys {
         if !pending.contains(&k) {
@@ -1538,7 +1546,7 @@ fn mark_revoking(dir: &Path, keys: impl IntoIterator<Item = String>) -> Result<(
 /// returning the pending keys (callers hold `CONFIG_LOCK`). A crash between the two writes of
 /// [`persist_units`] can leave a rendered config that still authorizes a pending key (codex
 /// gw-r5 P2): it is never republished as found.
-fn rerender_without_pending(dir: &Path) -> Result<Vec<String>, String> {
+pub(crate) fn rerender_without_pending(dir: &Path) -> Result<Vec<String>, String> {
     let pending = load_revoking(dir)?;
     if pending.is_empty() {
         return Ok(pending);
@@ -1867,7 +1875,7 @@ pub(crate) fn remove_broker_file(
 
 /// Serializes register/deregister WITH their publish, so the served config is never older than
 /// the last change (two units racing could otherwise publish out of order and drop a key).
-static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
+pub(crate) static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
 
 /// Register `unit` and publish the new config to the running gateway.
 pub(crate) fn register_live(
@@ -2131,7 +2139,7 @@ fn external_network_argv(gw: &Gateway) -> Vec<String> {
 /// routes from `config/gateway.json` when present, else the defaults (provider endpoints, broker
 /// credentials used only when present).
 // codex lg-r1 #11: preserve overrides on existing routes, fill the missing C4 routes.
-fn reconcile_routes(config: &mut GatewayConfig) {
+pub(crate) fn reconcile_routes(config: &mut GatewayConfig) {
     for mut route in GatewayConfig::default().providers {
         if !config.providers.iter().any(|r| r.port == route.port) {
             if let Some(old) = config
@@ -2152,7 +2160,10 @@ fn reconcile_routes(config: &mut GatewayConfig) {
 /// The allowlist is replaced, never merged: the persisted one is an earlier daemon's, and keeping
 /// it froze the first daemon's (usually empty) list, so a later `WICKED_SEAT_EGRESS_HOSTS` was
 /// ignored and every allowed host was refused. A host dropped from it is refused.
-fn provision_config(dir: &Path, egress_hosts: Vec<String>) -> Result<GatewayConfig, String> {
+pub(crate) fn provision_config(
+    dir: &Path,
+    egress_hosts: Vec<String>,
+) -> Result<GatewayConfig, String> {
     let mut config = load_config(dir)?;
     reconcile_routes(&mut config);
     config.egress_hosts = egress_hosts;
@@ -2415,7 +2426,7 @@ pub(crate) fn quarantine(rt: &Runtime, gw: &Gateway) -> bool {
 static QUARANTINE: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 /// The daemons' gateway dirs this process has taken over or started (their keys are its own).
-static OWNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+pub(crate) static OWNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 /// `rm --force` the gateway; on success its quarantine mark is cleared. Callers hold
 /// `PUBLISH_LOCK`.

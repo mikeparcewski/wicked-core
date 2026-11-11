@@ -3247,6 +3247,8 @@ impl OneShotScratch {
 impl Drop for OneShotScratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(sandbox_root(&self.run_id));
+        // Its replica scope in the cluster's session namespace (the pod is already gone).
+        crate::k8s::seat::drop_scope(&self.run_id);
         if let Some(home) = self.home.borrow_mut().take() {
             let _ = std::fs::remove_dir_all(home);
         }
@@ -3520,18 +3522,16 @@ impl WrappedCliStepRunner {
                 self.operational_home.is_some(),
                 true,
             );
-        // Warm the first unit's route before rendering any ask flags/files. Use the same
-        // cached runtime and <operational_home>/gateway directory as container_floor::arm.
+        // Warm the first unit's route before rendering any ask flags/files: the daemon's
+        // gateway on its cluster, from the same <operational_home>/gateway directory the pod
+        // arm uses (review r1: never the Docker gateway, whose routes a pod cannot reach).
         // A process-cached route cannot provide a gateway to an offline or homeless runner.
         let gateway_ok = otherwise_eligible
             && self.operational_home.as_deref().is_some_and(|home| {
                 crate::seat_gateway::mcp_route_ready()
-                    || crate::container_floor::runtime()
-                        .ok()
-                        .is_some_and(|runtime| {
-                            crate::seat_gateway::ensure_gateway(&runtime, &home.join("gateway"))
-                                .is_ok()
-                        })
+                    || crate::k8s::kube_for(home).ok().is_some_and(|kube| {
+                        crate::k8s::gw::ensure(&kube, &home.join("gateway")).is_ok()
+                    })
             });
         let mut ask_enabled = gateway_ok && crate::seat_gateway::mcp_route_ready();
         let mut argv = build_argv(&invocation, &prompt, &input.unit.allowed_skills);
@@ -4990,6 +4990,13 @@ impl WrappedCliStepRunner {
                     } else {
                         format!("(cli `{cli_key}` was killed by run cancellation)\n{out}")
                     },
+                    usage,
+                    files,
+                    tools,
+                ),
+                Ok((-1, out, err, usage, files, tools)) if err.starts_with(SETTLE_FAILED) => (
+                    StepStatus::Failed,
+                    settle_failure_output(&argv[0], &err, &out),
                     usage,
                     files,
                     tools,
@@ -7458,6 +7465,29 @@ const TIMED_OUT: &str = "__wicked_timed_out__";
 /// deadline is the engine's own turn ceiling. Collapsing them re-creates the 616c8661 ambiguity
 /// where a turn-timeout and an operator cancel are indistinguishable downstream.
 const CANCELLED: &str = "__wicked_cancelled__";
+/// The unit output of a seat pod whose settlement failed: the could-not-run line first (what
+/// classifiers read), then whatever the CLI printed.
+pub(crate) fn settle_failure_output(argv0: &str, err: &str, out: &str) -> String {
+    let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
+    let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
+    let mut text = format!("{COULD_NOT_RUN_PREFIX}{argv0}`: {why})");
+    if !out.trim().is_empty() {
+        text.push('\n');
+        text.push_str(out);
+    }
+    if !stderr.trim().is_empty() {
+        text.push_str("\n[stderr]\n");
+        text.push_str(stderr);
+    }
+    text
+}
+
+/// Between a settlement failure's reason and the CLI's stderr in the sentinel.
+pub(crate) const SETTLE_SEP: char = '\u{1e}';
+
+/// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
+/// write-back was refused): could not run, the reason after the prefix, the CLI's output kept.
+pub(crate) const SETTLE_FAILED: &str = "__wicked_settle_failed__";
 
 /// Upper bound on retained tool names per unit turn (FINDING-046 review, Copilot). `output` is capped
 /// at `MAX_OUT`; `tools` needs its own ceiling or a hung/looping CLI emitting `tool_use` blocks with
@@ -7562,11 +7592,41 @@ pub(crate) fn run_bounded(
     // read roots. FIRST: it rebuilds the command, so stdio and the process group are set on the
     // rebuilt one below. The guard removes the container however this function ends (a panic
     // included): a killed client leaves its container running.
-    let mut cmd = crate::container_floor::finalize(cmd);
-    let seat_container = crate::container_floor::seat_container(&cmd);
-    let _reap = crate::container_floor::ReapOnDrop(seat_container.clone());
+    // A seat pod (the Kubernetes runner): the carrier's env goes into the pod's unit env file over
+    // exec stdin, and the command becomes the kubectl client alone. The guard reaps the pod
+    // however this function ends; on the normal path `settle` below reaps it first and writes
+    // the unit's changes back.
+    let pod_seat = match crate::k8s::seat::finalize(&cmd) {
+        Ok(found) => found,
+        Err(e) => {
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            if let Some(id) = crate::k8s::seat::seat_id_of(&args) {
+                crate::k8s::seat::reap(&id);
+            }
+            return Err(std::io::Error::other(e));
+        }
+    };
+    let (mut cmd, pod_seat) = match pod_seat {
+        Some((c, seat)) => (c, Some(seat)),
+        None => (cmd, None),
+    };
+    let _reap = crate::container_floor::ReapOnDrop(pod_seat.as_ref().map(|s| {
+        crate::container_floor::SeatContainer {
+            runtime: PathBuf::from(cmd.get_program()),
+            name: s.id.clone(),
+        }
+    }));
     // agy: a pipe, closed below at once (EOF), never `/dev/null` (see the predicate).
-    let piped_stdin = crate::container_floor::stdin_must_be_a_pipe(&cmd);
+    let piped_stdin = match &pod_seat {
+        Some(seat) => {
+            wicked_apps_core::spawn::SeatCli::from_binary(&seat.cli)
+                == wicked_apps_core::spawn::SeatCli::Agy
+        }
+        None => crate::container_floor::stdin_must_be_a_pipe(&cmd),
+    };
     cmd.stdin(if piped_stdin {
         Stdio::piped()
     } else {
@@ -7704,14 +7764,58 @@ pub(crate) fn run_bounded(
         (code, killed_by, out, usage, files, tools, err)
     });
 
+    // The seat pod: its exit code is read back from the pod (a lost stream is no result), the
+    // pod is deleted and waited out, and only then does the unit's work come back (B11).
+    let mut code = code;
+    if let Some(seat) = &pod_seat {
+        // The token is read again here and once more before the write-back (codex b2-gw #4):
+        // a cancel that lands after the client ended still brings nothing back.
+        let is_cancelled = || {
+            cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst))
+        };
+        let ending = match killed_by {
+            Some(k) if k == CANCELLED => crate::k8s::seat::Ending::Cancelled,
+            _ if is_cancelled() => crate::k8s::seat::Ending::Cancelled,
+            Some(_) => crate::k8s::seat::Ending::TimedOut,
+            None => crate::k8s::seat::Ending::Exited(code),
+        };
+        match crate::k8s::seat::settle_unless(seat, ending, &is_cancelled) {
+            Ok(c) if killed_by.is_none() => code = c,
+            Ok(_) => {}
+            // Could not run, with no trusted exit code, but what the CLI produced is kept as the
+            // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
+            // minutes of output, usage and tool records.
+            Err(e) => {
+                // The reason, then the CLI's own stderr (review r4: it may say why it failed).
+                return Ok((
+                    -1,
+                    out,
+                    format!("{SETTLE_FAILED}{e}{SETTLE_SEP}{err}"),
+                    usage,
+                    files,
+                    tools,
+                ));
+            }
+        }
+    }
+    // A cancel seen only at settlement is a cancel too (codex r2): never a pass or a plain
+    // failure for a unit whose work did not come back.
+    let killed_by = match killed_by {
+        None if pod_seat.is_some()
+            && cancel
+                .as_ref()
+                .is_some_and(|c| c.load(std::sync::atomic::Ordering::SeqCst)) =>
+        {
+            Some(CANCELLED)
+        }
+        k => k,
+    };
     if let Some(sentinel) = killed_by {
         // Preserve what the CLI produced before the kill (debugging context on a hang).
         Ok((-1, out, sentinel.to_string(), usage, files, tools))
     } else {
-        let err = match &seat_container {
-            Some(seat) => crate::container_floor::explain_start_failure(&seat.name, code, err),
-            None => err,
-        };
         Ok((code, out, err, usage, files, tools))
     }
 }
@@ -9394,49 +9498,80 @@ mod tests {
         assert!(!out.governed);
     }
 
-    /// Container floor (codex review r1, P1): a seat wrapper goes through `run_bounded` — the
-    /// command `finalize` rebuilds keeps its piped stdio and process group (the rebuilt one used
-    /// to lose them and panic on `piped stdout`), its output streams, and the reap runs.
+    /// PARITY B8, A3, A12: a pod seat goes through `run_bounded`: its carrier env reaches the pod
+    /// only as the unit env file over exec stdin (never kubectl's argv or env), its output streams,
+    /// its exit code is the pod's rc file, and its pod is deleted before `run_bounded` returns.
     #[cfg(unix)]
     #[test]
-    fn a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped() {
+    fn a_pod_seat_runs_through_run_bounded_with_its_env_on_stdin_and_is_reaped() {
         if crate::validator::skip_when_nested(
-            "a_seat_wrapper_runs_through_run_bounded_with_its_pipes_and_is_reaped",
+            "a_pod_seat_runs_through_run_bounded_with_its_env_on_stdin_and_is_reaped",
         ) {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("wicked-cf-rb-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("wicked-k8s-rb-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
-        // A fake runtime: `run ...` prints its last argument; any other call (the reap) is logged.
-        let rt = dir.join("docker");
-        // Written by a child, never through a descriptor this process holds: a stub written
-        // in-process fails its exec with ETXTBSY on Linux when another test thread forks
-        // meanwhile (seen on ubuntu CI).
+        // A fake kubectl: the env write keeps its stdin; the seat exec prints its last argument;
+        // the rc read answers 0; the Sandbox is ours; the pod is gone.
+        let kubectl = dir.join("kubectl");
         crate::test_env::install_stub(
-            &rt,
+            &kubectl,
             &format!(
-                "#!/bin/sh\nif [ \"$1\" = run ]; then for a; do last=$a; done; echo \"seat-said:$last\"; exit 0; fi\necho \"$@\" >> {}/reaped\n",
-                dir.display()
+                "#!/bin/sh\nd={d}\necho \"$@\" >> $d/calls\n\
+                 case \"$*\" in\n\
+                 *'cat > /wicked-unit/env.tmp'*) cat > $d/env;;\n\
+                 *'cat /wicked-unit/rc'*) echo 0;;\n\
+                 *'get sandboxes.agents.x-k8s.io'*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"o\"}}}}}}';;\n\
+                 *' get pod '*) :;;\n\
+                 *' delete '*) :;;\n\
+                 *' exec -i -c seat '*) echo seat-ran;;\n\
+                 esac\nexit 0\n",
+                d = dir.display()
             ),
         );
-        let w = crate::container_floor::run_argv(&crate::container_floor::ContainerLaunch {
-            runtime: &rt,
-            image: "img:1",
-            name: "wicked-seat-rb",
-            network: "none",
-            workdir: &dir,
-            user: "1:1",
-            mounts: &[],
-            floor: "wicked-floor:t",
-            memory: "1g",
-            gateway_ports: &[],
-            own_ports: &[],
-        });
-        // spawn-audit: test-only — a fake runtime script; proves the finalized wrapper's pipes.
-        let mut cmd = Command::new(&w[0]);
-        cmd.args(&w[1..]).args(["claude", "-p", "hello"]);
+        let kube = crate::k8s::Kube {
+            kubectl: kubectl.clone(),
+            kubeconfig: None,
+            context: "t".into(),
+            owner: "o".into(),
+        };
+        let seat = crate::k8s::seat::register_for_test(&kube, "rbseat1", &dir, "claude");
+        let mut wrapper = kube.head(Some("ns"));
+        wrapper.extend(
+            [
+                "exec",
+                "-i",
+                "-c",
+                "seat",
+                "seat-1",
+                "--",
+                "/floor/busybox",
+                "sh",
+                "-c",
+                crate::k8s::seat::WRAPPER,
+                "wicked-unit-rbseat1",
+                "/floor/launch",
+                "/wicked-canary/probe",
+                "--",
+                "/floor/landrun",
+                "--rox",
+                "/usr",
+                "--",
+                "/floor/launch",
+                "--check",
+                "/wicked-canary/probe",
+                "--",
+            ]
+            .map(str::to_string),
+        );
+        // spawn-audit: test-only — a fake kubectl script; proves the pod seat's wiring.
+        let mut cmd = Command::new(&wrapper[0]);
+        cmd.args(&wrapper[1..])
+            .args(["claude", "-p", "hello"])
+            .env("UNIT_SECRET", "s3cr3t")
+            .current_dir(&dir);
         let emit = |_: &str| {};
         let (code, out, _err, ..) = run_bounded(
             cmd,
@@ -9447,9 +9582,24 @@ mod tests {
         )
         .expect("ran");
         assert_eq!(code, 0);
-        assert!(out.contains("seat-said:hello"), "{out}");
-        let reaped = std::fs::read_to_string(dir.join("reaped")).unwrap_or_default();
-        assert!(reaped.contains("rm --force wicked-seat-rb"), "{reaped}");
+        assert!(out.contains("seat-ran"), "{out}");
+        let env = std::fs::read_to_string(dir.join("env")).unwrap();
+        assert!(
+            env.contains("'claude' '-p' 'hello'") && env.contains("'--env' 'UNIT_SECRET'"),
+            "the argv is not in the unit file: {env}"
+        );
+        assert!(env.contains("export UNIT_SECRET='s3cr3t'"), "{env}");
+        assert!(env.contains("export WICKED_UNIT_CWD="), "{env}");
+        let calls = std::fs::read_to_string(dir.join("calls")).unwrap();
+        assert!(!calls.contains("s3cr3t"), "a secret rode an argv: {calls}");
+        assert!(
+            calls.contains("delete sandboxes.agents.x-k8s.io seat-1"),
+            "{calls}"
+        );
+        assert!(
+            crate::k8s::seat::lookup(&seat.id).is_none(),
+            "the seat outlived its unit"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
