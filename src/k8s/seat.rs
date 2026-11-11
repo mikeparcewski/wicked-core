@@ -857,7 +857,9 @@ pub(crate) fn sandbox_refusal(sbx: &Value) -> Option<(FloorUnarmed, String)> {
 pub(crate) fn deny_script(online: bool, host_ip: Option<&str>) -> String {
     let mut node = String::new();
     if let Some(ip) = host_ip {
-        for p in render::seat_gateway_ports() {
+        // The kubelet port listens on every node address: closed, it proves the policy covers
+        // the node at all; the gateway ports are what the seat's Landlock would let through.
+        for p in std::iter::once(&10250u16).chain(render::seat_gateway_ports()) {
             node.push_str(&format!("nc_ {ip} {p} node{p} & "));
         }
     }
@@ -874,8 +876,8 @@ pub(crate) fn deny_holds(out: &str, online: bool, node: bool) -> bool {
         && out.contains("net=closed")
         && (!online || out.contains("gw=open"))
         && (!node
-            || render::seat_gateway_ports()
-                .iter()
+            || std::iter::once(&10250u16)
+                .chain(render::seat_gateway_ports())
                 .all(|p| out.contains(&format!("node{p}=closed"))))
 }
 

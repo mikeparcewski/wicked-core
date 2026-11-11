@@ -1630,7 +1630,11 @@ fn k8s_the_deny_check_proves_the_seats_own_node_closed_on_every_gateway_port() {
     for p in render::seat_gateway_ports() {
         assert!(s.contains(&format!("nc_ 192.168.5.15 {p} node{p}")), "{s}");
     }
-    let mut out = String::from("api=closed\nnet=closed\ngw=open\n");
+    assert!(
+        s.contains("nc_ 192.168.5.15 10250 node10250"),
+        "the kubelet port listens"
+    );
+    let mut out = String::from("api=closed\nnet=closed\ngw=open\nnode10250=closed\n");
     for p in render::seat_gateway_ports() {
         out.push_str(&format!("node{p}=closed\n"));
     }
