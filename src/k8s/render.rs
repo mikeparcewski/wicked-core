@@ -394,7 +394,10 @@ fn view_init(floor_image: &str, sub: &str) -> Value {
         "command": ["/busybox", "sh", "-c",
             // Both sides' failure fails the init (codex b2-gw #6): a copy cut short never
             // starts the reviewer on part of the tree.
-            format!("set -o pipefail; /busybox mkdir /wicked-view/{VIEW_TREE} && cd /wicked-ro && \
+            // Made afresh each time (codex r1 #11): a re-run init never fails on, or keeps, the
+            // tree an earlier run left.
+            format!("set -o pipefail; /busybox rm -rf /wicked-view/{VIEW_TREE} && \
+                     /busybox mkdir /wicked-view/{VIEW_TREE} && cd /wicked-ro && \
                      /busybox tar -cf - . | /busybox tar -C /wicked-view/{VIEW_TREE} -xf -")],
         "securityContext": hardened_context(),
         "resources": {"requests": {"memory": "32Mi", "cpu": "50m"}, "limits": {"memory": "256Mi"}},

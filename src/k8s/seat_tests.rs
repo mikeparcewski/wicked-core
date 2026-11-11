@@ -684,7 +684,8 @@ fn k8s_a_read_only_units_view_is_never_in_the_write_back() {
     assert_eq!(init, vec!["floor", "view"]);
     let copy = spec["initContainers"][1]["command"][3].as_str().unwrap();
     assert!(
-        copy.contains(&format!("mkdir /wicked-view/{}", render::VIEW_TREE))
+        copy.contains(&format!("rm -rf /wicked-view/{}", render::VIEW_TREE))
+            && copy.contains(&format!("mkdir /wicked-view/{}", render::VIEW_TREE))
             && copy.contains(&format!("-C /wicked-view/{} -xf", render::VIEW_TREE)),
         "{copy}"
     );
