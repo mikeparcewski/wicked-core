@@ -91,7 +91,11 @@ pub(crate) fn judge_controller(dep: &Value) -> Result<(), String> {
     if n("/status/observedGeneration") < n("/metadata/generation") {
         return Err("the agent-sandbox controller's rollout is not observed yet".into());
     }
-    if n("/status/updatedReplicas") < want || n("/status/availableReplicas") < want {
+    // ... and no old replica left (kubectl's own rollout-complete test, review r2 P2).
+    if n("/status/updatedReplicas") < want
+        || n("/status/availableReplicas") < want
+        || n("/status/replicas") > n("/status/updatedReplicas")
+    {
         return Err("the agent-sandbox controller's rollout is not complete".into());
     }
     Ok(())
@@ -306,21 +310,30 @@ pub(crate) fn install(admin: &Kube, home: &Path) -> Result<PathBuf, String> {
     let cfg = engine_kubeconfig(cluster, &token);
     let path = super::own_kubeconfig(home);
     let body = serde_json::to_vec_pretty(&cfg).map_err(|e| e.to_string())?;
-    write_private(&path, &body)?;
+    // Verified from a private staging file; the discoverable path is written only once the
+    // policy is seen enforcing (review r2 P2).
+    let staging = path.with_file_name(format!(
+        ".kubeconfig-verify-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    write_private(&staging, &body)?;
     // The credential is handed over only once the admission policy is seen ENFORCING on it
     // (policy propagation can lag the create, review r1 P2): a foreign write must be refused.
     let engine = Kube {
         kubectl: admin.kubectl.clone(),
-        kubeconfig: Some(path.clone()),
+        kubeconfig: Some(staging.clone()),
         context: OWN_CONTEXT.to_string(),
         owner: admin.owner.clone(),
     };
     let start = std::time::Instant::now();
     loop {
         match admission_enforced(&engine) {
-            Ok(()) => return Ok(path),
+            Ok(()) => {
+                std::fs::rename(&staging, &path).map_err(|e| e.to_string())?;
+                return Ok(path);
+            }
             Err(e) if start.elapsed() > Duration::from_secs(60) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(&staging);
                 return Err(format!(
                     "the engine account's admission policy did not enforce: {e}; no credential written"
                 ));
@@ -395,6 +408,11 @@ pub(crate) fn token_expiry(token: &str) -> Option<u64> {
 /// Renew the engine's own token (a TokenRequest it may make for itself only) when less than a
 /// week is left; the kubeconfig is rewritten in place. `Ok(false)` = nothing to do.
 pub(crate) fn renew_token_if_due(engine: &Kube) -> Result<bool, String> {
+    renew_token_below(engine, TOKEN_RENEW_BELOW_SECS)
+}
+
+/// [`renew_token_if_due`] with its threshold (a test renews at once with `u64::MAX`).
+pub(crate) fn renew_token_below(engine: &Kube, below_secs: u64) -> Result<bool, String> {
     let Some(path) = engine.kubeconfig.clone() else {
         return Ok(false);
     };
@@ -407,7 +425,7 @@ pub(crate) fn renew_token_if_due(engine: &Kube) -> Result<bool, String> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    if token_expiry(token).is_some_and(|exp| exp > now + TOKEN_RENEW_BELOW_SECS) {
+    if token_expiry(token).is_some_and(|exp| exp > now.saturating_add(below_secs)) {
         return Ok(false);
     }
     let fresh = mint_token(engine, &daemon_namespace_name(&engine.owner))?;
@@ -784,6 +802,26 @@ pub(crate) fn sweep(kube: &Kube, live: &dyn Fn(&str) -> bool) -> Result<Vec<Stri
                         .lines()
                         .map(|l| format!("{ns}/{l}")),
                 );
+                // Standalone pods an earlier engine started (the sync pod) go too (review r2 P2).
+                let r = kube.call(
+                    Some(&ns),
+                    &[
+                        "delete",
+                        "pods",
+                        "-l",
+                        &selector,
+                        "--ignore-not-found",
+                        "--wait=false",
+                        "--grace-period=0",
+                        "-o",
+                        "name",
+                    ],
+                    None,
+                    super::CALL_TIMEOUT,
+                );
+                if !r.ok() {
+                    return Err(r.err_text());
+                }
                 // A termination barrier (review r1 P2): the sweep succeeds only once no pod an
                 // earlier engine started is left running in the live run.
                 let start = std::time::Instant::now();
@@ -819,7 +857,7 @@ static PIDS_VERDICT: std::sync::Mutex<Option<(String, std::time::Instant, u32)>>
 
 /// The one node this runner certifies: v1 runs on a single-node local cluster, and a verdict
 /// for one node never approves another (review r1 P2).
-pub(crate) fn single_node(kube: &Kube) -> Result<String, (FloorUnarmed, String)> {
+pub(crate) fn single_node(kube: &Kube) -> Result<(String, String), (FloorUnarmed, String)> {
     let r = kube.call(
         None,
         &["get", "nodes", "-o", "json"],
@@ -831,13 +869,19 @@ pub(crate) fn single_node(kube: &Kube) -> Result<String, (FloorUnarmed, String)>
     }
     let v: Value = serde_json::from_slice(&r.stdout)
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e.to_string()))?;
-    let names: Vec<String> = v
+    // (name, uid): the uid is the node's incarnation, so a reset cluster whose node keeps its
+    // name is probed again (review r2 P2).
+    let names: Vec<(String, String)> = v
         .get("items")
         .and_then(Value::as_array)
         .map(|a| {
             a.iter()
-                .filter_map(|n| n.pointer("/metadata/name").and_then(Value::as_str))
-                .map(str::to_string)
+                .filter_map(|n| {
+                    Some((
+                        n.pointer("/metadata/name")?.as_str()?.to_string(),
+                        n.pointer("/metadata/uid")?.as_str()?.to_string(),
+                    ))
+                })
                 .collect()
         })
         .unwrap_or_default();
@@ -867,8 +911,8 @@ pub(crate) fn ensure_pids_limited(
             "the pids probe lock is poisoned".to_string(),
         )
     })?;
-    let node = single_node(kube)?;
-    let key = format!("{}|{node}", kube.head(None).join(" "));
+    let (node, node_uid) = single_node(kube)?;
+    let key = format!("{}|{node}|{node_uid}", kube.head(None).join(" "));
     if let Some((k, at, n)) = cache.as_ref() {
         if *k == key && at.elapsed() < PIDS_PROBE_EVERY {
             return Ok(*n);

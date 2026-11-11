@@ -146,6 +146,9 @@ fn k8s_names_are_dns_labels_and_label_values_never_collide() {
     assert_ne!(a, b);
     assert!(label_value(&"x".repeat(100)).len() <= 63);
     assert!(label_value("--").starts_with('x'));
+    // Review r2 P3: a label is a selector, not an identity: this pair maps to one label, which
+    // is why the sweep matches runs by their exact-id annotation.
+    assert_eq!(label_value("a b"), label_value(&label_value("a b")));
 }
 
 /// B1: every engine namespace enforces PodSecurity `restricted`.
@@ -476,8 +479,12 @@ fn k8s_the_controller_is_the_pinned_release() {
         json!({"metadata": {"generation": 2},
                "spec": {"replicas": 1, "template": {"spec": {"containers": [{"image": image}]}}},
                "status": {"observedGeneration": observed, "updatedReplicas": updated,
-                          "availableReplicas": avail}})
+                          "availableReplicas": avail, "replicas": updated.max(1)}})
     };
+    // Review r2 P2: the old controller still available beside an unready new one.
+    let mut mixed = dep(AGENT_SANDBOX_IMAGE, 2, 1, 1);
+    mixed["status"]["replicas"] = json!(2);
+    assert!(cluster::judge_controller(&mixed).is_err());
     assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 2, 1, 1)).is_ok());
     assert!(cluster::judge_controller(&dep(AGENT_SANDBOX_IMAGE, 2, 1, 0)).is_err());
     assert!(cluster::judge_controller(&dep("registry.k8s.io/x:v1.0.9", 2, 1, 1)).is_err());
@@ -597,6 +604,17 @@ fn k8s_a_bounded_call_feeds_stdin_and_reports_the_exit() {
     slow.hardened().args(["-c", "sleep 30"]);
     let r = run_bounded(slow, None, std::time::Duration::from_millis(300));
     assert_eq!(r.code, None);
+    // Review r2 P2: a descendant holding stdin cannot hold the call past its deadline.
+    let mut held = std::process::Command::new("/bin/sh");
+    held.hardened().args(["-c", "sleep 30 <&0 & exit 0"]);
+    let big = vec![b'x'; 4 * 1024 * 1024];
+    let t = std::time::Instant::now();
+    let _ = run_bounded(held, Some(&big), std::time::Duration::from_millis(300));
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(10),
+        "{:?}",
+        t.elapsed()
+    );
     assert_eq!(k.owner, "o");
 }
 
@@ -604,7 +622,7 @@ fn k8s_a_bounded_call_feeds_stdin_and_reports_the_exit() {
 /// `pids.max` (which reads `max` under the cgroup namespace even when the pod is limited).
 #[test]
 fn k8s_a_pod_without_a_pids_limit_is_refused() {
-    let net = "net=closed\nnet=closed\n";
+    let net = "net=closed\nnet=closed\nnet=closed\n";
     let fork = "sh: can't fork: Resource temporarily unavailable\n";
     let counts = |n: u32| -> String { (1..=n).map(|i| format!("{i}\n")).collect() };
     // The cluster's real answer at --pod-max-pids=4096 (lane data/pids-probe.txt).
@@ -623,7 +641,7 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     assert!(render::pids_probe_verdict("").is_err());
     // Review r1 P1: a cluster that lets a deny-all pod reach the API server or the kubelet
     // does not enforce NetworkPolicy: refused, whatever the pids answer.
-    let open = format!("net=open\nnet=closed\n{}{fork}", counts(4094));
+    let open = format!("net=closed\nnet=closed\nnet=open\n{}{fork}", counts(4094));
     assert!(render::pids_probe_verdict(&open)
         .unwrap_err()
         .contains("NetworkPolicy"));
@@ -638,6 +656,7 @@ fn k8s_a_pod_without_a_pids_limit_is_refused() {
     let script = pod["spec"]["containers"][0]["command"][3].as_str().unwrap();
     assert!(script.contains("-lt 4160"));
     assert!(script.contains("$KUBERNETES_SERVICE_HOST 443") && script.contains("$HOST_IP 10250"));
+    assert!(script.contains("1.1.1.1 443") && script.starts_with("/busybox sleep 3;"));
 }
 
 #[test]
