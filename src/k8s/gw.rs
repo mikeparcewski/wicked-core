@@ -254,18 +254,25 @@ impl Gw {
         }
     }
 
-    /// Whether the gateway Deployment is scaled to zero (no gateway starts on its own); `false`
-    /// when it cannot be read.
+    /// Whether no gateway can run or start: its Deployment is scaled to zero AND no gateway pod
+    /// is left (codex r2: a pod still terminating could start the gateway on the previous
+    /// config). `false` when either cannot be read.
     pub(crate) fn scaled_down(&self) -> bool {
-        self.kube
-            .get_json(Some(&self.ns), "deployment", render::GATEWAY_NAME)
-            .ok()
-            .flatten()
-            .and_then(|d| {
-                d.pointer("/spec/replicas")
-                    .and_then(serde_json::Value::as_u64)
-            })
-            == Some(0)
+        let no_pods = self
+            .kube
+            .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
+            .is_ok_and(|p| p.is_empty());
+        no_pods
+            && self
+                .kube
+                .get_json(Some(&self.ns), "deployment", render::GATEWAY_NAME)
+                .ok()
+                .flatten()
+                .and_then(|d| {
+                    d.pointer("/spec/replicas")
+                        .and_then(serde_json::Value::as_u64)
+                })
+                == Some(0)
     }
 
     /// Whether a gateway serves now, for a sign-out's confirmation ([`serving_state`]).
