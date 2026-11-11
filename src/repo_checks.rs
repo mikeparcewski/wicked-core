@@ -363,8 +363,10 @@ pub const DENIAL_SOURCE_TIMEOUT: &str = "repo_checks_timeout";
 /// (`repo_checks_timeout`). Each re-runs the floor on the tree as it stands — the seat does not
 /// run again — and the result goes through the ordinary gate fold:
 /// * `extend` — every check again under [`EXTEND_FACTOR`]× its bound;
-/// * `targeted` — the creator-stage selection: the repo's declared `test_targeted` stands in for
-///   the full test set (and `e2e` does not run); with no targeted command the test set is waived;
+/// * `targeted` — the creator-stage selection: the repo's declared (or derived) `test_targeted`
+///   stands in for the full test set (and `e2e` does not run). Offered only when the floor names
+///   one ([`RepoChecksReport::targeted_test`]); with none it is refused at the gate, and a re-run
+///   that still finds none fails closed — never a waiver of the tests (core#1392);
 /// * `accept_partial` — the checks that passed run again and the ones that did not finish (or
 ///   never ran) are WAIVED for this unit.
 ///
@@ -6134,8 +6136,9 @@ pub(crate) fn is_test_set_check(name: &str) -> bool {
 
 /// (core#469) The check set an operator's re-run runs, and the detected checks it waives.
 /// * `extend` — every check (the install excepted) under [`EXTEND_FACTOR`]× its base bound;
-/// * `targeted` — the CREATOR-stage selection (the declared `test_targeted` in place of the full
-///   test set, no `e2e`); a repo with no targeted command has its test set waived;
+/// * `targeted` — the CREATOR-stage selection (the declared or derived `test_targeted` in place of
+///   the full test set, no `e2e`); with no targeted command it is an error ([`NO_TARGETED_COMMAND`]):
+///   the floor reports `not_run` and denies, never waiving the tests (core#1392);
 /// * `accept_partial` — the named checks are waived, the rest run again.
 fn apply_rerun(
     worktree: &Path,
@@ -14745,8 +14748,8 @@ exit 1
 
     /// core#469: what each operator re-run runs. `extend` doubles every non-install bound;
     /// `targeted` swaps the full test set for the declared `test_targeted` (disclosing the
-    /// replaced full set) or, with none declared, waives the test set; `accept_partial` drops the
-    /// waived checks and runs the rest.
+    /// replaced full set) or, with none declared, is refused (core#1392: never a waiver of the
+    /// tests); `accept_partial` drops the waived checks and runs the rest.
     #[test]
     fn an_operator_rerun_selects_its_checks_and_names_what_it_waives() {
         let wt = scratch("rerun-select");

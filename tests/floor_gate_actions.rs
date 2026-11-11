@@ -363,6 +363,23 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
     match gate(evs, 3) {
         Some((_, _, false, Some(s), _)) if s == source => true,
         other => {
+            // Only a floor that could not run under an OS boundary excuses the test (core#1392
+            // review): a floor that RAN and was not denied this way is a failure, never a skip.
+            let ran = evs.iter().any(|e| {
+                matches!(
+                    e,
+                    CoreEvent::RepoChecksEvaluated {
+                        ord: 3,
+                        sandbox_error: None,
+                        ..
+                    }
+                )
+            });
+            assert!(
+                !ran,
+                "the fix floor ran under an OS write boundary but was not denied by `{source}`: \
+                 {other:?}"
+            );
             eprintln!(
                 "floor_gate_actions: the fix floor was not denied by `{source}` on this host \
                  ({other:?}) — no OS write boundary to run the checks under; the default floor \
@@ -619,7 +636,10 @@ fn an_operator_retry_clears_a_flaky_floor_on_an_unchanged_tree() {
 }
 
 /// core#544 (c): a rework that DOES change the tree re-runs the floor — and a repaired tree passes
-/// and the run goes on to verify.
+/// and the run goes on to verify. The engine's automatic rework is that rework here: the fix's
+/// first floor fails, the rework repairs the tree, and its fresh floor passes before any gate
+/// escalates. (Before core#1392's review this test waited for an escalation that never came and
+/// returned through the "no OS boundary" exit without asserting anything.)
 #[test]
 fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
     let repo = make_repo("rc-repair", TEST_FAILS_ON_BROKEN, 60, &[".break-in-fix"]);
@@ -627,20 +647,17 @@ fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
     let sid = "fg-rc-repair";
     let events = launch(&core, "rc-repair", &repo, sid);
     let first = until_settled(&events, sid);
-    if !fix_floor_denied(&first, "repo_checks") {
+    no_session_failed(&first);
+    let f = floors(&first, 3);
+    if f.is_empty() || f.iter().all(|x| x.1 == "not_run") {
+        eprintln!(
+            "floor_gate_actions: no OS write boundary on this host ({f:?}); nothing to assert"
+        );
         return;
     }
-    core.confirm_gate(sid, HumanDecision::RequestChanges { note: None })
-        .expect("request changes");
-    let second = until_settled(&events, sid);
-    no_session_failed(&second);
-    let reruns = floors(&second, 3);
-    assert_eq!(
-        reruns.len(),
-        1,
-        "one fresh floor for the changed tree: {reruns:?}"
-    );
-    assert_eq!(reruns[0].1, "passed");
+    assert_eq!(f[0].1, "failed", "the broken fix fails its floor: {f:?}");
+    assert_eq!(f.len(), 2, "one fresh floor for the repaired tree: {f:?}");
+    assert_eq!(f[1].1, "passed", "{f:?}");
     assert!(
         ran.lock().unwrap().iter().any(|(p, _)| p == "verify"),
         "the repaired tree reaches verify"
