@@ -11679,7 +11679,9 @@ fn dispatch_probe_job(
     let requirements = agent
         && session.base_commit.is_some()
         && (unit.role == crate::workflow::PhaseRole::Evaluator || qe_unit);
-    if !(baseline || new_author.is_some() || qe_unit || editor || requirements) {
+    // An Apps publish's produce step: its dispatch guard reads the tree (`apps::dispatch_refusal`).
+    let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
+    if !(baseline || new_author.is_some() || qe_unit || editor || requirements || publish_tree) {
         return None;
     }
     Some(dispatch_probe::ProbeJob {
@@ -12611,7 +12613,11 @@ fn dispatch_unit_with(
         &dispatched_unit,
         crate::apps::floor_env().as_deref(),
         in_process_governance().is_some(),
-        || current_worktree_tree(&*store, &session),
+        // (core#1390) The probe's read of the tree, when the dispatch has one.
+        || match probe.as_ref() {
+            Some(p) => p.tree().map(str::to_string),
+            None => current_worktree_tree(&*store, &session),
+        },
     ) {
         // Failed explicitly, whichever path dispatched (an approve already resolved its gate): a
         // refused Apps unit never leaves its run executing with no worker.
