@@ -1983,6 +1983,8 @@ impl Drop for PrivateDir {
 /// Make a [`PrivateDir`] (`0700`, created new: an existing path of that name is an error).
 pub(crate) fn private_temp_dir(tag: &str) -> Result<PrivateDir, String> {
     let p = std::env::temp_dir().join(format!("{tag}-{}", uuid::Uuid::new_v4().simple()));
+    // `mode` is Unix-only, so the binding is mutated only there.
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
