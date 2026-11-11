@@ -2,9 +2,9 @@
 //! host, so it asserts nothing about time.
 //!
 //! N runs at once on one registered repo of M files (each run gets its own worktree, as crew's
-//! runs share one checkout). Every unit is a fake seat that sleeps, writes a file into its worktree
-//! and answers, so the actor does all its own work (worktrees, snapshots, folds, store writes)
-//! while no model runs. When a run finishes, another is launched in its place until the window
+//! runs share one checkout). Every unit is a fake seat that sleeps and answers, leaving its tree
+//! as it found it (the phases are read-only), so the actor does all its own work (worktrees,
+//! snapshots, folds, store writes) while no model runs. When a run finishes, another is launched in its place until the window
 //! closes. Meanwhile it measures:
 //!
 //! * `list`: `sessions_detail()`, the read behind crew's GET /runs and the watchdog's
@@ -88,7 +88,8 @@ impl Dispatcher for StubDispatcher {
     }
 }
 
-/// The fake seat: sleeps a pseudo-random step time, writes one file into the worktree, answers.
+/// The fake seat: sleeps a pseudo-random step time and answers; it writes nothing (a read-only
+/// phase that changed its tree would be denied, and the run would park instead of finishing).
 struct LoadSeat {
     lo_ms: u64,
     hi_ms: u64,
@@ -101,18 +102,12 @@ impl StepRunner for LoadSeat {
         let span = self.hi_ms.saturating_sub(self.lo_ms).max(1);
         let ms = self.lo_ms + (n.wrapping_mul(2_654_435_761) % span);
         std::thread::sleep(Duration::from_millis(ms));
-        if let Some(wd) = &input.workdir {
-            let _ = std::fs::write(
-                wd.join(format!("load-{}-{}.txt", input.unit.ord, input.attempt)),
-                format!("unit {} attempt {}\n", input.unit.ord, input.attempt),
-            );
-        }
         StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
             attempt: input.attempt,
             output: format!(
-                "Unit {} did its step and wrote one file into the worktree. {}",
+                "Unit {} did its step and changed nothing. {}",
                 input.unit.ord,
                 "This is the load harness's fixed answer, long enough to count as substance. "
                     .repeat(4)
@@ -253,8 +248,15 @@ impl Samples {
     }
 }
 
-/// One real `wicked-core gate-hook` judgement of a read-only unit's `tool` call in `worktree`.
-fn gate_hook(db: &str, worktree: &Path, decisions: &Path, notes: &Path, tool: &str) -> Duration {
+/// One real `wicked-core gate-hook` judgement of a read-only unit's `tool` call in `worktree`: how
+/// long it took and its exit code (0 allow, 2 deny).
+fn gate_hook(
+    db: &str,
+    worktree: &Path,
+    decisions: &Path,
+    notes: &Path,
+    tool: &str,
+) -> (Duration, i32) {
     let payload = match tool {
         "Bash" => serde_json::json!({"tool_name":"Bash","tool_input":{"command":"ls src"}}),
         _ => {
@@ -283,8 +285,8 @@ fn gate_hook(db: &str, worktree: &Path, decisions: &Path, notes: &Path, tool: &s
         let mut stdin = child.stdin.take().unwrap();
         let _ = stdin.write_all(payload.to_string().as_bytes());
     }
-    let _ = child.wait();
-    t.elapsed()
+    let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+    (t.elapsed(), code)
 }
 
 #[test]
@@ -398,35 +400,37 @@ fn actor_latency_under_concurrent_runs() {
             }
         }));
     }
-    // The gate hook, on the first run's worktree once it exists.
+    // The gate hook, on a worktree of the same repo that no run uses (a run's worktree is reaped
+    // when it ends, and a tree that changed under the witness would turn every call into a deny).
+    // A call that is not allowed is counted apart: its timing is not an allowed call's.
     {
         let (samples, stop, db) = (samples.clone(), stop.clone(), db.clone());
-        let wt_root = repo.join("wicked-worktrees");
         let scratch = base.join("hook");
+        let worktree = base.join("hook-worktree");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                &worktree.to_string_lossy(),
+                "HEAD",
+            ],
+        );
         threads.push(std::thread::spawn(move || {
             std::fs::create_dir_all(scratch.join("notes")).unwrap();
             let decisions = scratch.join("decisions.ndjson");
-            let worktree = loop {
-                if stop.load(Ordering::Relaxed) {
-                    return;
-                }
-                let found = std::fs::read_dir(&wt_root)
-                    .ok()
-                    .and_then(|mut d| d.find_map(|e| e.ok().map(|e| e.path())));
-                if let Some(w) = found.filter(|w| w.join(".git").exists()) {
-                    break w;
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            };
             let mut n = 0u64;
             while !stop.load(Ordering::Relaxed) {
                 let tool = if n.is_multiple_of(2) { "Bash" } else { "Read" };
-                let took = gate_hook(&db, &worktree, &decisions, &scratch.join("notes"), tool);
+                let (took, code) =
+                    gate_hook(&db, &worktree, &decisions, &scratch.join("notes"), tool);
                 samples.add(
-                    if tool == "Bash" {
-                        "gate_hook_bash"
-                    } else {
-                        "gate_hook_read"
+                    match (tool, code) {
+                        ("Bash", 0) => "gate_hook_bash",
+                        (_, 0) => "gate_hook_read",
+                        _ => "gate_hook_not_allowed",
                     },
                     took,
                 );

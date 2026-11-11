@@ -63,8 +63,14 @@ impl ReadModel {
     pub(crate) fn for_store(spec: &str, actor: Arc<crate::actor_stats::ActorStats>) -> Self {
         let off =
             std::env::var("WICKED_READ_MODEL").is_ok_and(|v| v.trim().eq_ignore_ascii_case("off"));
+        // Resolved now, at spawn, as the actor resolves it: a later change of the process's working
+        // directory must not point the reads at another store.
         Self {
-            path: (!off && readable_spec(spec)).then(|| spec.to_string()),
+            path: (!off && readable_spec(spec)).then(|| {
+                std::path::absolute(spec)
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| spec.to_string())
+            }),
             conn: Mutex::new(None),
             actor,
         }
@@ -103,6 +109,12 @@ impl ReadModel {
                 *slot = None;
                 return None;
             }
+            // An actor that took `Shutdown` while this read waited answers it itself (stopped).
+            if self.actor.is_stopped() {
+                let _ = store.commit_batch();
+                *slot = None;
+                return None;
+            }
             match quiet {
                 // Pinned while no command had begun since the quiet moment: a between-commands
                 // state. Or the budget ran out: the last committed state, never another try.
@@ -120,7 +132,7 @@ impl ReadModel {
         // `COMMIT` ends the read transaction; a connection that cannot end it is not reused, and
         // what it read is not trusted either: the actor answers instead.
         let ended = store.commit_batch().is_ok();
-        if !ended || out.is_err() {
+        if !ended || out.is_err() || self.actor.is_stopped() {
             *slot = None;
             return None;
         }
@@ -141,6 +153,40 @@ mod tests {
         assert!(!readable_spec("postgres://h/db"));
         assert!(!readable_spec("postgresql://h/db"));
         assert!(!ReadModel::for_store(":memory:", Default::default()).applies());
+        let rel = ReadModel::for_store("relative/core.db", Default::default());
+        assert!(
+            rel.path
+                .as_deref()
+                .is_some_and(|p| std::path::Path::new(p).is_absolute()),
+            "a relative store is resolved at spawn: {:?}",
+            rel.path
+        );
+    }
+
+    #[test]
+    fn an_actor_that_stops_while_a_read_waits_answers_it_itself() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-read-model-stop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("core.db");
+        drop(wicked_apps_core::open_store(Some(db.to_str().unwrap())).unwrap());
+        let actor = Arc::new(crate::actor_stats::ActorStats::starting());
+        actor.started_up();
+        let rm = ReadModel::for_store(db.to_str().unwrap(), actor.clone());
+        assert_eq!(rm.read(|_| Ok(1)), Some(1));
+        // The actor takes Shutdown while the read runs: the read defers to the actor.
+        assert_eq!(
+            rm.read(|_| {
+                actor.mark_stopped();
+                Ok(2)
+            }),
+            None
+        );
+        assert_eq!(rm.read(|_| Ok(3)), None, "and every read after it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

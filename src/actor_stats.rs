@@ -80,7 +80,7 @@ pub struct RunningCommand {
 pub struct SlowCommand {
     pub command: String,
     pub ms: u64,
-    /// Commands waiting behind it when it started.
+    /// Commands waiting behind it when it started (a lower bound, as `backlog` is).
     pub backlog: usize,
     /// When it finished (Unix ms).
     pub at_ms: u64,
@@ -103,9 +103,10 @@ pub struct ActorStatsView {
     /// The command running now (`None` while the actor waits for work). A long `for_ms` here is
     /// the command every queued read and gate answer is waiting behind.
     pub running: Option<RunningCommand>,
-    /// Commands that were waiting when the actor last became free (the next one included).
+    /// Commands that were waiting when the actor last became free (the next one included). A
+    /// lower bound: at most 256 are taken off the channel per turn, and only those are counted.
     pub backlog: usize,
-    /// The most that ever waited at once.
+    /// The most [`ActorStatsView::backlog`] ever read (a lower bound, likewise).
     pub max_backlog: usize,
     pub slow_threshold_ms: u64,
     /// Slowest p99 first.
@@ -183,15 +184,17 @@ impl ActorStats {
         slow: Duration,
     ) {
         let ms = took.as_millis().min(u128::from(u64::MAX)) as u64;
-        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let (count, ring) = inner.per.entry(name).or_default();
-        *count += 1;
-        if ring.len() == RING {
-            ring.pop_front();
-        }
-        ring.push_back(ms);
-        if took >= slow {
-            eprintln!("wicked-core: slow actor command {name} took {ms} ms (backlog {backlog})");
+        {
+            let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let (count, ring) = inner.per.entry(name).or_default();
+            *count += 1;
+            if ring.len() == RING {
+                ring.pop_front();
+            }
+            ring.push_back(ms);
+            if took < slow {
+                return;
+            }
             if inner.slow.len() == SLOW_KEPT {
                 inner.slow.pop_front();
             }
@@ -202,6 +205,8 @@ impl ActorStats {
                 at_ms: crate::interaction::now_millis().max(0) as u64,
             });
         }
+        // Outside the lock: a stderr that blocks must never hold `actor_stats()` back with it.
+        eprintln!("wicked-core: slow actor command {name} took {ms} ms (backlog {backlog})");
     }
 
     pub(crate) fn view(&self, slow: Duration) -> ActorStatsView {
