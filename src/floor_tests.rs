@@ -2163,6 +2163,55 @@ fn the_base_guides_checks_for_the_stage_are_the_floors_checks() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// core#1393 (review r2): a build guide that covers a package replaces its detected checks, but
+/// not its declared native build — that provisioning runs right after the guide's install and
+/// before the guided checks that load the addon.
+#[cfg(unix)]
+#[test]
+fn a_build_guide_keeps_the_declared_native_build_after_its_install() {
+    let (repo, _, argv) = red_base("guide-native");
+    std::fs::write(
+        repo.join("package.json"),
+        r#"{"scripts":{"test":"exit 0"},"dependencies":{"better-sqlite3":"12.0.0"}}"#,
+    )
+    .unwrap();
+    std::fs::write(repo.join("package-lock.json"), "{}").unwrap();
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        repo.join(CONFIG_PATH),
+        r#"{"native_rebuild":["better-sqlite3"]}"#,
+    )
+    .unwrap();
+    git(&repo, &["add", "-A"]);
+    git(
+        &repo,
+        &["commit", "-qm", "a node package with a native addon"],
+    );
+    let mut test = libtest_check(&argv);
+    test["stage"] = serde_json::json!(["verify"]);
+    let install = serde_json::json!({"name": "install", "run": ["sh", "-c", "exit 0"],
+        "failedExit": [1], "stage": ["verify"]});
+    let base = commit_guide(&repo, &[install, test]);
+    let checks = detect_with(
+        &repo,
+        &FloorContext {
+            stage: FloorStage::Verify,
+            base_head: Some(base),
+            git_dir: Some(repo.join(".git")),
+            ..FloorContext::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        names(&checks),
+        ["install", NATIVE_BUILD_CHECK, "test"],
+        "{checks:?}"
+    );
+    assert_eq!(checks[0].source, GUIDE_SOURCE);
+    assert_eq!(checks[2].source, GUIDE_SOURCE);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// (round 16, item 8) A claim of "pre-existing" is judged on the check that DENIED, and a head
 /// that dropped the base's failing test (nothing to deselect) still rejects it.
 #[cfg(unix)]
