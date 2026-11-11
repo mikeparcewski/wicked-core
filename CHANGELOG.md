@@ -23,7 +23,8 @@ Two release tracks share this file, newest entry first regardless of track:
   unknown run only when the marker is its own. It never touches a tree marked by another daemon, not even that tree's
   check scratch. A tree with no daemon marker (another daemon's, or one minted before this release) is kept and
   reported, so an unknown run id alone never removes one. Terminal runs of the daemon's own store are still reaped
-  only when clean. Trees minted before this release stay until they are resumed (which marks them) or removed by hand.
+  only when clean. A daemon never reuses, cancels away or reaps a tree another daemon marked. Unknown-run trees
+  minted before this release stay until a resume marks them or they are removed by hand.
 
 - **A governance pack's rules apply only where the pack's scope fits the run (wicked-core#1414).** The mcp-server
   pack's MCPS-1001..1007 were judged on every run with a build or review step, so a crew change that builds no MCP

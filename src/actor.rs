@@ -10070,6 +10070,8 @@ fn reprovision_reaped_worktree(
         return Ok(session);
     };
     if crate::repo::is_live_worktree(std::path::Path::new(&workdir)) {
+        // (core#1373, review on #1431) A resume in place marks a tree no daemon marked yet.
+        crate::repo::adopt_live_worktree(std::path::Path::new(&workdir));
         return Ok(session);
     }
     let repo = crate::repo::get_repo(&*store, &repo_id)?.ok_or_else(|| {
