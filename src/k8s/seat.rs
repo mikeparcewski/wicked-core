@@ -1718,6 +1718,7 @@ pub(crate) enum Ending {
 /// wait it out, then write back every root that comes back. `Ok(code)` = the CLI's own exit code
 /// (or the client's for a timeout or cancel); `Err` = the unit has no result (a lost stream, a
 /// pod not confirmed gone, a write-back refused): could-not-run, never a pass.
+#[cfg(test)]
 pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
     settle_unless(seat, ending, &|| false)
 }
