@@ -27,6 +27,7 @@
 #![cfg_attr(not(unix), allow(dead_code))]
 
 pub(crate) mod cli;
+pub(crate) mod clock;
 pub(crate) mod cluster;
 pub(crate) mod floor;
 pub(crate) mod gw;

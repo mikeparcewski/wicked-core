@@ -97,6 +97,15 @@ pub struct BaseSkill {
     pub handed: bool,
 }
 
+/// One phase of a seat's arm ([`CoreEvent::SeatArmTimed`]): its name, how long it took, and what
+/// it moved (a copy-in's size), when that is worth saying.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArmPhase {
+    pub name: String,
+    pub ms: u64,
+    pub detail: Option<String>,
+}
+
 /// An event emitted by the core runtime as work progresses. Cheap to clone (fanned out to every
 /// subscriber). The taxonomy mirrors the plan → distribute → execute → evidence pipeline; P1 emits
 /// only `Heartbeat` (the rest land when the pipeline is lifted in P2).
@@ -1544,6 +1553,18 @@ pub enum CoreEvent {
         image: String,
         secs: u64,
     },
+    /// Where the engine's arm of a unit's seat spent its time (k8s-final: phase C measured 51 s from
+    /// dispatch to the seat pod's creation, and nothing said where it went). Emitted once per arm,
+    /// whether it armed (`ok`) or was refused; `phases` in order, each charged the time since the
+    /// previous one ended, `totalMs` the whole arm. Additive: a new frame.
+    SeatArmTimed {
+        session: String,
+        ord: u32,
+        cli: String,
+        ok: bool,
+        total_ms: u64,
+        phases: Vec<ArmPhase>,
+    },
     /// (PRODUCT-WORKS J4) A seat-container unit failed while the host's container runtime was
     /// not answering (a desktop runtime restarting): an infrastructure fault, not the seat's. The
     /// runner waits for the runtime with backoff, within a bounded window, and re-runs the unit on
@@ -2546,6 +2567,25 @@ impl CoreEvent {
                 "cli": cli,
                 "image": image,
                 "secs": secs,
+            }),
+            CoreEvent::SeatArmTimed {
+                session,
+                ord,
+                cli,
+                ok,
+                total_ms,
+                phases,
+            } => json!({
+                "type": "seatArmTimed",
+                "session": session,
+                "ord": ord,
+                "cli": cli,
+                "ok": ok,
+                "totalMs": total_ms,
+                "phases": phases
+                    .iter()
+                    .map(|p| json!({"name": p.name, "ms": p.ms, "detail": p.detail}))
+                    .collect::<Vec<_>>(),
             }),
             CoreEvent::ContainerRuntimeWait {
                 session,

@@ -4564,6 +4564,22 @@ mod tests {
             &["type", "session", "ord", "cli", "image", "secs"],
         );
         check(
+            CoreEvent::SeatArmTimed {
+                session: s(),
+                ord: 2,
+                cli: s(),
+                ok: true,
+                total_ms: 4200,
+                phases: vec![wicked_core::ArmPhase {
+                    name: "copy_in".to_string(),
+                    ms: 1200,
+                    detail: None,
+                }],
+            },
+            "seatArmTimed",
+            &["type", "session", "ord", "cli", "ok", "totalMs", "phases"],
+        );
+        check(
             CoreEvent::ContainerRuntimeWait {
                 session: s(),
                 ord: 2,

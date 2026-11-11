@@ -4187,7 +4187,10 @@ impl WrappedCliStepRunner {
                         secs: waited.as_secs(),
                     });
                 };
-                match crate::container_floor::arm_noting(
+                // Where the arm's time goes, phase by phase (k8s-final): said on the run whether
+                // the seat armed or was refused.
+                crate::k8s::clock::begin();
+                let armed = crate::container_floor::arm_noting(
                     &plan.inputs,
                     &argv,
                     &input.run_id,
@@ -4197,7 +4200,18 @@ impl WrappedCliStepRunner {
                     Some(prompt.as_str()),
                     gateway_dir.as_deref(),
                     &mut on_built,
-                ) {
+                );
+                if let Some((phases, total_ms)) = crate::k8s::clock::take() {
+                    self.emit_event(crate::event::CoreEvent::SeatArmTimed {
+                        session: input.run_id.clone(),
+                        ord: input.unit.ord,
+                        cli: cli_key.clone(),
+                        ok: armed.is_ok(),
+                        total_ms,
+                        phases,
+                    });
+                }
+                match armed {
                     // The hook route rides the gateway: a claude unit whose relay the gateway
                     // could not reach is refused, never run with its hook calls failing open.
                     Ok(c) if gov_env.is_some() && !crate::seat_gateway::hook_route_ready() => {

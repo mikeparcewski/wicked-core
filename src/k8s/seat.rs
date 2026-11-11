@@ -851,6 +851,20 @@ pub(crate) fn copy_in_stream(
     // The codec writes `files` roots by name; the stream carries them as plain entries.
     let refs: Vec<(String, &PlanRoot)> = plan_roots.iter().map(|(a, b)| (a.clone(), b)).collect();
     let plan = codec_plan(&refs);
+    // What each root moved (k8s-final arm timing): `replica:entries/bytes`.
+    super::clock::mark_with(
+        "copy_in_read",
+        Some(
+            stream
+                .iter()
+                .map(|r| {
+                    let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
+                    format!("{}:{}/{}", r.replica, r.entries.len(), bytes)
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    );
     Ok((sync::encode(&stream), plan, base, baseline))
 }
 
@@ -942,6 +956,7 @@ fn copy_in(
             ),
         ));
     }
+    super::clock::mark_with("copy_in_unpack", Some(format!("{} bytes", body.len())));
     if let Ok(mut g) = SEEDED.lock() {
         let set = g.get_or_insert_with(HashSet::new);
         for r in roots.iter().filter(|r| r.mode == Mode::Seed) {
@@ -1223,6 +1238,7 @@ pub(crate) fn arm(
     super::arming(s.run_id);
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
+    super::clock::mark("namespace");
     // The sync pod is inspected and replaced under the namespace's arm lock (codex r2): two
     // arms never delete each other's replacement.
     {
@@ -1230,6 +1246,7 @@ pub(crate) fn arm(
         let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
         ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
     }
+    super::clock::mark("sync_pod");
     let (roots, pod_mounts) = plan(
         s.tree,
         s.view,
@@ -1259,6 +1276,7 @@ pub(crate) fn arm(
     let arming = arm_lock(&ns);
     let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
     clear_stale(kube, &ns)?;
+    super::clock::mark("clear_stale");
     let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
     drop(_arming);
     // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
@@ -1331,6 +1349,7 @@ pub(crate) fn arm(
     let mut guard = Guard(Some(id.clone()));
     kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
+    super::clock::mark("sandbox_apply");
     let start = Instant::now();
     loop {
         let pod = kube
@@ -1359,10 +1378,12 @@ pub(crate) fn arm(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    super::clock::mark("pod_ready");
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
         reap(&id);
         return Err(e);
     }
+    super::clock::mark("deny_check");
     // The nested workspace node_modules the fill archived (B14): unpacked into the seat's tree
     // before its CLI starts. Ignored by git, so never written back.
     if s.deps.is_some() {
@@ -1394,6 +1415,9 @@ pub(crate) fn arm(
                 ),
             ));
         }
+    }
+    if s.deps.is_some() {
+        super::clock::mark("deps_unpack");
     }
     guard.0 = None;
     let mut wrapper = kube.head(Some(&ns));
