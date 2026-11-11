@@ -33,8 +33,8 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use wicked_apps_core::{
-    open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, NodeKind, ToNode,
-    CONFORMANCE_CLAIM,
+    open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, HardenedCommand, NodeKind,
+    ToNode, CONFORMANCE_CLAIM,
 };
 use wicked_governance::{conform, decide, is_shell_tool, recall_rules, select_any, RuleQuery};
 use wicked_orchestration::{apply_gate, get_phase, Phase};
@@ -166,15 +166,18 @@ pub const WICKED_CORE_EXE_ENV: &str = "WICKED_CORE_EXE";
 pub const WRITE_ROOTS_ENV: &str = "WICKED_WRITE_ROOTS";
 
 /// The EXACT repo-graph key dir the launcher added to [`WRITE_ROOTS_ENV`]
-/// (`execute_wrapped::graph_write_dir`), so the hook subprocess can tell the shared graph store
-/// ([`graph_store_paths`]). Unset when the unit was handed no graph.
+/// (`execute_wrapped::graph_write_dir`), so the hook subprocess can drop it — and only it — from
+/// the write-root witness ([`compute_witness_roots`]). Unset when the unit was handed no graph.
 pub const GRAPH_WRITE_DIR_ENV: &str = "WICKED_GRAPH_WRITE_DIR";
 
 /// Set (`1`) on a unit whose seat runs as a pod (the Kubernetes runner). Its read-only tree is a
 /// throwaway view in the pod, never written back (PARITY B17): the fenced-posture write scan of
-/// tool calls ([`phase_scope_denial`]) is a second mechanism for what the view already
-/// confines, so it does not run there. The estate verb gate and the remote-write fence still do:
-/// they guard writes that leave the pod.
+/// tool calls ([`phase_scope_denial`]) and the post-hoc write-root witness are second mechanisms
+/// for what the view already confines, so they do not run there. The estate verb gate and the
+/// remote-write fence still do: they guard writes that leave the pod.
+///
+/// Unset on the host seat floor (`WICKED_SEAT_FLOOR=host`), where the tree a read-only unit sees
+/// IS the real worktree: there both still run (coord, 2026-11-11), until the host floor is removed.
 pub const SEAT_POD_ENV: &str = "WICKED_SEAT_POD";
 
 /// Whether this hook judges a pod seat's call ([`SEAT_POD_ENV`]).
@@ -397,8 +400,8 @@ pub(crate) struct BoundaryCtx {
     /// reads its own environment ([`estate_store_pinned_from_env`]).
     pub estate_store_pinned: bool,
     /// The EXACT repo-graph key dir in `roots.write` (`execute_wrapped::graph_write_dir`), or
-    /// `None`. It is the engine's store, in the write set only for SQLite's WAL files; the
-    /// subprocess carrier reads [`GRAPH_WRITE_DIR_ENV`].
+    /// `None`. It is the engine's store, in the write set only for SQLite's WAL files, so the
+    /// write-root witness skips it; the subprocess carrier reads [`GRAPH_WRITE_DIR_ENV`].
     pub graph_write_dir: Option<std::path::PathBuf>,
     /// The graph STORE this boundary is bound to — the db path the carrier handed the seat as
     /// `WICKED_ESTATE_DB`, for the raw-SQLite fence (issue #645).
@@ -515,13 +518,311 @@ pub(crate) fn track_install_fence_cwd(
     let _ = std::fs::write(state, after.to_string_lossy().as_bytes());
 }
 
+/// Path of the write-root witness sidecar (issue #541 criterion 3):
+/// `<decisions-dir>/write-root-witness-<safe-phase>`. Mirrors `install_fence_cwd_path`.
+pub(crate) fn write_root_witness_path(decisions_path: &str, phase: &str) -> std::path::PathBuf {
+    let safe: String = phase
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Path::new(decisions_path).with_file_name(format!("write-root-witness-{safe}"))
+}
+
+/// FNV-1a fingerprint of the admitted write-root trees: sorted (path, size, stamp) tuples
+/// ([`entry_stamp`]).
+/// Detects any file creation, deletion, or content/metadata change a Bash call could cause.
+/// `DefaultHasher` is deliberately avoided (it is not stable across Rust versions).
+#[cfg(test)]
+pub(crate) fn fingerprint_write_roots(roots: &[std::path::PathBuf]) -> u64 {
+    const FNV_OFFSET: u64 = 14695981039346656037;
+    const FNV_PRIME: u64 = 1099511628211;
+    let mut entries: Vec<(String, u64, u64)> = Vec::new();
+    for root in roots {
+        let _ = collect_dir_entries_for_witness(root, &mut entries);
+    }
+    entries.sort_unstable();
+    let mut hash = FNV_OFFSET;
+    for (path, size, stamp) in &entries {
+        for b in path.bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        hash ^= size;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        hash ^= stamp;
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash
+}
+
+/// (core#765) The largest file the witness judges by CONTENT; a larger one is judged by its
+/// modification time, as every file was before.
+const WITNESS_CONTENT_CAP: u64 = 1024 * 1024;
+
+/// (core#765) The third element of a witness entry: for a regular file of at most
+/// [`WITNESS_CONTENT_CAP`] bytes, an FNV-1a digest of its CONTENT, so a byte-identical rewrite (a
+/// read-only reviewer running the repo's own idempotent generator — `testid-inventory.json`, run
+/// 049f77d8) is not a mutation; for anything else (a larger file, a directory of the raw walk,
+/// an unreadable file) the modification time in seconds, as before. Deterministic per file, so
+/// two snapshots of the same unchanged tree always agree.
+fn entry_stamp(path: &std::path::Path, meta: &std::fs::Metadata) -> u64 {
+    let mtime = || {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    };
+    if !meta.is_file() || meta.len() > WITNESS_CONTENT_CAP {
+        return mtime();
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mut hash: u64 = 14695981039346656037;
+            for b in bytes {
+                hash ^= b as u64;
+                hash = hash.wrapping_mul(1099511628211);
+            }
+            hash
+        }
+        Err(_) => mtime(),
+    }
+}
+
+/// (core#765) Paths the witness never watches, relative to a write root: the npm / node caches a
+/// repository's own commands write as a side effect (`.npm`, `npm-cache` — npm's `_logs/*-debug-0.log`
+/// —, `.node-gyp`, `node-compile-cache`), wherever they sit. A read-only reviewer running
+/// `npm test` cannot avoid them, and they are never the tree under review. (The engine scratch
+/// `tmp/` at a worktree root — the worker's `TMPDIR` and the repo checks' `HOME`/caches, where
+/// those logs landed on run 64bb6775 — is excluded at the git listing, as the worktree guard
+/// excludes it.)
+fn witness_ignores(rel: &str) -> bool {
+    const CACHES: [&str; 4] = [".npm", "npm-cache", ".node-gyp", "node-compile-cache"];
+    rel.split(['/', '\\']).any(|c| CACHES.contains(&c))
+}
+
+fn collect_dir_entries_for_witness(
+    dir: &std::path::Path,
+    out: &mut Vec<(String, u64, u64)>,
+) -> CollectorKind {
+    // For git-managed roots (directories that ARE a git worktree root, identified by the
+    // presence of a `.git` entry), use `git ls-files` so .gitignore is respected — target/,
+    // .git/, node_modules/, dist/ never appear and an allowed call's own build side-effects
+    // cannot read as an escape (INDEPENDENT REVIEW item 2). Only check when `.git` is present
+    // so that plain temp directories inside an outer git repo do not accidentally inherit the
+    // outer repo's file list via git's upward root search.
+    if dir.join(".git").exists() {
+        let scratch_exclude = format!("/{}/", crate::worktree_guard::ENGINE_SCRATCH_DIR);
+        if let Ok(output) = std::process::Command::new("git")
+            .hardened()
+            .args([
+                "ls-files",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                // (core#765) The engine scratch (`TMPDIR`, the repo checks' caches) is never the
+                // tree under review — the worktree guard and deliver exclude it the same way. An
+                // `--exclude` reaches only UNTRACKED files, so a committed `tmp/` file stays watched.
+                "--exclude",
+                &scratch_exclude,
+                "-z",
+            ])
+            .current_dir(dir)
+            .output()
+        {
+            if output.status.success() {
+                for rel in output.stdout.split(|&b| b == 0).filter(|s| !s.is_empty()) {
+                    let Ok(rel_str) = std::str::from_utf8(rel) else {
+                        continue;
+                    };
+                    if witness_ignores(rel_str) {
+                        continue;
+                    }
+                    let abs = dir.join(rel_str);
+                    let Ok(meta) = std::fs::metadata(&abs) else {
+                        continue;
+                    };
+                    if meta.is_file() {
+                        let stamp = entry_stamp(&abs, &meta);
+                        out.push((abs.to_string_lossy().into_owned(), meta.len(), stamp));
+                    }
+                }
+                return CollectorKind::GitLsFiles;
+            }
+        }
+    }
+    // Fallback for non-git roots (or when git ls-files fails): raw recursive walk
+    // skipping .git directories.
+    collect_dir_entries_raw(dir, out);
+    CollectorKind::RawWalk
+}
+
+fn collect_dir_entries_raw(dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in rd.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        if name == ".git" || witness_ignores(&name.to_string_lossy()) {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        // A directory is watched by its PRESENCE; what it holds is watched entry by entry. Its
+        // own size and mtime move whenever a child is renamed into place (an atomic rewrite of an
+        // unchanged file), which proves nothing (core#765). `u64::MAX` marks it a directory, so a
+        // directory replaced by an empty file at the same path still reads as a change.
+        let (size, stamp) = if meta.is_dir() {
+            (0, u64::MAX)
+        } else {
+            (meta.len(), entry_stamp(&path, &meta))
+        };
+        out.push((path.to_string_lossy().into_owned(), size, stamp));
+        if meta.is_dir() {
+            collect_dir_entries_raw(&path, out);
+        }
+    }
+}
+
+/// Which filesystem enumeration strategy produced a `WitnessSnapshot`.
+///
+/// Stored in the sidecar so that a snapshot taken with `git ls-files` and re-checked when `.git`
+/// is unavailable (forcing a raw walk) can be detected as a collector mismatch and re-snapshotted
+/// rather than diffed — the two strategies enumerate different file sets, so a diff would produce
+/// false positives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CollectorKind {
+    /// `git ls-files` succeeded for every root.
+    GitLsFiles,
+    /// Raw recursive directory walk (`.git` not found or `git ls-files` failed for any root).
+    RawWalk,
+}
+
+/// Sidecar payload for the post-hoc write-root witness (issue #541, items 1-3 of the review):
+/// the watched write roots (write set minus notes root), the collector kind, and the sorted entry
+/// list at snapshot time, so a mismatch can name the changed paths rather than only reporting a
+/// hash difference.
+#[derive(Debug, Clone)]
+pub(crate) struct WitnessSnapshot {
+    pub roots: Vec<std::path::PathBuf>,
+    /// Which strategy enumerated the entries. When the current collector differs from the stored
+    /// one, re-snapshot instead of diffing to avoid false positives.
+    pub collector: CollectorKind,
+    pub entries: Vec<(String, u64, u64)>, // (path, size_bytes, stamp — `entry_stamp`)
+}
+
+/// Read the stored write-root witness snapshot (`None` on first call or missing sidecar).
+fn read_write_root_witness(path: &std::path::Path) -> Option<WitnessSnapshot> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(raw.trim()).ok()?;
+    let roots = v
+        .get("roots")?
+        .as_array()?
+        .iter()
+        .filter_map(|r| r.as_str().map(std::path::PathBuf::from))
+        .collect();
+    // Missing "collector" key in old sidecars → RawWalk (conservative: forces re-snapshot,
+    // never a false deny).
+    let collector = match v.get("collector").and_then(|c| c.as_str()) {
+        Some("git_ls_files") => CollectorKind::GitLsFiles,
+        _ => CollectorKind::RawWalk,
+    };
+    let entries = v
+        .get("entries")?
+        .as_array()?
+        .iter()
+        .filter_map(|e| {
+            let arr = e.as_array()?;
+            let path = arr.first()?.as_str()?.to_string();
+            let size = arr.get(1)?.as_u64()?;
+            let mtime = arr.get(2)?.as_u64()?;
+            Some((path, size, mtime))
+        })
+        .collect();
+    Some(WitnessSnapshot {
+        roots,
+        collector,
+        entries,
+    })
+}
+
+/// Persist the write-root witness snapshot for the next gate-hook invocation to compare against.
+fn write_write_root_witness(path: &std::path::Path, snapshot: &WitnessSnapshot) {
+    let roots_json: Vec<serde_json::Value> = snapshot
+        .roots
+        .iter()
+        .map(|r| serde_json::Value::String(r.to_string_lossy().into_owned()))
+        .collect();
+    let entries_json: Vec<serde_json::Value> = snapshot
+        .entries
+        .iter()
+        .map(|(p, s, m)| serde_json::json!([p, s, m]))
+        .collect();
+    let collector_str = match snapshot.collector {
+        CollectorKind::GitLsFiles => "git_ls_files",
+        CollectorKind::RawWalk => "raw_walk",
+    };
+    let payload = serde_json::json!({
+        "roots": roots_json,
+        "collector": collector_str,
+        "entries": entries_json,
+    });
+    let _ = std::fs::write(path, payload.to_string());
+}
+
+/// Compute the write-root witness roots: the unit's write set minus the notes root and minus the
+/// engine's own code-graph store.
+///
+/// A ReadOnly evaluator may write to its notes root — that is an EXPECTED write, not a fence
+/// violation. The repo-graph key dir — EXACTLY the one the engine computed and handed over
+/// ([`BoundaryCtx::graph_write_dir`] / [`GRAPH_WRITE_DIR_ENV`]), never a path that merely looks
+/// like one — is in the write set only so SQLite can create its WAL files;
+/// it is the engine's store, changed by the read-only estate shim's open/close checkpoint and by
+/// the daemon's indexer, so a change there proves nothing about the unit (a `pa-scope` unit that
+/// grounded on the graph was denied for exactly that). The witness fingerprints everything ELSE in
+/// the write set (the tree and any extra roots) so a mutation there proves an unwanted write
+/// escaped the phase-scope fence (item 1).
+fn compute_witness_roots(boundary: Option<&BoundaryCtx>) -> Vec<std::path::PathBuf> {
+    let (write_roots, notes_roots, graph_dir) = match boundary {
+        Some(b) => (
+            b.roots.write.clone(),
+            b.deliverable_roots.clone(),
+            b.graph_write_dir.clone(),
+        ),
+        None => (
+            allowed_roots_from_env()
+                .map(|r| r.write)
+                .unwrap_or_default(),
+            deliverable_roots_from_env(),
+            graph_write_dir_from_env(),
+        ),
+    };
+    // EVERY admitted root is an expected write: under the read-only posture (the only one the
+    // witness runs for) that is the notes root and, on the QE unit, its QE ledger root
+    // (wicked-crew#951) — a verdict recorded there is not an escape.
+    write_roots
+        .into_iter()
+        .filter(|r| !notes_roots.contains(r))
+        .filter(|r| graph_dir.as_ref() != Some(r))
+        .collect()
+}
+
 /// The locations that identify the SHARED graph store, for the raw-SQLite fence (issue #645):
 /// the engine's EXACT repo-graph key dir ([`BoundaryCtx::graph_write_dir`] /
 /// [`GRAPH_WRITE_DIR_ENV`]), the store the boundary is BOUND to
 /// ([`BoundaryCtx::graph_store_db`] — the chat carrier has one without a write dir) and the store
 /// paths the environment PINS ([`ESTATE_STORE_PIN_ENV`]).
 ///
-/// Read per carrier: the in-process carrier takes the dir off the boundary it was handed, the hook subprocess off its own environment
+/// Read per carrier exactly as [`compute_witness_roots`] reads its inputs: the in-process carrier
+/// takes the dir off the boundary it was handed, the hook subprocess off its own environment
 /// (which is the worker's). The env values are kept only when they are absolute and not a
 /// filesystem root — the same fail-closed screen [`valid_config_home`] applies, so a stray
 /// `WICKED_HOME=/` cannot make every path look like the graph store.
@@ -540,6 +841,28 @@ pub(crate) fn graph_store_paths(boundary: Option<&BoundaryCtx>) -> Vec<std::path
         }
     }
     out
+}
+
+/// Diff two sorted entry lists and return the paths that changed (created, deleted, or modified).
+fn diff_witness_entries(old: &[(String, u64, u64)], new: &[(String, u64, u64)]) -> Vec<String> {
+    use std::collections::HashMap;
+    let old_map: HashMap<&str, (u64, u64)> =
+        old.iter().map(|(p, s, m)| (p.as_str(), (*s, *m))).collect();
+    let new_map: HashMap<&str, (u64, u64)> =
+        new.iter().map(|(p, s, m)| (p.as_str(), (*s, *m))).collect();
+    let mut changed: Vec<String> = Vec::new();
+    for (path, &val) in &new_map {
+        if old_map.get(path) != Some(&val) {
+            changed.push((*path).to_string());
+        }
+    }
+    for path in old_map.keys() {
+        if !new_map.contains_key(path) {
+            changed.push((*path).to_string());
+        }
+    }
+    changed.sort_unstable();
+    changed
 }
 
 /// ACP can classify an execute call by protocol kind even when the seat uses another tool name.
@@ -4715,6 +5038,56 @@ pub(crate) fn evaluate_tool_call(
         None => deliverable_roots_from_env(),
     };
 
+    // POST-HOC WITNESS (issue #541 items 1-3): for ReadOnly units, compare the entry list of the
+    // write roots (write set minus notes root) against the snapshot stored after the LAST allowed
+    // Bash call. A mismatch names the changed paths under a typed `witness-deny:` claim.
+    // Runs on BOTH carriers: the sidecar is keyed by decisions-dir+phase, which both share.
+    // PARITY B17 (coord, 2026-11-11): a pod seat's read-only tree is a throwaway view, so a
+    // mid-turn write there has nowhere to land and the witness does not run. On the host seat
+    // floor the tree is the real worktree, so it still does.
+    let witness_roots = if seat_in_pod() {
+        Vec::new()
+    } else {
+        compute_witness_roots(boundary)
+    };
+    let witness_path_buf = write_root_witness_path(decisions_path, phase);
+    if write_posture == crate::write_posture::WritePosture::ReadOnly && !witness_roots.is_empty() {
+        if let Some(stored) = read_write_root_witness(&witness_path_buf) {
+            let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
+            for root in &witness_roots {
+                let kind = collect_dir_entries_for_witness(root, &mut current_entries);
+                if kind == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
+            }
+            current_entries.sort_unstable();
+            // If the collector changed (e.g. .git became unavailable since the snapshot was
+            // taken), the two entry sets are not comparable — re-snapshot and admit rather than
+            // producing a false deny.
+            if stored.collector != current_collector {
+                let new_snapshot = WitnessSnapshot {
+                    roots: witness_roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries,
+                };
+                write_write_root_witness(&witness_path_buf, &new_snapshot);
+            } else {
+                let changed = diff_witness_entries(&stored.entries, &current_entries);
+                if !changed.is_empty() {
+                    let reason = format!(
+                        "write-root-mutated: the admitted write roots changed since the last \
+                         allowed Bash call — changed paths: {} (issue #541)",
+                        changed.join(", ")
+                    );
+                    append_witness_deny(decisions_path, scope, phase, tool, &changed);
+                    eprintln!("wicked-governance: DENY ({reason})");
+                    return 2;
+                }
+            }
+        }
+    }
+
     if let Some(reason) = phase_scope_denial(
         pre_build_scope,
         write_posture,
@@ -4843,6 +5216,28 @@ pub(crate) fn evaluate_tool_call(
                         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
                         track_install_fence_cwd(command, &cwd, home.as_deref(), &install_state);
                     }
+                }
+                // POST-HOC WITNESS: snapshot the witness roots (write set minus notes root) AFTER
+                // an allowed Bash call, on BOTH carriers, so the next invocation can detect
+                // mutations and name the changed paths (items 1-3 of the review).
+                if write_posture == crate::write_posture::WritePosture::ReadOnly
+                    && !witness_roots.is_empty()
+                {
+                    let mut entries = Vec::new();
+                    let mut collector = CollectorKind::GitLsFiles;
+                    for root in &witness_roots {
+                        let kind = collect_dir_entries_for_witness(root, &mut entries);
+                        if kind == CollectorKind::RawWalk {
+                            collector = CollectorKind::RawWalk;
+                        }
+                    }
+                    entries.sort_unstable();
+                    let snapshot = WitnessSnapshot {
+                        roots: witness_roots.clone(),
+                        collector,
+                        entries,
+                    };
+                    write_write_root_witness(&witness_path_buf, &snapshot);
                 }
             }
             0
@@ -5452,6 +5847,41 @@ pub(crate) const ESTATE_FENCE_RULE_ID: &str = "engine:estate-command-fence";
 /// ([`crate::path_policy`]'s module doc). What the phase actually produced is judged by its own
 /// output gate and required deliverables, not by this containment event.
 const PHASE_SCOPE_DENY_PREFIX: &str = "phase-scope-deny:";
+
+/// Claim-id prefix for a post-hoc write-root witness deny (issue #541, item 3 of the review).
+/// Fatal: the write roots watched by the witness changed between two gate-hook invocations or
+/// after the unit's last allowed Bash call, proving an unmodelled write escaped the fence.
+/// The changed paths are listed in `obligations` so the fold can name them without parsing prose.
+const WITNESS_DENY_PREFIX: &str = "witness-deny:";
+
+fn append_witness_deny(
+    decisions_path: &str,
+    scope: &str,
+    phase: &str,
+    tool: &str,
+    changed_paths: &[String],
+) {
+    let paths_str = changed_paths.join(", ");
+    let reason = format!(
+        "write-root-mutated: the admitted write roots changed since the \
+         last allowed Bash call — changed paths: {paths_str} (issue #541)"
+    );
+    let claim = ConformanceClaim {
+        claim_id: format!("{WITNESS_DENY_PREFIX}{phase}"),
+        scope: scope.to_string(),
+        phase: phase.to_string(),
+        policy_ids: vec!["engine:write-root-witness".to_string()],
+        decision: Decision::Deny,
+        obligations: changed_paths.to_vec(),
+        evaluated_context_ref: "sha256:witness".to_string(),
+        criteria: format!("write-root witness: {reason}"),
+        evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
+        evaluated_at: crate::clock::eval_now(),
+    };
+    // Annotated like every other fence recorder (issue #570): the witness fires ON a tool call, so
+    // its record names the call it refused instead of degrading to `(unknown)`.
+    append_annotated_claim(decisions_path, phase, tool, &claim);
+}
 
 /// Record a PHASE-SCOPE block: a pre-build phase's `Write`/`Edit` to a non-documentation path
 /// (core#296). The caller has already exited 2 — the tool call never runs. This is what makes the
@@ -6319,6 +6749,42 @@ pub(crate) fn fold_input_denial_in(
                 phase: Some(phase.to_string()),
                 findings_trimmed: false,
             });
+        }
+    }
+    // POST-HOC WITNESS unit-end check (item 2 of the review): re-scan the witness roots after
+    // all tool calls have been evaluated to catch a write that escaped via the last allowed Bash
+    // call (no subsequent gate-hook invocation would have detected it).
+    if denial.is_none() {
+        let witness_path = write_root_witness_path(&path.to_string_lossy(), phase);
+        if let Some(stored) = read_write_root_witness(&witness_path) {
+            let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
+            for root in &stored.roots {
+                let kind = collect_dir_entries_for_witness(root, &mut current_entries);
+                if kind == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
+            }
+            current_entries.sort_unstable();
+            // Collector mismatch: re-snapshot and do not deny — the entry sets are not
+            // comparable across collector strategies.
+            if stored.collector != current_collector {
+                let new_snapshot = WitnessSnapshot {
+                    roots: stored.roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries,
+                };
+                write_write_root_witness(&witness_path, &new_snapshot);
+            } else {
+                let changed = diff_witness_entries(&stored.entries, &current_entries);
+                if !changed.is_empty() {
+                    denial = Some(fail_closed(format!(
+                        "input governance denied {phase}: write-root mutated after the last \
+                         allowed Bash call — changed paths: {} (issue #541 unit-end catch)",
+                        changed.join(", ")
+                    )));
+                }
+            }
         }
     }
     // A GOVERNED unit whose log is PRESENT but has lost its armed marker was truncated/edited → the
@@ -7329,6 +7795,155 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// (core#765) A byte-identical rewrite is not a mutation — the witness judges a file by its
+    /// content, not its mtime (a reviewer's idempotent `npm run manifest:…` rewrote a tracked
+    /// file with the same bytes and the unit-end catch denied a PASS, run 049f77d8) — while a
+    /// same-size CONTENT change still is. And npm's own logs in a cache dir are never watched.
+    #[test]
+    fn the_witness_ignores_byte_identical_rewrites_and_npm_caches_but_not_content_changes() {
+        let base = std::env::temp_dir().join(format!("wicked-765-witness-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("root");
+        std::fs::create_dir_all(root.join("npm-cache").join("_logs")).unwrap();
+        let file = root.join("inventory.json");
+        std::fs::write(&file, "{\"a\":1}").unwrap();
+        let old_time = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
+        let snap = |root: &std::path::Path| {
+            let mut e = Vec::new();
+            collect_dir_entries_raw(root, &mut e);
+            e.sort_unstable();
+            e
+        };
+        let before = snap(&root);
+
+        // Same bytes rewritten (a fresh mtime) + npm writing its debug log: no change.
+        std::fs::write(&file, "{\"a\":1}").unwrap();
+        std::fs::write(
+            root.join("npm-cache").join("_logs").join("debug-0.log"),
+            "npm log",
+        )
+        .unwrap();
+        std::fs::create_dir_all(root.join(".npm").join("_cacache")).unwrap();
+        std::fs::write(root.join(".npm").join("_cacache").join("x"), "c").unwrap();
+        assert!(
+            diff_witness_entries(&before, &snap(&root)).is_empty(),
+            "{:?}",
+            diff_witness_entries(&before, &snap(&root))
+        );
+
+        // Same size, different bytes: a real mutation.
+        std::fs::write(&file, "{\"a\":2}").unwrap();
+        assert_eq!(
+            diff_witness_entries(&before, &snap(&root)),
+            vec![file.to_string_lossy().into_owned()]
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#765) In a git worktree the engine scratch `tmp/` — where the repo checks keep npm's
+    /// cache (`tmp/wicked-checks/npm-cache/_logs/*-debug-0.log`, run 64bb6775) — is not in the
+    /// witness listing, while an untracked file elsewhere still is.
+    #[test]
+    fn the_git_witness_listing_skips_the_engine_scratch() {
+        let base = std::env::temp_dir().join(format!("wicked-765-scratch-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if !git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            eprintln!("skipping: git init failed");
+            return;
+        }
+        std::fs::write(base.join("src.rs"), "fn main() {}").unwrap();
+        let logs = base.join("tmp/wicked-checks/npm-cache/_logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        std::fs::write(logs.join("2026-10-07T12_49_51_412Z-debug-0.log"), "npm").unwrap();
+        std::fs::write(base.join("stray.txt"), "x").unwrap();
+        let mut entries = Vec::new();
+        assert_eq!(
+            collect_dir_entries_for_witness(&base, &mut entries),
+            CollectorKind::GitLsFiles
+        );
+        assert!(
+            !entries.iter().any(|(p, _, _)| p.contains("wicked-checks")),
+            "{entries:?}"
+        );
+        assert!(entries.iter().any(|(p, _, _)| p.ends_with("stray.txt")));
+        assert!(entries.iter().any(|(p, _, _)| p.ends_with("src.rs")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// issue #541 criterion 3 — post-hoc witness: `fingerprint_write_roots` detects file creation
+    /// and `write_root_witness_path` mirrors `install_fence_cwd_path`.
+    #[test]
+    fn write_root_witness_fingerprint_detects_mutations() {
+        let base = std::env::temp_dir().join(format!("wicked-541-witness-{}", std::process::id(),));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("notes");
+        std::fs::create_dir_all(&root).unwrap();
+        let roots = vec![root.clone()];
+
+        let fp1 = fingerprint_write_roots(&roots);
+
+        // Create a file → fingerprint changes.
+        std::fs::write(root.join("new.md"), "content").unwrap();
+        let fp2 = fingerprint_write_roots(&roots);
+        assert_ne!(fp1, fp2, "fingerprint detects file creation");
+
+        // Remove the file → back to original.
+        std::fs::remove_file(root.join("new.md")).unwrap();
+        let fp3 = fingerprint_write_roots(&roots);
+        assert_eq!(fp1, fp3, "fingerprint restores when file is removed");
+
+        // Round-trip through sidecar with the new WitnessSnapshot format.
+        let sidecar = base.join("decisions").join("witness");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        assert!(read_write_root_witness(&sidecar).is_none());
+        let snap = WitnessSnapshot {
+            roots: roots.clone(),
+            collector: CollectorKind::RawWalk,
+            entries: {
+                let mut e = Vec::new();
+                let _ = collect_dir_entries_for_witness(&root, &mut e);
+                e.sort_unstable();
+                e
+            },
+        };
+        write_write_root_witness(&sidecar, &snap);
+        let loaded = read_write_root_witness(&sidecar).expect("sidecar loads");
+        assert_eq!(loaded.roots, roots, "roots round-trip");
+        assert!(
+            !loaded.entries.is_empty()
+                || std::fs::read_dir(&root)
+                    .map(|mut r| r.next().is_none())
+                    .unwrap_or(true),
+            "entries round-trip (empty dir = empty entries OK)"
+        );
+
+        // Sidecar path mirrors install-fence-cwd-path pattern.
+        let dp = base.join("gov").join("decisions.ndjson");
+        let wp = write_root_witness_path(&dp.to_string_lossy(), "unit-2");
+        assert!(
+            wp.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("write-root-witness-"))
+                .unwrap_or(false),
+            "sidecar filename has the expected prefix: {wp:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// item 8 — fd-dup operator tokens (`2>&1`, `>&2`) in `touch`/`mkdir` argument lists must
     /// not be treated as write targets; the command must be admitted when the only paths are
     /// within the notes root (F-FIX-S1-01: this run's own triage unit was refused on
@@ -7888,6 +8503,230 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// INDEPENDENT REVIEW item 2 — witness skips git-ignored paths so build outputs
+    /// (target/, node_modules/) do not appear as escapes.
+    #[test]
+    fn witness_skips_gitignored_paths_ir_item2() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-ir2-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        // Init a git repo so git ls-files works.
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            // Write a tracked file and a .gitignore that excludes target/.
+            std::fs::write(base.join(".gitignore"), "target/\n").unwrap();
+            std::fs::write(base.join("src.rs"), "fn main() {}").unwrap();
+            let _ = git(&["add", "."]);
+            let _ = git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ]);
+            // Now create target/debug/binary (git-ignored).
+            let target_dir = base.join("target").join("debug");
+            std::fs::create_dir_all(&target_dir).unwrap();
+            std::fs::write(target_dir.join("binary"), "ELF").unwrap();
+
+            // collect_dir_entries_for_witness must NOT include target/ contents.
+            let mut entries = Vec::new();
+            collect_dir_entries_for_witness(&base, &mut entries);
+            let has_target = entries.iter().any(|(p, _, _)| p.contains("target"));
+            assert!(
+                !has_target,
+                "witness must not include git-ignored target/ paths: {entries:?}"
+            );
+            // src.rs must be included.
+            let has_src = entries.iter().any(|(p, _, _)| p.ends_with("src.rs"));
+            assert!(has_src, "witness must include tracked src.rs: {entries:?}");
+        } else {
+            // git not available in test env: skip rather than fail.
+            eprintln!("skipping ir_item2 witness test: git init failed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Collector mismatch: a snapshot taken with `git ls-files` then re-checked when `.git` is
+    /// unavailable (forcing `RawWalk`) must re-snapshot and admit — no false denial even when no
+    /// file changed.
+    #[test]
+    fn ls_files_snapshot_then_git_unavailable_no_change_does_not_fail() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-coll-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if git(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
+            std::fs::write(base.join("tracked.rs"), "fn main() {}").unwrap();
+            let _ = git(&["add", "."]);
+            let _ = git(&[
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "user.name=t",
+                "commit",
+                "-m",
+                "init",
+            ]);
+
+            // Take a GitLsFiles snapshot.
+            let mut entries = Vec::new();
+            let kind = collect_dir_entries_for_witness(&base, &mut entries);
+            assert_eq!(
+                kind,
+                CollectorKind::GitLsFiles,
+                "first snapshot uses git ls-files"
+            );
+            entries.sort_unstable();
+            let sidecar = base.join("witness-sidecar");
+            let snap = WitnessSnapshot {
+                roots: vec![base.clone()],
+                collector: CollectorKind::GitLsFiles,
+                entries: entries.clone(),
+            };
+            write_write_root_witness(&sidecar, &snap);
+
+            // Rename .git so git ls-files fails → RawWalk.
+            let git_dir = base.join(".git");
+            let git_bak = base.join(".git-bak");
+            std::fs::rename(&git_dir, &git_bak).unwrap();
+
+            // Re-check: collector now RawWalk, no files changed.
+            let stored = read_write_root_witness(&sidecar).expect("sidecar present");
+            let mut current_entries = Vec::new();
+            let mut current_collector = CollectorKind::GitLsFiles;
+            for root in &stored.roots {
+                let k = collect_dir_entries_for_witness(root, &mut current_entries);
+                if k == CollectorKind::RawWalk {
+                    current_collector = CollectorKind::RawWalk;
+                }
+            }
+            current_entries.sort_unstable();
+
+            // Collector mismatch → must re-snapshot, NOT deny.
+            assert_ne!(
+                stored.collector, current_collector,
+                "collector changed: git→raw"
+            );
+            // The re-snapshot path (not a diff) means no denial is produced.
+            if stored.collector != current_collector {
+                let new_snap = WitnessSnapshot {
+                    roots: stored.roots.clone(),
+                    collector: current_collector,
+                    entries: current_entries.clone(),
+                };
+                write_write_root_witness(&sidecar, &new_snap);
+                // Verify the updated sidecar records RawWalk.
+                let reloaded = read_write_root_witness(&sidecar).expect("re-snapshotted sidecar");
+                assert_eq!(
+                    reloaded.collector,
+                    CollectorKind::RawWalk,
+                    "sidecar updated to RawWalk"
+                );
+            } else {
+                panic!("expected collector mismatch but got none — test setup wrong");
+            }
+
+            // Restore .git for cleanup.
+            let _ = std::fs::rename(&git_bak, &git_dir);
+        } else {
+            eprintln!("skipping collector-mismatch test: git init failed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#552 item 2: the collector-mismatch guard pinned through the PRODUCTION fold
+    /// ([`fold_input_denial`]), not a re-implementation of it — a `git ls-files` witness re-checked
+    /// with `.git` unavailable (a raw walk) re-snapshots and admits; removing the fold-site guard
+    /// fails this test (the raw walk sees `.git-bak/**`, a "change"). A real write after the
+    /// re-snapshot still denies, so the fold does read the witness.
+    #[test]
+    fn the_fold_resnapshots_on_a_collector_mismatch_and_still_catches_a_write_552() {
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::env::temp_dir().join(format!("wicked-collf-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git") // spawn-audit: test-only — isolated temp repo
+                .args(args)
+                .current_dir(&base)
+                .output()
+        };
+        if !git(&["init", "-q"])
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            eprintln!("skipping: git init failed");
+            return;
+        }
+        std::fs::write(base.join("tracked.rs"), "fn main() {}").unwrap();
+        let _ = git(&["add", "."]);
+        let _ = git(&[
+            "-c",
+            "user.email=t@t",
+            "-c",
+            "user.name=t",
+            "commit",
+            "-qm",
+            "i",
+        ]);
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("collfold-{}-{tid}", std::process::id());
+        let path = decisions_path_for(&run_id, 0);
+        let _ = std::fs::remove_file(&path);
+        append_decision(&path, &allow_claim("a1", "unit-1")).unwrap();
+        let sidecar = write_root_witness_path(&path.to_string_lossy(), "unit-1");
+        let mut entries = Vec::new();
+        assert_eq!(
+            collect_dir_entries_for_witness(&base, &mut entries),
+            CollectorKind::GitLsFiles
+        );
+        entries.sort_unstable();
+        write_write_root_witness(
+            &sidecar,
+            &WitnessSnapshot {
+                roots: vec![base.clone()],
+                collector: CollectorKind::GitLsFiles,
+                entries,
+            },
+        );
+        std::fs::rename(base.join(".git"), base.join(".git-bak")).unwrap();
+        assert_eq!(
+            fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap(),
+            None,
+            "a collector change with no file changed is no denial"
+        );
+        assert_eq!(
+            read_write_root_witness(&sidecar).map(|w| w.collector),
+            Some(CollectorKind::RawWalk),
+            "the fold re-snapshotted under the raw walk"
+        );
+        std::fs::write(base.join("escaped.txt"), "x").unwrap();
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-1", false).unwrap();
+        assert!(
+            denial
+                .as_ref()
+                .is_some_and(|d| d.reason.contains("escaped.txt")),
+            "{denial:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// item 4 — `bash_cd_escape_targets` fires when the command contains a write-CAPABLE
     /// program even if `bash_write_targets` finds no resolvable target. Interpreter-literal
     /// code-string scanning is retired; a Creator-posture unit writing outside its tree through
@@ -7944,6 +8783,174 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// items 1, 2, 3 — witness watches write roots minus notes root, runs on both carriers,
+    /// names changed paths, and catches a last-call write at fold time.
+    #[test]
+    fn witness_watches_write_roots_minus_notes_names_paths_items1_2_3() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-item123-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let notes = base.join("notes");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&notes).unwrap();
+
+        // --- item 1: witness_roots = write_roots minus notes ---
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), notes.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![notes.clone()], // notes root
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        let wr = compute_witness_roots(Some(&boundary));
+        assert_eq!(wr, vec![wt.clone()], "witness roots = write minus notes");
+        assert!(!wr.contains(&notes), "notes root excluded from witness");
+        // wicked-crew#951: the QE unit admits its QE ledger root AFTER the notes root — every
+        // admitted root is excluded, not only the first (a verdict recorded there is no escape).
+        let qe_root = base.join("evidence").join(".wicked-qe");
+        let qe_boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), notes.clone(), qe_root.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![notes.clone(), qe_root.clone()],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        assert_eq!(
+            compute_witness_roots(Some(&qe_boundary)),
+            vec![wt.clone()],
+            "witness roots = write minus every admitted root"
+        );
+
+        // --- item 3: changed paths named in diff ---
+        let sidecar = base.join("decisions").join("witness-test-phase");
+        std::fs::create_dir_all(sidecar.parent().unwrap()).unwrap();
+        // Snapshot an empty wt.
+        let snap1 = WitnessSnapshot {
+            roots: vec![wt.clone()],
+            collector: CollectorKind::RawWalk,
+            entries: vec![],
+        };
+        write_write_root_witness(&sidecar, &snap1);
+        // Create a file in wt.
+        let new_file = wt.join("leaked.rs");
+        std::fs::write(&new_file, "oops").unwrap();
+        // Re-scan and diff.
+        let stored = read_write_root_witness(&sidecar).expect("sidecar present");
+        let mut current = Vec::new();
+        for root in &stored.roots {
+            let _ = collect_dir_entries_for_witness(root, &mut current);
+        }
+        current.sort_unstable();
+        let changed = diff_witness_entries(&stored.entries, &current);
+        assert!(!changed.is_empty(), "diff detects created file");
+        assert!(
+            changed.iter().any(|p| p.contains("leaked.rs")),
+            "changed path names the file: {changed:?}"
+        );
+
+        // --- item 2 (fold-time unit-end catch): simulate a last-call write ---
+        // Write a snapshot, then modify the wt (simulating a last-call Bash), then call
+        // fold_input_denial with a governed unit that has no deny log yet.
+        // We use a temp run with a real decisions file so fold can find the witness.
+        let run_id = format!("witness-test-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0);
+        write_armed_marker(&dpath, "unit-witness").unwrap();
+        // Write a sentinel so fold doesn't fail-closed on missing hook-fired.
+        // (We skip the sentinel here to keep the test minimal — the fold closes on missing
+        // sentinel only when there ARE claim lines, which there are none here.)
+        // Store a snapshot with the leaked file still present.
+        let witness_path = write_root_witness_path(&dpath.to_string_lossy(), "unit-witness");
+        // Snapshot current state (wt has leaked.rs).
+        let snap_current = WitnessSnapshot {
+            roots: vec![wt.clone()],
+            collector: CollectorKind::RawWalk,
+            entries: current.clone(),
+        };
+        write_write_root_witness(&witness_path, &snap_current);
+        // Now add ANOTHER file to simulate a post-snapshot mutation.
+        let post_file = wt.join("post-mutation.rs");
+        std::fs::write(&post_file, "post").unwrap();
+        // fold_input_denial should detect the post-mutation.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let denial =
+            fold_input_denial(&mut store, &run_id, 0, "unit-witness", true).expect("fold ok");
+        assert!(
+            denial.is_some(),
+            "fold detects last-call write via unit-end witness check"
+        );
+        let reason = &denial.unwrap().reason;
+        assert!(
+            reason.contains("post-mutation.rs") || reason.contains("write-root mutated"),
+            "fold names the changed path: {reason}"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Regression (codex review of #642): only the EXACT graph dir the engine handed over is
+    /// skipped. A worktree or declared root that merely has the shape `<…>/repo-graphs/<key>` —
+    /// `/tmp/repo-graphs/app` — stays witnessed, with or without a real graph dir alongside it.
+    #[test]
+    fn witness_keeps_a_root_that_only_looks_like_a_graph_dir() {
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let app = std::path::PathBuf::from("/tmp/repo-graphs/app");
+        let outbox = std::path::PathBuf::from("/tmp/repo-graphs/outbox");
+        let graph = std::path::PathBuf::from("/srv/state/repo-graphs/app-0123456789ab");
+        let ctx = |write: Vec<std::path::PathBuf>, graph_write_dir| BoundaryCtx {
+            roots: AllowedRoots {
+                write,
+                read: vec![],
+            },
+            cwd: app.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir,
+            graph_store_db: None,
+        };
+        let no_graph = ctx(vec![app.clone(), outbox.clone()], None);
+        assert_eq!(
+            compute_witness_roots(Some(&no_graph)),
+            vec![app.clone(), outbox.clone()],
+            "lookalike roots stay witnessed when no graph was handed over"
+        );
+        let with_graph = ctx(
+            vec![app.clone(), outbox.clone(), graph.clone()],
+            Some(graph.clone()),
+        );
+        assert_eq!(
+            compute_witness_roots(Some(&with_graph)),
+            vec![app, outbox],
+            "only the exact graph dir is dropped"
+        );
     }
 
     /// core#707: the tool is a selection token — a rule with `applies_to: [tool:Bash]` fires on a
@@ -8034,6 +9041,179 @@ mod tests {
             "the tool:Bash rule fires on a Bash call"
         );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A read-only unit that grounds on the code graph (run 1a22f803's `pa-scope`: the estate
+    /// shim's SearchEntity) moves the graph's `estate.db` — the engine's store, not the unit's
+    /// write — and must NOT be denied; the same unit writing into its worktree still IS. Driven
+    /// through `evaluate_tool_call` end to end: allowed Bash (snapshot), mutate, next Bash.
+    #[test]
+    fn witness_ignores_engine_graph_store_but_catches_worktree_write() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-witness-graph-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let graph_dir = base.join("repo-graphs").join("wicked-studio-c79949084bda");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&graph_dir).unwrap();
+        std::fs::write(graph_dir.join("estate.db"), "v1").unwrap();
+        let policy_db = base.join("policy.db");
+        drop(open_store(Some(&policy_db.to_string_lossy())).unwrap());
+        let policy_db = policy_db.to_string_lossy().into_owned();
+
+        let run_id = format!("witness-graph-{}-{tid}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let dpath = decisions_path_for(&run_id, 0)
+            .to_string_lossy()
+            .into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone(), graph_dir.clone()],
+                read: vec![graph_dir.clone()],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: Some(graph_dir.clone()),
+            graph_store_db: None,
+        };
+        let bash = || {
+            evaluate_tool_call(
+                "wicked-agent/witness-graph/shared",
+                "unit-1",
+                None,
+                None,
+                Some(&policy_db),
+                &dpath,
+                &serde_json::json!({ "command": "ls" }),
+                "Bash",
+                Some(&boundary),
+            )
+        };
+
+        assert_eq!(
+            bash(),
+            0,
+            "first Bash is admitted and snapshots the witness"
+        );
+        // The shim / indexer rewrites the graph store (size moves too, beating mtime granularity).
+        std::fs::write(graph_dir.join("estate.db"), "v2-checkpointed").unwrap();
+        std::fs::write(graph_dir.join("estate.db-wal"), "").unwrap();
+        assert_eq!(
+            bash(),
+            0,
+            "a change in the engine's graph store is not a read-only unit's write"
+        );
+        // The unit itself writes into its worktree: still caught.
+        std::fs::write(wt.join("leaked.rs"), "oops").unwrap();
+        assert_eq!(bash(), 2, "a worktree write under ReadOnly is still denied");
+        let log = std::fs::read_to_string(&dpath).unwrap();
+        let deny = log
+            .lines()
+            .find(|l| l.contains(WITNESS_DENY_PREFIX))
+            .expect("witness deny recorded");
+        assert!(
+            deny.contains("leaked.rs"),
+            "deny names the worktree file: {deny}"
+        );
+        assert!(
+            !deny.contains("estate.db"),
+            "deny never names the graph store: {deny}"
+        );
+
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// PARITY B17 (coord, 2026-11-11): the witness is deleted only where the read-only tree is a
+    /// throwaway copy. A pod seat ([`SEAT_POD_ENV`]) mutating its view is not judged; on the host
+    /// seat floor (no pod) the same mutation is still denied and named. Mutation: drop the
+    /// `seat_in_pod()` guard (pod case denied) or run it unconditionally (host case admitted).
+    #[test]
+    fn the_witness_runs_on_the_host_floor_and_not_for_a_pod_seat() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        use crate::path_policy::AllowedRoots;
+        use crate::write_posture::WritePosture;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base =
+            std::env::temp_dir().join(format!("wicked-witness-pod-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let policy_db = base.join("policy.db");
+        drop(open_store(Some(&policy_db.to_string_lossy())).unwrap());
+        let policy_db = policy_db.to_string_lossy().into_owned();
+        let boundary = BoundaryCtx {
+            roots: AllowedRoots {
+                write: vec![wt.clone()],
+                read: vec![],
+            },
+            cwd: wt.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: false,
+            write_posture: WritePosture::ReadOnly,
+            deliverable_roots: vec![],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        for (in_pod, after_write) in [(false, 2), (true, 0)] {
+            if in_pod {
+                std::env::set_var(SEAT_POD_ENV, "1");
+            } else {
+                std::env::remove_var(SEAT_POD_ENV);
+            }
+            let run_id = format!("witness-pod-{in_pod}-{}-{tid}", std::process::id());
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let dpath = decisions_path_for(&run_id, 0)
+                .to_string_lossy()
+                .into_owned();
+            let bash = || {
+                evaluate_tool_call(
+                    "wicked-agent/witness-pod/shared",
+                    "unit-1",
+                    None,
+                    None,
+                    Some(&policy_db),
+                    &dpath,
+                    &serde_json::json!({ "command": "ls" }),
+                    "Bash",
+                    Some(&boundary),
+                )
+            };
+            assert_eq!(bash(), 0, "in_pod={in_pod}: first Bash admitted");
+            std::fs::write(wt.join(format!("leaked-{in_pod}.rs")), "oops").unwrap();
+            assert_eq!(bash(), after_write, "in_pod={in_pod}");
+            let log = std::fs::read_to_string(&dpath).unwrap_or_default();
+            assert_eq!(
+                log.contains(WITNESS_DENY_PREFIX),
+                !in_pod,
+                "in_pod={in_pod}: {log}"
+            );
+            assert_eq!(
+                write_root_witness_path(&dpath, "unit-1").exists(),
+                !in_pod,
+                "a pod seat never stores a witness snapshot"
+            );
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        }
+        std::env::remove_var(SEAT_POD_ENV);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -8198,66 +9378,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         }
         let _ = std::fs::remove_dir_all(&base);
-    }
-
-    /// Issue #570 defect 1 — the denial that could not be audited.
-    ///
-    /// Run 35565185 produced 59 hook records; its ONE deny read
-    /// `{"decision":"deny","denyingPolicy":null,"toolName":"(unknown)"}`, so the single moment the
-    /// fence acted was the single record that could say neither WHAT was blocked nor WHICH rule
-    /// blocked it. Both halves came from the DEFAULT recorder: `append_boundary_deny` appended a
-    /// bare claim (no tool-call annotation ⇒ `(unknown)`) with `policy_ids: vec![]` (⇒ `null`). The
-    /// post-hoc write-root witness had the same annotation gap.
-    ///
-    /// Mutation: give either recorder back `policy_ids: vec![]`, or route it back through bare
-    /// `append_decision`, and this test fails.
-    #[test]
-    fn a_boundary_deny_names_its_tool_and_its_rule() {
-        let run_id = format!("boundary-audit-{}", std::process::id());
-        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
-        let p = decisions_path_for(&run_id, 0);
-        write_armed_marker_for(&p, "unit-2", Some(CARRIER_WRAPPED_CLI)).unwrap();
-        let path = p.to_str().unwrap();
-
-        // The advisory arm: a blocked out-of-boundary READ — the exact shape of the live run's deny.
-        append_boundary_deny(
-            path,
-            "wf/unit-2",
-            "unit-2",
-            "Read",
-            "path outside this unit's boundary: /other/repo/notes.md (read)",
-            false,
-        );
-        // The fatal arm: a WRITE escape.
-        append_boundary_deny(
-            path,
-            "wf/unit-2",
-            "unit-2",
-            "Bash",
-            "Bash write leaves the unit boundary: /etc/hosts (write)",
-            true,
-        );
-        let recs = collect_hook_decisions(&run_id, 0, "unit-2");
-        assert_eq!(recs.len(), 2, "{recs:?}");
-        assert!(
-            recs.iter().all(|r| r.decision == "deny"),
-            "every row is a deny: {recs:?}"
-        );
-        assert_eq!(
-            recs.iter()
-                .map(|r| r.tool_name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Read", "Bash"],
-            "each deny names the tool it blocked: {recs:?}"
-        );
-        assert_eq!(
-            recs.iter()
-                .map(|r| r.denying_policy.as_deref())
-                .collect::<Vec<_>>(),
-            vec![Some(BOUNDARY_READ_RULE_ID), Some(BOUNDARY_WRITE_RULE_ID),],
-            "each deny names the rule that blocked it: {recs:?}"
-        );
-        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
     /// additional acceptance — under ReadOnly, `sed -i`, `rm`, `truncate`, `patch`, `ln`,
@@ -9861,6 +10981,117 @@ mod boundary_tests {
     }
 
     #[test]
+    fn shell_read_951_r8_advisory_preserves_policy_denial() {
+        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
+        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (dir, scratch, outside) = shell_read_951_r2_fixture("r8-policy");
+        let sibling = dir.join("wicked-worktrees/run-2");
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("secret"), "secret").unwrap();
+        for with_policy in [false, true] {
+            let policy_db = dir.join(format!("policy-{with_policy}.db"));
+            {
+                let mut store =
+                    wicked_apps_core::open_store(Some(policy_db.to_str().unwrap())).unwrap();
+                if with_policy {
+                    wicked_governance::register_policy(
+                        &mut store,
+                        &wicked_governance::Policy {
+                            id: "pol-shell-read-bash".into(),
+                            kind: "ops".into(),
+                            applies_to: vec!["tool:Bash".into()],
+                            effect: wicked_governance::Effect::Deny,
+                            trigger: wicked_governance::Trigger { contains: None },
+                            obligations: vec![],
+                            criteria: "no shell in this test".into(),
+                            severity: wicked_governance::Severity::High,
+                            rule: "Deny every Bash call.".into(),
+                            retired: false,
+                        },
+                    )
+                    .unwrap();
+                }
+            }
+            let boundary = BoundaryCtx {
+                roots: crate::path_policy::AllowedRoots {
+                    write: vec![scratch.clone()],
+                    read: vec![dir.join("wicked-worktrees")],
+                },
+                cwd: scratch.clone(),
+                home: None,
+                claude_config_dir: None,
+                pre_build_scope: false,
+                write_posture: crate::write_posture::WritePosture::Full,
+                deliverable_roots: vec![],
+                estate_store_pinned: false,
+                graph_write_dir: None,
+                graph_store_db: None,
+            };
+            for (kind, context, continues) in [
+                (
+                    "outside",
+                    json!({"command": format!("cat {}", shell_read_951_path(&outside.join("tip.mjs")))}),
+                    true,
+                ),
+                (
+                    "sibling",
+                    json!({"command": format!("cat {}", shell_read_951_path(&sibling.join("secret")))}),
+                    true,
+                ),
+                // Earlier advisory classes keep their boundary-first early return.
+                ("direct", json!({"path": outside.join("tip.mjs")}), false),
+                (
+                    "write",
+                    json!({"command": format!("echo x > {}", shell_read_951_path(&std::env::temp_dir().join("951-r8-write")))}),
+                    false,
+                ),
+            ] {
+                let log = dir.join(format!("decisions-{with_policy}-{kind}.jsonl"));
+                assert_eq!(
+                    evaluate_tool_call(
+                        "wicked-agent/951-r8",
+                        "build",
+                        None,
+                        None,
+                        Some(policy_db.to_str().unwrap()),
+                        log.to_str().unwrap(),
+                        &context,
+                        "Bash",
+                        Some(&boundary),
+                    ),
+                    2,
+                    "{with_policy}: {kind}"
+                );
+                let claims: Vec<ConformanceClaim> = std::fs::read_to_string(&log)
+                    .unwrap()
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let denies: Vec<_> = claims
+                    .iter()
+                    .filter(|claim| claim.decision == Decision::Deny)
+                    .collect();
+                assert_eq!(claims.len(), denies.len(), "{claims:?}");
+                assert_eq!(
+                    denies.len(),
+                    if with_policy && continues { 2 } else { 1 },
+                    "{with_policy}: {kind}: {claims:?}"
+                );
+                assert!(is_advisory_deny(denies[0]), "{claims:?}");
+                if with_policy && continues {
+                    assert_eq!(denies[1].policy_ids, ["pol-shell-read-bash"]);
+                    assert!(!is_advisory_deny(denies[1]), "{claims:?}");
+                }
+                assert!(!install_fence_cwd_path(log.to_str().unwrap(), "build").exists());
+                assert!(!write_root_witness_path(log.to_str().unwrap(), "build").exists());
+            }
+        }
+    }
+
+    #[test]
     fn shell_read_951_r8_at_file_operands() {
         let (_, scratch, outside) = shell_read_951_r2_fixture("r8-at-file");
         let path = outside.join("secret file");
@@ -10736,116 +11967,6 @@ mod boundary_tests {
         std::fs::write(outside.join("tip.mjs"), "secret").unwrap();
         std::fs::write(scratch.join("scripts/a.mjs"), "ok").unwrap();
         (dir, scratch, outside)
-    }
-
-    #[test]
-    fn shell_read_951_r8_advisory_preserves_policy_denial() {
-        // (core#1194) The hook reads the process env (`WICKED_HOOK_INVOCATION` decides its exit code);
-        // a test that sets it holds the write lock. Seen in a nested repro: exit 3, not 2.
-        let _env = crate::test_env::ENV_LOCK
-            .read()
-            .unwrap_or_else(|p| p.into_inner());
-        let (dir, scratch, outside) = shell_read_951_r2_fixture("r8-policy");
-        let sibling = dir.join("wicked-worktrees/run-2");
-        std::fs::create_dir_all(&sibling).unwrap();
-        std::fs::write(sibling.join("secret"), "secret").unwrap();
-        for with_policy in [false, true] {
-            let policy_db = dir.join(format!("policy-{with_policy}.db"));
-            {
-                let mut store =
-                    wicked_apps_core::open_store(Some(policy_db.to_str().unwrap())).unwrap();
-                if with_policy {
-                    wicked_governance::register_policy(
-                        &mut store,
-                        &wicked_governance::Policy {
-                            id: "pol-shell-read-bash".into(),
-                            kind: "ops".into(),
-                            applies_to: vec!["tool:Bash".into()],
-                            effect: wicked_governance::Effect::Deny,
-                            trigger: wicked_governance::Trigger { contains: None },
-                            obligations: vec![],
-                            criteria: "no shell in this test".into(),
-                            severity: wicked_governance::Severity::High,
-                            rule: "Deny every Bash call.".into(),
-                            retired: false,
-                        },
-                    )
-                    .unwrap();
-                }
-            }
-            let boundary = BoundaryCtx {
-                roots: crate::path_policy::AllowedRoots {
-                    write: vec![scratch.clone()],
-                    read: vec![dir.join("wicked-worktrees")],
-                },
-                cwd: scratch.clone(),
-                home: None,
-                claude_config_dir: None,
-                pre_build_scope: false,
-                write_posture: crate::write_posture::WritePosture::Full,
-                deliverable_roots: vec![],
-                estate_store_pinned: false,
-                graph_write_dir: None,
-                graph_store_db: None,
-            };
-            for (kind, context, continues) in [
-                (
-                    "outside",
-                    json!({"command": format!("cat {}", shell_read_951_path(&outside.join("tip.mjs")))}),
-                    true,
-                ),
-                (
-                    "sibling",
-                    json!({"command": format!("cat {}", shell_read_951_path(&sibling.join("secret")))}),
-                    true,
-                ),
-                // Earlier advisory classes keep their boundary-first early return.
-                ("direct", json!({"path": outside.join("tip.mjs")}), false),
-                (
-                    "write",
-                    json!({"command": format!("echo x > {}", shell_read_951_path(&std::env::temp_dir().join("951-r8-write")))}),
-                    false,
-                ),
-            ] {
-                let log = dir.join(format!("decisions-{with_policy}-{kind}.jsonl"));
-                assert_eq!(
-                    evaluate_tool_call(
-                        "wicked-agent/951-r8",
-                        "build",
-                        None,
-                        None,
-                        Some(policy_db.to_str().unwrap()),
-                        log.to_str().unwrap(),
-                        &context,
-                        "Bash",
-                        Some(&boundary),
-                    ),
-                    2,
-                    "{with_policy}: {kind}"
-                );
-                let claims: Vec<ConformanceClaim> = std::fs::read_to_string(&log)
-                    .unwrap()
-                    .lines()
-                    .filter_map(|line| serde_json::from_str(line).ok())
-                    .collect();
-                let denies: Vec<_> = claims
-                    .iter()
-                    .filter(|claim| claim.decision == Decision::Deny)
-                    .collect();
-                assert_eq!(claims.len(), denies.len(), "{claims:?}");
-                assert_eq!(
-                    denies.len(),
-                    if with_policy && continues { 2 } else { 1 },
-                    "{with_policy}: {kind}: {claims:?}"
-                );
-                assert!(is_advisory_deny(denies[0]), "{claims:?}");
-                if with_policy && continues {
-                    assert_eq!(denies[1].policy_ids, ["pol-shell-read-bash"]);
-                    assert!(!is_advisory_deny(denies[1]), "{claims:?}");
-                }
-                assert!(!install_fence_cwd_path(log.to_str().unwrap(), "build").exists());
-            }
-        }
     }
 
     fn shell_read_951_r2_assert_reads(scratch: &Path, home: &Path, commands: &[String]) {
@@ -12344,6 +13465,79 @@ mod boundary_tests {
 
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// Issue #570 defect 1 — the denial that could not be audited.
+    ///
+    /// Run 35565185 produced 59 hook records; its ONE deny read
+    /// `{"decision":"deny","denyingPolicy":null,"toolName":"(unknown)"}`, so the single moment the
+    /// fence acted was the single record that could say neither WHAT was blocked nor WHICH rule
+    /// blocked it. Both halves came from the DEFAULT recorder: `append_boundary_deny` appended a
+    /// bare claim (no tool-call annotation ⇒ `(unknown)`) with `policy_ids: vec![]` (⇒ `null`). The
+    /// post-hoc write-root witness had the same annotation gap.
+    ///
+    /// Mutation: give either recorder back `policy_ids: vec![]`, or route it back through bare
+    /// `append_decision`, and this test fails.
+    #[test]
+    fn a_boundary_and_witness_deny_name_their_tool_and_their_rule() {
+        let run_id = format!("boundary-audit-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker_for(&p, "unit-2", Some(CARRIER_WRAPPED_CLI)).unwrap();
+        let path = p.to_str().unwrap();
+
+        // The advisory arm: a blocked out-of-boundary READ — the exact shape of the live run's deny.
+        append_boundary_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Read",
+            "path outside this unit's boundary: /other/repo/notes.md (read)",
+            false,
+        );
+        // The fatal arm: a WRITE escape.
+        append_boundary_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            "Bash write leaves the unit boundary: /etc/hosts (write)",
+            true,
+        );
+        // The post-hoc witness (issue #541) fires ON a tool call, so its record names that call.
+        append_witness_deny(
+            path,
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            &["src/lib.rs".to_string()],
+        );
+
+        let recs = collect_hook_decisions(&run_id, 0, "unit-2");
+        assert_eq!(recs.len(), 3, "{recs:?}");
+        assert!(
+            recs.iter().all(|r| r.decision == "deny"),
+            "every row is a deny: {recs:?}"
+        );
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.tool_name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Read", "Bash", "Bash"],
+            "each deny names the tool it blocked: {recs:?}"
+        );
+        assert_eq!(
+            recs.iter()
+                .map(|r| r.denying_policy.as_deref())
+                .collect::<Vec<_>>(),
+            vec![
+                Some(BOUNDARY_READ_RULE_ID),
+                Some(BOUNDARY_WRITE_RULE_ID),
+                Some("engine:write-root-witness"),
+            ],
+            "each deny names the rule that blocked it: {recs:?}"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
     /// Issue #570, the acceptance in one assertion: EVERY engine-side deny recorder names its tool
