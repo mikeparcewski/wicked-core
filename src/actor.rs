@@ -9984,7 +9984,8 @@ fn sweep_expired_retained_worktrees(store: &dyn GraphStore) {
 fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
-    std::thread::spawn(move || {
+    // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
+    crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid);
         if let Some(repo) = repo {
             crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid);
@@ -10019,7 +10020,7 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
         return;
     };
     let rid = session.id.clone();
-    std::thread::spawn(move || remove_run_floor_cache(Some(&workdir), &rid));
+    crate::repo::spawn_bound(move || remove_run_floor_cache(Some(&workdir), &rid));
 }
 
 /// (core#1122) A terminal run's repo-checks floor build cache goes NOW, keyed by the tree its
@@ -10029,6 +10030,10 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
 /// holding the leaf leaves it marked orphaned, removed when that floor ends.
 fn remove_run_floor_cache(workdir: Option<&str>, run_id: &str) {
     if let Some(wd) = workdir {
+        // (review r3 on #1431) Never the scratch of a tree another daemon now holds at this path.
+        if !crate::repo::may_touch_tree(std::path::Path::new(wd)) {
+            return;
+        }
         crate::repo_checks::remove_check_scratch(std::path::Path::new(wd), run_id);
     }
 }

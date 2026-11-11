@@ -1188,9 +1188,23 @@ pub(crate) fn daemon_owner_of_store(db_path: &str) -> String {
 /// from an engine before core#1373, or one another engine minted without it).
 fn worktree_daemon(wt: &Path) -> Option<String> {
     let marker = worktree_admin_dir(wt)?.join(DAEMON_MARKER);
-    let owner = std::fs::read_to_string(marker).ok()?;
+    let owner = match std::fs::read_to_string(marker) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        // (review r3 on #1431) A marker that exists and cannot be read is nobody's to touch.
+        Err(_) => return Some(UNREADABLE_OWNER.to_string()),
+    };
     let owner = owner.trim();
     (!owner.is_empty()).then(|| owner.to_string())
+}
+
+/// The owner a marker that cannot be read stands for: no daemon's id, so no daemon may touch it.
+const UNREADABLE_OWNER: &str = "\u{0}unreadable";
+
+/// (review r3 on #1431) Whether the calling thread's daemon may act on the tree at `wt` (its check
+/// scratch included): [`daemon_may_touch`] for the actor's cleanup threads.
+pub(crate) fn may_touch_tree(wt: &Path) -> bool {
+    !wt.exists() || daemon_may_touch(wt)
 }
 
 /// Record the calling thread's daemon as the worktree's owner, when it has none yet: a tree another
@@ -1206,22 +1220,25 @@ fn stamp_worktree_daemon(wt: &Path) -> bool {
     let marker = dir.join(DAEMON_MARKER);
     // (review on #1431) A no-clobber claim: of two daemons stamping one unmarked tree at once,
     // exactly one creates the marker; the other finds it and leaves it as it is.
-    use std::io::Write;
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&marker)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(owner.as_bytes()) {
-                eprintln!(
-                    "wicked-core: could not stamp the daemon owner on worktree {} ({e}) — the \
-                     boot reaper will keep it rather than remove it (core#1373)",
-                    wt.display()
-                );
-            }
-            true
-        }
+    // (review r3) Written whole to a private file first, then published with a hard link, which
+    // never replaces an existing marker: an interrupted write leaves no partial marker behind.
+    let tmp = dir.join(format!(
+        "{DAEMON_MARKER}.{}.{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    if let Err(e) = std::fs::write(&tmp, &owner) {
+        eprintln!(
+            "wicked-core: could not stamp the daemon owner on worktree {} ({e}) — the boot reaper \
+             will keep it rather than remove it (core#1373)",
+            wt.display()
+        );
+        return true;
+    }
+    let published = std::fs::hard_link(&tmp, &marker);
+    let _ = std::fs::remove_file(&tmp);
+    match published {
+        Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
             let existing = std::fs::read_to_string(&marker).unwrap_or_default();
             if existing.trim() == owner {
@@ -1304,6 +1321,52 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
     match worktree_owner(wt) {
         None => true,
         Some(owner) => owner == run_id || sanitize_worktree_id(&owner) == run_id,
+    }
+}
+
+/// (review r3 on #1431) One run's tree is minted, removed or reaped by one thread at a time in this
+/// process: an ownership check and the git removal it guards are never split by another thread's
+/// removal and a replacement mint (two cleanups the actor queued for one failed launch, say).
+/// Keyed by the repository and the run's worktree name. Across daemons, the checks above stand.
+struct TreeLock(String);
+
+fn tree_locks() -> &'static (std::sync::Mutex<HashSet<String>>, std::sync::Condvar) {
+    static LOCKS: std::sync::OnceLock<(std::sync::Mutex<HashSet<String>>, std::sync::Condvar)> =
+        std::sync::OnceLock::new();
+    LOCKS.get_or_init(|| {
+        (
+            std::sync::Mutex::new(HashSet::new()),
+            std::sync::Condvar::new(),
+        )
+    })
+}
+
+impl TreeLock {
+    fn take(repo_root: &str, run_id: &str) -> Self {
+        let key = format!("{repo_root}\0{}", sanitize_worktree_id(run_id));
+        let (held, freed) = tree_locks();
+        let mut set = held.lock().unwrap_or_else(|p| p.into_inner());
+        while set.contains(&key) {
+            set = freed.wait(set).unwrap_or_else(|p| p.into_inner());
+        }
+        set.insert(key.clone());
+        TreeLock(key)
+    }
+}
+
+/// (tests) Hold `run_id`'s tree lock, as a removal still going would.
+#[cfg(test)]
+pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {
+    TreeLock::take(repo_root, run_id)
+}
+
+impl Drop for TreeLock {
+    fn drop(&mut self) {
+        let (held, freed) = tree_locks();
+        held.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.0);
+        freed.notify_all();
     }
 }
 
@@ -1587,6 +1650,8 @@ pub fn create_worktree_based(
     run_id: &str,
     base_ref: Option<&str>,
 ) -> anyhow::Result<(PathBuf, Option<RunBase>)> {
+    // A removal or reap of this run's tree still going on another thread ends first.
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     if wt.is_dir() {
         if is_live_worktree(&wt) {
@@ -1699,6 +1764,7 @@ pub fn create_worktree_based(
 /// startup leftover whose run id no longer exists on the store (no record, nothing to preserve).
 /// A run that merely FINISHED goes through [`reap_worktree_if_clean`] instead (FINDING-003).
 pub fn remove_worktree(repo_root: &str, run_id: &str) {
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     // A colliding run id derives the OWNER's path (core#337, hashless colon tier) — and this is
     // the FORCE form, so touching a tree minted for a different raw id would destroy a live
@@ -1773,6 +1839,7 @@ pub(crate) fn clean_ignored_in_worktree(repo_root: &str, run_id: &str) {
 /// named leftover rather than a silent leak; a clean tree adds nothing the branch doesn't already
 /// carry, and goes. The branch itself is never touched either way.
 pub fn reap_worktree_if_clean(repo_root: &str, run_id: &str) -> bool {
+    let _tree = TreeLock::take(repo_root, run_id);
     let wt = worktree_path(repo_root, run_id);
     if !wt.is_dir() {
         // Nothing on disk. Drop any dangling admin entry so the path is re-usable, and the
@@ -4115,6 +4182,76 @@ mod tests {
             daemon_owner_of_store(":memory:"),
             daemon_owner_of_store(":memory:")
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// (review r3 on #1431) The daemon's own cleanup threads still clean its marked trees (bound),
+    /// an unreadable marker is nobody's to remove, the marker is published whole, and one run's
+    /// tree is removed by one thread at a time (a removal waits for the one still going).
+    #[test]
+    fn bound_cleanups_unreadable_markers_whole_markers_and_one_removal_at_a_time() {
+        let root = git_repo("reap-r3");
+        let p = root.to_str().unwrap().to_string();
+        let _a = DaemonOwnerScope::bind(Some("daemon-a".into()));
+        let wt = create_worktree(&p, "run-kept").unwrap();
+        let admin = worktree_admin_dir(&wt).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(admin.join(DAEMON_MARKER)).unwrap(),
+            "daemon-a"
+        );
+        assert!(
+            std::fs::read_dir(&admin).unwrap().flatten().all(|e| !e
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wicked-daemon.")),
+            "no private marker file is left behind"
+        );
+        std::fs::write(root.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::write(wt.join(".gitignore"), "node_modules/\n").unwrap();
+        std::fs::create_dir_all(wt.join("node_modules/x")).unwrap();
+        std::fs::write(wt.join("node_modules/x/i.js"), "1\n").unwrap();
+        spawn_bound({
+            let p = p.clone();
+            move || clean_ignored_in_worktree(&p, "run-kept")
+        })
+        .join()
+        .unwrap();
+        assert!(
+            !wt.join("node_modules").exists(),
+            "a bound cleanup cleans its own tree"
+        );
+        assert!(is_live_worktree(&wt));
+
+        // One removal at a time: a second waits for the first (held here).
+        let held = hold_tree_for_test(&p, "run-kept");
+        let remover = spawn_bound({
+            let p = p.clone();
+            move || remove_worktree(&p, "run-kept")
+        });
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            is_live_worktree(&wt),
+            "the removal waits for the tree's lock"
+        );
+        drop(held);
+        remover.join().unwrap();
+        assert!(!wt.exists());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let wt = create_worktree(&p, "run-locked").unwrap();
+            let marker = worktree_admin_dir(&wt).unwrap().join(DAEMON_MARKER);
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o000)).unwrap();
+            if std::fs::read(&marker).is_err() {
+                remove_worktree(&p, "run-locked");
+                assert!(
+                    is_live_worktree(&wt),
+                    "an unreadable marker is nobody's to remove"
+                );
+            }
+            std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
