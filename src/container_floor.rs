@@ -4631,6 +4631,11 @@ mod tests {
                 );
             }
         }
+        // A seat makes its own venv (pip bootstraps from this Debian package).
+        assert!(
+            SEAT_DOCKERFILE.contains("python3-venv"),
+            "the seat image installs python3-venv"
+        );
     }
 
     #[test]
