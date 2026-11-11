@@ -50,10 +50,29 @@ pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
         }
     }
     probe(kube)?;
+    // The engine's own token is renewed while the cluster answers (B-5): a 30-day TokenRequest,
+    // renewed inside its last week. Only the engine's own context (an operator's kubeconfig is
+    // never rewritten); a failed renewal is reported and the old token used until it expires.
+    if renews(kube) {
+        if let Err(e) = renew_token_if_due(kube) {
+            eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
+        }
+    }
     if let Ok(mut last) = LAST.lock() {
         *last = Some((kube.clone(), std::time::Instant::now()));
     }
     Ok(())
+}
+
+/// Whether `kube`'s credential is the engine's own, the one renewal may rewrite (codex b5 #3):
+/// its context AND its file, `<state home>/k8s/kubeconfig` as `cluster install` wrote it. An
+/// operator's kubeconfig with a context of the same name is never rewritten.
+pub(crate) fn renews(kube: &Kube) -> bool {
+    kube.context == super::OWN_CONTEXT
+        && kube
+            .kubeconfig
+            .as_deref()
+            .is_some_and(|k| super::engine_home().is_some_and(|h| super::own_kubeconfig(&h) == k))
 }
 
 /// Whether the cluster can run seats now: the API server answers, the controller runs the
@@ -747,6 +766,19 @@ pub(crate) enum SweepAction {
     ReapStalePods(String),
 }
 
+/// Whether namespace `n` was created before `at` (pure; RFC 3339 UTC strings compare in order).
+/// No bound, or no readable creation time, counts as before.
+pub(crate) fn before(n: &Value, at: Option<&str>) -> bool {
+    match (
+        at,
+        n.pointer("/metadata/creationTimestamp")
+            .and_then(Value::as_str),
+    ) {
+        (Some(at), Some(created)) => created < at,
+        _ => true,
+    }
+}
+
 /// Pure half of [`sweep`]: decide per namespace. `live` answers whether a run id is still
 /// executing in this engine. A namespace without this daemon's labels is never in the list.
 pub(crate) fn sweep_plan(
@@ -782,8 +814,18 @@ pub(crate) fn sweep_plan(
 
 /// The boot sweep: terminal runs' namespaces are deleted; in a live run, sandboxes an earlier
 /// engine process created (another [`super::BOOT_LABEL`]) are deleted. Answers what it did.
-pub(crate) fn sweep(kube: &Kube, live: &dyn Fn(&str) -> bool) -> Result<Vec<String>, String> {
-    let namespaces = kube.list_owned(None, "namespaces", &[(ROLE_LABEL, "run")])?;
+/// `created_before` (RFC 3339): a namespace created at or after it (this engine's own, made
+/// while the sweep ran) is left alone (B-5).
+pub(crate) fn sweep(
+    kube: &Kube,
+    live: &dyn Fn(&str) -> bool,
+    created_before: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let namespaces: Vec<Value> = kube
+        .list_owned(None, "namespaces", &[(ROLE_LABEL, "run")])?
+        .into_iter()
+        .filter(|n| before(n, created_before))
+        .collect();
     let mut done = Vec::new();
     for action in sweep_plan(&namespaces, &kube.owner, live) {
         match action {

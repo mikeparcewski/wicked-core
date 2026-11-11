@@ -28,22 +28,11 @@ use super::{cluster, label_value, Kube};
 pub(crate) const CONTAINER: &str = "checks";
 /// The in-memory dir the check wrapper writes its exit code to.
 pub(crate) const RC_DIR: &str = "/wicked-rc";
-/// The check wrapper's exit-code file.
-pub(crate) const RC_FILE: &str = "/wicked-rc/rc";
 /// How long a floor or fill pod may take to be admitted and start.
 pub(crate) const POD_START: Duration = Duration::from_secs(120);
 
 /// Floor pods whose deletion was not confirmed: (namespace, pod).
 static UNREAPED: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-/// Record a floor pod as not confirmed gone (tests).
-#[cfg(test)]
-pub(crate) fn mark_unreaped(ns: &str, name: &str) {
-    UNREAPED
-        .lock()
-        .unwrap()
-        .push((ns.to_string(), name.to_string()));
-}
 
 /// Where a floor's pods go: the run's namespace, or (no run) one of the floor's own.
 #[derive(Debug)]
@@ -65,6 +54,9 @@ impl Place {
                 true,
             ),
         };
+        if !owned {
+            super::arming(&run);
+        }
         let ns = cluster::ensure_run(&kube, &run, &render::RunBudget::default(), "20Gi")?;
         Ok(Place {
             kube,

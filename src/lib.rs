@@ -275,7 +275,7 @@ pub use domain_extraction::{
     COVERAGE_SCRIPT, COVERAGE_VALIDATOR_PIN, DOMAIN_EXTRACTION_WORKFLOW_ID, EXTRACT_APPLY_STEP,
     EXTRACT_PREPARE_STEP, RULES_REL, RULES_REVIEW_INSTRUCTIONS, WORKLIST_REL,
 };
-pub use event::{BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
+pub use event::{ArmPhase, BaseSkill, CoreEvent, InjectedContext, StepFailureKind};
 pub use execute_wrapped::WrappedCliStepRunner;
 pub use gate_hook::{
     count_claims, decisions_path_for, gov_run_dir, parse_protocol_version, protocol_version_line,
@@ -287,6 +287,7 @@ pub use index_budget::{
     index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
     INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,
 };
+pub use k8s::cli::cluster_main;
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, judge_mcp_call_json, list_mcp_tools_json,
     preview_mcp_calls_json, record_mcp_boundary_escape_json, resolve_estate_scope_json,

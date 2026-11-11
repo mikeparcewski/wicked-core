@@ -66,6 +66,102 @@ static SEEDED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new
 fn seeded_key(ns: &str, replica: &str) -> String {
     format!("{ns}\0{replica}")
 }
+
+/// A read-only root's host signature (no file is opened: a link-free walk and one `lstat` per
+/// entry, its kind, size, mode, inode, mtime and ctime), with the root's skip list and masks.
+/// `None` when it cannot be taken: the root is sent.
+#[cfg(unix)]
+fn root_signature(r: &PlanRoot) -> Option<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+    let mut h = Sha256::new();
+    let field = |h: &mut Sha256, b: &[u8]| {
+        h.update((b.len() as u64).to_le_bytes());
+        h.update(b);
+    };
+    for s in &r.skip {
+        field(&mut h, s.as_bytes());
+    }
+    h.update([0xff]);
+    for s in &r.masks {
+        field(&mut h, s.as_bytes());
+    }
+    h.update([0xff]);
+    let mut listed = sync::host_plain_listing(&r.host, &r.skip).ok()?;
+    // The root and every directory on the way too (codex r2 #1): a directory moved out and back
+    // changes their metadata, not its files'.
+    let mut dirs: Vec<String> = listed
+        .iter()
+        .flat_map(|rel| {
+            let parts: Vec<&str> = rel.split('/').collect();
+            (0..parts.len()).map(move |i| parts[..i].join("/"))
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    listed.sort();
+    for rel in dirs.iter().chain(&listed) {
+        let m = std::fs::symlink_metadata(r.host.join(rel)).ok()?;
+        field(&mut h, rel.as_bytes());
+        for n in [
+            u64::from(m.mode()),
+            m.len(),
+            m.ino(),
+            m.mtime() as u64,
+            m.mtime_nsec() as u64,
+            m.ctime() as u64,
+            m.ctime_nsec() as u64,
+        ] {
+            h.update(n.to_le_bytes());
+        }
+    }
+    Some(h.finalize().into())
+}
+
+#[cfg(not(unix))]
+fn root_signature(_r: &PlanRoot) -> Option<[u8; 32]> {
+    None
+}
+
+/// Host plain roots already read, by host path, at the signature they had then (k8s-final). An
+/// empty root or one larger than [`READ_CACHE_ROOT`] is not kept; past [`READ_CACHE_ALL`] bytes
+/// or [`READ_CACHE_ROOTS`] roots the cache starts over.
+#[allow(clippy::type_complexity)]
+static READ_CACHE: std::sync::Mutex<Option<HashMap<PathBuf, ([u8; 32], Vec<Entry>)>>> =
+    std::sync::Mutex::new(None);
+const READ_CACHE_ROOT: usize = 32 * 1024 * 1024;
+const READ_CACHE_ALL: usize = 128 * 1024 * 1024;
+const READ_CACHE_ROOTS: usize = 256;
+
+fn read_cache_get(host: &Path, sig: &[u8; 32]) -> Option<Vec<Entry>> {
+    let g = READ_CACHE.lock().ok()?;
+    let (have, entries) = g.as_ref()?.get(host)?;
+    (have == sig).then(|| entries.clone())
+}
+
+fn read_cache_put(host: &Path, sig: &[u8; 32], entries: &[Entry]) {
+    let size = |es: &[Entry]| {
+        es.iter()
+            .map(|e| e.data.capacity() + e.path.capacity() + ENTRY_OVERHEAD)
+            .sum::<usize>()
+    };
+    if entries.is_empty() || size(entries) > READ_CACHE_ROOT {
+        return;
+    }
+    if let Ok(mut g) = READ_CACHE.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(host.to_path_buf(), (*sig, entries.to_vec()));
+        if m.len() > READ_CACHE_ROOTS
+            || m.values().map(|(_, es)| size(es)).sum::<usize>() > READ_CACHE_ALL
+        {
+            m.clear();
+        }
+    }
+}
+
+/// What a kept entry costs beyond its bytes (codex r2 #3: many empty files are not free).
+const ENTRY_OVERHEAD: usize = 64;
+
 /// The replica's shallow history.
 const REPLICA_DEPTH: &str = "50";
 /// The deadline of one engine git call on a host tree.
@@ -375,7 +471,7 @@ pub(crate) fn one_shot_scope(run_id: &str) -> Option<String> {
 pub(crate) fn place(kube: &Kube, run_id: &str) -> (String, Option<String>, String) {
     match one_shot_scope(run_id) {
         Some(scope) => (
-            super::run_namespace_name(&kube.owner, "sessions"),
+            super::run_namespace_name(&kube.owner, super::SESSIONS_RUN),
             Some(scope),
             "sessions".to_string(),
         ),
@@ -446,9 +542,22 @@ fn ensure_sync(
     floor: &str,
 ) -> Result<(), (FloorUnarmed, String)> {
     clear_sync_suspect(kube, ns).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+    // Only a sync pod of this boot is used (codex b5 #10): a predecessor's may still run a codec
+    // its engine left, and the boot sweep removes it; it is replaced here, never shared.
     let running = |kube: &Kube| -> Result<bool, String> {
         let pods = kube.list_owned(Some(ns), "pods", &[(ROLE_LABEL, "sync")])?;
-        Ok(cluster::running_pod(&pods).as_deref() == Some("sync"))
+        let ours: Vec<Value> = pods
+            .into_iter()
+            .filter(|p| {
+                p.pointer(&format!(
+                    "/metadata/labels/{}",
+                    super::BOOT_LABEL.replace('/', "~1")
+                ))
+                .and_then(Value::as_str)
+                    == Some(super::boot_id())
+            })
+            .collect();
+        Ok(cluster::running_pod(&ours).as_deref() == Some("sync"))
     };
     if running(kube).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))? {
         return Ok(());
@@ -458,7 +567,16 @@ fn ensure_sync(
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
     if let Some(p) = existing {
         // A sync pod that ended (or a predecessor's): replaced.
-        if p.pointer("/status/phase").and_then(Value::as_str) != Some("Pending") {
+        // A Pending pod is kept only when it is this boot's (codex r2): an earlier boot's holds
+        // the name and is replaced whatever its phase.
+        let this_boot = p
+            .pointer(&format!(
+                "/metadata/labels/{}",
+                super::BOOT_LABEL.replace('/', "~1")
+            ))
+            .and_then(Value::as_str)
+            == Some(super::boot_id());
+        if p.pointer("/status/phase").and_then(Value::as_str) != Some("Pending") || !this_boot {
             kube.delete_owned(Some(ns), "pod", "sync", true)
                 .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
         }
@@ -566,6 +684,90 @@ fn replica_git(
     }
     let sha = String::from_utf8_lossy(&head.stdout).trim().to_string();
     let branch = head_branch(tree)?;
+    // The rebuilt `.git` is a function of the commit, the branch and the masks alone (k8s-final:
+    // about eight git processes, up to 7 s at an arm): rebuilt once per key, then reused.
+    let key = (
+        tree.to_path_buf(),
+        sha.clone(),
+        branch.clone(),
+        masks.to_vec(),
+    );
+    // Never for a shallow host repository (codex r1 #6): deepening it changes what the fetch
+    // brings without moving the commit.
+    let shallow = bounded(tree, &["rev-parse", "--is-shallow-repository"]);
+    let cacheable = shallow.ok() && String::from_utf8_lossy(&shallow.stdout).trim() == "false";
+    let hit = GIT_CACHE
+        .lock()
+        .ok()
+        .filter(|_| cacheable)
+        .and_then(|g| g.as_ref().and_then(|m| m.get(&key).cloned()));
+    if let Some(entries) = hit {
+        let size: u64 = entries
+            .iter()
+            .map(|e| (e.data.len() + e.path.len()) as u64)
+            .sum();
+        if size > budget {
+            return Err(format!(
+                "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
+            ));
+        }
+        return Ok(Some((sha, entries)));
+    }
+    let built = rebuild_replica_git(tree, &sha, &branch, masks, budget)?;
+    #[cfg(test)]
+    GIT_BUILDS.with(|c| c.set(c.get() + 1));
+    // Still not shallow once built (codex r2 #2): a source that changed under the build is not kept.
+    let still = bounded(tree, &["rev-parse", "--is-shallow-repository"]);
+    let cacheable =
+        cacheable && still.ok() && String::from_utf8_lossy(&still.stdout).trim() == "false";
+    let size = |es: &[Entry]| {
+        es.iter()
+            .map(|e| e.data.capacity() + e.path.capacity() + ENTRY_OVERHEAD)
+            .sum::<usize>()
+    };
+    // Bounded in bytes (codex r1 #7): a history over a root's share is not kept, and past the
+    // whole the cache starts over.
+    if cacheable && size(&built) <= GIT_CACHE_ROOT {
+        if let Ok(mut g) = GIT_CACHE.lock() {
+            let m = g.get_or_insert_with(HashMap::new);
+            m.insert(key, built.clone());
+            if m.len() > 64 || m.values().map(|es| size(es)).sum::<usize>() > GIT_CACHE_ALL {
+                m.clear();
+            }
+        }
+    }
+    Ok(Some((sha, built)))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// (tests) Plain roots read from the host, and replica `.git`s built, on this thread.
+    pub(crate) static HOST_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static GIT_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Rebuilt replica `.git`s by (tree, commit, branch, masks) (k8s-final), each at most
+/// [`GIT_CACHE_ROOT`] bytes and [`GIT_CACHE_ALL`] in all.
+const GIT_CACHE_ROOT: usize = 16 * 1024 * 1024;
+const GIT_CACHE_ALL: usize = 64 * 1024 * 1024;
+#[allow(clippy::type_complexity)]
+static GIT_CACHE: std::sync::Mutex<
+    Option<HashMap<(PathBuf, String, Option<String>, Vec<String>), Vec<Entry>>>,
+> = std::sync::Mutex::new(None);
+
+/// [`replica_git`]'s build: a shallow clone of `sha` at `branch`, masks skip-worktree, read whole.
+fn rebuild_replica_git(
+    tree: &Path,
+    sha: &str,
+    branch: &Option<String>,
+    masks: &[String],
+    budget: u64,
+) -> Result<Vec<Entry>, String> {
+    let bounded = |dir: &Path, args: &[&str]| -> super::Called {
+        let mut c = sync::git(dir);
+        c.args(args);
+        super::run_capped(c, None, GIT_CALL, 64 << 20)
+    };
     let tmp = std::env::temp_dir().join(format!(
         "wicked-replica-git-{}",
         uuid::Uuid::new_v4().simple()
@@ -600,7 +802,7 @@ fn replica_git(
         "--no-tags",
         &format!("--depth={REPLICA_DEPTH}"),
         &src,
-        &sha,
+        sha,
     ])
     .or_else(|_| {
         run(&[
@@ -616,12 +818,12 @@ fn replica_git(
     })?;
     match &branch {
         Some(b) => {
-            run(&["update-ref", b, &sha])?;
+            run(&["update-ref", b, sha])?;
             run(&["symbolic-ref", "HEAD", b])?;
         }
-        None => run(&["update-ref", "--no-deref", "HEAD", &sha])?,
+        None => run(&["update-ref", "--no-deref", "HEAD", sha])?,
     }
-    run(&["read-tree", &sha])?;
+    run(&["read-tree", sha])?;
     // A masked path git tracks is absent from the replica's tree: marked skip-worktree, so the
     // seat's `git add -A` never stages its deletion (review r1). Its blob stays in the history,
     // as the Docker floor's read-only object store held it.
@@ -672,7 +874,7 @@ fn replica_git(
             }
         }
     }
-    Ok(Some((sha, entries)))
+    Ok(entries)
 }
 
 /// The branch a host tree's HEAD names (`refs/heads/...`), or `None` when it is detached.
@@ -713,7 +915,10 @@ pub(crate) fn copy_in_stream(
     let mut budget: u64 = 0;
     let mut count: usize = 0;
     let mut seed_used: u64 = 0;
+    // How long each root took on the host (k8s-final arm timing), by replica path.
+    let mut took: HashMap<String, u128> = HashMap::new();
     for r in roots {
+        let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
         if r.mode == Mode::Seed {
             // Sent once per replica, outside the unit's budget: an oversized cache is left out.
@@ -727,9 +932,18 @@ pub(crate) fn copy_in_stream(
                 mode: r.mode,
                 entries,
             });
+            took.insert(replica.clone(), t_root.elapsed().as_millis());
             plan_roots.push((replica, r.clone()));
             continue;
         }
+        // A plain root read before at the same host signature is not read again (k8s-final: the
+        // skills snapshot took up to 35 s to open file by file, for every replica and judge).
+        // Signed BEFORE it is listed and read, and kept only when signed the same after (codex
+        // r1 #5): the entries kept are those of the state the signature names.
+        let cached = (r.mode == Mode::Plain)
+            .then(|| root_signature(r))
+            .flatten()
+            .map(|sig| (sig, read_cache_get(&r.host, &sig)));
         let rels: Vec<String> = if r.mode == Mode::Files {
             r.files.clone()
         } else {
@@ -739,11 +953,37 @@ pub(crate) fn copy_in_stream(
             }
         };
         let mut entries: Vec<Entry> = Vec::new();
+        if let Some((_, Some(hit))) = &cached {
+            for e in hit {
+                count += 1;
+                if count > sync::MAX_ENTRIES {
+                    return Err(format!(
+                        "the unit's copy-in has more than {} files",
+                        sync::MAX_ENTRIES
+                    ));
+                }
+                let size = if e.kind == sync::Kind::Link {
+                    256
+                } else {
+                    e.data.len() as u64
+                };
+                budget += size.max(e.path.len() as u64);
+                if budget > STREAM_LIMIT {
+                    return Err(format!(
+                        "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
+                        r.host.join(&e.path).display()
+                    ));
+                }
+                entries.push(e.clone());
+            }
+        }
         // Neither a tree nor a plain root carries git metadata (codex b2-sync #17): only the
         // tree's own rebuilt `.git` root does, and nothing of a `.git` ever comes back.
         let no_git = matches!(r.mode, Mode::Tree | Mode::Plain);
+        let read_now = !matches!(&cached, Some((_, Some(_))));
         for p in rels
             .iter()
+            .filter(|_| read_now)
             .filter(|p| !r.skip.iter().any(|s| sync::under(p, s)))
             .filter(|p| !no_git || !p.split('/').any(sync::is_git_name))
         {
@@ -771,11 +1011,23 @@ pub(crate) fn copy_in_stream(
                 entries.push(e);
             }
         }
+        #[cfg(test)]
+        if read_now && r.mode == Mode::Plain {
+            HOST_READS.with(|c| c.set(c.get() + 1));
+        }
+        if let Some((sig, None)) = &cached {
+            if root_signature(r).as_ref() == Some(sig) {
+                read_cache_put(&r.host, sig, &entries);
+            }
+        }
         // The tree's `.git` first: the codec mirrors the tree by what that git lists. Always
         // sent, empty when the host has no commit (review r3): an empty root still replaces a
         // `.git` a seat planted in the replica, so its hooks never reach a later unit.
         if r.mode == Mode::Tree && r.host == tree && with_git {
-            let (sha, git_entries) = match replica_git(tree, &r.masks, STREAM_LIMIT - budget)? {
+            let t_git = Instant::now();
+            let rebuilt = replica_git(tree, &r.masks, STREAM_LIMIT - budget)?;
+            took.insert(format!("{replica}/.git"), t_git.elapsed().as_millis());
+            let (sha, git_entries) = match rebuilt {
                 Some((sha, entries)) => (Some(sha), entries),
                 None => (None, Vec::new()),
             };
@@ -819,6 +1071,11 @@ pub(crate) fn copy_in_stream(
                     .collect(),
             );
         }
+        let ms = t_root
+            .elapsed()
+            .as_millis()
+            .saturating_sub(took.get(&format!("{replica}/.git")).copied().unwrap_or(0));
+        took.insert(replica.clone(), ms);
         stream.push(Root {
             replica: replica.clone(),
             mode: r.mode,
@@ -829,6 +1086,21 @@ pub(crate) fn copy_in_stream(
     // The codec writes `files` roots by name; the stream carries them as plain entries.
     let refs: Vec<(String, &PlanRoot)> = plan_roots.iter().map(|(a, b)| (a.clone(), b)).collect();
     let plan = codec_plan(&refs);
+    // What each root moved (k8s-final arm timing): `replica:entries/bytes/ms`.
+    super::clock::mark_with(
+        "copy_in_read",
+        Some(
+            stream
+                .iter()
+                .map(|r| {
+                    let bytes: usize = r.entries.iter().map(|e| e.data.len()).sum();
+                    let ms = took.get(&r.replica).copied().unwrap_or(0);
+                    format!("{}:{}/{}/{}ms", r.replica, r.entries.len(), bytes, ms)
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    );
     Ok((sync::encode(&stream), plan, base, baseline))
 }
 
@@ -920,6 +1192,7 @@ fn copy_in(
             ),
         ));
     }
+    super::clock::mark_with("copy_in_unpack", Some(format!("{} bytes", body.len())));
     if let Ok(mut g) = SEEDED.lock() {
         let set = g.get_or_insert_with(HashSet::new);
         for r in roots.iter().filter(|r| r.mode == Mode::Seed) {
@@ -1198,9 +1471,18 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
+    super::arming(s.run_id);
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
-    ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
+    super::clock::mark("namespace");
+    // The sync pod is inspected and replaced under the namespace's arm lock (codex r2): two
+    // arms never delete each other's replacement.
+    {
+        let arming = arm_lock(&ns);
+        let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
+        ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
+    }
+    super::clock::mark("sync_pod");
     let (roots, pod_mounts) = plan(
         s.tree,
         s.view,
@@ -1230,6 +1512,7 @@ pub(crate) fn arm(
     let arming = arm_lock(&ns);
     let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
     clear_stale(kube, &ns)?;
+    super::clock::mark("clear_stale");
     let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
     drop(_arming);
     // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
@@ -1302,6 +1585,7 @@ pub(crate) fn arm(
     let mut guard = Guard(Some(id.clone()));
     kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
+    super::clock::mark("sandbox_apply");
     let start = Instant::now();
     loop {
         let pod = kube
@@ -1330,10 +1614,12 @@ pub(crate) fn arm(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    super::clock::mark("pod_ready");
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
         reap(&id);
         return Err(e);
     }
+    super::clock::mark("deny_check");
     // The nested workspace node_modules the fill archived (B14): unpacked into the seat's tree
     // before its CLI starts. Ignored by git, so never written back.
     if s.deps.is_some() {
@@ -1365,6 +1651,9 @@ pub(crate) fn arm(
                 ),
             ));
         }
+    }
+    if s.deps.is_some() {
+        super::clock::mark("deps_unpack");
     }
     guard.0 = None;
     let mut wrapper = kube.head(Some(&ns));
@@ -2505,6 +2794,7 @@ pub(crate) fn drop_scope(run_id: &str) {
             set.retain(|k| !k.starts_with(&prefix));
         }
     }
+
     let r = kube.call(
         Some(&ns),
         &[
@@ -2569,14 +2859,4 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         settled: Mutex::new(false),
         deps: false,
     })
-}
-
-/// A replica entry kind for the tests' fixtures.
-#[cfg(test)]
-pub(crate) fn file(path: &str, data: &[u8]) -> Entry {
-    Entry {
-        kind: sync::Kind::File,
-        path: path.into(),
-        data: data.to_vec(),
-    }
 }

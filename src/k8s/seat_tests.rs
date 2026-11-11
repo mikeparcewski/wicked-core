@@ -2646,3 +2646,139 @@ fn k8s_a_deps_seat_writes_its_tool_caches_over_the_read_only_claim() {
     }
     assert!(render::NM_WRITABLE.contains(&".vite-temp"));
 }
+
+/// k8s-final arm timing: a plain root's host read is reused while its host signature holds,
+/// and a change on the host (content, a new file) is always read again.
+#[test]
+fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
+    let base = std::env::temp_dir().join(format!("wicked-rc-{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir_all(base.join("skills/a")).unwrap();
+    let base = base.canonicalize().unwrap();
+    struct Rm(PathBuf);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _rm = Rm(base.clone());
+    let skills = base.join("skills");
+    std::fs::write(skills.join("a/SKILL.md"), "one").unwrap();
+    let r = PlanRoot {
+        host: skills.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: false,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let body = |r: &PlanRoot| {
+        let (b, _, _, _) = seat::copy_in_stream(
+            None,
+            &base,
+            std::slice::from_ref(r),
+            false,
+            &Default::default(),
+        )
+        .unwrap();
+        let d = sync::decode(&mut b.as_slice(), sync::MAX_STREAM).unwrap();
+        d.into_iter()
+            .flat_map(|root| root.entries)
+            .map(|e| (e.path, String::from_utf8(e.data).unwrap()))
+            .collect::<Vec<_>>()
+    };
+    let reads = || seat::HOST_READS.with(|c| c.get());
+    let first = body(&r);
+    assert_eq!(first, vec![("a/SKILL.md".to_string(), "one".to_string())]);
+    let n = reads();
+    assert_eq!(body(&r), first, "a cached read differs from the host");
+    assert_eq!(reads(), n, "an unchanged root was read from the host again");
+    // Another skip list is another signature: read again.
+    let skipping = PlanRoot {
+        skip: vec!["zz".into()],
+        ..r.clone()
+    };
+    body(&skipping);
+    assert_eq!(reads(), n + 1);
+    // A directory moved out and back is read again (codex r2 #1).
+    std::fs::rename(skills.join("a"), base.join("a-away")).unwrap();
+    std::fs::rename(base.join("a-away"), skills.join("a")).unwrap();
+    body(&r);
+    assert_eq!(reads(), n + 2, "a moved directory kept the cached read");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(skills.join("a/SKILL.md"), "two").unwrap();
+    std::fs::write(skills.join("b.md"), "b").unwrap();
+    let mut now = body(&r);
+    now.sort();
+    assert_eq!(
+        now,
+        vec![
+            ("a/SKILL.md".to_string(), "two".to_string()),
+            ("b.md".to_string(), "b".to_string())
+        ]
+    );
+}
+
+/// k8s-final arm timing: the replica's rebuilt `.git` is reused for the same commit, and a new
+/// commit (or another mask) rebuilds it.
+#[cfg(unix)]
+#[test]
+fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
+    let t = tmp("git-cache");
+    git_in(&t, &["init", "-q", "-b", "main"]);
+    std::fs::write(t.join("a.txt"), "a").unwrap();
+    git_in(&t, &["add", "a.txt"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    let tree = PlanRoot {
+        host: t.clone(),
+        mode: Mode::Tree,
+        skip: vec![".git".into()],
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+    };
+    let git_of = |r: &PlanRoot| {
+        let (b, _, base, _) =
+            seat::copy_in_stream(None, &t, std::slice::from_ref(r), true, &Default::default())
+                .unwrap();
+        let d = sync::decode(&mut b.as_slice(), sync::MAX_STREAM).unwrap();
+        let g = d.into_iter().find(|x| x.mode == Mode::Git).unwrap();
+        (base.unwrap(), g.entries)
+    };
+    let builds = || seat::GIT_BUILDS.with(|c| c.get());
+    let (base1, g1) = git_of(&tree);
+    let n = builds();
+    let (base2, g2) = git_of(&tree);
+    assert_eq!((&base1, &g1), (&base2, &g2));
+    assert_eq!(builds(), n, "the same commit rebuilt its .git");
+    std::fs::write(t.join("b.txt"), "b").unwrap();
+    git_in(&t, &["add", "b.txt"]);
+    git_in(&t, &["commit", "-q", "-m", "b"]);
+    let (base3, g3) = git_of(&tree);
+    assert_ne!(base3, base1, "a new commit read the cached .git");
+    assert_ne!(g3, g1);
+    // A mask makes a different index (skip-worktree): never the unmasked one.
+    let masked = PlanRoot {
+        masks: vec!["b.txt".into()],
+        ..tree.clone()
+    };
+    let (_, g4) = git_of(&masked);
+    assert_ne!(g4, g3);
+    // A shallow host repository is never cached (codex r1 #6): each arm rebuilds.
+    let shallow = tmp("git-cache-shallow");
+    let src = format!("file://{}", t.display());
+    git_in(&shallow, &["clone", "-q", "--depth", "1", &src, "s"]);
+    let s = shallow.join("s");
+    let st = PlanRoot {
+        host: s.clone(),
+        ..tree.clone()
+    };
+    let shallow_git = |r: &PlanRoot| {
+        seat::copy_in_stream(None, &s, std::slice::from_ref(r), true, &Default::default()).unwrap()
+    };
+    shallow_git(&st);
+    let m = builds();
+    shallow_git(&st);
+    assert_eq!(builds(), m + 1, "a shallow host's .git was cached");
+    let _ = std::fs::remove_dir_all(&shallow);
+    let _ = std::fs::remove_dir_all(&t);
+}

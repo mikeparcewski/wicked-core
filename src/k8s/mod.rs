@@ -22,10 +22,12 @@
 //! The parity contract this module is held to is `PARITY.md` of the k8s-swap lane, mirrored in
 //! the module tests (each test names its row).
 
-// `cluster install`/`uninstall`, the boot sweep and the token renewal are wired to the CLI and the
-// daemon's boot in B-5 of the stacked k8s-swap series (D7 train); the allowance goes with it.
-#![allow(dead_code)]
+// Windows hosts run no seat, floor or login pod (the runners are Unix-only): the transport is
+// compiled there but not reached.
+#![cfg_attr(not(unix), allow(dead_code))]
 
+pub(crate) mod cli;
+pub(crate) mod clock;
 pub(crate) mod cluster;
 pub(crate) mod floor;
 pub(crate) mod gw;
@@ -307,6 +309,102 @@ pub(crate) fn kube_for(home: &Path) -> Result<Kube, (FloorUnarmed, String)> {
         crate::validator::find_on_path,
     )
 }
+
+/// Each run's arm epoch and its lifecycle lock (codex b5 #9/#10): every arm of the run takes the
+/// lock (so it waits out a namespace deletion in flight) and bumps the epoch, and a release
+/// scheduled at an earlier epoch is void, so a run resumed after it ended never loses its new
+/// namespace. The epoch is read without the lock (codex r2): the actor never waits behind a
+/// deletion.
+type Life = std::sync::Arc<(std::sync::Mutex<()>, std::sync::atomic::AtomicU64)>;
+static LIFE: std::sync::Mutex<Option<std::collections::HashMap<String, Life>>> =
+    std::sync::Mutex::new(None);
+
+fn life(run_id: &str) -> Life {
+    let mut g = LIFE.lock().unwrap_or_else(|p| p.into_inner());
+    g.get_or_insert_with(std::collections::HashMap::new)
+        .entry(run_id.to_string())
+        .or_default()
+        .clone()
+}
+
+/// The run's arm epoch now (0 = never armed by this process); never blocks.
+pub(crate) fn run_epoch(run_id: &str) -> u64 {
+    life(run_id).1.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The run arms (a seat or a floor is about to use its namespace): waits out a release in
+/// flight, then voids every release scheduled before now.
+pub(crate) fn arming(run_id: &str) {
+    let l = life(run_id);
+    let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A run reached a terminal state (B-5; called off the actor thread with every terminal
+/// transition, `epoch` read when it did): its namespace goes, with its pods, replica and per-run
+/// cache claims, and is waited out, unless the run armed again since. A resumed run gets a new
+/// one. Nothing happens when the daemon has no cluster configured.
+pub(crate) fn release_run(run_id: &str, epoch: u64) {
+    let l = life(run_id);
+    let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {
+        return;
+    }
+    let Some(home) = engine_home() else {
+        return;
+    };
+    let Ok(kube) = kube_for(&home) else {
+        return;
+    };
+    if !kube.kubeconfig.as_ref().is_some_and(|k| k.is_file()) && std::env::var(CONTEXT_ENV).is_err()
+    {
+        return;
+    }
+    if let Err(e) = cluster::delete_run(&kube, run_id, true) {
+        eprintln!("wicked-core: run {run_id}'s namespace was not deleted: {e}");
+    }
+    crate::checks_container::forget_namespace(&run_namespace_name(&kube.owner, run_id));
+    drop(g);
+}
+
+/// The daemon's boot sweep (B-5), off the actor thread: the namespaces of runs that are not
+/// `live` (terminal, or unknown to the store) go; a live run keeps its namespace and loses only
+/// the pods an earlier engine left. A namespace created after this boot is never touched. The
+/// daemon's shared session namespace is live.
+pub(crate) fn boot_sweep(live: std::collections::HashSet<String>) {
+    let started = rfc3339(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    );
+    let _ = std::thread::Builder::new()
+        .name("wicked-k8s-boot-sweep".into())
+        .spawn(move || {
+            let Some(home) = engine_home() else {
+                return;
+            };
+            let Ok(kube) = kube_for(&home) else {
+                return;
+            };
+            if cluster::probe_cached(&kube).is_err() {
+                return;
+            }
+            // A run that armed in this process since boot is live too (codex b5 #10).
+            let is_live =
+                |run: &str| run == SESSIONS_RUN || live.contains(run) || run_epoch(run) > 0;
+            match cluster::sweep(&kube, &is_live, Some(&started)) {
+                Ok(done) if !done.is_empty() => {
+                    eprintln!("wicked-core: the boot sweep removed {}", done.join(", "))
+                }
+                Ok(_) => {}
+                Err(e) => eprintln!("wicked-core: the cluster boot sweep did not finish: {e}"),
+            }
+        });
+}
+
+/// The run id of the daemon's shared one-shot session namespace.
+pub(crate) const SESSIONS_RUN: &str = "sessions";
 
 /// One kubectl call's result.
 #[derive(Debug)]

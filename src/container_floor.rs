@@ -3397,6 +3397,7 @@ pub(crate) fn arm_noting(
     }
     let mut spec =
         crate::worker_sandbox::resolve_seat_floor(inp).map_err(|w| (w, String::new()))?;
+    crate::k8s::clock::mark("plan");
     // The directory holding the launch files is not writable inside a container: the gate
     // hook runs on the host, so the seat has nothing to write there (and nothing to plant).
     let pin_dirs: Vec<PathBuf> = spec
@@ -3425,6 +3426,7 @@ pub(crate) fn arm_noting(
         build_image(&rt, crate::checks_container::DOCKERFILE, &sync_image, &[])
             .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     }
+    crate::k8s::clock::mark("images");
     // A seat's only route out is the daemon's model gateway: an engine with no gateway dir (no
     // state home) runs only offline seats.
     if !offline_seats() && gateway_dir.is_none() {
@@ -3448,6 +3450,7 @@ pub(crate) fn arm_noting(
     let kube = crate::k8s::kube_for(&home)?;
     crate::k8s::cluster::probe_cached(&kube)?;
     crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image)?;
+    crate::k8s::clock::mark("cluster_probe");
     let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     add_read_roots(&mut mounts, read_roots);
     let mut argv = argv.to_vec();
@@ -3457,6 +3460,13 @@ pub(crate) fn arm_noting(
         add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     }
     cover_gateway_dir(&mut mounts, gateway_dir)
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
+    // way: never in a replica, and a seat-writable tree over it is refused.
+    // From the state home the cluster settings were read from (codex r2: an offline seat has
+    // no gateway dir, and is covered all the same).
+    let engine_k8s = Some(home.join("k8s"));
+    cover_gateway_dir(&mut mounts, engine_k8s.as_deref())
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
@@ -3485,12 +3495,14 @@ pub(crate) fn arm_noting(
     inspect_seat_image(&rt, &floor_id, &image)
         .and_then(|f| check_seat_image(&f, &dests))
         .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    crate::k8s::clock::mark("image_inspect");
     let online = gateway_dir.is_some() && !offline_seats();
     gateway_route_defined(cli, online).map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     let (env, files, lease, seat_args, copilot_account, gateway_ip) =
         match gateway_dir.filter(|_| online) {
             Some(dir) => {
                 let gw = crate::k8s::gw::ensure(&kube, dir)?;
+                crate::k8s::clock::mark("gateway_ensure");
                 // The broker's one refresher runs beside this daemon's gateway (a credential that
                 // expired between runs is renewed, by its own CLI, before the seat starts). Each
                 // pass finds the gateway again (a quarantine re-creates it).
@@ -3523,6 +3535,7 @@ pub(crate) fn arm_noting(
                         rw: false,
                     });
                 }
+                crate::k8s::clock::mark("sign_in");
                 let unit = format!(
                     "{run_id}#{ord}@{}",
                     &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -3559,6 +3572,7 @@ pub(crate) fn arm_noting(
                     since,
                 };
                 crate::k8s::gw::register_live(&gw, key.clone()).map_err(down)?;
+                crate::k8s::clock::mark("key_register");
                 (
                     env,
                     files,

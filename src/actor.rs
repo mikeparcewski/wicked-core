@@ -1127,6 +1127,15 @@ pub(crate) fn run(
             }
         }
     }
+    // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
+    // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
+    // skips it (liveness unknown).
+    match crate::domain::all_sessions(&store) {
+        Ok(sessions) => crate::k8s::boot_sweep(partition_sessions_for_reap(&sessions).0),
+        Err(e) => {
+            eprintln!("wicked-core: skipping the cluster boot sweep: cannot read sessions ({e})")
+        }
+    }
     // (DES-TEAMING-002 §8.8) A member turn's read-only view is removed when the turn ends; one an
     // engine crash mid-turn left behind goes here, once per process (only views past the age
     // threshold that no live turn holds, so another engine's live views on the same temp dir
@@ -9988,10 +9997,13 @@ fn sweep_expired_retained_worktrees(store: &dyn GraphStore) {
 fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
+    let epoch = crate::k8s::run_epoch(&rid);
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
-        remove_run_floor_cache(workdir.as_deref(), &rid);
-        if let Some(repo) = repo {
+        remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
+        // A run that armed again since it ended keeps its tree (codex r2): its live edits
+        // may sit in the replica only.
+        if let Some(repo) = repo.filter(|_| crate::k8s::run_epoch(&rid) == epoch) {
             crate::repo::clean_ignored_in_worktree(&repo.root_path, &rid);
         }
     });
@@ -10000,9 +10012,12 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
+    let epoch = crate::k8s::run_epoch(&rid);
     crate::repo::spawn_bound(move || {
-        remove_run_floor_cache(workdir.as_deref(), &rid);
-        if let Some(repo) = repo {
+        remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
+        // A run that armed again since it ended keeps its tree (codex r2): its live edits
+        // may sit in the replica only.
+        if let Some(repo) = repo.filter(|_| crate::k8s::run_epoch(&rid) == epoch) {
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
         }
     });
@@ -10020,11 +10035,11 @@ fn run_repo(
 /// [`remove_run_floor_cache`] off the actor thread, for a terminal transition that does not go
 /// through [`reap_terminal_worktree`] (a cancel: its worktree reap is repository-bound).
 fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
-    let Some(workdir) = session.workdir.clone() else {
-        return;
-    };
+    // A run with no workdir can still have a namespace (codex b5 #12): it goes regardless.
+    let workdir = session.workdir.clone();
     let rid = session.id.clone();
-    crate::repo::spawn_bound(move || remove_run_floor_cache(Some(&workdir), &rid));
+    let epoch = crate::k8s::run_epoch(&rid);
+    crate::repo::spawn_bound(move || remove_run_floor_cache(workdir.as_deref(), &rid, epoch));
 }
 
 /// (core#1122) A terminal run's repo-checks floor build cache goes NOW, keyed by the tree its
@@ -10032,14 +10047,18 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
 /// repository (or one since removed), which the worktree reap never reaches. Only this run's own
 /// leaf: the key is the run id, so no other run's cache is touched. Best-effort; a floor still
 /// holding the leaf leaves it marked orphaned, removed when that floor ends.
-fn remove_run_floor_cache(workdir: Option<&str>, run_id: &str) {
+fn remove_run_floor_cache(workdir: Option<&str>, run_id: &str, epoch: u64) {
     if let Some(wd) = workdir {
-        // (review r3 on #1431) Never the scratch of a tree another daemon now holds at this path.
-        if !crate::repo::may_touch_tree(std::path::Path::new(wd)) {
-            return;
+        // (review r3 on #1431) Never the scratch of a tree another daemon now holds at this path
+        // (its namespace below is this daemon's own, by owner label, and goes regardless).
+        if crate::repo::may_touch_tree(std::path::Path::new(wd)) {
+            crate::repo_checks::remove_check_scratch(std::path::Path::new(wd), run_id);
         }
-        crate::repo_checks::remove_check_scratch(std::path::Path::new(wd), run_id);
     }
+    // k8s-swap B-5: the run's namespace (pods, replica, per-run cache claims) goes with it,
+    // unless the run armed again since it ended (`epoch`, read on the actor thread at the
+    // terminal transition; codex b5 #9).
+    crate::k8s::release_run(run_id, epoch);
 }
 
 /// core#290 — the other half of [`reap_terminal_worktree`]: give a resuming run its worktree BACK.
