@@ -4242,9 +4242,6 @@ fn tree_bytes(dir: &Path) -> u64 {
 
 /// Remove a leaf directory (a link at its path is removed, never followed).
 fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
-    // (DES-FLOOR-CONTAINER) The leaf's cargo target volumes go with it, whichever path removes it
-    // (a run's end, a guarded checkout dropped, the cap pass, an orphan retired).
-    crate::checks_container::remove_leaf_volumes(leaf);
     match std::fs::symlink_metadata(leaf) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -5013,13 +5010,12 @@ fn run_floor_inner(
         let tree = journal.map(|j| j.tree.as_str()).filter(|t| !t.is_empty());
         let prepared = check_cache_root()
             .map_err(|e| format!("the check cache: {e}"))
-            .and_then(|cache| {
+            .and_then(|_cache| {
                 crate::checks_container::ChecksFloor::prepare(
                     worktree,
                     ctx,
                     tree,
                     scratch.root(),
-                    &cache,
                     &detected,
                 )
                 .map_err(|e| e.0)

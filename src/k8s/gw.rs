@@ -516,7 +516,7 @@ fn probe_routes(gw: &Gw, ip: &str) {
 }
 
 /// The daemon's gateway, started or taken over, serving its current config (the cluster half
-/// of `seat_gateway::ensure_gateway`): keys an earlier engine left are confirmed refused before
+/// of gateway startup): keys an earlier engine left are confirmed refused before
 /// any new unit runs.
 pub(crate) fn ensure(kube: &Kube, dir: &Path) -> Result<Gw, (FloorUnarmed, String)> {
     let gwerr = |e: String| (FloorUnarmed::GatewayUnavailable, e);

@@ -20,7 +20,7 @@ open to check a claim.
 - **`containers/` holds the images the engine builds itself** (from the file alone, no
   build context, tagged by a hash of its inputs): `checks/node22-rust.Dockerfile` (the
   repo-checks floor, `src/checks_container.rs`), `seats/seat.Dockerfile` (one seat image
-  per CLI), `seats/netns.Dockerfile` (each seat's network sidecar) and `floor.Dockerfile`
+  per CLI), and `floor.Dockerfile`
   (the trusted launcher mounted into every seat, `src/container_floor.rs`).
 - **`crates/wicked-core-ts` is workspace-EXCLUDED on purpose** (its own
   `[profile.release]` lto/strip shapes the shipped `.node` artifact; folding it in
@@ -29,6 +29,14 @@ open to check a claim.
   `cd crates/wicked-core-ts && cargo test`
 - Wire-shape gotcha for core-ts: a Rust `Option` without `skip_serializing_if`
   serializes as `null`, never absent — TS `=== undefined` guards are dead code.
+
+## Local runner
+
+Seats and the checks floor run as pods on a local Kubernetes cluster (Rancher Desktop or
+Docker Desktop Kubernetes), installed once with `wicked-core cluster install --admin-context
+<ctx> --home <state home>`. The container CLI (`docker`, `nerdctl` or `podman`) only builds
+images into the store the cluster shares (`imagePullPolicy: Never`). Use
+`wicked-core seat-image build|status` to build or report images.
 
 ## Conventions
 

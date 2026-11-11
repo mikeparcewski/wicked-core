@@ -39,9 +39,6 @@
 //! (a second pass skips); the daemon starts one background loop per gateway dir.
 
 // Native Windows has no container floor: only the refresher's pure half compiles there.
-// k8s-swap B-2..B-5 (D7 train): the Docker transport this module still carries is unused once
-// seats run as pods; B-6 deletes it with its Docker-only tests. Until then it is allowed dead.
-#![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
 
@@ -684,6 +681,7 @@ fn refusal(status: u16, body: &[u8]) -> String {
 #[cfg(unix)]
 mod live {
     use super::*;
+    #[cfg(test)]
     use crate::container_floor::{output_within, Runtime};
     use crate::seat_login::BrokerIo;
     use std::time::{Duration, Instant};
@@ -726,6 +724,7 @@ mod live {
 
     /// Make `request` from a short-lived hardened curl container on `network`; the answer comes
     /// back on stdout. Errors name the status only, never the answer.
+    #[cfg(test)]
     pub(crate) fn send(
         rt: &Runtime,
         dir: &Path,
@@ -1305,12 +1304,10 @@ mod live {
     }
 }
 
-#[cfg(all(unix, test))]
-pub(crate) use live::renew_on_host;
 #[cfg(unix)]
-pub(crate) use live::{
-    answer, refresh, request_argv, resolve_copilot, send, start, ACCOUNT_TIMEOUT,
-};
+pub(crate) use live::{answer, refresh, request_argv, resolve_copilot, start, ACCOUNT_TIMEOUT};
+#[cfg(all(unix, test))]
+pub(crate) use live::{renew_on_host, send};
 
 /// (tests) FAKE renewing CLIs: shell stubs of codex, pi and opencode that renew the way the real
 /// ones do (in their own store, in the throwaway home they are run in) by rewriting each `from`
@@ -1824,59 +1821,6 @@ mod tests {
             }
             std::fs::remove_dir_all(dir).unwrap();
         }
-    }
-
-    /// The copilot account reads ride attached stdio with no runtime logging; a refused read
-    /// names its status and error code, never the body's detail.
-    #[cfg(unix)]
-    #[test]
-    fn account_reads_use_attached_stdio_without_runtime_logging() {
-        let dir = std::env::temp_dir().join(format!("c4-post-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let runtime = dir.join("runtime");
-        crate::test_env::install_stub(
-            &runtime,
-            r#"#!/bin/sh
-base=${0%/*}
-if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
-[ "$1" = run ] || exit 1
-printf '%s\n' "$*" > "$base/argv"
-cat > "$base/request"
-case "$*" in
-  *refused*) printf '{"message":"FAKE-detail","error":{"type":"rate_limit_error"}}\n429' ;;
-  *) printf '{"endpoints":{"api":"https://FAKE.invalid"}}\n200' ;;
-esac
-"#,
-        );
-        let rt = crate::container_floor::Runtime::answering(runtime);
-        let _lock = mutation_lock(&dir).unwrap();
-        let read = |url: &str| {
-            live::send(
-                &rt,
-                &dir,
-                "copilot",
-                "FAKE-ext",
-                &Request {
-                    url: url.into(),
-                    token: "FAKE-gho-R1".into(),
-                    headers: crate::copilot_account::USER_HEADERS.to_vec(),
-                },
-            )
-        };
-        let answer = read("https://FAKE.invalid/copilot_internal/user").unwrap();
-        assert_eq!(answer["endpoints"]["api"], "https://FAKE.invalid");
-        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
-        assert!(argv.contains("--log-driver none"));
-        assert!(!argv.contains("FAKE-gho-R1"));
-        assert!(!argv.contains(" -A "), "{argv}");
-        let refused = read("https://FAKE.invalid/refused").unwrap_err();
-        assert_eq!(refused, "the endpoint answered HTTP 429 (rate_limit_error)");
-        assert_eq!(
-            std::fs::read_to_string(dir.join("request")).unwrap(),
-            "authorization: Bearer FAKE-gho-R1\n"
-        );
-        drop(_lock);
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

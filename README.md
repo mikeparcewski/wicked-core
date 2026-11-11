@@ -139,15 +139,15 @@ the floor fails closed and the gate denies (core#416).
 
 | Host | Where the repository's checks run | The verify floor | Governed runs |
 |---|---|---|---|
-| **macOS** | a fresh Linux container per floor side when a container runtime answers (`docker`, `podman` or `nerdctl`) and the floor can be prepared there; else `sandbox-exec` (base system), with the reason | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container`, or `macos-sandbox` with its `fallbackReason`) | primary |
+| **macOS** | a fresh Linux pod per floor side on the local Kubernetes cluster when the floor can be prepared there; else `sandbox-exec` (base system), with the reason | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container`, or `macos-sandbox` with its `fallbackReason`) | primary |
 | **Linux** | `bwrap` — `apt install bubblewrap` / `dnf install bubblewrap` | runs the checks with `bwrap`; **without it, denies** | supported |
 | **Windows** (incl. Git Bash / WSL host side) | none | **denies every floor phase, by construction** | not supported |
 
-`WICKED_FLOOR_RUNNER` picks the floor: `auto` (the default) tries the container on macOS only,
+`WICKED_FLOOR_RUNNER` picks the floor: `auto` (the default) tries pods on macOS only,
 `container` asks for it on any host and refuses the floor when it cannot start, `sandbox` keeps the
-host floor. The container has no network, a read-only root, every capability dropped and a memory
+host floor. The checks pod has no network, a read-only root, every capability dropped and a memory
 cap (`WICKED_FLOOR_MEMORY`, default `6g`); the tree is copied in, and a check that rewrites a
-tracked file stands for nothing. A check killed for memory, or a container that stops answering,
+tracked file stands for nothing. A check killed for memory, or a pod that stops answering,
 is "could not run", never a failure of the change. The image is `containers/checks/node22-rust.Dockerfile`,
 built on first use. `wicked-core floor run --repo <dir> --base <commit> [--full]` runs one floor and
 prints its report (which floor ran is its `runner` field). The container cannot run everything: an
@@ -162,14 +162,13 @@ containment evidence, and every report, gate note and `repoChecksEvaluated` even
 (`sandbox_level: "none"`). A real Windows boundary (AppContainer / a restricted-token job object,
 or the checks under WSL2 `bwrap`) is not designed and not shipped.
 
-**Seats run in containers too.** The `wicked-core` CLI (and crew's daemon) run governed seats in a
-hardened container per seat by default (`WICKED_SEAT_FLOOR=container`): one image per CLI built
-from `containers/seats/seat.Dockerfile`, the engine's own launcher mounted from
-`containers/floor.Dockerfile`, a read-only root, and a network whose only way out is the model
-gateway. A unit whose container cannot start is refused, never run on the host;
-`WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. `wicked-core seat-image
-build|hold|status` builds the images, holds them against a runtime's image cleanup (the `docker`
-CLI only), and reports them.
+**Seats run as Kubernetes pods too.** Governed seats and the checks floor run on a local
+Kubernetes cluster (Rancher Desktop or Docker Desktop Kubernetes), installed once with
+`wicked-core cluster install --admin-context <ctx> --home <state home>`. Seats use the trusted
+floor launcher, a read-only root and the model gateway. A unit whose pod cannot start is refused;
+`WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. The container CLI (`docker`,
+`nerdctl` or `podman`) only builds images into the store the cluster shares
+(`imagePullPolicy: Never`). `wicked-core seat-image build|status` builds or reports the images.
 
 Two smaller consequences of the same rule, worth knowing before you debug them:
 

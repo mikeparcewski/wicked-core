@@ -199,15 +199,12 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "seat-image",
-        "wicked-core seat-image build [<cli>...|all] | seat-image hold [<cli>...|all] | \
+        "wicked-core seat-image build [<cli>...|all] | \
          seat-image status [--json] [<cli>...]\n  \
-         Build, hold or report the container images governed seats run in under the container \
-         floor (WICKED_SEAT_FLOOR=container). `hold` keeps each present image with a stopped holder \
-         container so a runtime's image cleanup (a kubelet's image GC) cannot delete it; the engine \
-         also holds them on every dispatch (docker CLI only). `status` also reads the runtime \
-         VM's disk; `--json` prints it all as one object. A missing \
-         WICKED_SEAT_BASE_IMAGE is rebuilt from WICKED_SEAT_BASE_DOCKERFILE when set. Needs a \
-         container runtime (docker, podman, nerdctl).",
+         Build or report the images governed seats use in Kubernetes pods. The container CLI \
+         (docker, podman, nerdctl) builds images into the store shared with the local cluster \
+         (imagePullPolicy: Never). A missing WICKED_SEAT_BASE_IMAGE is rebuilt from \
+         WICKED_SEAT_BASE_DOCKERFILE when set; --json prints status as one object.",
     ),
     (
         "seat-login",
