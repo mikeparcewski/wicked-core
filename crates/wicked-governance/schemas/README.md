@@ -19,7 +19,7 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
 
 - **Bundle version** (`VERSION` file): bumps when ANY file in the bundle changes
   (additive optional field = patch; new required field = minor; invariant change
-  = major). Currently `1.3.0` (1.0.0→1.1.0 added `conformance-rules.schema.json`
+  = major). Currently `1.3.1` (1.0.0→1.1.0 added `conformance-rules.schema.json`
   to the bundle — archive commit 75735b9; 1.2.0→1.2.1 is the additive, optional
   DC-S1 project-rule fields of conformance-rules 1.2.0; 1.2.1→1.2.2 is the additive
   `operator-words` rule source kind of conformance-rules 1.3.0, core#827; 1.2.2→1.2.3 is
@@ -28,7 +28,10 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
   1.2.3→1.3.0 replaces that optional `metadata.coverage` object's fields with the real-requirements
   label `real_pct`/`min_pct`/`behavior_bearing`/`real`/`placeholders`/`unmapped`/`not_product`
   and adds the coverage report's optional `not_product` and `placeholder_nodes`, core#1233; the
-  engine relabels every graph it reads, so no persisted label is served in the old shape).
+  engine relabels every graph it reads, so no persisted label is served in the old shape);
+  1.3.0→1.3.1 adds domain-model 1.1.0's optional `requirement.business_domain` and
+  `metadata.business_domains` (the repository's business domains, proposed from code evidence;
+  requirement keys unchanged).
 - **Per-schema contract version** (the `$id` version segment and each schema's
   `metadata.schema_version` const): the version a *document* carries and a
   consumer validates against. Independent of the bundle semver — the schemas say

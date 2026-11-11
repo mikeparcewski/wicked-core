@@ -2452,6 +2452,7 @@ mod tests {
                 migration_mode: "functional".into(),
                 source: Some("estate-graph".into()),
                 coverage: None,
+                business_domains: Vec::new(),
             },
             domains: Default::default(),
         }
@@ -2781,6 +2782,7 @@ mod tests {
                     migration_mode: "functional".into(),
                     source: Some("estate-graph".into()),
                     coverage: None,
+                    business_domains: Vec::new(),
                 },
                 domains: Default::default(),
             };
@@ -2824,6 +2826,7 @@ mod tests {
                     migration_mode: "functional".into(),
                     source: Some("estate-graph".into()),
                     coverage: Some(built_at),
+                    business_domains: Vec::new(),
                 },
                 domains: Default::default(),
             };

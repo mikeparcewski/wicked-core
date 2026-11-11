@@ -90,8 +90,16 @@ pub const RULES_REVIEW_INSTRUCTIONS: &str =
 the current page, hub-first, of product-code units not yet resolved to a requirement (unmapped \
 first, then placeholders an earlier page left empty or under the confidence threshold). \
 Completeness is not your question. The host measures the share of real requirements after each \
-page and maps the next page until the target is reached; grouping by domain happens in the \
-domain-graph step. Judge each stated rule: it names a unit of the worklist, it states what the \
+page and maps the next page until the target is reached; the requirements graph is built in the \
+domain-graph step. When the rules file carries `business_domains` (the repository's business \
+domains, proposed on its first page), judge each domain too: it names an area by what the code \
+does for its users, never a directory, package or module name; its purpose is one line; and its \
+evidence cites real code (entry points, routes, CLI verbs, public-API nouns) that shows that \
+area. Judge each rule's `domain` pick, and each of the file's `assignments`, as part of the \
+work: the area the rule serves, not its file's directory. A domain the code does not show, a \
+catalog of directory names, or picks that mostly follow the directory instead of the rule are \
+problems you list as `ITEM n: FAIL — business_domains — <why>`. Judge each stated rule: it \
+names a unit of the worklist, it states what the \
 business requires rather than describing the code, it is grounded in that unit's source, and its \
 confidence is not inflated. An empty statement is right where the source supports no rule: pure \
 plumbing such as a re-export, a getter or a pass-through wrapper. Most product code does encode \

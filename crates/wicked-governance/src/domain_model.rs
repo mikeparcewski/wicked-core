@@ -40,6 +40,38 @@ pub struct Metadata {
     /// "82% of behaviours mapped".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub coverage: Option<ModelCoverage>,
+    /// The repository's BUSINESS domains the requirements were assigned to (domain-model 1.1.0,
+    /// bundle 1.3.1, optional; reqgraph Fix B): what the code does for its users, as the page's
+    /// extractor proposed them from code evidence and the host checked them. Each carries the
+    /// package directories its requirements live in: the mapping from the requirement keys
+    /// (`<dir>::REQ-NNN`, unchanged) to the business area. Empty when nothing was assigned.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub business_domains: Vec<BusinessDomain>,
+}
+
+/// One business domain of the repository (`metadata.business_domains[]`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BusinessDomain {
+    /// A lowercase slug, stable across builds (the catalog is never replaced once stored).
+    pub id: String,
+    /// The area in words a product owner recognises ("Credential management").
+    pub name: String,
+    /// One line: what the area does for the product's users.
+    pub purpose: String,
+    /// Requirements in this build assigned to it.
+    pub requirements: u64,
+    /// The package directories (the requirement keys' domain part) those requirements live in,
+    /// with how many each: the key-to-area mapping.
+    pub directories: std::collections::BTreeMap<String, u64>,
+}
+
+/// A requirement's business domain (`requirement.business_domain`, domain-model 1.1.0, bundle
+/// 1.3.1, optional): the catalog entry its rule picked, with the pick's confidence.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct BusinessDomainRef {
+    pub id: String,
+    pub name: String,
+    pub confidence: f64,
 }
 
 /// The coverage a domain model was built at (`metadata.coverage`, domain-model 1.1.0, schema
@@ -114,6 +146,11 @@ pub struct Requirement {
     /// `validated` with its count, or `unconfirmed` with why. See [`crate::corroboration`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub corroboration: Option<crate::corroboration::Corroboration>,
+    /// The business domain the requirement serves (domain-model 1.1.0, bundle 1.3.1, optional):
+    /// read from the code node's `business_domain` annotation. Its key keeps the package
+    /// directory, so links and overrides keyed `<dir>::REQ-NNN` hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub business_domain: Option<BusinessDomainRef>,
     /// The estate SymbolId of the code this requirement covers, when the builder knows it. Not part
     /// of the document (the schema is closed); the store carries it as the requirement's
     /// `SatisfiedBy` edge and its `code_symbol` metadata. `legacy_components` names code by
@@ -793,8 +830,9 @@ fn recompute_observing(
     // in release; the three buckets partition the behavior-bearing set by construction.
     debug_assert_eq!(resolved + risk_flagged + unaccounted, behavior_bearing);
 
-    // Surface any unrecognized Other tag once (release-safe — eprintln!, not debug_assert!).
-    for tag in &unknown_other {
+    // Surface any unrecognized Other tag once (release-safe — eprintln!, not debug_assert!). Core's
+    // own bookkeeping kinds are known structural nodes, never a kind to consider (core#1376).
+    for tag in kinds_to_warn_about(&unknown_other) {
         eprintln!(
             "wicked-governance: coverage classification WARN — unrecognized NodeKind::Other(\"{tag}\") \
              treated as STRUCTURAL (not in the behavior-kind set); if it is a behavior kind, add it to \
@@ -1352,6 +1390,10 @@ pub fn build_domain_model_with(
     let idx = BehaviorIndex::build(store, &nodes)?;
     let mut unknown_other = std::collections::BTreeSet::new();
     let mut slots: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    // The business domains the requirements were assigned to (reqgraph Fix B), by id: each one's
+    // name and purpose as the first requirement in SymbolId order carries them.
+    let mut business: std::collections::BTreeMap<String, BusinessDomain> =
+        std::collections::BTreeMap::new();
 
     for node in &nodes {
         // Not product behaviour (a test, data, manifest or document file): no requirement, even
@@ -1480,7 +1522,28 @@ pub fn build_domain_model_with(
             .map(|a| a.author.trim())
             .collect::<std::collections::BTreeSet<_>>()
             .len() as u32;
+        // The business domain its rule picked (an advisory attribute: an annotation that does
+        // not parse is ignored, never repaired into a domain). 1.1.0 only (1.0.0 is closed).
+        let business_domain = if rich {
+            business_domain_of(&annotations)
+        } else {
+            None
+        };
+        if let Some((bd, purpose)) = &business_domain {
+            let entry = business
+                .entry(bd.id.clone())
+                .or_insert_with(|| BusinessDomain {
+                    id: bd.id.clone(),
+                    name: bd.name.clone(),
+                    purpose: purpose.clone(),
+                    requirements: 0,
+                    directories: std::collections::BTreeMap::new(),
+                });
+            entry.requirements += 1;
+            *entry.directories.entry(package.clone()).or_insert(0) += 1;
+        }
         let requirement = Requirement {
+            business_domain: business_domain.map(|(bd, _)| bd),
             corroboration: corroboration
                 .as_ref()
                 .map(|c| c.assess(node, extractor_sources)),
@@ -1506,9 +1569,60 @@ pub fn build_domain_model_with(
             migration_mode: "functional".to_string(),
             source: Some("estate-graph".to_string()),
             coverage: rich.then(|| model_coverage(&recomputed, min_pct)),
+            business_domains: business.into_values().collect(),
         },
         domains,
     })
+}
+
+/// The estate annotation type a code node's business domain rides on (garden's
+/// `business_domains.ANN_TYPE`): value = compact JSON `{"id", "name", "purpose"}`, confidence =
+/// the pick's. Not an accounting type: it never makes a node mapped.
+pub const BUSINESS_DOMAIN_ANN: &str = "business_domain";
+
+/// A node's business domain from its `business_domain` annotations: the one with the highest
+/// confidence (ties: the smaller id), with its purpose. None when no annotation parses: an id
+/// that is not a lowercase slug of 2..=48, an empty or over-long name or purpose, or a
+/// confidence outside [0,1]. Nothing is invented or repaired.
+fn business_domain_of(
+    annotations: &[wicked_estate_core::Annotation],
+) -> Option<(BusinessDomainRef, String)> {
+    fn slug(id: &str) -> bool {
+        (2..=48).contains(&id.len())
+            && id.starts_with(|c: char| c.is_ascii_lowercase())
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+    }
+    let text = |v: &serde_json::Value, max: usize| {
+        v.as_str()
+            .map(str::trim)
+            .filter(|t| !t.is_empty() && t.chars().count() <= max && !t.contains(char::is_control))
+            .map(str::to_string)
+    };
+    annotations
+        .iter()
+        .filter(|a| a.r#type == BUSINESS_DOMAIN_ANN)
+        .filter(|a| a.confidence.is_finite() && (0.0..=1.0).contains(&a.confidence))
+        .filter_map(|a| {
+            let v: serde_json::Value = serde_json::from_str(&a.value).ok()?;
+            let id = v.get("id")?.as_str().filter(|id| slug(id))?.to_string();
+            let name = text(v.get("name")?, 60)?;
+            let purpose = text(v.get("purpose")?, 200)?;
+            Some((
+                BusinessDomainRef {
+                    id,
+                    name,
+                    confidence: a.confidence,
+                },
+                purpose,
+            ))
+        })
+        .min_by(|(a, _), (b, _)| {
+            b.confidence
+                .total_cmp(&a.confidence)
+                .then_with(|| a.id.cmp(&b.id))
+        })
 }
 
 /// Persist an assembled [`DomainModel`] into the estate graph store as nodes + edges.
@@ -1917,6 +2031,24 @@ fn read_build_record(store: &dyn GraphRead) -> anyhow::Result<BuildRecord> {
 /// (`requirements-graph/target`): set when the operator lowers the target for this repository at a
 /// generation's budget ask, so every reader of this store — `wicked-core coverage`, `domain-graph`
 /// and the requirements read — holds the graph to it before the daemon-wide minimum.
+/// The `NodeKind::Other` tags core writes into a store itself: the repository's coverage target
+/// ([`set_repo_min_coverage_pct`]), the build record and the persisted graph's domain and
+/// requirement nodes ([`persist_domain_model`]). Structural, and known, so the coverage
+/// classifier's unknown-kind warning skips them (core#1376).
+const CORE_SYNTHETIC_KINDS: [&str; 4] = [
+    "requirements_target",
+    "requirements_graph",
+    "domain",
+    "requirement",
+];
+/// The unrecognized `Other` tags worth a warning: all but [`CORE_SYNTHETIC_KINDS`].
+fn kinds_to_warn_about(
+    unknown: &std::collections::BTreeSet<String>,
+) -> impl Iterator<Item = &String> {
+    unknown
+        .iter()
+        .filter(|t| !CORE_SYNTHETIC_KINDS.contains(&t.as_str()))
+}
 const TARGET_ID: &str = "target";
 const TARGET_KEY: &str = "min_coverage_pct";
 
@@ -2597,6 +2729,7 @@ mod tests {
                 migration_mode: "functional".to_string(),
                 source: None,
                 coverage: None,
+                business_domains: Vec::new(),
             },
             domains,
         };
@@ -2731,6 +2864,7 @@ mod tests {
                 migration_mode: "functional".to_string(),
                 source: None,
                 coverage: None,
+                business_domains: Vec::new(),
             },
             domains,
         };
@@ -3266,6 +3400,169 @@ mod tests {
             );
         }
 
+        /// reqgraph Fix B: a requirement carries the business domain its rule picked (the
+        /// highest-confidence parseable annotation), the model lists the catalog with the
+        /// directory mapping, and nothing else moves: the requirement keys keep their package
+        /// directory, the coverage is the same, and a malformed annotation is ignored.
+        #[test]
+        fn business_domains_ride_on_requirements_without_moving_keys_or_coverage() {
+            let mut s = store();
+            let charge = node(
+                &mut s,
+                "charge",
+                NodeKind::Function,
+                "be/integrations/stripe.py",
+            );
+            let link = node(
+                &mut s,
+                "link",
+                NodeKind::Function,
+                "be/integrations/oauth.py",
+            );
+            let refund = node(
+                &mut s,
+                "refund",
+                NodeKind::Function,
+                "be/executor/billing.py",
+            );
+            let other = node(&mut s, "other", NodeKind::Function, "be/executor/run.py");
+            for n in [&charge, &link, &refund, &other] {
+                map(&mut s, n, "extract-loop", "R");
+            }
+            let keys = |m: &DomainModel| -> Vec<(String, String, String)> {
+                m.domains
+                    .iter()
+                    .flat_map(|(d, dom)| {
+                        dom.requirements
+                            .iter()
+                            .map(move |(k, r)| (d.clone(), k.clone(), r.title.clone()))
+                    })
+                    .collect()
+            };
+            let before = build_at(&s, 100);
+            let cov_before = cov(&s);
+            assert!(before.metadata.business_domains.is_empty());
+            let pick = |key: &str, id: &str, name: &str, conf: f64| {
+                Annotation::new(
+                    BUSINESS_DOMAIN_ANN,
+                    key,
+                    serde_json::json!({"id": id, "name": name, "purpose": "Bills usage."})
+                        .to_string(),
+                )
+                .with_confidence(conf)
+            };
+            s.annotate(
+                &charge.symbol,
+                pick("a", "usage-billing", "Usage billing", 0.9),
+            )
+            .unwrap();
+            // Two picks on one node: the more confident one stands.
+            s.annotate(&refund.symbol, pick("a", "accounts", "Accounts", 0.4))
+                .unwrap();
+            s.annotate(
+                &refund.symbol,
+                pick("b", "usage-billing", "Usage billing", 0.8),
+            )
+            .unwrap();
+            // Nothing invented from what does not parse: not JSON, a path-like id, a blank name.
+            s.annotate(
+                &link.symbol,
+                Annotation::new(BUSINESS_DOMAIN_ANN, "a", "{not json").with_confidence(0.9),
+            )
+            .unwrap();
+            s.annotate(
+                &link.symbol,
+                pick("b", "be/integrations", "Integrations", 0.9),
+            )
+            .unwrap();
+            s.annotate(&other.symbol, pick("a", "runs", "  ", 0.9))
+                .unwrap();
+            let after = build_at(&s, 100);
+            assert_eq!(keys(&after), keys(&before), "no requirement key moves");
+            let cov_after = cov(&s);
+            assert_eq!(
+                (
+                    cov_after.resolved,
+                    cov_after.behavior_bearing,
+                    cov_after.unaccounted
+                ),
+                (
+                    cov_before.resolved,
+                    cov_before.behavior_bearing,
+                    cov_before.unaccounted
+                ),
+                "a business domain is not accounting"
+            );
+            let by_title = |t: &str| {
+                after
+                    .domains
+                    .values()
+                    .flat_map(|d| d.requirements.values())
+                    .find(|r| r.title == t)
+                    .unwrap()
+                    .business_domain
+                    .clone()
+            };
+            assert_eq!(
+                by_title("charge"),
+                Some(BusinessDomainRef {
+                    id: "usage-billing".into(),
+                    name: "Usage billing".into(),
+                    confidence: 0.9
+                })
+            );
+            assert_eq!(
+                by_title("refund").map(|b| b.id).as_deref(),
+                Some("usage-billing")
+            );
+            assert_eq!(by_title("link"), None);
+            assert_eq!(by_title("other"), None);
+            assert_eq!(
+                after.metadata.business_domains,
+                vec![BusinessDomain {
+                    id: "usage-billing".into(),
+                    name: "Usage billing".into(),
+                    purpose: "Bills usage.".into(),
+                    requirements: 2,
+                    directories: [
+                        ("be/executor".to_string(), 1),
+                        ("be/integrations".to_string(), 1)
+                    ]
+                    .into_iter()
+                    .collect(),
+                }]
+            );
+            // The persisted graph reads back with it (crew serves this document).
+            let mut model = after.clone();
+            stabilize_requirement_ids(&s, &mut model).unwrap();
+            persist_domain_model(&mut s, &model).unwrap();
+            let read: DomainModel =
+                serde_json::from_value(load_domain_graph(&s, None).unwrap().unwrap()).unwrap();
+            assert_eq!(
+                read.metadata.business_domains,
+                model.metadata.business_domains
+            );
+            assert_eq!(keys(&read), keys(&before));
+        }
+
+        /// core#1376: core's own bookkeeping kinds never draw the unknown-kind warning; a kind
+        /// core really does not know still does.
+        #[test]
+        fn the_unknown_kind_warning_skips_cores_own_nodes() {
+            let unknown: std::collections::BTreeSet<String> = [
+                "requirements_target",
+                "requirements_graph",
+                "domain",
+                "requirement",
+                "flow_step",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+            let warned: Vec<&String> = kinds_to_warn_about(&unknown).collect();
+            assert_eq!(warned, vec!["flow_step"]);
+        }
+
         /// P1: a build records the commit its code graph was indexed at, and the read returns it.
         #[test]
         fn a_build_records_the_code_commit_it_was_made_from() {
@@ -3283,6 +3580,7 @@ mod tests {
                     migration_mode: "functional".into(),
                     source: Some("estate-graph".into()),
                     coverage: None,
+                    business_domains: Vec::new(),
                 },
                 domains: Default::default(),
             };

@@ -72,6 +72,20 @@ fn built_domain_model_validates_against_the_kept_schema() {
         )
         .unwrap();
 
+    // reqgraph Fix B: charge's rule picked a business domain, so 1.1.0 carries
+    // `requirement.business_domain` and `metadata.business_domains`; 1.0.0 (closed) carries neither.
+    store
+        .annotate(
+            &charge.symbol,
+            Annotation::new(
+                wicked_governance::BUSINESS_DOMAIN_ANN,
+                wicked_governance::BUSINESS_DOMAIN_ANN,
+                r#"{"id":"payment-collection","name":"Payment collection","purpose":"Charges customers and records what they paid."}"#,
+            )
+            .with_confidence(0.85),
+        )
+        .unwrap();
+
     let coverage = CoverageReport {
         coverage: 1.0,
         ..Default::default()
@@ -89,6 +103,13 @@ fn built_domain_model_validates_against_the_kept_schema() {
     let new = wicked_governance::build_domain_model_with(&store, &coverage, "1.1.0", &opts)
         .expect("build 1.1.0");
     assert!(new.metadata.coverage.is_some());
+    assert_eq!(new.metadata.business_domains.len(), 1);
+    assert!(old.metadata.business_domains.is_empty());
+    assert!(old
+        .domains
+        .values()
+        .flat_map(|d| d.requirements.values())
+        .all(|r| r.business_domain.is_none()));
     assert!(new
         .domains
         .values()
@@ -108,6 +129,11 @@ fn built_domain_model_validates_against_the_kept_schema() {
 
     let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("schema parses");
     let compiled = jsonschema::JSONSchema::compile(&schema).expect("schema compiles");
+    assert_eq!(
+        read_back["domains"]["billing"]["requirements"]["REQ-002"]["business_domain"]["id"],
+        "payment-collection",
+        "the business domain reads back from estate"
+    );
     let instances = [
         serde_json::to_value(&old).unwrap(),
         serde_json::to_value(&new).unwrap(),
