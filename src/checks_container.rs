@@ -2816,6 +2816,8 @@ pub(crate) mod test_seam {
     pub(crate) fn mode() -> Option<Mode> {
         MODE.with(Cell::get)
     }
+    // Its callers are the Unix-only live tests (B-6 review r2: Windows clippy).
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub(crate) fn set_mode(m: Option<Mode>) {
         MODE.with(|c| c.set(m));
     }

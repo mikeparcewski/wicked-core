@@ -39,6 +39,7 @@
 //! (a second pass skips); the daemon starts one background loop per gateway dir.
 
 // Native Windows has no container floor: only the refresher's pure half compiles there.
+#![cfg_attr(not(unix), allow(dead_code))]
 
 use std::path::{Path, PathBuf};
 
