@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Fixed: "Re-run with the targeted tests" no longer turns into "run no tests" (wicked-core#1392).** On a repo
+  with no targeted test command, the `targeted` answer at a timed-out floor's gate used to waive the whole test set,
+  and the floor then passed and the gate allowed the change with no test evidence. Now a timed-out floor's report
+  names what a targeted re-run would run (`targeted_test`, read before the first check runs). The gate refuses
+  `targeted` when there is none, and stays open with the alternatives named. The timeout's denial text says
+  either "re-run with the targeted tests (`<source>`)" or that no targeted re-run is offered. A targeted re-run that
+  still finds no targeted command fails closed (the floor reports `not_run` and denies); it never waives the tests.
+  `accept_partial` remains the explicit waiver. Its floor note now leads with "tests waived by the operator
+  (`accept_partial`): …", and the gate receipt records `skipped[] {instrument: repo_checks, reason:
+  waived_by_operator}`, which the delivery receipt carries.
+
 - **The checks floor image and the seat images carry Python's test toolchain (wicked-core#1401).** wicked-garden's
   suite runs `python3 -m pytest`, and neither image had pytest, so every garden run's floor failed with "No Python
   with pytest found" and the operator had to approve the gate as their own judgment. Both images now install

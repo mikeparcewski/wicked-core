@@ -194,6 +194,9 @@ pub const SKIP_NOT_APPLICABLE: &str = "not_applicable";
 /// (QE acceptance) A waived or skipped QE acceptance on a receipt's `skipped[]`.
 pub const SKIP_QE_WAIVED: &str = "qe_waived_by_score";
 pub const SKIP_QE_OPERATOR: &str = "qe_skipped_by_operator";
+/// (core#1392) Floor checks the operator waived at the gate (`accept_partial`), on `skipped[]`
+/// under `repo_checks` with the label as its detail.
+pub const SKIP_WAIVED_BY_OPERATOR: &str = "waived_by_operator";
 
 /// [`QeAcceptance::status`].
 pub const QE_REQUIRED: &str = "required";
@@ -595,6 +598,34 @@ impl AssuranceReceipt {
     }
 
     pub fn skip(&mut self, instrument: &str, reason: &str, detail: Option<String>) {
+        // (core#1392) An operator's waiver is never hidden behind another skip of the same
+        // instrument, and every waiver's detail is kept (a delivery aggregates every gate's).
+        if reason == SKIP_WAIVED_BY_OPERATOR {
+            match self
+                .skipped
+                .iter_mut()
+                .find(|s| s.instrument == instrument && s.reason == reason)
+            {
+                Some(s) => {
+                    if let Some(d) = detail {
+                        match s.detail.as_mut() {
+                            Some(have) if have.split("; ").any(|x| x == d) => {}
+                            Some(have) => {
+                                have.push_str("; ");
+                                have.push_str(&d);
+                            }
+                            None => s.detail = Some(d),
+                        }
+                    }
+                }
+                None => self.skipped.push(SkippedInstrument {
+                    instrument: instrument.to_string(),
+                    reason: reason.to_string(),
+                    detail,
+                }),
+            }
+            return;
+        }
         if !self.skipped.iter().any(|s| s.instrument == instrument) {
             self.skipped.push(SkippedInstrument {
                 instrument: instrument.to_string(),
@@ -608,6 +639,37 @@ impl AssuranceReceipt {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// core#1392 (review): an operator's waiver is never hidden behind another skip of the same
+    /// instrument, and a delivery keeps every gate's waiver detail (once each).
+    #[test]
+    fn an_operator_waiver_is_kept_beside_other_skips_and_merged_across_gates() {
+        let mut r = AssuranceReceipt::default();
+        r.skip(REPO_CHECKS, SKIP_NOT_APPLICABLE, Some("no checks".into()));
+        r.skip(
+            REPO_CHECKS,
+            SKIP_WAIVED_BY_OPERATOR,
+            Some("tests waived (unit 3)".into()),
+        );
+        r.skip(
+            REPO_CHECKS,
+            SKIP_WAIVED_BY_OPERATOR,
+            Some("tests waived (unit 5)".into()),
+        );
+        r.skip(
+            REPO_CHECKS,
+            SKIP_WAIVED_BY_OPERATOR,
+            Some("tests waived (unit 3)".into()),
+        );
+        r.skip(REPO_CHECKS, SKIP_ERROR, Some("later generic".into()));
+        assert_eq!(r.skipped.len(), 2, "{:?}", r.skipped);
+        assert_eq!(r.skipped[0].reason, SKIP_NOT_APPLICABLE);
+        assert_eq!(r.skipped[1].reason, SKIP_WAIVED_BY_OPERATOR);
+        assert_eq!(
+            r.skipped[1].detail.as_deref(),
+            Some("tests waived (unit 3); tests waived (unit 5)")
+        );
+    }
 
     #[test]
     fn the_default_contract_requires_a_distinct_evaluator_and_a_judge() {

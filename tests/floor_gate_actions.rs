@@ -363,6 +363,13 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
     match gate(evs, 3) {
         Some((_, _, false, Some(s), _)) if s == source => true,
         other => {
+            // Only a floor that could not run under an OS boundary excuses the test (core#1392
+            // review): a floor that ran (or never reported) and was not denied this way fails.
+            assert!(
+                no_boundary(evs),
+                "the fix floor was not denied by `{source}` and did not report a missing OS \
+                 write boundary: {other:?}"
+            );
             eprintln!(
                 "floor_gate_actions: the fix floor was not denied by `{source}` on this host \
                  ({other:?}) — no OS write boundary to run the checks under; the default floor \
@@ -371,6 +378,27 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
             false
         }
     }
+}
+
+/// Did the fix unit's floor say it could not arm an OS write boundary (`sandbox_error`)? The one
+/// shape that excuses a test here. A Windows host has no boundary at all, and there a floor that
+/// never reported counts too; anywhere else a missing report is a failure, never a skip.
+fn no_boundary(evs: &[CoreEvent]) -> bool {
+    let mut reported = false;
+    for e in evs {
+        if let CoreEvent::RepoChecksEvaluated {
+            ord: 3,
+            sandbox_error,
+            ..
+        } = e
+        {
+            if sandbox_error.is_some() {
+                return true;
+            }
+            reported = true;
+        }
+    }
+    cfg!(windows) && !reported
 }
 
 fn no_session_failed(evs: &[CoreEvent]) {
@@ -619,7 +647,10 @@ fn an_operator_retry_clears_a_flaky_floor_on_an_unchanged_tree() {
 }
 
 /// core#544 (c): a rework that DOES change the tree re-runs the floor — and a repaired tree passes
-/// and the run goes on to verify.
+/// and the run goes on to verify. The engine's automatic rework is that rework here: the fix's
+/// first floor fails, the rework repairs the tree, and its fresh floor passes before any gate
+/// escalates. (Before core#1392's review this test waited for an escalation that never came and
+/// returned through the "no OS boundary" exit without asserting anything.)
 #[test]
 fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
     let repo = make_repo("rc-repair", TEST_FAILS_ON_BROKEN, 60, &[".break-in-fix"]);
@@ -627,20 +658,17 @@ fn a_rework_that_repairs_the_tree_re_runs_the_floor() {
     let sid = "fg-rc-repair";
     let events = launch(&core, "rc-repair", &repo, sid);
     let first = until_settled(&events, sid);
-    if !fix_floor_denied(&first, "repo_checks") {
+    no_session_failed(&first);
+    let f = floors(&first, 3);
+    if no_boundary(&first) {
+        eprintln!(
+            "floor_gate_actions: no OS write boundary on this host ({f:?}); nothing to assert"
+        );
         return;
     }
-    core.confirm_gate(sid, HumanDecision::RequestChanges { note: None })
-        .expect("request changes");
-    let second = until_settled(&events, sid);
-    no_session_failed(&second);
-    let reruns = floors(&second, 3);
-    assert_eq!(
-        reruns.len(),
-        1,
-        "one fresh floor for the changed tree: {reruns:?}"
-    );
-    assert_eq!(reruns[0].1, "passed");
+    assert_eq!(f[0].1, "failed", "the broken fix fails its floor: {f:?}");
+    assert_eq!(f.len(), 2, "one fresh floor for the repaired tree: {f:?}");
+    assert_eq!(f[1].1, "passed", "{f:?}");
     assert!(
         ran.lock().unwrap().iter().any(|(p, _)| p == "verify"),
         "the repaired tree reaches verify"
@@ -749,33 +777,129 @@ fn accept_partial_waives_the_unfinished_check_and_discloses_it() {
     assert!(det_pass && combined);
     assert!(
         note.as_deref()
-            .is_some_and(|n| n.contains("accept_partial") && n.contains("waived test")),
+            .is_some_and(|n| n.contains("tests waived by the operator (`accept_partial`): test")),
         "{note:?}"
     );
     let _ = std::fs::remove_dir_all(&repo);
 }
 
-/// core#469: `targeted` — a repo with no `test_targeted` command has its full test set waived for
-/// this unit (disclosed), and the rest re-runs.
+/// core#1392: `targeted` on a repo with no targeted test command used to waive the whole test set
+/// and let the gate ALLOW with no test evidence. It is now refused at the gate, which stays open
+/// and re-answerable; the timeout's denial says that no targeted re-run is offered; and the
+/// operator's explicit waiver (`accept_partial`) then carries "tests waived by the operator" on
+/// the gate's note and its receipt (which the delivery receipt aggregates).
 #[test]
-fn targeted_without_a_targeted_command_waives_the_full_test_set() {
+fn targeted_without_a_targeted_command_is_refused_and_the_gate_stays_open() {
     let Some((core, events, _ran, repo)) = timed_out_fix("targeted", "fg-targeted") else {
         return;
     };
-    core.confirm_gate("fg-targeted", escalation("targeted"))
-        .expect("targeted");
+    let err = core
+        .confirm_gate("fg-targeted", escalation("targeted"))
+        .expect_err("no targeted command: refused");
+    assert!(
+        err.to_string().contains("needs a targeted test command"),
+        "{err}"
+    );
+    let views = core.sessions_detail().expect("sessions");
+    let s = views
+        .iter()
+        .find(|v| v.session.id == "fg-targeted")
+        .expect("run");
+    assert_eq!(
+        s.session.status,
+        SessionStatus::AwaitingHuman,
+        "the gate stays held"
+    );
+    // The operator's explicit waiver is the way through, labelled as theirs.
+    core.confirm_gate("fg-targeted", escalation("accept_partial"))
+        .expect("accept partial");
     let second = until_settled(&events, "fg-targeted");
+    no_session_failed(&second);
+    let (_, det_pass, combined, _, note) = gate(&second, 3).expect("gateEvaluated");
+    assert!(det_pass && combined);
+    assert!(
+        note.as_deref()
+            .is_some_and(|n| n.contains("tests waived by the operator (`accept_partial`): test")),
+        "{note:?}"
+    );
+    let receipt = second
+        .iter()
+        .rev()
+        .find_map(|ev| match ev {
+            CoreEvent::GateEvaluated {
+                ord: 3, assurance, ..
+            } => Some(assurance.clone()),
+            _ => None,
+        })
+        .expect("the gate's receipt");
+    assert!(
+        receipt.skipped.iter().any(|k| k.instrument == "repo_checks"
+            && k.reason == "waived_by_operator"
+            && k.detail.as_deref().is_some_and(|d| d.contains("test"))),
+        "{:?}",
+        receipt.skipped
+    );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// core#1392: with a declared `test_targeted`, the timed-out floor names it, the gate offers it,
+/// and the re-run RUNS the targeted tests (never a waiver of every test).
+#[test]
+fn targeted_with_a_targeted_command_runs_it() {
+    let marker = std::env::temp_dir().join(format!(
+        "wicked-core-floorgate-tgt-{}-slow-done",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&marker);
+    let repo = make_repo("tgt", r#"["sh", "-c", "exit 0"]"#, 3, &[]);
+    // The targeted command is the slow one: the creator floor runs it in place of `test`.
+    std::fs::write(
+        repo.join(".wicked/checks.json"),
+        format!(
+            r#"{{"lint": ["sh", "-c", "exit 0"], "test": ["sh", "-c", "exit 0"], "test_targeted": {}, "timeout_s": 3}}"#,
+            test_slow_until(&marker)
+        ),
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "targeted"]);
+    let (core, _ran) = core_for("tgt", Rework::ChangesNothing);
+    let sid = "fg-tgt";
+    let events = launch(&core, "tgt", &repo, sid);
+    let first = until_settled(&events, sid);
+    no_session_failed(&first);
+    if !fix_floor_denied(&first, "repo_checks_timeout") {
+        return;
+    }
+    let denial = first
+        .iter()
+        .rev()
+        .find_map(|ev| match ev {
+            CoreEvent::GateEvaluated {
+                ord: 3,
+                denial_reason,
+                ..
+            } => denial_reason.clone(),
+            _ => None,
+        })
+        .expect("the timeout's denial");
+    assert!(
+        denial.contains("re-run with the targeted tests (`.wicked/checks.json test_targeted`)"),
+        "{denial}"
+    );
+    std::fs::write(&marker, "").unwrap();
+    core.confirm_gate(sid, escalation("targeted"))
+        .expect("targeted is offered");
+    let second = until_settled(&events, sid);
     no_session_failed(&second);
     let f = floors(&second, 3);
     assert_eq!(f.len(), 1, "{f:?}");
-    assert_eq!(f[0].2, vec!["lint".to_string()]);
-    let (_, _, combined, _, note) = gate(&second, 3).expect("gateEvaluated");
-    assert!(combined);
+    assert_eq!(f[0].1, "passed");
     assert!(
-        note.as_deref()
-            .is_some_and(|n| n.contains("targeted") && n.contains("waived test")),
-        "{note:?}"
+        f[0].2.contains(&"test_targeted".to_string()),
+        "the targeted tests ran: {f:?}"
     );
+    let _ = std::fs::remove_file(&marker);
     let _ = std::fs::remove_dir_all(&repo);
 }
 

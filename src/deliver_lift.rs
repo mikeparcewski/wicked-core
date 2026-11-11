@@ -1411,6 +1411,22 @@ pub(crate) fn delivery_receipt(
         // …and every gate whose judge was a fallback seat (operator ruling 2026-10-14).
         r.judge_fallbacks.extend(g.judge_fallbacks.iter().cloned());
     }
+    // (core#1392) Every floor the operator waived checks on, read off the unit's own stored floor
+    // report too — a unit a daemon from before the waiver label approved carries a receipt
+    // without it, and is not folded again before delivery.
+    for u in units {
+        if let Some(w) = u
+            .repo_checks
+            .as_ref()
+            .and_then(crate::pipeline::operator_waiver)
+        {
+            r.skip(
+                crate::assurance::REPO_CHECKS,
+                crate::assurance::SKIP_WAIVED_BY_OPERATOR,
+                Some(format!("{w} (unit {})", u.ord)),
+            );
+        }
+    }
     // (DES-RULE-CHECK-001 S2) Every steering rule's verdict across the run's gates, the worst row
     // per rule (deny-dominates): a skip stays labelled with its reason on the delivery.
     r.rules = crate::rule_check::aggregate(
