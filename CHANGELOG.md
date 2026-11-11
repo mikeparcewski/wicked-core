@@ -14,6 +14,17 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The boot reaper removes only worktrees its own daemon minted (wicked-core#1373).** Two daemons on one host (a
+  stable daemon and a test rig, each with its own state home) can register the same checkout. Restarting either one
+  force-removed the other's live, parked and retained worktrees, uncommitted work included, because a run id its own
+  store did not know was treated as an orphan (the self-test's S12 saw 5 of 5 removed). Every worktree a daemon mints
+  or adopts now carries that daemon's id in its git admin dir (`.git/worktrees/<name>/wicked-daemon`, a digest of the
+  daemon's store, with no path in it), beside the existing run-id marker. The boot reaper force-removes a tree of an
+  unknown run only when the marker is its own. It never touches a tree marked by another daemon, not even that tree's
+  check scratch. A tree with no daemon marker (another daemon's, or one minted before this release) is kept and
+  reported, so an unknown run id alone never removes one. Terminal runs of the daemon's own store are still reaped
+  only when clean. Trees minted before this release stay until they are resumed (which marks them) or removed by hand.
+
 - **A governance pack's rules apply only where the pack's scope fits the run (wicked-core#1414).** The mcp-server
   pack's MCPS-1001..1007 were judged on every run with a build or review step, so a crew change that builds no MCP
   server was ruled broken on MCPS-1007 (an SPDX header on every file) and the operator had to skip it. Each shipped

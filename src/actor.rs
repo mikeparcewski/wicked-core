@@ -836,6 +836,11 @@ pub(crate) fn run(
     // the daemon's durable state and two daemons on one host never share a graph directory. Held
     // for the actor's lifetime — the same `GOV_DB_PATH` idiom, one line up.
     let _repo_graph_state_home = crate::code_graph::StateHomeScope::for_store(&path);
+    // (core#1373) Every worktree this actor mints carries this daemon's id, and the boot reaper
+    // force-removes only trees that carry it: a checkout another daemon registered too keeps that
+    // daemon's trees.
+    let _daemon_owner =
+        crate::repo::DaemonOwnerScope::bind(Some(crate::repo::daemon_owner_of_store(&path)));
 
     // Seed the deterministic floor the built-in Evaluator phases pin (FINDING-025 item 1).
     //
@@ -1101,14 +1106,16 @@ pub(crate) fn run(
     // clean (the same rule the terminal-status reap applies — so a crash between a run finishing
     // and its reap, or a run predating the reap, converges here instead of surviving restarts);
     // worktrees of LIVE runs are kept (resume); worktrees whose run id the store has never heard
-    // of are force-removed. A sessions read failure SKIPS the reap: with liveness unknown, any
+    // of are force-removed only when THIS daemon minted them (core#1373: a tree another daemon
+    // minted on a shared checkout, or an unmarked one, is kept). A sessions read failure SKIPS the reap: with liveness unknown, any
     // removal could take a resumable run's checkout, and leaking for one boot is the cheaper error.
     if let Ok(repos) = boot_repos {
         if !repos.is_empty() {
             match crate::domain::all_sessions(&store) {
                 Ok(sessions) => {
                     let (live, terminal) = partition_sessions_for_reap(&sessions);
-                    crate::repo::reap_orphan_worktrees(&repos, &live, &terminal);
+                    let owner = crate::repo::bound_daemon_owner();
+                    crate::repo::reap_orphan_worktrees(&repos, &live, &terminal, owner.as_deref());
                 }
                 Err(e) => eprintln!(
                     "wicked-core: skipping the startup worktree reap — cannot read sessions ({e})"
@@ -1831,7 +1838,11 @@ pub(crate) fn run(
                             .and_then(|(_, preset)| preset.as_deref())
                             .or_else(|| selected_def.as_ref().map(|d| d.id.as_str()))
                             == Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID);
+                        // (core#1373) The tree is minted on its own thread: it carries this
+                        // daemon's id all the same.
+                        let daemon_owner = crate::repo::bound_daemon_owner();
                         std::thread::spawn(move || {
+                            let _daemon_owner = crate::repo::DaemonOwnerScope::bind(daemon_owner);
                             // (DES-L9 / crew#550) An explicit base — the open PR's head branch a
                             // revision run starts from — reaches the mint here; `None` keeps the
                             // remote-default resolution. Read before `spec` moves into the reply.
@@ -33457,7 +33468,7 @@ mod terminal_worktree_reap_tests {
         );
     }
 
-    /// FINDING-003 boot call site (`run()`). `reap_orphan_worktrees(repos, live, terminal)` KEEPS
+    /// FINDING-003 boot call site (`run()`). `reap_orphan_worktrees(repos, live, terminal, daemon)` KEEPS
     /// `live` and REAPS `terminal`; both are `&HashSet<String>`, so swapping them at the boot site
     /// COMPILES and silently inverts the meaning — resumable runs' checkouts reaped, terminal
     /// leftovers kept — while the repo-level test (which calls the fn with named sets) stays green.
@@ -33478,7 +33489,7 @@ mod terminal_worktree_reap_tests {
             "the startup reaper no longer binds partition's (live, terminal) tuple in order — a \
              swapped destructure would feed the live set to the reap position (FINDING-003)"
         );
-        let call = concat!("reap_orphan_worktrees(&repos, ", "&live, &terminal)");
+        let call = concat!("reap_orphan_worktrees(&repos, ", "&live, &terminal, ");
         assert!(
             src.contains(call),
             "the startup reap call's argument order changed — live must be the KEEP arg and terminal \
