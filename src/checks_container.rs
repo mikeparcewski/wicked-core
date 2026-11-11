@@ -3315,6 +3315,19 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
     let t = Instant::now();
     let report = crate::repo_checks::run_floor(&worktree, &ctx);
+    // The made-up namespace goes before any output is written (codex r2): a closed stdout
+    // cannot skip it.
+    if made_up {
+        crate::repo_checks::remove_check_scratch(&worktree, &run_id);
+        // The namespace this invocation made up goes with it (codex b3-floor #3): nothing else
+        // ever ends a run of that id.
+        if let Some(kube) = crate::k8s::engine_home().and_then(|h| crate::k8s::kube_for(&h).ok()) {
+            if let Err(e) = crate::k8s::cluster::delete_run(&kube, &run_id, false) {
+                eprintln!("wicked-core floor run: the run namespace was not deleted: {e}");
+            }
+            forget_namespace(&crate::k8s::run_namespace_name(&kube.owner, &run_id));
+        }
+    }
     eprintln!(
         "wicked-core floor run: {} in {:.1}s",
         if report.passed { "PASSED" } else { "FAILED" },
@@ -3326,20 +3339,6 @@ pub fn run_cli(args: &[String]) -> i32 {
     );
     if full {
         crate::power::set_full_suite(&run_id, false);
-    }
-    if made_up {
-        crate::repo_checks::remove_check_scratch(&worktree, &run_id);
-        // The namespace this invocation made up goes with it (codex b3-floor #3): nothing else
-        // ever ends a run of that id.
-        if let Some(kube) = crate::k8s::engine_home().and_then(|h| crate::k8s::kube_for(&h).ok()) {
-            if let Err(e) = crate::k8s::cluster::delete_run(&kube, &run_id, false) {
-                eprintln!("wicked-core floor run: the run namespace was not deleted: {e}");
-            }
-            forget_namespace(&crate::k8s::run_namespace_name(
-                &kube.owner,
-                &run_id,
-            ));
-        }
     }
     if report.passed {
         0

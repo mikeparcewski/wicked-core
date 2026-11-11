@@ -819,7 +819,7 @@ fn k8s_a_check_runs_under_the_fixed_wrapper_and_writes_its_own_exit_code() {
             "A=b c",
             "/bin/sh",
             "-c",
-            "exec \"$@\"",
+            "exec -- \"$@\"",
             "wicked-argv",
             "npm",
             "test"
@@ -990,6 +990,14 @@ fn k8s_a_check_named_with_an_equals_sign_runs() {
         "{}",
         String::from_utf8_lossy(&o.stdout)
     );
+    // An argv starting `--` is a program, never `exec`'s option: it does not pass (codex r2).
+    let a = floor::check_argv("x", "/", &[], &["--".into()]);
+    let o = std::process::Command::new(&a[6])
+        .hardened()
+        .args(&a[7..])
+        .output()
+        .unwrap();
+    assert!(!o.status.success());
     let _ = std::fs::remove_dir_all(&d);
 }
 

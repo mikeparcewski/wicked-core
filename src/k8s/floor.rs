@@ -215,14 +215,24 @@ impl Place {
     /// gone is remembered (codex b3-floor #1): repository code may still run in it, writing the
     /// run's claims, so no further floor pod starts in this namespace until it is.
     pub(crate) fn delete(&self, name: &str) {
-        if let Err(e) = self.kube.delete_owned(Some(&self.ns), "pod", name, true) {
-            eprintln!(
+        // Registered before the deletion is attempted (codex r2): a floor starting while this
+        // one is still being waited out sees it, and waits it out too.
+        let entry = (self.ns.clone(), name.to_string());
+        if let Ok(mut u) = UNREAPED.lock() {
+            u.push(entry.clone());
+        }
+        match self.kube.delete_owned(Some(&self.ns), "pod", name, true) {
+            Ok(_) => {
+                if let Ok(mut u) = UNREAPED.lock() {
+                    if let Some(i) = u.iter().position(|x| *x == entry) {
+                        u.remove(i);
+                    }
+                }
+            }
+            Err(e) => eprintln!(
                 "wicked-core: floor pod {name} in {} not confirmed gone: {e}",
                 self.ns
-            );
-            if let Ok(mut u) = UNREAPED.lock() {
-                u.push((self.ns.clone(), name.to_string()));
-            }
+            ),
         }
     }
 
@@ -355,7 +365,8 @@ pub(crate) fn check_argv(
     v.extend(env.iter().map(|(k, val)| format!("{k}={val}")));
     // A fixed program between the assignments and the repository's argv (codex b3-floor #5):
     // `env` would read an executable named `./check=fail` as one more assignment and pass.
-    v.extend(["/bin/sh", "-c", "exec \"$@\"", "wicked-argv"].map(String::from));
+    // `exec --` (codex r2): an argv starting `--` is a program, never the builtin's option.
+    v.extend(["/bin/sh", "-c", "exec -- \"$@\"", "wicked-argv"].map(String::from));
     v.extend(argv.iter().cloned());
     v
 }
