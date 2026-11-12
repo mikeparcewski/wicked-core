@@ -2958,6 +2958,17 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.42** — 2026-11-12 — patch release on main ea1b7c5, carrying 2 PRs since 0.15.41: #1460 and #1462.
+  - **A Desk chat scoped to "All repos" runs on the Kubernetes seat floor again (#1462).** Every registered
+    repository is a read root of such a chat, and the floor copied each one whole, with its ignored build output and
+    the run worktrees under it, so the copy-in passed the 512 MiB stream limit and every turn on every seat was
+    refused. A read-only plain root with its own `.git` is now copied as git lists it (tracked, plus untracked files
+    that are not ignored); a `.git` gone since the plan is refused, never copied whole. A refused copy-in is reported
+    as `copy_in_refused`, no longer as `root_unresolvable`.
+  - **Lockfile:** #1460 re-stamped the 0.15.41 platform lock entries.
+  - **Upgrade notes.** No binding method change, no `LaunchSpec` field change; gate protocol 3 is unchanged. Wire: one
+    new seat-unarmed reason, `copy_in_refused` (`hostBoundary().reason` and the disclosure). No Dockerfile
+    change, so no image rebuild.
 - **core-ts 0.15.41** — 2026-11-12 — patch release on main 8b946a5, carrying 6 PRs since 0.15.40: #1448, #1450,
   #1451, #1452, #1454 and #1459.
   - **The requirements read carries a confidence-weighted headline, `coverage.weightedPct` (#1451, core#1445).**
