@@ -14,6 +14,9 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Rancher Desktop's containerd images are visible to Kubernetes (wicked-core#1449).** The k8s runner now
+  builds and inspects images with `nerdctl --namespace k8s.io`, the store the kubelet reads.
+
 - **The requirements read carries a confidence-weighted headline, `coverage.weightedPct` (core#1445).** The header
   counted every resolved behaviour as a full 1 (86% shown against 41% strictly true on a measured slice).
   `weightedPct` is `round(100 × Σ w / denominator)` over the same behaviour-bearing denominator: a human-validated
