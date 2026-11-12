@@ -2954,11 +2954,14 @@ Two release tracks share this file, newest entry first regardless of track:
     container CLI (`docker`, `nerdctl` or `podman`) only builds and inspects images, into the store the cluster
     shares (`imagePullPolicy: Never`). `WICKED_SEAT_FLOOR=host` still selects the labelled interim host floor.
   - **Where a seat's arm spends its time (#1421).** New additive frame `seatArmTimed` (`session`, `ord`, `cli`,
-    `ok`, `totalMs`, `phases[]` of `{name, ms, detail?}`), once per arm.
+    `ok`, `totalMs`, `phases[]` of `{name, ms, detail}`, `detail` a string or `null`), once per arm.
   - **Lockfile:** #1443 re-stamped the 0.15.39 platform lock entries.
-  - **Upgrade notes.** A governed seat or a checks floor on the container floor now needs a local Kubernetes cluster
-    (Rancher Desktop or Docker Desktop Kubernetes) and a one-time `wicked-core cluster install` into the daemon's
-    state home; without one the unit is refused with a named kind, never run on the host. The engine's own
+  - **Upgrade notes.** A governed seat on the container floor now needs a local Kubernetes cluster (Rancher Desktop
+    or Docker Desktop Kubernetes) and a one-time `wicked-core cluster install` into the daemon's state home; without
+    one the unit is refused with a named kind, never run on the host. The checks floor is different:
+    `WICKED_FLOOR_RUNNER=auto` (the default) tries pods on macOS only and falls back to the host floor, with the
+    reason, when the pods cannot start (Linux `auto` runs on the host); only `WICKED_FLOOR_RUNNER=container`
+    refuses instead. The engine's own
     credential lives at `<state home>/k8s` (0600), a new state-home subtree registered in
     `tests/fixtures/state-home-subtrees.json`; a consumer that mirrors that fixture (crew) needs the same entry.
     Wire: one additive event, `seatArmTimed`. No binding method change, no `LaunchSpec` field change; gate protocol
