@@ -1018,6 +1018,13 @@ pub(crate) fn boundary_denial_tracked(
                 (directory_bases, read_targets) =
                     shell_cwd_walk(directory_bases, &[raw.to_string()], home);
             }
+            // (core#1461) `cd <absolute> && …` with nothing that runs after a failed `cd`: every
+            // later write starts there, never in a cwd an earlier call left the shell in.
+            if let Some(dir) =
+                leading_cd_dominates(command, home.filter(|_| !command_may_set_home(command)))
+            {
+                bases = vec![dir];
+            }
             let mut operands = ShellOperands::default();
             // Keep the real home for reads even when the command may set HOME. Clearing it
             // would silently drop home-relative reads instead of conservatively judging them.
@@ -2454,6 +2461,73 @@ const FIND_PATTERN_PREDICATES: &[&str] = &[
 // Bound work even for hostile command text. After 64 unique cwd candidates, retain
 // those already collected and keep judging against them; this literal scan is best-effort.
 const MAX_SHELL_CWD_CANDIDATES: usize = 64;
+
+/// (core#1461) The one directory every later part of `command` runs in, when the text settles it:
+/// the command opens with `cd <word>` joined by `&&`, the word resolves to ONE absolute path, and
+/// nothing in the command can run after a failed `cd` (no `;`, `||`, `&`, `|&` or line break
+/// anywhere, quoted text aside). If that `cd` fails, the `&&` chain stops and nothing else runs; if
+/// it succeeds, everything after it starts there. So the cwd the seat's shell stood in before the
+/// call (the unit cwd, the tracked sidecar cwd, the call's own cwd) is no base for a later
+/// relative path. Run 12a50f95: `cd <draft root> && sed -i … deck.html` was judged against the
+/// skills snapshot an earlier call had `cd`-ed into, and the unit was denied. The `cd` itself is
+/// still judged by the `cd` fence. `None` for every other shape: all candidates stay.
+fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
+    if command.contains(['\n', '\r']) {
+        return None;
+    }
+    let toks = shell_tokens_with_operators(command, true);
+    let [cd, dest, and, rest @ ..] = toks.as_slice() else {
+        return None;
+    };
+    if cd != "cd" || and != "&&" || dest.starts_with('-') || redirect_glob(dest).is_some() {
+        return None;
+    }
+    let readings = resolve_shell_readings(dest, home)?;
+    let [only] = readings.as_slice() else {
+        return None;
+    };
+    if !Path::new(only).is_absolute() || only.contains(OPAQUE_EXPANSION) {
+        return None;
+    }
+    // Nothing after the `cd` may move the shell elsewhere or name where it was: no other
+    // `cd`/`pushd`/`popd` and no `OLDPWD`, in any word as the shell (or an `eval`, or an inner
+    // `sh -c`) reads it. A word the text cannot resolve (a variable, `$(…)`, a glob) could be any
+    // of them, so it keeps every candidate too.
+    // Sourced code (`.`/`source` in command position) may `cd` anywhere, so it keeps them too.
+    const MOVES: [&str; 4] = ["cd", "pushd", "popd", "OLDPWD"];
+    let mut at_command = true;
+    for t in rest {
+        if matches!(t.as_str(), ";" | "||" | "&" | "|&" | ";;" | ";&" | ";;&") {
+            return None;
+        }
+        if matches!(t.as_str(), "&&" | "|" | "(" | ")" | "!" | "{" | "}") {
+            at_command = true;
+            continue;
+        }
+        if redirect_glob(t).is_some() || t.starts_with('<') {
+            continue;
+        }
+        let readings = resolve_shell_readings(t, home)?;
+        for r in &readings {
+            if r.contains(OPAQUE_EXPANSION)
+                || (at_command && matches!(r.as_str(), "." | "source"))
+                || r.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .any(|w| MOVES.contains(&w))
+            {
+                return None;
+            }
+        }
+        // An assignment before a command (`X=1 prog`) leaves the next word in command position.
+        at_command = t.split_once('=').is_some_and(|(k, _)| {
+            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        });
+    }
+    Some(crate::path_policy::normalize_for_fence(
+        only,
+        Path::new("/"),
+        home,
+    ))
+}
 
 fn shell_cwd_candidates(
     bases: Vec<PathBuf>,
@@ -11631,6 +11705,117 @@ mod boundary_tests {
                 "command after heredoc must remain visible"
             );
         }
+    }
+
+    /// core#1461 (run 12a50f95, deck draft unit): the seat had `cd`-ed into the skills snapshot (a
+    /// read root) in an earlier call, so the tracked sidecar cwd was the snapshot; then
+    /// `cd <draft root> && sed -i '…' deck.html` was judged against that cwd too, the file
+    /// resolved under the snapshot, and the unit was DENIED (boundary-deny). A leading absolute
+    /// `cd` joined by `&&`, with nothing that can run after a failed `cd`, decides the base. Every
+    /// shape where a later part may run elsewhere keeps the old candidates and stays denied.
+    #[test]
+    fn a_leading_cd_into_the_draft_root_decides_where_its_writes_land_1461() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("k8s-drafts-1461-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("sandbox");
+        let draft = base.join("state").join("interactive-drafts").join("deck-1");
+        let attempt = draft.join("attempt-1");
+        let snapshot = base
+            .join("state")
+            .join("skills")
+            .join("snapshots")
+            .join("000004");
+        for d in [&wt, &attempt, &snapshot] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(attempt.join("deck.html"), "<section>").unwrap();
+        let roots = AllowedRoots {
+            write: vec![wt.clone(), draft.clone()],
+            read: vec![snapshot.clone()],
+        };
+        let state = base.join("install-fence-cwd-unit-2");
+        std::fs::write(&state, snapshot.to_string_lossy().as_bytes()).unwrap();
+        let check = |cmd: &str| {
+            boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": cmd }),
+                "Bash",
+                Some(&state),
+                false,
+                &[],
+            )
+        };
+        let a = shell_read_951_path(&attempt);
+        for ok in [
+            format!(
+                "cd {a} && sed -i 's/^section {{/.slide {{/; s/ break-after: page//' deck.html"
+            ),
+            format!("cd {a} && sed -i.bak 's/a/b/' deck.html && ls"),
+            format!("cd {a} && cat > deck.html"),
+            format!("cd {a} && mkdir -p records && cat deck.html | tee records/copy.html"),
+        ] {
+            assert_eq!(check(&ok), None, "a write in the draft root: {ok}");
+        }
+        for denied in [
+            format!("cd {a}; sed -i 's/a/b/' deck.html"),
+            format!("cd {a} || true && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} & sed -i 's/a/b/' deck.html"),
+            format!("cd {a} | sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && cd - && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && eval 'cd -' && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && \"c\"d \"$OLDPWD\" && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && $GO && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && popd && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} > deck.html && true"),
+            format!("cd {a} 2>deck.html && true"),
+            format!("(cd {a}) && sed -i 's/a/b/' deck.html"),
+            format!("! cd {a} && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && sed -i 's/a/b/' deck.html;sed -i 's/a/b/' x.html"),
+            format!("cd {a} && . ./go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && source go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && X=1 . go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && sh -c 'cd -; sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && c\\d - && sed -i 's/a/b/' deck.html"),
+            "cd attempt-1 && sed -i 's/a/b/' deck.html".to_string(),
+            format!(
+                "cd {} && sed -i 's/a/b/' SKILL.md",
+                shell_read_951_path(&snapshot)
+            ),
+        ] {
+            let (reason, fatal) =
+                check(&denied).unwrap_or_else(|| panic!("still a write escape: {denied}"));
+            assert!(
+                reason.contains("leaves the unit boundary"),
+                "{denied}: {reason}"
+            );
+            assert!(fatal, "{denied}: fatal outside the temp");
+        }
+        // Glued operators are split as the shell splits them: a glued `cd -` keeps every candidate.
+        assert_eq!(
+            leading_cd_dominates(&format!("cd {a}&&cd -&&sed -i 's/a/b/' deck.html"), None),
+            None
+        );
+        // A line break ends the `&&` chain: the rule never applies across one.
+        assert_eq!(
+            leading_cd_dominates(&format!("cd {a} && true\nsed -i 's/a/b/' deck.html"), None),
+            None
+        );
+        assert_eq!(
+            leading_cd_dominates(&format!("cd {a} && sed -i 's/a/b/' deck.html"), None),
+            Some(crate::path_policy::normalize_for_fence(
+                &a,
+                std::path::Path::new("/"),
+                None
+            ))
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

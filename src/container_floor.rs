@@ -2236,6 +2236,7 @@ pub(crate) fn arm_noting(
     prompt: Option<&str>,
     gateway_dir: Option<&Path>,
     on_built: &mut dyn FnMut(&str, Duration),
+    before_copy: &mut dyn FnMut(&MountView) -> Result<(), String>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let cli = argv
         .first()
@@ -2277,6 +2278,51 @@ pub(crate) fn arm_noting(
         .filter_map(|p| p.parent().map(Path::to_path_buf))
         .collect();
     spec.writable.retain(|w| !pin_dirs.contains(w));
+    // The engine's state home: its cluster settings, and its own credential the mounts cover.
+    let state_home = gateway_dir
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .or_else(|| wicked_apps_core::spawn::worker_home_base().ok());
+    // The unit's mounts and the view of them, settled before any image or cluster work.
+    let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    add_read_roots(&mut mounts, read_roots);
+    let mut argv = argv.to_vec();
+    mount_argv_paths(&mut mounts, &mut argv, prompt);
+    // A member turn's repository view: read-only, or the seat does not start.
+    if let Some(view) = read_view {
+        add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    }
+    cover_gateway_dir(&mut mounts, gateway_dir)
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
+    // way: never in a replica, and a seat-writable tree over it is refused.
+    // From the state home the cluster settings were read from (codex r2: an offline seat has
+    // no gateway dir, and is covered all the same).
+    // (No state home is refused as `no_cluster` below, before any copy-in.)
+    let engine_k8s = state_home.as_ref().map(|h| h.join("k8s"));
+    cover_gateway_dir(&mut mounts, engine_k8s.as_deref())
+        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
+    // core#1228: a prompt too long for one exec argument rides a private read-only file.
+    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
+        Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
+            .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
+        None => None,
+    };
+    let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
+        .chain(spec.protected.iter().cloned())
+        .chain(spec.readmitted.iter().cloned())
+        .chain(spec.readmitted_files.iter().cloned())
+        .chain(inp.write_roots.iter().cloned())
+        .chain(read_roots.iter().cloned())
+        .chain(read_view.map(Path::to_path_buf))
+        .chain(prompt_file.as_ref().map(|c| c.file.clone()))
+        .collect();
+    let view = mount_view(&mounts, &working_set);
+    // (core#1461) What the caller must settle from the final view BEFORE anything is copied in,
+    // and before anything outside this process (image, cluster) is touched: the pod mounts each
+    // launch file by subPath, bound to the inode the copy-in made, so a file rewritten after the
+    // arm (claude's narrowed `--settings`) never reached the seat.
+    before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
     // The image builder (D2: it builds the seat, floor and sync images into the store the
     // cluster shares; it never runs a seat).
     let rt = runtime().map_err(|w| (w, String::new()))?;
@@ -2308,53 +2354,16 @@ pub(crate) fn arm_noting(
     }
     // The engine's cluster: the daemon's own (its state home holds the kubeconfig `cluster
     // install` wrote), answering, with the pinned controller and a pod pids limit (B2).
-    let home = gateway_dir
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .or_else(|| wicked_apps_core::spawn::worker_home_base().ok())
-        .ok_or_else(|| {
-            (
-                FloorUnarmed::NoCluster,
-                "no state home for the cluster settings".to_string(),
-            )
-        })?;
+    let home = state_home.ok_or_else(|| {
+        (
+            FloorUnarmed::NoCluster,
+            "no state home for the cluster settings".to_string(),
+        )
+    })?;
     let kube = crate::k8s::kube_for(&home)?;
     crate::k8s::cluster::probe_cached(&kube)?;
     crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image)?;
     crate::k8s::clock::mark("cluster_probe");
-    let mut mounts = mount_plan(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    add_read_roots(&mut mounts, read_roots);
-    let mut argv = argv.to_vec();
-    mount_argv_paths(&mut mounts, &mut argv, prompt);
-    // A member turn's repository view: read-only, or the seat does not start.
-    if let Some(view) = read_view {
-        add_read_view(&mut mounts, view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    }
-    cover_gateway_dir(&mut mounts, gateway_dir)
-        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    // The engine's own cluster credential (`<state home>/k8s`, codex b5 #1) is covered the same
-    // way: never in a replica, and a seat-writable tree over it is refused.
-    // From the state home the cluster settings were read from (codex r2: an offline seat has
-    // no gateway dir, and is covered all the same).
-    let engine_k8s = Some(home.join("k8s"));
-    cover_gateway_dir(&mut mounts, engine_k8s.as_deref())
-        .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
-    // core#1228: a prompt too long for one exec argument rides a private read-only file.
-    let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
-        Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
-            .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
-        None => None,
-    };
-    let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
-        .chain(spec.protected.iter().cloned())
-        .chain(spec.readmitted.iter().cloned())
-        .chain(spec.readmitted_files.iter().cloned())
-        .chain(inp.write_roots.iter().cloned())
-        .chain(read_roots.iter().cloned())
-        .chain(read_view.map(Path::to_path_buf))
-        .chain(prompt_file.as_ref().map(|c| c.file.clone()))
-        .collect();
-    let view = mount_view(&mounts, &working_set);
     // The seat image cannot move a mount (a link where one lands, a declared volume).
     let dests: Vec<PathBuf> = mounts
         .iter()
@@ -3291,6 +3300,80 @@ mod agy_tests;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// core#1461 (runs d0f84ace, 12a50f95): the claude seat's `--settings` file was narrowed around
+    /// the run's declared draft root only AFTER the arm, whose copy-in had already put the host
+    /// fence into the replica; the pod mounts that file by subPath (bound to the copy-in's inode),
+    /// so the seat kept `Read(<state home>/interactive-drafts/**)` and could neither read nor edit
+    /// its own draft. The arm now hands the caller the final mount view before ANY work outside
+    /// this process: this arm has no runtime or cluster to reach, and its refusal is the
+    /// callback's own, with a view that exposes the declared root and mounts the launch file.
+    #[test]
+    fn the_arm_settles_the_launch_files_from_the_view_before_any_copy_in_1461() {
+        let base = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-1461-{}", uuid::Uuid::new_v4().simple()));
+        let sandbox = base.join("sandbox");
+        let draft = base.join("state").join("interactive-drafts").join("deck-1");
+        let gov = base.join("gov").join("attempt-0");
+        for d in [&sandbox, &draft, &gov] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let settings = gov.join("settings-unit-2.json");
+        std::fs::write(&settings, r#"{"permissions":{"deny":[]}}"#).unwrap();
+        let inp = crate::worker_sandbox::FloorInputs {
+            cwd: sandbox.clone(),
+            write_roots: vec![sandbox.clone(), draft.clone()],
+            read_only: false,
+            seat_dirs: vec![gov.clone()],
+            scratch: None,
+            unmask: vec![],
+            pinned: vec![settings.clone()],
+            net: vec![],
+            home: None,
+            trusted_git_dir: None,
+        };
+        let argv: Vec<String> = ["claude", "-p", "draft it", "--settings"]
+            .iter()
+            .map(|s| s.to_string())
+            .chain(std::iter::once(settings.to_string_lossy().into_owned()))
+            .collect();
+        let mut seen: Option<MountView> = None;
+        let mut before_copy = |v: &MountView| {
+            seen = Some(v.clone());
+            Err("stopped by the test before any copy-in".to_string())
+        };
+        let out = arm_noting(
+            &inp,
+            &argv,
+            "run-1461",
+            2,
+            &[],
+            None,
+            Some("draft it"),
+            None,
+            &mut |_, _| {},
+            &mut before_copy,
+        );
+        match out {
+            Err((why, detail)) => {
+                assert_eq!(why, FloorUnarmed::RootUnresolvable);
+                assert_eq!(detail, "stopped by the test before any copy-in");
+            }
+            Ok(_) => panic!("the test's callback refuses the arm"),
+        }
+        let view = seen.expect("the arm hands the caller its view before any copy-in");
+        assert!(
+            view.roots.iter().any(|(p, rw)| *p == draft && *rw),
+            "the declared draft root is a writable root of the view: {view:?}"
+        );
+        assert!(
+            view.mounted.contains(&settings),
+            "the launch file is mounted (by itself) in the view: {view:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     /// One failed (or slow) attempt is not the outcome: the second attempt answers, after one
     /// short pause. A single-attempt probe read this runtime down (e2e-1105 09:02Z).
