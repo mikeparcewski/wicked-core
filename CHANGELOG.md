@@ -2958,7 +2958,15 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
-- **core-ts 0.15.42** — 2026-11-12 — patch release on main ea1b7c5, carrying 2 PRs since 0.15.41: #1460 and #1462.
+- **core-ts 0.15.42** — 2026-11-12 — patch release on main a574003, carrying 3 PRs since 0.15.41: #1460, #1462 and
+  #1466.
+  - **A Claude seat on the Kubernetes seat floor can read and edit its run's declared draft root (#1466, core#1461).**
+    Every chat-made document, deck and page failed there, from two separate denies. The seat's `--settings` file was
+    narrowed around the declared root only after the pod's copy of it was made, so the pod kept the state-home deny
+    rules; it is now narrowed before the copy. The gate hook judged a `cd <draft root> && <write>` against a stale
+    working directory left by an earlier call; a leading `cd` to one absolute path joined by `&&` now sets the write
+    base, and only when nothing after it can run on a failed `cd` or move or re-read the working directory. Every
+    other shape keeps every candidate base, as before.
   - **A Desk chat scoped to "All repos" runs on the Kubernetes seat floor again (#1462).** Every registered
     repository is a read root of such a chat, and the floor copied each one whole, with its ignored build output and
     the run worktrees under it, so the copy-in passed the 512 MiB stream limit and every turn on every seat was
