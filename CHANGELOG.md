@@ -2967,8 +2967,8 @@ Two release tracks share this file, newest entry first regardless of track:
     as `copy_in_refused`, no longer as `root_unresolvable`.
   - **Lockfile:** #1460 re-stamped the 0.15.41 platform lock entries.
   - **Upgrade notes.** No binding method change, no `LaunchSpec` field change; gate protocol 3 is unchanged. Wire: one
-    new seat-unarmed reason, `copy_in_refused` (`hostBoundary().reason` and the disclosure). No Dockerfile
-    change, so no image rebuild.
+    new seat-unarmed reason, `copy_in_refused`, in the seat-unarmed disclosure of a refused unit. No
+    Dockerfile change, so no image rebuild.
 - **core-ts 0.15.41** — 2026-11-12 — patch release on main 8b946a5, carrying 6 PRs since 0.15.40: #1448, #1450,
   #1451, #1452, #1454 and #1459.
   - **The requirements read carries a confidence-weighted headline, `coverage.weightedPct` (#1451, core#1445).**
