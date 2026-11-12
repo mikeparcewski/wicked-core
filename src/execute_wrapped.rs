@@ -2494,8 +2494,11 @@ fn open_state_home_around_declared(
 /// comma-joined entry, [`inject_isolation_flags`]; a token equal to `prompt` is never read as the
 /// flag) and, for a governed unit, `permissions.deny` in its `settings` file
 /// ([`arm_input_governance`]), rewritten with the same O_EXCL discipline it was written with,
-/// before the container starts. Called only after the container floor armed: the host floor's
-/// rules are never narrowed. `Err` refuses the launch.
+/// before the container starts. Called only on the container floor, never for the host floor's
+/// rules, in two stages (core#1461): the settings file from the settled mount view BEFORE any
+/// copy-in (`container_floor::arm_noting`'s `before_copy`: a pod mounts the file by subPath, so a
+/// later rewrite never reaches the seat; pass an empty `argv`), then the argv after the arm
+/// (`settings: None`; the argv rides the unit env at the spawn). `Err` refuses the launch.
 pub(crate) fn narrow_container_fence(
     argv: &mut [String],
     prompt: Option<&str>,
@@ -4190,6 +4193,38 @@ impl WrappedCliStepRunner {
                 // Where the arm's time goes, phase by phase (k8s-final): said on the run whether
                 // the seat armed or was refused.
                 crate::k8s::clock::begin();
+                // A claude seat's fence reflects what its container mounts: a host rule over an
+                // ancestor of its own tree (`~/.wicked` above `~/.wicked/repos`) is narrowed to the
+                // other mounted entries there, and the state-home rules are opened around the
+                // run's own declared roots (its deliverable inbox, artifact-runs-fix).
+                let fence_settings = plan.inputs.pinned.first().filter(|_| governed).cloned();
+                let declared: Vec<PathBuf> = input
+                    .governance
+                    .iter()
+                    .flat_map(|g| g.extra_write_roots.iter().chain(g.extra_read_roots.iter()))
+                    .map(PathBuf::from)
+                    .collect();
+                // (core#1461) The settings file is narrowed BEFORE the arm copies it into the
+                // seat's replica: the pod mounts it by subPath, bound to the inode the copy-in
+                // made, so a rewrite after the arm never reached the seat and claude kept the
+                // host fence (`Read(<state home>/interactive-drafts/**)`, `Edit(<state home>/**)`)
+                // over its own draft root.
+                let mut fence_refusal: Option<String> = None;
+                let mut before_copy = |view: &crate::container_floor::MountView| {
+                    if !is_claude {
+                        return Ok(());
+                    }
+                    narrow_container_fence(
+                        &mut [],
+                        Some(prompt.as_str()),
+                        fence_settings.as_deref(),
+                        handed.map(|s| s.root.as_path()),
+                        operational_home,
+                        &declared,
+                        view,
+                    )
+                    .inspect_err(|why| fence_refusal = Some(why.clone()))
+                };
                 let armed = crate::container_floor::arm_noting(
                     &plan.inputs,
                     &argv,
@@ -4200,6 +4235,7 @@ impl WrappedCliStepRunner {
                     Some(prompt.as_str()),
                     gateway_dir.as_deref(),
                     &mut on_built,
+                    &mut before_copy,
                 );
                 if let Some((phases, total_ms)) = crate::k8s::clock::take() {
                     self.emit_event(crate::event::CoreEvent::SeatArmTimed {
@@ -4210,6 +4246,9 @@ impl WrappedCliStepRunner {
                         total_ms,
                         phases,
                     });
+                }
+                if let Some(why) = fence_refusal {
+                    return isolation_refusal(input, &why);
                 }
                 match armed {
                     // The hook route rides the gateway: a claude unit whose relay the gateway
@@ -4225,25 +4264,13 @@ impl WrappedCliStepRunner {
                         );
                     }
                     Ok(mut c) => {
-                        // A claude seat's fence reflects what its container mounts: a host
-                        // rule over an ancestor of its own tree (`~/.wicked` above
-                        // `~/.wicked/repos`) is narrowed to the other mounted entries there.
+                        // The argv half of the same fence (its settings file was narrowed before
+                        // the copy-in, above): the argv rides the unit env at the spawn.
                         if is_claude {
-                            let settings = plan.inputs.pinned.first().filter(|_| governed);
-                            // The run's own declared roots (its deliverable inbox), which the
-                            // state-home fence must not deny the seat (artifact-runs-fix).
-                            let declared: Vec<PathBuf> = input
-                                .governance
-                                .iter()
-                                .flat_map(|g| {
-                                    g.extra_write_roots.iter().chain(g.extra_read_roots.iter())
-                                })
-                                .map(PathBuf::from)
-                                .collect();
                             if let Err(why) = narrow_container_fence(
                                 &mut c.argv,
                                 Some(prompt.as_str()),
-                                settings.map(PathBuf::as_path),
+                                None,
                                 handed.map(|s| s.root.as_path()),
                                 operational_home,
                                 &declared,
