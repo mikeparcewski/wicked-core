@@ -455,7 +455,9 @@ pub(crate) fn active_runs_on_repo(
 /// a JSON file in the checkout (operator ruling 2026-10-31). Same discipline as
 /// [`coverage_report_for_repo`]: the repo resolves from the registry on `daemon`, its
 /// `code_graph_db` opens READ-ONLY. Returns `{ "graph": <domain-model document or null>,
-/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product },
+/// "coverage": { real_pct, min_pct, behavior_bearing, real, placeholders, unmapped, not_product,
+/// weightedPct }, where `weightedPct` is the confidence-weighted share (headline only; optional on the
+/// wire, absent from the persisted build label, and never an input to the gate),
 /// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
 /// "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" | "not_product" |
 /// "unindexed" } } } or null }` — `rows` is the engine's verdict on each listed requirement that
@@ -505,9 +507,18 @@ pub fn requirements_graph_for_repo(
         .as_ref()
         .map(|(_, _, u)| u.clone())
         .unwrap_or_default();
-    let (report, rows) =
+    let (report, rows, weighted_milli) =
         wicked_governance::recompute_front_half_coverage_for_rows(&repo_store, &units)?;
     let coverage = wicked_governance::model_coverage(&report, min_pct);
+    // The confidence-weighted headline rides on the READ only (optional on the wire, never in the
+    // persisted label, which keeps `coverage` typed): older readers ignore the extra key.
+    let mut coverage_read = serde_json::to_value(&coverage)?;
+    if let Some(map) = coverage_read.as_object_mut() {
+        map.insert(
+            "weightedPct".to_string(),
+            serde_json::json!(wicked_governance::weighted_pct(&report, weighted_milli)),
+        );
+    }
     let (graph, build, rows) = match loaded {
         Some((mut graph, build, _)) => {
             wicked_governance::label_domain_graph(&mut graph, &coverage)?;
@@ -535,7 +546,7 @@ pub fn requirements_graph_for_repo(
     let code = built_from.map(|(commit, basis)| code_drift(&repo.root_path, &commit, basis));
     let target = serde_json::json!({ "repo": repo_target, "daemon": daemon_target.ok() });
     Ok(serde_json::json!({
-        "graph": graph, "coverage": coverage, "build": build, "rows": rows, "code": code,
+        "graph": graph, "coverage": coverage_read, "build": build, "rows": rows, "code": code,
         "target": target,
     }))
 }
@@ -3200,9 +3211,23 @@ mod tests {
             moved["coverage"]["real"], 0,
             "the store now (nothing mapped in it)"
         );
+        // `weightedPct` is a read-only headline: the legacy fields still equal the document's label,
+        // and neither the label nor the persisted build coverage ever carries the key.
+        let mut legacy = moved["coverage"].clone();
+        assert!(legacy["weightedPct"].is_number(), "{legacy}");
+        legacy.as_object_mut().unwrap().remove("weightedPct");
         assert_eq!(
-            moved["graph"]["metadata"]["coverage"], moved["coverage"],
+            moved["graph"]["metadata"]["coverage"], legacy,
             "the document still carries the live label, as before"
+        );
+        assert!(moved["build"]["coverage"].get("weightedPct").is_none());
+        let with: wicked_governance::ModelCoverage =
+            serde_json::from_value(moved["coverage"].clone()).unwrap();
+        let without: wicked_governance::ModelCoverage = serde_json::from_value(legacy).unwrap();
+        assert_eq!(with, without, "a reader without the field still parses");
+        assert_eq!(
+            moved["coverage"]["weightedPct"], 100,
+            "an empty denominator reads as the share does: 100"
         );
         assert!(requirements_graph_for_repo(&daemon, db, "no-such-repo").is_err());
 

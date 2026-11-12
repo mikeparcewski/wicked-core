@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The requirements read carries a confidence-weighted headline, `coverage.weightedPct` (core#1445).** The header
+  counted every resolved behaviour as a full 1 (86% shown against 41% strictly true on a measured slice).
+  `weightedPct` is `round(100 × Σ w / denominator)` over the same behaviour-bearing denominator: a human-validated
+  requirement weighs 1.0, a business rule its confidence (at most 1.0), a resolved node with no numeric confidence the
+  resolve threshold, and risk-flagged and unaccounted nodes 0. Each weight is fixed-point, rounded to 1/10,000
+  (`round(10,000 × c)`), and the sum is in integers, so one graph always gives one percent. It is optional on the wire
+  and computed at the read, so older readers still parse and the persisted label is unchanged. `real_pct`,
+  `meets_minimum` and the coverage gate are unchanged.
+
 - **A Stop no longer holds the engine while its worktree is deleted (wicked-core#1429).** On the dev daemon one gate
   answer took 175 s: a Stop cancels the run, and the cancel reaped the run's worktree on the engine's single actor
   thread, deleting its `node_modules` file by file while every other run's reads, gate answers and step results

@@ -722,8 +722,10 @@ fn is_product_node(node: &wicked_apps_core::Node, idx: &BehaviorIndex) -> bool {
 
 /// The bucket a behavior-bearing node falls into for the resolved/risk/unaccounted split.
 enum Bucket {
-    /// Validated requirement OR business_rule ≥ threshold. Carries the mean_confidence contribution.
-    Resolved(Option<f64>),
+    /// Validated requirement OR business_rule ≥ threshold. `conf` is the mean_confidence contribution
+    /// (only a resolved-via-rule node carries one); `validated` is a human-validated requirement, which
+    /// weighs a full 1.0 in the confidence-weighted headline.
+    Resolved { validated: bool, conf: Option<f64> },
     /// Accounted (requirement / business_rule / advisory / risk) but not resolved.
     Risk,
     /// Bare — neither resolved nor risk. The coverage hole.
@@ -775,11 +777,12 @@ fn classify_node(
     }
     // resolved = validated requirement OR a business_rule at/above threshold.
     let rule_resolved = best_rule_conf.is_some_and(|c| c >= threshold);
-    if (has_requirement && requirement_validated) || rule_resolved {
+    let validated = has_requirement && requirement_validated;
+    if validated || rule_resolved {
         // mean_confidence contribution: only a resolved-via-rule node carries a numeric confidence
         // (a requirement carries none — NodeSemantics has no confidence field).
         let conf = if rule_resolved { best_rule_conf } else { None };
-        Ok(Bucket::Resolved(conf))
+        Ok(Bucket::Resolved { validated, conf })
     } else {
         Ok(Bucket::Risk)
     }
@@ -798,7 +801,37 @@ pub fn recompute_front_half_coverage_with(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
 ) -> anyhow::Result<CoverageReport> {
-    recompute_observing(store, cfg, &mut |_, _| Ok(()))
+    recompute_observing(store, cfg, &mut |_, _| Ok(())).map(|(report, _)| report)
+}
+
+/// Fixed-point scale of the confidence-weighted share: a full behaviour weighs `WEIGHT_SCALE`.
+const WEIGHT_SCALE: f64 = 10_000.0;
+
+/// The weight of ONE resolved behaviour in the confidence-weighted headline, in 1/10_000ths: a
+/// human-validated requirement 1.0; a business rule its confidence (capped at 1.0); a resolved node with
+/// no numeric confidence the resolve threshold (conservative). Integers, so the same graph always sums to
+/// the same number. The callers have already refused a confidence or threshold outside [0,1].
+fn weight_milli(validated: bool, conf: Option<f64>, threshold: f64) -> u64 {
+    if validated {
+        return WEIGHT_SCALE as u64;
+    }
+    (conf.unwrap_or(threshold).min(1.0) * WEIGHT_SCALE).round() as u64
+}
+
+/// `round(100 × Σ weight / denominator)`: the confidence-weighted share of the behaviour-bearing
+/// denominator, 100 on an empty one (as [`real_pct`]). `weighted_milli` is the fixed-point sum
+/// [`recompute_front_half_coverage_for_rows`] returns. Headline only, never an input to
+/// [`meets_minimum`] or the gate.
+#[must_use]
+pub fn weighted_pct(report: &CoverageReport, weighted_milli: u128) -> u8 {
+    let den = denominator(report);
+    if den == 0 {
+        return 100;
+    }
+    let scale = WEIGHT_SCALE as u128;
+    // Round half up in integers: (2·sum + den·scale) / (2·den·scale).
+    let pct = (200 * weighted_milli + den * scale) / (2 * den * scale);
+    pct.min(100) as u8
 }
 
 /// Where the coverage share puts one node: counted in its denominator (and whether it resolves, i.e. is
@@ -832,7 +865,7 @@ fn recompute_observing(
     store: &dyn GraphRead,
     cfg: &CoverageConfig,
     observe: &mut dyn FnMut(&wicked_apps_core::Node, UnitClass) -> anyhow::Result<()>,
-) -> anyhow::Result<CoverageReport> {
+) -> anyhow::Result<(CoverageReport, u128)> {
     // Fail-closed on an out-of-schema threshold (the schema constrains resolve_threshold to [0,1]) — the
     // public `..._with` entry point could otherwise emit a schema-invalid report. Mirrors the annotation
     // confidence guard below.
@@ -865,6 +898,7 @@ fn recompute_observing(
     let mut risk_flagged: u64 = 0;
     let mut unaccounted: u64 = 0;
     let mut confidences: Vec<f64> = Vec::new();
+    let mut weighted_milli: u128 = 0;
     let mut unaccounted_nodes: Vec<UnaccountedNode> = Vec::new();
     let mut placeholder_nodes: Vec<UnaccountedNode> = Vec::new();
     let mut not_product: u64 = 0;
@@ -902,11 +936,12 @@ fn recompute_observing(
         observe(
             node,
             UnitClass::Counted {
-                real: matches!(bucket, Bucket::Resolved(_)),
+                real: matches!(bucket, Bucket::Resolved { .. }),
             },
         )?;
         match bucket {
-            Bucket::Resolved(conf) => {
+            Bucket::Resolved { validated, conf } => {
+                weighted_milli += u128::from(weight_milli(validated, conf, cfg.resolve_threshold));
                 resolved += 1;
                 acc.resolved += 1;
                 if let Some(c) = conf {
@@ -999,7 +1034,7 @@ fn recompute_observing(
         }),
     });
 
-    Ok(CoverageReport {
+    let report = CoverageReport {
         total,
         behavior_bearing,
         resolved,
@@ -1014,7 +1049,8 @@ fn recompute_observing(
         requirement_reuse,
         not_product,
         placeholder_nodes,
-    })
+    };
+    Ok((report, weighted_milli))
 }
 
 /// A behaviour-bearing node as the report lists it (`unaccounted_nodes`, `placeholder_nodes`).
@@ -2499,42 +2535,44 @@ pub type ListedRows =
 /// wicked-crew listed 1,458 rows on TypeScript shapes under a header that, since core#1238, counts none of
 /// them, and crew could only guess real from the document, whose synthesized fallback rule hides a
 /// risk-only unit.) A unit the store no longer holds is [`Uncounted::Unindexed`]. A requirement with no
-/// recorded unit (a build before `code_symbol`) has no verdict: no claim either way.
+/// recorded unit (a build before `code_symbol`) has no verdict: no claim either way. The third value is
+/// the fixed-point weight sum behind [`weighted_pct`], taken from the same pass.
 pub fn recompute_front_half_coverage_for_rows(
     store: &dyn GraphRead,
     units: &RequirementUnits,
-) -> anyhow::Result<(CoverageReport, ListedRows)> {
+) -> anyhow::Result<(CoverageReport, ListedRows, u128)> {
     let wanted: std::collections::HashSet<&str> = units
         .values()
         .flat_map(|reqs| reqs.values().map(String::as_str))
         .collect();
     let threshold = CoverageConfig::default().resolve_threshold;
     let mut seen: std::collections::HashMap<String, ListedRow> = std::collections::HashMap::new();
-    let report = recompute_observing(store, &CoverageConfig::default(), &mut |node, class| {
-        let sym = node.symbol.as_str();
-        if !wanted.contains(sym) {
-            return Ok(());
-        }
-        let row = match class {
-            UnitClass::Counted { real } => ListedRow {
-                real,
-                uncounted: None,
-                code_mismatch: code_mismatch_of(store, &node.symbol)?,
-            },
-            // Not counted: still say whether a rule was stated there, by the same classifier.
-            UnitClass::Uncounted(why) => {
-                let semantics = store.node_semantics(&node.symbol)?;
-                let bucket = classify_node(store, node, threshold, semantics.as_ref())?;
-                ListedRow {
-                    real: matches!(bucket, Bucket::Resolved(_)),
-                    uncounted: Some(why),
-                    code_mismatch: code_mismatch_of(store, &node.symbol)?,
-                }
+    let (report, weighted_milli) =
+        recompute_observing(store, &CoverageConfig::default(), &mut |node, class| {
+            let sym = node.symbol.as_str();
+            if !wanted.contains(sym) {
+                return Ok(());
             }
-        };
-        seen.insert(sym.to_string(), row);
-        Ok(())
-    })?;
+            let row = match class {
+                UnitClass::Counted { real } => ListedRow {
+                    real,
+                    uncounted: None,
+                    code_mismatch: code_mismatch_of(store, &node.symbol)?,
+                },
+                // Not counted: still say whether a rule was stated there, by the same classifier.
+                UnitClass::Uncounted(why) => {
+                    let semantics = store.node_semantics(&node.symbol)?;
+                    let bucket = classify_node(store, node, threshold, semantics.as_ref())?;
+                    ListedRow {
+                        real: matches!(bucket, Bucket::Resolved { .. }),
+                        uncounted: Some(why),
+                        code_mismatch: code_mismatch_of(store, &node.symbol)?,
+                    }
+                }
+            };
+            seen.insert(sym.to_string(), row);
+            Ok(())
+        })?;
     let mut out = ListedRows::new();
     for (domain, reqs) in units {
         for (req, sym) in reqs {
@@ -2548,7 +2586,7 @@ pub fn recompute_front_half_coverage_for_rows(
                 .insert(req.clone(), row);
         }
     }
-    Ok((report, out))
+    Ok((report, out, weighted_milli))
 }
 
 enum Loaded {
@@ -3048,6 +3086,15 @@ mod tests {
         // Round-trips back to an equal JSON value (serde symmetry; schema conformance is proven by
         // the integration test in tests/domain_model_schema.rs which validates against the schema).
         assert_eq!(serde_json::to_value(&model).unwrap(), json);
+    }
+
+    #[test]
+    fn weight_milli_is_one_for_validated_c_for_a_rule_and_the_threshold_without_one() {
+        assert_eq!(weight_milli(true, Some(0.2), 0.75), 10_000);
+        assert_eq!(weight_milli(false, Some(0.8), 0.75), 8_000);
+        assert_eq!(weight_milli(false, None, 0.75), 7_500);
+        assert_eq!(weight_milli(false, None, 0.6), 6_000);
+        assert_eq!(weight_milli(false, Some(1.0), 0.75), 10_000);
     }
 
     /// Operator ruling 2026-10-31: the gate is the CONFIGURED MINIMUM (default 80%), compared in
@@ -3786,6 +3833,92 @@ mod tests {
                         .with_author(author),
                 )
                 .unwrap();
+        }
+
+        /// A business rule at `conf` only (no requirement), so the node resolves by rule alone.
+        fn rule(store: &mut SqliteStore, n: &Node, conf: f64) {
+            store
+                .annotate(
+                    &n.symbol,
+                    Annotation::new("business_rule", "RULE-W", format!("{} holds", n.name))
+                        .with_confidence(conf)
+                        .with_provenance("extract-loop")
+                        .with_author("seat-1"),
+                )
+                .unwrap();
+        }
+
+        fn weighted(store: &SqliteStore) -> (CoverageReport, u128) {
+            recompute_observing(store, &CoverageConfig::default(), &mut |_, _| Ok(())).unwrap()
+        }
+
+        /// core#1445: validated = 1.0 (a rule on the same node does not lower it), a rule weighs its
+        /// confidence, risk-only and bare nodes weigh 0 but stay in the denominator.
+        #[test]
+        fn weighted_share_validated_rule_risk_and_bare() {
+            let mut s = store();
+            let validated = node(&mut s, "v", NodeKind::Function, "pkg/ops.rs");
+            let ruled = node(&mut s, "r", NodeKind::Function, "pkg/ops.rs");
+            let risky = node(&mut s, "k", NodeKind::Function, "pkg/ops.rs");
+            let _bare = node(&mut s, "b", NodeKind::Function, "pkg/ops.rs");
+            s.set_node_semantics(
+                &validated.symbol,
+                None,
+                Some("v holds"),
+                Some(&ValidationClaim::new(true, "test-fixture").unwrap()),
+            )
+            .unwrap();
+            rule(&mut s, &validated, 0.8);
+            rule(&mut s, &ruled, 0.8);
+            s.annotate(
+                &risky.symbol,
+                Annotation::new("risk", "r", "unverified").with_confidence(0.9),
+            )
+            .unwrap();
+            let (r, sum) = weighted(&s);
+            assert_eq!(sum, 18_000, "10_000 validated + 8_000 rule");
+            assert_eq!((weighted_pct(&r, sum), real_pct(&r)), (45, 50));
+            // Structural and non-product nodes stay out of the denominator.
+            node(&mut s, "Shape", NodeKind::Struct, "package.json");
+            node(&mut s, "t", NodeKind::Function, "tests/ops_test.rs");
+            let (r, sum2) = weighted(&s);
+            assert_eq!((sum2, weighted_pct(&r, sum2)), (18_000, 45));
+        }
+
+        #[test]
+        fn weighted_share_rounds_and_does_not_depend_on_insertion_order() {
+            let build = |order: &[(&str, f64)]| {
+                let mut s = store();
+                for (name, c) in order {
+                    let n = node(&mut s, name, NodeKind::Function, "pkg/ops.rs");
+                    rule(&mut s, &n, *c);
+                }
+                let (r, sum) = weighted(&s);
+                (sum, weighted_pct(&r, sum))
+            };
+            assert_eq!(build(&[("a", 0.805)]), (8_050, 81));
+            let one = build(&[("a", 0.9), ("b", 0.8), ("c", 0.75)]);
+            let two = build(&[("c", 0.75), ("a", 0.9), ("b", 0.8)]);
+            assert_eq!(one, two);
+            assert_eq!(one.0, 24_500);
+        }
+
+        #[test]
+        fn weighted_share_is_a_headline_not_the_gate() {
+            let mut s = store();
+            for name in ["a", "b"] {
+                let n = node(&mut s, name, NodeKind::Function, "pkg/ops.rs");
+                rule(&mut s, &n, 0.75);
+            }
+            let (r, sum) = weighted(&s);
+            assert_eq!((weighted_pct(&r, sum), real_pct(&r)), (75, 100));
+            assert!(meets_minimum(&r, 100));
+            assert_eq!(weighted(&store()).1, 0);
+            assert_eq!(
+                weighted_pct(&weighted(&store()).0, 0),
+                100,
+                "empty denominator"
+            );
         }
 
         fn build_at(store: &SqliteStore, min: u8) -> DomainModel {
@@ -5063,7 +5196,7 @@ mod tests {
                 5,
                 "every row with a code_symbol: {units:?}"
             );
-            let (report, rows) = recompute_front_half_coverage_for_rows(&s, &units).unwrap();
+            let (report, rows, _) = recompute_front_half_coverage_for_rows(&s, &units).unwrap();
             assert_eq!(report, cov(&s), "the same report as the plain recompute");
             assert_eq!(
                 (
