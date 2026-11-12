@@ -2,18 +2,18 @@
   "date": "2026-08-30 01:37:40 UTC",
   "estate_rev": "25974355f96861e6d5c50f3ce2c37d6fb2223a5a",
   "binaries": {
-    "wicked-core": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/target-aw13-seed/debug/wicked-core",
-    "wicked-estate": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate",
-    "wicked-estate-mcp": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate-mcp",
+    "wicked-core": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/target-aw13-seed/debug/wicked-core",
+    "wicked-estate": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate",
+    "wicked-estate-mcp": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/estate-prefix/bin/wicked-estate-mcp",
     "note": "released versions recorded in versions.txt beside this file"
   },
   "stores": {
-    "enforcement": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
-    "discovery": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db",
-    "knowledge": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db",
-    "memory": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/memory.db",
-    "xedge": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/xedge.db",
-    "events": "/private/tmp/claude-501/-Users-<user>-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/events.db"
+    "enforcement": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/enforcement.db",
+    "discovery": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/discovery-graph.db",
+    "knowledge": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/knowledge.db",
+    "memory": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/memory.db",
+    "xedge": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/xedge.db",
+    "events": "/private/tmp/claude-501/-Users-michael-parcewski-Projects-wicked/f5d30481-90ff-4c55-9faa-abdb54e1619c/scratchpad/wave4/aw13-scratch/events.db"
   },
   "rules_recalled": 40,
   "seed_rule_ids_verified": [
