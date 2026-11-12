@@ -278,10 +278,7 @@ pub fn validate_event_type(s: &str) -> bool {
         }
         segments += 1;
     }
-    if segments != 3 {
-        return false;
-    }
-    true
+    segments == 3
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

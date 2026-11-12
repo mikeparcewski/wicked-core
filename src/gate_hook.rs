@@ -879,8 +879,86 @@ fn is_shell_call(context: &serde_json::Value, tool: &str) -> bool {
 /// (the wrapped carrier's per-attempt sidecar), or from `cwd` when there is none, and the estate
 /// shim rule (issue #463) with `estate_store_pinned` — whether the WORKER's environment pins the
 /// store ([`ESTATE_STORE_PIN_ENV`]); a parameter, like the roots, so both carriers judge alike.
+///
+/// (fix-multiline-cd, run 8e0ffbec) A Bash write refused only because its leading `cd` is not
+/// chained (`cd <dir>` then a line break or `;`: if the `cd` fails, the rest runs in the shell's
+/// previous directory) is still refused, but ADVISORY, with the remedy: the command with `&&` in
+/// place of that one separator ([`leading_cd_unchained`]) passes every check. Nothing runs either
+/// way; the seat is told to chain the `cd` and is not failed for the first spelling.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn boundary_denial_tracked(
+    roots: &crate::path_policy::AllowedRoots,
+    cwd: &std::path::Path,
+    home: Option<&std::path::Path>,
+    claude_config_dir: Option<&std::path::Path>,
+    context: &serde_json::Value,
+    tool: &str,
+    install_state: Option<&std::path::Path>,
+    estate_store_pinned: bool,
+    graph_store: &[std::path::PathBuf],
+) -> Option<(String, bool)> {
+    let judge = |context: &serde_json::Value| {
+        boundary_denial_judged(
+            roots,
+            cwd,
+            home,
+            claude_config_dir,
+            context,
+            tool,
+            install_state,
+            estate_store_pinned,
+            graph_store,
+        )
+    };
+    let verdict = judge(context);
+    if !matches!(verdict, Some((_, true))) || !is_shell_call(context, tool) {
+        return verdict;
+    }
+    let Some(command) = context.get("command").and_then(serde_json::Value::as_str) else {
+        return verdict;
+    };
+    let home_for_cd = home.filter(|_| !command_may_set_home(command));
+    let Some((rewritten, dest)) = leading_cd_unchained(command, home_for_cd) else {
+        return verdict;
+    };
+    let length = rewritten.len();
+    let mut chained = context.clone();
+    chained["command"] = serde_json::Value::String(rewritten);
+    // The rewrite is judged with the whole scan budget, and only a judgement no scan of which
+    // can have been cut short counts (codex on fix-multiline-cd: a rewrite past the budget lost
+    // an `env -C` cwd).
+    let (rejudged, spent) = with_fresh_scan_budget(|| judge(&chained));
+    if rejudged.is_some() || spent + 2 * length > MAX_SHELL_SCAN_BYTES {
+        return verdict;
+    }
+    Some((
+        format!(
+            "{UNCHAINED_CD_REASON_PREFIX} the leading `cd {dest}` ends at a line break or `;`, so \
+             if it fails the rest runs in the shell's previous directory, outside the unit \
+             boundary. Chain it: put ` && ` in place of that line break or `;` (`cd {dest} && \
+             cat > file <<'EOF'` with the body below is fine), or write to absolute paths"
+        ),
+        false,
+    ))
+}
+
+/// `f` run with the shell-scan budget of a fresh session, the caller's restored after: a second
+/// judgement must not see less of a command than the first one did.
+/// Also returns the bytes `f` charged: when that plus twice the longest text it scanned exceeds
+/// the budget, a scan may have been cut short.
+fn with_fresh_scan_budget<T>(f: impl FnOnce() -> T) -> (T, usize) {
+    let outer = SHELL_SCAN.with(|slot| slot.replace(Some(ShellScanState::default())));
+    let out = f();
+    let spent = SHELL_SCAN.with(|slot| slot.get().map_or(0, |state| state.bytes));
+    SHELL_SCAN.with(|slot| slot.set(outer));
+    (out, spent)
+}
+
+/// The reason prefix of an unchained-`cd` refusal ([`boundary_denial_tracked`]).
+pub(crate) const UNCHAINED_CD_REASON_PREFIX: &str = "Bash write refused (advisory):";
+
+#[allow(clippy::too_many_arguments)]
+fn boundary_denial_judged(
     roots: &crate::path_policy::AllowedRoots,
     cwd: &std::path::Path,
     home: Option<&std::path::Path>,
@@ -1064,6 +1142,19 @@ pub(crate) fn boundary_denial_tracked(
             // escapes applied, `~`/`$HOME` expanded ([`resolved_bash_write_targets`]); judging the
             // spelled word let `> "/outside/f"` resolve under the cwd and pass.
             let writes = resolved_bash_write_targets(command, home);
+            // A full candidate set may have dropped the cwd a write lands in (codex on
+            // fix-multiline-cd): a write after more directory changes than the scan follows is
+            // refused, not judged on what was left.
+            if candidates.len() >= MAX_SHELL_CWD_CANDIDATES && !writes.is_empty() {
+                return Some((
+                    format!(
+                        "Bash write refused: the command changes directory in more places than \
+                         the scan follows ({MAX_SHELL_CWD_CANDIDATES}), so where its writes land \
+                         cannot be judged; split it into smaller calls"
+                    ),
+                    true,
+                ));
+            }
             let mut advisory: Option<String> = None;
             for (target, base) in writes
                 .iter()
@@ -1551,18 +1642,63 @@ pub(crate) fn bash_write_phase_scope(
 /// boundary versus the old whole-token tokenizer (Copilot review on #228). So a `\`-escaped operator and
 /// any operator inside `'…'`/`"…"` are kept verbatim in the current token — split only the bare ones.
 ///
+/// (core#1465) A bare line break ends a command as `;` does, so it is the token `;` (a heredoc's
+/// header and body lines keep today's whitespace reading: the body is the program's data), and a
+/// glued control operator (`-&&sed`, `true||x`, `a|tee f`, `x&y`) is split off as its own token.
+/// The redirect spellings `>&`, `<&`, `>|` and `&>` stay inside their word, as the redirect scans
+/// read them. Comments are not modelled: a `#` and the words after it stay tokens, so a comment
+/// can add a refused target but never hide one; a glued operator inside a comment is split too,
+/// an accepted false refusal. A command holding `${`, `$[`, a backtick or `$'` keeps the
+/// whitespace-only reading of line breaks and glued operators: those contexts may hold either as
+/// data, and this lexer does not track them.
+///
 /// The tokens keep their quotes and escapes: they are WORDS as spelled. A write target taken from
 /// them is judged only after [`resolve_shell_word`] reads it as the shell will (core#922).
 fn shell_tokens(command: &str) -> Vec<String> {
-    shell_tokens_with_operators(command, false)
+    lex_shell_tokens(command, false, &heredoc_lines(command))
+}
+
+/// [`shell_tokens`] of a `command` whose heredoc bodies were blanked from `original` (same lines):
+/// the heredoc lines are found in `original`, where the closing delimiter is still spelled.
+fn shell_tokens_blanked(command: &str, original: &str) -> Vec<String> {
+    lex_shell_tokens(command, false, &heredoc_lines(original))
 }
 
 /// Reads need argument boundaries even beside glued input redirects and sequence operators.
 /// Keep the write scan's token spelling intact while sharing its quote/escape lexer (core#951).
 fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<String> {
+    lex_shell_tokens(command, split_operators, &[])
+}
+
+/// The lexer behind [`shell_tokens`] and [`shell_tokens_with_operators`]. `heredoc` lists the
+/// lines (0-based, sorted) whose line break ends a heredoc header or body line, where no command
+/// ends; it is read only when `split_operators` is false.
+fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
-    let mut chars = command.chars().peekable();
+    // (core#1465) Which line a line break ends: its index among all of them.
+    let breaks: Vec<usize> = if split_operators {
+        Vec::new()
+    } else {
+        command.match_indices('\n').map(|(at, _)| at).collect()
+    };
+    let in_heredoc = |at: usize| {
+        breaks
+            .binary_search(&at)
+            .is_ok_and(|line| heredoc.binary_search(&line).is_ok())
+    };
+    // A heredoc's body (or closing delimiter) line: the line before it ends inside the heredoc.
+    // Its text is the program's data, read as before: no glued operator is split there.
+    let in_body = |at: usize| {
+        let line = breaks.partition_point(|b| *b < at);
+        line > 0 && heredoc.binary_search(&(line - 1)).is_ok()
+    };
+    // A `${…}` operand, `$[…]` arithmetic, a backtick substitution or a `$'…'` string may hold a
+    // line break or `||` that is not a separator of the outer command (`rm -- -${X:-a|| ../f}`
+    // removes `../f`), and this lexer does not track those contexts: a command holding any of
+    // them keeps the whitespace-only reading of both (codex r5, r6).
+    let expansion = !split_operators && ["${", "$[", "`", "$'"].iter().any(|t| command.contains(t));
+    let mut chars = command.char_indices().map(|(at, c)| (c, at)).peekable();
     let mut in_single = false;
     let mut in_double = false;
     let flush = |cur: &mut String, out: &mut Vec<String>| {
@@ -1570,7 +1706,7 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
             out.push(std::mem::take(cur));
         }
     };
-    while let Some(ch) = chars.next() {
+    while let Some((ch, at)) = chars.next() {
         if in_single {
             // Single quotes are fully literal — not even `\` escapes; only a closing `'` ends them.
             cur.push(ch);
@@ -1582,14 +1718,14 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
         if ch == '\\' {
             // (core#922 review) A backslash-newline is a LINE CONTINUATION, removed before the
             // shell splits words (outside single quotes): it is no character of any word.
-            if chars.peek() == Some(&'\n') {
+            if chars.peek().map(|p| p.0) == Some('\n') {
                 chars.next();
                 continue;
             }
             // Backslash escapes the next char: keep BOTH verbatim so an escaped `;`/`(`/`)` stays a
             // literal path byte, exactly as the pre-split whole-token tokenizer delivered it.
             cur.push(ch);
-            if let Some(next) = chars.next() {
+            if let Some((next, _)) = chars.next() {
                 cur.push(next);
             }
             continue;
@@ -1613,14 +1749,14 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
             }
             '#' if split_operators && cur.is_empty() => {
                 // A comment is not a command's argument stream, including paths in it.
-                for c in chars.by_ref() {
+                for (c, _) in chars.by_ref() {
                     if c == '\n' {
                         break;
                     }
                 }
                 out.push(";".to_string());
             }
-            '\n' if split_operators => {
+            '\n' if split_operators || !(expansion || in_heredoc(at)) => {
                 flush(&mut cur, &mut out);
                 out.push(";".to_string());
             }
@@ -1633,19 +1769,43 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
                     String::new()
                 };
                 op.push(c);
-                if chars.peek().is_some_and(|n| {
+                if chars.peek().is_some_and(|&(n, _)| {
                     matches!(
-                        (c, *n),
+                        (c, n),
                         ('<', '<' | '>' | '&')
                             | ('>', '>' | '|' | '&')
                             | ('&', '&' | '>')
                             | ('|', '|' | '&')
                     )
                 }) {
-                    op.push(chars.next().unwrap());
-                    if op == "<<" && chars.peek() == Some(&'<') {
-                        op.push(chars.next().unwrap());
+                    op.push(chars.next().unwrap().0);
+                    if op == "<<" && chars.peek().map(|p| p.0) == Some('<') {
+                        op.push(chars.next().unwrap().0);
                     }
+                }
+                out.push(op);
+            }
+            // (core#1465) A glued control operator ends the word before it. `>&`/`<&`/`>|` finish
+            // the redirect operator in `cur`; `&>`/`&>>` start a redirect word of their own.
+            c @ ('&' | '|') => {
+                let redirect = cur.strip_suffix(['>', '<']).is_some_and(|before| {
+                    before.chars().rev().take_while(|b| *b == '\\').count() % 2 == 0
+                });
+                if redirect || expansion || in_body(at) {
+                    cur.push(c);
+                    continue;
+                }
+                flush(&mut cur, &mut out);
+                if c == '&' && chars.peek().map(|p| p.0) == Some('>') {
+                    cur.push(c);
+                    continue;
+                }
+                let mut op = c.to_string();
+                if chars
+                    .peek()
+                    .is_some_and(|&(n, _)| matches!((c, n), ('&', '&') | ('|', '|' | '&')))
+                {
+                    op.push(chars.next().unwrap().0);
                 }
                 out.push(op);
             }
@@ -1657,6 +1817,53 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
         }
     }
     flush(&mut cur, &mut out);
+    out
+}
+
+/// (core#1465) The lines (0-based, sorted) whose line break ends a heredoc's header line or one of
+/// its body lines (any receiver). The closing delimiter line is not one of them (unless another
+/// heredoc of the same header follows): the next command starts after it. Only a plain delimiter
+/// ([`plain_heredoc_word`]) is read; any other spelling (`$'E'`, `E'O'F`) might close where this
+/// scan does not, so its line breaks stay separators.
+fn heredoc_lines(command: &str) -> Vec<usize> {
+    let lines: Vec<&str> = command.split('\n').collect();
+    let last = lines.len().saturating_sub(1);
+    let mut out = Vec::new();
+    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    let mut i = 0usize;
+    while i < lines.len() {
+        let line = lines[i];
+        if let Some((delim, dash)) = pending.front() {
+            let probe = if *dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if probe == delim {
+                pending.pop_front();
+                if !pending.is_empty() {
+                    out.push(i);
+                }
+            } else {
+                out.push(i);
+            }
+            i += 1;
+            continue;
+        }
+        let mut header = line.to_string();
+        while header.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 && i < last {
+            i += 1;
+            header.push('\n');
+            header.push_str(lines[i]);
+        }
+        let found = heredocs_in(&header, true, false);
+        if !found.is_empty() && found.iter().all(|h| plain_heredoc_word(&h.word)) {
+            out.push(i);
+            pending.extend(found.into_iter().map(|h| (h.delim, h.dash)));
+        }
+        i += 1;
+    }
+    out.retain(|line| *line < last);
     out
 }
 
@@ -1696,7 +1903,7 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
     heredocs_on(line, false)
         .into_iter()
         .next()
-        .map(|(delim, dash, _)| (delim, dash))
+        .map(|h| (h.delim, h.dash))
 }
 
 // Shell/interpreter heredocs are scripts; other receivers get data, including multiple bodies.
@@ -1726,7 +1933,11 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
                 header.push('\n');
                 header.push_str(next);
             }
-            pending.extend(heredocs_on(&header, true));
+            pending.extend(
+                heredocs_on(&header, true)
+                    .into_iter()
+                    .map(|h| (h.delim, h.dash, h.executable)),
+            );
             out.push(header);
         }
     }
@@ -1782,7 +1993,65 @@ fn heredoc_runs_script(header: &str, operator: usize) -> bool {
     }
 }
 
-fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool, bool)> {
+/// The text of the word `rest` starts with: up to its first blank or operator character outside
+/// quotes (a backslash escapes one character), the span a shell lexer reads as the word.
+fn delimiter_word(rest: &str) -> &str {
+    let (mut sq, mut dq, mut escaped) = (false, false, false);
+    for (at, c) in rest.char_indices() {
+        if escaped {
+            escaped = false;
+        } else if sq {
+            sq = c != '\'';
+        } else if c == '\\' {
+            escaped = true;
+        } else if dq {
+            dq = c != '"';
+        } else if c == '\'' {
+            sq = true;
+        } else if c == '"' {
+            dq = true;
+        } else if c.is_whitespace() || matches!(c, ';' | '|' | '&' | '<' | '>' | '(' | ')') {
+            return &rest[..at];
+        }
+    }
+    rest
+}
+
+/// A heredoc delimiter spelled so every reader agrees where its body ends: a plain word, bare or
+/// wholly quoted (`EOF`, `'EOF'`, `"EOF"`, `\EOF`).
+fn plain_heredoc_word(word: &str) -> bool {
+    let plain = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    plain(word)
+        || [('\'', '\''), ('"', '"')].iter().any(|(open, close)| {
+            word.strip_prefix(*open)
+                .and_then(|w| w.strip_suffix(*close))
+                .is_some_and(plain)
+        })
+        || word.strip_prefix('\\').is_some_and(plain)
+}
+
+/// One heredoc operator on a header line ([`heredocs_in`]).
+struct Heredoc {
+    /// The delimiter after quote removal.
+    delim: String,
+    /// `<<-`: leading tabs are stripped from the body and the delimiter line.
+    dash: bool,
+    /// A script program reads the body (read scan with classification only).
+    executable: bool,
+    /// The delimiter word as spelled.
+    word: String,
+    /// The delimiter word starts quoted or escaped (`'E'`, `"E"`, `\E`): the body is literal.
+    quoted: bool,
+}
+
+fn heredocs_on(line: &str, read_scan: bool) -> Vec<Heredoc> {
+    heredocs_in(line, read_scan, read_scan)
+}
+
+/// Each heredoc operator on `line`. `classify` asks whether a script program reads each body,
+/// a nested scan charged to the shell-scan budget: a caller that only needs where bodies are
+/// passes `false`.
+fn heredocs_in(line: &str, read_scan: bool, classify: bool) -> Vec<Heredoc> {
     let b = line.as_bytes();
     let (mut i, mut sq, mut dq) = (0usize, false, false);
     let mut found = Vec::new();
@@ -1826,7 +2095,8 @@ fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool, bool)> {
             }
             let rest = &line[j..];
             let word: String = if read_scan {
-                shell_tokens_with_operators(rest, true)
+                // Lex only the next word, not the rest of the line once per operator.
+                shell_tokens_with_operators(delimiter_word(rest), true)
                     .into_iter()
                     .next()
                     .unwrap_or_default()
@@ -1854,13 +2124,15 @@ fn heredocs_on(line: &str, read_scan: bool) -> Vec<(String, bool, bool)> {
                 .map(program_basename);
             // …and only when its output is not piped on (`cat <<'EOF' | sh` runs the body).
             let piped_on = line[i..].contains('|');
-            if (read_scan && !word.is_empty())
-                || (!delim.is_empty()
-                    && quoted
-                    && !piped_on
-                    && matches!(program, Some("cat" | "tee")))
-            {
-                found.push((delim, dash, read_scan && heredoc_runs_script(line, i)));
+            let data_sink = !piped_on && matches!(program, Some("cat" | "tee"));
+            if (read_scan && !word.is_empty()) || (!delim.is_empty() && quoted && data_sink) {
+                found.push(Heredoc {
+                    executable: classify && heredoc_runs_script(line, i),
+                    delim,
+                    dash,
+                    word: word.clone(),
+                    quoted,
+                });
             }
             i = j + word.len();
             continue;
@@ -2465,26 +2737,80 @@ const MAX_SHELL_CWD_CANDIDATES: usize = 64;
 /// (core#1461) The one directory every later part of `command` runs in, when the text settles it:
 /// the command opens with `cd <word>` joined by `&&`, the word resolves to ONE absolute path, and
 /// nothing in the command can run after a failed `cd` (no `;`, `||`, `&`, `|&` or line break
-/// anywhere, quoted text aside). If that `cd` fails, the `&&` chain stops and nothing else runs; if
-/// it succeeds, everything after it starts there. So the cwd the seat's shell stood in before the
-/// call (the unit cwd, the tracked sidecar cwd, the call's own cwd) is no base for a later
-/// relative path. Run 12a50f95: `cd <draft root> && sed -i … deck.html` was judged against the
-/// skills snapshot an earlier call had `cd`-ed into, and the unit was denied. The `cd` itself is
-/// still judged by the `cd` fence. `None` for every other shape: all candidates stay.
+/// outside quotes, except the lines of a plain data heredoc: `cd <dir> && cat > f <<'EOF'` with
+/// its body). If that `cd` fails, the `&&` chain stops and nothing else runs; if it succeeds,
+/// everything after it starts there. So the cwd the seat's shell stood in before the call (the
+/// unit cwd, the tracked sidecar cwd, the call's own cwd) is no base for a later relative path.
+/// Run 12a50f95: `cd <draft root> && sed -i … deck.html` was judged against the skills snapshot an
+/// earlier call had `cd`-ed into, and the unit was denied. The `cd` itself is still judged by the
+/// `cd` fence. `None` for every other shape: all candidates stay.
 fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
-    // Only the blanks the shell splits on (a no-break space or a form feed is part of a word to
-    // the shell, not to this tokenizer), and no line break (it ends the `&&` chain).
+    leading_cd(command, home).and_then(|(dir, chained)| chained.then_some(dir))
+}
+
+/// (fix-multiline-cd, run 8e0ffbec) `command` with the separator right after its leading `cd <dir>`
+/// (a line break or `;`) made `&&`, and the `cd` word as spelled, when that one change is all that
+/// keeps the `cd` from settling where the rest runs: the rewrite passes [`leading_cd_dominates`]
+/// and the original does not. Nothing proves the unchained `cd` succeeds (on a pod seat the
+/// directory is a replica the host cannot inspect), so the original stays refused; the rewrite
+/// only lets the refusal name its remedy.
+fn leading_cd_unchained(command: &str, home: Option<&Path>) -> Option<(String, String)> {
+    if leading_cd_dominates(command, home).is_some() {
+        return None;
+    }
+    let start = command.len() - command.trim_start_matches([' ', '\t']).len();
+    let after_cd = command[start..].strip_prefix("cd")?;
+    let blanks = after_cd.len() - after_cd.trim_start_matches([' ', '\t']).len();
+    if blanks == 0 {
+        return None;
+    }
+    let dest_at = start + 2 + blanks;
+    let dest = delimiter_word(&command[dest_at..]);
+    let mut at = dest_at + dest.len();
+    at += command[at..].len() - command[at..].trim_start_matches([' ', '\t']).len();
+    let rewritten = match command[at..].chars().next()? {
+        '\n' => format!("{} && {}", &command[..at], &command[at + 1..]),
+        ';' if !command[at + 1..].starts_with([';', '&']) => {
+            format!("{} &&{}", &command[..at], &command[at + 1..])
+        }
+        _ => return None,
+    };
+    leading_cd_dominates(&rewritten, home)?;
+    Some((rewritten, dest.to_string()))
+}
+
+/// The leading `cd` of `command` and whether it is chained by `&&` with nothing that can run past
+/// a failed `cd`. `None` unless the `cd` names ONE absolute directory and nothing after it can
+/// move the shell or name where it was (see the checks below).
+fn leading_cd(command: &str, home: Option<&Path>) -> Option<(PathBuf, bool)> {
+    // Only the blanks the shell splits on (a no-break space, a form feed or a carriage return is
+    // part of a word to the shell, not to this tokenizer).
     if command
         .chars()
-        .any(|c| c.is_whitespace() && c != ' ' && c != '\t')
+        .any(|c| c.is_whitespace() && !matches!(c, ' ' | '\t' | '\n'))
     {
         return None;
     }
-    let toks = shell_tokens_with_operators(command, true);
-    let [cd, dest, and, rest @ ..] = toks.as_slice() else {
+    // A data heredoc's body is no command; past a line break, only plain ones are understood.
+    let script = if command.contains('\n') {
+        data_heredocs_removed(command)?
+    } else {
+        command.to_string()
+    };
+    let toks = shell_tokens_with_operators(&script, true);
+    // A quoted string across a line break: what follows its quote is text, not commands.
+    if toks.iter().any(|t| t.contains('\n')) {
+        return None;
+    }
+
+    let [cd, dest, sep, rest @ ..] = toks.as_slice() else {
         return None;
     };
-    if cd != "cd" || and != "&&" || dest.starts_with('-') || redirect_glob(dest).is_some() {
+    if cd != "cd"
+        || !matches!(sep.as_str(), "&&" | ";")
+        || dest.starts_with('-')
+        || redirect_glob(dest).is_some()
+    {
         return None;
     }
     let readings = resolve_shell_readings(dest, home)?;
@@ -2494,23 +2820,26 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
     if !Path::new(only).is_absolute() || only.contains(OPAQUE_EXPANSION) {
         return None;
     }
+    const RUNS_AFTER_FAILED_CD: [&str; 7] = [";", "||", "&", "|&", ";;", ";&", ";;&"];
+    let chained = sep == "&&"
+        && !rest
+            .iter()
+            .any(|t| RUNS_AFTER_FAILED_CD.contains(&t.as_str()));
     // Nothing after the `cd` may start another shell (its startup files, `-c` strings and `$`
     // expansions may move it anywhere), or move this one or name where it was, in any word as the
     // shell reads it and in every token of that reading as a shell would split it again (a string
     // an `eval` or `trap` reads): no `cd`/`chdir`/`pushd`/`popd`, no `OLDPWD`, no startup code
     // (`BASH_ENV`, `ENV`), no `.`/`source`/`eval`/`trap` or the wrappers that reach them, and no
     // quote, backslash or backtick left for a next reading. A word the text cannot resolve (a
-    // variable, `$(…)`, a glob) could be any of them. Each of these keeps every candidate.
+    // variable, `$(…)`, a glob, `~-`) could be any of them. Each of these keeps every candidate.
     const MOVES: [&str; 7] = ["cd", "chdir", "pushd", "popd", "OLDPWD", "BASH_ENV", "ENV"];
     const REREAD: [&str; 7] = [".", "source", "eval", "trap", "builtin", "command", "exec"];
     const SHELLS: [&str; 9] = [
         "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox", "fish",
     ];
     for t in rest {
-        if matches!(t.as_str(), ";" | "||" | "&" | "|&" | ";;" | ";&" | ";;&") {
-            return None;
-        }
-        if matches!(t.as_str(), "&&" | "|" | "(" | ")" | "!" | "{" | "}")
+        if RUNS_AFTER_FAILED_CD.contains(&t.as_str())
+            || matches!(t.as_str(), "&&" | "|" | "(" | ")" | "!" | "{" | "}")
             || redirect_glob(t).is_some()
             || t.starts_with('<')
         {
@@ -2530,11 +2859,96 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
             }
         }
     }
-    Some(crate::path_policy::normalize_for_fence(
-        only,
-        Path::new("/"),
-        home,
-    ))
+    let dir = crate::path_policy::normalize_for_fence(only, Path::new("/"), home);
+    // Where the kernel stands once the `cd` succeeds: a later `../x` climbs from the directory a
+    // link resolves to, not from the link's spelling (`cd <root>/self && … > ../x`).
+    let dir = if cfg!(unix) {
+        std::fs::canonicalize(&dir).unwrap_or(dir)
+    } else {
+        dir
+    };
+    Some((dir, chained))
+}
+
+/// `command` with the body and closing line of every heredoc removed, so the header line runs on
+/// into what follows the body as the shell reads it, or `None` unless every heredoc is plain data
+/// the shell runs nothing from. A header is one physical line (no continuation anywhere) holding
+/// exactly one `<<` and no `(`, `)`, `|`, `$` or backtick (where `<<` may be a shift, a pattern or
+/// text, or the body may reach a program); the program it feeds is `cat` or `tee`; its delimiter is
+/// a plain word, bare or wholly quoted (`EOF`, `'EOF'`, `"EOF"`, `\EOF`); and an unquoted body
+/// holds no `$`, backtick or backslash (nothing is expanded there). A heredoc never closed is
+/// refused too.
+fn data_heredocs_removed(command: &str) -> Option<String> {
+    if command.contains("\\\n") {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    let mut pending: Option<Heredoc> = None;
+    for line in command.split('\n') {
+        if let Some(h) = &pending {
+            let probe = if h.dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if probe == h.delim {
+                pending = None;
+            } else if !h.quoted && line.contains(['$', '`', '\\']) {
+                return None;
+            }
+            continue;
+        }
+        let mut found = heredocs_in(line, true, false);
+        if found.is_empty() {
+            out.push(line);
+            continue;
+        }
+        let h = found.pop()?;
+        let toks = shell_tokens_with_operators(line, true);
+        let delimiter_is_plain = plain_heredoc_word(&h.word);
+        let at = toks.iter().position(|t| t == "<<")?;
+        let start = toks[..at]
+            .iter()
+            .rposition(|t| matches!(t.as_str(), ";" | "&&" | "||" | "&"))
+            .map_or(0, |i| i + 1);
+        let mut skip = false;
+        let program = toks[start..at].iter().find(|t| {
+            if std::mem::take(&mut skip) {
+                return false;
+            }
+            match redirection_operand(t) {
+                Some(takes_next) => {
+                    skip = takes_next;
+                    false
+                }
+                None => true,
+            }
+        });
+        if !found.is_empty()
+            || !delimiter_is_plain
+            || h.delim.is_empty()
+            || !matches!(program.map(String::as_str), Some("cat" | "tee"))
+            || toks.iter().filter(|t| *t == "<<").count() != 1
+            || toks
+                .iter()
+                .any(|t| matches!(t.as_str(), "(" | ")" | "|" | "|&") || t.contains(['$', '`']))
+        {
+            return None;
+        }
+        out.push(line);
+        pending = Some(h);
+    }
+    if pending.is_some() {
+        return None;
+    }
+    // Blank last lines (a final line break after the delimiter) run nothing.
+    while out
+        .last()
+        .is_some_and(|line| line.trim_matches([' ', '\t']).is_empty())
+    {
+        out.pop();
+    }
+    Some(out.join("\n"))
 }
 
 fn shell_cwd_candidates(
@@ -2816,8 +3230,9 @@ fn collect_bash_write_targets(
     // (core#552) The body of a QUOTED-delimiter heredoc is data the shell never expands, so its
     // words are no command's arguments: `tee docs/x.md <<'EOF'` naming `/var/log/app.log` in its
     // body writes only `docs/x.md`. An unquoted heredoc's body still expands `$(…)`, so it stays.
+    let original = command;
     let command = &strip_quoted_heredoc_bodies(command);
-    let owned = shell_tokens(command);
+    let owned = shell_tokens_blanked(command, original);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     // Redirection targets. `redirect_glob(tok)` returns Some(glued-filename-or-empty) for a write
@@ -4057,8 +4472,9 @@ fn unwrap_program_with_reads<'a>(
 /// wrapper table and nothing else): `$(…)`/backtick substitution and `$VAR`/`${VAR}` in a
 /// PROGRAM word (a write TARGET with one fails closed since core#922 — [`ShellTarget::Unresolved`]),
 /// in-place editors (`sed -i`, `perl -i`), `git apply`/`patch`, `rm`/`ln`, a SECOND
-/// level of wrapping (`sh -c 'sh -c "…"'`), a renamed binary, raw SQLite via python, and the
-/// no-space glued operator (`a&&wicked-estate`). (`touch`, `git -C`, `cd`, and inline interpreters
+/// level of wrapping (`sh -c 'sh -c "…"'`), a renamed binary, and raw SQLite via python. A glued
+/// operator (`a&&wicked-estate`) is split as the shell splits it since core#1465. (`touch`,
+/// `git -C`, `cd`, and inline interpreters
 /// (`python3 -c`, `node -e`, `perl -e`, `python3 - <<EOF`) are now modelled — issues #541/#540.)
 /// OS-level containment is the only hermetic
 /// guarantee; this is the secondary layer for sandbox-less hosts.
@@ -11773,7 +12189,6 @@ mod boundary_tests {
             assert_eq!(check(&ok), None, "a write in the draft root: {ok}");
         }
         for denied in [
-            format!("cd {a}; sed -i 's/a/b/' deck.html"),
             format!("cd {a} || true && sed -i 's/a/b/' deck.html"),
             format!("cd {a} & sed -i 's/a/b/' deck.html"),
             format!("cd {a} | sed -i 's/a/b/' deck.html"),
@@ -11825,6 +12240,16 @@ mod boundary_tests {
             );
             assert!(fatal, "{denied}: fatal outside the temp");
         }
+        // (fix-multiline-cd) A `cd` not chained by `&&` may fail and leave the rest in the old cwd:
+        // still refused, but advisory, naming the remedy, since chained it would pass.
+        let unchained = format!("cd {a}; sed -i 's/a/b/' deck.html");
+        let (reason, fatal) =
+            check(&unchained).unwrap_or_else(|| panic!("still a write escape: {unchained}"));
+        assert!(!fatal, "{unchained}: {reason}");
+        assert!(
+            reason.starts_with(UNCHAINED_CD_REASON_PREFIX) && reason.contains("&&"),
+            "{unchained}: {reason}"
+        );
         // Glued operators are split as the shell splits them: a glued `cd -` keeps every candidate.
         assert_eq!(
             leading_cd_dominates(&format!("cd {a}&&cd -&&sed -i 's/a/b/' deck.html"), None),
@@ -11844,6 +12269,399 @@ mod boundary_tests {
             ))
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// fix-multiline-cd (run 8e0ffbec, demo plan unit): a claude seat wrote its own declared plan
+    /// root with `cd <plan>` + line break + `cat > chapters.json <<'E'`. If that `cd` fails, the
+    /// heredoc lands in the cwd an earlier call left (here a read root), and nothing on the host
+    /// can prove it will not fail (a pod seat's root is a replica), so the write stays refused,
+    /// but ADVISORY, with the remedy, instead of denying the unit. The chained spelling
+    /// `cd <plan> && cat > chapters.json <<'E'` with its body passes. Every shape where control
+    /// may leave the directory, or a heredoc body may run, stays unit-fatal.
+    #[test]
+    fn an_unchained_leading_cd_is_refused_with_its_remedy_and_a_chained_heredoc_passes() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("multiline-cd-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("sandbox");
+        let plan = base.join("demos").join("r1").join("plan");
+        let probe = base.join("demos").join("r1").join("probe");
+        let outside = base.join("outside");
+        for d in [&wt, &plan, &probe, &outside] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let roots = AllowedRoots {
+            write: vec![wt.clone(), plan.clone()],
+            read: vec![probe.clone()],
+        };
+        // The earlier call left the shell in the probe dir (a read root).
+        let state = base.join("install-fence-cwd-unit-3");
+        std::fs::write(&state, probe.to_string_lossy().as_bytes()).unwrap();
+        let check = |cmd: &str| {
+            boundary_denial_tracked(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": cmd }),
+                "Bash",
+                Some(&state),
+                false,
+                &[],
+            )
+        };
+        let p = shell_read_951_path(&plan);
+        let chapters = "[\n  {\"key\": \"01-tip-jar\", \"title\": \"Add tips, then reset\", \
+                        \"blurb\": \"Press it?\"}\n]";
+        let run_8e0ffbec = format!("cd {p}\ncat > chapters.json <<'E'\n{chapters}\nE");
+        for unchained in [
+            run_8e0ffbec.clone(),
+            format!("cd {p}; cat > storyline.json <<'E'\n{{}}\nE"),
+            format!("cd {p}\ncat > s.json <<\"E\"\n{{\"cost\": \"$5 `x`\"}}\nE"),
+            format!("cd {p}\nmkdir -p shots && echo done > shots/x.txt"),
+            format!("cd {p}/missing\n{}", "cat > chapters.json <<'E'\n[]\nE"),
+        ] {
+            let (reason, fatal) =
+                check(&unchained).unwrap_or_else(|| panic!("an unchained cd ran: {unchained}"));
+            assert!(!fatal, "advisory, not unit-fatal: {unchained}: {reason}");
+            assert!(
+                reason.starts_with(UNCHAINED_CD_REASON_PREFIX) && reason.contains(" && "),
+                "names the remedy: {unchained}: {reason}"
+            );
+        }
+        for chained in [
+            format!("cd {p} && cat > chapters.json <<'E'\n{chapters}\nE"),
+            format!("cd {p} && cat > chapters.json <<EOF\n{chapters}\nEOF"),
+            format!("cd {p} && cat > chapters.json <<\"EOF\"\n$5 `x`\nEOF"),
+            format!("cd {p} && tee s.json <<'E' >/dev/null\n$5\nE"),
+            format!("cd {p} && cat > a.md <<-'E'\n\tx\n\tE"),
+        ] {
+            assert_eq!(
+                check(&chained),
+                None,
+                "a chained write in the plan root: {chained}"
+            );
+        }
+        let o = shell_read_951_path(&outside);
+        let pr = shell_read_951_path(&probe);
+        let w = "cat > chapters.json <<'E'\n[]\nE";
+        for fatal_shape in [
+            // More than the first separator runs past a failed `cd`: chaining it is no remedy.
+            format!("cd {p}\nmkdir -p shots\necho done > shots/x.txt"),
+            format!("cd {p}  # the plan dir\nmkdir -p shots"),
+            format!("cd {p} && cat > a.md <<'E' # the script\nx\nE"),
+            format!("cd {p}\ncat > a.md <<'A'\nx\nA\ncat > b.md <<'B'\ny\nB"),
+            format!("cd {p} && cat > a.md <<'A'\nx\nA\ncat > b.md <<'B'\ny\nB"),
+            format!("cd {p}; touch a & touch b"),
+            format!("cd {p} && touch a; touch b"),
+            // Control leaves the dir, or names where it was.
+            format!("cd {p}\ncd {pr}\n{w}"),
+            format!("cd {p}\ncd -\n{w}"),
+            format!("cd {p} && cd -\n{w}"),
+            format!("cd {p}\npushd {pr}\n{w}"),
+            format!("cd {p}\npopd\n{w}"),
+            format!("cd {p}\nchdir -\n{w}"),
+            format!("cd {p}\nOLDPWD={pr}\n{w}"),
+            // The `cd` runs in a subshell, a pipeline, the background, or under a redirect.
+            format!("(cd {p})\n{w}"),
+            format!("cd {p}\n(cd -; {w})"),
+            format!("cd {p} 2>/dev/null\n{w}"),
+            format!("cd {p} >log.txt\n{w}"),
+            format!("cd {p} &\n{w}"),
+            format!("cd {p} | true\n{w}"),
+            format!("cd {p} || true\n{w}"),
+            format!("! cd {p}\n{w}"),
+            // Sourced code, functions, eval, another shell.
+            format!("cd {p}\n. ./go.sh\n{w}"),
+            format!("cd {p}\nsource go.sh\n{w}"),
+            format!("cd {p}\nf() {{ cd -; }}\nf\n{w}"),
+            format!("cd {p}\nfunction f {{ pushd {pr}; }}\nf\n{w}"),
+            format!("cd {p}\neval 'cd -'\n{w}"),
+            format!("cd {p}\neval \"$GO\"\n{w}"),
+            format!("cd {p}\nexec bash\n{w}"),
+            format!("cd {p}\nbash -c 'cd -; true'\n{w}"),
+            format!("cd {p}\ntrap 'cd -' DEBUG\n{w}"),
+            // A heredoc body some program may run, or the shell may expand.
+            format!("cd {p} && bash <<'S'\ncd -\nS\n{w}"),
+            format!("cd {p} && awk -f - <<'S'\nBEGIN {{ system(\"cd -\") }}\nS\n{w}"),
+            format!("cd {p} && python3 - <<'S'\nimport os\nS\n{w}"),
+            format!("cd {p} && python3 - 'x;cat ' <<'S'\nimport os\nS\n{w}"),
+            format!("cd {p} && cat <<'S' | sh\ncd -\nS\n{w}"),
+            format!("cd {p} && cat <<'S' > >(python3)\nimport os\nS\n{w}"),
+            format!("cd {p} && cat > a.json <<EOF\n$(cd -; echo x > b)\nEOF\n{w}"),
+            format!("cd {p} && cat > a.json <<EOF\n`cd -`\nEOF\n{w}"),
+            format!("cd {p} && cat > a.json <<EOF\nx\\\nEOF\ncd -\nEOF\n{w}"),
+            format!("cd {p} && cat > a.json <<'E'\nnever closed"),
+            // A `<<` the shell reads as text, a shift, a pattern or a comment, or a delimiter
+            // this scan would read differently: the lines after it run.
+            format!("cd {p} && echo \"x\n<<E \"\ncd {o}\nE\n{w}"),
+            format!("cd {p} && echo '\ncat <<true # '\ncd -\ntrue\n{w}"),
+            format!("cd {p} && ((x=1<<2))\ncd {o}\n2\n{w}"),
+            format!("cd {p} && (\\\n(x=1<<true))\ncd -\ntrue\n{w}"),
+            format!("cd {p} && x=${{y/<<E/}}\ncd {o}\nE\n{w}"),
+            format!("cd {p} && cat /dev/null # <<t'rue'\ncd -\ntrue\n{w}"),
+            format!("cd {p} && cat <<$'E'\ndata\nE\ncd -\n$E\n{w}"),
+            format!("cd {p} && cat <<true' X'\ndata\ntrue X\ncd -\ntrue\n{w}"),
+            // Variables in the path, glued and escaped forms, odd blanks.
+            format!("cd $PLAN\n{w}"),
+            format!("cd {p}/$X\n{w}"),
+            format!("cd \"$HOME\"/x\n{w}"),
+            format!("cd {p};cd -;{w}"),
+            format!("cd {p}&&cd -&&{w}"),
+            format!("cd {p}\nc\\d -\n{w}"),
+            format!("cd {p}\nc''d -\n{w}"),
+            format!("cd {p}\r\n{w}"),
+            format!("cd {p}\u{a0}\n{w}"),
+            format!("cd {p}\ncat > ~-/chapters.json <<'E'\n[]\nE"),
+            // The directory itself is outside the write roots.
+            format!("cd {pr}\n{w}"),
+            format!("cd {o}; {w}"),
+        ] {
+            let (reason, fatal) = check(&fatal_shape)
+                .unwrap_or_else(|| panic!("still a write escape: {fatal_shape}"));
+            if fatal_shape.contains("~-") {
+                // `~-` is OLDPWD: an unresolvable target, refused by its own rule.
+                assert!(
+                    reason.contains("cannot be resolved"),
+                    "{fatal_shape}: {reason}"
+                );
+                continue;
+            }
+            assert!(
+                fatal && !reason.starts_with(UNCHAINED_CD_REASON_PREFIX),
+                "{fatal_shape}: unit-fatal: {reason}"
+            );
+            assert_eq!(
+                leading_cd_dominates(&fatal_shape, None),
+                None,
+                "{fatal_shape}"
+            );
+        }
+        // The rewrite is judged with a whole budget of its own: a long command judged inside the
+        // hook's outer session must not lose the `env -C` cwd on the second pass (codex r3).
+        {
+            let _outer = ShellScanGuard::session();
+            drop(ShellScanGuard::scan(&"x".repeat(1000), false));
+            let spent = || SHELL_SCAN.with(|slot| slot.get().map(|state| state.bytes));
+            assert_eq!(spent(), Some(1000));
+            assert_eq!(with_fresh_scan_budget(spent), (Some(0), 0));
+            assert_eq!(
+                with_fresh_scan_budget(|| drop(ShellScanGuard::scan("abc", false))),
+                ((), 3)
+            );
+            assert_eq!(spent(), Some(1000));
+            let long = format!("cd {p}; env -C {pr} touch f #{}", "x".repeat(18000));
+            let (reason, fatal) = check(&long).expect("the env -C write is refused");
+            assert!(
+                fatal && !reason.starts_with(UNCHAINED_CD_REASON_PREFIX),
+                "{reason}"
+            );
+        }
+        // A rewrite past the scan budget is no remedy: its `env -C` cwd could be lost (codex r4).
+        {
+            let prefix = format!("cd {p}; env -C {pr} touch victim ");
+            let long = format!("{prefix}{}", "x".repeat(65535 - prefix.len()));
+            let (reason, fatal) = check(&long).expect("the env -C write is refused");
+            assert!(
+                fatal && !reason.starts_with(UNCHAINED_CD_REASON_PREFIX),
+                "{reason}"
+            );
+        }
+        // Chained into a read root: it settles the base, and the write there is refused.
+        let into_read_root = format!("cd {pr} && {w}");
+        assert!(check(&into_read_root).is_some_and(|(_, fatal)| fatal));
+        // A link inside the root back to the root: `..` climbs from where the kernel stands.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&plan, plan.join("self")).unwrap();
+            let up = format!("cd {p}/self && cat > ../chapters.json <<'E'\n[]\nE");
+            assert!(
+                check(&up).is_some_and(|(_, fatal)| fatal),
+                "a write above the root through a link: {up}"
+            );
+        }
+        let want = Some(crate::path_policy::normalize_for_fence(
+            &p,
+            std::path::Path::new("/"),
+            None,
+        ));
+        assert_eq!(leading_cd_dominates(&run_8e0ffbec, None), None);
+        let chained = run_8e0ffbec.replacen('\n', " && ", 1);
+        assert_eq!(
+            leading_cd_unchained(&run_8e0ffbec, None),
+            Some((chained.clone(), p.clone()))
+        );
+        assert_eq!(leading_cd_dominates(&chained, None), want);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A write after more directory changes than the scan follows is refused: the capped candidate
+    /// set could have dropped the cwd the write lands in (codex on fix-multiline-cd: 63 `cd`s in a
+    /// comment pushed out `env -C ..`, and `../victim` was judged inside the root).
+    #[test]
+    fn a_write_after_more_cwds_than_the_scan_follows_is_refused() {
+        use crate::path_policy::AllowedRoots;
+        let tid = format!("{:?}", std::thread::current().id()).replace(['(', ')'], "");
+        let base = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("cwd-overflow-{}-{tid}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let allowed = base.join("allowed");
+        let deep = allowed.join("deep");
+        std::fs::create_dir_all(&deep).unwrap();
+        let roots = AllowedRoots {
+            write: vec![allowed.clone()],
+            read: vec![base.clone()],
+        };
+        let d = shell_read_951_path(&deep);
+        let fakes = |sep: &str| {
+            (0..63)
+                .map(|i| format!("{sep}cd {d}/fake{i}"))
+                .collect::<String>()
+        };
+        for cmd in [
+            format!("env -C .. touch ../victim; true #x{}", fakes("&&")),
+            format!("env -C .. touch ../victim; false {}", fakes(" && ")),
+        ] {
+            let (reason, fatal) = boundary_denial_with(
+                &roots,
+                &deep,
+                None,
+                None,
+                &json!({ "command": cmd }),
+                "Bash",
+            )
+            .expect("refused");
+            assert!(fatal && reason.contains("more places"), "{reason}");
+        }
+        // Few directory changes: judged as before, and an in-root write passes.
+        assert_eq!(
+            boundary_denial_with(
+                &roots,
+                &deep,
+                None,
+                None,
+                &json!({ "command": format!("touch x && cd {d}/fake0 && cd {d}/fake1") }),
+                "Bash",
+            ),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#1465: the Bash write scan reads a command after a bare line break or a glued control
+    /// operator as its own command, while a heredoc body stays the program's data and the
+    /// redirect spellings `>&`, `&>`, `>|` stay whole.
+    #[test]
+    fn the_write_scan_sees_a_command_after_a_line_break_or_a_glued_operator_1465() {
+        for (cmd, target) in [
+            ("true\ntee /outside/f", "/outside/f"),
+            ("true&&tee /outside/f", "/outside/f"),
+            ("true||tee /outside/f", "/outside/f"),
+            ("echo x|tee /outside/f", "/outside/f"),
+            ("echo x 2>&1|tee /outside/f", "/outside/f"),
+            ("sleep 1&cp a /outside/f", "/outside/f"),
+            ("cd /x && true\nsed -i 's/a/b/' /outside/f", "/outside/f"),
+            ("cd /x&&cd -&&sed -i 's/a/b/' /outside/f", "/outside/f"),
+            ("cat <<'E' > a\nbody\nE\ntee /outside/f", "/outside/f"),
+            ("echo x&>/outside/f", "/outside/f"),
+            ("echo x >|/outside/f", "/outside/f"),
+            ("echo \\>|tee /outside/f", "/outside/f"),
+            ("echo ok # note\ntee /outside/f", "/outside/f"),
+            ("cat <<EOF\n# $(touch /outside/f)\nEOF", "/outside/f"),
+            ("echo ${UNSET:- #$(touch /outside/f)}", "/outside/f"),
+            ("rm -f -- -${R5:-unused|| /outside/f}", "/outside/f}"),
+            ("rm -f -- -${R5:-unused\n/outside/f}", "/outside/f}"),
+            ("rm -f -- -$[0|| 0] /outside/f", "/outside/f"),
+            (
+                "rm -f -- -`false||printf 'x %s' /x ` /outside/f",
+                "/outside/f",
+            ),
+            ("touch $'/x\\0\\'x|| /outside/f '", "/outside/f"),
+            (
+                "cat <<$'E'\ndata\nE\ntrue; touch /outside/f\n$E",
+                "/outside/f",
+            ),
+            (
+                "cat <<E'O'F\ndata\nEOF\ntouch /outside/f\nE'O'F",
+                "/outside/f",
+            ),
+            (
+                "cat <<true' X'\ndata\ntrue X\ntrue; touch /outside/f\ntrue",
+                "/outside/f",
+            ),
+            (
+                "cat /dev/null # <<t'rue'\ntrue; touch /outside/f\ntrue",
+                "/outside/f",
+            ),
+        ] {
+            assert!(
+                bash_write_targets(cmd).iter().any(|t| t == target),
+                "{cmd:?}: {:?}",
+                bash_write_targets(cmd)
+            );
+        }
+        // A heredoc body line is the program's data, and a comment is no command.
+        for cmd in [
+            "cat <<EOF > a\ntee /outside/f\nEOF",
+            "cat > a <<'EOF'\ncp x /outside/f\nEOF",
+            "cat <<A <<B > a\ntee /outside/f\nA\ntee /outside/g\nB",
+            "cat <<EOF\nx|tee /outside/f\nEOF",
+            "cat <<EOF\nx&&tee /outside/f\nEOF",
+            "cat <<EOF\n# x\nEOF",
+        ] {
+            let targets = bash_write_targets(cmd);
+            assert!(
+                !targets.iter().any(|t| t.starts_with("/outside")),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        // Finding where heredoc lines are must not spend the shell-scan budget the write scan
+        // needs: a long heredoc header still leaves the `eval` write after it visible.
+        let long = format!(
+            "cat <<E # {}\ndata\nE\ntrue; eval 'touch /outside-1465/f'\n",
+            "x".repeat(9000)
+        );
+        #[cfg(unix)]
+        {
+            let wt = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+            let roots = crate::path_policy::AllowedRoots {
+                write: vec![wt.clone()],
+                read: vec![],
+            };
+            let (reason, fatal) = boundary_denial_with(
+                &roots,
+                &wt,
+                Some(std::path::Path::new("/home/op")),
+                None,
+                &json!({ "command": long }),
+                "Bash",
+            )
+            .expect("the eval write after a long heredoc header");
+            assert!(fatal && reason.contains("outside-1465"), "{reason}");
+        }
+        {
+            // Lexing alone charges nothing to the session's budget.
+            let _session = ShellScanGuard::session();
+            for _ in 0..3 {
+                shell_tokens(&long);
+            }
+            assert_eq!(
+                SHELL_SCAN.with(|slot| slot.get().map(|state| state.bytes)),
+                Some(0)
+            );
+        }
+        assert_eq!(
+            bash_cd_targets_inner("cd /x&&cd -&&true\npushd /y", true),
+            vec!["/x", "/y"]
+        );
+        assert_eq!(
+            shell_tokens("a 2>&1|b&>f\nc>|g&&d"),
+            vec!["a", "2>&1", "|", "b", "&>f", ";", "c>|g", "&&", "d"]
+        );
     }
 
     #[test]
