@@ -372,6 +372,103 @@ pub(crate) fn argv_line(argv: &[String]) -> Result<String, String> {
     Ok(s)
 }
 
+/// Extract only the identity from the explicit seat-owned copy, without resolving includes or
+/// consulting the operator's config. A bad copy must never prevent a unit from running.
+fn git_identity_config(path: &Path) -> Result<Option<String>, ()> {
+    use std::io::Read;
+    use wicked_apps_core::HardenedCommand as _;
+
+    const LIMIT: u64 = 64 * 1024;
+    let meta = std::fs::symlink_metadata(path).map_err(|_| ())?;
+    if !path.is_absolute() || !meta.is_file() || meta.len() > LIMIT {
+        return Err(());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(|_| ())?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > LIMIT || bytes.contains(&0) {
+        return Err(());
+    }
+    let mut content = String::from("[user]\n");
+    for key in ["name", "email"] {
+        let mut cmd = Command::new("git");
+        cmd.hardened()
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .args(["config", "--no-includes", "--file"])
+            .arg(path)
+            .args(["--null", "--get", &format!("user.{key}")]);
+        let out = super::run_capped(cmd, None, Duration::from_secs(10), LIMIT);
+        if out.code == Some(1) && out.stdout.is_empty() {
+            continue; // A missing key is allowed; git still parsed the file.
+        }
+        if !out.ok() {
+            return Err(());
+        }
+        let value = std::str::from_utf8(&out.stdout).map_err(|_| ())?;
+        let value = value.strip_suffix('\0').ok_or(())?;
+        if value.contains(['\n', '\0']) {
+            return Err(());
+        }
+        let value = value.replace('\\', "\\\\").replace('"', "\\\"");
+        content.push_str(&format!("\t{key} = \"{value}\"\n"));
+    }
+    Ok((content != "[user]\n").then_some(content))
+}
+
+/// Carry only spawn hardening's seat-owned user.name/user.email when the global config's
+/// host path is absent from the replica mounts. No system config or other global settings
+/// are shipped. The prelude rides the unit env over stdin; the identity file outlives that env
+/// file in the pod's per-unit memory volume, written as the seat uid with mode 0600. It needs
+/// an individual Landlock read rule (the rest of `/wicked-unit` stays inaccessible).
+pub(crate) fn git_config_handoff(
+    vars: &mut [(String, String)],
+    mounted: &[PathBuf],
+    unit_dir: &Path,
+) -> (String, Vec<String>) {
+    for (key, value) in vars {
+        if key != "GIT_CONFIG_GLOBAL" {
+            continue;
+        }
+        let path = Path::new(value);
+        // Empty disables the file; /dev/null already exists and is admitted in the pod.
+        if path.as_os_str().is_empty()
+            || path == Path::new("/dev/null")
+            || mounted.iter().any(|root| path.starts_with(root))
+        {
+            continue;
+        }
+        let content = match git_identity_config(path) {
+            Ok(Some(content)) => content,
+            Ok(None) => continue,
+            Err(()) => {
+                // One engine-written line, with no file contents, paths, or git diagnostics.
+                eprintln!("wicked-core: the seat git identity could not be read");
+                continue;
+            }
+        };
+        let dest = unit_dir
+            .join("gitconfig-global")
+            .to_string_lossy()
+            .into_owned();
+        let prelude = format!(
+            "(umask 077; printf '%s' '{}' > '{dest}.tmp' && \
+             /floor/busybox mv '{dest}.tmp' '{dest}') || {{ \
+             /floor/busybox rm -rf '{dest}.tmp' '{dest}' || :; \
+             export GIT_CONFIG_GLOBAL=/dev/null; \
+             echo 'wicked-seat: the git identity could not be written' >&2; }}\n",
+            content.replace('\'', "'\\''"),
+            dest = dest.replace('\'', "'\\''")
+        );
+        *value = dest.clone();
+        return (prelude, vec![dest]);
+    }
+    (String::new(), Vec::new())
+}
+
 /// The exit code of a seat exec: the pod's rc file is the evidence, kubectl's own code only
 /// when it agrees (pure). `None` = the stream was lost (no rc, or a disagreement).
 pub(crate) fn exit_code(kubectl: i32, rc_file: Option<&str>) -> Option<i32> {
@@ -1692,8 +1789,9 @@ fn classify_apply(e: &str) -> FloorUnarmed {
 
 /// Make a seat command complete right before it spawns: every variable the carrier set
 /// explicitly goes into the pod's unit env file (over stdin) and is passed by name through
-/// landrun; the seat homes are re-synced (the runner wrote their placeholder files after
-/// arming). The returned command is kubectl alone, with no carrier variable in its own env.
+/// landrun; unmounted seat-owned git identity rides the same handoff. The seat homes are re-synced
+/// (the runner wrote their placeholder files after arming). The returned command is kubectl
+/// alone, with no carrier variable in its own env.
 /// `Ok(None)`: `cmd` is not a pod seat's.
 pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, String> {
     let args: Vec<String> = cmd
@@ -1754,6 +1852,10 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         ));
         names.push(key);
     }
+    // nopush_git_config_env()'s GIT_CONFIG_COUNT/KEY/VALUE entries also ride this env
+    // handoff and landrun's --env entries, so the push fence does not depend on a config file.
+    let (git_files, git_reads) =
+        git_config_handoff(&mut vars, mounted, Path::new(render::UNIT_DIR));
     // agy's configuration home IS its home: the carrier's seat home when the pod mounts it
     // writable; every other CLI keeps the pod's in-memory home.
     let home = home
@@ -1781,6 +1883,9 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         .position(|a| *a == format!("{MARKER_PREFIX}{id}"))
         .ok_or("the seat argv has no marker")?;
     let mut launch = args[marker + 1..end].to_vec();
+    for path in git_reads {
+        launch.extend(["--ro".into(), path]);
+    }
     for n in &names {
         if !args[land..end]
             .windows(2)
@@ -1791,7 +1896,8 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         }
     }
     launch.extend_from_slice(&args[end..]);
-    let body = format!("{}{}", env_file(&vars)?, argv_line(&launch)?);
+    // The prelude's /dev/null fallback must override the exported identity path.
+    let body = format!("{}{git_files}{}", env_file(&vars)?, argv_line(&launch)?);
     // The seat homes again: the placeholder files the runner wrote after arming.
     let homes: Vec<PlanRoot> = seat
         .roots

@@ -541,6 +541,369 @@ fn k8s_no_secret_or_prompt_is_ever_on_an_exec_argv() {
     );
 }
 
+/// #1456: only identity reaches git through the file after the wrapper removes the unit env.
+/// The no-push fence reaches git independently through the carrier's environment entries.
+#[cfg(unix)]
+#[test]
+fn k8s_git_config_handoff_preserves_operator_identity_and_push_fence() {
+    let host = tmp("git-config-host");
+    let pod = tmp("git-config-pod");
+    let unit = pod.join("unit's files");
+    let tree = pod.join("repo");
+    std::fs::create_dir_all(&unit).unwrap();
+    std::fs::create_dir_all(&tree).unwrap();
+    let global = host.join("gitconfig-copy");
+    let system = host.join("gitconfig-system");
+    let identity = concat!(
+        "[user]\n\tname = \"Op \\\"quoted\\\" \\\\ path's $(false)\"\n",
+        "\temail = \"op@users.noreply.example\"\n",
+    );
+    let content = format!(
+        "{identity}\
+         [commit]\ngpgsign = true\n\
+         [gpg]\nprogram = /nonexistent\n\
+         [filter \"lfs\"]\nrequired = true\nclean = /nonexistent %f\n\
+         [url \"wicked-nopush://\"]\npushInsteadOf = https://\n\
+         [protocol \"ssh\"]\nallow = never\n"
+    );
+    std::fs::write(&global, content).unwrap();
+    std::fs::write(&system, "[user]\nname = System Identity\n").unwrap();
+    let mut vars = vec![
+        (
+            "GIT_CONFIG_GLOBAL".into(),
+            global.to_string_lossy().into_owned(),
+        ),
+        (
+            "GIT_CONFIG_SYSTEM".into(),
+            system.to_string_lossy().into_owned(),
+        ),
+        ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+    ];
+    // These are the actual COUNT/KEY/VALUE entries that finalize passes through landrun's
+    // --env flags. The shipped identity file deliberately contains no push-fence entries.
+    let fence = wicked_apps_core::spawn::nopush_git_config_env();
+    vars.extend(fence.clone());
+    let (prelude, reads) = seat::git_config_handoff(&mut vars, std::slice::from_ref(&tree), &unit);
+    assert!(!prelude.contains("exit"));
+    assert_eq!(reads, [unit.join("gitconfig-global").to_string_lossy()]);
+    assert_eq!(vars[0].1, reads[0]);
+    assert_eq!(vars[1].1, system.to_string_lossy());
+    assert_eq!(&vars[3..], fence.as_slice());
+    let env = unit.join("env");
+    std::fs::write(
+        &env,
+        format!("{}{prelude}", seat::env_file(&vars).unwrap())
+            .replace("/floor/busybox", "/usr/bin/env"),
+    )
+    .unwrap();
+    // Host files are unavailable to the pod. No inherited identity can rescue the commit.
+    std::fs::remove_dir_all(&host).unwrap();
+    let out = std::process::Command::new("/bin/sh")
+        .hardened()
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", &pod)
+        .current_dir(&tree)
+        .args([
+            "-c",
+            "set -eu; . \"$1\"; rm \"$1\"; git init -q -b main; \
+             printf '*.bin filter=lfs\\n' > .gitattributes; echo content > tracked.bin; \
+             git add .gitattributes tracked.bin; git commit -qm unit; \
+             git log -1 --format='%an <%ae>|%cn <%ce>'; \
+             git -c user.email=override@example.test commit --allow-empty -qm override; \
+             git log -1 --format='%an <%ae>|%cn <%ce>'; \
+             git remote add origin https://example.invalid/repo; \
+             git remote get-url --push origin; git config --get protocol.ssh.allow; \
+             if git push origin HEAD >push.log 2>&1; then false; fi; \
+             cat push.log >&2; grep -q wicked-nopush push.log",
+            "seat",
+        ])
+        .arg(&env)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let name = "Op \"quoted\" \\ path's $(false)";
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!(
+            "{name} <op@users.noreply.example>|{name} <op@users.noreply.example>\n\
+             {name} <override@example.test>|{name} <override@example.test>\n\
+             wicked-nopush://example.invalid/repo\nnever"
+        )
+    );
+    assert!(!env.exists());
+    assert_eq!(std::fs::read_to_string(&reads[0]).unwrap(), identity);
+    assert!(!unit.join("gitconfig-system").exists());
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::fs::metadata(&reads[0]).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    std::fs::remove_dir_all(pod).unwrap();
+}
+
+#[test]
+fn k8s_git_config_handoff_keeps_visible_disabled_and_system_paths() {
+    let mut vars = vec![
+        ("GIT_CONFIG_GLOBAL".into(), "/replica/gitconfig-copy".into()),
+        (
+            "GIT_CONFIG_SYSTEM".into(),
+            "/unmounted/system-config".into(),
+        ),
+        ("GIT_AUTHOR_NAME".into(), "Explicit Author".into()),
+    ];
+    let original = vars.clone();
+    assert_eq!(
+        seat::git_config_handoff(&mut vars, &["/replica".into()], Path::new(render::UNIT_DIR)),
+        (String::new(), Vec::new())
+    );
+    assert_eq!(vars, original);
+    for disabled in ["", "/dev/null"] {
+        vars[0].1 = disabled.into();
+        let original = vars.clone();
+        assert_eq!(
+            seat::git_config_handoff(&mut vars, &[], Path::new(render::UNIT_DIR)),
+            (String::new(), Vec::new())
+        );
+        assert_eq!(vars, original);
+    }
+    assert_eq!(
+        seat::git_config_handoff(&mut [], &[], Path::new(render::UNIT_DIR)),
+        (String::new(), Vec::new())
+    );
+}
+
+#[test]
+fn k8s_git_config_handoff_skips_missing_unreadable_oversized_or_invalid_copies() {
+    let host = tmp("git-config-skip");
+    let file = host.join("gitconfig-copy");
+    let skip = |path: &Path| {
+        let mut vars = vec![(
+            "GIT_CONFIG_GLOBAL".into(),
+            path.to_string_lossy().into_owned(),
+        )];
+        let original = vars.clone();
+        assert_eq!(
+            seat::git_config_handoff(&mut vars, &[], Path::new(render::UNIT_DIR)),
+            (String::new(), Vec::new())
+        );
+        assert_eq!(
+            vars, original,
+            "an unusable identity must not refuse the unit"
+        );
+    };
+    skip(&file); // Missing file.
+    skip(&host); // Not a regular file.
+    std::fs::write(&file, vec![b'#'; 64 * 1024 + 1]).unwrap();
+    skip(&file);
+    for invalid in [
+        b"[user]\nname=Op\0".as_slice(),
+        b"[user\nname=Op\n",
+        b"[user]\nname=Op\nemail=\"line\\nbreak\"\n",
+    ] {
+        std::fs::write(&file, invalid).unwrap();
+        skip(&file);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(&file, "[user]\nname=Op\n").unwrap();
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o0)).unwrap();
+        // A privileged test runner can still read mode 000; the error path applies when denied.
+        if std::fs::File::open(&file).is_err() {
+            skip(&file);
+        }
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let link = host.join("link");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        skip(&link);
+    }
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+#[test]
+fn k8s_git_config_handoff_ignores_includes_and_allows_single_keys_at_size_limit() {
+    let host = tmp("git-config-keys");
+    let file = host.join("gitconfig-copy");
+    let included = host.join("included");
+    std::fs::write(
+        &included,
+        "[user]\nname=Included\nemail=included@example.test\n",
+    )
+    .unwrap();
+    let include = format!("[include]\npath = {}\n", included.display());
+    // Includes must not supply either identity key, even when both are otherwise absent.
+    std::fs::write(&file, &include).unwrap();
+    let mut vars = vec![(
+        "GIT_CONFIG_GLOBAL".into(),
+        file.to_string_lossy().into_owned(),
+    )];
+    let original = vars.clone();
+    assert_eq!(
+        seat::git_config_handoff(&mut vars, &[], &host),
+        (String::new(), Vec::new())
+    );
+    assert_eq!(vars, original);
+    for (key, value) in [("name", "Op"), ("email", "op@example.test")] {
+        let mut content = format!("[user]\n{key} = {value}\n{include}#");
+        content.extend(std::iter::repeat_n('x', 64 * 1024 - content.len()));
+        std::fs::write(&file, content).unwrap();
+        let (prelude, reads) = seat::git_config_handoff(&mut vars, &[], &host);
+        assert!(!prelude.contains("exit"));
+        assert!(prelude.contains(&format!("[user]\n\t{key} = \"{value}\"\n")));
+        assert_eq!(reads, [host.join("gitconfig-global").to_string_lossy()]);
+        vars.clone_from(&original);
+    }
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_git_config_handoff_write_failure_falls_back_to_empty_config() {
+    let host = tmp("git-config-write-failure");
+    let file = host.join("gitconfig-copy");
+    std::fs::write(&file, "[user]\nname=Op\nemail=op@example.test\n").unwrap();
+    let mut vars = vec![(
+        "GIT_CONFIG_GLOBAL".into(),
+        file.to_string_lossy().into_owned(),
+    )];
+    // A failed temporary write must remove any stale/partial final config as well.
+    let dest = host.join("gitconfig-global");
+    let partial = host.join("gitconfig-global.tmp");
+    std::fs::write(&dest, "[user\n").unwrap();
+    std::fs::create_dir(&partial).unwrap();
+    let (prelude, _) = seat::git_config_handoff(&mut vars, &[], &host);
+    assert!(!prelude.contains("exit"));
+    vars.push((
+        "WICKED_UNIT_CWD".into(),
+        host.to_string_lossy().into_owned(),
+    ));
+    vars.push(("GIT_CONFIG_NOSYSTEM".into(), "1".into()));
+    let env = host.join("env");
+    std::fs::write(
+        &env,
+        format!(
+            "{}{prelude}{}",
+            seat::env_file(&vars).unwrap(),
+            seat::argv_line(&[
+                "/bin/sh".into(),
+                "-c".into(),
+                "test \"$GIT_CONFIG_GLOBAL\" = /dev/null && git config --list && \
+                 git init -q -b main && git -c user.name=Unit \
+                 -c user.email=unit@example.test -c commit.gpgsign=false \
+                 commit --allow-empty -qm unit"
+                    .into(),
+            ])
+            .unwrap()
+        )
+        .replace("/floor/busybox", "/usr/bin/env"),
+    )
+    .unwrap();
+    let wrapper = seat::WRAPPER
+        .replace("/wicked-unit", &host.to_string_lossy())
+        .replace("/floor/busybox", "/usr/bin/env");
+    let out = std::process::Command::new("/bin/sh")
+        .hardened()
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", &host)
+        .args(["-c", &wrapper])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr)
+            .matches("wicked-seat: the git identity could not be written")
+            .count(),
+        1
+    );
+    assert!(!dest.exists());
+    assert!(!partial.exists());
+    assert!(!env.exists());
+    assert_eq!(std::fs::read_to_string(host.join("rc")).unwrap(), "0\n");
+    std::fs::remove_dir_all(host).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_git_config_handoff_bounds_host_git_and_discards_incomplete_identity() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
+
+    const CHILD_ROOT: &str = "WICKED_TEST_GIT_IDENTITY_ROOT";
+    if let Some(host) = std::env::var_os(CHILD_ROOT) {
+        let host = PathBuf::from(host);
+        let mut vars = vec![(
+            "GIT_CONFIG_GLOBAL".into(),
+            host.join("gitconfig-copy").to_string_lossy().into_owned(),
+        )];
+        let original = vars.clone();
+        assert_eq!(
+            seat::git_config_handoff(&mut vars, &[], &host),
+            (String::new(), Vec::new())
+        );
+        assert_eq!(vars, original, "a failed git call must not refuse the unit");
+        return;
+    }
+
+    let host = tmp("git-config-bounded");
+    let git = host.join("git");
+    std::fs::write(
+        host.join("gitconfig-copy"),
+        "[user]\nname=Op\nemail=op@example.test\n",
+    )
+    .unwrap();
+    // Isolate PATH in a child test process so concurrent tests keep using the real git.
+    // The name succeeds; a failed email must discard the identity already extracted.
+    for failure in [
+        "exec /bin/sleep 60",
+        "kill -KILL $$",
+        "value=x; i=0; while [ $i -lt 17 ]; do value=$value$value; i=$((i + 1)); done; \
+         printf '%s\\000' \"$value\"",
+    ] {
+        std::fs::write(
+            &git,
+            format!(
+                "#!/bin/sh\nif [ \"$7\" = user.name ]; then printf 'Op\\000'; exit 0; fi\n\
+                 {failure}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .hardened()
+            .env("PATH", &host)
+            .env(CHILD_ROOT, &host)
+            .args([
+                "--exact",
+                concat!(
+                    "k8s::seat_tests::",
+                    "k8s_git_config_handoff_bounds_host_git_and_discards_incomplete_identity"
+                ),
+                "--nocapture",
+            ]);
+        let out = super::run_capped(child, None, Duration::from_secs(20), 64 * 1024);
+        assert!(out.ok(), "{failure}: {}", out.err_text());
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr)
+                .matches("wicked-core: the seat git identity could not be read")
+                .count(),
+            1,
+            "{failure}"
+        );
+    }
+    std::fs::remove_dir_all(host).unwrap();
+}
+
 // ── A3: exit-code honesty ────────────────────────────────────────────────────────────────────
 
 #[test]
