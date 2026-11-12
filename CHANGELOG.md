@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **The Kubernetes checks floor copies each side with its own `.git` (wicked-core#1453).** HEAD
+  names the side, `origin/<default>` names the run base, and no other history is copied.
+  Repository tests can use `git ls-files`, `git merge-base` and `git diff <base>` on the floor.
+  The private `.git` is best effort: a failed build is logged and the tree is copied without it.
+
 - **Rancher Desktop's containerd images are visible to Kubernetes (wicked-core#1449).** The k8s runner now
   builds and inspects images with `nerdctl --namespace k8s.io`, the store the kubelet reads.
 

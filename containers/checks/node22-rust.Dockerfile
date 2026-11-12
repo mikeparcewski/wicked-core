@@ -21,6 +21,10 @@ RUN apt-get update \
       build-essential pkg-config libssl-dev \
       jq python3-pytest python3-yaml python3-zstandard \
  && rm -rf /var/lib/apt/lists/*
+# The kubelet owns the emptyDir roots; checks run as uid 1000. Trust only the copied sides,
+# in protected system configuration so plain git works from any subdirectory of either side.
+RUN git config --system --add safe.directory /work/head \
+ && git config --system --add safe.directory /work/base
 RUN curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" --component rustfmt,clippy \
  && chmod -R a+rX /usr/local/cargo /usr/local/rustup \

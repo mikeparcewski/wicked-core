@@ -1,6 +1,39 @@
 use super::*;
 
 #[test]
+fn the_floor_image_trusts_both_copied_sides_in_system_git_config() {
+    for dir in ["/work/head", "/work/base"] {
+        assert!(DOCKERFILE.contains(&format!("git config --system --add safe.directory {dir}")));
+    }
+}
+
+#[test]
+fn host_git_disables_transports_lazy_fetch_hooks_and_host_configuration() {
+    let c = git_cmd(Path::new("pinned.git"), &["rev-parse", "HEAD"]);
+    let args: Vec<_> = c.get_args().map(|a| a.to_str().unwrap()).collect();
+    for setting in [
+        "core.hooksPath=/dev/null",
+        "core.fsmonitor=false",
+        "protocol.allow=never",
+    ] {
+        assert!(args.windows(2).any(|a| a == ["-c", setting]));
+    }
+    let env: std::collections::BTreeMap<_, _> = c.get_envs().collect();
+    for (key, value) in [
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_ALLOW_PROTOCOL", "none"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+    ] {
+        assert_eq!(
+            env.get(std::ffi::OsStr::new(key)),
+            Some(&Some(std::ffi::OsStr::new(value)))
+        );
+    }
+}
+
+#[test]
 fn the_runner_switch_reads_auto_container_and_sandbox_and_refuses_a_typo() {
     assert_eq!(mode_from(None), Ok(Mode::Auto));
     assert_eq!(mode_from(Some(" ")), Ok(Mode::Auto));
@@ -361,6 +394,460 @@ fn the_engine_written_tar_extracts_to_the_same_tree() {
     );
 }
 
+#[cfg(unix)]
+mod private_git {
+    use super::*;
+
+    struct Fixture {
+        root: PathBuf,
+        repo: PathBuf,
+        git_dir: PathBuf,
+        base: String,
+        head_tree: String,
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let mut c = git_cmd(&dir.join(".git"), &[]);
+        c.args(["-c", "safe.directory=*"])
+            .args(args)
+            .current_dir(dir)
+            .env("HOME", dir)
+            .env("GIT_AUTHOR_NAME", "floor test")
+            .env("GIT_AUTHOR_EMAIL", "test@wicked.invalid")
+            .env("GIT_COMMITTER_NAME", "floor test")
+            .env("GIT_COMMITTER_EMAIL", "test@wicked.invalid")
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .stdin(Stdio::null());
+        let o = output_within(c, PROBE).expect("fixture git timed out");
+        assert!(
+            o.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    }
+
+    fn assert_object_absent(dir: &Path, id: &str) {
+        let mut c = git_cmd(&dir.join(".git"), &["cat-file", "-e", id]);
+        c.current_dir(dir).stdin(Stdio::null());
+        let o = output_within(c, PROBE).expect("cat-file timed out");
+        assert!(!o.status.success(), "exported unrelated object {id}");
+    }
+
+    fn fixture() -> Fixture {
+        let root = std::env::temp_dir().join(format!(
+            "wicked-floor-git-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main", "--template="]);
+        std::fs::write(repo.join("tracked.txt"), "older\n").unwrap();
+        std::fs::write(repo.join("ancestor-only.txt"), "pre-base secret\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "older than base"]);
+        git(&repo, &["rm", "-q", "ancestor-only.txt"]);
+        std::fs::write(repo.join("tracked.txt"), "A\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "A"]);
+        let base = git(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &base]);
+        git(
+            &repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        );
+        git(&repo, &["checkout", "-q", "-b", "feature"]);
+        std::fs::write(repo.join("committed.txt"), "B\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "B"]);
+        std::fs::write(repo.join("tracked.txt"), "C\n").unwrap();
+        git(&repo, &["add", "-A"]);
+        git(&repo, &["commit", "-q", "-m", "C"]);
+        std::fs::write(repo.join("tracked.txt"), "uncommitted\n").unwrap();
+        std::fs::write(repo.join("untracked-new.txt"), "new\n").unwrap();
+        let git_dir = repo.join(".git");
+        let head_tree = crate::worktree_guard::snapshot_through(&repo, &git_dir)
+            .unwrap()
+            .tree;
+        Fixture {
+            root,
+            repo,
+            git_dir,
+            base,
+            head_tree,
+        }
+    }
+
+    fn extract(f: &Fixture, id: &str, files: Option<&GitFiles>, name: &str) -> PathBuf {
+        let entries = ls_tree(&f.git_dir, id).unwrap();
+        let mut archive = Vec::new();
+        let held = write_side_tar(
+            &f.git_dir,
+            &entries,
+            &vec![0; entries.len()],
+            files,
+            &mut archive,
+        )
+        .unwrap();
+        assert_eq!(held.len(), entries.len());
+        assert!(held.iter().all(|(p, _)| !p.starts_with(".git/")));
+        let out = f.root.join(name);
+        std::fs::create_dir(&out).unwrap();
+        // spawn-audit: test-only — extracts the exact floor copy-in stream into a private dir.
+        let mut c = Command::new("tar");
+        c.hardened().args(["-x", "-f", "-", "-C"]).arg(&out);
+        let result = run_fed(c, PROBE, |w| {
+            w.write_all(&archive).map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert!(
+            result.status.is_some_and(|s| s.success()),
+            "{}",
+            tail(&result.err, 6)
+        );
+        result.fed.unwrap();
+        out
+    }
+
+    #[test]
+    fn floor_git_head_snapshot_survives_removing_the_source() {
+        let f = fixture();
+        let pinned_head = git(&f.repo, &["rev-parse", "HEAD"]);
+        let intermediate_blob = git(&f.repo, &["rev-parse", "HEAD:tracked.txt"]);
+        let older_blob = git(
+            &f.repo,
+            &["rev-parse", &format!("{}^:ancestor-only.txt", f.base)],
+        );
+        let files = floor_git(&f.git_dir, &f.head_tree, Tree::Head, Some(&f.base)).unwrap();
+        let again = floor_git(&f.git_dir, &f.head_tree, Tree::Head, Some(&f.base)).unwrap();
+        let file = |files: &GitFiles, rel: &str| {
+            files.iter().find(|(p, _, _)| p == rel).unwrap().2.clone()
+        };
+        assert_eq!(
+            file(&files, "refs/heads/feature"),
+            file(&again, "refs/heads/feature")
+        );
+        let out = extract(&f, &f.head_tree, Some(&files), "head");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(
+            git(&out, &["ls-files"]),
+            "committed.txt\ntracked.txt\nuntracked-new.txt"
+        );
+        assert_eq!(git(&out, &["merge-base", "HEAD", "origin/main"]), f.base);
+        assert_eq!(
+            git(&out, &["symbolic-ref", "refs/remotes/origin/HEAD"]),
+            "refs/remotes/origin/main"
+        );
+        assert_eq!(
+            git(&out, &["diff", "--name-only", &f.base]),
+            "committed.txt\ntracked.txt\nuntracked-new.txt"
+        );
+        assert_eq!(
+            git(&out, &["show", &format!("{}:tracked.txt", f.base)]),
+            "A"
+        );
+        assert_eq!(git(&out, &["status", "--porcelain"]), "");
+        assert_eq!(git(&out, &["rev-parse", "--abbrev-ref", "HEAD"]), "feature");
+        let head = git(&out, &["rev-parse", "HEAD"]);
+        assert_eq!(
+            git(&out, &["rev-list", "HEAD"]),
+            format!("{head}\n{}", f.base)
+        );
+        assert_eq!(
+            git(&out, &["log", "--format=%s", "-1"]),
+            "wicked floor snapshot"
+        );
+        assert_eq!(
+            std::fs::read_to_string(out.join(".git/shallow")).unwrap(),
+            format!("{}\n", f.base)
+        );
+        for id in [&pinned_head, &intermediate_blob, &older_blob] {
+            assert_object_absent(&out, id);
+        }
+        assert!(!out.join(".git/objects/info/alternates").exists());
+        assert!(!out.join(".git/hooks").exists());
+        for dir in [
+            "refs",
+            "refs/heads",
+            "refs/tags",
+            "objects",
+            "objects/info",
+            "objects/pack",
+        ] {
+            assert!(out.join(".git").join(dir).is_dir(), "missing {dir}");
+        }
+    }
+
+    #[test]
+    fn floor_git_base_has_the_base_commit_and_index() {
+        let f = fixture();
+        let files = floor_git(&f.git_dir, &f.base, Tree::Base, Some(&f.base)).unwrap();
+        let out = extract(&f, &f.base, Some(&files), "base");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(git(&out, &["rev-parse", "HEAD"]), f.base);
+        assert_eq!(git(&out, &["ls-files"]), "tracked.txt");
+        assert_eq!(git(&out, &["status", "--porcelain"]), "");
+        assert_eq!(git(&out, &["rev-list", "HEAD"]), f.base);
+        assert_eq!(
+            std::fs::read_to_string(out.join(".git/shallow")).unwrap(),
+            format!("{}\n", f.base)
+        );
+    }
+
+    #[test]
+    fn floor_git_plain_git_discovers_the_copy_from_a_subdirectory() {
+        let f = fixture();
+        std::fs::create_dir(f.repo.join("nested")).unwrap();
+        std::fs::write(f.repo.join("nested/from-subdir.txt"), "nested\n").unwrap();
+        let tree = crate::worktree_guard::snapshot_through(&f.repo, &f.git_dir)
+            .unwrap()
+            .tree;
+        let files = floor_git(&f.git_dir, &tree, Tree::Head, Some(&f.base)).unwrap();
+        let out = extract(&f, &tree, Some(&files), "plain");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        let plain = |args: &[&str]| {
+            // spawn-audit: test-only — ordinary discovery, no GIT_DIR or safe.directory override.
+            let mut c = Command::new("git");
+            c.hardened()
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+                .env("HOME", &out)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .current_dir(out.join("nested"))
+                .args(args)
+                .stdin(Stdio::null());
+            let o = output_within(c, PROBE).expect("plain git timed out");
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8(o.stdout).unwrap().trim().to_string()
+        };
+        assert_eq!(plain(&["ls-files"]), "from-subdir.txt");
+        assert_eq!(plain(&["merge-base", "HEAD", "origin/main"]), f.base);
+    }
+
+    #[test]
+    fn floor_git_diverged_head_uses_the_base_without_exporting_the_common_ancestor() {
+        let f = fixture();
+        let ancestor = git(&f.repo, &["rev-parse", &format!("{}^", f.base)]);
+        let blob = git(
+            &f.repo,
+            &["rev-parse", &format!("{ancestor}:ancestor-only.txt")],
+        );
+        git(&f.repo, &["clean", "-fd"]);
+        git(
+            &f.repo,
+            &["checkout", "-q", "-f", "-B", "feature", &ancestor],
+        );
+        git(&f.repo, &["rm", "-q", "ancestor-only.txt"]);
+        std::fs::write(f.repo.join("tracked.txt"), "diverged\n").unwrap();
+        git(&f.repo, &["add", "-A"]);
+        git(&f.repo, &["commit", "-q", "-m", "sibling of base"]);
+        assert_eq!(git(&f.repo, &["merge-base", "HEAD", &f.base]), ancestor);
+        let pinned_head = git(&f.repo, &["rev-parse", "HEAD"]);
+        let tree = git(&f.repo, &["rev-parse", "HEAD^{tree}"]);
+        let files = floor_git(&f.git_dir, &tree, Tree::Head, Some(&f.base)).unwrap();
+        let out = extract(&f, &tree, Some(&files), "diverged");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(git(&out, &["merge-base", "HEAD", "origin/main"]), f.base);
+        assert_eq!(git(&out, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(
+            git(&out, &["show", &format!("{}:tracked.txt", f.base)]),
+            "A"
+        );
+        for id in [&ancestor, &blob, &pinned_head] {
+            assert_object_absent(&out, id);
+        }
+    }
+
+    #[test]
+    fn floor_git_alternates_chain_does_not_export_an_unrelated_blob() {
+        let f = fixture();
+        let other = f.root.join("other");
+        std::fs::create_dir(&other).unwrap();
+        git(&other, &["init", "-q", "--template="]);
+        std::fs::write(other.join("unrelated.txt"), "alternate-only secret\n").unwrap();
+        let blob = git(&other, &["hash-object", "-w", "unrelated.txt"]);
+        std::fs::write(
+            f.git_dir.join("objects/info/alternates"),
+            format!("{}\n", other.join(".git/objects").display()),
+        )
+        .unwrap();
+        git(&f.repo, &["cat-file", "-e", &blob]);
+        let files = floor_git(&f.git_dir, &f.head_tree, Tree::Head, Some(&f.base)).unwrap();
+        let out = extract(&f, &f.head_tree, Some(&files), "alternates-chain");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        std::fs::remove_dir_all(&other).unwrap();
+        assert_eq!(git(&out, &["merge-base", "HEAD", "origin/main"]), f.base);
+        assert_object_absent(&out, &blob);
+        assert!(!out.join(".git/objects/info/alternates").exists());
+    }
+
+    #[test]
+    fn the_copy_in_writer_refuses_only_exact_dot_git_components() {
+        let f = fixture();
+        let oid = git(&f.repo, &["rev-parse", "HEAD:tracked.txt"]);
+        for path in [".git", ".git/config", "nested/.git/HEAD"] {
+            let entries = vec![Entry {
+                mode: 0o100644,
+                oid: oid.clone(),
+                path: path.into(),
+            }];
+            assert!(write_side_tar(&f.git_dir, &entries, &[0], None, &mut Vec::new()).is_err());
+        }
+        for path in [
+            "git~1/HEAD",
+            "nested/GIT~1/config",
+            ".GiT/config",
+            "nested/.gitignore",
+        ] {
+            let entries = vec![Entry {
+                mode: 0o100644,
+                oid: oid.clone(),
+                path: path.into(),
+            }];
+            let held = write_side_tar(&f.git_dir, &entries, &[0], None, &mut Vec::new()).unwrap();
+            assert_eq!(held[0].0, path);
+        }
+    }
+
+    #[test]
+    fn floor_git_failure_still_copies_the_complete_tree() {
+        let f = fixture();
+        let missing = "0000000000000000000000000000000000000001";
+        let error = floor_git(&f.git_dir, &f.head_tree, Tree::Head, Some(missing)).unwrap_err();
+        assert!(error.starts_with("rev-parse: exit status: "), "{error}");
+        assert!(
+            !error.contains(missing),
+            "only the step and exit status are reported"
+        );
+        let files = optional_floor_git(&f.git_dir, &f.head_tree, Tree::Head, Some(missing));
+        assert!(files.is_none());
+        let out = extract(&f, &f.head_tree, files.as_deref(), "without-git");
+        assert!(!out.join(".git").exists());
+        for name in ["committed.txt", "tracked.txt", "untracked-new.txt"] {
+            assert_eq!(
+                std::fs::read(out.join(name)).unwrap(),
+                std::fs::read(f.repo.join(name)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn floor_git_unborn_head_gets_a_parentless_snapshot_without_origin() {
+        let f = fixture();
+        git(&f.repo, &["symbolic-ref", "HEAD", "refs/heads/unborn"]);
+        let files = floor_git(&f.git_dir, &f.head_tree, Tree::Head, None).unwrap();
+        let out = extract(&f, &f.head_tree, Some(&files), "unborn");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_eq!(git(&out, &["rev-list", "--count", "HEAD"]), "1");
+        assert_eq!(git(&out, &["rev-parse", "--abbrev-ref", "HEAD"]), "unborn");
+        assert_eq!(git(&out, &["for-each-ref", "refs/remotes"]), "");
+        assert_eq!(git(&out, &["status", "--porcelain"]), "");
+        assert!(!git(&out, &["cat-file", "-p", "HEAD"])
+            .lines()
+            .any(|l| l.starts_with("parent ")));
+    }
+
+    #[test]
+    fn floor_git_without_a_run_base_ignores_the_pinned_history() {
+        let f = fixture();
+        let pinned_head = git(&f.repo, &["rev-parse", "HEAD"]);
+        let files = floor_git(&f.git_dir, &f.head_tree, Tree::Head, None).unwrap();
+        let out = extract(&f, &f.head_tree, Some(&files), "no-base");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        let head = git(&out, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&out, &["rev-list", "HEAD"]), head);
+        assert_eq!(git(&out, &["for-each-ref", "refs/remotes"]), "");
+        assert_eq!(
+            std::fs::read_to_string(out.join(".git/shallow")).unwrap(),
+            format!("{head}\n")
+        );
+        assert!(!git(&out, &["cat-file", "-p", "HEAD"])
+            .lines()
+            .any(|l| l.starts_with("parent ")));
+        assert_object_absent(&out, &pinned_head);
+    }
+
+    #[test]
+    fn floor_git_detached_head_gets_a_snapshot_and_defaults_to_origin_main() {
+        let f = fixture();
+        let head = git(&f.repo, &["rev-parse", "HEAD"]);
+        let tree = git(&f.repo, &["rev-parse", "HEAD^{tree}"]);
+        git(&f.repo, &["checkout", "-q", "--detach", &head]);
+        git(
+            &f.repo,
+            &["update-ref", "--no-deref", "-d", "refs/remotes/origin/HEAD"],
+        );
+        let files = floor_git(&f.git_dir, &tree, Tree::Head, Some(&f.base)).unwrap();
+        let out = extract(&f, &tree, Some(&files), "detached");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        assert_ne!(git(&out, &["rev-parse", "HEAD"]), head);
+        assert_eq!(git(&out, &["rev-list", "--count", "HEAD"]), "2");
+        assert_eq!(
+            git(&out, &["log", "--format=%s", "-1"]),
+            "wicked floor snapshot"
+        );
+        assert_eq!(
+            git(&out, &["rev-parse", "--abbrev-ref", "HEAD"]),
+            "wicked-floor"
+        );
+        assert_eq!(git(&out, &["merge-base", "HEAD", "origin/main"]), f.base);
+        assert_eq!(git(&out, &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn floor_git_uses_the_pinned_common_dir_after_worktree_git_redirection() {
+        let f = fixture();
+        let linked = f.root.join("linked");
+        git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked",
+                linked.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let pinned = crate::worktree_guard::pinned_git_dir(&linked, &f.repo).unwrap();
+        std::fs::write(linked.join("tracked.txt"), "linked snapshot\n").unwrap();
+        let snapshot = crate::worktree_guard::snapshot_through(&linked, &pinned).unwrap();
+        std::fs::write(linked.join(".git"), "gitdir: missing-redirected-git\n").unwrap();
+        git(
+            &f.repo,
+            &["update-ref", "refs/remotes/origin/trunk", &f.base],
+        );
+        git(
+            &f.repo,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/trunk",
+            ],
+        );
+        let files = floor_git(&pinned, &snapshot.tree, Tree::Head, Some(&f.base)).unwrap();
+        let out = extract(&f, &snapshot.tree, Some(&files), "linked-copy");
+        std::fs::remove_dir_all(&f.repo).unwrap();
+        std::fs::remove_dir_all(&linked).unwrap();
+        assert_eq!(git(&out, &["rev-parse", "--abbrev-ref", "HEAD"]), "linked");
+        assert_eq!(git(&out, &["merge-base", "HEAD", "origin/trunk"]), f.base);
+        assert_eq!(git(&out, &["status", "--porcelain"]), "");
+    }
+}
+
 /// The fill pod's install is fixed, with every lifecycle script off (B-6 review: the Kubernetes
 /// fill runs exactly this argv).
 #[test]
@@ -677,21 +1164,20 @@ mod live {
                 c.argv.first().is_some_and(|a| a == "npm") && c.argv.iter().any(|a| a == "test")
             })
             .unwrap_or_else(|| panic!("no vitest run among {names:?}: {:?}", r.sandbox_error));
-        // The suite ran (Vite bundled its config and the workers started), and nothing failed on
-        // a read-only node_modules. Studio's own tests that need a `.git` (the floor's copy has
-        // none, by design) are the studio's to answer, not this guard's (live 2026-11-11: 8955
-        // passed, 2 failed for want of git history).
+        // Vite bundled its config and the workers started. The private .git also lets Studio's
+        // inventory and tracked-file tests use git just as they do in a host worktree.
         let all = format!("{}{}", test.stdout_tail, test.stderr_tail);
         assert!(all.contains("Test Files"), "{test:#?}");
         for bad in ["EROFS", "read-only file system", ".vite-temp"] {
             assert!(!all.contains(bad), "{bad}: {test:#?}");
         }
+        assert_eq!(test.exit_code, Some(0), "{test:#?}");
     }
 
     /// PARITY B13 on pods, one install for every case: a passing floor runs with no network in
-    /// its copy (no `.git`, the marker set); a check that rewrites the tree stands for nothing; an
-    /// OOM kill is floor infrastructure whatever the exit code; a check's own exit code survives
-    /// the exec transport. Run: `WICKED_TEST_CONTAINER_FLOOR=1 WICKED_K8S_ADMIN_CONTEXT=<ctx>
+    /// its copy (a private `.git`, the marker set); a check that rewrites the tree stands for
+    /// nothing; an OOM kill is floor infrastructure whatever the exit code; a check's own exit
+    /// code survives the exec transport. Run: `WICKED_TEST_CONTAINER_FLOOR=1 WICKED_K8S_ADMIN_CONTEXT=<ctx>
     /// cargo test --lib checks_container::tests::live:: -- --test-threads 1`.
     #[test]
     fn k8s_live_the_checks_floor_runs_on_pods() {
@@ -708,7 +1194,13 @@ mod live {
             &[(
                 "t.js",
                 "const net=require('net');const fs=require('fs');\
-                 if(process.env.WICKED_CHECKS_FLOOR!=='container'||fs.existsSync('.git')){process.exit(2)}\
+                 if(process.env.WICKED_CHECKS_FLOOR!=='container'||!fs.existsSync('.git')){process.exit(2)}\
+                 const cp=require('child_process');\
+                 const files=cp.execFileSync('git',['ls-files'],{encoding:'utf8'});\
+                 if(!files.split('\\n').includes('t.js')){process.exit(5)}\
+                 const base=cp.execFileSync('git',['merge-base','HEAD','origin/main'],{encoding:'utf8'}).trim();\
+                 const origin=cp.execFileSync('git',['rev-parse','origin/main'],{encoding:'utf8'}).trim();\
+                 if(base!==origin){process.exit(6)}\
                  const s=net.connect(443,'1.1.1.1');s.setTimeout(3000,()=>process.exit(3));\
                  s.on('error',()=>process.exit(0));s.on('connect',()=>process.exit(4));",
             )],
