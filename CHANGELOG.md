@@ -2937,6 +2937,36 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.40** — 2026-11-12 — patch release on main 711f734, carrying 7 PRs since 0.15.39:
+  #1400, #1410, #1417, #1420, #1421, #1442 (the Kubernetes runner, core#1383 B-1..B-6) and #1443.
+  - **Seats, judges, sign-ins and the checks floor run as pods on a local Kubernetes cluster (#1400, #1410, #1417,
+    #1420, #1421, core#1383).** `wicked-core cluster install --admin-context <ctx> --home <state home>` installs the
+    pinned agent-sandbox controller (v1.0.10, sha-checked) and a scoped engine account once; install refuses a
+    cluster without a pod pids limit or an enforced NetworkPolicy. `cluster status` is the diagnostics JSON and
+    `cluster uninstall` removes the daemon's own objects and its credential. Each run gets a restricted namespace
+    (default-deny egress, the model gateway only), seats get a replica of the tree copied in and a checked
+    write-back, read-only units a throwaway view, and the checks floor runs its sides as offline pods. A run's
+    namespace is deleted at every terminal transition, and the daemon's boot sweep deletes the namespaces of runs
+    that are no longer live. New refusal kinds: `no_cluster`, `cluster_unreachable`, `controller_missing`,
+    `admission_pending`, `image_unavailable`, `policy_refused`, `exec_stream_lost`, `pids_unlimited`.
+  - **The Docker runner is deleted (#1442, B-6).** Seat containers, per-seat networks and their netns sidecar,
+    gateway containers, Docker login containers and the image holders are gone; `seat-image hold` is gone. The
+    container CLI (`docker`, `nerdctl` or `podman`) only builds and inspects images, into the store the cluster
+    shares (`imagePullPolicy: Never`). `WICKED_SEAT_FLOOR=host` still selects the labelled interim host floor.
+  - **Where a seat's arm spends its time (#1421).** New additive frame `seatArmTimed` (`session`, `ord`, `cli`,
+    `ok`, `totalMs`, `phases[]` of `{name, ms, detail}`, `detail` a string or `null`), once per arm.
+  - **Lockfile:** #1443 re-stamped the 0.15.39 platform lock entries.
+  - **Upgrade notes.** A governed seat on the container floor now needs a local Kubernetes cluster (Rancher Desktop
+    or Docker Desktop Kubernetes) and a one-time `wicked-core cluster install` into the daemon's state home; without
+    one the unit is refused with a named kind, never run on the host. The checks floor is different:
+    `WICKED_FLOOR_RUNNER=auto` (the default) tries pods on macOS only and falls back to the host floor, with the
+    reason, when the pods cannot start (Linux `auto` runs on the host); only `WICKED_FLOOR_RUNNER=container`
+    refuses instead. The engine's own
+    credential lives at `<state home>/k8s` (0600), a new state-home subtree registered in
+    `tests/fixtures/state-home-subtrees.json`; a consumer that mirrors that fixture (crew) needs the same entry.
+    Wire: one additive event, `seatArmTimed`. No binding method change, no `LaunchSpec` field change; gate protocol
+    3 is unchanged. The checks-floor and seat Dockerfiles are unchanged, so their image tags are unchanged; the netns
+    image is no longer built.
 - **core-ts 0.15.39** — 2026-11-11 — patch release on main a5dddf6, carrying 8 PRs since 0.15.38: #1411, #1416, #1425,
   #1426, #1427, #1428, #1431 and #1433.
   - **The requirements share counts only real behaviour (#1428, closes #1375 and #1235).** The share reads estate's
