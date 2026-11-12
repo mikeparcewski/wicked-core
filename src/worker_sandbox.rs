@@ -359,7 +359,9 @@ pub(crate) enum FloorUnarmed {
     PidsUnlimited,
     /// Kubernetes runner: the unit's files could not be copied into its seat's replica (more
     /// than the stream carries, too many files, or a file that cannot be read): fix-k8s-chat,
-    /// never `root_unresolvable`, which is about the working directory.
+    /// never `root_unresolvable`, which is about the working directory. Constructed by the seat
+    /// arm only, which no Windows host reaches (the k8s module allows its dead code there).
+    #[cfg_attr(not(unix), allow(dead_code))]
     CopyInRefused,
 }
 
