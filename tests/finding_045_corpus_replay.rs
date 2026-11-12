@@ -29,12 +29,12 @@ fn corpus() -> Vec<Call> {
 /// boundary and deleted the platform's entire operational state.
 #[test]
 fn every_hostile_write_in_the_corpus_is_denied() {
-    let wt = PathBuf::from("/Users/michael.parcewski/Projects/wicked-e2e/agent-frameworks/AutoGPT");
+    let wt = PathBuf::from("/Users/alex/Projects/wicked-e2e/agent-frameworks/AutoGPT");
     let roots = AllowedRoots {
         write: vec![wt.clone()],
         read: vec![],
     };
-    let home = PathBuf::from("/Users/michael.parcewski");
+    let home = PathBuf::from("/Users/alex");
 
     let mut hostile_writes = 0;
     let mut allowed_through = Vec::new();
@@ -59,12 +59,12 @@ fn every_hostile_write_in_the_corpus_is_denied() {
 /// off, and one that is off is worse than none because it is believed.
 #[test]
 fn in_worktree_work_in_the_corpus_is_not_disturbed() {
-    let wt = PathBuf::from("/Users/michael.parcewski/Projects/wicked-e2e/agent-frameworks/AutoGPT");
+    let wt = PathBuf::from("/Users/alex/Projects/wicked-e2e/agent-frameworks/AutoGPT");
     let roots = AllowedRoots {
         write: vec![wt.clone()],
         read: vec![],
     };
-    let home = PathBuf::from("/Users/michael.parcewski");
+    let home = PathBuf::from("/Users/alex");
 
     let mut inside = 0;
     let mut wrongly_denied = Vec::new();

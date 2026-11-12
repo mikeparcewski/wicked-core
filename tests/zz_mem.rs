@@ -1,6 +1,8 @@
 #[test]
 fn measure_rank_cost() {
-    let db = "/Users/michael.parcewski/.wicked/sources/AutoGOT/.wicked/code-graph.db";
+    let home = std::env::var("HOME").unwrap_or_default();
+    let db = format!("{home}/.wicked/sources/AutoGOT/.wicked/code-graph.db");
+    let db = db.as_str();
     if !std::path::Path::new(db).exists() {
         eprintln!("skip");
         return;
