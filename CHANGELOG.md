@@ -14,6 +14,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Kubernetes seat commits carry the operator's configured git identity again (wicked-core#1456).** The
+  operator's `user.name` and `user.email` from the seat-owned git config reach the seat pod, so
+  k8s seat commits carry that identity again. Other global settings are not carried.
+
 - **The Kubernetes checks floor copies each side with its own `.git` (wicked-core#1453).** HEAD
   names the side, `origin/<default>` names the run base, and no other history is copied.
   Repository tests can use `git ls-files`, `git merge-base` and `git diff <base>` on the floor.

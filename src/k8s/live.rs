@@ -573,8 +573,27 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
     let script = "set -e; test ! -e .env; test \"$UNIT_SECRET\" = s3cr3t; \
                   echo after > a.txt; rm gone.txt; echo new > new.txt; mkdir -p target; echo o > target/out.o; \
                   printf '#!/bin/sh\\necho pwned\\n' > .git/hooks/post-commit; chmod +x .git/hooks/post-commit; \
-                  git add -A; git -c user.name=seat -c user.email=s@s commit -qm unit; echo > .env; echo done";
-    let cmd = seat_cmd(&wrapper, &tree, script, &[("UNIT_SECRET", "s3cr3t")]);
+                  git add -A; git commit -qm unit; echo > .env; echo done";
+    // Like spawn hardening: an already resolved, seat-owned copy outside the mounted tree,
+    // supplied explicitly on the carrier. The pod must receive its identity without rediscovering it.
+    let global = home.join("gitconfig-seat-copy");
+    let system = home.join("gitconfig-system");
+    std::fs::write(
+        &global,
+        "[user]\n\tname = Op\n\temail = op@users.noreply.example\n",
+    )
+    .unwrap();
+    std::fs::write(&system, "").unwrap();
+    let mut cmd = seat_cmd(&wrapper, &tree, script, &[("UNIT_SECRET", "s3cr3t")]);
+    cmd.env("GIT_CONFIG_GLOBAL", &global)
+        .env("GIT_CONFIG_SYSTEM", &system)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env(
+            "GIT_SSH_COMMAND",
+            wicked_apps_core::spawn::NOPUSH_SSH_COMMAND,
+        )
+        .envs(wicked_apps_core::spawn::nopush_git_config_env());
     let (fin, seat2) = super::seat::finalize(&cmd)
         .expect("finalize")
         .expect("a pod seat");
@@ -621,6 +640,11 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
     );
     let head = git(&["rev-parse", "HEAD"]);
     assert_ne!(head, base);
+    assert_eq!(
+        git(&["log", "-1", "--format=%an <%ae>|%cn <%ce>"]),
+        "Op <op@users.noreply.example>|Op <op@users.noreply.example>",
+        "the landed commit must carry the operator's identity for author and committer"
+    );
     assert_eq!(
         git(&["rev-parse", "HEAD^"]),
         base,
