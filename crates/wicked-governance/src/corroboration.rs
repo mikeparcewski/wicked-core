@@ -92,11 +92,19 @@ fn is_test_node(node: &wicked_apps_core::Node) -> bool {
     sym.contains("/tests/") || sym.contains("::tests::") || node.name.starts_with("test_")
 }
 
+/// Text docs, plus the binary documents estate converts to Markdown at index time (its
+/// `doc_convert::DOC_EXTENSIONS`): their stored content is that Markdown, so they are read and
+/// counted like any `.md`, and never mistaken for a code extension.
 fn is_doc_path(file: &str) -> bool {
     let f = file.to_ascii_lowercase();
-    [".md", ".mdx", ".rst", ".adoc", ".txt"]
-        .iter()
-        .any(|e| f.ends_with(e))
+    [
+        ".md", ".mdx", ".rst", ".adoc", ".txt", // text
+        ".pdf", ".doc", ".docx", ".docm", ".odt", ".rtf", ".epub", // documents
+        ".ppt", ".pps", ".pot", ".pptx", ".pptm", ".ppsx", ".ppsm", ".odp", // slides
+        ".xls", ".xlsx", ".xlsm", ".xlsb", ".ods", // spreadsheets
+    ]
+    .iter()
+    .any(|e| f.ends_with(e))
 }
 
 fn is_config_path(file: &str) -> bool {
@@ -512,6 +520,40 @@ mod tests {
             (two.status.as_str(), two.extra_extractors),
             ("validated", 1)
         );
+    }
+
+    /// A binary document estate indexed (stored as the Markdown it converted to) is a doc: its
+    /// mentions count, and its extension never joins the code extensions `unindexed_mentions`
+    /// scans for. Before, a `.pdf`/`.docx` was neither.
+    #[test]
+    fn converted_documents_are_docs_and_their_mentions_count() {
+        use wicked_apps_core::{GraphWrite, SqliteStore};
+        for f in [
+            "docs/spec.pdf",
+            "a/Deck.PPTX",
+            "b.docx",
+            "c.xlsx",
+            "d.odt",
+            "e.rtf",
+            "f.epub",
+            "README.md",
+        ] {
+            assert!(is_doc_path(f), "{f}");
+        }
+        for f in ["data.csv", "src/lib.rs", "pdf"] {
+            assert!(!is_doc_path(f), "{f}");
+        }
+        let mut st = SqliteStore::in_memory().unwrap();
+        st.begin_batch().unwrap();
+        st.set_file_digest("docs/runbook.pdf", "r1").unwrap();
+        st.set_file_content(
+            "docs/runbook.pdf",
+            "# Runbook\nCall `settle_invoice` once.\n",
+        )
+        .unwrap();
+        st.commit_batch().unwrap();
+        let idx = CorroborationIndex::build(&st, None).unwrap();
+        assert_eq!(idx.doc_mentions.get("settle_invoice").copied(), Some(1));
     }
 
     /// wicked-estate#374's shape: a tracked source file the index skipped names the symbol, so its
