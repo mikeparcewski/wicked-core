@@ -6,6 +6,7 @@
 //! seat: it builds images into the store shared with the cluster (pods use `imagePullPolicy:
 //! Never`) and inspects a seat image before an arm ([`inspect_seat_image`]: a short-lived helper
 //! that runs only the floor's own busybox over the image as data).
+//! With `nerdctl`, every command uses the kubelet's `k8s.io` containerd namespace.
 //!
 //! The mount plan comes from [`SeatFloor`]: writable roots, read views, pinned launch files,
 //! and secret masks. [`crate::k8s::seat`] carries it into the pod along with the trusted floor
@@ -27,6 +28,7 @@ use wicked_apps_core::HardenedCommand;
 pub(crate) const SEAT_FLOOR_ENV: &str = "WICKED_SEAT_FLOOR";
 /// The runtime CLI to use (a name on `PATH` or an absolute path); otherwise the first of
 /// `docker`, `podman`, `nerdctl` found on `PATH` or in a well-known install dir.
+/// `nerdctl` always uses the kubelet's `k8s.io` containerd namespace.
 pub(crate) const RUNTIME_ENV: &str = "WICKED_CONTAINER_RUNTIME";
 /// A Debian-based base image to build the seat images on instead of the default (a project's own
 /// toolchain image). Part of the image tag, so a change rebuilds.
@@ -43,6 +45,7 @@ pub(crate) const MEMORY_ENV: &str = "WICKED_SEAT_MEMORY";
 pub(crate) const SEAT_LABEL: &str = "wicked.seat";
 
 const DEFAULT_BASE: &str = "node:24.22.2-trixie-slim";
+const CONTAINERD_NAMESPACE: &str = "k8s.io";
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The gateway's listeners a seat may connect to: CONNECT 3000, Anthropic 4000, OpenAI 4001,
@@ -250,11 +253,24 @@ impl Runtime {
 
     pub(crate) fn cmd(&self) -> Command {
         let mut c = Command::new(&self.cli);
-        c.hardened().stdin(Stdio::null());
+        c.hardened()
+            .args(runtime_global_args(&self.cli))
+            .stdin(Stdio::null());
         if let Some(path) = client_path(&self.cli, std::env::var_os("PATH").as_deref()) {
             c.env("PATH", path);
         }
         c
+    }
+}
+
+/// Global flags before the subcommand (wicked-core#1449): the kubelet reads images from
+/// containerd's `k8s.io` namespace, and pods use `imagePullPolicy: Never`, so nerdctl's default
+/// namespace would leave built images invisible to the pods.
+fn runtime_global_args(cli: &Path) -> &'static [&'static str] {
+    if cli.file_name().is_some_and(|name| name == "nerdctl") {
+        &["--namespace", CONTAINERD_NAMESPACE]
+    } else {
+        &[]
     }
 }
 
@@ -287,6 +303,7 @@ fn client_path(cli: &Path, path: Option<&std::ffi::OsStr>) -> Option<std::ffi::O
 
 /// The runtime CLIs to try, in order: the operator's choice, then `docker`, `podman`, `nerdctl`
 /// on `PATH`, then the install dirs the common desktops use (the daemon's `PATH` often lacks them).
+/// Rancher Desktop's `~/.rd/bin/nerdctl` is last, after every Docker and Podman install candidate.
 pub(crate) fn runtime_candidates(
     choice: Option<&str>,
     home: Option<&Path>,
@@ -334,6 +351,12 @@ pub(crate) fn runtime_candidates(
         "/Applications/Docker.app/Contents/Resources/bin/docker",
     ] {
         let p = PathBuf::from(abs);
+        if p.is_file() {
+            push(p);
+        }
+    }
+    if let Some(h) = home {
+        let p = h.join(".rd/bin/nerdctl");
         if p.is_file() {
             push(p);
         }
@@ -3433,7 +3456,7 @@ mod tests {
     /// A runtime stub that logs its argv and answers `image inspect` only for the tags a `build`
     /// made (or `present` names).
     fn image_stub(dir: &Path, present: &[&str]) -> PathBuf {
-        // Named `docker`: the engine holds images on the docker CLI only.
+        // Named `docker` so these fixtures receive no runtime-specific global flags.
         let rt = dir.join("docker");
         let have = dir.join("have");
         std::fs::write(
@@ -4189,6 +4212,20 @@ mod tests {
                 PathBuf::from("/bin/nerdctl")
             ]
         );
+        let home = tmp("rd-runtimes");
+        let bin = home.join(".rd/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let docker = bin.join("docker");
+        let nerdctl = bin.join("nerdctl");
+        std::fs::write(&docker, "").unwrap();
+        std::fs::write(&nerdctl, "").unwrap();
+        let orbstack = home.join(".orbstack/bin/docker");
+        std::fs::create_dir_all(orbstack.parent().unwrap()).unwrap();
+        std::fs::write(&orbstack, "").unwrap();
+        let all = runtime_candidates(None, Some(&home), |_| None);
+        assert_eq!(&all[..2], &[docker, orbstack]);
+        assert_eq!(all.last(), Some(&nerdctl));
+        std::fs::remove_dir_all(home).unwrap();
     }
 
     #[test]
@@ -4683,6 +4720,83 @@ mod tests {
             ),
             s(&["opencode", "-c", "script", "n", "opencode", "4096"])
         );
+    }
+
+    #[test]
+    fn runtime_commands_select_kubelet_namespace_only_for_nerdctl() {
+        for (cli, global_args) in [
+            ("nerdctl", &["--namespace", "k8s.io"][..]),
+            ("docker", &[][..]),
+            ("podman", &[][..]),
+        ] {
+            let rt = Runtime {
+                cli: Path::new("/some/dir").join(cli),
+                answer_bound: None,
+            };
+            for argv in [
+                &[
+                    "build",
+                    "--label",
+                    "wicked.seat=1",
+                    "-t",
+                    "wicked-floor:x",
+                    "-",
+                ][..],
+                &["image", "inspect", "--format", "{{.Id}}", "wicked-floor:x"][..],
+            ] {
+                let mut cmd = rt.cmd();
+                cmd.args(argv);
+                let actual: Vec<_> = cmd.get_args().map(|a| a.to_str().unwrap()).collect();
+                let expected: Vec<_> = global_args.iter().chain(argv).copied().collect();
+                assert_eq!(actual, expected, "{cli} {argv:?}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_build_passes_kubelet_namespace_to_nerdctl() {
+        let dir = c4_temp();
+        let cli = dir.join("nerdctl");
+        let log = dir.join("argv");
+        let recipe = dir.join("Dockerfile");
+        crate::test_env::install_stub(
+            &cli,
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{log}'\ncat > '{recipe}'\n",
+                log = log.display(),
+                recipe = recipe.display()
+            ),
+        );
+        let df = "FROM busybox:1.37-musl\n";
+        assert_eq!(
+            build_image(
+                &Runtime::answering(cli),
+                df,
+                "wicked-floor:x",
+                &["BASE=busybox:1.37-musl".to_string()]
+            )
+            .unwrap(),
+            "wicked-floor:x"
+        );
+        let argv = std::fs::read_to_string(log).unwrap();
+        assert_eq!(
+            argv.lines().collect::<Vec<_>>(),
+            vec![
+                "--namespace",
+                "k8s.io",
+                "build",
+                "--label",
+                "wicked.seat=1",
+                "--build-arg",
+                "BASE=busybox:1.37-musl",
+                "-t",
+                "wicked-floor:x",
+                "-"
+            ]
+        );
+        assert_eq!(std::fs::read_to_string(recipe).unwrap(), df);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
