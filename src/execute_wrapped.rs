@@ -2494,8 +2494,11 @@ fn open_state_home_around_declared(
 /// comma-joined entry, [`inject_isolation_flags`]; a token equal to `prompt` is never read as the
 /// flag) and, for a governed unit, `permissions.deny` in its `settings` file
 /// ([`arm_input_governance`]), rewritten with the same O_EXCL discipline it was written with,
-/// before the container starts. Called only after the container floor armed: the host floor's
-/// rules are never narrowed. `Err` refuses the launch.
+/// before the container starts. Called only on the container floor, never for the host floor's
+/// rules, in two stages (core#1461): the settings file from the settled mount view BEFORE any
+/// copy-in (`container_floor::arm_noting`'s `before_copy`: a pod mounts the file by subPath, so a
+/// later rewrite never reaches the seat; pass an empty `argv`), then the argv after the arm
+/// (`settings: None`; the argv rides the unit env at the spawn). `Err` refuses the launch.
 pub(crate) fn narrow_container_fence(
     argv: &mut [String],
     prompt: Option<&str>,

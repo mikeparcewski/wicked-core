@@ -2494,26 +2494,18 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
     if !Path::new(only).is_absolute() || only.contains(OPAQUE_EXPANSION) {
         return None;
     }
-    // Nothing after the `cd` may move a shell elsewhere or name where it was, in any word as the
-    // shell reads it, and in every piece of that reading (a string an `eval`, `trap`, `sh -c` or
-    // sourced file reads again): no `cd`/`chdir`/`pushd`/`popd`, no `OLDPWD`, no shell startup
-    // code (`BASH_ENV`, `ENV`), no `.`/`source`/`eval`/`trap` or the wrappers that reach them,
-    // no quote, backslash or backtick left for a next reading, and no `$` when a shell reads a
-    // string again (`sh -c '$GO'`). A word the text cannot resolve (a variable, `$(…)`, a glob)
-    // could be any of them. Each of these keeps every candidate.
+    // Nothing after the `cd` may start another shell (its startup files, `-c` strings and `$`
+    // expansions may move it anywhere), or move this one or name where it was, in any word as the
+    // shell reads it and in every token of that reading as a shell would split it again (a string
+    // an `eval` or `trap` reads): no `cd`/`chdir`/`pushd`/`popd`, no `OLDPWD`, no startup code
+    // (`BASH_ENV`, `ENV`), no `.`/`source`/`eval`/`trap` or the wrappers that reach them, and no
+    // quote, backslash or backtick left for a next reading. A word the text cannot resolve (a
+    // variable, `$(…)`, a glob) could be any of them. Each of these keeps every candidate.
     const MOVES: [&str; 7] = ["cd", "chdir", "pushd", "popd", "OLDPWD", "BASH_ENV", "ENV"];
     const REREAD: [&str; 7] = [".", "source", "eval", "trap", "builtin", "command", "exec"];
     const SHELLS: [&str; 9] = [
         "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox", "fish",
     ];
-    let shell_reads_again = rest.iter().any(|t| {
-        resolve_shell_readings(t, home).is_none_or(|rs| {
-            rs.iter().any(|r| {
-                r.split([' ', '\t'])
-                    .any(|w| SHELLS.contains(&w.rsplit('/').next().unwrap_or(w)))
-            })
-        })
-    });
     for t in rest {
         if matches!(t.as_str(), ";" | "||" | "&" | "|&" | ";;" | ";&" | ";;&") {
             return None;
@@ -2527,8 +2519,10 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
         for r in resolve_shell_readings(t, home)? {
             if r.contains(OPAQUE_EXPANSION)
                 || r.contains(['\'', '"', '\\', '`'])
-                || (shell_reads_again && r.contains('$'))
-                || r.split([' ', '\t']).any(|w| REREAD.contains(&w))
+                || shell_tokens_with_operators(&r, true).iter().any(|w| {
+                    REREAD.contains(&w.as_str())
+                        || SHELLS.contains(&w.rsplit('/').next().unwrap_or(w))
+                })
                 || r.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .any(|w| MOVES.contains(&w))
             {
@@ -11808,6 +11802,10 @@ mod boundary_tests {
             format!("cd {a} && trap '. ./go.sh' DEBUG && sed -i 's/a/b/' deck.html"),
             format!("cd {a} && trap '$GO' DEBUG && sed -i 's/a/b/' deck.html"),
             format!("cd {a} && bash -c '$GO && sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && bash -c 'true;. ./go.sh && sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && bash --rcfile ./go.sh -ic 'sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && /bin/sh -c 'sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && trap 'true;. ./go.sh' DEBUG && sed -i 's/a/b/' deck.html"),
             format!("cd {a} && sh -c '. ./go.sh && sed -i s/a/b/ deck.html'"),
             format!("cd {a} && BASH_ENV=./go.sh bash -c 'sed -i s/a/b/ deck.html'"),
             format!("cd {a} && chdir - && sed -i 's/a/b/' deck.html"),
