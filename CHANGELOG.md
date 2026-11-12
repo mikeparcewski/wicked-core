@@ -14,6 +14,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Corroboration counts converted documents as docs.** Estate now indexes PDF, Word, PowerPoint, Excel,
+  OpenDocument, RTF and EPUB files as the Markdown it converts them to, so `is_doc_path` lists their
+  extensions: a requirement named in a `.pdf` or `.docx` counts that file as a doc mention, and those
+  extensions are no longer taken for code extensions when looking for unindexed source files.
+
 - **Kubernetes seat commits carry the operator's configured git identity again (wicked-core#1456).** The
   operator's `user.name` and `user.email` from the seat-owned git config reach the seat pod, so
   k8s seat commits carry that identity again. Other global settings are not carried.
