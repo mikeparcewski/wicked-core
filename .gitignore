@@ -17,3 +17,6 @@ __pycache__/
 .loop-run/
 /tmp/
 .product/
+
+# QE run evidence (run artifacts carry host-specific paths; never committed)
+.wicked-testing/evidence/
