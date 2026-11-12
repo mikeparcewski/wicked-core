@@ -2472,7 +2472,12 @@ const MAX_SHELL_CWD_CANDIDATES: usize = 64;
 /// skills snapshot an earlier call had `cd`-ed into, and the unit was denied. The `cd` itself is
 /// still judged by the `cd` fence. `None` for every other shape: all candidates stay.
 fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
-    if command.contains(['\n', '\r']) {
+    // Only the blanks the shell splits on (a no-break space or a form feed is part of a word to
+    // the shell, not to this tokenizer), and no line break (it ends the `&&` chain).
+    if command
+        .chars()
+        .any(|c| c.is_whitespace() && c != ' ' && c != '\t')
+    {
         return None;
     }
     let toks = shell_tokens_with_operators(command, true);
@@ -2489,16 +2494,26 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
     if !Path::new(only).is_absolute() || only.contains(OPAQUE_EXPANSION) {
         return None;
     }
-    // Nothing after the `cd` may move the shell elsewhere or name where it was: no other
-    // `cd`/`pushd`/`popd` and no `OLDPWD`, in any word as the shell (or an `eval`, or an inner
-    // `sh -c`) reads it. A word the text cannot resolve (a variable, `$(…)`, a glob) could be any
-    // of them, so it keeps every candidate too.
-    // Code read a second time keeps every candidate as well: any word that is sourced code,
-    // `eval` or a wrapper that reaches them (`.`, `source`, `eval`, `builtin`, `command`, `exec`),
-    // wherever it stands (`time X=1 . ./x.sh` sources in this shell too), and any word that still
-    // holds a quote or a backslash once the shell has read it (`eval 'c""d -'`).
-    const MOVES: [&str; 4] = ["cd", "pushd", "popd", "OLDPWD"];
-    const REREAD: [&str; 6] = [".", "source", "eval", "builtin", "command", "exec"];
+    // Nothing after the `cd` may move a shell elsewhere or name where it was, in any word as the
+    // shell reads it, and in every piece of that reading (a string an `eval`, `trap`, `sh -c` or
+    // sourced file reads again): no `cd`/`chdir`/`pushd`/`popd`, no `OLDPWD`, no shell startup
+    // code (`BASH_ENV`, `ENV`), no `.`/`source`/`eval`/`trap` or the wrappers that reach them,
+    // no quote, backslash or backtick left for a next reading, and no `$` when a shell reads a
+    // string again (`sh -c '$GO'`). A word the text cannot resolve (a variable, `$(…)`, a glob)
+    // could be any of them. Each of these keeps every candidate.
+    const MOVES: [&str; 7] = ["cd", "chdir", "pushd", "popd", "OLDPWD", "BASH_ENV", "ENV"];
+    const REREAD: [&str; 7] = [".", "source", "eval", "trap", "builtin", "command", "exec"];
+    const SHELLS: [&str; 9] = [
+        "sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "busybox", "fish",
+    ];
+    let shell_reads_again = rest.iter().any(|t| {
+        resolve_shell_readings(t, home).is_none_or(|rs| {
+            rs.iter().any(|r| {
+                r.split([' ', '\t'])
+                    .any(|w| SHELLS.contains(&w.rsplit('/').next().unwrap_or(w)))
+            })
+        })
+    });
     for t in rest {
         if matches!(t.as_str(), ";" | "||" | "&" | "|&" | ";;" | ";&" | ";;&") {
             return None;
@@ -2512,7 +2527,8 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
         for r in resolve_shell_readings(t, home)? {
             if r.contains(OPAQUE_EXPANSION)
                 || r.contains(['\'', '"', '\\', '`'])
-                || REREAD.contains(&r.as_str())
+                || (shell_reads_again && r.contains('$'))
+                || r.split([' ', '\t']).any(|w| REREAD.contains(&w))
                 || r.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .any(|w| MOVES.contains(&w))
             {
@@ -11756,6 +11772,7 @@ mod boundary_tests {
                 "cd {a} && sed -i 's/^section {{/.slide {{/; s/ break-after: page//' deck.html"
             ),
             format!("cd {a} && sed -i.bak 's/a/b/' deck.html && ls"),
+            format!("cd {a} && sed -i 's/end$/fin/' deck.html"),
             format!("cd {a} && cat > deck.html"),
             format!("cd {a} && mkdir -p records && cat deck.html | tee records/copy.html"),
         ] {
@@ -11788,6 +11805,14 @@ mod boundary_tests {
             format!("cd {a} && 2>/dev/null source go.sh && sed -i 's/a/b/' deck.html"),
             format!("cd {a} && bash -c 'c\"\"d -; sed -i s/a/b/ deck.html'"),
             format!("cd {a} && time X=1 . ./go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && trap '. ./go.sh' DEBUG && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && trap '$GO' DEBUG && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && bash -c '$GO && sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && sh -c '. ./go.sh && sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && BASH_ENV=./go.sh bash -c 'sed -i s/a/b/ deck.html'"),
+            format!("cd {a} && chdir - && sed -i 's/a/b/' deck.html"),
+            format!("cd {a}\u{a0} && sed -i 's/a/b/' deck.html"),
+            format!("cd {a}\u{c} && sed -i 's/a/b/' deck.html"),
             "cd attempt-1 && sed -i 's/a/b/' deck.html".to_string(),
             format!(
                 "cd {} && sed -i 's/a/b/' SKILL.md",
