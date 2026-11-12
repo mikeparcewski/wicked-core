@@ -150,10 +150,11 @@ cap (`WICKED_FLOOR_MEMORY`, default `6g`); the tree is copied in, and a check th
 tracked file stands for nothing. A check killed for memory, or a pod that stops answering,
 is "could not run", never a failure of the change. The image is `containers/checks/node22-rust.Dockerfile`,
 built on first use. `wicked-core floor run --repo <dir> --base <commit> [--full]` runs one floor and
-prints its report (which floor ran is its `runner` field). The container cannot run everything: an
-install other than `npm ci`, a check that names the base commit (the copy has no history), a build
-guide that reads results from a file, or a check whose command the image lacks sends `auto` back to
-the host floor. Only each check's own command is probed: a tool a script calls inside the container
+prints its report (which floor ran is its `runner` field). Each copied side carries a private
+`.git` (HEAD the side, `origin/<default>` the run base, no other history). The container cannot run
+everything: an install other than `npm ci`, a build guide that reads results from a file, or a
+check whose command the image lacks sends `auto` back to the host floor. Only each check's own
+command is probed: a tool a script calls inside the container
 (`go test` from an npm script) fails there, so such a repository sets `WICKED_FLOOR_RUNNER=sandbox`.
 
 The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the

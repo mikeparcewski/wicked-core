@@ -3,6 +3,10 @@
 //! Each floor side runs in a fresh pod in the run's namespace. The engine streams a verified
 //! copy of the pinned tree into it, executes checks through `kubectl exec`, and verifies the
 //! tree after each check. The pod's rc file must agree with the command's exit status.
+//! Each side carries a private `.git`: HEAD names its copied snapshot, `origin/<default>` names
+//! the run base, and no other history is exported. If rebuilding `.git` fails, the tree still
+//! runs and the engine logs the failed step. Host hooks and repository configuration are never
+//! copied.
 //!
 //! Fill pods prepare dependency caches on claims in the run's namespace; checks run offline
 //! with a read-only root and a memory cap. OOM kills are infrastructure failures, never
@@ -66,6 +70,10 @@ const REAP: Duration = Duration::from_secs(20);
 /// A changed file's mtime is stamped this far past the copy, so it is later than any build an
 /// earlier copy of the leaf could have run (the VM's clock may trail the host's a little).
 const MTIME_MARGIN_S: u64 = 2;
+/// Refuse oversized git metadata before reading it into the copy-in archive.
+const FLOOR_GIT_BYTES: u64 = 256 * 1024 * 1024;
+
+type GitFiles = Vec<(String, u32, Vec<u8>)>;
 
 /// The operator's choice of floor ([`RUNNER_ENV`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +622,8 @@ pub(crate) fn tar_member(
     let short: String = path.chars().take(100).collect();
     if link {
         out.write_all(&ustar(&short, b'2', 0o777, 0, mtime, &link_target))
+    } else if mode & 0o170000 == 0o040000 {
+        out.write_all(&ustar(&short, b'5', 0o755, 0, mtime, ""))
     } else {
         let m = if mode & 0o111 != 0 { 0o755 } else { 0o644 };
         out.write_all(&ustar(&short, b'0', m, body.len() as u64, mtime, ""))?;
@@ -630,23 +640,39 @@ fn pad(out: &mut impl Write, len: usize) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A git command over the pinned git dir, with no system or global configuration.
+/// A git command over an explicit git dir, with no hooks, fsmonitor or host configuration.
 fn git_cmd(git_dir: &Path, args: &[&str]) -> Command {
-    // spawn-audit: hardened — git plumbing over the run's pinned git dir (object reads only).
+    // spawn-audit: hardened — pinned object reads or plumbing in an engine-owned temporary repo.
     let mut c = Command::new("git");
     c.hardened()
+        .args([
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "protocol.allow=never",
+        ])
         .args(args)
         .env("GIT_DIR", git_dir)
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env(
-            "GIT_CONFIG_GLOBAL",
-            if cfg!(windows) { "NUL" } else { "/dev/null" },
-        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_ALLOW_PROTOCOL", "none")
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .env_remove("GIT_CONFIG_PARAMETERS")
         .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_SHALLOW_FILE")
+        .env_remove("GIT_DEFAULT_REF_FORMAT")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .current_dir(std::env::temp_dir());
     c
 }
@@ -675,6 +701,198 @@ fn read_blob(git_dir: &Path, id: &str, rel: &str) -> Option<Vec<u8>> {
         .map(|o| o.stdout)
 }
 
+/// Rebuild a side's git dir using only the pinned object store, never the worktree's `.git`.
+/// The alternate exists only during construction; every reachable object is packed locally.
+fn floor_git(
+    git_dir: &Path,
+    side_tree: &str,
+    side: Tree,
+    base: Option<&str>,
+) -> Result<GitFiles, String> {
+    let tmp = std::env::temp_dir().join(format!(
+        "wicked-floor-git-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    struct Rm(PathBuf);
+    impl Drop for Rm {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    std::fs::create_dir(&tmp).map_err(|_| "create directory: no exit status")?;
+    let _rm = Rm(tmp.clone());
+    let run = |dir: &Path, args: &[&str]| -> Result<String, String> {
+        let mut c = git_cmd(dir, args);
+        c.current_dir(&tmp)
+            .env("HOME", &tmp)
+            .env("GIT_AUTHOR_NAME", "wicked floor")
+            .env("GIT_AUTHOR_EMAIL", "floor@wicked.invalid")
+            .env("GIT_COMMITTER_NAME", "wicked floor")
+            .env("GIT_COMMITTER_EMAIL", "floor@wicked.invalid")
+            .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
+            .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z")
+            .stdin(Stdio::null());
+        // Only the engine-generated command name and exit status may reach the diagnostic.
+        // Arguments and stderr can contain repository configuration, credentials or host paths.
+        let step = args[0];
+        let o = output_within(c, COPY).ok_or_else(|| format!("{step}: no exit status"))?;
+        if !o.status.success() {
+            return Err(format!("{step}: {}", o.status));
+        }
+        String::from_utf8(o.stdout)
+            .map(|s| s.trim().to_string())
+            .map_err(|_| format!("{step}: {}", o.status))
+    };
+    let common = run(
+        git_dir,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    )?;
+    let objects = Path::new(&common)
+        .join("objects")
+        .canonicalize()
+        .map_err(|_| "objects path: no exit status")?;
+    let objects = objects.to_str().ok_or("objects path: no exit status")?;
+    if objects.chars().any(char::is_control) {
+        return Err("objects path: no exit status".into());
+    }
+    let format = run(git_dir, &["rev-parse", "--show-object-format"])?;
+    let branch = run(git_dir, &["symbolic-ref", "-q", "HEAD"])
+        .ok()
+        .filter(|r| r.starts_with("refs/heads/"))
+        .unwrap_or_else(|| "refs/heads/wicked-floor".into());
+    let default = run(git_dir, &["symbolic-ref", "-q", "refs/remotes/origin/HEAD"])
+        .ok()
+        .filter(|r| r.starts_with("refs/remotes/origin/"))
+        .unwrap_or_else(|| "refs/remotes/origin/main".into());
+    let built = tmp.join(".git");
+    let git = |args: &[&str]| run(&built, args);
+    git(&[
+        "init",
+        "-q",
+        "--template=",
+        &format!("--object-format={format}"),
+    ])?;
+    git(&["config", "core.fsmonitor", "false"])?;
+    let alternate = built.join("objects/info/alternates");
+    std::fs::write(&alternate, format!("{objects}\n"))
+        .map_err(|_| "write alternate: no exit status")?;
+    let base = base
+        .map(|base| git(&["rev-parse", "--verify", &format!("{base}^{{commit}}")]))
+        .transpose()?;
+    let head = match side {
+        Tree::Base => base.clone().ok_or("run base: no exit status")?,
+        Tree::Head => {
+            let mut args = vec!["commit-tree", side_tree];
+            if let Some(base) = base.as_deref() {
+                args.extend(["-p", base]);
+            }
+            args.extend(["-m", "wicked floor snapshot"]);
+            git(&args)?
+        }
+    };
+    git(&["update-ref", &branch, &head])?;
+    git(&["symbolic-ref", "HEAD", &branch])?;
+    if let Some(base) = base.as_deref() {
+        git(&["update-ref", &default, base])?;
+        git(&["symbolic-ref", "refs/remotes/origin/HEAD", &default])?;
+    }
+    std::fs::write(
+        built.join("shallow"),
+        format!("{}\n", base.as_deref().unwrap_or(&head)),
+    )
+    .map_err(|_| "write shallow: no exit status")?;
+    git(&["read-tree", side_tree])?;
+    // No -l: reachable objects borrowed through the alternate must enter our own pack.
+    git(&["repack", "-a", "-d", "-q"])?;
+    std::fs::remove_file(alternate).map_err(|_| "remove alternate: no exit status")?;
+    git(&["prune-packed"])?;
+    git(&["rev-parse", "--verify", "HEAD"])?;
+    if let Some(base) = base.as_deref() {
+        git(&["cat-file", "-e", base])?;
+    }
+    git(&["rev-list", "HEAD"])?;
+    for rel in ["FETCH_HEAD", "ORIG_HEAD"] {
+        let _ = std::fs::remove_file(built.join(rel));
+    }
+    let _ = std::fs::remove_dir_all(built.join("logs"));
+    floor_git_files(&built)
+}
+
+/// Size the entire private git dir from metadata before reading any of its file contents.
+fn floor_git_files(root: &Path) -> Result<GitFiles, String> {
+    let mut dirs = vec![root.to_path_buf()];
+    let mut listed = Vec::new();
+    let mut size = 0u64;
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).map_err(|_| "list metadata: no exit status")? {
+            let entry = entry.map_err(|_| "list metadata: no exit status")?;
+            let path = entry.path();
+            let metadata =
+                std::fs::symlink_metadata(&path).map_err(|_| "size bound: no exit status")?;
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| "metadata path: no exit status")?;
+            let rel = rel
+                .to_str()
+                .ok_or("metadata path: no exit status")?
+                .replace('\\', "/");
+            if metadata.is_dir() {
+                if rel != "hooks" {
+                    dirs.push(path);
+                }
+            } else if metadata.is_file() {
+                if rel == "description" {
+                    continue;
+                }
+                size = size
+                    .saturating_add(metadata.len())
+                    .saturating_add(rel.len() as u64);
+                if size > FLOOR_GIT_BYTES {
+                    return Err("size bound: no exit status".into());
+                }
+                #[cfg(unix)]
+                let mode = {
+                    use std::os::unix::fs::PermissionsExt;
+                    metadata.permissions().mode()
+                };
+                #[cfg(not(unix))]
+                let mode = 0o100644;
+                listed.push((path, rel, mode));
+            } else {
+                return Err("metadata type: no exit status".into());
+            }
+        }
+    }
+    listed.sort_by(|a, b| a.1.cmp(&b.1));
+    listed
+        .into_iter()
+        .map(|(path, rel, mode)| {
+            std::fs::read(path)
+                .map(|bytes| (rel, mode, bytes))
+                .map_err(|_| "read metadata: no exit status".into())
+        })
+        .collect()
+}
+
+/// Git support is best effort: a failed rebuild must never prevent the original tree copy.
+fn optional_floor_git(
+    git_dir: &Path,
+    side_tree: &str,
+    tree: Tree,
+    base: Option<&str>,
+) -> Option<Arc<GitFiles>> {
+    match floor_git(git_dir, side_tree, tree, base) {
+        Ok(files) => Some(Arc::new(files)),
+        Err(reason) => {
+            eprintln!(
+                "wicked-core: checks floor {} has no .git: {reason}",
+                side(tree)
+            );
+            None
+        }
+    }
+}
+
 /// What a copied file must still hold after a check: its bytes' sha256, or its link target.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) enum Expect {
@@ -694,6 +912,17 @@ pub(crate) fn write_tree_tar(
     mtimes: &[u64],
     out: &mut dyn Write,
 ) -> Result<Vec<(String, Expect)>, String> {
+    write_side_tar(git_dir, entries, mtimes, None, out)
+}
+
+/// The exact copy-in archive: git metadata is deliberately outside the verified tree's `held`.
+fn write_side_tar(
+    git_dir: &Path,
+    entries: &[Entry],
+    mtimes: &[u64],
+    git: Option<&GitFiles>,
+    out: &mut dyn Write,
+) -> Result<Vec<(String, Expect)>, String> {
     use sha2::{Digest, Sha256};
     let mut c = git_cmd(git_dir, &["cat-file", "--batch"]);
     c.stdin(Stdio::piped())
@@ -709,6 +938,9 @@ pub(crate) fn write_tree_tar(
         let mut line = String::new();
         let mut out = out;
         for (e, t) in entries.iter().zip(mtimes) {
+            if e.path.split('/').any(|c| c == ".git") {
+                return Err(format!("the tree holds a git metadata path {:?}", e.path));
+            }
             writeln!(tx, "{}", e.oid).map_err(|e| e.to_string())?;
             tx.flush().map_err(|e| e.to_string())?;
             line.clear();
@@ -739,6 +971,23 @@ pub(crate) fn write_tree_tar(
                 )
             };
             held.push((e.path.clone(), expect));
+        }
+        if let Some(files) = git {
+            for dir in [
+                ".git",
+                ".git/refs",
+                ".git/refs/heads",
+                ".git/refs/tags",
+                ".git/objects",
+                ".git/objects/info",
+                ".git/objects/pack",
+            ] {
+                tar_member(&mut out, dir, 0o040755, 0, &[]).map_err(|e| e.to_string())?;
+            }
+            for (rel, mode, bytes) in files {
+                tar_member(&mut out, &format!(".git/{rel}"), *mode, 0, bytes)
+                    .map_err(|e| e.to_string())?;
+            }
         }
         out.write_all(&[0u8; 1024]).map_err(|e| e.to_string())?;
         out.flush().map_err(|e| e.to_string())
@@ -928,6 +1177,7 @@ struct NmMount {
 #[derive(Debug, Clone)]
 struct SidePlan {
     entries: Vec<Entry>,
+    git: Option<Arc<GitFiles>>,
     nm: Vec<NmMount>,
     cargo: bool,
 }
@@ -1034,18 +1284,6 @@ impl ChecksFloor {
                  this install is `{}`",
                 c.argv.join(" ")
             )));
-        }
-        if let Some(base) = ctx.base_head.as_deref().filter(|b| b.len() >= 7) {
-            if let Some(c) = detected
-                .iter()
-                .find(|c| c.argv.iter().any(|a| a.contains(base)))
-            {
-                return Err(no(format!(
-                    "`{}` names the base commit, which needs the repository's history; the \
-                     container's copy has none",
-                    c.name
-                )));
-            }
         }
         if let Some(Ok(Some(guide))) = ctx
             .base_head
@@ -1391,7 +1629,13 @@ impl ChecksFloor {
                 );
             }
         }
-        Ok(SidePlan { entries, nm, cargo })
+        let git = optional_floor_git(&self.git_dir, &id, tree, self.base_commit.as_deref());
+        Ok(SidePlan {
+            entries,
+            git,
+            nm,
+            cargo,
+        })
     }
 
     /// The environment every check of a side sees inside, before a guide's own.
@@ -1624,7 +1868,7 @@ impl ChecksFloor {
         c.args(["sh", "-c", &script]);
         let mut held = Vec::new();
         let fed = run_fed(c, COPY, |w| {
-            held = write_tree_tar(&self.git_dir, &entries, &times, w)?;
+            held = write_side_tar(&self.git_dir, &entries, &times, plan.git.as_deref(), w)?;
             Ok(())
         })
         .map_err(|e| format!("the tree copy-in: {e}"))?;
