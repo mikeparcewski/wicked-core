@@ -2958,6 +2958,32 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.41** — 2026-11-12 — patch release on main 8b946a5, carrying 6 PRs since 0.15.40: #1448, #1450,
+  #1451, #1452, #1454 and #1459.
+  - **The requirements read carries a confidence-weighted headline, `coverage.weightedPct` (#1451, core#1445).**
+    Optional on the wire and computed at the read; `real_pct`, `meets_minimum` and the coverage gate are unchanged.
+  - **On Rancher Desktop's containerd engine, nerdctl builds and inspects images in the kubelet's `k8s.io` namespace
+    (#1452, core#1449).** Floor and seat images built with nerdctl were invisible to the cluster's pods
+    (`imagePullPolicy: Never`), so seats and the checks floor could not start. `~/.rd/bin/nerdctl` is now the last
+    runtime candidate. docker and podman are unchanged.
+  - **The Kubernetes checks floor copies each side with its own `.git` (#1454, core#1453).** A regression from the
+    Docker floor: the pod copy had no `.git`, so repository tests that call git failed on head and base alike. HEAD
+    names the side and `origin/<default>` names the run base; no other history is copied. Building it is best
+    effort (a failure is logged and the tree is copied without it). Checks that name the base commit are no longer
+    refused at prepare time.
+  - **Kubernetes seat commits carry the operator's git identity again (#1459, core#1456).** A regression from the
+    Docker runner: the pod was pointed at a host path for its global git config, so a delivered run's commits
+    carried git's automatic identity (`seat@wicked.local`). The pod now gets only `user.name` and `user.email` from
+    the seat-owned copy; signing, filters and other settings are not carried. An identity problem never refuses a
+    unit.
+  - **Committed host paths replaced with placeholders (#1450).** Evidence records, tests and fixtures only; no product
+    source change.
+  - **Lockfile:** #1448 re-stamped the 0.15.40 platform lock entries.
+  - **Upgrade notes.** No binding method change, no `LaunchSpec` field change; gate protocol 3 is unchanged. Wire: one
+    additive optional JSON key, `coverage.weightedPct` on the requirements read. The checks-floor Dockerfile
+    (`containers/checks/node22-rust.Dockerfile`) changed: it trusts `/work/head` and `/work/base` in system git
+    config, so its image tag changes and the floor image is rebuilt on first use. The seat Dockerfiles are
+    unchanged. Rancher Desktop on containerd no longer needs the dockerd (moby) engine for the k8s runner.
 - **core-ts 0.15.40** — 2026-11-12 — patch release on main 711f734, carrying 7 PRs since 0.15.39:
   #1400, #1410, #1417, #1420, #1421, #1442 (the Kubernetes runner, core#1383 B-1..B-6) and #1443.
   - **Seats, judges, sign-ins and the checks floor run as pods on a local Kubernetes cluster (#1400, #1410, #1417,
