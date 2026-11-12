@@ -357,6 +357,10 @@ pub(crate) enum FloorUnarmed {
     /// Kubernetes runner: the engine's probe found no pod pids limit of at most 4096 (measured by
     /// forking: a container's own `pids.max` reads `max` even under a pod limit), PARITY B2.
     PidsUnlimited,
+    /// Kubernetes runner: the unit's files could not be copied into its seat's replica (more
+    /// than the stream carries, too many files, or a file that cannot be read): fix-k8s-chat,
+    /// never `root_unresolvable`, which is about the working directory.
+    CopyInRefused,
 }
 
 impl FloorUnarmed {
@@ -481,6 +485,10 @@ impl FloorUnarmed {
                  fork without bound — set the kubelet's pod-max-pids to 4096 (Rancher Desktop: a k3s \
                  argument), then retry"
             }
+            FloorUnarmed::CopyInRefused => {
+                "copy_in_refused: the unit's files could not be copied into its seat (more than \
+                 the copy-in stream carries, too many files, or a file that cannot be read)"
+            }
         }
     }
 
@@ -513,6 +521,7 @@ impl FloorUnarmed {
             FloorUnarmed::PolicyRefused => "policy_refused",
             FloorUnarmed::ExecStreamLost => "exec_stream_lost",
             FloorUnarmed::PidsUnlimited => "pids_unlimited",
+            FloorUnarmed::CopyInRefused => "copy_in_refused",
         }
     }
 }

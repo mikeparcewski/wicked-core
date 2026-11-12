@@ -529,6 +529,23 @@ pub(crate) fn host_tree_listing(root: &Path) -> Result<Vec<String>, String> {
             return host_plain_listing(root, &[".git".to_string()]);
         }
     }
+    git_listing(root, true)
+}
+
+/// The files of a host repository `root` git lists (tracked, plus untracked and not ignored),
+/// relative; never a plain listing: `Err` when git fails or `root` is no repository (a read-only
+/// repository root, fix-k8s-chat). An untracked embedded repository (git's `dir/` record) is a
+/// directory, so it is left out, as [`read_host_entry`] leaves a directory out.
+pub(crate) fn host_repo_listing(root: &Path) -> Result<Vec<String>, String> {
+    if std::fs::symlink_metadata(root.join(".git")).is_err() {
+        return Err(format!("{} is no longer a repository", root.display()));
+    }
+    git_listing(root, false)
+}
+
+/// What git lists in `root` (tracked, plus untracked and not ignored); `Err` when git fails. A
+/// tree keeps git's `dir/` records (an embedded repository refuses its copy-in, as it did).
+fn git_listing(root: &Path, dirs: bool) -> Result<Vec<String>, String> {
     let out = git(root)
         .args(["ls-files", "-z", "-c", "-o", "--exclude-standard"])
         .output()
@@ -543,7 +560,11 @@ pub(crate) fn host_tree_listing(root: &Path) -> Result<Vec<String>, String> {
     // A name the stream cannot carry refuses the copy-in (review r5): left out, the seat's
     // `git add -A` would record its deletion.
     let mut v: Vec<String> = Vec::new();
-    for raw in out.stdout.split(|b| *b == 0).filter(|s| !s.is_empty()) {
+    for raw in out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty() && (dirs || !s.ends_with(b"/")))
+    {
         match String::from_utf8(raw.to_vec()) {
             Ok(p) => v.push(p),
             Err(_) => {

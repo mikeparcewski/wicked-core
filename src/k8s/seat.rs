@@ -181,6 +181,10 @@ pub(crate) struct PlanRoot {
     /// The masks under this root (relative): never copied, scrubbed from the replica at every
     /// copy-in, never written back, never committed.
     pub(crate) masks: Vec<String>,
+    /// A read-only repository (a plain root bound read-only, with its own `.git`): copied as what
+    /// git lists, never its ignored files, never from the read cache (fix-k8s-chat: a chat's "All
+    /// repos" read roots, crew#1034, were copied whole, build output and run worktrees included).
+    pub(crate) repo: bool,
 }
 
 /// A mount of the floor's plan, as the pod renders it.
@@ -285,6 +289,8 @@ pub(crate) fn plan(
         if path == tree {
             skip.push(".git".into());
         }
+        let repo =
+            mode == Mode::Plain && !*rw && std::fs::symlink_metadata(path.join(".git")).is_ok();
         roots.push(PlanRoot {
             host: path.clone(),
             mode,
@@ -292,6 +298,7 @@ pub(crate) fn plan(
             back,
             files: Vec::new(),
             masks: root_masks,
+            repo,
         });
     }
     let mut file_roots: Vec<(PathBuf, (Vec<String>, bool))> = files.into_iter().collect();
@@ -307,6 +314,7 @@ pub(crate) fn plan(
             back: rw && admitted,
             files: names,
             masks: Vec::new(),
+            repo: false,
         });
     }
     // Parents before their nested roots (a nested root lands inside its parent's copy).
@@ -1037,7 +1045,7 @@ pub(crate) fn copy_in_stream(
         // skills snapshot took up to 35 s to open file by file, for every replica and judge).
         // Signed BEFORE it is listed and read, and kept only when signed the same after (codex
         // r1 #5): the entries kept are those of the state the signature names.
-        let cached = (r.mode == Mode::Plain)
+        let cached = (r.mode == Mode::Plain && !r.repo)
             .then(|| root_signature(r))
             .flatten()
             .map(|sig| (sig, read_cache_get(&r.host, &sig)));
@@ -1046,6 +1054,8 @@ pub(crate) fn copy_in_stream(
         } else {
             match r.mode {
                 Mode::Tree => sync::host_tree_listing(&r.host)?,
+                // Never a plain listing (a `.git` gone since the plan is refused, not copied whole).
+                Mode::Plain if r.repo => sync::host_repo_listing(&r.host)?,
                 _ => sync::host_plain_listing(&r.host, &r.skip)?,
             }
         };
@@ -1109,7 +1119,7 @@ pub(crate) fn copy_in_stream(
             }
         }
         #[cfg(test)]
-        if read_now && r.mode == Mode::Plain {
+        if read_now && r.mode == Mode::Plain && !r.repo {
             HOST_READS.with(|c| c.set(c.get() + 1));
         }
         if let Some((sig, None)) = &cached {
@@ -1154,6 +1164,7 @@ pub(crate) fn copy_in_stream(
                         back: false,
                         files: Vec::new(),
                         masks: Vec::new(),
+                        repo: false,
                     },
                 ));
                 base = sha;
@@ -1244,7 +1255,7 @@ fn seed_entries(host: &Path, skip: &[String], used: &mut u64) -> Vec<Entry> {
 }
 
 /// Copy `roots` into the replica through the sync pod.
-fn copy_in(
+pub(crate) fn copy_in(
     kube: &Kube,
     ns: &str,
     scope: Option<&str>,
@@ -1261,11 +1272,12 @@ fn copy_in(
             .filter(|rep| g.as_ref().is_some_and(|s| s.contains(&seeded_key(ns, rep))))
             .collect()
     };
+    // What could not be copied in is said as that (fix-k8s-chat), never `root_unresolvable`.
     let (body, plan, base, baseline) = copy_in_stream(scope, tree, roots, with_git, &seeded)
-        .map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+        .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
-            FloorUnarmed::RootUnresolvable,
+            FloorUnarmed::CopyInRefused,
             format!(
                 "the unit's copy-in is larger than {} bytes",
                 STREAM_LIMIT + SEED_LIMIT

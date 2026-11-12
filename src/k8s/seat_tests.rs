@@ -1414,6 +1414,7 @@ fn k8s_the_production_plan_packs_and_unpacks_through_the_pod_codec() {
         back: true,
         files: Vec::new(),
         masks: vec![".env".into()],
+        repo: false,
     };
     let plan = seat::codec_plan(&[("w".into(), &r)]).to_string();
     let stream = sync::encode(&[Root {
@@ -1597,6 +1598,7 @@ fn k8s_a_refusal_in_a_later_root_leaves_every_earlier_root_unchanged() {
         back: true,
         files: Vec::new(),
         masks,
+        repo: false,
     };
     let ra = plain(&a, Vec::new());
     let rb = plain(&b, vec!["secret.txt".into()]);
@@ -1743,6 +1745,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
         back: false,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
     assert!(e.contains("larger than"), "{e}");
@@ -1869,6 +1872,7 @@ fn k8s_links_in_two_roots_cannot_combine_into_an_escape() {
         back: true,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let outer = plain(&root, vec!["sub".into()]);
     let inner = plain(&root.join("sub"), Vec::new());
@@ -1900,6 +1904,7 @@ fn k8s_a_host_link_the_write_back_replaces_is_not_followed() {
         back: true,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     // `a` becomes a directory; `b -> a/../out` then resolves to `out`, inside the root.
     let plans: Vec<seat::RootPlan<'_>> = vec![(
@@ -2079,6 +2084,7 @@ fn k8s_a_file_replacing_a_directory_with_unseen_contents_is_refused_before_any_c
         back: true,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let plans: Vec<seat::RootPlan<'_>> = vec![(
         &r,
@@ -2337,6 +2343,7 @@ fn k8s_a_seeded_cache_is_not_sent_again() {
         back: false,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let rep = seat::replica_of(None, &cache).unwrap();
     let first = seat::copy_in_stream(
@@ -2802,6 +2809,7 @@ fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
         back: true,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let (stream, _, _, baseline) =
         seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap();
@@ -2849,6 +2857,7 @@ fn k8s_the_fenced_scratch_is_no_home_and_goes_at_settle() {
         back: false,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let mut roots = vec![mk("/w/home"), mk("/w/scratch")];
     let dirs = [PathBuf::from("/w/home"), PathBuf::from("/w/scratch")];
@@ -3033,6 +3042,7 @@ fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
         back: false,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let body = |r: &PlanRoot| {
         let (b, _, _, _) = seat::copy_in_stream(
@@ -3098,6 +3108,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         back: true,
         files: Vec::new(),
         masks: Vec::new(),
+        repo: false,
     };
     let git_of = |r: &PlanRoot| {
         let (b, _, base, _) =
@@ -3122,6 +3133,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
     // A mask makes a different index (skip-worktree): never the unmasked one.
     let masked = PlanRoot {
         masks: vec!["b.txt".into()],
+        repo: false,
         ..tree.clone()
     };
     let (_, g4) = git_of(&masked);
@@ -3144,4 +3156,186 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
     assert_eq!(builds(), m + 1, "a shallow host's .git was cached");
     let _ = std::fs::remove_dir_all(&shallow);
     let _ = std::fs::remove_dir_all(&t);
+}
+
+// ── fix-k8s-chat: read-only repositories (a chat's "All repos" scope, crew#1034) ─────────────
+
+#[cfg(unix)]
+fn git_init(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .hardened()
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `tree` (a scratch tree, no repository) and `repo` bound as `rw`: the unit's replica plan.
+#[cfg(unix)]
+fn plan_with_repo(tree: &Path, repo: &Path, rw: bool) -> Vec<PlanRoot> {
+    let mounts = [
+        PlanMount::Bind {
+            path: tree.to_path_buf(),
+            rw: true,
+        },
+        PlanMount::Bind {
+            path: repo.to_path_buf(),
+            rw,
+        },
+    ];
+    seat::plan(tree, false, &mounts, &[], &[], None).0
+}
+
+/// A repository with source, ignored build output (sparse: over the whole stream's limit), an
+/// ignored secret, a run worktree under it, and an untracked embedded repository.
+#[cfg(unix)]
+fn registered_repo(host: &Path) -> Option<PathBuf> {
+    let repo = host.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    if !git_init(&repo) {
+        return None;
+    }
+    std::fs::write(
+        repo.join(".gitignore"),
+        "target/\n.env\nwicked-worktrees/\n",
+    )
+    .unwrap();
+    for (p, d) in [
+        ("src/a.rs", "fn a() {}"),
+        (".env", "TOKEN=secret"),
+        ("wicked-worktrees/run-1/other.rs", "another run's work"),
+    ] {
+        std::fs::create_dir_all(repo.join(p).parent().unwrap()).unwrap();
+        std::fs::write(repo.join(p), d).unwrap();
+    }
+    std::fs::create_dir_all(repo.join("target/debug")).unwrap();
+    let f = std::fs::File::create(repo.join("target/debug/huge.rlib")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    std::fs::create_dir_all(repo.join("vendor/lib")).unwrap();
+    if !git_init(&repo.join("vendor/lib")) {
+        return None;
+    }
+    std::fs::write(repo.join("vendor/lib/x.rs"), "x").unwrap();
+    Some(repo)
+}
+
+/// The P1 (plugins-e2e, chat b9d791b1): a read-only repository was copied whole, so its ignored
+/// build output passed the stream's limit and every chat turn was refused. It is now copied as
+/// git lists it: never its build output, its ignored `.env`, the runs' worktrees under it, its
+/// `.git`, or an embedded repository.
+#[cfg(unix)]
+#[test]
+fn k8s_a_read_only_repo_is_copied_as_git_lists_it_not_whole() {
+    let host = tmp("ro-repo");
+    let tree = host.join("chat");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("note.md"), "n").unwrap();
+    let Some(repo) = registered_repo(&host) else {
+        eprintln!("skipping: git init failed");
+        return;
+    };
+    let roots = plan_with_repo(&tree, &repo, false);
+    // Before the fix: "the unit's copy-in is larger than 536870912 bytes (at …/target/…)".
+    let (body, plan, _, _) =
+        seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap();
+    let r = roots.iter().find(|r| r.host == repo).unwrap();
+    assert!(r.repo && r.mode == Mode::Plain && !r.back, "{r:?}");
+    let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
+    let rep = seat::replica_of(None, &repo).unwrap();
+    let got = decoded.iter().find(|d| d.replica == rep).unwrap();
+    let mut paths: Vec<&str> = got.entries.iter().map(|e| e.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, vec![".gitignore", "src/a.rs"]);
+    // The pod codec lands it as listed.
+    let replica = tmp("ro-repo-replica");
+    let out = codec(&replica, &["unpack", &plan.to_string()], &body);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(replica.join(&rep).join("src/a.rs").is_file());
+    assert!(!replica.join(&rep).join(".env").exists());
+    let _ = std::fs::remove_dir_all(&host);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// Only a read-only bind is a repository projection: a writable plain root with a `.git` (a
+/// seat's scratch) is still copied whole, as it was.
+#[cfg(unix)]
+#[test]
+fn k8s_a_writable_plain_root_with_a_git_dir_is_not_a_repo_projection() {
+    let host = tmp("rw-repo");
+    let tree = host.join("chat");
+    std::fs::create_dir_all(&tree).unwrap();
+    let repo = host.join("scratch");
+    std::fs::create_dir_all(&repo).unwrap();
+    if !git_init(&repo) {
+        eprintln!("skipping: git init failed");
+        return;
+    }
+    std::fs::write(repo.join(".gitignore"), "out/\n").unwrap();
+    std::fs::create_dir_all(repo.join("out")).unwrap();
+    std::fs::write(repo.join("out/kept"), "k").unwrap();
+    let roots = plan_with_repo(&tree, &repo, true);
+    let r = roots.iter().find(|r| r.host == repo).unwrap();
+    assert!(!r.repo, "{r:?}");
+    let (body, _, _, _) =
+        seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap();
+    let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
+    let rep = seat::replica_of(None, &repo).unwrap();
+    let got = decoded.iter().find(|d| d.replica == rep).unwrap();
+    assert!(got.entries.iter().any(|e| e.path == "out/kept"));
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+/// A read-only repository whose `.git` went after the plan is refused, never copied whole.
+#[cfg(unix)]
+#[test]
+fn k8s_a_read_only_repo_that_lost_its_git_is_refused_not_copied_whole() {
+    let host = tmp("ro-repo-gone");
+    let tree = host.join("chat");
+    std::fs::create_dir_all(&tree).unwrap();
+    let Some(repo) = registered_repo(&host) else {
+        eprintln!("skipping: git init failed");
+        return;
+    };
+    let roots = plan_with_repo(&tree, &repo, false);
+    std::fs::remove_dir_all(repo.join(".git")).unwrap();
+    let e = seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap_err();
+    assert!(e.contains("no longer a repository"), "{e}");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+/// A refused copy-in says so (`copy_in_refused`), never `root_unresolvable` (the working directory).
+#[cfg(unix)]
+#[test]
+fn k8s_a_refused_copy_in_is_reported_as_copy_in_refused() {
+    let host = tmp("copy-in-refused");
+    let kubectl = host.join("kubectl");
+    crate::test_env::install_stub(&kubectl, "#!/bin/sh\nexit 0\n");
+    let kube = super::Kube {
+        kubectl,
+        kubeconfig: None,
+        context: "t".into(),
+        owner: "o".into(),
+    };
+    let data = host.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let f = std::fs::File::create(data.join("big.bin")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let r = PlanRoot {
+        host: data.clone(),
+        mode: Mode::Plain,
+        skip: Vec::new(),
+        back: false,
+        files: Vec::new(),
+        masks: Vec::new(),
+        repo: false,
+    };
+    let (why, e) = seat::copy_in(&kube, "ns", None, &data, &[r], false).unwrap_err();
+    assert_eq!(why, FloorUnarmed::CopyInRefused, "{e}");
+    assert_eq!(why.as_str(), "copy_in_refused");
+    assert!(e.contains("larger than"), "{e}");
+    let _ = std::fs::remove_dir_all(&host);
 }
