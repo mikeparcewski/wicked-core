@@ -2493,34 +2493,54 @@ fn leading_cd_dominates(command: &str, home: Option<&Path>) -> Option<PathBuf> {
     // `cd`/`pushd`/`popd` and no `OLDPWD`, in any word as the shell (or an `eval`, or an inner
     // `sh -c`) reads it. A word the text cannot resolve (a variable, `$(…)`, a glob) could be any
     // of them, so it keeps every candidate too.
-    // Sourced code (`.`/`source` in command position) may `cd` anywhere, so it keeps them too.
+    // Code read a second time keeps every candidate as well: sourced code and `eval`, and the
+    // wrappers that reach them (`builtin`, `command`, `exec`) in command position, and any word
+    // that still holds a quote or a backslash once the shell has read it (`eval 'c""d -'`).
     const MOVES: [&str; 4] = ["cd", "pushd", "popd", "OLDPWD"];
+    const REREAD: [&str; 6] = [".", "source", "eval", "builtin", "command", "exec"];
     let mut at_command = true;
+    let mut redirect_operand = false;
     for t in rest {
         if matches!(t.as_str(), ";" | "||" | "&" | "|&" | ";;" | ";&" | ";;&") {
             return None;
         }
         if matches!(t.as_str(), "&&" | "|" | "(" | ")" | "!" | "{" | "}") {
             at_command = true;
+            redirect_operand = false;
             continue;
         }
-        if redirect_glob(t).is_some() || t.starts_with('<') {
-            continue;
-        }
+        // A redirection is no command word: it (and its operand) leaves the command position
+        // where it was (`> /dev/null . ./x.sh`).
+        let redirect = redirect_glob(t).is_some() || t.starts_with('<');
         let readings = resolve_shell_readings(t, home)?;
         for r in &readings {
             if r.contains(OPAQUE_EXPANSION)
-                || (at_command && matches!(r.as_str(), "." | "source"))
+                || r.contains(['\'', '"', '\\', '`'])
+                || (at_command && !redirect && !redirect_operand && REREAD.contains(&r.as_str()))
                 || r.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
                     .any(|w| MOVES.contains(&w))
             {
                 return None;
             }
         }
+        if redirect {
+            // A bare operator (`>`, `2>`, `<`) takes the next word as its operand.
+            redirect_operand = redirect_glob(t).is_some_and(str::is_empty)
+                || matches!(
+                    t.trim_start_matches(|c: char| c.is_ascii_digit()),
+                    "<" | "<>"
+                );
+            continue;
+        }
+        if redirect_operand {
+            redirect_operand = false;
+            continue;
+        }
         // An assignment before a command (`X=1 prog`) leaves the next word in command position.
-        at_command = t.split_once('=').is_some_and(|(k, _)| {
-            !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        });
+        at_command = at_command
+            && t.split_once('=').is_some_and(|(k, _)| {
+                !k.is_empty() && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+            });
     }
     Some(crate::path_policy::normalize_for_fence(
         only,
@@ -11783,6 +11803,12 @@ mod boundary_tests {
             format!("cd {a} && X=1 . go.sh && sed -i 's/a/b/' deck.html"),
             format!("cd {a} && sh -c 'cd -; sed -i s/a/b/ deck.html'"),
             format!("cd {a} && c\\d - && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && eval 'c\"\"d -' && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && builtin source ./go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && command . ./go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && > /dev/null . ./go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && 2>/dev/null source go.sh && sed -i 's/a/b/' deck.html"),
+            format!("cd {a} && bash -c 'c\"\"d -; sed -i s/a/b/ deck.html'"),
             "cd attempt-1 && sed -i 's/a/b/' deck.html".to_string(),
             format!(
                 "cd {} && sed -i 's/a/b/' SKILL.md",

@@ -3306,22 +3306,37 @@ mod tests {
     /// fence into the replica; the pod mounts that file by subPath (bound to the copy-in's inode),
     /// so the seat kept `Read(<state home>/interactive-drafts/**)` and could neither read nor edit
     /// its own draft. The arm now hands the caller the final mount view before ANY work outside
-    /// this process: this arm has no runtime or cluster to reach, and its refusal is the
-    /// callback's own, with a view that exposes the declared root and mounts the launch file.
+    /// this process (this arm has no runtime or cluster to reach: its refusal is the callback's
+    /// own), and the settings narrowed from that view are what any copy-in would read.
     #[test]
     fn the_arm_settles_the_launch_files_from_the_view_before_any_copy_in_1461() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let base = std::env::temp_dir()
             .canonicalize()
             .unwrap()
             .join(format!("wicked-1461-{}", uuid::Uuid::new_v4().simple()));
         let sandbox = base.join("sandbox");
-        let draft = base.join("state").join("interactive-drafts").join("deck-1");
+        let state = base.join("state");
+        let draft = state.join("interactive-drafts").join("deck-1");
         let gov = base.join("gov").join("attempt-0");
-        for d in [&sandbox, &draft, &gov] {
+        let gateway = state.join("gateway");
+        for d in [&sandbox, &draft, &gov, &gateway] {
             std::fs::create_dir_all(d).unwrap();
         }
+        let sh = crate::execute_wrapped::rule_path(&state).unwrap();
+        let host_fence = [
+            format!("Read({sh}/interactive-drafts)"),
+            format!("Read({sh}/interactive-drafts/**)"),
+            format!("Edit({sh}/**)"),
+        ];
         let settings = gov.join("settings-unit-2.json");
-        std::fs::write(&settings, r#"{"permissions":{"deny":[]}}"#).unwrap();
+        std::fs::write(
+            &settings,
+            serde_json::json!({ "permissions": { "deny": host_fence } }).to_string(),
+        )
+        .unwrap();
         let inp = crate::worker_sandbox::FloorInputs {
             cwd: sandbox.clone(),
             write_roots: vec![sandbox.clone(), draft.clone()],
@@ -3339,9 +3354,28 @@ mod tests {
             .map(|s| s.to_string())
             .chain(std::iter::once(settings.to_string_lossy().into_owned()))
             .collect();
-        let mut seen: Option<MountView> = None;
+        let deny_of = || -> Vec<String> {
+            let v: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&settings).unwrap()).unwrap();
+            v["permissions"]["deny"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect()
+        };
+        let mut seen: Option<(MountView, Vec<String>)> = None;
         let mut before_copy = |v: &MountView| {
-            seen = Some(v.clone());
+            crate::execute_wrapped::narrow_container_fence(
+                &mut [],
+                Some("draft it"),
+                Some(&settings),
+                None,
+                Some(&state),
+                std::slice::from_ref(&draft),
+                v,
+            )?;
+            seen = Some((v.clone(), deny_of()));
             Err("stopped by the test before any copy-in".to_string())
         };
         let out = arm_noting(
@@ -3352,7 +3386,7 @@ mod tests {
             &[],
             None,
             Some("draft it"),
-            None,
+            Some(&gateway),
             &mut |_, _| {},
             &mut before_copy,
         );
@@ -3363,7 +3397,7 @@ mod tests {
             }
             Ok(_) => panic!("the test's callback refuses the arm"),
         }
-        let view = seen.expect("the arm hands the caller its view before any copy-in");
+        let (view, at_copy) = seen.expect("the arm hands the caller its view before any copy-in");
         assert!(
             view.roots.iter().any(|(p, rw)| *p == draft && *rw),
             "the declared draft root is a writable root of the view: {view:?}"
@@ -3372,6 +3406,12 @@ mod tests {
             view.mounted.contains(&settings),
             "the launch file is mounted (by itself) in the view: {view:?}"
         );
+        for rule in &host_fence {
+            assert!(
+                !at_copy.contains(rule),
+                "the settings a copy-in reads no longer deny the draft ({rule}): {at_copy:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 

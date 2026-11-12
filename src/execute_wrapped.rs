@@ -4234,9 +4234,6 @@ impl WrappedCliStepRunner {
                     &mut on_built,
                     &mut before_copy,
                 );
-                if let Some(why) = fence_refusal {
-                    return isolation_refusal(input, &why);
-                }
                 if let Some((phases, total_ms)) = crate::k8s::clock::take() {
                     self.emit_event(crate::event::CoreEvent::SeatArmTimed {
                         session: input.run_id.clone(),
@@ -4246,6 +4243,9 @@ impl WrappedCliStepRunner {
                         total_ms,
                         phases,
                     });
+                }
+                if let Some(why) = fence_refusal {
+                    return isolation_refusal(input, &why);
                 }
                 match armed {
                     // The hook route rides the gateway: a claude unit whose relay the gateway
