@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **A `cd` on its own line no longer fails the unit that wrote its own root (run 8e0ffbec).** A Bash
+  call such as `cd <plan dir>`, a line break, then `cat > chapters.json <<'EOF'` is still refused,
+  because if that `cd` fails the heredoc lands in the shell's previous directory. The refusal is now
+  advisory when putting `&&` in place of that one line break or `;` would pass, and it names that
+  remedy, so the seat retries instead of the unit being denied. `cd <dir> && cat > f <<'EOF'` with its
+  body now passes when the heredoc is plain data (`cat`/`tee`, a plain delimiter, nothing expanded).
+
+- **The Bash write scan sees a command after a line break or a glued operator (wicked-core#1465).**
+  `true` + line break + `tee /outside/f`, and `cd x&&cd -&&sed -i … f`, are judged as separate
+  commands. Heredoc lines and commands holding `${` keep the old reading. A write after more
+  directory changes than the scan follows (64) is refused.
+
 - **Corroboration counts converted documents as docs.** Estate now indexes PDF, Word, PowerPoint, Excel,
   OpenDocument, RTF and EPUB files as the Markdown it converts them to, so `is_doc_path` lists their
   extensions: a requirement named in a `.pdf` or `.docx` counts that file as a doc mention, and those
