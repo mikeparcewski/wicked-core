@@ -463,7 +463,7 @@ fn k8s_the_cargo_state_dir_is_a_home_that_is_neither_seeded_nor_written_back() {
     seat::mark_homes(&mut roots, &[cache.clone(), build.clone()], None);
     let by = |p: &Path| roots.iter().find(|r| r.host == p).unwrap();
     assert_eq!(by(&cache).mode, Mode::Seed);
-    assert_eq!(by(&build).mode, Mode::Home, "the cargo state is not a seed");
+    assert_eq!(by(&build).mode, Mode::Home, "not a seed");
     assert!(!by(&build).back, "the cargo state came back");
     // No root that comes back holds the cargo home or the target dir.
     for dir in [build.join("cargo-home"), build.join("target")] {

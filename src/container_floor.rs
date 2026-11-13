@@ -3671,7 +3671,8 @@ mod tests {
             };
             let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
             let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
-            assert!(calls.contains(&format!("--build-arg BASE={checks}")), "{calls}");
+            let arg = format!("--build-arg BASE={checks}");
+            assert!(calls.contains(&arg), "{calls}");
             let seat_build = calls.find(&format!("-t {tag} -")).expect("seat build");
             match calls.find(&format!("-t {checks} -")) {
                 Some(base_build) => {
@@ -5040,7 +5041,11 @@ mod tests {
         // that would redirect every build: it is never read, `CARGO_HOME` is elsewhere.
         let legacy = worker.join("cache").join("claude").join("cargo");
         std::fs::create_dir_all(&legacy).unwrap();
-        std::fs::write(legacy.join("config.toml"), "[build]\nrustc = \"/sentinel\"\n").unwrap();
+        std::fs::write(
+            legacy.join("config.toml"),
+            "[build]\nrustc = \"/sentinel\"\n",
+        )
+        .unwrap();
         let (plan, mounts) = cargo_seat(&worker, &tree, &[]);
         let cache = worker.join("cache").join("claude");
         let build = worker.join("seat-build").join("claude");
@@ -5055,7 +5060,8 @@ mod tests {
         assert_eq!(get("CARGO_TARGET_DIR"), build.join("target"));
         // Neither is a seed root, a write root or in the tree.
         for p in [get("CARGO_HOME"), get("CARGO_TARGET_DIR")] {
-            assert!(!p.starts_with(worker.join("cache")), "{p:?} is a seed root");
+            let seed = worker.join("cache");
+            assert!(!p.starts_with(&seed), "{p:?} is a seed root");
             assert!(!p.starts_with(&tree), "{p:?} is in the tree");
             assert!(!plan.inputs.write_roots.iter().any(|w| p.starts_with(w)));
         }
