@@ -4939,6 +4939,34 @@ mod tests {
                 "type", "session", "ord", "attempt", "cli", "level", "reason",
             ],
         );
+        check(
+            CoreEvent::SeatReach {
+                session: s(),
+                ord: 1,
+                attempt: 0,
+                cli: s(),
+                floor: "container".to_string(),
+                boundary: "armed".to_string(),
+                reason: None,
+                read_roots: vec![s()],
+                write_roots: vec![s()],
+                egress: vec![s()],
+            },
+            "seatReach",
+            &[
+                "type",
+                "session",
+                "ord",
+                "attempt",
+                "cli",
+                "floor",
+                "boundary",
+                "reason",
+                "readRoots",
+                "writeRoots",
+                "egress",
+            ],
+        );
         // F-036 / F-039 gate-evidence events.
         check(
             CoreEvent::EvaluatorMutatedWorktree {
