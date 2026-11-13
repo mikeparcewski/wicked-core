@@ -4032,6 +4032,8 @@ impl WrappedCliStepRunner {
             // (IG1-core-2) What armed the write boundary (`Ok(launcher)`), or why none did and
             // whether that was already disclosed — read by the `os_sandbox`-class arm below.
             let floor: Result<&'static str, (String, bool)>;
+            // (CX6) What this launch reaches, said at the spawn below.
+            let reach: SeatReachFacts;
             // C5 (codex c5-r1..r6): ACP is gone from the seats, so on the interim host floor a
             // governed unit runs only when the FINAL argv keeps a per-call check — claude (its gate
             // hook) or codex in its own bounded sandbox — whatever seat key carries it and whatever
@@ -4325,6 +4327,10 @@ impl WrappedCliStepRunner {
                         floor_env = plan.env;
                         floor_build_env = plan.build_env;
                         floor = Ok(c.tool);
+                        reach = SeatReachFacts::container(
+                            &c.view,
+                            crate::seat_gateway::egress_hosts_from_env(),
+                        );
                         Some(crate::validator::WorkerSandbox {
                             wrapper: c.wrapper,
                             level: crate::validator::SandboxLevel::Sandboxed,
@@ -4381,9 +4387,11 @@ impl WrappedCliStepRunner {
                             reason: reason.clone(),
                         });
                     }
+                    reach = SeatReachFacts::host(Err(reason.clone()), &worker_write_roots);
                     floor = Err((reason.clone(), true));
                     None
                 } else {
+                    reach = SeatReachFacts::host(Ok(()), &worker_write_roots);
                     floor = Ok(crate::worker_sandbox::launcher_name_of(&ws.wrapper));
                     Some(ws)
                 }
@@ -4392,11 +4400,17 @@ impl WrappedCliStepRunner {
                 // still gets the repository boundary — its own tree writable, the clone and its
                 // sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (not a run
                 // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
-                match crate::worker_sandbox::default_worker_sandbox(
+                let default_floor = crate::worker_sandbox::default_worker_sandbox(
                     &cwd,
                     &worker_write_roots,
                     &cli_key,
-                ) {
+                );
+                reach = SeatReachFacts::host_default(
+                    default_floor.as_ref().map(|_| ()).map_err(|why| *why),
+                    launches_bounded_codex(&argv),
+                    &worker_write_roots,
+                );
+                match default_floor {
                     Ok(armed) => {
                         floor = Ok(armed.tool);
                         Some(armed.sandbox)
@@ -4518,6 +4532,8 @@ impl WrappedCliStepRunner {
                 adapter = Box::new(tap);
                 (turn, engine_id, seen)
             });
+            // (CX6) What this launch reaches, said once per spawn beside the skills handoff.
+            self.emit_event(reach.event(&input.run_id, input.unit.ord, input.attempt, &cli_key));
             let mut cmd = build_worker_command(&argv, sandbox.as_ref());
             cmd.current_dir(&cwd);
             // The seat-aware configuration decision (core#410), decided above alongside the
@@ -5380,6 +5396,100 @@ pub(crate) fn seat_keeps_host_floor_check_with(invocation: &str, posture: Vec<St
         apply_seat_posture(&mut argv, &posture);
     }
     host_floor_keeps_a_check(&argv)
+}
+
+/// (CX6) What one launch can reach, gathered where the launch decides its floor and said as
+/// [`CoreEvent::SeatReach`](crate::event::CoreEvent::SeatReach) at the spawn. Only values the
+/// launch already computed: the container's final mount view, the host's armed write roots, the
+/// floor's own unarmed reason, the gateway's allowlist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeatReachFacts {
+    floor: &'static str,
+    boundary: &'static str,
+    reason: Option<String>,
+    read_roots: Vec<String>,
+    write_roots: Vec<String>,
+    egress: Vec<String>,
+}
+
+impl SeatReachFacts {
+    /// A seat pod: the unit's working roots as the final mounts expose them, split by whether
+    /// the seat can write them, and the gateway's CONNECT allowlist.
+    fn container(view: &crate::container_floor::MountView, egress: Vec<String>) -> Self {
+        let roots = |rw: bool| -> Vec<String> {
+            view.roots
+                .iter()
+                .filter(|(_, w)| *w == rw)
+                .map(|(p, _)| p.to_string_lossy().into_owned())
+                .collect()
+        };
+        SeatReachFacts {
+            floor: "container",
+            boundary: "armed",
+            reason: None,
+            read_roots: roots(false),
+            write_roots: roots(true),
+            egress,
+        }
+    }
+
+    /// The host carrier's outcome. Its network is open and its reads are not jailed, so only the
+    /// write roots are a fact, and only when the floor armed.
+    fn host(armed: Result<(), String>, write_roots: &[PathBuf]) -> Self {
+        let (boundary, reason, write_roots) = match armed {
+            Ok(()) => (
+                "armed",
+                None,
+                write_roots
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            ),
+            Err(why) => ("unarmed", Some(why), Vec::new()),
+        };
+        SeatReachFacts {
+            floor: "host",
+            boundary,
+            reason,
+            read_roots: Vec::new(),
+            write_roots,
+            egress: vec!["open".to_string()],
+        }
+    }
+
+    /// The default repository boundary's outcome: codex's own bounded `--sandbox` is its
+    /// boundary (`cli_own`, as the floor counts it); anything else unarmed names its reason.
+    fn host_default(
+        armed: Result<(), crate::worker_sandbox::FloorUnarmed>,
+        bounded_codex: bool,
+        write_roots: &[PathBuf],
+    ) -> Self {
+        match armed {
+            Err(crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn) if bounded_codex => {
+                SeatReachFacts {
+                    boundary: "cli_own",
+                    reason: None,
+                    ..Self::host(Ok(()), &[])
+                }
+            }
+            other => Self::host(other.map_err(|why| why.as_str().to_string()), write_roots),
+        }
+    }
+
+    fn event(self, session: &str, ord: u32, attempt: u32, cli: &str) -> crate::event::CoreEvent {
+        crate::event::CoreEvent::SeatReach {
+            session: session.to_string(),
+            ord,
+            attempt,
+            cli: cli.to_string(),
+            floor: self.floor.to_string(),
+            boundary: self.boundary.to_string(),
+            reason: self.reason,
+            read_roots: self.read_roots,
+            write_roots: self.write_roots,
+            egress: self.egress,
+        }
+    }
 }
 
 fn launches_bounded_codex(argv: &[String]) -> bool {
@@ -20108,5 +20218,72 @@ mod artifact_run_roots_tests {
         );
         assert!(!said.contains(&link.display().to_string()), "{said}");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (CX6) A repo-less chat's cwd is not a run worktree: the default boundary does not arm, the
+    /// reach says why with the floor's own token, and no roots are claimed.
+    #[test]
+    fn seat_reach_of_a_repo_less_chat_is_unarmed_not_a_worktree() {
+        let dir = std::env::temp_dir().join(format!("wicked-reach-chat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let roots = vec![dir.clone()];
+        let res = crate::worker_sandbox::default_worker_sandbox(&dir, &roots, "claude");
+        let reach = SeatReachFacts::host_default(
+            res.as_ref().map(|_| ()).map_err(|why| *why),
+            false,
+            &roots,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(reach.floor, "host");
+        assert_eq!(reach.boundary, "unarmed");
+        assert_eq!(reach.reason.as_deref(), Some("not_a_worktree"));
+        assert!(reach.read_roots.is_empty() && reach.write_roots.is_empty());
+        assert_eq!(reach.egress, vec!["open"]);
+    }
+
+    /// (CX6) codex's own bounded `--sandbox` is the boundary; a codex launch that is not bounded
+    /// is unarmed, never `cli_own`.
+    #[test]
+    fn seat_reach_of_a_codex_launch_is_cli_own() {
+        let roots = vec![PathBuf::from("/w")];
+        let own = crate::worker_sandbox::FloorUnarmed::SeatArmsItsOwn;
+        let bounded = SeatReachFacts::host_default(Err(own), true, &roots);
+        assert_eq!(bounded.boundary, "cli_own");
+        assert_eq!(bounded.reason, None);
+        assert!(bounded.write_roots.is_empty());
+        let unbounded = SeatReachFacts::host_default(Err(own), false, &roots);
+        assert_eq!(unbounded.boundary, "unarmed");
+        assert_eq!(unbounded.reason.as_deref(), Some("seat_arms_its_own"));
+        // An armed host floor names its write roots.
+        let armed = SeatReachFacts::host_default(Ok(()), false, &roots);
+        assert_eq!(
+            (armed.boundary, armed.write_roots),
+            ("armed", vec!["/w".to_string()])
+        );
+    }
+
+    /// (CX6) A container launch reports its mounts as read / write roots and the gateway's
+    /// allowlist as egress.
+    #[test]
+    fn seat_reach_of_a_container_launch_is_its_mounts_and_the_allowlist() {
+        let view = crate::container_floor::MountView {
+            mounted: vec![PathBuf::from("/t"), PathBuf::from("/skills")],
+            roots: vec![
+                (PathBuf::from("/t"), true),
+                (PathBuf::from("/skills"), false),
+            ],
+        };
+        let hosts = vec![
+            "index.crates.io".to_string(),
+            "static.crates.io".to_string(),
+        ];
+        let reach = SeatReachFacts::container(&view, hosts.clone());
+        assert_eq!((reach.floor, reach.boundary), ("container", "armed"));
+        assert_eq!(reach.write_roots, vec!["/t"]);
+        assert_eq!(reach.read_roots, vec!["/skills"]);
+        assert_eq!(reach.egress, hosts);
+        let ev = reach.event("run", 2, 1, "claude").to_json();
+        assert_eq!(ev["type"], "seatReach");
+        assert_eq!(ev["writeRoots"], serde_json::json!(["/t"]));
     }
 }

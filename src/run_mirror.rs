@@ -33,6 +33,7 @@ pub fn bus_type(event_type: &str) -> Option<&'static str> {
         "qeAcceptanceDecided" => "wicked.run.qe.decided",
         "workerMessageQueued" => "wicked.run.steer.queued",
         "workerMessageInjected" => "wicked.run.steer.delivered",
+        "seatReach" => "wicked.seat.reach.reported",
         _ => return None,
     })
 }

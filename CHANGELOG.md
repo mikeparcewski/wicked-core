@@ -14,6 +14,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Every worker launch now says what it can reach: `CoreEvent::SeatReach` (chat-extend CX6).** Emitted
+  once per spawn on the wrapped path, chats included, beside the skills handoff, from values the launch
+  already computed (no new probe, no behaviour change). Wire `seatReach` (camelCase: `session`, `ord`,
+  `attempt`, `cli`, `floor`, `boundary`, `reason`, `readRoots`, `writeRoots`, `egress`), mirrored on the
+  bus as `wicked.seat.reach.reported` and surfaced through core-ts like `skillsSnapshotHanded`. `floor`
+  is `host` or `container`; `boundary` is `armed`, `unarmed` (with `reason`, the floor's own token such
+  as `not_a_worktree`) or `cli_own` (codex's own bounded sandbox decides). A container seat reports its
+  working roots as its final mounts expose them (`readRoots` read-only, `writeRoots` writable) and the
+  gateway's `WICKED_SEAT_EGRESS_HOSTS` allowlist as `egress`; the host reports its armed write roots
+  (empty when unarmed or `cli_own`) and `egress: ["open"]`.
 - **A `cd` on its own line no longer fails the unit that wrote its own root (run 8e0ffbec).** A Bash
   call such as `cd <plan dir>`, a line break, then `cat > chapters.json <<'EOF'` is still refused,
   because if that `cd` fails the heredoc lands in the shell's previous directory. The refusal is now

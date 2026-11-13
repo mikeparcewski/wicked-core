@@ -900,6 +900,30 @@ pub enum CoreEvent {
         /// and can be judged unused). Empty for `none`.
         skills: Vec<String>,
     },
+    /// (CX6) What one worker launch can reach, said at EVERY spawn on the wrapped path (a chat's
+    /// included), from the values that launch already computed — no probe of its own.
+    /// `floor`: `"host"` (the OS-sandbox carrier) or `"container"` (the seat pod). `boundary`:
+    /// `"armed"` (the floor holds), `"unarmed"` (it does not; `reason` is the `FloorUnarmed`
+    /// token, e.g. `not_a_worktree`, or the sandbox's downgrade text; the worker still runs
+    /// where the engine lets an unarmed launch run) or `"cli_own"` (codex's own `--sandbox`
+    /// decides; `reason` is `None`). `read_roots` / `write_roots`: the launch's actual roots —
+    /// for a container the unit's working roots as the FINAL mounts expose them (read-only
+    /// binds / writable binds), on the host the armed write roots (reads are not jailed, so
+    /// `read_roots` is empty); both empty when unarmed or `cli_own`. `egress`: a container
+    /// seat's gateway CONNECT allowlist (`WICKED_SEAT_EGRESS_HOSTS`, empty = model routes
+    /// only), or `["open"]` on the host, whose network is not restricted.
+    SeatReach {
+        session: String,
+        ord: u32,
+        attempt: u32,
+        cli: String,
+        floor: String,
+        boundary: String,
+        reason: Option<String>,
+        read_roots: Vec<String>,
+        write_roots: Vec<String>,
+        egress: Vec<String>,
+    },
     /// (F-036) An `executes_code: false` phase — an evaluator, a recon rung, a review — CHANGED
     /// the worktree it was working in. Emitted at the gate fold when the engine's own before/after
     /// tree snapshots differ (`worktree_guard`), for EVERY seat and carrier, independent of the
@@ -3020,6 +3044,30 @@ impl CoreEvent {
                 "source": source,
                 "lever": lever,
                 "skills": skills,
+            }),
+            CoreEvent::SeatReach {
+                session,
+                ord,
+                attempt,
+                cli,
+                floor,
+                boundary,
+                reason,
+                read_roots,
+                write_roots,
+                egress,
+            } => json!({
+                "type": "seatReach",
+                "session": session,
+                "ord": ord,
+                "attempt": attempt,
+                "cli": cli,
+                "floor": floor,
+                "boundary": boundary,
+                "reason": reason,
+                "readRoots": read_roots,
+                "writeRoots": write_roots,
+                "egress": egress,
             }),
             CoreEvent::EvaluatorMutatedWorktree {
                 session,
