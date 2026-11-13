@@ -5476,13 +5476,7 @@ impl SeatReachFacts {
         }
     }
 
-    fn event(
-        self,
-        session: &str,
-        ord: u32,
-        attempt: u32,
-        cli: &str,
-    ) -> crate::event::CoreEvent {
+    fn event(self, session: &str, ord: u32, attempt: u32, cli: &str) -> crate::event::CoreEvent {
         crate::event::CoreEvent::SeatReach {
             session: session.to_string(),
             ord,
@@ -20279,7 +20273,10 @@ mod artifact_run_roots_tests {
                 (PathBuf::from("/skills"), false),
             ],
         };
-        let hosts = vec!["index.crates.io".to_string(), "static.crates.io".to_string()];
+        let hosts = vec![
+            "index.crates.io".to_string(),
+            "static.crates.io".to_string(),
+        ];
         let reach = SeatReachFacts::container(&view, hosts.clone());
         assert_eq!((reach.floor, reach.boundary), ("container", "armed"));
         assert_eq!(reach.write_roots, vec!["/t"]);
