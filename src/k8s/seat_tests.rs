@@ -474,6 +474,102 @@ fn k8s_the_cargo_state_dir_is_a_home_that_is_neither_seeded_nor_written_back() {
     }
 }
 
+/// After a cargo build in a unit, the write-back of a tree whose `.gitignore` lacks `target/` holds
+/// no `target/` entry: the unit's real `CARGO_TARGET_DIR` (from the floor plan) is outside the
+/// tree, so the build output lands in the cargo state home, which is never packed. Run through the
+/// pod's own codec, as the real write-back is. With cargo's default (`<tree>/target`) the same
+/// build WOULD be packed, because git lists it.
+#[cfg(unix)]
+#[test]
+fn k8s_a_cargo_build_in_a_tree_without_a_target_ignore_writes_no_target_back() {
+    use wicked_apps_core::spawn::{SeatCli, SeatConfig, WORKER_HOME_ENV};
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let host = tmp("cargo-wb");
+    let tree = host.join("wt");
+    let worker = host.join("worker");
+    std::fs::create_dir_all(&tree).unwrap();
+    let prior = std::env::var_os(WORKER_HOME_ENV);
+    std::env::set_var(WORKER_HOME_ENV, &worker);
+    let config = SeatConfig::Isolated {
+        cli: SeatCli::Claude,
+        root: None,
+        set: Vec::new(),
+        strip: Vec::new(),
+    };
+    let plan = crate::worker_sandbox::plan_seat_floor(
+        crate::worker_sandbox::SeatLaunch {
+            cwd: &tree,
+            cli: SeatCli::Claude,
+            config: &config,
+            read_only: false,
+            scratch: None,
+            gov_log_dir: None,
+            own_ports: &[],
+        },
+        vec![tree.clone()],
+    );
+    match prior {
+        Some(v) => std::env::set_var(WORKER_HOME_ENV, v),
+        None => std::env::remove_var(WORKER_HOME_ENV),
+    }
+    let target = plan
+        .env
+        .iter()
+        .find(|(k, _)| *k == "CARGO_TARGET_DIR")
+        .map(|(_, v)| v.clone())
+        .expect("every container seat unit has a CARGO_TARGET_DIR");
+    // The replica: the tree root `w` (a git repo whose .gitignore lacks target/) and the build
+    // state root `b`; a build writes where CARGO_TARGET_DIR says.
+    let replica = tmp("cargo-wb-replica");
+    let w = replica.join("w");
+    std::fs::create_dir_all(w.join("src")).unwrap();
+    let init = std::process::Command::new("git")
+        .hardened()
+        .args(["init", "-q"])
+        .current_dir(&w)
+        .status()
+        .is_ok_and(|s| s.success());
+    if !init {
+        eprintln!("skipping: git init failed");
+        return;
+    }
+    std::fs::write(w.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(w.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let built = match target.strip_prefix(&tree) {
+        Ok(rel) => w.join(rel),
+        Err(_) => replica.join("b").join("target"),
+    };
+    std::fs::create_dir_all(built.join("debug")).unwrap();
+    std::fs::write(built.join("debug/app"), "binary").unwrap();
+    let w_root = PlanRoot {
+        host: tree.clone(),
+        mode: Mode::Tree,
+        skip: vec![".git".into()],
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+        repo: false,
+    };
+    let pack_plan = seat::codec_plan(&[("w".into(), &w_root)]).to_string();
+    let packed = codec(&replica, &["pack", &pack_plan], b"");
+    assert!(
+        packed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&packed.stderr)
+    );
+    let roots = sync::decode(&mut packed.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"src/main.rs"), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("target")),
+        "a target/ entry came back: {paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&host);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
 #[test]
 fn k8s_a_read_only_tree_exposed_only_by_the_boundary_is_still_its_own_root() {
     let clone = PathBuf::from("/home/u/repo");

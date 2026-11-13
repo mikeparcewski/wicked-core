@@ -208,6 +208,14 @@ jobs:
             --build-arg "CLI_PACKAGE=$pkg" --build-arg "CLI_PIN=$pkg" \
             -t wicked-seat-claude:ci - < containers/seats/seat.Dockerfile
 
+      # The ledger layer is best effort in the Dockerfile (a failed install still builds), so assert
+      # here that it succeeded on the new base: QE records its verdict with it (core#1009).
+      - name: The ledger install layer succeeded on the new base
+        run: |
+          set -eu
+          docker run --rm --network none --entrypoint sh wicked-seat-claude:ci -euc \
+            'test -f /opt/wicked-ledger/node_modules/wicked-ledger/package.json && grep "\"version\"" /opt/wicked-ledger/node_modules/wicked-ledger/package.json'
+
       - name: A crate with rust-toolchain.toml channel = "stable" builds in both images
         run: |
           set -eu
