@@ -204,9 +204,14 @@ jobs:
           docker build -t wicked-checks-floor:ci - < containers/checks/node22-rust.Dockerfile
           pkg="$(grep -o '@anthropic-ai/claude-code@[0-9.]*' src/container_floor.rs | head -n1)"
           test -n "$pkg"
-          docker build --build-arg BASE=wicked-checks-floor:ci --build-arg CLI=claude \
+          # Match the engine's self-contained default build: OCI solvers cannot use a local tag.
+          {
+            sed 's/^FROM ${BASE}$/FROM ${BASE} AS wicked_toolchain/' containers/checks/node22-rust.Dockerfile
+            sed -e '/^# syntax=/d' -e '/^ARG BASE=/d' -e 's/^FROM ${BASE}$/FROM wicked_toolchain/' containers/seats/seat.Dockerfile
+          } > "$RUNNER_TEMP/seat.Dockerfile"
+          docker build --build-arg CLI=claude \
             --build-arg "CLI_PACKAGE=$pkg" --build-arg "CLI_PIN=$pkg" \
-            -t wicked-seat-claude:ci - < containers/seats/seat.Dockerfile
+            -t wicked-seat-claude:ci - < "$RUNNER_TEMP/seat.Dockerfile"
 
       # The ledger layer is best effort in the Dockerfile (a failed install still builds), so assert
       # here that it succeeded on the new base: QE records its verdict with it (core#1009).
@@ -229,7 +234,7 @@ jobs:
             echo "== $image"
             # The Debian PATH and no RUSTUP_* variables; the image's rustup home is read-only to
             # this user, as in a seat. The network is off: the crate has no dependencies.
-            docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp \
+            docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp:exec \
               -v "$dir/tiny:/work/tiny" -w /work/tiny --entrypoint /usr/bin/env "$image" \
               -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp \
               CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \

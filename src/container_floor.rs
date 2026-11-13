@@ -679,7 +679,7 @@ pub(crate) fn image_present(rt: &Runtime, tag: &str) -> bool {
     output_within(c, rt.bound(PROBE_TIMEOUT)).is_some_and(|o| o.status.success())
 }
 
-/// Build `cli`'s seat image from the seat Dockerfile alone (no build context).
+/// Build `cli`'s seat image, composing the embedded checks recipe by default (no build context).
 pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String> {
     let package =
         seat_package(cli).ok_or_else(|| format!("no seat image is defined for `{cli}`"))?;
@@ -687,7 +687,7 @@ pub(crate) fn build_seat_image(rt: &Runtime, cli: &str) -> Result<String, String
 }
 
 /// The base the seat images build on: the operator's own ([`BASE_IMAGE_ENV`], with its recipe
-/// [`BASE_DOCKERFILE_ENV`]) or the default registry image.
+/// [`BASE_DOCKERFILE_ENV`]) or the embedded checks floor stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SeatBase {
     pub(crate) image: String,
@@ -713,10 +713,34 @@ impl SeatBase {
     }
 }
 
+/// One self-contained build for BuildKit OCI workers, whose solver cannot see containerd's
+/// local images. Keep the toolchain recipe embedded once; the seat's global BASE declaration
+/// must be removed rather than shadowing the checks recipe's global ARG.
+fn default_seat_dockerfile() -> String {
+    let floor = crate::checks_container::DOCKERFILE.replacen(
+        "FROM ${BASE}\n",
+        "FROM ${BASE} AS wicked_toolchain\n",
+        1,
+    );
+    let seat = SEAT_DOCKERFILE
+        .lines()
+        .filter(|line| !line.starts_with("ARG BASE=") && !line.starts_with("# syntax="))
+        .map(|line| {
+            if line == "FROM ${BASE}" {
+                "FROM wicked_toolchain"
+            } else {
+                line
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{floor}\n{seat}\n")
+}
+
 /// [`build_seat_image`] on `base`: an operator base that is missing is rebuilt from its recipe
 /// first; a missing operator base with no recipe fails naming the base and the
 /// fix. The default base is the checks floor image: it is ensured (built from the engine's
-/// embedded Dockerfile, again if a GC removed it) before the seat build.
+/// embedded Dockerfile, again if a GC removed it) before the self-contained seat build.
 fn build_seat_image_on(
     rt: &Runtime,
     cli: &str,
@@ -736,9 +760,15 @@ fn build_seat_image_on(
         );
         build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[])?;
     }
-    let mut args = vec![format!("BASE={}", base.image), format!("CLI={cli}")];
+    let mut args = vec![format!("CLI={cli}")];
+    let dockerfile = if base.operator {
+        args.push(format!("BASE={}", base.image));
+        SEAT_DOCKERFILE.to_string()
+    } else {
+        default_seat_dockerfile()
+    };
     args.extend(package.build_args());
-    build_image(rt, SEAT_DOCKERFILE, &tag, &args).map_err(|e| {
+    build_image(rt, &dockerfile, &tag, &args).map_err(|e| {
         if base.operator && !image_present(rt, &base.image) {
             missing_base_error(&base.image, &e)
         } else {
@@ -3610,10 +3640,11 @@ mod tests {
                    grep -qx \"$last\" '{have}' || exit 1\n\
                    echo sha256:{id}; exit 0 ;;\n\
                  esac\n\
-                 if [ \"$1\" = build ]; then cat > /dev/null; t=; while [ $# -gt 0 ]; do\n\
+                 if [ \"$1\" = build ]; then cat > '{dockerfile}'; t=; while [ $# -gt 0 ]; do\n\
                    [ \"$1\" = -t ] && t=$2; shift; done; echo \"$t\" >> '{have}'; fi\n\
                  exit 0\n",
                 log = dir.join("calls.log").display(),
+                dockerfile = dir.join("Dockerfile").display(),
                 have = have.display(),
                 id = "b".repeat(64)
             ),
@@ -3646,6 +3677,74 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn default_seat_build_has_one_toolchain_stage_and_no_local_image_from() {
+        let df = default_seat_dockerfile();
+        let froms: Vec<_> = df.lines().filter(|l| l.starts_with("FROM ")).collect();
+        assert_eq!(
+            froms,
+            ["FROM ${BASE} AS wicked_toolchain", "FROM wicked_toolchain"]
+        );
+        assert_eq!(df.matches("ARG BASE=").count(), 1);
+        assert_eq!(df.matches("ARG RUST_TOOLCHAIN=").count(), 1);
+        assert_eq!(df.matches("https://sh.rustup.rs").count(), 1);
+        assert!(!df.contains("FROM wicked-checks-floor:"));
+    }
+
+    #[test]
+    fn toolchain_ci_can_execute_the_binary_on_its_read_only_container() {
+        let ci = include_str!("../.github/workflows/ci.yml");
+        let job = ci.split("  seat-toolchain:").nth(1).unwrap();
+        assert!(job.contains("--tmpfs /tmp:exec"));
+        assert!(job.contains("--network none --read-only --user 1000:1000"));
+        assert!(job.contains(
+            "-i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp"
+        ));
+        assert!(!job.contains("--build-arg BASE=wicked-checks-floor:"));
+    }
+
+    #[test]
+    fn ci_builds_the_same_self_contained_seat_recipe_as_the_engine() {
+        let ci: serde_yaml::Value =
+            serde_yaml::from_str(include_str!("../.github/workflows/ci.yml")).unwrap();
+        let script = ci["jobs"]["seat-toolchain"]["steps"][1]["run"]
+            .as_str()
+            .expect("the image build step");
+        let dir = c4_temp();
+        let docker = image_stub(&dir, &[]);
+        let path = std::env::join_paths(
+            std::iter::once(docker.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            )),
+        )
+        .unwrap();
+        let output = Command::new("bash")
+            .hardened()
+            .args(["-euc", script])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env("PATH", path)
+            .env("RUNNER_TEMP", &dir)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let actual = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        let instructions = |s: &str| {
+            s.lines()
+                .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            instructions(&actual),
+            instructions(&default_seat_dockerfile())
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     /// The default seat base is the checks floor image; building a seat image ensures it first
     /// (the floor's own build from the embedded Dockerfile), and builds it again when a GC removed
     /// it. There is no registry fallback: a present one is not rebuilt.
@@ -3671,8 +3770,9 @@ mod tests {
             };
             let tag = build_seat_image_on(&rt, "claude", pkg, &base).unwrap();
             let calls = std::fs::read_to_string(dir.join("calls.log")).unwrap();
-            let arg = format!("--build-arg BASE={checks}");
-            assert!(calls.contains(&arg), "{calls}");
+            assert!(!calls.contains("--build-arg BASE="), "{calls}");
+            let df = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
+            assert_eq!(df, default_seat_dockerfile());
             let seat_build = calls.find(&format!("-t {tag} -")).expect("seat build");
             match calls.find(&format!("-t {checks} -")) {
                 Some(base_build) => {

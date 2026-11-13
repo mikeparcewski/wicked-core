@@ -1247,11 +1247,9 @@ pub(crate) fn inherited_cli_dirs(
 /// It is a seat dir, so both floors admit it read-write: the host floor's profile, and the
 /// container floor's bind mount at the same path ([`crate::container_floor::mount_plan`]). A
 /// container seat's `HOME` is a 512 MB tmpfs (`/home/seat`), and wicked-core's registry alone
-/// fetches to ~684 MB, so the caches must never default into `HOME`. The dir outlives every run and
-/// every container: the cargo registry is downloaded once per CLI and reused by its later seats,
-/// across runs and repos (cargo's own lock serialises concurrent seats). No run deletes it; cargo's
-/// automatic cache cleanup (1.88+) drops entries unused for months, and the operator may delete the
-/// dir at any time (the next seat fetches again).
+/// fetches to ~684 MB, so package state must never default into `HOME`. Non-cargo caches outlive
+/// runs and containers and may be seeded from the host. Cargo instead uses the run-scoped home
+/// described in [`seat_build_dir`]; a legacy `cache/<cli>/cargo` is never used as `CARGO_HOME`.
 pub(crate) fn seat_cache_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<PathBuf> {
     let base = wicked_apps_core::spawn::worker_home_base().ok()?;
     Some(base.join("cache").join(cli.root_name().unwrap_or("other")))
@@ -1260,8 +1258,9 @@ pub(crate) fn seat_cache_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<Pa
 /// Where a container seat's cargo state lives: `<worker home>/seat-build/<seat root name>`, one per
 /// CLI, beside [`seat_cache_dir`] but NOT under it. On the host it is only the mount point: the
 /// run's replica holds `cargo-home` and `target` there (a per-run, per-CLI copy, dropped with the
-/// run namespace), and neither is a seed root (the host's cache is never copied in) nor a
-/// write-back root (a build's output never reaches the host tree, whatever its `.gitignore` says).
+/// run namespace). A fenced unit instead keeps its target in per-unit `scratch/target`, removed
+/// at settle; cargo home always stays here. Neither is a seed root (the host's cache is never
+/// copied in) nor a write-back root (a build's output never reaches the host tree, whatever its `.gitignore` says).
 pub(crate) fn seat_build_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<PathBuf> {
     let base = wicked_apps_core::spawn::worker_home_base().ok()?;
     Some(

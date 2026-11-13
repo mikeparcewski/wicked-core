@@ -38,11 +38,12 @@ Docker Desktop Kubernetes), installed once with `wicked-core cluster install --a
 seat: it builds images into the store the cluster shares (`imagePullPolicy: Never`) and
 inspects a seat image before an arm (a short-lived helper running only the floor's busybox). Use
 `wicked-core seat-image build|status` to build or report images. Every seat image builds on the
-checks floor image (`checks_container::image_tag()`; the engine ensures it first, no registry
-fallback; `WICKED_SEAT_BASE_IMAGE` overrides), which links the pinned Rust toolchain into
-`/usr/local/bin`: seats have cargo and a repo `rust-toolchain` file is not applied. A seat unit's
-`CARGO_HOME`/`CARGO_TARGET_DIR` live under `<worker home>/seat-build/<cli>` (a replica home, never
-seeded or written back).
+embedded checks floor recipe as a named stage (the engine also ensures the standalone checks
+image, rebuilding it if removed; `WICKED_SEAT_BASE_IMAGE` overrides), which links the pinned Rust
+toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` file is not applied. A seat unit's
+`CARGO_HOME` always lives under `<worker home>/seat-build/<cli>` in the per-run, per-CLI replica
+(never seeded or written back). A full-posture unit's `CARGO_TARGET_DIR` lives there too; a fenced
+unit keeps its per-unit `scratch/target`, removed at settle.
 
 ## Conventions
 

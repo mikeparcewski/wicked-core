@@ -514,45 +514,83 @@ fn k8s_a_cargo_build_in_a_tree_without_a_target_ignore_writes_no_target_back() {
         Some(v) => std::env::set_var(WORKER_HOME_ENV, v),
         None => std::env::remove_var(WORKER_HOME_ENV),
     }
-    let target = plan
-        .env
-        .iter()
-        .find(|(k, _)| *k == "CARGO_TARGET_DIR")
-        .map(|(_, v)| v.clone())
-        .expect("every container seat unit has a CARGO_TARGET_DIR");
-    // The replica: the tree root `w` (a git repo whose .gitignore lacks target/) and the build
-    // state root `b`; a build writes where CARGO_TARGET_DIR says.
+    // Resolve the production floor and mount/replica plan, including every admitted root.
+    let floor = crate::worker_sandbox::resolve_seat_floor(&plan.inputs).unwrap();
+    let mounts = seat::plan_mounts(&crate::container_floor::mount_plan(&floor).unwrap());
+    let (mut planned_roots, _) = seat::plan(
+        &tree,
+        plan.inputs.read_only,
+        &mounts,
+        &floor.protected,
+        &plan.inputs.write_roots,
+        Some(&worker.join("cache")),
+    );
+    seat::mark_homes(&mut planned_roots, &plan.inputs.seat_dirs, None);
     let replica = tmp("cargo-wb-replica");
-    let w = replica.join("w");
-    std::fs::create_dir_all(w.join("src")).unwrap();
+    let scope = Some("cargo-unit");
+    let mapped = |path: &Path| replica.join(seat::replica_of(scope, path).unwrap());
+    for root in &planned_roots {
+        std::fs::create_dir_all(mapped(&root.host)).unwrap();
+    }
+    let w = mapped(&tree);
     let init = std::process::Command::new("git")
         .hardened()
         .args(["init", "-q"])
         .current_dir(&w)
         .status()
-        .is_ok_and(|s| s.success());
-    if !init {
-        eprintln!("skipping: git init failed");
-        return;
-    }
+        .expect("git init");
+    assert!(init.success());
+    std::fs::create_dir_all(w.join("src")).unwrap();
     std::fs::write(w.join(".gitignore"), "*.log\n").unwrap();
+    std::fs::write(
+        w.join("Cargo.toml"),
+        "[package]\nname = \"cargo-wb-probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
     std::fs::write(w.join("src/main.rs"), "fn main() {}\n").unwrap();
-    let built = match target.strip_prefix(&tree) {
-        Ok(rel) => w.join(rel),
-        Err(_) => replica.join("b").join("target"),
-    };
-    std::fs::create_dir_all(built.join("debug")).unwrap();
-    std::fs::write(built.join("debug/app"), "binary").unwrap();
-    let w_root = PlanRoot {
-        host: tree.clone(),
-        mode: Mode::Tree,
-        skip: vec![".git".into()],
-        back: true,
-        files: Vec::new(),
-        masks: Vec::new(),
-        repo: false,
-    };
-    let pack_plan = seat::codec_plan(&[("w".into(), &w_root)]).to_string();
+    let planned_env = |key| plan.env.iter().find(|(k, _)| *k == key).unwrap().1.clone();
+    let target = planned_env("CARGO_TARGET_DIR");
+    let cargo_home = planned_env("CARGO_HOME");
+    for path in [&target, &cargo_home] {
+        assert!(!planned_roots
+            .iter()
+            .any(|r| r.mode == Mode::Seed && path.starts_with(&r.host)));
+        assert!(!seat::write_back_roots(&planned_roots)
+            .iter()
+            .any(|r| path.starts_with(&r.host)));
+        assert!(planned_roots.iter().any(|r| path.starts_with(&r.host)));
+    }
+    // A retained replica's old cargo seed must not influence this real cargo invocation.
+    let legacy = mapped(&worker.join("cache/claude/cargo"));
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(
+        legacy.join("config.toml"),
+        "invalid cargo configuration [\n",
+    )
+    .unwrap();
+    let mut cargo = std::process::Command::new("cargo");
+    cargo
+        .hardened()
+        .args(["build", "--offline"])
+        .current_dir(&w);
+    for key in ["CARGO_HOME", "CARGO_TARGET_DIR"] {
+        cargo.env(key, mapped(&planned_env(key)));
+    }
+    let built = cargo.output().expect("cargo must be on PATH");
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let artifact = mapped(&target).join("debug/cargo-wb-probe");
+    assert!(artifact.is_file(), "cargo produced no binary: {artifact:?}");
+    assert!(!w.join("target").exists());
+    assert_ne!(mapped(&cargo_home), legacy);
+    let refs: Vec<_> = seat::write_back_roots(&planned_roots)
+        .into_iter()
+        .map(|r| (seat::replica_of(scope, &r.host).unwrap(), r))
+        .collect();
+    let pack_plan = seat::codec_plan(&refs).to_string();
     let packed = codec(&replica, &["pack", &pack_plan], b"");
     assert!(
         packed.status.success(),
@@ -560,10 +598,16 @@ fn k8s_a_cargo_build_in_a_tree_without_a_target_ignore_writes_no_target_back() {
         String::from_utf8_lossy(&packed.stderr)
     );
     let roots = sync::decode(&mut packed.stdout.as_slice(), sync::MAX_STREAM).unwrap();
-    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(roots.len(), refs.len());
+    let paths: Vec<&str> = roots
+        .iter()
+        .flat_map(|r| r.entries.iter().map(|e| e.path.as_str()))
+        .collect();
     assert!(paths.contains(&"src/main.rs"), "{paths:?}");
     assert!(
-        !paths.iter().any(|p| p.starts_with("target")),
+        !paths
+            .iter()
+            .any(|p| p.split('/').any(|part| part == "target") || p.contains("cargo-wb-probe")),
         "a target/ entry came back: {paths:?}"
     );
     let _ = std::fs::remove_dir_all(&host);
