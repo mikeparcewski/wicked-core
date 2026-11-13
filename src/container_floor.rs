@@ -734,12 +734,7 @@ fn build_seat_image_on(
             "wicked-core: building the checks floor image {} (the seat base)",
             base.image
         );
-        build_image(
-            rt,
-            crate::checks_container::DOCKERFILE,
-            &base.image,
-            &[],
-        )?;
+        build_image(rt, crate::checks_container::DOCKERFILE, &base.image, &[])?;
     }
     let mut args = vec![format!("BASE={}", base.image), format!("CLI={cli}")];
     args.extend(package.build_args());
@@ -3663,7 +3658,11 @@ mod tests {
         let pkg = seat_package("claude").unwrap();
         for present in [false, true] {
             let dir = c4_temp();
-            let have: Vec<&str> = if present { vec![checks.as_str()] } else { vec![] };
+            let have: Vec<&str> = if present {
+                vec![checks.as_str()]
+            } else {
+                vec![]
+            };
             let rt = Runtime::answering(image_stub(&dir, &have));
             let base = SeatBase {
                 image: checks.clone(),
