@@ -435,6 +435,45 @@ fn k8s_the_replica_plan_leaves_the_clone_out_and_comes_back_only_for_write_roots
     assert!(roots.iter().find(|r| r.host == notes).unwrap().back);
 }
 
+/// A container seat's cargo home and target dir (`<worker home>/seat-build/<cli>`) are a home in the
+/// replica: not under the seed base (the host's cache is never copied into them), and no root that
+/// comes back, so a build's `target/` never reaches the host even where the tree's `.gitignore`
+/// lacks it (the target is not in the tree at all).
+#[test]
+fn k8s_the_cargo_state_dir_is_a_home_that_is_neither_seeded_nor_written_back() {
+    let tree = PathBuf::from("/home/u/.wicked/repos/app/wt/run-1");
+    let cache = PathBuf::from("/home/u/.wicked-worker/cache/claude");
+    let build = PathBuf::from("/home/u/.wicked-worker/seat-build/claude");
+    let mounts: Vec<PlanMount> = [&tree, &cache, &build]
+        .into_iter()
+        .map(|p| PlanMount::Bind {
+            path: p.clone(),
+            rw: true,
+        })
+        .collect();
+    let seed_base = PathBuf::from("/home/u/.wicked-worker/cache");
+    let (mut roots, _) = seat::plan(
+        &tree,
+        false,
+        &mounts,
+        &[],
+        std::slice::from_ref(&tree),
+        Some(&seed_base),
+    );
+    seat::mark_homes(&mut roots, &[cache.clone(), build.clone()], None);
+    let by = |p: &Path| roots.iter().find(|r| r.host == p).unwrap();
+    assert_eq!(by(&cache).mode, Mode::Seed);
+    assert_eq!(by(&build).mode, Mode::Home, "the cargo state is not a seed");
+    assert!(!by(&build).back, "the cargo state came back");
+    // No root that comes back holds the cargo home or the target dir.
+    for dir in [build.join("cargo-home"), build.join("target")] {
+        assert!(
+            !roots.iter().any(|r| r.back && dir.starts_with(&r.host)),
+            "{dir:?} is under a write-back root"
+        );
+    }
+}
+
 #[test]
 fn k8s_a_read_only_tree_exposed_only_by_the_boundary_is_still_its_own_root() {
     let clone = PathBuf::from("/home/u/repo");

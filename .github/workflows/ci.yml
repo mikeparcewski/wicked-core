@@ -185,3 +185,45 @@ jobs:
         env:
           TEST_POSTGRES_URL: postgres://wicked:wicked@localhost:5432/estate_test
         run: cargo test --manifest-path crates/wicked-apps-core/Cargo.toml --features postgres
+
+  # core#1476: the checks floor image and a seat image built on it carry the pinned Rust toolchain on
+  # the default PATH, so a repository whose rust-toolchain.toml names `channel = "stable"` builds
+  # with the image's own binaries (rustup would otherwise try to install `stable` into a read-only
+  # RUSTUP_HOME). No other job builds images; the image tests are stubs or WICKED_CONTAINER_LIVE-gated.
+  seat-toolchain:
+    name: floor + seat image toolchain (ubuntu x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout wicked-core
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Build the checks floor image and the claude seat image on it
+        run: |
+          set -eu
+          docker build -t wicked-checks-floor:ci - < containers/checks/node22-rust.Dockerfile
+          pkg="$(grep -o '@anthropic-ai/claude-code@[0-9.]*' src/container_floor.rs | head -n1)"
+          test -n "$pkg"
+          docker build --build-arg BASE=wicked-checks-floor:ci --build-arg CLI=claude \
+            --build-arg "CLI_PACKAGE=$pkg" --build-arg "CLI_PIN=$pkg" \
+            -t wicked-seat-claude:ci - < containers/seats/seat.Dockerfile
+
+      - name: A crate with rust-toolchain.toml channel = "stable" builds in both images
+        run: |
+          set -eu
+          dir="$(mktemp -d)"
+          mkdir -p "$dir/tiny/src"
+          printf '[toolchain]\nchannel = "stable"\n' > "$dir/tiny/rust-toolchain.toml"
+          printf '[package]\nname = "tiny"\nversion = "0.1.0"\nedition = "2021"\n' > "$dir/tiny/Cargo.toml"
+          printf 'fn main() {\n    println!("{}", add(1, 2));\n}\n\npub fn add(a: u32, b: u32) -> u32 {\n    a + b\n}\n\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn adds() {\n        assert_eq!(super::add(1, 2), 3);\n    }\n}\n' > "$dir/tiny/src/main.rs"
+          chmod -R a+rwX "$dir"
+          for image in wicked-checks-floor:ci wicked-seat-claude:ci; do
+            echo "== $image"
+            # The Debian PATH and no RUSTUP_* variables; the image's rustup home is read-only to
+            # this user, as in a seat. The network is off: the crate has no dependencies.
+            docker run --rm --network none --read-only --user 1000:1000 --tmpfs /tmp \
+              -v "$dir/tiny:/work/tiny" -w /work/tiny --entrypoint /usr/bin/env "$image" \
+              -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp \
+              CARGO_HOME=/tmp/cargo-home CARGO_TARGET_DIR=/tmp/target \
+              sh -euc 'cargo run && cargo clippy -- -D warnings && cargo fmt --check && cargo test'
+          done

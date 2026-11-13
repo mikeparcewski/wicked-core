@@ -170,6 +170,13 @@ floor launcher, a read-only root and the model gateway. A unit whose pod cannot 
 `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. The container CLI (`docker`,
 `nerdctl` or `podman`) never runs a seat: it builds images into the store the cluster shares
 (`imagePullPolicy: Never`) and inspects a seat image before an arm. `wicked-core seat-image build|status` builds or reports the images.
+Every seat image is built on the checks floor image (`containers/checks/node22-rust.Dockerfile`:
+node, the pinned Rust toolchain linked into `/usr/local/bin`, git, a C toolchain), which the engine
+builds first (and again if an image cleanup removed it), so a builder or QE seat on a Rust repository
+has `cargo`, and a repository `rust-toolchain` file is not applied (the floor's pinned toolchain is
+used). `WICKED_SEAT_BASE_IMAGE` still overrides the base. Each container seat unit builds into a
+per-run, per-CLI `CARGO_TARGET_DIR` and `CARGO_HOME` in the run's replica, neither seeded from the
+host nor written back.
 
 Two smaller consequences of the same rule, worth knowing before you debug them:
 

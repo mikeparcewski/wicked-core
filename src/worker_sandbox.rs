@@ -1257,14 +1257,26 @@ pub(crate) fn seat_cache_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<Pa
     Some(base.join("cache").join(cli.root_name().unwrap_or("other")))
 }
 
+/// Where a container seat's cargo state lives: `<worker home>/seat-build/<seat root name>`, one per
+/// CLI, beside [`seat_cache_dir`] but NOT under it. On the host it is only the mount point: the
+/// run's replica holds `cargo-home` and `target` there (a per-run, per-CLI copy, dropped with the
+/// run namespace), and neither is a seed root (the host's cache is never copied in) nor a
+/// write-back root (a build's output never reaches the host tree, whatever its `.gitignore` says).
+pub(crate) fn seat_build_dir(cli: wicked_apps_core::spawn::SeatCli) -> Option<PathBuf> {
+    let base = wicked_apps_core::spawn::worker_home_base().ok()?;
+    Some(
+        base.join("seat-build")
+            .join(cli.root_name().unwrap_or("other")),
+    )
+}
+
 /// The toolchain caches a governed seat is pointed into its [`seat_cache_dir`], keyed by
 /// toolchain: `(toolchain, variable, subdir)`. One mechanism for every toolchain: a new one is a
-/// row here (the dir, the bind and the env pass-through follow). Build output is not a cache and is
-/// not here: cargo's target dir is the unit's tree (`<worktree>/target`, cargo's default, reused by
-/// the run's later units and removed with the worktree), or under a fenced posture its own scratch
-/// (`CARGO_TARGET_DIR`, [`plan_seat_floor`]), because a fenced tree is read-only.
+/// row here (the dir, the bind and the env pass-through follow). Build state is not a cache and is
+/// not here: cargo's home and target dir are in [`seat_build_dir`] (`CARGO_HOME`,
+/// `CARGO_TARGET_DIR`, [`plan_seat_floor`]), reused by the run's later units of the same CLI; a
+/// fenced posture's target is its own scratch, because a fenced tree is read-only.
 pub(crate) const SEAT_TOOLCHAIN_CACHES: &[(&str, &str, &str)] = &[
-    ("cargo", "CARGO_HOME", "cargo"),
     ("npm", "npm_config_cache", "npm"),
     ("yarn", "YARN_CACHE_FOLDER", "yarn"),
     ("pnpm", "npm_config_store_dir", "pnpm-store"),
@@ -1407,10 +1419,17 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
     }
     let cache = seat_cache_dir(launch.cli);
     seat_dirs.extend(cache.iter().cloned());
+    // Cargo's home and target: a home (kept in the replica, never back), not under the seed base.
+    let build = seat_build_dir(launch.cli);
+    seat_dirs.extend(build.iter().cloned());
     seat_dirs.extend(launch.scratch.map(Path::to_path_buf));
     seat_dirs.extend(launch.gov_log_dir.map(Path::to_path_buf));
     let mut env: Vec<(&'static str, PathBuf)> =
         cache.as_deref().map(floor_cache_env).unwrap_or_default();
+    if let Some(build) = &build {
+        env.push(("CARGO_HOME", build.join("cargo-home")));
+        env.push(("CARGO_TARGET_DIR", build.join("target")));
+    }
     let tmp = match (launch.read_only, launch.scratch) {
         (true, Some(scratch)) => {
             let tmp = scratch.join("tmp");
@@ -1418,6 +1437,8 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
             for k in ["TMPDIR", "TMP", "TEMP"] {
                 env.push((k, tmp.clone()));
             }
+            // The fenced posture's target stays in its scratch (last value wins).
+            env.retain(|(k, _)| *k != "CARGO_TARGET_DIR");
             env.push(("CARGO_TARGET_DIR", scratch.join("target")));
             tmp
         }

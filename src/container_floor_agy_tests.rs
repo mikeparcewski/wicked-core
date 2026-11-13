@@ -88,8 +88,8 @@ fn the_agy_seat_image_installs_its_pinned_tarball_verified_before_unpacking() {
     let other = SeatPackage::Tarball(&OTHER_BUILD);
     assert!(pkg.pin().contains(t.amd64.1) && pkg.pin().contains(t.arm64.1));
     assert_ne!(
-        content_tag(&[SEAT_DOCKERFILE, &pkg.pin(), DEFAULT_BASE]),
-        content_tag(&[SEAT_DOCKERFILE, &other.pin(), DEFAULT_BASE]),
+        content_tag(&[SEAT_DOCKERFILE, &pkg.pin(), &default_base()]),
+        content_tag(&[SEAT_DOCKERFILE, &other.pin(), &default_base()]),
         "another checksum is another image"
     );
 }

@@ -46,7 +46,8 @@ pub(crate) const DEFAULT_MEMORY: &str = "6g";
 pub(crate) const PLATFORM_SCOPE: &str = "the checks ran in a Linux container with no network: \
      macOS-only code paths did not run here, and tests that need an OS write boundary or the \
      network inside the floor leave themselves out (WICKED_CHECKS_FLOOR=container); the \
-     repository's CI covers them on its own platforms";
+     repository's CI covers them on its own platforms; built with the floor's pinned Rust \
+     toolchain; a repository rust-toolchain file is not applied";
 
 const HOME: &str = "/home/floor";
 const TARGET_DIR: &str = "/wicked/target";
@@ -59,8 +60,9 @@ const INSTALL_LOG: &str = ".wicked-install.log";
 /// The install every `node_modules` volume is filled with, whatever argv the repository detected:
 /// a fixed, trusted command (a repository argv like `--ignore-scripts=false` never reaches it).
 const NPM_FILL: &[&str] = &["npm", "ci", "--ignore-scripts", "--no-audit", "--no-fund"];
-pub(crate) const PATH_IN: &str =
-    "/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+/// No cargo bin dir (it holds only rustup's proxies): the image links the pinned toolchain's own
+/// binaries into the default PATH, so a repository's `rust-toolchain` file is never applied.
+pub(crate) const PATH_IN: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const PROBE: Duration = Duration::from_secs(15);
 const START: Duration = Duration::from_secs(120);
 const COPY: Duration = Duration::from_secs(300);

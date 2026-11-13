@@ -14,6 +14,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **Seats get the Rust toolchain (core#1476, slice A).** A builder or QE seat on a Rust repository
+  had no `cargo` (exit 127), and the checks floor could not build a repository whose
+  `rust-toolchain.toml` names a toolchain the image lacks (wicked-estate's `channel = "stable"`:
+  rustup tried to install it into a read-only `RUSTUP_HOME`). The checks floor image now links the
+  pinned toolchain's binaries into `/usr/local/bin`, the floor's `PATH` drops rustup's proxies (a
+  repository `rust-toolchain` file is not applied; the platform scope says so), and every seat image
+  is built on the checks floor image (ensured first, rebuilt if removed; `WICKED_SEAT_BASE_IMAGE`
+  still overrides). Each container seat unit gets a per-run, per-CLI `CARGO_TARGET_DIR` and
+  `CARGO_HOME` under `<worker home>/seat-build/<cli>`, neither seeded from the host nor written
+  back, so a build's `target/` no longer comes back when `.gitignore` lacks it. New CI job
+  `seat-toolchain` builds both images and runs cargo on a `channel = "stable"` crate.
+
 - **A `cd` on its own line no longer fails the unit that wrote its own root (run 8e0ffbec).** A Bash
   call such as `cd <plan dir>`, a line break, then `cat > chapters.json <<'EOF'` is still refused,
   because if that `cd` fails the heredoc lands in the shell's previous directory. The refusal is now
