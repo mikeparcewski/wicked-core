@@ -2975,6 +2975,21 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.43** — 2026-11-12 — patch release on main c644735, carrying 3 PRs since 0.15.42: #1467, #1468 and
+  #1471.
+  - **A `cd` on its own line no longer fails the unit (#1471, core#1465).** `cd <dir>`, a line break, then a write is
+    still refused (a failed `cd` would write in the previous directory), but the refusal is advisory when joining that
+    line with `&&` would pass, and it names that remedy, so the seat retries instead of the unit being denied.
+    `cd <dir> && cat > f <<'EOF'` with a plain-data heredoc now passes. The Bash write scan also judges a command after
+    a line break or a glued operator (`&&`, `;`) as its own command. Also carries the Rust 1.100 clippy fix in
+    `wicked-apps-core`.
+  - **Corroboration counts estate-converted documents as docs (#1467).** `is_doc_path` lists the PDF, Word,
+    PowerPoint, Excel, OpenDocument, RTF and EPUB extensions estate 0.35.4 indexes as Markdown, so a requirement named
+    in such a file counts it as a doc mention, and those extensions are no longer taken for code when looking for
+    unindexed source files. It has an effect only with wicked-estate 0.35.4 or later.
+  - **Lockfile:** #1468 re-stamped the 0.15.42 platform lock entries.
+  - **Upgrade notes.** No binding method change, no `LaunchSpec` field change; gate protocol 3 is unchanged. No new
+    wire field; a leading-`cd` refusal can now be advisory. No Dockerfile change, so no image rebuild.
 - **core-ts 0.15.42** — 2026-11-12 — patch release on main a574003, carrying 3 PRs since 0.15.41: #1460, #1462 and
   #1466.
   - **A Claude seat on the Kubernetes seat floor can read and edit its run's declared draft root (#1466, core#1461).**
