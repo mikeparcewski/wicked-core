@@ -1,6 +1,10 @@
 # syntax=docker/dockerfile:1
-# wicked seat image: one CLI on an OSS base. The engine builds it on first use (or `wicked-core
-# seat-image build <cli>`) from this file alone (no build context), with CLI naming the CLI and
+# wicked seat image: one CLI on the checks floor image (containers/checks/node22-rust.Dockerfile:
+# node, the pinned Rust toolchain on the default PATH, git, a C toolchain), so every seat is
+# Rust-capable. The engine composes the checks recipe as a named stage for the default build;
+# an operator override is passed as BASE.
+# The ARG default below is only for a build run by hand. The engine builds it on first use (or `wicked-core
+# seat-image build <cli>`) without a build context, with CLI naming the CLI and
 # either CLI_PACKAGE its published npm package, or (a CLI not published to npm: agy) CLI_TARBALL_*
 # its vendor release tarball per architecture, each at the version the engine is verified against;
 # tagged by the hash of this file, the package pin and the base. Nothing here runs before the floor holds: the engine's

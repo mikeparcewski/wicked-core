@@ -1298,3 +1298,16 @@ mod live {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
+
+#[test]
+fn the_floor_path_has_no_rustup_proxies_and_the_image_links_the_pinned_toolchain() {
+    assert!(!PATH_IN.contains("/usr/local/cargo/bin"), "{PATH_IN}");
+    assert!(PATH_IN.split(':').any(|d| d == "/usr/local/bin"));
+    assert!(DOCKERFILE.contains("ln -sf \"$f\" /usr/local/bin/"));
+    assert!(!DOCKERFILE
+        .lines()
+        .any(|l| l.starts_with("ENV PATH=") && l.contains("/usr/local/cargo/bin")));
+    assert!(PLATFORM_SCOPE.contains(
+        "built with the floor's pinned Rust toolchain; a repository rust-toolchain file is not applied"
+    ));
+}

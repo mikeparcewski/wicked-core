@@ -15,7 +15,7 @@ ARG BASE=node:24.22.2-trixie-slim
 FROM ${BASE}
 ARG RUST_TOOLCHAIN=1.99.1
 ENV RUSTUP_HOME=/usr/local/rustup CARGO_HOME=/usr/local/cargo
-ENV PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates curl git procps unzip python3 \
       build-essential pkg-config libssl-dev \
@@ -27,8 +27,11 @@ RUN git config --system --add safe.directory /work/head \
  && git config --system --add safe.directory /work/base
 RUN curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs \
       | sh -s -- -y --profile minimal --default-toolchain "$RUST_TOOLCHAIN" --component rustfmt,clippy \
- && chmod -R a+rX /usr/local/cargo /usr/local/rustup \
- && rustc --version && cargo --version && cargo clippy --version && cargo fmt --version
+ && chmod -R a+rX /usr/local/cargo /usr/local/rustup
+# The pinned toolchain's own binaries on the default PATH (the seat images build on this one): a
+# repository's rust-toolchain.toml (`channel = "stable"`) then never reaches rustup, which would try
+# to install it into a read-only RUSTUP_HOME. Idempotent; exactly one toolchain must be installed.
+RUN set -eu; test "$(ls -d /usr/local/rustup/toolchains/*/ | wc -l)" -eq 1; for f in /usr/local/rustup/toolchains/*/bin/*; do ln -sf "$f" /usr/local/bin/; done; env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/nonexistent sh -c 'cargo --version && rustc --version && cargo clippy --version && cargo fmt --version'
 # The mount points the engine's cache volumes are first mounted on, owned by the checks' user
 # (uid 1000, `node`): a fresh named volume takes this ownership on its first mount, so no root
 # step is needed to make it writable by the install container.

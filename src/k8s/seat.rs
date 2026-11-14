@@ -2236,13 +2236,18 @@ pub(crate) fn settle_unless(
     Ok(code)
 }
 
+/// Select the roots returned by a unit; cargo homes and scratch must never be among them.
+pub(crate) fn write_back_roots(roots: &[PlanRoot]) -> Vec<&PlanRoot> {
+    roots.iter().filter(|r| r.back).collect()
+}
+
 /// The write-back (B11): every root that comes back is packed in the sync pod and checked on the
 /// host whole; the unit's new commits are fetched (fsck), checked for a fast-forward and for a
 /// masked or `.git` path, all BEFORE any host file changes (review r1); then only what the seat
 /// changed against the copy-in baseline is applied with the no-follow walk, a file the host also
 /// changed meanwhile is a conflict (refused, never overwritten), and the host HEAD moves last.
 pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
-    let back: Vec<&PlanRoot> = seat.roots.iter().filter(|r| r.back).collect();
+    let back = write_back_roots(&seat.roots);
     if back.is_empty() {
         return Ok(());
     }
