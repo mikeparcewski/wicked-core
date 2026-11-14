@@ -12115,11 +12115,13 @@ exit 1
             wt = wt.join("a-deeper-directory-level");
         }
         std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        // Check access bits, as in the private-dir creation test below: a setgid system temp
+        // directory passes that special bit to children without granting group/other access.
         let binder = "import os, socket, stat\n\
                       t = os.environ['TMPDIR']\n\
                       assert os.environ['TMP'] == t and os.environ['TEMP'] == t\n\
                       print('TMPDIR=' + t)\n\
-                      print('MODE=' + oct(stat.S_IMODE(os.stat(t).st_mode)))\n\
+                      print('MODE=' + oct(stat.S_IMODE(os.stat(t).st_mode) & 0o777))\n\
                       s = socket.socket(socket.AF_UNIX)\n\
                       s.bind(os.path.join(t, 'x.sock'))\n\
                       s.listen(1)\n\
