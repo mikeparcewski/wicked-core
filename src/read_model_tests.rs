@@ -219,8 +219,13 @@ fn once_the_actor_takes_shutdown_no_read_is_answered_off_it() {
     assert_eq!(core.sessions().unwrap().len(), 2);
     let events = core.subscribe();
     core.shutdown_for_test();
-    // The actor took `Shutdown` once its subscribers are gone.
-    while events.recv_timeout(Duration::from_secs(10)).is_ok() {}
+    // Queue an acknowledged actor command behind Shutdown. It returns when the actor
+    // drops the reply channel, so a busy actor cannot be mistaken for a stopped one.
+    core.ping();
+    assert!(matches!(
+        events.recv_timeout(Duration::from_secs(10)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    ));
     assert!(
         core.sessions().is_err(),
         "a stopped actor's reads fail, as before"

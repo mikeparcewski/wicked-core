@@ -14,6 +14,23 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Fixed
+
+- **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
+  now disables CONNECT egress and emits a warning naming the variable, instead of silently
+  selecting open egress. Only an unset value selects the open default. Gemini telemetry and
+  Codex discovery comments now distinguish restrictive lists from the open default.
+
+### Changed
+
+- **Seat egress is open by default (core#1476).** With `WICKED_SEAT_EGRESS_HOSTS` unset (or `*`, alone or
+  inside a list) the gateway's CONNECT listener serves one `egress-allowlist` route with no `hostnames`
+  key, so a seat fetches crates, npm and PyPI packages with no operator setting (agentgateway v1.6.0
+  matches `hostnames: ["*"]` against nothing, so `*` is never rendered). An empty, whitespace-only or
+  `none` value keeps today's no-route behaviour; any other value is exactly that comma-separated list.
+  Seats still get no credential (an https push to github.com has none) and the seat NetworkPolicy is
+  unchanged.
+
 - **Seats get the Rust toolchain (core#1476, slice A).** A builder or QE seat on a Rust repository
   had no `cargo` (exit 127), and the checks floor could not build a repository whose
   `rust-toolchain.toml` names a toolchain the image lacks (wicked-estate's `channel = "stable"`:

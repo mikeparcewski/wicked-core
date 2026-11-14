@@ -120,25 +120,75 @@ pub(crate) const COPILOT_DEFAULT_HOST: &str = "api.githubcopilot.com";
 /// The route file of the copilot CLI's own sign-in (its GitHub token).
 pub(crate) const COPILOT_CLI_FILE: &str = "copilot.token";
 /// The hostnames (comma-separated) seats may reach through the gateway's CONNECT listener, by
-/// TLS SNI: package registries, e.g. `index.crates.io,static.crates.io` for cargo (the sparse
-/// index and the crate downloads it names; a git dependency or another registry needs its own
-/// hosts). Unset or empty = none. This daemon's value, read each time it provisions the gateway:
-/// `config/gateway.json` does not keep an earlier daemon's list. A host not named is
-/// refused at the gateway, which logs `route not found` with the host as `tls.sni`; the seat's
-/// client sees its TLS handshake cut (curl and cargo: `[35] SSL connect error ... unexpected eof`).
+/// TLS SNI. Egress is OPEN by default: unset or `*` (alone, or inside a list) lets a seat reach
+/// any host, so crates, npm and PyPI packages fetch with no operator setting. An empty,
+/// whitespace-only or `none` value is an explicit "no egress" (no route, the listener stays
+/// closed). Any other value is exactly that list (e.g. `index.crates.io,static.crates.io`;
+/// suffix wildcards such as `*.io` match as the gateway matches them). This daemon's value,
+/// read each time it provisions the gateway: `config/gateway.json` does not keep an earlier
+/// daemon's list. A host the list does not name is refused at the gateway, which logs
+/// `route not found` with the host as `tls.sni`; the seat's client sees its TLS handshake cut
+/// (curl and cargo: `[35] SSL connect error ... unexpected eof`). Seats gain no credential: an
+/// https push to github.com still has no token. A non-Unicode value fails closed (no route)
+/// with a warning naming the variable.
 pub(crate) const EGRESS_HOSTS_ENV: &str = "WICKED_SEAT_EGRESS_HOSTS";
 
-/// The CONNECT allowlist named by [`EGRESS_HOSTS_ENV`]'s value: trimmed, blanks dropped.
+/// The in-config marker for open egress. It is never rendered as a hostname: agentgateway
+/// v1.6.0 matches `hostnames: ["*"]` against nothing, while a route with no `hostnames` key
+/// matches every SNI.
+const EGRESS_OPEN: &str = "*";
+
+/// The CONNECT allowlist named by [`EGRESS_HOSTS_ENV`]'s value: trimmed, blanks dropped; `*`
+/// anywhere in the list = open (`["*"]`); empty or `none` = no hosts.
 fn parse_egress_hosts(raw: &str) -> Vec<String> {
-    raw.split(',')
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let hosts: Vec<String> = raw
+        .split(',')
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
-        .collect()
+        .collect();
+    if hosts.iter().any(|h| h == EGRESS_OPEN) {
+        return vec![EGRESS_OPEN.to_string()];
+    }
+    hosts
 }
 
-/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]).
+/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]); unset = open, non-Unicode = closed.
 pub(crate) fn egress_hosts_from_env() -> Vec<String> {
-    parse_egress_hosts(&std::env::var(EGRESS_HOSTS_ENV).unwrap_or_default())
+    match std::env::var(EGRESS_HOSTS_ENV) {
+        Ok(raw) => egress_hosts_from_value(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => egress_hosts_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "wicked-core: warning: {EGRESS_HOSTS_ENV} is not valid Unicode; disabling seat CONNECT egress"
+            );
+            Vec::new()
+        }
+    }
+}
+
+/// [`egress_hosts_from_env`] for an already-read value: `None` (unset) = open.
+fn egress_hosts_from_value(raw: Option<&str>) -> Vec<String> {
+    raw.map_or_else(|| vec![EGRESS_OPEN.to_string()], parse_egress_hosts)
+}
+
+/// The CONNECT route for an allowlist: none when empty, hostless (matches every SNI) when open,
+/// else the named hostnames.
+fn egress_tcp_routes(hosts: &[String]) -> Vec<serde_json::Value> {
+    if hosts.is_empty() {
+        return vec![];
+    }
+    let mut route = json!({
+        "name": "egress-allowlist",
+        "gateways": "secure/public-egress",
+        "backends": [{"dynamic": {}}]
+    });
+    if !hosts.iter().any(|h| h == EGRESS_OPEN) {
+        route["hostnames"] = json!(hosts);
+    }
+    vec![route]
 }
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
@@ -634,13 +684,9 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             "name": "public-egress", "hostname": "*", "protocol": "TLS"
         }]}},
         // An empty hostname list can mean match-all to a router. Omit the route entirely when
-        // nothing is allowed, keeping the idle CONNECT listener closed.
-        "tcpRoutes": if config.egress_hosts.is_empty() { vec![] } else { vec![json!({
-            "name": "egress-allowlist",
-            "gateways": "secure/public-egress",
-            "hostnames": config.egress_hosts,
-            "backends": [{"dynamic": {}}]
-        })] }
+        // nothing is allowed, keeping the idle CONNECT listener closed; open egress is the route
+        // with no `hostnames` key.
+        "tcpRoutes": egress_tcp_routes(&config.egress_hosts)
     })
 }
 
@@ -933,8 +979,9 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
 /// and reads `GEMINI_API_KEY` (the unit's key, sent as `x-goog-api-key`) and
 /// `GOOGLE_GEMINI_BASE_URL` (the route). No Anthropic or OpenAI variable reaches it. The CONNECT
 /// proxy stays: what else agy contacts (its feature flags at `antigravity-unleash.goog`, its
-/// telemetry at `play.googleapis.com`) is refused there at once unless the operator's
-/// `WICKED_SEAT_EGRESS_HOSTS` names it; the turn does not need either.
+/// telemetry at `play.googleapis.com`) is refused there under a restrictive egress list unless
+/// the operator names those hosts. With `WICKED_SEAT_EGRESS_HOSTS` unset or `*`, those CONNECTs are allowed;
+/// the turn does not need either.
 fn gemini_seat_env(cli: &str, bearer: &str) -> Vec<(String, String)> {
     vec![
         ("GEMINI_API_KEY".into(), bearer.into()),
@@ -960,9 +1007,11 @@ pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 /// what it sends), never the built-in OpenAI provider with `OPENAI_BASE_URL` at the route. On the
 /// built-in provider a `…/backend-api/codex` base makes codex >= 0.162 run ChatGPT workspace
 /// routing discovery first: a direct `GET https://chatgpt.com/backend-api/wham/accounts/check`
-/// outside the route (refused at the gateway's CONNECT listener), whose failure is fatal
-/// ("workspace routing discovery failed"), and whose success would move every request to the
-/// discovered https origin, around the gateway. A custom provider is not routed
+/// outside the route. A restrictive egress list refuses discovery at the gateway's CONNECT
+/// listener unless the operator names its host; with `WICKED_SEAT_EGRESS_HOSTS` unset or `*`,
+/// those CONNECTs are allowed. Discovery failure is fatal ("workspace routing discovery failed"),
+/// and success would move every request to the discovered https origin, around the gateway.
+/// A custom provider is not routed
 /// (`supports_codex_backend_routes` is the built-in provider's alone), so the gateway stays the
 /// only path and the broker's credential the only one upstream.
 ///
@@ -3279,6 +3328,137 @@ mod tests {
                 "hostnames": ["registry.npmjs.org"], "backends": [{"dynamic": {}}]
             }])
         );
+    }
+
+    fn egress_routes_for(hosts: Vec<String>) -> Value {
+        let config = GatewayConfig {
+            egress_hosts: hosts,
+            ..plain_config()
+        };
+        render(&config)["tcpRoutes"].clone()
+    }
+
+    /// Open egress (unset or `*`) renders one hostless route: agentgateway v1.6.0 matches
+    /// `hostnames: ["*"]` against nothing, so the key must be absent, never `["*"]`.
+    #[test]
+    fn open_egress_renders_a_hostless_route_never_a_star_hostname() {
+        let open = json!([{
+            "name": "egress-allowlist", "gateways": "secure/public-egress",
+            "backends": [{"dynamic": {}}]
+        }]);
+        for raw in ["*", " * ", "*,a.example", "a.example, *"] {
+            let routes = egress_routes_for(parse_egress_hosts(raw));
+            assert_eq!(routes, open, "value {raw:?}");
+            assert!(routes[0].get("hostnames").is_none(), "value {raw:?}");
+        }
+        let routes = egress_routes_for(egress_hosts_from_value(None));
+        assert_eq!(routes, open, "unset");
+        assert!(!render(&GatewayConfig {
+            egress_hosts: egress_hosts_from_value(None),
+            ..plain_config()
+        })
+        .to_string()
+        .contains(r#""hostnames":["*"]"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_egress_env_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(EGRESS_HOSTS_ENV, value),
+                    None => std::env::remove_var(EGRESS_HOSTS_ENV),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(EGRESS_HOSTS_ENV));
+        let invalid = OsString::from_vec(b"a.example,\xff".to_vec());
+        std::env::set_var(EGRESS_HOSTS_ENV, &invalid);
+        assert_eq!(std::env::var_os(EGRESS_HOSTS_ENV), Some(invalid));
+        assert!(matches!(
+            std::env::var(EGRESS_HOSTS_ENV),
+            Err(std::env::VarError::NotUnicode(_))
+        ));
+
+        let routes = egress_routes_for(egress_hosts_from_env());
+        assert!(
+            routes
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|route| route.get("hostnames").is_some()),
+            "invalid Unicode must never render a hostless route: {routes}"
+        );
+        assert_eq!(
+            routes,
+            json!([]),
+            "invalid Unicode must disable CONNECT egress"
+        );
+    }
+
+    #[test]
+    fn ancillary_connect_docs_describe_restrictive_and_open_egress() {
+        let source = include_str!("seat_gateway.rs");
+        for (start, end) in [
+            (
+                "/// An agy seat on its Gemini API-key route:",
+                "fn gemini_seat_env(",
+            ),
+            (
+                "/// The CLI arguments a seat signed in with",
+                "pub(crate) fn seat_args_for(",
+            ),
+        ] {
+            let docs = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                docs.contains("restrictive egress list"),
+                "{start}: qualify refusal"
+            );
+            assert!(
+                docs.contains("unset or `*`"),
+                "{start}: describe open default"
+            );
+            assert!(
+                docs.contains("CONNECTs are allowed"),
+                "{start}: describe allowed CONNECTs"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_empty_or_none_egress_renders_no_route() {
+        for raw in ["", "  ", "none", " None "] {
+            assert!(parse_egress_hosts(raw).is_empty(), "value {raw:?}");
+            assert_eq!(
+                egress_routes_for(parse_egress_hosts(raw)),
+                json!([]),
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_egress_list_renders_exactly_those_hostnames() {
+        let routes = egress_routes_for(parse_egress_hosts("a.example, b.example,,*.io"));
+        assert_eq!(
+            routes[0]["hostnames"],
+            json!(["a.example", "b.example", "*.io"])
+        );
+        assert_eq!(routes.as_array().unwrap().len(), 1);
     }
 
     /// The CONNECT allowlist served is this daemon's `WICKED_SEAT_EGRESS_HOSTS`, not the list an
