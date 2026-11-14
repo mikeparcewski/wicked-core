@@ -22,7 +22,10 @@ fn build(root: &Path, base: Option<&str>) -> String {
         .env_remove("WICKED_SEAT_BASE_DOCKERFILE")
         .env_remove("WICKED_SEAT_IMAGE_CLAUDE");
     if let Some(base) = base {
-        cmd.env("WICKED_SEAT_BASE_IMAGE", base);
+        cmd.env("WICKED_SEAT_BASE_IMAGE", base)
+            .env("SEAT_TEST_OPERATOR_BASE", "1");
+    } else {
+        cmd.env_remove("SEAT_TEST_OPERATOR_BASE");
     }
     let out = cmd.output().expect("seat-image runs");
     assert!(out.status.success(), "{out:?}");
@@ -51,6 +54,10 @@ case "$1" in
     tag=
     while [ "$#" -gt 0 ]; do
       if [ "$1" = -t ]; then tag=$2; fi
+      # Model an OCI worker: the default build cannot resolve containerd's local floor tag.
+      if [ "$1" = --build-arg ] && [ "${SEAT_TEST_OPERATOR_BASE:-}" != 1 ]; then
+        case "$2" in BASE=wicked-checks-floor:*) exit 42 ;; esac
+      fi
       shift
     done
     test -n "$tag"
@@ -76,8 +83,15 @@ esac
         include_str!("../containers/checks/node22-rust.Dockerfile")
     );
     let recipe = std::fs::read_to_string(root.join(tags[2])).unwrap();
-    assert!(recipe.contains("FROM ${BASE} AS wicked_toolchain\n"));
-    assert!(recipe.contains("FROM wicked_toolchain\n"));
+    assert_eq!(
+        recipe
+            .lines()
+            .filter(|line| line.starts_with("FROM "))
+            .collect::<Vec<_>>(),
+        ["FROM ${BASE} AS wicked_toolchain", "FROM wicked_toolchain"]
+    );
+    assert_eq!(recipe.matches("ARG BASE=").count(), 1);
+    assert_eq!(recipe.matches("ARG RUST_TOOLCHAIN=").count(), 1);
     assert_eq!(recipe.matches("https://sh.rustup.rs").count(), 1);
 
     // An explicit checks base must produce the same seat tag as the default base.
@@ -97,4 +111,58 @@ esac
         "{repaired}"
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn toolchain_ci_keeps_an_executable_tmpfs_and_the_restricted_runtime() {
+    let ci: serde_yaml::Value =
+        serde_yaml::from_str(include_str!("../.github/workflows/ci.yml")).unwrap();
+    let job = &ci["jobs"]["seat-toolchain"];
+    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+    let script = job["steps"]
+        .as_sequence()
+        .unwrap()
+        .iter()
+        .filter_map(|step| step["run"].as_str())
+        .find(|script| script.contains("cargo run"))
+        .unwrap();
+    assert!(script.contains("--tmpfs /tmp:exec"));
+    assert!(script.contains("--network none --read-only --user 1000:1000"));
+    assert!(script.contains(
+        "-i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/tmp"
+    ));
+    assert!(script
+        .contains("cargo run && cargo clippy -- -D warnings && cargo fmt --check && cargo test"));
+}
+
+#[test]
+fn cargo_lifecycle_docs_distinguish_fenced_targets_from_run_scoped_home() {
+    for doc in [include_str!("../README.md"), include_str!("../CLAUDE.md")] {
+        let text = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("`CARGO_HOME`"));
+        assert!(text.contains("per-run, per-CLI"));
+        assert!(
+            text.contains("a fenced unit keeps its per-unit `scratch/target`, removed at settle")
+        );
+    }
+    let source = include_str!("../src/worker_sandbox.rs");
+    let cache_docs = source
+        .split("/// The per-seat cache dir")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn seat_cache_dir")
+        .next()
+        .unwrap();
+    assert!(cache_docs.contains("Non-cargo caches outlive"));
+    assert!(cache_docs.contains("Cargo instead uses the run-scoped home"));
+    let build_docs = source
+        .split("/// Where a container seat's cargo state lives")
+        .nth(1)
+        .unwrap()
+        .split("pub(crate) fn seat_build_dir")
+        .next()
+        .unwrap();
+    assert!(build_docs.contains("dropped with the"));
+    assert!(build_docs.contains("run namespace"));
+    assert!(build_docs.contains("cargo home always stays here"));
 }

@@ -3710,7 +3710,7 @@ mod tests {
         let script = ci["jobs"]["seat-toolchain"]["steps"][1]["run"]
             .as_str()
             .expect("the image build step");
-        let dir = c4_temp();
+        let dir = tmp("ci-seat-recipe");
         let docker = image_stub(&dir, &[]);
         let path = std::env::join_paths(
             std::iter::once(docker.parent().unwrap().to_path_buf()).chain(std::env::split_paths(
@@ -3756,7 +3756,7 @@ mod tests {
         assert!(!SeatBase::from_env().operator);
         let pkg = seat_package("claude").unwrap();
         for present in [false, true] {
-            let dir = c4_temp();
+            let dir = tmp("default-seat-base");
             let have: Vec<&str> = if present {
                 vec![checks.as_str()]
             } else {
