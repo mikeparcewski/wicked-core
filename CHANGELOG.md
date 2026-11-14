@@ -2991,6 +2991,19 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.44** — 2026-11-14 — patch release on main 4c1b431, carrying 2 PRs since 0.15.43: #1473 and #1480.
+  - **Seats get the Rust toolchain (#1480, core#1476 slice A).** A builder or QE seat on a Rust repository has `cargo`:
+    every seat image includes the checks floor recipe as a named stage, which links the pinned toolchain into
+    `/usr/local/bin`. The checks floor no longer applies a repository `rust-toolchain` file (a `channel = "stable"` repo
+    such as wicked-estate builds with the pinned toolchain instead of failing in a read-only `RUSTUP_HOME`). Each
+    container seat unit's `CARGO_HOME` (and a full-posture unit's `CARGO_TARGET_DIR`) is per-run, per-CLI replica state,
+    neither seeded from the host nor written back.
+  - **Lockfile:** #1473 re-stamped the 0.15.43 platform lock entries.
+  - **Upgrade notes.** No binding method change, no `LaunchSpec` field change, no new wire field; gate protocol 3 is
+    unchanged. The checks floor and seat Dockerfiles changed, and their image tags hash the Dockerfile, so the engine
+    builds new checks and seat images on first use after the upgrade (the first unit on each CLI takes longer;
+    `wicked-core seat-image build <cli>` builds them ahead). Open egress for seats (core#1476 slice B, #1487) is not in
+    this release.
 - **core-ts 0.15.43** — 2026-11-12 — patch release on main c644735, carrying 3 PRs since 0.15.42: #1467, #1468 and
   #1471.
   - **A `cd` on its own line no longer fails the unit (#1471, core#1465).** `cd <dir>`, a line break, then a write is
