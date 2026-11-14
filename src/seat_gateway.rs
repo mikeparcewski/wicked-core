@@ -120,25 +120,65 @@ pub(crate) const COPILOT_DEFAULT_HOST: &str = "api.githubcopilot.com";
 /// The route file of the copilot CLI's own sign-in (its GitHub token).
 pub(crate) const COPILOT_CLI_FILE: &str = "copilot.token";
 /// The hostnames (comma-separated) seats may reach through the gateway's CONNECT listener, by
-/// TLS SNI: package registries, e.g. `index.crates.io,static.crates.io` for cargo (the sparse
-/// index and the crate downloads it names; a git dependency or another registry needs its own
-/// hosts). Unset or empty = none. This daemon's value, read each time it provisions the gateway:
-/// `config/gateway.json` does not keep an earlier daemon's list. A host not named is
-/// refused at the gateway, which logs `route not found` with the host as `tls.sni`; the seat's
-/// client sees its TLS handshake cut (curl and cargo: `[35] SSL connect error ... unexpected eof`).
+/// TLS SNI. Egress is OPEN by default: unset or `*` (alone, or inside a list) lets a seat reach
+/// any host, so crates, npm and PyPI packages fetch with no operator setting. An empty,
+/// whitespace-only or `none` value is an explicit "no egress" (no route, the listener stays
+/// closed). Any other value is exactly that list (e.g. `index.crates.io,static.crates.io`;
+/// suffix wildcards such as `*.io` match as the gateway matches them). This daemon's value,
+/// read each time it provisions the gateway: `config/gateway.json` does not keep an earlier
+/// daemon's list. A host the list does not name is refused at the gateway, which logs
+/// `route not found` with the host as `tls.sni`; the seat's client sees its TLS handshake cut
+/// (curl and cargo: `[35] SSL connect error ... unexpected eof`). Seats gain no credential: an
+/// https push to github.com still has no token.
 pub(crate) const EGRESS_HOSTS_ENV: &str = "WICKED_SEAT_EGRESS_HOSTS";
 
-/// The CONNECT allowlist named by [`EGRESS_HOSTS_ENV`]'s value: trimmed, blanks dropped.
+/// The in-config marker for open egress. It is never rendered as a hostname: agentgateway
+/// v1.6.0 matches `hostnames: ["*"]` against nothing, while a route with no `hostnames` key
+/// matches every SNI.
+const EGRESS_OPEN: &str = "*";
+
+/// The CONNECT allowlist named by [`EGRESS_HOSTS_ENV`]'s value: trimmed, blanks dropped; `*`
+/// anywhere in the list = open (`["*"]`); empty or `none` = no hosts.
 fn parse_egress_hosts(raw: &str) -> Vec<String> {
-    raw.split(',')
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    let hosts: Vec<String> = raw
+        .split(',')
         .map(|h| h.trim().to_string())
         .filter(|h| !h.is_empty())
-        .collect()
+        .collect();
+    if hosts.iter().any(|h| h == EGRESS_OPEN) {
+        return vec![EGRESS_OPEN.to_string()];
+    }
+    hosts
 }
 
-/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]).
+/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]); unset = open.
 pub(crate) fn egress_hosts_from_env() -> Vec<String> {
-    parse_egress_hosts(&std::env::var(EGRESS_HOSTS_ENV).unwrap_or_default())
+    egress_hosts_from_value(std::env::var(EGRESS_HOSTS_ENV).ok().as_deref())
+}
+
+/// [`egress_hosts_from_env`] for an already-read value: `None` (unset) = open.
+fn egress_hosts_from_value(raw: Option<&str>) -> Vec<String> {
+    raw.map_or_else(|| vec![EGRESS_OPEN.to_string()], parse_egress_hosts)
+}
+
+/// The CONNECT route for an allowlist: none when empty, hostless (matches every SNI) when open,
+/// else the named hostnames.
+fn egress_tcp_routes(hosts: &[String]) -> Vec<serde_json::Value> {
+    if hosts.is_empty() {
+        return vec![];
+    }
+    let mut route = json!({
+        "name": "egress-allowlist",
+        "gateways": "secure/public-egress",
+        "backends": [{"dynamic": {}}]
+    });
+    if !hosts.iter().any(|h| h == EGRESS_OPEN) {
+        route["hostnames"] = json!(hosts);
+    }
+    vec![route]
 }
 
 /// A seat's revocable placeholder key and the identity authenticated requests carry.
@@ -634,13 +674,9 @@ pub(crate) fn render(config: &GatewayConfig) -> Value {
             "name": "public-egress", "hostname": "*", "protocol": "TLS"
         }]}},
         // An empty hostname list can mean match-all to a router. Omit the route entirely when
-        // nothing is allowed, keeping the idle CONNECT listener closed.
-        "tcpRoutes": if config.egress_hosts.is_empty() { vec![] } else { vec![json!({
-            "name": "egress-allowlist",
-            "gateways": "secure/public-egress",
-            "hostnames": config.egress_hosts,
-            "backends": [{"dynamic": {}}]
-        })] }
+        // nothing is allowed, keeping the idle CONNECT listener closed; open egress is the route
+        // with no `hostnames` key.
+        "tcpRoutes": egress_tcp_routes(&config.egress_hosts)
     })
 }
 
@@ -3279,6 +3315,59 @@ mod tests {
                 "hostnames": ["registry.npmjs.org"], "backends": [{"dynamic": {}}]
             }])
         );
+    }
+
+    fn egress_routes_for(hosts: Vec<String>) -> Value {
+        let config = GatewayConfig {
+            egress_hosts: hosts,
+            ..plain_config()
+        };
+        render(&config)["tcpRoutes"].clone()
+    }
+
+    /// Open egress (unset or `*`) renders one hostless route: agentgateway v1.6.0 matches
+    /// `hostnames: ["*"]` against nothing, so the key must be absent, never `["*"]`.
+    #[test]
+    fn open_egress_renders_a_hostless_route_never_a_star_hostname() {
+        let open = json!([{
+            "name": "egress-allowlist", "gateways": "secure/public-egress",
+            "backends": [{"dynamic": {}}]
+        }]);
+        for raw in ["*", " * ", "*,a.example", "a.example, *"] {
+            let routes = egress_routes_for(parse_egress_hosts(raw));
+            assert_eq!(routes, open, "value {raw:?}");
+            assert!(routes[0].get("hostnames").is_none(), "value {raw:?}");
+        }
+        let routes = egress_routes_for(egress_hosts_from_value(None));
+        assert_eq!(routes, open, "unset");
+        assert!(!render(&GatewayConfig {
+            egress_hosts: egress_hosts_from_value(None),
+            ..plain_config()
+        })
+        .to_string()
+        .contains(r#""hostnames":["*"]"#));
+    }
+
+    #[test]
+    fn explicit_empty_or_none_egress_renders_no_route() {
+        for raw in ["", "  ", "none", " None "] {
+            assert!(parse_egress_hosts(raw).is_empty(), "value {raw:?}");
+            assert_eq!(
+                egress_routes_for(parse_egress_hosts(raw)),
+                json!([]),
+                "value {raw:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_named_egress_list_renders_exactly_those_hostnames() {
+        let routes = egress_routes_for(parse_egress_hosts("a.example, b.example,,*.io"));
+        assert_eq!(
+            routes[0]["hostnames"],
+            json!(["a.example", "b.example", "*.io"])
+        );
+        assert_eq!(routes.as_array().unwrap().len(), 1);
     }
 
     /// The CONNECT allowlist served is this daemon's `WICKED_SEAT_EGRESS_HOSTS`, not the list an

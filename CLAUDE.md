@@ -45,6 +45,11 @@ toolchain into `/usr/local/bin`: seats have cargo and a repo `rust-toolchain` fi
 (never seeded or written back). A full-posture unit's `CARGO_TARGET_DIR` lives there too; a fenced
 unit keeps its per-unit `scratch/target`, removed at settle.
 
+Seat egress goes through the gateway's CONNECT listener by TLS SNI and is OPEN by default:
+`WICKED_SEAT_EGRESS_HOSTS` unset or `*` renders a route with no `hostnames` key (never `["*"]`,
+which agentgateway v1.6.0 matches against nothing); empty or `none` = no egress; any other value =
+exactly that comma-separated list. Seats get no new credential.
+
 ## Conventions
 
 - Single-writer store actor — never open the shared SQLite from a second writer.
