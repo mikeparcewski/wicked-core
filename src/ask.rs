@@ -1237,7 +1237,10 @@ mod tests {
         }
         f.core.tx.send(Command::EmitEvent(created)).unwrap();
         f.core.tx.send(Command::EmitEvent(resolved)).unwrap();
-        f.core.sessions().unwrap();
+        // Read-model calls do not drain the actor queue. Ping acknowledges both emits;
+        // its heartbeat must be the next frame if both legacy frames were suppressed.
+        f.core.ping();
+        assert!(matches!(events.try_recv(), Ok(CoreEvent::Heartbeat)));
         assert!(matches!(
             events.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
