@@ -14,6 +14,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Fixed
+
+- **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
+  now disables CONNECT egress and emits a warning naming the variable, instead of silently
+  selecting open egress. Only an unset value selects the open default. Gemini telemetry and
+  Codex discovery comments now distinguish restrictive lists from the open default.
+
 ### Changed
 
 - **Seat egress is open by default (core#1476).** With `WICKED_SEAT_EGRESS_HOSTS` unset (or `*`, alone or

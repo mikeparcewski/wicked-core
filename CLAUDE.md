@@ -48,7 +48,8 @@ unit keeps its per-unit `scratch/target`, removed at settle.
 Seat egress goes through the gateway's CONNECT listener by TLS SNI and is OPEN by default:
 `WICKED_SEAT_EGRESS_HOSTS` unset or `*` renders a route with no `hostnames` key (never `["*"]`,
 which agentgateway v1.6.0 matches against nothing); empty or `none` = no egress; any other value =
-exactly that comma-separated list. Seats get no new credential.
+exactly that comma-separated list. A non-Unicode value disables egress and emits a warning naming
+the variable. Seats get no new credential.
 
 ## Conventions
 

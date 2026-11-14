@@ -129,7 +129,8 @@ pub(crate) const COPILOT_CLI_FILE: &str = "copilot.token";
 /// daemon's list. A host the list does not name is refused at the gateway, which logs
 /// `route not found` with the host as `tls.sni`; the seat's client sees its TLS handshake cut
 /// (curl and cargo: `[35] SSL connect error ... unexpected eof`). Seats gain no credential: an
-/// https push to github.com still has no token.
+/// https push to github.com still has no token. A non-Unicode value fails closed (no route)
+/// with a warning naming the variable.
 pub(crate) const EGRESS_HOSTS_ENV: &str = "WICKED_SEAT_EGRESS_HOSTS";
 
 /// The in-config marker for open egress. It is never rendered as a hostname: agentgateway
@@ -154,9 +155,18 @@ fn parse_egress_hosts(raw: &str) -> Vec<String> {
     hosts
 }
 
-/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]); unset = open.
+/// This daemon's CONNECT allowlist ([`EGRESS_HOSTS_ENV`]); unset = open, non-Unicode = closed.
 pub(crate) fn egress_hosts_from_env() -> Vec<String> {
-    egress_hosts_from_value(std::env::var(EGRESS_HOSTS_ENV).ok().as_deref())
+    match std::env::var(EGRESS_HOSTS_ENV) {
+        Ok(raw) => egress_hosts_from_value(Some(&raw)),
+        Err(std::env::VarError::NotPresent) => egress_hosts_from_value(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            eprintln!(
+                "wicked-core: warning: {EGRESS_HOSTS_ENV} is not valid Unicode; disabling seat CONNECT egress"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// [`egress_hosts_from_env`] for an already-read value: `None` (unset) = open.
@@ -969,8 +979,9 @@ pub(crate) fn seat_env_for(cli: &str, kind: CredentialKind, bearer: &str) -> Vec
 /// and reads `GEMINI_API_KEY` (the unit's key, sent as `x-goog-api-key`) and
 /// `GOOGLE_GEMINI_BASE_URL` (the route). No Anthropic or OpenAI variable reaches it. The CONNECT
 /// proxy stays: what else agy contacts (its feature flags at `antigravity-unleash.goog`, its
-/// telemetry at `play.googleapis.com`) is refused there at once unless the operator's
-/// `WICKED_SEAT_EGRESS_HOSTS` names it; the turn does not need either.
+/// telemetry at `play.googleapis.com`) is refused there under a restrictive egress list unless
+/// the operator names those hosts. With `WICKED_SEAT_EGRESS_HOSTS` unset or `*`, those CONNECTs are allowed;
+/// the turn does not need either.
 fn gemini_seat_env(cli: &str, bearer: &str) -> Vec<(String, String)> {
     vec![
         ("GEMINI_API_KEY".into(), bearer.into()),
@@ -996,9 +1007,11 @@ pub(crate) const CODEX_GATEWAY_PROVIDER: &str = "wicked-gateway";
 /// what it sends), never the built-in OpenAI provider with `OPENAI_BASE_URL` at the route. On the
 /// built-in provider a `…/backend-api/codex` base makes codex >= 0.162 run ChatGPT workspace
 /// routing discovery first: a direct `GET https://chatgpt.com/backend-api/wham/accounts/check`
-/// outside the route (refused at the gateway's CONNECT listener), whose failure is fatal
-/// ("workspace routing discovery failed"), and whose success would move every request to the
-/// discovered https origin, around the gateway. A custom provider is not routed
+/// outside the route. A restrictive egress list refuses discovery at the gateway's CONNECT
+/// listener unless the operator names its host; with `WICKED_SEAT_EGRESS_HOSTS` unset or `*`,
+/// those CONNECTs are allowed. Discovery failure is fatal ("workspace routing discovery failed"),
+/// and success would move every request to the discovered https origin, around the gateway.
+/// A custom provider is not routed
 /// (`supports_codex_backend_routes` is the built-in provider's alone), so the gateway stays the
 /// only path and the broker's credential the only one upstream.
 ///
@@ -3346,6 +3359,84 @@ mod tests {
         })
         .to_string()
         .contains(r#""hostnames":["*"]"#));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_unicode_egress_env_fails_closed() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(value) => std::env::set_var(EGRESS_HOSTS_ENV, value),
+                    None => std::env::remove_var(EGRESS_HOSTS_ENV),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(EGRESS_HOSTS_ENV));
+        let invalid = OsString::from_vec(b"a.example,\xff".to_vec());
+        std::env::set_var(EGRESS_HOSTS_ENV, &invalid);
+        assert_eq!(std::env::var_os(EGRESS_HOSTS_ENV), Some(invalid));
+        assert!(matches!(
+            std::env::var(EGRESS_HOSTS_ENV),
+            Err(std::env::VarError::NotUnicode(_))
+        ));
+
+        let routes = egress_routes_for(egress_hosts_from_env());
+        assert!(
+            routes
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|route| route.get("hostnames").is_some()),
+            "invalid Unicode must never render a hostless route: {routes}"
+        );
+        assert_eq!(
+            routes,
+            json!([]),
+            "invalid Unicode must disable CONNECT egress"
+        );
+    }
+
+    #[test]
+    fn ancillary_connect_docs_describe_restrictive_and_open_egress() {
+        let source = include_str!("seat_gateway.rs");
+        for (start, end) in [
+            (
+                "/// An agy seat on its Gemini API-key route:",
+                "fn gemini_seat_env(",
+            ),
+            (
+                "/// The CLI arguments a seat signed in with",
+                "pub(crate) fn seat_args_for(",
+            ),
+        ] {
+            let docs = source
+                .split_once(start)
+                .unwrap()
+                .1
+                .split_once(end)
+                .unwrap()
+                .0;
+            assert!(
+                docs.contains("restrictive egress list"),
+                "{start}: qualify refusal"
+            );
+            assert!(
+                docs.contains("unset or `*`"),
+                "{start}: describe open default"
+            );
+            assert!(
+                docs.contains("CONNECTs are allowed"),
+                "{start}: describe allowed CONNECTs"
+            );
+        }
     }
 
     #[test]
