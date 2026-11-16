@@ -2,8 +2,10 @@
 //! ISOLATED REVIEWER, run by the engine as its own fresh worker session inside the QE unit's
 //! attempt — so QE acceptance works on every seat, including ones with no sub-agent (pi, codex).
 //!
-//! 1. The executor turn (the unit's own seat) runs garden's `accept --phase evidence` and names the
-//!    evidence dir on a `QE-EVIDENCE:` line ([`parse_marker`]); it writes no QE verdict.
+//! 1. (core#1484) Before the executor turn the engine creates the attempt's QE run and its
+//!    evidence dir in the run's ledger ([`prepare_evidence`]; a same-tree retry resumes the last
+//!    one). The executor turn (the unit's own seat) runs garden's `accept --phase evidence
+//!    --resume <that dir>`; it writes no QE verdict and names no dir.
 //! 2. The engine BINDS that dir to this run and attempt ([`bind_evidence`]).
 //! 3. A reviewer turn on a run seat ([`candidates`], stamped at dispatch) runs on a NEW input
 //!    ([`reviewer_input`]): no prior outputs, no executor directive, only the evidence path, and a
@@ -21,7 +23,8 @@ use std::sync::Arc;
 use crate::domain::{AgentSession, QeReview, QeReviewAttempt, QeReviewerSeat, WorkUnit};
 use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus};
 
-/// The line the executor turn names its evidence dir on.
+/// The line an executor turn used to name its evidence dir on (core#1484: no longer read for the
+/// bind; only quoted back when the seat wrote its evidence somewhere else).
 pub(crate) const EVIDENCE_MARKER: &str = "QE-EVIDENCE:";
 /// The variable ONLY the reviewer turn's child receives: the nonce it stamps on its verdict
 /// (`review_session`), and garden's licence to review inline (this session was started for the
@@ -237,18 +240,25 @@ pub(crate) fn resume_dir(unit: &WorkUnit) -> Option<&str> {
         .flatten()
 }
 
-/// The executor turn's directive (rides the unit prompt; short — the PTY line budget).
-pub(crate) fn evidence_directive(skill: &str, resume: Option<&str>) -> String {
-    let resume = resume.map(|d| format!(" --resume {d}")).unwrap_or_default();
-    format!(
-        " QE ACCEPTANCE IS REQUIRED: run \"{skill}\" accept --phase evidence{resume} (writer and \
-         executor only; no review, no QE verdict) on a scenario written from this run's \
-         acceptance list. Its ledger is ${}, outside the worktree (never write .wicked-qe into \
-         the tree). Put the line `{EVIDENCE_MARKER} <evidence dir>` before your VERDICT line: \
-         the engine then runs the isolated reviewer in a fresh session, and delivery is refused \
-         without its PASS.",
-        super::LEDGER_DIR_ENV
-    )
+/// The executor turn's directive (rides the unit prompt; short — the PTY line budget). (core#1484)
+/// `dir` is the evidence dir the engine created or resumes for this attempt
+/// ([`prepare_evidence`]): the seat names nothing, and writes nowhere else. `Err(why)`: the engine
+/// could not create the QE run, so no QE verdict can bind this attempt, and the seat is told so.
+pub(crate) fn evidence_directive(skill: &str, dir: Result<&str, &str>) -> String {
+    match dir {
+        Ok(dir) => format!(
+            " QE ACCEPTANCE IS REQUIRED: run \"{skill}\" accept --phase evidence --resume {dir} \
+             (writer and executor only; no QE verdict) on a scenario from this run's acceptance \
+             list. The engine made that QE run: write scenario.md, the plan and all evidence in \
+             that dir, never in a dir of your own or the worktree. The engine then runs the \
+             isolated reviewer; delivery needs its PASS."
+        ),
+        Err(why) => format!(
+            " QE ACCEPTANCE IS REQUIRED, but the engine could not create this attempt's QE run \
+             ({}), so no QE verdict can bind it: do your step and say so.",
+            bounded_line(why, REDO_REASON_MAX)
+        ),
+    }
 }
 
 /// The reviewer turn's whole task: the evidence path, nothing else — and (core#928) the absolute
@@ -306,6 +316,7 @@ pub(crate) fn reviewer_unit(
     u.qe_reviewer_seats.clear();
     u.qe_review = None;
     u.qe_review_session = nonce.map(str::to_string);
+    u.qe_evidence_dir = None;
     u
 }
 
@@ -614,9 +625,10 @@ pub(crate) fn iso_millis(s: &str) -> Option<i64> {
     Some(((days * 24 + hh) * 60 + mm) * 60_000 + ss * 1000 + ms)
 }
 
-/// (§3.1 step 2) Bind the executor's marker to THIS run and attempt: exactly
-/// `<ledger_root>/evidence/<uuid>` (canonically — no link anywhere on the way), holding the plan and
-/// the scenario copy, whose run record is live, stamped with this crew run, points at this dir,
+/// (§3.1 step 2) Bind the attempt's evidence dir (core#1484: the one the engine made or resumed,
+/// [`prepare_evidence`]; never a path the seat named) to THIS run and attempt: exactly
+/// `<ledger_root>/evidence/<uuid>` (canonically — no link anywhere on the way), holding the
+/// scenario copy, whose run record is live, stamped with this crew run, points at this dir,
 /// and was created in this attempt (`not_before`, unix millis) — or is the run this attempt was
 /// told to RESUME. Returns the QE run id and the dir.
 pub(crate) fn bind_evidence(
@@ -656,10 +668,15 @@ pub(crate) fn bind_evidence(
             root.join("evidence").join(&id).display()
         ));
     }
-    for f in ["test-plan.md", "scenario.md"] {
-        if !real.join(f).is_file() {
-            return Err(format!("the evidence dir holds no `{f}`"));
-        }
+    // (core#1484) Identity, not completeness: a missing plan is the reviewer's to judge (its
+    // brief says how). The scenario copy is the reviewer's scenario path, so it must be there.
+    if !real.join("scenario.md").is_file() {
+        return Err(format!(
+            "the evidence dir {} holds no `scenario.md`: the QE executor must write the scenario \
+             copy, the plan and the evidence into the dir the engine made for this attempt, never \
+             into a dir of its own",
+            real.display()
+        ));
     }
     let run = read_record(&root.join("runs").join(format!("{id}.json")))
         .map_err(|e| format!("the QE run record: {e}"))?;
@@ -911,14 +928,7 @@ pub(crate) fn record_reply_verdict(
     }
     let root = std::fs::canonicalize(ledger_root)
         .map_err(|e| format!("the run's QE ledger could not be resolved: {e}"))?;
-    let dir = root.join("verdicts");
-    match std::fs::symlink_metadata(&dir) {
-        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
-        Ok(_) => return Err("the QE ledger's verdicts is not a plain directory".to_string()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&dir)
-            .map_err(|e| format!("the QE ledger's verdicts could not be created: {e}"))?,
-        Err(e) => return Err(format!("the QE ledger's verdicts could not be read: {e}")),
-    }
+    let dir = plain_table_dir(&root, "verdicts")?;
     // (xreview codex P2) Newer than every verdict chronologically AND as text: crew's reader and
     // the bind order by the `created_at` string, and a writer may omit the fraction
     // (`…:00Z` sorts after `…:00.001Z`).
@@ -940,34 +950,11 @@ pub(crate) fn record_reply_verdict(
         return Err("no timestamp sorts after the QE run's newest verdict".to_string());
     }
     let vid = uuid::Uuid::new_v4().to_string();
-    // (xreview codex P2) The ledger's SQLite index will not see this write: mark it behind FIRST,
-    // so its next open rebuilds from the JSON records even if the engine stops right after the
-    // verdict lands. A marker with no new verdict only costs a rebuild. (xreview agy P2) A marker
-    // already there must be a plain file: a dangling link or a directory reads as "no marker" to
-    // wicked-ledger, so it is refused rather than trusted.
-    let marker_path = root.join(LEDGER_DRIFT_MARKER);
-    let marker = serde_json::json!({
-        "reason": format!("wicked-core recorded verdict {vid} as canonical JSON"),
-        "marked_at": at,
-    });
-    match write_new(&marker_path, marker.to_string().as_bytes()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            match std::fs::symlink_metadata(&marker_path) {
-                Ok(m) if m.is_file() => {}
-                _ => {
-                    return Err(format!(
-                        "the ledger's `{LEDGER_DRIFT_MARKER}` is not a plain file"
-                    ))
-                }
-            }
-        }
-        Err(e) => {
-            return Err(format!(
-                "the ledger's index drift marker could not be written: {e}"
-            ))
-        }
-    }
+    mark_index_drift(
+        &root,
+        &format!("wicked-core recorded verdict {vid} as canonical JSON"),
+        &at,
+    )?;
     let rec = serde_json::json!({
         "id": vid,
         "run_id": id,
@@ -984,16 +971,186 @@ pub(crate) fn record_reply_verdict(
         "deleted": 0,
         "deleted_at": serde_json::Value::Null,
     });
-    let body = serde_json::to_string_pretty(&rec).map_err(|e| e.to_string())?;
-    let file = dir.join(format!("{vid}.json"));
-    let tmp = dir.join(format!("{vid}.json.tmp.{}", now_millis()));
+    write_record(&dir, &vid, &rec).map_err(|e| format!("the verdict could not be written: {e}"))?;
+    Ok(true)
+}
+
+/// `<root>/<table>`, created when absent; refused unless it is a plain directory (never a link).
+fn plain_table_dir(root: &Path, table: &str) -> Result<PathBuf, String> {
+    let dir = root.join(table);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+        Ok(_) => return Err(format!("the QE ledger's {table} is not a plain directory")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(&dir)
+            .map_err(|e| format!("the QE ledger's {table} could not be created: {e}"))?,
+        Err(e) => return Err(format!("the QE ledger's {table} could not be read: {e}")),
+    }
+    Ok(dir)
+}
+
+/// (xreview codex P2) The ledger's SQLite index will not see a canonical-JSON write by the engine:
+/// mark it behind FIRST, so its next open rebuilds from the JSON records even if the engine stops
+/// right after the write. A marker with no new record only costs a rebuild. (xreview agy P2) A
+/// marker already there must be a plain file: a dangling link or a directory reads as "no marker"
+/// to wicked-ledger, so it is refused rather than trusted.
+fn mark_index_drift(root: &Path, reason: &str, at: &str) -> Result<(), String> {
+    let marker_path = root.join(LEDGER_DRIFT_MARKER);
+    let marker = serde_json::json!({ "reason": reason, "marked_at": at });
+    match write_new(&marker_path, marker.to_string().as_bytes()) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            match std::fs::symlink_metadata(&marker_path) {
+                Ok(m) if m.is_file() => Ok(()),
+                _ => Err(format!(
+                    "the ledger's `{LEDGER_DRIFT_MARKER}` is not a plain file"
+                )),
+            }
+        }
+        Err(e) => Err(format!(
+            "the ledger's index drift marker could not be written: {e}"
+        )),
+    }
+}
+
+/// One canonical record, `<dir>/<id>.json`, the way wicked-ledger writes it: a new temp file, then
+/// a rename (no partial record is ever visible).
+fn write_record(dir: &Path, id: &str, rec: &serde_json::Value) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
+    let file = dir.join(format!("{id}.json"));
+    let tmp = dir.join(format!("{id}.json.tmp.{}", now_millis()));
     write_new(&tmp, body.as_bytes())
         .and_then(|()| std::fs::rename(&tmp, &file))
         .map_err(|e| {
             let _ = std::fs::remove_file(&tmp);
-            format!("the verdict could not be written: {e}")
-        })?;
-    Ok(true)
+            e.to_string()
+        })
+}
+
+/// (core#1484) The project row the engine's QE runs of one crew run share (wicked-ledger's
+/// `projects.name` is unique, so this name is the engine's own and never a repo's).
+fn engine_project_name(crew_run: &str) -> String {
+    format!("wicked-crew run {crew_run}")
+}
+
+/// (core#1484, crew#1554) Create THIS ATTEMPT's QE run in the run's ledger, the way wicked-ledger's
+/// `create()` writes it (complete rows, so its index rebuild reads them with no FK gap): the ledger
+/// `config.json` when absent (garden's preflight), the crew run's project row, a scenario row, the
+/// run row (`status: running`, stamped `crew_run_id`, `evidence_path` = the new dir, created now,
+/// after the attempt's start) and the empty `evidence/<uuid>` dir. Returns that dir. The executor
+/// resumes this run (`accept --phase evidence --resume <dir>`), so no seat ever chooses the dir's
+/// name or makes the record: the identity the engine binds is the one it made.
+pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf, String> {
+    let root = std::fs::canonicalize(ledger_root)
+        .map_err(|e| format!("the run's QE ledger could not be resolved: {e}"))?;
+    let at = millis_iso(now_millis());
+    let id = uuid::Uuid::new_v4().to_string();
+    mark_index_drift(
+        &root,
+        &format!("wicked-core created QE run {id} as canonical JSON"),
+        &at,
+    )?;
+    let config = root.join("config.json");
+    match write_new(
+        &config,
+        serde_json::json!({ "version": "1.0", "created_at": at })
+            .to_string()
+            .as_bytes(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(format!(
+                "the ledger's config.json could not be written: {e}"
+            ))
+        }
+    }
+    let live = |rec: &Record| !deleted(rec);
+    let name = engine_project_name(crew_run);
+    let projects = plain_table_dir(&root, "projects")?;
+    let mut project_id = None;
+    for entry in std::fs::read_dir(&projects)
+        .map_err(|e| format!("the QE ledger's projects could not be read: {e}"))?
+    {
+        let path = entry
+            .map_err(|e| format!("the QE ledger's projects could not be read: {e}"))?
+            .path();
+        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+            continue;
+        }
+        if let Ok(rec) = read_record(&path) {
+            if live(&rec) && field(&rec, "name") == Some(name.as_str()) {
+                project_id = field(&rec, "id").map(str::to_string);
+                break;
+            }
+        }
+    }
+    let project_id = match project_id {
+        Some(p) => p,
+        None => {
+            let pid = uuid::Uuid::new_v4().to_string();
+            write_record(
+                &projects,
+                &pid,
+                &serde_json::json!({
+                    "id": pid, "name": name,
+                    "description": "QE runs wicked-core created for this crew run's QE unit",
+                    "created_at": at, "updated_at": at, "deleted": 0, "deleted_at": null,
+                }),
+            )
+            .map_err(|e| format!("the QE project could not be written: {e}"))?;
+            pid
+        }
+    };
+    let evidence = plain_table_dir(&root, "evidence")?;
+    let dir = evidence.join(&id);
+    std::fs::create_dir(&dir).map_err(|e| {
+        format!(
+            "the evidence dir {} could not be created: {e}",
+            dir.display()
+        )
+    })?;
+    let scenarios = plain_table_dir(&root, "scenarios")?;
+    let sid = uuid::Uuid::new_v4().to_string();
+    write_record(
+        &scenarios,
+        &sid,
+        &serde_json::json!({
+            "id": sid, "project_id": project_id, "strategy_id": null,
+            "name": format!("acceptance {id}"), "format_version": "1.0",
+            "body": null, "source_path": dir.join("scenario.md").to_string_lossy(),
+            "created_at": at, "updated_at": at, "deleted": 0, "deleted_at": null,
+        }),
+    )
+    .map_err(|e| format!("the QE scenario could not be written: {e}"))?;
+    let runs = plain_table_dir(&root, "runs")?;
+    write_record(
+        &runs,
+        &id,
+        &serde_json::json!({
+            "id": id, "project_id": project_id, "scenario_id": sid,
+            "started_at": at, "finished_at": null, "status": "running",
+            "evidence_path": dir.to_string_lossy(), "crew_run_id": crew_run,
+            "created_by": "wicked-core",
+            "created_at": at, "updated_at": at, "deleted": 0, "deleted_at": null,
+        }),
+    )
+    .map_err(|e| format!("the QE run record could not be written: {e}"))?;
+    Ok(dir)
+}
+
+/// (core#1484) The evidence dir THIS attempt's executor works in, decided by the engine before the
+/// executor turn: the QE run a same-tree retry resumes ([`resume_dir`]), else a new one
+/// ([`mint_qe_run`]). `None` when the unit runs no engine reviewer; `Some(Err)` when the run could
+/// not be created (the attempt then binds nothing, and says why).
+pub(crate) fn prepare_evidence(unit: &WorkUnit, crew_run: &str) -> Option<Result<String, String>> {
+    if !applies(unit) {
+        return None;
+    }
+    if let Some(dir) = resume_dir(unit) {
+        return Some(Ok(dir.to_string()));
+    }
+    let ledger = unit.qe_ledger_root.as_deref()?;
+    Some(mint_qe_run(Path::new(ledger), crew_run).map(|d| d.to_string_lossy().into_owned()))
 }
 
 /// A reviewer turn that failed AS A SEAT — a FAILED launch or turn whose output the judge
@@ -1047,23 +1204,29 @@ pub(crate) fn run(
         attempts: Vec::new(),
     };
     let ledger = input.unit.qe_ledger_root.as_deref().map(Path::new)?;
-    let Some(marker) = parse_marker(&executor.output) else {
-        review.reason = format!(
-            "the QE executor turn named no evidence (no `{EVIDENCE_MARKER}` line; wicked-garden \
-             may be older than the engine-run reviewer)"
-        );
+    // (core#1484, crew#1554) The dir the engine made or resumed for this attempt is the one bound:
+    // a `QE-EVIDENCE:` line is never the source (seats named hand-made dirs, prose, a parent dir or
+    // an older attempt's run). It is quoted back only when the bind fails, to say where it went.
+    let Some(engine_dir) = input.unit.qe_evidence_dir.as_deref() else {
+        review.reason = "the engine created no QE run for this attempt (see the daemon log), so \
+                         there is no evidence to bind"
+            .to_string();
         return Some(review);
     };
     let (id, dir) = match bind_evidence(
         ledger,
-        &marker,
+        engine_dir,
         &input.run_id,
         not_before,
         resume_dir(&input.unit),
     ) {
         Ok(b) => b,
         Err(why) => {
-            review.reason = format!("the QE evidence could not be bound: {why}");
+            let named = parse_marker(&executor.output)
+                .filter(|m| Path::new(m) != Path::new(engine_dir))
+                .map(|m| format!(" (the executor named `{}` instead)", bounded_line(&m, 160)))
+                .unwrap_or_default();
+            review.reason = format!("the QE evidence could not be bound: {why}{named}");
             return Some(review);
         }
     };

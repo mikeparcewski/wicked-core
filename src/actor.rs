@@ -9304,6 +9304,7 @@ fn escalate_denied_unit(
     if class == "verdict_not_pass"
         && unit.role == crate::workflow::PhaseRole::Evaluator
         && unit.tool_cmd.is_none()
+        && !power_gate::qe_binding_miss(unit)
     {
         let rounds = record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
         if !power_rounds_left
@@ -9352,7 +9353,12 @@ fn escalate_denied_unit(
     // of rounds; the gate still opens first, so the answer is the ordinary, audited arm.
     // The failed hand-off step is recorded either way; past the review's own rework cap
     // (`review_adjudication`, core#761) the operator decides, never the engine.
-    let send_back = power_gate::auto_send_back(subscribers, session, unit, class, &reason)
+    // (crew#1554) …except a QE binding miss: nothing the builder does can bind QE evidence, so the
+    // hand-off re-runs the QE step instead (the gate's own `RetryQe` checks still decide).
+    let redo_qe = power_gate::auto_redo_qe(subscribers, session, unit, &reason);
+    let send_back = (!redo_qe)
+        .then(|| power_gate::auto_send_back(subscribers, session, unit, class, &reason))
+        .flatten()
         .filter(|_| adjudication.is_none());
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
@@ -9374,11 +9380,17 @@ fn escalate_denied_unit(
         prompt,
     );
     if paused.is_ok() {
-        if let Some(note) = send_back {
+        let decision = if redo_qe {
+            Some(crate::workflow::HumanDecision::RetryQe)
+        } else {
+            send_back
+                .map(|note| crate::workflow::HumanDecision::RequestChanges { note: Some(note) })
+        };
+        if let Some(decision) = decision {
             let (reply, _rx) = std::sync::mpsc::channel();
             let _ = self_tx.send(Command::ConfirmGate {
                 run_id: session.id.clone(),
-                decision: crate::workflow::HumanDecision::RequestChanges { note: Some(note) },
+                decision,
                 actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
                 expect: None,
                 reply,

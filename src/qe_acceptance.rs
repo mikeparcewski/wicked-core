@@ -492,8 +492,8 @@ pub(crate) fn directive(qe: &QeAcceptance, skill: &str) -> String {
 }
 
 /// The QE line a unit's prompt carries: for the QE unit the engine runs a reviewer for
-/// ([`review::applies`]) the evidence-only directive (resuming the last QE run on a same-tree
-/// retry), else [`directive`].
+/// ([`review::applies`]) the evidence-only directive naming the evidence dir the engine made or
+/// resumes for this attempt (core#1484, [`review::prepare_evidence`]), else [`directive`].
 pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
     let floor = unit
         .qe_floor_note
@@ -504,7 +504,12 @@ pub(crate) fn unit_directive(unit: &WorkUnit, skill: &str) -> String {
     if review::applies(unit) {
         return format!(
             "{}{floor}{}",
-            review::evidence_directive(skill, review::resume_dir(unit)),
+            review::evidence_directive(
+                skill,
+                unit.qe_evidence_dir
+                    .as_deref()
+                    .ok_or("the daemon log says why"),
+            ),
             review::redo_note(unit)
         );
     }

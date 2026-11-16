@@ -4829,6 +4829,40 @@ fn run_unit_and_judge_in<'scope, 'env>(
         _ => None,
     };
     let input = with_deps.as_ref().unwrap_or(input);
+    // (core#1484, crew#1554) THE QE EVIDENCE DIR: when this attempt's seat runs as the QE executor
+    // (not a floor re-run or a judge re-run, where it does not run again), the engine creates the
+    // attempt's QE run and its evidence dir now, after `qe_not_before`, or picks the run a
+    // same-tree retry resumes. The directive names it and the bind reads it: no seat chooses it.
+    let executor_turn = input
+        .unit
+        .repo_checks
+        .as_ref()
+        .and_then(|r| r.requested_rerun.as_ref())
+        .is_none()
+        && input
+            .unit
+            .requested_rejudge
+            .as_ref()
+            .is_none_or(|j| j.consumed);
+    let with_qe_dir: Option<StepInput> = executor_turn
+        .then(|| crate::qe_acceptance::review::prepare_evidence(&input.unit, &input.run_id))
+        .flatten()
+        .and_then(|made| match made {
+            Ok(dir) => {
+                let mut i = input.clone();
+                i.unit.qe_evidence_dir = Some(dir);
+                Some(i)
+            }
+            Err(why) => {
+                eprintln!(
+                    "wicked-core: unit {} of run {}: the QE run for this attempt could not be \
+                     created: {why}",
+                    input.unit.ord, input.run_id
+                );
+                None
+            }
+        });
+    let input = with_qe_dir.as_ref().unwrap_or(input);
     // The step-boundary injector (§8.9): the advice every carrier receives, as prior context.
     // (ASK-K3c) Whether the boundary's team answers reached a seat turn: the stream read
     // succeeded and the seat ran (not a repo-checks re-run). Stamped on `step.completed`.

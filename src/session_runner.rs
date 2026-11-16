@@ -886,6 +886,7 @@ mod tests {
             qe_reviewer_seats: Vec::new(),
             qe_floor_note: None,
             qe_review_session: None,
+            qe_evidence_dir: None,
             qe_review: None,
             qe_redos: Vec::new(),
             rule_steps: Vec::new(),
