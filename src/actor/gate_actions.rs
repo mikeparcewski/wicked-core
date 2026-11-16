@@ -54,6 +54,10 @@ pub struct GateAction {
     /// `reassign`: the seats the engine would re-seat the gated unit on now, roster order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub seats: Vec<String>,
+    /// `reassign`: which of [`GateAction::seats`] this run has benched (taken on purpose — a seat
+    /// signed back in — and said so), roster order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub benched_seats: Vec<String>,
     /// `skip_rules`: the rule ids a skip may name (each with its own reason).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<String>,
@@ -86,6 +90,7 @@ fn act(action: &str, intent: &str, note: NoteRule) -> GateAction {
         note,
         note_intent: None,
         seats: Vec::new(),
+        benched_seats: Vec::new(),
         rules: Vec::new(),
         needs_plan_rev: false,
     }
@@ -151,7 +156,7 @@ pub(crate) fn gate_actions(
         .find_map(|r| r.gate_kind.clone())
         .unwrap_or_else(|| "gate".to_string());
     let actions = if kind_open(super::CONSENT_GATE_KIND) {
-        consent_actions(store, &session, &units, ord)?
+        consent_actions(store, &session, &units, ord, &gate_kind)?
     } else if kind_open(crate::repeat::GATE_KIND) {
         repeat_actions(store, run_id, ord)?
     } else {
@@ -197,8 +202,10 @@ fn plan_actions(cursor: Option<&WorkUnit>, ord: u32, rev: Option<u32>) -> GateAc
             } else {
                 NoteRule::Optional
             };
+            // Every plan answer names the held revision, reject included: a stale card's reject
+            // must never cancel a newer plan held at the same ord.
             let mut a = act(token, intent, note);
-            a.needs_plan_rev = token != "reject";
+            a.needs_plan_rev = true;
             actions.push(a);
         }
     }
@@ -210,32 +217,53 @@ fn plan_actions(cursor: Option<&WorkUnit>, ord: u32, rev: Option<u32>) -> GateAc
     }
 }
 
-/// A consent gate's answers (core#820): its plan's default (approve), each of its choices, reject.
-/// An Apps publish's consent takes only reject until it can produce (the publish QE backstop).
+/// A consent gate's answers (core#820): every ordinary answer the decision path's checks take
+/// (approve = the plan's default; send back, an intent amendment, …), each of the dry-run plan's
+/// choices after the approve, and reject. An Apps publish's consent takes only reject until it can
+/// produce (the publish QE backstop) — judged on the QE record's own tree: the current tree's
+/// snapshot writes git objects, which this read never does, so a tree changed since the QE PASS is
+/// refused when the answer arrives.
 fn consent_actions(
     store: &dyn GraphStore,
     session: &AgentSession,
     units: &[WorkUnit],
     ord: u32,
+    gate_kind: &str,
 ) -> anyhow::Result<Vec<GateAction>> {
     let reject = act("reject", "stop", NoteRule::None);
     if crate::apps::is_publish(session) {
-        let tree = super::current_worktree_tree(store, session);
-        if crate::apps::publish_consent_refusal(session, units, tree.as_deref()).is_some() {
+        let reviewed = units
+            .iter()
+            .find(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none())
+            .and_then(|u| u.qe_review.as_ref())
+            .and_then(|r| r.tree.clone());
+        if crate::apps::publish_consent_refusal(session, units, reviewed.as_deref()).is_some() {
             return Ok(vec![reject]);
         }
     }
     let offer = super::consent_offer(store, &session.id, ord)?;
-    let mut actions = vec![act("approve", "continue", NoteRule::Optional)];
-    for c in offer.plan.iter().flat_map(|p| p.choices.iter()) {
-        let token = format!("{}{}", crate::consent_plan::CHOICE_PREFIX, c.id);
-        actions.push(act(&token, "consent_choice", NoteRule::None));
-    }
-    actions.push(reject);
+    let mut actions = answer_actions(store, session, units, gate_kind)?;
+    let at = actions
+        .iter()
+        .position(|a| a.action == "approve")
+        .map_or(0, |i| i + 1);
+    let choices: Vec<GateAction> = offer
+        .plan
+        .iter()
+        .flat_map(|p| p.choices.iter())
+        .map(|c| {
+            let token = format!("{}{}", crate::consent_plan::CHOICE_PREFIX, c.id);
+            act(&token, "consent_choice", NoteRule::None)
+        })
+        .collect();
+    actions.splice(at..at, choices);
+    // A consent gate's approve runs the step on the plan's default: never a reassign of it here.
+    actions.retain(|a| a.action != "reassign");
     Ok(actions)
 }
 
-/// A loop's ask (domain-graph-3): one answer per choice of its command (else approve), reject.
+/// A loop's ask (domain-graph-3), as `repeat_gate::resolve_answer` takes it: approve (the
+/// command's recommended choice), one answer per choice, reject.
 fn repeat_actions(
     store: &dyn GraphStore,
     run_id: &str,
@@ -253,9 +281,8 @@ fn repeat_actions(
             )
         })
         .collect();
-    if actions.is_empty() {
-        actions.push(act("approve", "continue", NoteRule::Optional));
-    }
+    // A plain approve takes the command's recommended choice (else none); it carries no note.
+    actions.insert(0, act("approve", "continue", NoteRule::None));
     actions.push(act("reject", "stop", NoteRule::None));
     Ok(actions)
 }
@@ -417,14 +444,23 @@ fn answer_actions(
     if matches!(approve_intent, "retry" | "continue") && takes(&plain) {
         if let Some(unit) = cursor.filter(|u| u.tool_cmd.is_none()) {
             let current = unit.assigned_cli.as_deref().unwrap_or("claude");
-            let seats: Vec<String> = super::eligible_roster_keys(session)
-                .into_iter()
-                .filter(|k| k != current)
+            // Every roster seat the explicit re-seat takes — a benched one too (an operator may send
+            // a step to a seat signed back in): `benched_seats` says which, so a skin can say so.
+            let seats: Vec<String> = session
+                .clis
+                .iter()
+                .filter(|k| k.as_str() != current)
                 .filter(|k| super::refuse_ballot_only_target(k).is_ok())
                 .filter(|k| super::parked_reseat_refusal(session, units, unit.ord, k).is_ok())
+                .cloned()
                 .collect();
             if !seats.is_empty() {
                 let mut a = act("reassign", "reseat_and_retry", NoteRule::Optional);
+                a.benched_seats = seats
+                    .iter()
+                    .filter(|k| session.benched_seats.iter().any(|b| &b.cli == *k))
+                    .cloned()
+                    .collect();
                 a.seats = seats;
                 actions.push(a);
             }
@@ -458,7 +494,29 @@ fn approve_intent(
     match gate_kind {
         "deliver" => "deliver",
         "terminal" => "complete",
+        // A failed step's gate (triage could not apply its flag, or escalated): approve re-runs it.
+        "failure" | "triage" => "retry",
         _ if cursor.is_some_and(|u| u.status == crate::domain::UnitStatus::Rejected) => "retry",
         _ => "continue",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approve_intent;
+
+    /// A failed step's gate (triage could not apply its flag, or escalated) re-runs the step.
+    #[test]
+    fn a_failure_or_triage_gates_approve_is_a_retry() {
+        let session = crate::actor::sessions_detail_fold_tests::session("r");
+        for kind in ["failure", "triage"] {
+            assert_eq!(approve_intent(&session, None, kind, false), "retry");
+        }
+        assert_eq!(approve_intent(&session, None, "def", false), "continue");
+        assert_eq!(approve_intent(&session, None, "deliver", false), "deliver");
+        assert_eq!(
+            approve_intent(&session, None, "x", true),
+            "land_with_carried_items"
+        );
     }
 }

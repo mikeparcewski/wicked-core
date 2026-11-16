@@ -14,6 +14,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+### Added
+
+- **The engine publishes every answer an open gate takes** (studio#1170, crew#1512). `Core::gate_actions` /
+  napi `gateActions(runId)`: per open gate, each answer's token, what it does at this gate (`intent`), whether it
+  takes a note, a reassign's seats (benched ones flagged), a rule skip's rule ids, and whether a plan answer names its
+  revision. Each candidate is run through the decision path's own pre-checks (`refuse_before_resolving`,
+  `plan_answer_refusal`, `parked_reseat_refusal`, now shared with the decision path), so the list is the accepted set.
+  `tests/fixtures/gate-actions.json` pins one list per gate shape for the consumers' contract test.
+
 ### Fixed
 
 - **The engine owns the QE evidence dir, and a QE binding miss re-runs QE (core#1484, crew#1554).**

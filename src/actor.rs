@@ -10369,7 +10369,7 @@ pub(crate) fn parked_reseat_refusal(
              so there is nothing to reassign"
         );
     }
-    refuse_author_reassign(session, &units, session.unit_ix, cli)?;
+    refuse_author_reassign(session, units, session.unit_ix, cli)?;
     // (DES-APPS-001 K0) A publish's excluded builder seat takes none of its units, parked or not.
     if let Some(why) = crate::apps::reassign_refusal(session, cli) {
         anyhow::bail!("run {run_id}: {why}");
@@ -15987,24 +15987,21 @@ fn confirm_plan_gate(
         cursor.is_some_and(not_run),
         expect.and_then(|e| e.plan_rev).is_some(),
     )?;
-    match &decision {
-        // (DES-CATALOG-002 §2.4) A SEND-BACK (accepted above only with the plan revision it
-        // answers, before any unit of the plan has run).
-        HumanDecision::RequestChanges { note } => {
-            return start_send_back(
-                store,
-                runner,
-                self_tx,
-                run_id,
-                session,
-                state,
-                pending,
-                gate_id,
-                ord,
-                note.clone(),
-            );
-        }
-        _ => {}
+    // (DES-CATALOG-002 §2.4) A SEND-BACK (accepted above only with the plan revision it answers,
+    // before any unit of the plan has run).
+    if let HumanDecision::RequestChanges { note } = &decision {
+        return start_send_back(
+            store,
+            runner,
+            self_tx,
+            run_id,
+            session,
+            state,
+            pending,
+            gate_id,
+            ord,
+            note.clone(),
+        );
     }
     // (crew#1139) THE OPERATOR'S NOTE: an approve's `amend` (with or without an edited plan) is
     // carried to the steps the plan releases. It is staged with the answer and lands only when the
@@ -18693,7 +18690,7 @@ pub(crate) fn refuse_before_resolving(
     // Refused here, so the adjudication gate stays open for request changes or reject.
     if let (true, Some(preset), crate::workflow::HumanDecision::Approve { .. }) = (
         adjudication_open,
-        crate::apps::run_preset(&session),
+        crate::apps::run_preset(session),
         &decision,
     ) {
         anyhow::bail!(
@@ -18704,7 +18701,7 @@ pub(crate) fn refuse_before_resolving(
     // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
     // refused here, before the row resolves and before its `gate.decided` is published, when
     // there is no creator to rerun (a member-step dispute reworks the member instead).
-    let dispute_amend = team_gate::dispute_gate_open(&session)
+    let dispute_amend = team_gate::dispute_gate_open(session)
         && session
             .team
             .as_ref()
@@ -18780,7 +18777,7 @@ pub(crate) fn refuse_before_resolving(
         // can make it — whatever the amend scope, which it supersedes.
         crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if floor_fix_route => {
             if let Some(cursor) = cursor {
-                floor_fix_request(&*store, &session, &units, cursor, a)?;
+                floor_fix_request(store, session, &units, cursor, a)?;
             }
         }
         crate::workflow::HumanDecision::Approve {
@@ -18806,8 +18803,7 @@ pub(crate) fn refuse_before_resolving(
         | crate::workflow::HumanDecision::Rejudge
         | crate::workflow::HumanDecision::RetryQe
         | crate::workflow::HumanDecision::RecheckRules { .. }
-            if team_gate::transport_gate_open(&session)
-                || team_gate::dispute_gate_open(&session) =>
+            if team_gate::transport_gate_open(session) || team_gate::dispute_gate_open(session) =>
         {
             anyhow::bail!(
                 "a team pause takes approve, request changes or reject — not a floor re-run, \
@@ -18818,7 +18814,7 @@ pub(crate) fn refuse_before_resolving(
         // gave no verdict, QE acceptance is still required, the cap allows it and a reviewer
         // seat can run now.
         crate::workflow::HumanDecision::RetryQe => {
-            qe_redo_check(&session, &units, cursor, run_id)?;
+            qe_redo_check(session, &units, cursor, run_id)?;
         }
         // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
         // the engine's judge selection names a seat now — the row stays open otherwise.
@@ -18836,11 +18832,11 @@ pub(crate) fn refuse_before_resolving(
         // floor: refused HERE, before the row resolves, unless it applies — the gate stays
         // open and re-answerable otherwise.
         crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
-            floor_override_for(&session, cursor, rationale, adjudication_open, run_id)?;
+            floor_override_for(session, cursor, rationale, adjudication_open, run_id)?;
         }
         // (j4-gates) A QE skip: refused HERE, before the row resolves, unless it applies.
         crate::workflow::HumanDecision::SkipQe { reason } => {
-            skip_qe_plan(&session, cursor, reason, adjudication_open, run_id)?;
+            skip_qe_plan(session, cursor, reason, adjudication_open, run_id)?;
         }
         // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
         // resolves, so the gate stays open and re-answerable rather than resolving as an
@@ -18855,7 +18851,7 @@ pub(crate) fn refuse_before_resolving(
             let cursor = cursor.ok_or_else(|| {
                 anyhow::anyhow!("run {run_id} has no unit at its cursor to re-run the floor of")
             })?;
-            floor_rerun_request(&*store, cursor, *mode)?;
+            floor_rerun_request(store, cursor, *mode)?;
         }
         crate::workflow::HumanDecision::AcceptSuggestion => {
             let cursor = cursor.ok_or_else(|| {
@@ -30142,7 +30138,10 @@ mod request_changes_tests {
 
     /// Every answer a skin could send at a non-plan gate, labelled the way [`listed_labels`] expands
     /// the list: `<token>` without a note, `<token>+note` with one, `skip_rules:<rule>+note`.
-    fn candidate_answers(store: &dyn GraphStore, run_id: &str) -> Vec<(String, HumanDecision)> {
+    pub(super) fn candidate_answers(
+        store: &dyn GraphStore,
+        run_id: &str,
+    ) -> Vec<(String, HumanDecision)> {
         use crate::repo_checks::FloorRerunMode as Mode;
         let s = |t: &str| t.to_string();
         let mut v = vec![
@@ -30260,36 +30259,78 @@ mod request_changes_tests {
             }
         }
         assert_eq!(listed_labels(&listed), accepted, "{name}: {listed:#?}");
+        gate_actions_golden(name, &listed);
+        // REASSIGN = re-seat, then the plain approve: its seats are every roster seat the re-seat
+        // takes (and the approve then accepts), where that approve re-runs or runs a seat step —
+        // compared in full whether or not the list names a reassign.
         let session = crate::domain::get_session(&store, &run_id)
             .unwrap()
             .unwrap();
-        let ord = crate::domain::session_units(&store, &run_id).unwrap()[session.unit_ix].ord;
-        let seats: Vec<String> = listed
-            .actions
-            .iter()
-            .find(|a| a.action == "reassign")
-            .map(|a| a.seats.clone())
-            .unwrap_or_default();
-        for cli in session.clis.iter() {
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let unit = units[session.unit_ix].clone();
+        let reruns = action(&listed, "approve").is_some_and(|a| {
+            matches!(a.intent.as_str(), "retry" | "continue") && a.note != crate::NoteRule::Required
+        }) && unit.tool_cmd.is_none();
+        let current = unit.assigned_cli.clone().unwrap_or_else(|| "claude".into());
+        let mut expected = Vec::new();
+        for cli in session.clis.iter().filter(|c| **c != current) {
             let mut fresh = open_store(Some(":memory:")).unwrap();
             seed(&mut fresh, &run_id);
             let s = crate::domain::get_session(&fresh, &run_id)
                 .unwrap()
                 .unwrap();
             let mut subs = crate::event_log::EventSink::default();
-            let current = crate::domain::session_units(&fresh, &run_id).unwrap()[s.unit_ix]
-                .assigned_cli
-                .clone()
-                .unwrap_or_else(|| "claude".into());
-            let took = refuse_ballot_only_target(cli).is_ok()
-                && reseat_parked_unit(&mut fresh, &mut subs, &s, ord, Some(cli)).is_ok();
-            if seats.contains(cli) {
-                assert!(took, "{name}: listed seat {cli} must re-seat");
-            } else if *cli != current && listed.actions.iter().any(|a| a.action == "reassign") {
-                assert!(!took, "{name}: unlisted seat {cli} must be refused");
+            let reseated = refuse_ballot_only_target(cli).is_ok()
+                && reseat_parked_unit(&mut fresh, &mut subs, &s, unit.ord, Some(cli)).is_ok();
+            if reruns && reseated {
+                let plain = HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                };
+                let approved = answer(&mut fresh, &run_id, plain).0;
+                assert!(
+                    approved.is_ok(),
+                    "{name}: re-seat on {cli}, then approve: {approved:?}"
+                );
+                expected.push(cli.clone());
             }
         }
+        let seats: Vec<String> = action(&listed, "reassign")
+            .map(|a| a.seats.clone())
+            .unwrap_or_default();
+        assert_eq!(seats, expected, "{name}: reassign seats");
         listed
+    }
+
+    /// (studio#1170) THE ENGINE'S SIDE OF THE CROSS-REPO CONTRACT: every shape's list is pinned in
+    /// `tests/fixtures/gate-actions.json`, which studio's contract test renders (crew's CI runs it
+    /// against this file at the wicked-core ref it builds). A changed list fails here until the file
+    /// is regenerated: `UPDATE_GATE_ACTIONS_FIXTURE=1 cargo test -p wicked-core --lib gate_actions
+    /// -- --test-threads=1`.
+    pub(super) fn gate_actions_golden(name: &str, listed: &crate::GateActions) {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _held = LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/gate-actions.json"
+        );
+        let mut all: std::collections::BTreeMap<String, serde_json::Value> =
+            std::fs::read_to_string(path)
+                .ok()
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+        let now = serde_json::to_value(listed).unwrap();
+        if std::env::var_os("UPDATE_GATE_ACTIONS_FIXTURE").is_some() {
+            all.insert(name.to_string(), now);
+            std::fs::write(path, serde_json::to_string_pretty(&all).unwrap() + "\n").unwrap();
+            return;
+        }
+        assert_eq!(
+            all.get(name),
+            Some(&now),
+            "tests/fixtures/gate-actions.json is stale for `{name}` — regenerate it \
+             (UPDATE_GATE_ACTIONS_FIXTURE=1, --test-threads=1)"
+        );
     }
 
     fn action<'a>(listed: &'a crate::GateActions, token: &str) -> Option<&'a crate::GateAction> {
@@ -30426,7 +30467,16 @@ mod request_changes_tests {
             seed_bug_with_deliver(store, run_id);
             let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
             s.unit_ix = 3;
-            s.clis = vec!["claude".into(), "codex".into()];
+            s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+            s.benched_seats = vec![crate::domain::BenchedSeat {
+                cli: "pi".into(),
+                reason: "quota_exhausted".into(),
+                source: "worker".into(),
+                governed_only: false,
+                benched_until: None,
+                strikes: 0,
+                replaced: None,
+            }];
             s.assurance = crate::assurance::RunAssurance::new(None, false);
             put_node(store, s.to_node()).unwrap();
             let mut units = crate::domain::session_units(store, run_id).unwrap();
@@ -30444,7 +30494,9 @@ mod request_changes_tests {
         };
         let listed = listed_is_accepted("distinct", &seed);
         let reassign = action(&listed, "reassign").expect("Reassign is the engine's remedy");
-        assert_eq!(reassign.seats, ["codex"]);
+        // Never the builder's seat; a benched seat is taken on purpose, and said so.
+        assert_eq!(reassign.seats, ["codex", "pi"]);
+        assert_eq!(reassign.benched_seats, ["pi"]);
         assert_eq!(reassign.intent, "reseat_and_retry");
         assert_eq!(action(&listed, "approve").unwrap().intent, "retry");
     }
@@ -30544,6 +30596,53 @@ mod request_changes_tests {
                 .unwrap()
                 .rules,
             ["R1"]
+        );
+    }
+
+    /// (studio#1155) A capped review whose rules are SETTLED lists Land again.
+    #[test]
+    fn gate_actions_review_adjudication_with_settled_rules_lands() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            let mut subs = crate::event_log::EventSink::default();
+            fold_verify_after_send_backs(store, &mut subs, run_id, 2, THIRD_FAIL);
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            let report = crate::rule_check::RuleCheckReport {
+                rows: vec![crate::rule_check::RuleVerdict {
+                    rule_id: "R1".into(),
+                    status: crate::rule_check::RuleStatus::Kept,
+                    how: crate::rule_check::RuleHow::Judge,
+                    reason: "r".into(),
+                    rule_key: "k".into(),
+                    evidence_key: Some("ek-R1".into()),
+                    origin: Some(crate::rule_check::RuleOrigin::Judge),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            units[3].rule_check = Some(report);
+            put_node(store, units[3].to_node()).unwrap();
+        };
+        let listed = listed_is_accepted("adj-rules-settled", &seed);
+        assert_eq!(
+            action(&listed, "approve").unwrap().intent,
+            "land_with_carried_items"
+        );
+        assert!(action(&listed, crate::rule_check::SKIP_ACTION).is_none());
+    }
+
+    /// (core#782) A read-only phase's floor gate: an approve with a note is a FLOOR FIX.
+    #[test]
+    fn gate_actions_read_only_floor_gate_says_a_note_is_a_floor_fix() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_floor_red_verify(store, run_id, "codex");
+            open_row(store, run_id, 4, "escalation");
+        };
+        let listed = listed_is_accepted("floor-fix", &seed);
+        let approve = action(&listed, "approve").unwrap();
+        assert_eq!(
+            approve.note_intent.as_deref(),
+            Some("floor_fix"),
+            "{listed:#?}"
         );
     }
 
@@ -38243,6 +38342,14 @@ mod plan_gate_confirm_tests {
             assert_eq!((listed.ord, listed.plan_rev), (2, Some(1)));
             let tokens: Vec<&str> = listed.actions.iter().map(|a| a.action.as_str()).collect();
             assert_eq!(tokens, want, "{listed:#?}");
+            super::request_changes_tests::gate_actions_golden(
+                if cursor == UnitStatus::Done {
+                    "plan-ran"
+                } else {
+                    "plan"
+                },
+                &listed,
+            );
             for (token, d) in [
                 ("approve", approve()),
                 (
@@ -38285,7 +38392,79 @@ mod plan_gate_confirm_tests {
                 );
                 assert_eq!(r.is_ok(), want.contains(&token), "{token}: {r:?}");
             }
+            // Every other answer a skin could send is refused at a plan gate.
+            for (label, d) in super::request_changes_tests::candidate_answers(&store, "r") {
+                if [
+                    "approve",
+                    "approve+note",
+                    "request_changes",
+                    "request_changes+note",
+                    "reject",
+                ]
+                .contains(&label.as_str())
+                {
+                    continue;
+                }
+                let mut fresh = open_store(Some(":memory:")).unwrap();
+                fixture(&mut fresh, cursor);
+                let mut subs = crate::event_log::EventSink::default();
+                let (tx, _rx) = channel::<Command>();
+                let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+                let r = confirm_gate_expecting(
+                    &mut fresh,
+                    &mut subs,
+                    &runner,
+                    &tx,
+                    &mut HashSet::new(),
+                    "r",
+                    d,
+                    None,
+                    Some(GateExpect {
+                        ord: Some(2),
+                        plan_rev: Some(1),
+                    }),
+                    &None,
+                    &None,
+                    uuid::Uuid::nil(),
+                    false,
+                );
+                assert!(r.is_err(), "{label} is not a plan answer");
+            }
         }
+        // Every plan answer names the revision, reject too: a stale card's reject never cancels a
+        // newer plan.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        fixture(&mut store, UnitStatus::Distributed);
+        let listed = gate_actions::gate_actions(&store, "r").unwrap().unwrap();
+        assert!(
+            listed.actions.iter().all(|a| a.needs_plan_rev),
+            "{listed:#?}"
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let stale = confirm_gate_expecting(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut HashSet::new(),
+            "r",
+            HumanDecision::Reject,
+            None,
+            Some(GateExpect {
+                ord: Some(2),
+                plan_rev: Some(2),
+            }),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        assert!(
+            stale.is_err_and(|e| e.to_string().contains(crate::workflow::GATE_CHANGED)),
+            "a reject naming another revision is refused"
+        );
     }
 
     #[test]
