@@ -9451,6 +9451,37 @@ fn denial_gate_prompt(
     mutation: Option<&crate::worktree_guard::WorktreeMutation>,
     note: &str,
 ) -> String {
+    let mut prompt = denial_gate_prompt_body(unit, class, reason, mutation, note);
+    prompt.push_str(&failover_note(unit));
+    prompt
+}
+
+/// (core#1496) What a gate says when the step's result came from a seat it was failed over to:
+/// every seat that gave no verdict on it first, and the seat whose result the gate shows. Empty
+/// when the step never failed over.
+pub(crate) fn failover_note(unit: &crate::domain::WorkUnit) -> String {
+    if unit.worker_failed_clis.is_empty() {
+        return String::new();
+    }
+    let by = unit.assigned_cli.as_deref().unwrap_or("another seat");
+    format!(
+        " [failover: this step's earlier attempts on {} ended with no verdict (a seat failure) and \
+         moved on; this result is from `{by}`]",
+        unit.worker_failed_clis
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )
+}
+
+fn denial_gate_prompt_body(
+    unit: &crate::domain::WorkUnit,
+    class: &str,
+    reason: &str,
+    mutation: Option<&crate::worktree_guard::WorktreeMutation>,
+    note: &str,
+) -> String {
     let ord = unit.ord;
     let source = unit
         .denial
@@ -10817,19 +10848,21 @@ fn advance_or_pause_with(
         }
         let (reviewing_ord, prompt) = match reason {
             PauseReason::DefGate { reviewing_ord } => {
-                let done = units.iter().find(|u| u.ord == reviewing_ord).map_or_else(
+                let reviewed = units.iter().find(|u| u.ord == reviewing_ord);
+                let done = reviewed.map_or_else(
                     || format!("unit {reviewing_ord}"),
                     |p| p.description.clone(),
                 );
                 (
                     Some(reviewing_ord),
                     format!(
-                        "Approve the output of unit {} ({}) before unit {} runs: {}{}",
+                        "Approve the output of unit {} ({}) before unit {} runs: {}{}{}",
                         reviewing_ord,
                         done,
                         unit.ord,
                         unit.description,
-                        unsuppressed_gate_note(session.human_confirm)
+                        unsuppressed_gate_note(session.human_confirm),
+                        reviewed.map(failover_note).unwrap_or_default()
                     ),
                 )
             }

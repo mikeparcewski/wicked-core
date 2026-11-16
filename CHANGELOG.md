@@ -37,7 +37,12 @@ Two release tracks share this file, newest entry first regardless of track:
   (no hand-off round spent, not booked as a review round) instead of sending the work back to the
   build; the redo's own checks still apply (its cap, QE still required, a free reviewer seat), and
   when they refuse, the gate stays open for the operator and the build is not rewound.
-
+- **A reviewer's verdict is never a worker error (core#1496).** An evaluator turn the runner marked
+  failed whose answer names `VERDICT: PASS` or `VERDICT: FAIL` is a completed turn: the fold judges
+  its verdict (a FAIL opens its gate or goes back), and the seat failover ladder, reserved for a turn
+  with no verdict, never re-runs it on another seat that might say PASS. The classifier's substring
+  match had read "tests all exited 0" in a FAIL's own text as a crash (run 4ff99f51). A gate whose
+  result came from a failover seat now says which seats gave no verdict first.
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently
   selecting open egress. Only an unset value selects the open default. Gemini telemetry and

@@ -3005,6 +3005,44 @@ pub(crate) fn floor_fix_unit(
 /// a fallback judge): on a line of its own. The seat's own text streams through the same sink
 /// with no trailing newline, so a bare note fused onto its last sentence (run 24590a4b:
 /// "…confirming the bug and the fix empirically.agent validator: the run's judge is out …").
+/// (core#1496) The evaluator verdicts that end a turn: what a garden evaluator writes on its
+/// `VERDICT:` line (`PASS` | `FAIL`).
+const TURN_VERDICTS: [&str; 2] = ["PASS", "FAIL"];
+
+/// (core#1496) An agent EVALUATOR turn the runner reported `Failed` whose answer names its verdict
+/// (`VERDICT: PASS` or `VERDICT: FAIL`, the parser every evaluator fold reads) is a completed turn:
+/// its status becomes `Ok`, so the fold judges the verdict and the failover ladder — reserved for a
+/// seat that produced no verdict (a refusal, a crash, a timeout) — never re-runs it on another seat.
+/// Every other output is returned unchanged: a creator, a tool step, a turn with no verdict, a
+/// timeout or a cancel.
+pub(crate) fn verdict_completes_the_turn(
+    unit: &crate::domain::WorkUnit,
+    mut output: StepOutput,
+    emit_delta: &DeltaSink,
+) -> StepOutput {
+    if output.status != StepStatus::Failed
+        || unit.role != crate::workflow::PhaseRole::Evaluator
+        || unit.tool_cmd.is_some()
+    {
+        return output;
+    }
+    let Some(token) = crate::validator::parse_evaluator_verdict(&output.output).token else {
+        return output;
+    };
+    if !TURN_VERDICTS.contains(&token.as_str()) {
+        return output;
+    }
+    engine_note(
+        emit_delta,
+        &format!(
+            "the seat's process reported a failure after it answered VERDICT: {token}; that \
+             verdict is the step's result (core#1496), not a seat failure"
+        ),
+    );
+    output.status = StepStatus::Ok;
+    output
+}
+
 pub(crate) fn engine_note(emit_delta: &DeltaSink, text: &str) {
     emit_delta(&format!("\n{}\n", text.trim()));
 }
@@ -5001,6 +5039,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
             }
         },
     };
+    // (core#1496) A VERDICT IS A RESULT, NEVER A WORKER ERROR: an evaluator turn the runner marked
+    // failed (a nonzero exit after the answer, a stderr line) but whose answer carries its verdict
+    // completed its work. It folds as a completed turn, so a FAIL is judged as a FAIL — the gate, or
+    // a send-back — and is never failed over to another seat that might say PASS.
+    let output = verdict_completes_the_turn(&input.unit, output, emit_delta);
     // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below), so
     // none of the floor's inputs below is computed for it.
     let member_reviewing = input
@@ -12885,3 +12928,81 @@ mod judge_fallback_tests {
 #[cfg(test)]
 #[path = "cli_runner_rule_check_tests.rs"]
 mod rule_check_seat_tests;
+
+#[cfg(test)]
+mod verdict_completes_the_turn_tests {
+    use super::*;
+
+    fn out(status: StepStatus, text: &str) -> StepOutput {
+        StepOutput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: text.into(),
+            status,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+
+    /// (core#1496) Only an agent evaluator's failed turn that names PASS or FAIL completes: a
+    /// creator, a tool step, a turn with no verdict or another token, and a timeout are unchanged.
+    #[test]
+    fn a_failed_evaluator_turn_with_a_verdict_is_a_completed_turn() {
+        let mut eval = crate::domain::WorkUnit::pending("r:review", "r", 2, "review");
+        eval.role = crate::workflow::PhaseRole::Evaluator;
+        let notes = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let seen = notes.clone();
+        let sink: Box<DeltaSink> = Box::new(move |t: &str| seen.lock().unwrap().push_str(t));
+        let sink = &*sink;
+        let failed_fail = out(
+            StepStatus::Failed,
+            "all exited 0\nVERDICT: FAIL\n(cli `codex` exited 1)",
+        );
+        let got = verdict_completes_the_turn(&eval, failed_fail.clone(), sink);
+        assert_eq!(got.status, StepStatus::Ok);
+        assert_eq!(
+            got.output, failed_fail.output,
+            "the answer is kept as it is"
+        );
+        assert!(
+            notes.lock().unwrap().contains("VERDICT: FAIL"),
+            "the step says so"
+        );
+        assert_eq!(
+            verdict_completes_the_turn(&eval, out(StepStatus::Failed, "VERDICT: PASS"), sink)
+                .status,
+            StepStatus::Ok
+        );
+        for (status, text) in [
+            (
+                StepStatus::Failed,
+                "(cli `codex` exited 1) connection reset",
+            ),
+            (StepStatus::Failed, "VERDICT: maybe"),
+            (StepStatus::TimedOut, "VERDICT: FAIL"),
+        ] {
+            assert_eq!(
+                verdict_completes_the_turn(&eval, out(status, text), sink).status,
+                status,
+                "{text}"
+            );
+        }
+        let mut creator = eval.clone();
+        creator.role = crate::workflow::PhaseRole::Creator;
+        assert_eq!(
+            verdict_completes_the_turn(&creator, out(StepStatus::Failed, "VERDICT: FAIL"), sink)
+                .status,
+            StepStatus::Failed
+        );
+        let mut tool = eval.clone();
+        tool.tool_cmd = Some(vec!["make".into(), "check".into()]);
+        assert_eq!(
+            verdict_completes_the_turn(&tool, out(StepStatus::Failed, "VERDICT: FAIL"), sink)
+                .status,
+            StepStatus::Failed
+        );
+    }
+}
