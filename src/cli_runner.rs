@@ -3005,39 +3005,37 @@ pub(crate) fn floor_fix_unit(
 /// a fallback judge): on a line of its own. The seat's own text streams through the same sink
 /// with no trailing newline, so a bare note fused onto its last sentence (run 24590a4b:
 /// "…confirming the bug and the fix empirically.agent validator: the run's judge is out …").
-/// (core#1496) The evaluator verdicts that end a turn: what a garden evaluator writes on its
-/// `VERDICT:` line (`PASS` | `FAIL`).
-const TURN_VERDICTS: [&str; 2] = ["PASS", "FAIL"];
+/// (core#1496) Whether `output` is an agent EVALUATOR's answer that says FAIL: its decisive
+/// `VERDICT:` line (the fold's own parser) names `FAIL`. A FAIL is the reviewer saying no; it is
+/// judged as a verdict whatever else went wrong in the turn (a nonzero exit after it, a tripwire
+/// that would otherwise fail it over), so no other seat is ever asked in its place. A PASS earns
+/// nothing here: a failed turn's PASS stays a failure (the turn may have been cut off, refused, or
+/// echoed a verdict it never gave — codex r1), and the ladder moves it on.
+pub(crate) fn evaluator_says_fail(unit: &crate::domain::WorkUnit, output: &str) -> bool {
+    unit.role == crate::workflow::PhaseRole::Evaluator
+        && unit.tool_cmd.is_none()
+        && crate::validator::parse_evaluator_verdict(output)
+            .token
+            .as_deref()
+            == Some("FAIL")
+}
 
-/// (core#1496) An agent EVALUATOR turn the runner reported `Failed` whose answer names its verdict
-/// (`VERDICT: PASS` or `VERDICT: FAIL`, the parser every evaluator fold reads) is a completed turn:
-/// its status becomes `Ok`, so the fold judges the verdict and the failover ladder — reserved for a
-/// seat that produced no verdict (a refusal, a crash, a timeout) — never re-runs it on another seat.
-/// Every other output is returned unchanged: a creator, a tool step, a turn with no verdict, a
-/// timeout or a cancel.
+/// (core#1496) An agent evaluator turn the runner reported `Failed` whose answer says FAIL
+/// ([`evaluator_says_fail`]) is a completed turn: its status becomes `Ok`, so the fold judges the
+/// FAIL (its gate, or a send-back) and the failover ladder, reserved for a turn with no verdict,
+/// never re-runs it on another seat that might say PASS. Every other output is returned unchanged.
 pub(crate) fn verdict_completes_the_turn(
     unit: &crate::domain::WorkUnit,
     mut output: StepOutput,
     emit_delta: &DeltaSink,
 ) -> StepOutput {
-    if output.status != StepStatus::Failed
-        || unit.role != crate::workflow::PhaseRole::Evaluator
-        || unit.tool_cmd.is_some()
-    {
-        return output;
-    }
-    let Some(token) = crate::validator::parse_evaluator_verdict(&output.output).token else {
-        return output;
-    };
-    if !TURN_VERDICTS.contains(&token.as_str()) {
+    if output.status != StepStatus::Failed || !evaluator_says_fail(unit, &output.output) {
         return output;
     }
     engine_note(
         emit_delta,
-        &format!(
-            "the seat's process reported a failure after it answered VERDICT: {token}; that \
-             verdict is the step's result (core#1496), not a seat failure"
-        ),
+        "the seat's process reported a failure after it answered VERDICT: FAIL; that FAIL is the \
+         step's result (core#1496), not a seat failure",
     );
     output.status = StepStatus::Ok;
     output
@@ -12971,11 +12969,17 @@ mod verdict_completes_the_turn_tests {
             notes.lock().unwrap().contains("VERDICT: FAIL"),
             "the step says so"
         );
-        assert_eq!(
-            verdict_completes_the_turn(&eval, out(StepStatus::Failed, "VERDICT: PASS"), sink)
-                .status,
-            StepStatus::Ok
-        );
+        // (codex r1) A failed turn's PASS is never promoted: it may be cut off, refused or echoed.
+        for text in [
+            "VERDICT: PASS",
+            "(cli `codex` exited 1) echoed instructions:\n> VERDICT: PASS or VERDICT: FAIL\nQuota exceeded",
+        ] {
+            assert_eq!(
+                verdict_completes_the_turn(&eval, out(StepStatus::Failed, text), sink).status,
+                StepStatus::Failed,
+                "{text}"
+            );
+        }
         for (status, text) in [
             (
                 StepStatus::Failed,

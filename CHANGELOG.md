@@ -37,12 +37,13 @@ Two release tracks share this file, newest entry first regardless of track:
   (no hand-off round spent, not booked as a review round) instead of sending the work back to the
   build; the redo's own checks still apply (its cap, QE still required, a free reviewer seat), and
   when they refuse, the gate stays open for the operator and the build is not rewound.
-- **A reviewer's verdict is never a worker error (core#1496).** An evaluator turn the runner marked
-  failed whose answer names `VERDICT: PASS` or `VERDICT: FAIL` is a completed turn: the fold judges
-  its verdict (a FAIL opens its gate or goes back), and the seat failover ladder, reserved for a turn
-  with no verdict, never re-runs it on another seat that might say PASS. The classifier's substring
-  match had read "tests all exited 0" in a FAIL's own text as a crash (run 4ff99f51). A gate whose
-  result came from a failover seat now says which seats gave no verdict first.
+- **A reviewer's FAIL is never a worker error (core#1496).** An agent evaluator turn whose answer
+  says `VERDICT: FAIL` is judged as that FAIL even when the runner marked the turn failed or a
+  tripwire would have failed it over, so no other seat is asked in its place (the classifier's
+  substring match had read "tests all exited 0" in a FAIL's own text as a crash, run 4ff99f51). A
+  failed turn's PASS is not promoted: it may have been cut off or echoed, and it still fails over.
+  Every escalation and adjudication gate, and the def gate that reviews a unit, says which seats
+  gave no verdict first and which seat's result it shows (or that none produced one).
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently
   selecting open egress. Only an unset value selects the open default. Gemini telemetry and

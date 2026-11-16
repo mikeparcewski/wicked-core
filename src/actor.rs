@@ -6528,7 +6528,10 @@ fn apply_step_result(
     // Without this, three "done" units of refusal one-liners reached the coverage gate looking
     // like finished phases. Non-skill units are exempt: free-text work could legitimately quote
     // such a line.
-    if unknown_command_noop(unit, &output) {
+    // (core#1496) An evaluator's FAIL is judged as its verdict: no tripwire turns it into a seat
+    // failure that fails over to another seat (codex r1 on the tripwire after normalization).
+    let says_fail = crate::cli_runner::evaluator_says_fail(unit, &output.output);
+    if unknown_command_noop(unit, &output) && !says_fail {
         output.status = crate::workflow::StepStatus::Failed;
     }
     // (core#769) IN-TOOL APPROVAL REFUSAL TRIPWIRE: an Ok agent step whose every command was
@@ -6537,7 +6540,7 @@ fn apply_step_result(
     // path, where the appended line — the launcher's own frame, last — classifies as
     // `approval_unavailable`: the seat is benched for the run and the unit fails over.
     {
-        if let Some(n) = approval_refusals(unit, &output) {
+        if let Some(n) = approval_refusals(unit, &output).filter(|_| !says_fail) {
             output.status = crate::workflow::StepStatus::Failed;
             output.output.push_str(&format!(
                 "\n(wicked-core: the seat ran no command — {n} exec_command failed: \
@@ -9373,7 +9376,11 @@ fn escalate_denied_unit(
         .flatten()
         .filter(|_| adjudication.is_none());
     let (gate_kind, prompt) = match adjudication {
-        Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
+        // (core#1496, codex r1) The adjudication round says where the result came from too.
+        Some(p) => (
+            crate::review_context::REVIEW_ADJUDICATION_GATE,
+            format!("{p}{}", failover_note(unit)),
+        ),
         None => (
             ESCALATION_GATE_KIND,
             denial_gate_prompt(unit, class, &reason, mutation, note),
@@ -9463,16 +9470,27 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit) -> String {
     if unit.worker_failed_clis.is_empty() {
         return String::new();
     }
-    let by = unit.assigned_cli.as_deref().unwrap_or("another seat");
-    format!(
-        " [failover: this step's earlier attempts on {} ended with no verdict (a seat failure) and \
-         moved on; this result is from `{by}`]",
-        unit.worker_failed_clis
-            .iter()
-            .map(|c| format!("`{c}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
+    let seats = unit
+        .worker_failed_clis
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    match unit
+        .assigned_cli
+        .as_deref()
+        .filter(|by| !unit.worker_failed_clis.iter().any(|c| c == by))
+    {
+        Some(by) => format!(
+            " [failover: this step's earlier attempts on {seats} ended with no verdict (a seat \
+             failure) and moved on; this result is from `{by}`]"
+        ),
+        // (codex r1) Every seat tried failed: there is no result to attribute.
+        None => format!(
+            " [failover: every seat this step was tried on ({seats}) ended with no verdict; no seat \
+             produced a result]"
+        ),
+    }
 }
 
 fn denial_gate_prompt_body(

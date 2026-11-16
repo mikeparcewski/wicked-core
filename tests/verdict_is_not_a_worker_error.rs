@@ -63,7 +63,7 @@ impl Dispatcher for NoBallots {
 
 /// build → review → wrap-up; the review's own gate (it fires after the review) shows its result.
 const DEF: &str = r#"{"id":"c1496-build-review","phases":[
-  {"id":"build","kind":"build","gate":"auto"},
+  {"id":"build","kind":"build","role":"creator","gate":"auto"},
   {"id":"review","kind":"review","role":"evaluator","gate":{"human_confirm":{"unconditional":true}},"depends_on":["build"]},
   {"id":"wrapup","kind":"build","gate":"auto","depends_on":["review"]}]}"#;
 
@@ -238,4 +238,19 @@ fn a_turn_with_no_verdict_still_fails_over_and_the_gate_names_the_failed_seat() 
         )) && prompt.contains(&format!("this result is from `{}`]", seats[1])),
         "the gate shows every attempt: {prompt}"
     );
+}
+
+/// (codex r1) A failed turn's PASS is never promoted to a result: it may have been cut off,
+/// refused, or have echoed a verdict it never gave. It still fails over, as a seat failure.
+#[test]
+fn a_failed_turns_pass_is_not_a_result_and_still_fails_over() {
+    let sid = "c1496-failed-pass";
+    let (evs, runner) = run(sid, "(cli `codex` exited 1) cut off\nVERDICT: PASS");
+    assert!(
+        evs.iter().any(|e| matches!(e,
+            CoreEvent::StepFailed { session, detail, .. }
+                if session == sid && detail.contains("failing over to"))),
+        "{evs:?}"
+    );
+    assert_eq!(runner.review_seats.lock().unwrap().len(), 2);
 }
