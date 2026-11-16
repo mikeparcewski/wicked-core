@@ -20,11 +20,14 @@ Two release tracks share this file, newest entry first regardless of track:
   Before the QE executor turn the engine creates the attempt's QE run in the run's ledger (complete
   project, scenario and run rows, `config.json` when absent, the `evidence/<uuid>` dir) and the
   directive names it (`accept --phase evidence --resume <dir>`); a same-tree retry resumes the last
-  bound run as before. The bind reads that dir, never a `QE-EVIDENCE:` line, so a hand-made dir with
-  no run record, a non-UUID name (`run-471`), prose or a parent dir, and an earlier attempt's run no
-  longer fail the bind. A missing `test-plan.md` is the reviewer's to judge, not a bind failure. On a
-  power run a QE record that bound nothing re-runs the QE step (the `retry_qe` arm, no hand-off round
-  spent) instead of sending the work back to the build, and it is no longer booked as a review round.
+  bound run, whose dir the engine now empties itself. The bind reads that dir, never a `QE-EVIDENCE:`
+  line, so a hand-made dir with no run record, a non-UUID name (`run-471`), prose or a parent dir, and
+  an earlier attempt's run no longer fail the bind. A missing `test-plan.md` is the reviewer's to
+  judge (the reviewer brief says so), not a bind failure. On a power run, when a fresh QE run's
+  evidence could not be bound and no reviewer ran, the hand-off answers the gate with `retry_qe`
+  (no hand-off round spent, not booked as a review round) instead of sending the work back to the
+  build; the redo's own checks still apply (its cap, QE still required, a free reviewer seat), and
+  when they refuse, the gate stays open for the operator and the build is not rewound.
 
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently

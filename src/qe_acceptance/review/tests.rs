@@ -520,11 +520,6 @@ fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
         attempts: Vec::new(),
     });
     assert_eq!(resume_dir(&u), Some("/l/.wicked-qe/evidence/abc"));
-    assert_eq!(
-        prepare_evidence(&u, RUN),
-        Some(Ok("/l/.wicked-qe/evidence/abc".to_string())),
-        "a same-tree retry resumes its run; the engine makes none"
-    );
     u.worktree_baseline = Some(baseline("t2"));
     assert_eq!(resume_dir(&u), None, "a changed tree starts a fresh QE run");
     // Without a ledger root the unit keeps the full-pipeline directive (no reviewer can bind).
@@ -532,6 +527,8 @@ fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
     bare.qe_ledger_root = None;
     assert!(super::super::unit_directive(&bare, "q").contains("accept (writer, executor, isolated"));
     assert!(reviewer_brief("/d", None).len() < 520);
+    // (xreview codex r1) A dir with no plan is still judged: the brief says how.
+    assert!(reviewer_brief("/d", None).contains("no plan: judge the scenario's assertions"));
     // (core#928) The scratch line, with a realistic notes root, keeps the brief one short line.
     let scratch = std::path::Path::new(
         "/var/folders/4c/rvzl16px0yx907_m1rx6mwrw0000gp/T/wicked-core-notes/run-0123456789ab/unit-6/tmp",
@@ -1148,7 +1145,12 @@ fn the_engine_made_qe_run_is_a_complete_ledger_record() {
     let id = dir.file_name().unwrap().to_string_lossy().into_owned();
     assert!(uuid::Uuid::parse_str(&id).is_ok());
     assert_eq!(dir, l.root.join("evidence").join(&id));
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "empty");
+    // Only the engine's mark: a files-only copy-in (the k8s replica) still creates the dir.
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [EVIDENCE_SENTINEL]);
     let read = |t: &str, i: &str| read_record(&l.root.join(t).join(format!("{i}.json"))).unwrap();
     let run = read("runs", &id);
     for k in [
@@ -1885,4 +1887,86 @@ fn the_reviewer_keeps_the_engines_requirements_record() {
         "{}",
         r.unit.description
     );
+}
+
+/// (xreview codex r1) The mint fails closed on the project table: an unreadable project record, or
+/// the engine's project under a filename that is not its id, refuses it; a soft-deleted engine
+/// project (its unique name still held in the index) is reused, never duplicated.
+#[test]
+fn the_mint_fails_closed_on_a_bad_project_table_and_reuses_a_deleted_engine_project() {
+    let l = Ledger::new("mint-projects");
+    let projects = l.root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(projects.join("broken.json"), "{ not json").unwrap();
+    let e = mint_qe_run(&l.root, RUN).unwrap_err();
+    assert!(e.contains("broken.json"), "{e}");
+    std::fs::remove_file(projects.join("broken.json")).unwrap();
+    let rec = |id: &str, deleted: i64| {
+        serde_json::json!({"id": id, "name": engine_project_name(RUN), "description": null,
+            "created_at": now_iso(), "updated_at": now_iso(), "deleted": deleted, "deleted_at": null})
+        .to_string()
+    };
+    std::fs::write(projects.join("p-old.json"), rec("different-id", 0)).unwrap();
+    let e = mint_qe_run(&l.root, RUN).unwrap_err();
+    assert!(e.contains("not its filename"), "{e}");
+    std::fs::remove_file(projects.join("p-old.json")).unwrap();
+    std::fs::write(projects.join("p-del.json"), rec("p-del", 1)).unwrap();
+    let dir = mint_qe_run(&l.root, RUN).unwrap();
+    let run = read_record(&l.root.join("runs").join(format!(
+        "{}.json",
+        dir.file_name().unwrap().to_string_lossy()
+    )))
+    .unwrap();
+    assert_eq!(field(&run, "project_id"), Some("p-del"));
+    assert_eq!(std::fs::read_dir(&projects).unwrap().count(), 1);
+}
+
+/// (xreview codex r1) A same-tree retry resumes its QE run with the dir EMPTIED by the engine (the
+/// run and verdict rows stay), so a seat that writes nothing can never re-submit the last attempt's
+/// artifacts; a resume dir outside this ledger is refused.
+#[test]
+fn a_resumed_runs_evidence_dir_is_emptied_by_the_engine() {
+    let l = Ledger::new("resume-reset");
+    let (id, dir) = l.evidence(RUN, "2020-01-01T00:00:00.000Z");
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("logs/old.log"), "old").unwrap();
+    l.verdict(&id, "FAIL", Some("n0"), RUN, "2020-01-01T00:00:01.000Z");
+    let mut u = qe_unit("pi", &l.root);
+    u.qe_review = Some(QeReview {
+        outcome: OUTCOME_FAIL.into(),
+        reason: "r".into(),
+        evidence_dir: Some(dir.to_string_lossy().into_owned()),
+        qe_run_id: Some(id.clone()),
+        tree: Some("t1".into()),
+        verdict: Some("FAIL".into()),
+        attempts: Vec::new(),
+    });
+    let got = prepare_evidence(&u, RUN).unwrap().unwrap();
+    assert_eq!(got, dir.to_string_lossy());
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        [EVIDENCE_SENTINEL],
+        "the last attempt's artifacts are gone"
+    );
+    assert!(l.root.join("runs").join(format!("{id}.json")).is_file());
+    assert_eq!(
+        verdicts_of(&l.root, &id).unwrap().len(),
+        1,
+        "the verdict rows stay"
+    );
+    // Nothing the executor did not write binds: no scenario copy, no bind.
+    assert!(bind_evidence(&l.root, &got, RUN, 0, Some(&got))
+        .unwrap_err()
+        .contains("scenario.md"));
+    // A resume dir that is not this ledger's own is refused, never emptied.
+    let outside = l.base.join(&id);
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "k").unwrap();
+    u.qe_review.as_mut().unwrap().evidence_dir = Some(outside.to_string_lossy().into_owned());
+    assert!(prepare_evidence(&u, RUN).unwrap().is_err());
+    assert!(outside.join("keep").is_file());
 }

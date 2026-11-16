@@ -797,12 +797,19 @@ pub(super) fn on_counted(
     }
 }
 
-/// (crew#1554) Whether `unit`'s denial is a QE record that bound nothing (the evidence or the
-/// reviewer's verdict could not be bound: outcome `invalid`, no verdict). Not a finding on the
-/// work, so it is never a review round and never goes back to the builder, who cannot fix it.
+/// (crew#1554) Whether `unit`'s denial is a QE record that bound NOTHING: outcome `invalid`, no
+/// verdict, no QE run bound (no lineage either) and no reviewer turn run — the evidence of a fresh
+/// QE run could not be bound, so no reviewer ever judged it. Not a finding on the work, so it is
+/// never a review round and never goes back to the builder, who cannot fix it. (xreview codex r1)
+/// A record whose reviewer DID run (its reply or its ledger verdict could not be bound), or that
+/// resumes a QE run holding an earlier verdict, is not one: a FAIL there must never be retired by
+/// an automatic redo.
 pub(super) fn qe_binding_miss(unit: &crate::domain::WorkUnit) -> bool {
-    crate::qe_acceptance::review::non_verdict(unit)
-        .is_some_and(|r| r.outcome == crate::qe_acceptance::review::OUTCOME_INVALID)
+    crate::qe_acceptance::review::non_verdict(unit).is_some_and(|r| {
+        r.outcome == crate::qe_acceptance::review::OUTCOME_INVALID
+            && r.attempts.is_empty()
+            && r.qe_run_id.is_none()
+    })
 }
 
 /// (crew#1554) On a power run, a QE binding miss ([`qe_binding_miss`]) re-runs the QE step — the
@@ -1064,6 +1071,36 @@ mod qe_binding_tests {
         assert!(!auto_redo_qe(&mut sink, &mut s, &u, "QE acceptance: FAIL"));
         let note = auto_send_back(&mut sink, &mut s, &u, "verdict_not_pass", "QE: FAIL");
         assert!(note.is_some_and(|n| n.contains("round 1 of")));
+    }
+
+    /// (xreview codex r1) Only a record that bound NOTHING is a miss: once a reviewer turn ran, or
+    /// the record resumes a QE run that may hold an earlier verdict, an automatic redo could retire
+    /// a FAIL, so it stays a review outcome (and on a power run goes back to the build as today).
+    #[test]
+    fn a_record_whose_reviewer_ran_or_that_resumes_a_run_is_never_a_binding_miss() {
+        let mut ran = qe_unit(r::OUTCOME_INVALID, None);
+        ran.qe_review
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(crate::domain::QeReviewAttempt {
+                seat: "codex".into(),
+                basis: r::BASIS_DISTINCT.into(),
+                same_cli: false,
+                status: r::OUTCOME_INVALID.into(),
+                session: "n-1".into(),
+                governed: true,
+                tool_activity: true,
+                attempt: 1,
+            });
+        assert!(!qe_binding_miss(&ran));
+        let mut lineage = qe_unit(r::OUTCOME_INVALID, None);
+        lineage.qe_review.as_mut().unwrap().qe_run_id = Some("dd76".into());
+        assert!(!qe_binding_miss(&lineage));
+        let mut s = power_session();
+        let mut sink = crate::event_log::EventSink::default();
+        assert!(!auto_redo_qe(&mut sink, &mut s, &ran, "x"));
+        assert!(auto_send_back(&mut sink, &mut s, &ran, "verdict_not_pass", "x").is_some());
     }
 
     #[test]

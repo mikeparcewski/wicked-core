@@ -276,11 +276,12 @@ pub(crate) fn reviewer_brief(dir: &str, scratch: Option<&Path>) -> String {
         .unwrap_or_default();
     format!(
         "Run its accept action as the ISOLATED REVIEWER: accept --phase review --evidence {dir}. \
-         wicked-core started this session for this review alone, so you hold no plan writing or \
-         test execution: open the acceptance reviewer here, judge only the scenario, plan and \
-         evidence files in that directory, record the verdict in the QE ledger (stamped with \
-         ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), and change nothing else. If a check \
-         could not run here, put `{INCONCLUSIVE_MARKER} <what, why>` before VERDICT.{stage}"
+         wicked-core started this session for this review alone (no plan writing, no test \
+         execution): open the acceptance reviewer here, judge only the scenario, plan and \
+         evidence files in that dir (no plan: judge the scenario's assertions), record the \
+         verdict in the QE ledger (stamped with ${REVIEW_SESSION_ENV} and WICKED_RUN_ID), change \
+         nothing else. If a check could not run, put `{INCONCLUSIVE_MARKER} <what, why>` before \
+         VERDICT.{stage}"
     )
 }
 
@@ -1064,7 +1065,10 @@ pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf,
             ))
         }
     }
-    let live = |rec: &Record| !deleted(rec);
+    // (xreview codex r1) Fail closed on the project table: an unreadable record, or a record whose
+    // id is not its filename (wicked-ledger's rebuild skips it, leaving every dependent row an FK
+    // orphan), refuses the mint. A soft-deleted row still holds its unique name in the index, so
+    // a deleted engine project is reused, never duplicated under the same name.
     let name = engine_project_name(crew_run);
     let projects = plain_table_dir(&root, "projects")?;
     let mut project_id = None;
@@ -1074,15 +1078,27 @@ pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf,
         let path = entry
             .map_err(|e| format!("the QE ledger's projects could not be read: {e}"))?
             .path();
-        if path.extension().and_then(|x| x.to_str()) != Some("json") {
+        let Some(stem) = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .and_then(|n| n.strip_suffix(".json"))
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        let rec = read_record(&path).map_err(|e| format!("the QE project: {e}"))?;
+        if field(&rec, "name") != Some(name.as_str()) {
             continue;
         }
-        if let Ok(rec) = read_record(&path) {
-            if live(&rec) && field(&rec, "name") == Some(name.as_str()) {
-                project_id = field(&rec, "id").map(str::to_string);
-                break;
-            }
+        if field(&rec, "id") != Some(stem.as_str()) {
+            return Err(format!(
+                "the QE project {} names id {:?}, not its filename",
+                path.display(),
+                field(&rec, "id")
+            ));
         }
+        project_id = Some(stem);
+        break;
     }
     let project_id = match project_id {
         Some(p) => p,
@@ -1109,6 +1125,7 @@ pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf,
             dir.display()
         )
     })?;
+    write_sentinel(&dir, &id)?;
     let scenarios = plain_table_dir(&root, "scenarios")?;
     let sid = uuid::Uuid::new_v4().to_string();
     write_record(
@@ -1138,18 +1155,86 @@ pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf,
     Ok(dir)
 }
 
+/// (xreview codex r1) The engine's mark in an evidence dir it made or reset: a copy-in that moves
+/// files only (the Kubernetes replica's plain roots) still creates the dir, and the dir is never
+/// empty before the executor writes. Garden's resume may delete it; nothing reads it back.
+const EVIDENCE_SENTINEL: &str = ".wicked-core-qe-run";
+
+fn write_sentinel(dir: &Path, id: &str) -> Result<(), String> {
+    write_new(
+        &dir.join(EVIDENCE_SENTINEL),
+        serde_json::json!({ "qe_run_id": id, "created_by": "wicked-core" })
+            .to_string()
+            .as_bytes(),
+    )
+    .map_err(|e| {
+        format!(
+            "the evidence dir {} could not be marked: {e}",
+            dir.display()
+        )
+    })
+}
+
+/// (xreview codex r1) Empty a resumed run's evidence dir before its executor turn, so the reviewer
+/// judges only this attempt's artifacts whatever the seat does (garden's `--resume` asks the seat
+/// to; the engine no longer depends on it). The dir must be this ledger's own plain
+/// `evidence/<id>`; links inside it are removed, never followed. The run and verdict rows stay.
+fn reset_evidence_dir(ledger_root: &Path, dir: &str) -> Result<(), String> {
+    let root = std::fs::canonicalize(ledger_root)
+        .map_err(|e| format!("the run's QE ledger could not be resolved: {e}"))?;
+    let path = Path::new(dir);
+    let id = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .filter(|n| uuid::Uuid::parse_str(n).is_ok())
+        .ok_or_else(|| format!("the resumed evidence dir `{dir}` is not a QE run dir"))?
+        .to_string();
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("the resumed evidence dir `{dir}` could not be read: {e}"))?;
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "the resumed evidence dir `{dir}` is not a plain directory"
+        ));
+    }
+    if std::fs::canonicalize(path).ok() != Some(root.join("evidence").join(&id)) {
+        return Err(format!(
+            "the resumed evidence dir `{dir}` is not this run's ledger dir"
+        ));
+    }
+    for entry in std::fs::read_dir(path)
+        .map_err(|e| format!("the resumed evidence dir `{dir}` could not be read: {e}"))?
+    {
+        let p = entry
+            .map_err(|e| format!("the resumed evidence dir `{dir}` could not be read: {e}"))?
+            .path();
+        let m = std::fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+        if m.is_dir() && !m.file_type().is_symlink() {
+            std::fs::remove_dir_all(&p)
+        } else {
+            std::fs::remove_file(&p)
+        }
+        .map_err(|e| {
+            format!(
+                "the resumed evidence {} could not be removed: {e}",
+                p.display()
+            )
+        })?;
+    }
+    write_sentinel(path, &id)
+}
+
 /// (core#1484) The evidence dir THIS attempt's executor works in, decided by the engine before the
-/// executor turn: the QE run a same-tree retry resumes ([`resume_dir`]), else a new one
-/// ([`mint_qe_run`]). `None` when the unit runs no engine reviewer; `Some(Err)` when the run could
+/// executor turn: the QE run a same-tree retry resumes ([`resume_dir`], its dir emptied by the
+/// engine), else a new one ([`mint_qe_run`]). `None` when the unit runs no engine reviewer; `Some(Err)` when the run could
 /// not be created (the attempt then binds nothing, and says why).
 pub(crate) fn prepare_evidence(unit: &WorkUnit, crew_run: &str) -> Option<Result<String, String>> {
     if !applies(unit) {
         return None;
     }
-    if let Some(dir) = resume_dir(unit) {
-        return Some(Ok(dir.to_string()));
-    }
     let ledger = unit.qe_ledger_root.as_deref()?;
+    if let Some(dir) = resume_dir(unit) {
+        return Some(reset_evidence_dir(Path::new(ledger), dir).map(|()| dir.to_string()));
+    }
     Some(mint_qe_run(Path::new(ledger), crew_run).map(|d| d.to_string_lossy().into_owned()))
 }
 
