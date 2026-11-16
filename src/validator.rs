@@ -2667,6 +2667,17 @@ fn agent_validate_in(
 /// (PRODUCT-WORKS J4) The unit id of a re-probe ([`reprobe_seat`]).
 pub(crate) const REPROBE_UNIT: &str = "seat-reprobe";
 
+/// (core#1509) The wall budget, in seconds, of one RULE-JUDGE call ([`run_rule_judge`]). The call
+/// ran under the daemon's whole turn ceiling (`WICKED_UNIT_TIMEOUT_SECS`, two hours by default), so
+/// a judge seat that hung held the step that long. Past this budget the call ends `TimedOut`: the
+/// batch's rules are asked alone on another seat (`rule_check::check`). A daemon ceiling lower than
+/// this still wins (`workflow::effective_timeout` takes the lower).
+pub(crate) const RULE_JUDGE_BUDGET_SECS: u64 = 15 * 60;
+
+/// (core#1509) The wall budget, in seconds, of one re-probe ([`reprobe_seat`]): a one-word answer.
+/// A seat that cannot give it in this long stays benched for its next backoff.
+pub(crate) const REPROBE_BUDGET_SECS: u64 = 5 * 60;
+
 /// (PRODUCT-WORKS J4) What a seat whose quota bench fell due is asked before it is seated again: one
 /// word, no tools, no files.
 pub(crate) const REPROBE_PROMPT: &str = "Readiness check from the wicked engine. Do not run any \
@@ -2693,6 +2704,7 @@ pub(crate) fn reprobe_seat(
     // configuration home, so its own sign-in and quota are what is asked.
     unit.assigned_cli = Some(key.to_string());
     unit.assigned_invocation = Some(seat.headless_invocation.clone());
+    unit.budget_secs = Some(REPROBE_BUDGET_SECS);
     let out = runner.run_unit(&build_validator_input(&run_id, unit));
     runner.on_run_complete(&run_id);
     let text = out.output.trim();
@@ -2716,9 +2728,10 @@ pub(crate) fn reprobe_seat(
 }
 
 /// (DES-RULE-CHECK-001 S2) ONE rule-check judge call on `seat`: the batch `prompt` in a fresh
-/// one-shot session (never shared with another call), released on every exit. A seat that could
-/// not run, or whose whole answer is a provider refusal with no `RULE` line, failed as a seat (the
-/// check moves to another); a timeout or a stop ends the batch.
+/// one-shot session (never shared with another call), released on every exit, under
+/// [`RULE_JUDGE_BUDGET_SECS`]. A seat that could not run, or whose whole answer is a provider
+/// refusal with no `RULE` line, failed as a seat (the check moves to another); a timeout or a stop
+/// ends the batch.
 pub(crate) fn run_rule_judge(
     prompt: &str,
     seat: &AgenticCli,
@@ -2732,6 +2745,8 @@ pub(crate) fn run_rule_judge(
     let mut unit = WorkUnit::pending("validator-agent", "validator", 1, prompt.to_string());
     unit.assigned_cli = Some(seat.key.clone());
     unit.assigned_invocation = Some(seat.headless_invocation.clone());
+    // (core#1509) Never the daemon's whole turn ceiling: a hung judge ends `TimedOut` here.
+    unit.budget_secs = Some(RULE_JUDGE_BUDGET_SECS);
     let out = runner.run_unit(&build_validator_input(&run_id, unit));
     runner.on_run_complete(&run_id);
     let answered_a_rule = out.output.lines().any(|l| {
@@ -7438,5 +7453,84 @@ mod triage_parse_tests {
             long.contains("[…]") && long.len() < 1_500,
             "a brief-sized description is bounded"
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use crate::workflow::{StepInput, StepStatus};
+
+    /// (core#1509) The rule judge and the re-probe each run under their own wall budget, never the
+    /// daemon's two-hour turn ceiling: the carrier reads `unit.budget_secs`
+    /// (`workflow::effective_timeout`), so a hung judge seat ends `TimedOut` and its batch moves on.
+    #[test]
+    fn the_rule_judge_and_the_reprobe_carry_a_wall_budget() {
+        use crate::workflow::{StepOutput, StepRunner};
+        struct BudgetSpy {
+            reply: &'static str,
+            status: StepStatus,
+            seen: std::sync::Mutex<Vec<Option<u64>>>,
+        }
+        impl StepRunner for BudgetSpy {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.seen.lock().unwrap().push(input.unit.budget_secs);
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: self.reply.to_string(),
+                    status: self.status,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let mut codex = wicked_council::registry::builtin()
+            .into_iter()
+            .next()
+            .expect("a built-in seat");
+        codex.key = "codex".into();
+        codex.headless_invocation = "codex exec {PROMPT}".into();
+        let judge = BudgetSpy {
+            reply: "RULE R1: KEPT — src/a.rs:1",
+            status: StepStatus::Ok,
+            seen: Default::default(),
+        };
+        assert!(matches!(
+            run_rule_judge("RULES: ...", &codex, &judge),
+            crate::rule_check::JudgeAnswer::Answered(_)
+        ));
+        assert_eq!(
+            *judge.seen.lock().unwrap(),
+            vec![Some(RULE_JUDGE_BUDGET_SECS)]
+        );
+        assert!(
+            std::time::Duration::from_secs(RULE_JUDGE_BUDGET_SECS)
+                < std::time::Duration::from_secs(crate::workflow::UNIT_TIMEOUT_DEFAULT_SECS),
+            "the budget is tighter than the default turn ceiling"
+        );
+        // A judge that ran out its budget ends the batch as a timeout (its rules are asked alone).
+        let hung = BudgetSpy {
+            reply: "(cli `codex` exceeded the timeout and was killed)",
+            status: StepStatus::TimedOut,
+            seen: Default::default(),
+        };
+        assert!(matches!(
+            run_rule_judge("RULES: ...", &codex, &hung),
+            crate::rule_check::JudgeAnswer::TimedOut(_)
+        ));
+        let probe = BudgetSpy {
+            reply: "READY",
+            status: StepStatus::Ok,
+            seen: Default::default(),
+        };
+        assert_eq!(
+            reprobe_seat("codex", &codex, &probe).as_deref(),
+            Ok("READY")
+        );
+        assert_eq!(*probe.seen.lock().unwrap(), vec![Some(REPROBE_BUDGET_SECS)]);
     }
 }
