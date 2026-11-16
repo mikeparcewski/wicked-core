@@ -7085,10 +7085,11 @@ fn apply_step_result(
         // gates re-dispatching codex/pi). Persisted — a resume honours it too.
         // (F-7R3-001) …and so does a QUOTA refusal (`exceeded your monthly quota`, `rate limit`,
         // `usage limit`, `insufficient credits`, …) or a binary that could not be spawned at all
-        // (the wrapped runner's `(could not run …: No such file or directory)` line): a seat that
-        // answers this way has no work left in it for this run. The transcript is judged by
-        // `classify_refusal` — authentication over the whole text, quota over its tail only — so
-        // a worker whose SUBJECT was rate limiting is not mistaken for one that was rate limited.
+        // (the wrapped runner's `(could not run …: No such file or directory)` line). The
+        // transcript is judged by `classify_refusal` over its tail, a sign-in refusal only in the
+        // CLI's own frame (core#1479) — so a worker whose SUBJECT was rate limiting or a sign-on
+        // system is not mistaken for one that was rate limited or signed out. A quota or sign-in
+        // bench is re-probed after its backoff (`seat_bench`).
         let seat_refusal = if unit.tool_cmd.is_none() {
             // (r2-N2) The generic quota rule needs exit evidence — the wrapped runner's own
             // `(cli … exited N)` marker with N ≠ 0; a provider sentence needs none.

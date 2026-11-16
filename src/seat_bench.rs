@@ -201,7 +201,13 @@ pub fn reprobe_outcome(seat: &BenchedSeat, answer: Result<&str, &str>, now: i64)
             use wicked_council::types::SeatFailureReason as R;
             let exited_nonzero =
                 crate::execute_wrapped::wrapped_exit_code(output).is_some_and(|c| c != 0);
-            match R::classify_refusal(output, exited_nonzero) {
+            // A binary that could not start is read from the wrapped runner's own line, as the
+            // worker and judge paths read it.
+            let cause = R::classify_refusal(output, exited_nonzero).or_else(|| {
+                crate::execute_wrapped::spawn_failure_detail(output)
+                    .and_then(R::classify_spawn_detail)
+            });
+            match cause {
                 Some(cause @ (R::NotInstalled | R::ApprovalUnavailable)) => BenchReprobe {
                     strikes: 0,
                     reason: Some(cause.as_str().to_string()),
@@ -248,29 +254,31 @@ fn failed_probe(
 }
 
 /// A seat that answered its re-probe and then refused its real call in the same attempt (the judge
-/// call that the probe let it take came back `quota_exhausted`) did not come back: its outcome is
-/// read as a failed probe, with the next backoff (or the reset time the refusal stated). Without
-/// this, the lift and the judge's fresh strike-1 bench would reset the backoff on every expiry.
+/// call that the probe let it take came back `quota_exhausted` or, core#1479, `not_logged_in`) did
+/// not come back: its outcome is read as a failed probe of that cause, with its next backoff (or the
+/// reset time a quota refusal stated), and the bench takes that cause as its reason. Without this,
+/// the lift and the judge's fresh strike-1 bench would reset the backoff on every expiry.
 /// `refusals` are the attempt's judge refusals: `(seat, cause token, stated reset time)`.
 pub fn reconcile_with_refusals(
     reprobes: &[BenchReprobe],
     refusals: &[(String, String, Option<i64>)],
 ) -> Vec<BenchReprobe> {
-    let quota_token = wicked_council::types::SeatFailureReason::QuotaExhausted.as_str();
+    use wicked_council::types::SeatFailureReason as R;
+    let lifting = [R::QuotaExhausted.as_str(), R::NotLoggedIn.as_str()];
     reprobes
         .iter()
         .map(|r| {
             let refused = refusals
                 .iter()
-                .find(|(seat, token, _)| seat == &r.seat && token == quota_token);
+                .find(|(seat, token, _)| seat == &r.seat && lifting.contains(&token.as_str()));
             match refused {
-                Some((_, _, reset_at)) if r.returned => {
-                    let mut failed = failed_probe(r.clone(), quota_token, false, "", r.at);
-                    if let Some(at) = reset_at.filter(|at| *at > r.at) {
+                Some((_, token, reset_at)) if r.returned => {
+                    let mut failed = failed_probe(r.clone(), token, true, "", r.at);
+                    if let Some(at) = reset_at.filter(|at| *at > r.at && quota_class(token)) {
                         failed.benched_until = Some(at.min(r.at + MAX_RESET_MS));
                     }
                     failed.detail = format!(
-                        "answered its re-probe, then refused its judge call for quota ({})",
+                        "answered its re-probe, then refused its judge call ({token}) ({})",
                         r.detail
                     );
                     failed
@@ -867,8 +875,8 @@ mod tests {
             reconcile_with_refusals(std::slice::from_ref(&r), &stated)[0].benched_until,
             Some(NOW + 90 * MIN)
         );
-        // Another cause, or no refusal: the outcome stands.
-        let other = vec![("copilot".to_string(), "not_logged_in".to_string(), None)];
+        // A cause that does not lift, or no refusal: the outcome stands.
+        let other = vec![("copilot".to_string(), "empty_answer".to_string(), None)];
         assert!(reconcile_with_refusals(std::slice::from_ref(&r), &other)[0].returned);
         assert!(reconcile_with_refusals(std::slice::from_ref(&r), &[])[0].returned);
         let mut run = vec![b];
@@ -877,6 +885,95 @@ mod tests {
             run[0].strikes, 2,
             "the backoff keeps growing, it is not reset to strike 1"
         );
+    }
+
+    /// (core#1479, codex r1 on #1510) A sign-in bench whose seat answers its probe and then refuses
+    /// its judge call is a failed probe of THAT cause: for quota the bench is retagged quota (and a
+    /// later unclassified failure keeps the quota backoff); for sign-in the backoff advances
+    /// instead of restarting at 5 minutes.
+    #[test]
+    fn a_sign_in_bench_answered_then_refused_on_the_judge_call_advances_its_backoff() {
+        let b = stamp(bench("codex", "signed out"), NOW);
+        let t1 = NOW + 5 * MIN;
+        let r = reprobe_outcome(&b, Ok("READY"), t1);
+        // …then the judge call refuses for quota.
+        let quota = vec![("codex".to_string(), "quota_exhausted".to_string(), None)];
+        let out = reconcile_with_refusals(std::slice::from_ref(&r), &quota);
+        assert_eq!(
+            (out[0].returned, out[0].strikes, out[0].reason.as_deref()),
+            (false, 2, Some("quota_exhausted"))
+        );
+        assert_eq!(out[0].benched_until, Some(t1 + 30 * MIN));
+        let mut run = vec![b.clone()];
+        apply_reprobes(&mut run, &out);
+        assert_eq!(run[0].reason, "quota_exhausted");
+        let t2 = run[0].benched_until.unwrap();
+        let again = reprobe_outcome(&run[0], Err("(cli `codex` exited 1) boom"), t2);
+        assert_eq!(
+            again.benched_until,
+            Some(t2 + 60 * MIN),
+            "the quota backoff, strike 3"
+        );
+        // …or for sign-in: strike 2, ten minutes, not a fresh five.
+        let sign_in = vec![("codex".to_string(), "not_logged_in".to_string(), None)];
+        let out = reconcile_with_refusals(std::slice::from_ref(&r), &sign_in);
+        assert_eq!((out[0].returned, out[0].strikes), (false, 2));
+        assert_eq!(out[0].benched_until, Some(t1 + 10 * MIN));
+        let mut run = vec![b];
+        assert!(matches!(
+            &apply_reprobes(&mut run, &out)[..],
+            [Applied::Rebenched { strikes: 2, .. }]
+        ));
+    }
+
+    /// (codex r1 on #1510) A probe whose binary could not start benches the seat for good
+    /// (`not_installed`), read from the wrapped runner's own line as on the worker path.
+    #[test]
+    fn a_probe_whose_binary_is_missing_benches_for_good() {
+        let b = stamp(bench("opencode", "signed out"), NOW);
+        let r = reprobe_outcome(
+            &b,
+            Err("(could not run `opencode`: No such file or directory (os error 2))"),
+            NOW + 5 * MIN,
+        );
+        assert_eq!(
+            (r.reason.as_deref(), r.benched_until, r.strikes),
+            (Some("not_installed"), None, 0)
+        );
+    }
+
+    /// (codex r1 on #1510) A sign-in bench over a host-floor (governed-only) bench lifts back to
+    /// it, whichever arrived first: the seat may judge again, never take governed work.
+    #[test]
+    fn a_sign_in_bench_over_a_host_floor_bench_lifts_back_to_it_in_either_order() {
+        let host = BenchedSeat {
+            governed_only: true,
+            source: "launcher".into(),
+            ..bench("pi", "host floor")
+        };
+        let sign_in = BenchedSeat {
+            source: "judge".into(),
+            ..bench("pi", "not_logged_in")
+        };
+        for order in [
+            [host.clone(), sign_in.clone()],
+            [sign_in.clone(), host.clone()],
+        ] {
+            let mut run = Vec::new();
+            for b in order {
+                crate::domain::bench_seat(&mut run, b);
+            }
+            assert_eq!(run.len(), 1);
+            assert!(
+                !run[0].governed_only && run[0].replaced.is_some(),
+                "{run:?}"
+            );
+            let due = run[0].benched_until.expect("stamped");
+            let r = reprobe_outcome(&run[0], Ok("READY"), due);
+            apply_reprobes(&mut run, &[r]);
+            assert_eq!(run.len(), 1, "back under the host-floor bench: {run:?}");
+            assert!(run[0].governed_only && run[0].reason == "host floor");
+        }
     }
 
     #[test]

@@ -1524,15 +1524,16 @@ pub enum CoreEvent {
         /// The bench reason as persisted (`quota_exhausted (no success in the run)`).
         reason: String,
         /// Who benched it: `worker`, `judge`, or (PRODUCT-WORKS J4) `reprobe` — a seat whose quota
-        /// bench fell due did not answer its re-probe and is benched again, for longer.
+        /// or sign-in bench fell due did not answer its re-probe and is benched again, for longer.
         source: String,
-        /// (PRODUCT-WORKS J4) When a QUOTA bench falls due for a re-probe (unix millis): the
-        /// provider's reset time when the refusal stated one, else the backoff (15, 30, then 60
-        /// minutes). `null` for a bench that never lifts by itself (sign-in, a missing binary).
+        /// (PRODUCT-WORKS J4, core#1479) When a QUOTA or SIGN-IN bench falls due for a re-probe
+        /// (unix millis): for quota, the provider's reset time when the refusal stated one, else
+        /// the backoff (15, 30, then 60 minutes); for sign-in, 5, 10, then 15 minutes. `null` for a
+        /// bench that never lifts by itself (a missing binary, a forced approval policy).
         /// Wire `benchedUntilMs`.
         benched_until_ms: Option<i64>,
     },
-    /// (PRODUCT-WORKS J4) A seat's QUOTA bench fell due and the seat answered its re-probe (one
+    /// (PRODUCT-WORKS J4, core#1479) A seat's quota or sign-in bench fell due and the seat answered its re-probe (one
     /// cheap ungoverned call): it is back on the run's roster, for routing and as a judge.
     /// `reason` is the bench it had. Additive: a new frame.
     SeatBenchLifted {

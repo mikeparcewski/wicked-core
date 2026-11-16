@@ -5354,8 +5354,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // an authentication failure, a quota refusal, a binary that could not start — reported for
     // the fold to bench (`source: "judge"`; a quota refusal benches only a seat with no
     // successful unit in the run — review F3) so they are never re-tried by the next unit. The
-    // transcript is judged by `classify_refusal` (authentication over the whole text, the quota
-    // refusal frame over its tail) and a wrapped `(could not run …)` line by the spawn error it
+    // transcript is judged by `classify_refusal` (over its tail; a sign-in refusal only in the
+    // CLI's own frame, core#1479) and a wrapped `(could not run …)` line by the spawn error it
     // carries.
     let judge_refusals: std::cell::RefCell<Vec<crate::workflow::JudgeRefusal>> =
         std::cell::RefCell::new(Vec::new());
