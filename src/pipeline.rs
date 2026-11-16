@@ -3214,8 +3214,7 @@ pub(crate) fn no_change_contradicted_note(
     output: &str,
     evidence: &crate::workflow::UnitEvidence,
 ) -> &'static str {
-    if evidence.tree_changed == Some(true) && crate::actor::no_change_mention(output) == Some(true)
-    {
+    if evidence.tree_changed == Some(true) && crate::actor::no_change_line(output).is_some() {
         NO_CHANGE_CONTRADICTED
     } else {
         ""
@@ -5780,12 +5779,12 @@ mod judge_bench_tests {
     /// the denial reads as before.
     #[test]
     fn a_no_change_answer_that_changed_the_tree_is_read_as_a_change() {
-        let said = "NO CHANGE NEEDED: the failures are load-bound. Also tried PATHEXT on Windows.";
+        let said = "Also tried PATHEXT on Windows.\nNO-CHANGE: the failures are load-bound.";
         let reason = fold_retry_answer("nochange-contradicted", said, Some(true)).expect("denied");
         assert!(reason.starts_with(NO_CHANGE_CONTRADICTED), "{reason}");
         assert!(reason.contains("repo checks floor failed"), "{reason}");
         assert!(
-            crate::actor::no_change_mention(&reason) != Some(true),
+            crate::actor::no_change_line(&reason).is_none(),
             "the disclosure is not itself a declaration a later fold could read"
         );
         let plain =

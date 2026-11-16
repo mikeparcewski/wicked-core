@@ -3447,8 +3447,32 @@ pub(crate) fn run(
                                         | SessionStatus::Failed
                                 )
                             });
+                        // (core#1486) The unit executing now owns the message: never heard by
+                        // another unit dispatched after it.
+                        let for_ord = crate::domain::get_session(&store, &run_id)
+                            .ok()
+                            .flatten()
+                            .filter(|s| s.status == SessionStatus::Executing)
+                            .and_then(|s| {
+                                crate::domain::session_units(&store, &run_id)
+                                    .ok()?
+                                    .get(s.unit_ix)
+                                    .filter(|u| {
+                                        matches!(
+                                            u.status,
+                                            crate::domain::UnitStatus::Distributed
+                                                | crate::domain::UnitStatus::Pending
+                                        )
+                                    })
+                                    .map(|u| u.ord)
+                            });
                         if live {
-                            crate::power::queue_operator_message(&run_id, &target_str, &message);
+                            crate::power::queue_operator_message(
+                                &run_id,
+                                &target_str,
+                                &message,
+                                for_ord,
+                            );
                             emit(
                                 &mut subscribers,
                                 CoreEvent::WorkerMessageQueued {
@@ -8005,7 +8029,7 @@ fn apply_step_result(
     // (crew#972, run 7d8c9c98) "No change" is THIS unit's: its tree against its own dispatch
     // baseline (`evidence.tree_changed`), not only a worktree clean at HEAD — a creator whose
     // writes were all denied passed its gate because EARLIER phases had already changed the
-    // worktree. Only an explicit declaration ([`declares_no_change`], core#929) exempts it.
+    // worktree. Only an explicit declaration ([`no_change_line`], core#1486) exempts it.
     let clean = match post_clean {
         Some(clean) if session.workdir.is_some() => clean,
         _ => worktree_is_clean(session.workdir.as_deref()),
@@ -8027,13 +8051,12 @@ fn apply_step_result(
         .as_ref()
         .or(unit.repo_checks.as_ref())
         .is_some_and(|r| r.outcome() == "failed" && r.failure_split().is_some());
-    let mention = no_change_mention(&output.output);
+    let declared = no_change_line(&output.output).is_some();
     // (rig run ea73afc0) A no-change answer is one only while the tree IS unchanged: the engine
-    // compares it (`evidence.tree_changed`) and never takes the reply's word. An attempt that said
-    // NO CHANGE NEEDED and changed the tree anyway is a change (its floor runs on the new tree).
+    // compares it (`evidence.tree_changed`) and never takes the reply's word. An attempt that wrote
+    // its `NO-CHANGE:` line and changed the tree anyway is a change (its floor runs on the new tree).
     let declared_no_change = evidence.tree_changed != Some(true)
-        && (mention == Some(true)
-            || (mention.is_none() && floor_red && !clean && !output.output.trim().is_empty()));
+        && (declared || (floor_red && !clean && !output.output.trim().is_empty()));
     let left_no_change = clean || evidence.tree_changed == Some(false);
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the answer exemption, where `no_prose` already means "no answer at all": an
@@ -8046,9 +8069,9 @@ fn apply_step_result(
         const NO_DIFF: &str = "executes-code phase reported done but left no change in the \
                                worktree (done is re-derived from the diff, never asserted)";
         const NO_OWN_DIFF: &str = "the build step changed nothing in the worktree (its writes \
-                                   may have been refused); it did not say NO CHANGE NEEDED, so \
-                                   done is not accepted — retry it on a seat that can write, or \
-                                   reassign";
+                                   may have been refused); it wrote no `NO-CHANGE: <why>` line, \
+                                   so done is not accepted — retry it on a seat that can write, \
+                                   or reassign";
         // `no_prose` wins the tie so the pre-existing rejection keeps its exact record shape —
         // the new arm only ever rejects folds that previously passed.
         let why: &'static str = if prose_rejects {
@@ -8797,8 +8820,9 @@ pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
 const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (core#651)] Your own \
      repo-checks floor ran on the tree you left and FAILED (the checks and their tails are above). \
      Fix the failures your change caused in this round. If a failure is not caused by your change, \
-     do not edit anything to chase it: change nothing and reply with NO CHANGE NEEDED and the \
-     reason. Either way, a second red floor opens the escalation gate for a human.";
+     do not edit anything to chase it: change nothing and end your reply with the line \
+     `NO-CHANGE: <the reason>`. Either way, a second red floor opens the escalation gate for a \
+     human.";
 
 /// (rig run ea73afc0) The automatic round's SCOPE, on every variant of its note: its retry turn
 /// answered NO CHANGE NEEDED for the failures but also applied a team member's unrelated Windows
@@ -8831,7 +8855,8 @@ fn floor_auto_retry_note(report: Option<&crate::repo_checks::RepoChecksReport>) 
              they may be this change's: {}. Fix the ones your change caused{}. If a failure is not \
              caused by your change (it tests code you did not touch, or it is timing- or \
              load-sensitive and fails intermittently), do not edit anything to chase it: change \
-             nothing and reply with {NO_CHANGE_NEEDED} and the reason. Either way, a second red \
+             nothing and end your reply with the line `{NO_CHANGE_FIELD} <the reason>`. Either \
+             way, a second red \
              floor opens the escalation gate for a human.{FLOOR_AUTO_RETRY_SCOPE_NOTE}",
             split.head_only.join(", "),
             if split.base_shared > 0 {
@@ -11644,6 +11669,11 @@ fn power_dispatch(
                 round,
                 power.voice.as_deref(),
             ));
+            // (core#1486) The attempt's retry or send-back notes ride turn 1 as their own block
+            // too, and every later turn restates them ahead of the (clipped) task.
+            let notes = crate::power::attempt_notes(&unit);
+            unit.description
+                .push_str(&crate::power::notes_block(&notes));
             crate::power::arm_build(
                 &session.id,
                 unit.ord,
@@ -11654,6 +11684,7 @@ fn power_dispatch(
                     round,
                     base: session.base_commit.clone(),
                     voice: power.voice.clone(),
+                    notes,
                 },
             );
             if let Some(p) = s.power.as_mut() {
@@ -12650,7 +12681,7 @@ fn dispatch_unit_with(
     // headless carrier has no live process to write into): this unit's seat hears every one
     // addressed to it or to all, once, as an operator context block.
     if unit.tool_cmd.is_none() && review_of.is_none() {
-        let queued = crate::power::take_operator_messages(run_id, current_cli);
+        let queued = crate::power::take_operator_messages(run_id, current_cli, unit.ord);
         if !queued.is_empty() {
             let text = queued
                 .iter()
@@ -15231,125 +15262,36 @@ fn run_tool_cmd_jailed(
 ///
 /// Actor-thread subprocess, deliberately: both are fast plumbing reads, and this runs ONLY on the
 /// short-output governed path (rare), never per unit.
-/// (crew#972) The line a creator writes when its step legitimately needs no change to the tree; the
-/// code-evidence floor accepts an unchanged tree only with it.
-pub(crate) const NO_CHANGE_NEEDED: &str = "NO CHANGE NEEDED";
+/// (crew#972, core#1486) The STRUCTURED field a creator writes when its step legitimately needs no
+/// change to the tree: a line of its own, `NO-CHANGE: <why>`, like `VERDICT:` and `HANDOFF:`. The
+/// code-evidence floor accepts an unchanged tree only with it. It replaces the `NO CHANGE NEEDED`
+/// phrase search (core#929/#1142's 19 negation cues), which read prose and an operator's own note
+/// back as declarations and missed a seat's answer whenever its wording moved.
+pub(crate) const NO_CHANGE_FIELD: &str = "NO-CHANGE:";
 
-/// (core#929, core#1142) Whether `output` declares [`NO_CHANGE_NEEDED`] ([`no_change_mention`]).
+/// (core#1486) Whether `output` declares no change ([`no_change_line`]).
 #[cfg(test)]
 pub(crate) fn declares_no_change(output: &str) -> bool {
-    no_change_mention(output) == Some(true)
+    no_change_line(output).is_some()
 }
 
-/// (core#929, core#1142) How `output` uses the [`NO_CHANGE_NEEDED`] phrase: `Some(true)` when a line
-/// DECLARES it, `Some(false)` when it only mentions it, `None` when it never appears. A worker
-/// should not have to know a magic line shape to say it changed nothing (rig run 85ddad0d), so the
-/// phrase is read anywhere in a line, in any case, as whole words, markdown emphasis (`*`, `_`,
-/// `` ` ``) ignored: `No change needed — the fix is already on main`, `Checked the tree. NO CHANGE
-/// NEEDED`, `The failures are not caused by this change — NO CHANGE NEEDED`.
-///
-/// A mention does NOT declare (codex r1, r2; xreview on #1146):
-/// - when the words just before it, back to the last `,`, `—` or `–` of its sentence, negate it
-///   or make it conditional (`not`, `cannot`, `couldn't`, `never`, `isn't`, `unable`, `if`,
-///   `unless`, `would`, … — `I cannot declare NO CHANGE NEEDED`, `I cannot truthfully declare:
-///   NO CHANGE NEEDED`);
-/// - when its sentence quotes it as an instruction (`reply with`, `respond with`, `answer with` —
-///   `If no edits are required, reply with: NO CHANGE NEEDED`, an echo of the retry note);
-/// - when anything but the end of the line, a separator (`—` `–` `-` `:` `.` `;` `,` `(` `)` `!`)
-///   or a reason (`because`, `since`) follows it — the phrase as a subject or object is prose
-///   (`NO CHANGE NEEDED would be false: …`, `NO CHANGE NEEDED is what I would say`,
-///   `NO CHANGE NEEDED? No: …`, `no change needed in foo.rs`);
-/// - when it is fused into a longer word (`XNO CHANGE NEEDED`, `NO CHANGE NEEDEDS`).
-///
-/// A sentence ends at `;`, `!`, `?`, or a `.` followed by a blank or the line's end — never at
-/// the dot of `tip.mjs`.
-pub(crate) fn no_change_mention(output: &str) -> Option<bool> {
-    const MARKER: &str = "no change needed";
-    const CUES: [&str; 19] = [
-        "not",
-        "cannot",
-        "can't",
-        "couldn't",
-        "never",
-        "don't",
-        "doesn't",
-        "didn't",
-        "won't",
-        "wouldn't",
-        "shouldn't",
-        "isn't",
-        "aren't",
-        "wasn't",
-        "weren't",
-        "unable",
-        "if",
-        "unless",
-        "would",
-    ];
-    const CUE_PAIRS: [[&str; 2]; 3] = [["reply", "with"], ["respond", "with"], ["answer", "with"]];
-    fn words(text: &str) -> Vec<&str> {
-        text.split(|c: char| !(c.is_alphanumeric() || c == '\''))
-            .filter(|w| !w.is_empty())
-            .collect()
-    }
-    // The start of the sentence `before` ends in.
-    fn sentence_start(before: &str) -> usize {
-        let mut start = 0;
-        let mut it = before.char_indices().peekable();
-        while let Some((i, c)) = it.next() {
-            let ends = match c {
-                ';' | '!' | '?' => true,
-                '.' => it.peek().is_none_or(|(_, n)| n.is_whitespace()),
-                _ => false,
-            };
-            if ends {
-                start = i + c.len_utf8();
-            }
+/// (core#1486) The reason on the LAST [`NO_CHANGE_FIELD`] line of `output`: a line whose first word,
+/// past list or emphasis decoration (`-`, `*`, `>`, `` ` ``, `#`), is `NO-CHANGE:` (any case) with a
+/// reason after it. A line that mentions the field mid-sentence, quotes it after `>` inside prose,
+/// or names no reason is not one. Capped at 300 characters.
+pub(crate) fn no_change_line(output: &str) -> Option<String> {
+    output.lines().rev().find_map(|line| {
+        let bare = line.trim_start_matches(|c: char| c.is_whitespace() || "-*>`#".contains(c));
+        let head = bare.get(..NO_CHANGE_FIELD.len())?;
+        if !head.eq_ignore_ascii_case(NO_CHANGE_FIELD) {
+            return None;
         }
-        start
-    }
-    let hedged = |before: &str| {
-        let sentence = &before[sentence_start(before)..];
-        let window = sentence
-            .rfind([',', '\u{2014}', '\u{2013}'])
-            .map_or(sentence, |i| &sentence[i..]);
-        words(window).iter().any(|w| CUES.contains(w))
-            || words(sentence)
-                .windows(2)
-                .any(|p| CUE_PAIRS.iter().any(|c| c[..] == *p))
-    };
-    let closes = |after: &str| {
-        let after = after.trim_start();
-        after.is_empty()
-            || after.starts_with([
-                '\u{2014}', '\u{2013}', '-', ':', '.', ';', ',', '(', ')', '!',
-            ])
-            || matches!(words(after).first(), Some(&("because" | "since")))
-    };
-    let mut mentioned = false;
-    for line in output.lines() {
-        let line: String = line
-            .chars()
-            .filter(|c| !matches!(c, '*' | '_' | '`'))
-            .map(|c| if c == '\u{2019}' { '\'' } else { c })
-            .collect::<String>()
-            .to_lowercase();
-        let mut from = 0;
-        while let Some(i) = line[from..].find(MARKER) {
-            let (at, end) = (from + i, from + i + MARKER.len());
-            let (before, after) = (&line[..at], &line[end..]);
-            let whole = !before.chars().last().is_some_and(char::is_alphanumeric)
-                && !after.chars().next().is_some_and(char::is_alphanumeric);
-            if whole {
-                if !hedged(before) && closes(after) {
-                    return Some(true);
-                }
-                mentioned = true;
-            }
-            from = end;
-        }
-    }
-    mentioned.then_some(false)
+        let why = bare[NO_CHANGE_FIELD.len()..]
+            .trim()
+            .trim_end_matches(['*', '`'])
+            .trim();
+        (!why.is_empty()).then(|| why.chars().take(300).collect())
+    })
 }
 
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
@@ -29178,48 +29120,34 @@ mod request_changes_tests {
         );
     }
 
-    /// core#929, core#1142: the NO CHANGE NEEDED declaration is read anywhere in a line, in any
-    /// case, decorated or followed by a reason; a negated, conditional, questioned or quoted
-    /// mention, or one fused into a longer word, is prose (codex r1, r2).
+    /// core#1486: the no-change declaration is a STRUCTURED field: a `NO-CHANGE: <why>` line of its
+    /// own (decoration tolerated), never a phrase found in prose; it needs a reason. An instruction
+    /// that quotes the field mid-sentence, or the old phrase, is not one.
     #[test]
-    fn core_929_no_change_needed_is_read_decorated_or_fused() {
+    fn core_1486_no_change_is_a_structured_line_with_a_reason() {
         for yes in [
-            "prose\nNO CHANGE NEEDED\n",
-            "  NO CHANGE NEEDED  ",
-            "**NO CHANGE NEEDED** — the fix is already in the tree",
-            "`NO CHANGE NEEDED`",
-            "NO CHANGE NEEDED: attempt 0 landed it",
-            "Checked the tree. NO CHANGE NEEDED",
-            "no change needed",
-            "No change needed — the fix is already on main",
-            "I made no further edits this round. No change needed: the three failures are flakes.",
-            "The failures are outside my diff, so no change needed.",
-            "The three floor failures are not caused by this change — NO CHANGE NEEDED",
-            "The failure is not caused by my change, so no change needed",
-            "no change needed because the fix landed on main",
-            "NO CHANGE NEEDED: these tests are not caused by my change",
-            "Edited nothing in tip.mjs. NO CHANGE NEEDED",
+            "prose\nNO-CHANGE: the fix is already in the tree\n",
+            "  NO-CHANGE: attempt 0 landed it  ",
+            "- **NO-CHANGE: the three failures are load flakes**",
+            "`NO-CHANGE: outside my diff`",
+            "no-change: the fix landed on main",
+            "> NO-CHANGE: base-shared failures only",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
         }
+        assert_eq!(
+            no_change_line("x\nNO-CHANGE: one\nNO-CHANGE: two").as_deref(),
+            Some("two"),
+            "the last line decides"
+        );
         for no in [
-            "Change nothing; reply with the line NO CHANGE NEEDED.",
-            "change nothing and reply with NO CHANGE NEEDED and the reason",
-            "I cannot declare NO CHANGE NEEDED",
-            "I can’t say no change needed",
-            "I cannot truthfully declare: NO CHANGE NEEDED",
-            "If no edits are required, reply with: NO CHANGE NEEDED",
-            "If no edits are required, reply with NO CHANGE NEEDED",
-            "NO CHANGE NEEDED? No: I changed tip.mjs",
-            "It is not a case of no change needed",
-            "NO CHANGE NEEDED would be false: the implementation is still missing.",
-            "NO CHANGE NEEDED is what I would say, but I edited tip.mjs",
-            "I cannot leave tip.mjs as NO CHANGE NEEDED",
-            "I couldn't declare NO CHANGE NEEDED",
-            "I shouldn't say no change needed",
-            "no change needed in foo.rs, but the test still fails",
-            "NO CHANGE NEEDEDS",
-            "XNO CHANGE NEEDED",
+            "NO CHANGE NEEDED",
+            "Checked the tree. NO CHANGE NEEDED",
+            "change nothing and end your reply with the line `NO-CHANGE: <the reason>`",
+            "If nothing is needed, write NO-CHANGE: and why",
+            "NO-CHANGE:",
+            "NO-CHANGE:   ",
+            "XNO-CHANGE: fused",
             "I changed tip.mjs and added a test.",
             "",
         ] {
@@ -31377,7 +31305,7 @@ mod code_evidence_floor_tests {
         }
     }
 
-    /// …and an explicit `NO CHANGE NEEDED` line is the one way such a step passes the floor.
+    /// …and an explicit `NO-CHANGE: <why>` line is the one way such a step passes the floor.
     #[test]
     fn a_code_creator_that_declares_no_change_needed_clears_the_floor() {
         let wt = git_worktree("no-change-needed");
@@ -31396,7 +31324,7 @@ mod code_evidence_floor_tests {
             tree_changed: Some(false),
             ..Default::default()
         };
-        let text = format!("{}\nNO CHANGE NEEDED\n", prose());
+        let text = format!("{}\nNO-CHANGE: the plan needs no code change\n", prose());
         let (_session, unit) = fold_ev(&mut store, &mut subs, run_id, &text, true, evidence);
         assert!(
             unit.denial.as_ref().is_none_or(|d| d.source != "substance"),
@@ -31424,11 +31352,11 @@ mod code_evidence_floor_tests {
                 Some(&["test b::shared", "test c::other"]),
             ))
         };
-        // (xreview on #1146) A reply that names the marker only to negate it is not a no-change
-        // answer even after a red floor; nor is a no-edit reply over a floor that named no test
-        // (a build or compile failure); nor a disclaimed marker with no floor behind it.
+        // A no-edit reply over a floor that named no test (a build or compile failure) is no
+        // no-change answer; nor is prose that names the old phrase with no floor behind it
+        // (core#1486: only the structured `NO-CHANGE:` line declares; a phrase never does).
         let negated = format!(
-            "{}\nI cannot declare NO CHANGE NEEDED: my edit to src/lib.rs was refused.\n",
+            "{}\nNO CHANGE NEEDED: my edit to src/lib.rs was refused.\n",
             prose()
         );
         let disclaimed = format!(
@@ -31445,7 +31373,7 @@ mod code_evidence_floor_tests {
                 false,
             ),
             ("no floor", None, &reply, true),
-            ("negated", red(&["test a::mine"]), &negated, true),
+            ("old phrase, no floor", None, &negated, true),
             ("unnamed failures", unnamed, &reply, true),
             ("disclaimed, no floor", None, &disclaimed, true),
         ] {
@@ -31491,7 +31419,7 @@ mod code_evidence_floor_tests {
         )));
         for note in [head_only.as_str(), plain.as_str(), all_shared.as_str()] {
             assert!(
-                note.contains("not caused by your change") && note.contains(NO_CHANGE_NEEDED),
+                note.contains("not caused by your change") && note.contains(NO_CHANGE_FIELD),
                 "{note}"
             );
             assert!(
