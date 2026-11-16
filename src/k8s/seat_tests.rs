@@ -2134,19 +2134,157 @@ fn k8s_a_file_and_a_directory_of_one_folded_name_are_refused_however_they_sort()
     assert!(sync::check_entries(&r, &[]).is_err());
 }
 
+/// (core#1498, run ea75313b seq 6215-6217) A file that would take the write-back past the stream's
+/// limit is LEFT OUT, never read and never the whole write-back refused: the seat's other files
+/// still come back, and the stream names what stayed behind.
 #[cfg(unix)]
 #[test]
-fn k8s_the_pod_codec_refuses_an_oversized_file_before_reading_it() {
+fn k8s_the_pod_codec_leaves_an_oversized_file_out_before_reading_it() {
     let replica = tmp("bigpack");
     std::fs::create_dir_all(replica.join("w")).unwrap();
     let f = std::fs::File::create(replica.join("w/big")).unwrap();
     f.set_len(sync::MAX_STREAM + 1).unwrap();
+    std::fs::write(replica.join("w/verdict.json"), "{}").unwrap();
     let plan = json!([["w", "plain", [], []]]).to_string();
     let out = codec(&replica, &["pack", &plan], b"");
-    assert!(!out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("limit"));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(
+        left,
+        vec![sync::Skipped {
+            path: "big".into(),
+            why: "limit".into()
+        }]
+    );
+    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        paths,
+        ["verdict.json"],
+        "the seat's other output comes back"
+    );
+    assert!(left[0].describe(Path::new("/h/w")).contains("stream limit"));
     assert!(sync::POD_CODEC.contains(&format!("MAX = {}", sync::MAX_STREAM)));
     let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1498) Build output never comes back: a directory holding a cache-directory tag (cargo writes
+/// one into every target dir, whatever its name: `target/`, `baseline-target/`, a CARGO_TARGET_DIR in
+/// a written-back root) is named once as left out and none of it is packed, in a plain root and in
+/// an untracked, unignored dir of a git tree. A file NAMED `CACHEDIR.TAG` without the tag's
+/// signature marks nothing.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_leaves_tagged_build_output_out() {
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n# cargo\n";
+    let replica = tmp("cachepack");
+    // A plain root (a walkthroughs author dir) with a CARGO_TARGET_DIR inside it.
+    let plain = replica.join("p");
+    std::fs::create_dir_all(plain.join("cargo-target/debug/build")).unwrap();
+    std::fs::write(plain.join("cargo-target/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(plain.join("cargo-target/debug/build/parser.o"), "obj").unwrap();
+    std::fs::create_dir_all(plain.join("cargo-target/inner")).unwrap();
+    std::fs::write(plain.join("cargo-target/inner/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(plain.join("notes.md"), "n").unwrap();
+    std::fs::create_dir_all(plain.join("fake")).unwrap();
+    std::fs::write(plain.join("fake/CACHEDIR.TAG"), "not a tag").unwrap();
+    // A git tree with an untracked, unignored baseline-target/ (run ea75313b's shape).
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("lib.rs"), "a").unwrap();
+    git_in(&t, &["add", "lib.rs"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    std::fs::write(t.join("lib.rs"), "b").unwrap();
+    std::fs::create_dir_all(t.join("baseline-target/debug")).unwrap();
+    std::fs::write(t.join("baseline-target/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(t.join("baseline-target/debug/x.o"), "obj").unwrap();
+    let plan = json!([["p", "plain", [], []], ["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left_p = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(
+        left_p,
+        vec![sync::Skipped {
+            path: "cargo-target".into(),
+            why: "cache".into()
+        }]
+    );
+    let mut paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["fake/CACHEDIR.TAG", "notes.md"]);
+    let left_w = sync::take_skipped(&mut roots[1]).unwrap();
+    assert_eq!(
+        left_w,
+        vec![sync::Skipped {
+            path: "baseline-target".into(),
+            why: "cache".into()
+        }]
+    );
+    let paths: Vec<&str> = roots[1].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["lib.rs"], "the seat's real change still comes back");
+    assert!(left_w[0].describe(&t).contains("build output"));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1498) What the pod left out is kept as the host has it: never a deletion, while a file the
+/// seat really removed is still deleted. A skip naming a git path or an unsafe path refuses.
+#[test]
+fn k8s_a_left_out_path_is_never_a_deletion() {
+    let host = tmp("keep-host");
+    std::fs::create_dir_all(host.join("target/debug")).unwrap();
+    std::fs::write(host.join("target/debug/old.o"), "o").unwrap();
+    std::fs::write(host.join("big.bin"), "b").unwrap();
+    std::fs::write(host.join("gone.txt"), "g").unwrap();
+    let digest = |rel: &str| {
+        sync::digest(&entry(
+            Kind::File,
+            rel,
+            &std::fs::read(host.join(rel)).unwrap(),
+        ))
+    };
+    let base: std::collections::HashMap<String, [u8; 32]> =
+        ["target/debug/old.o", "big.bin", "gone.txt"]
+            .iter()
+            .map(|r| (r.to_string(), digest(r)))
+            .collect();
+    let left = vec![
+        sync::Skipped {
+            path: "target".into(),
+            why: "cache".into(),
+        },
+        sync::Skipped {
+            path: "big.bin".into(),
+            why: "limit".into(),
+        },
+    ];
+    let (writes, deletes) = seat::delta_keeping(&host, &base, Vec::new(), &left).unwrap();
+    assert!(writes.is_empty());
+    assert_eq!(deletes, vec!["gone.txt".to_string()]);
+    let (_, all) = seat::delta(&host, &base, Vec::new()).unwrap();
+    assert_eq!(
+        all.len(),
+        3,
+        "without the skips every path would have been deleted"
+    );
+    for bad in [".git", "a/../b", "/abs"] {
+        let mut r = Root {
+            replica: "t".into(),
+            mode: Mode::Plain,
+            entries: vec![entry(Kind::Skipped, bad, b"cache")],
+        };
+        assert!(sync::take_skipped(&mut r).is_err(), "{bad}");
+    }
+    let _ = std::fs::remove_dir_all(&host);
 }
 
 #[test]

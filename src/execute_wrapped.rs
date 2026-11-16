@@ -7822,8 +7822,16 @@ pub(crate) fn run_bounded(
             None => crate::k8s::seat::Ending::Exited(code),
         };
         match crate::k8s::seat::settle_unless(seat, ending, &is_cancelled) {
-            Ok(c) if killed_by.is_none() => code = c,
-            Ok(_) => {}
+            Ok((c, left_out)) => {
+                // (core#1498) What the write-back left out is a step warning, never a failure.
+                for w in &left_out {
+                    eprintln!("wicked-core: {w}");
+                    emit(&format!("\n[wicked-core] {w}\n"));
+                }
+                if killed_by.is_none() {
+                    code = c;
+                }
+            }
             // Could not run, with no trusted exit code, but what the CLI produced is kept as the
             // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
             // minutes of output, usage and tool records.
