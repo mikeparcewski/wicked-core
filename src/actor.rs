@@ -10322,7 +10322,8 @@ enum Reseat {
 /// (core#572) Refuse a reassignment onto a seat whose registry record says it may vote but not
 /// work (`seat_eligible_for_work = false`). A key with no record (an ad-hoc seat) is not judged.
 fn refuse_ballot_only_target(cli: &str) -> anyhow::Result<()> {
-    let registry = crate::registry_roster();
+    // Eligibility only: the records, never the sign-in fill (studio#1170: a read-only caller).
+    let registry = crate::registry_records();
     let record = registry.iter().find(|c| c.key == cli).or_else(|| {
         registry
             .iter()
@@ -30391,6 +30392,19 @@ mod request_changes_tests {
         assert_eq!(judgment.note, crate::NoteRule::Required);
     }
 
+    /// (review r2) The QE shapes HERMETIC: the work is built and QE-executed on `codex`, so the one
+    /// seat a QE redo can draw is `claude`, which every skills source admits (the live plugin cache
+    /// hands non-Claude seats nothing; CI has no cache). The golden list is then the same anywhere.
+    fn qe_on_codex(store: &mut dyn GraphStore, run_id: &str) {
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        for u in units.iter_mut().take(4) {
+            u.assigned_cli = Some("codex".into());
+            put_node(store, u.to_node()).unwrap();
+        }
+        units[2].authored_by = vec!["codex".into()];
+        put_node(store, units[2].to_node()).unwrap();
+    }
+
     /// An escalation only the isolated QE reviewer denied, with no verdict (INCONCLUSIVE): the QE
     /// redo is listed beside the operator's judgment; a recorded FAIL takes no redo.
     #[test]
@@ -30408,6 +30422,7 @@ mod request_changes_tests {
                 ),
                 true,
             );
+            qe_on_codex(store, run_id);
         };
         let listed = listed_is_accepted("qe-inconclusive", &inconclusive);
         assert!(
@@ -30433,6 +30448,7 @@ mod request_changes_tests {
                 qe_record(crate::qe_acceptance::review::OUTCOME_FAIL, Some("FAIL")),
                 true,
             );
+            qe_on_codex(store, run_id);
         };
         let listed = listed_is_accepted("qe-fail", &fail);
         assert!(
@@ -30628,6 +30644,40 @@ mod request_changes_tests {
             "land_with_carried_items"
         );
         assert!(action(&listed, crate::rule_check::SKIP_ACTION).is_none());
+    }
+
+    /// (review r2) A team dispute's approve WITH a note is its send-back (`answer_dispute_gate`
+    /// reworks the step): the list says so (`noteIntent: send_back`), never a noted continue.
+    #[test]
+    fn gate_actions_team_dispute_says_a_noted_approve_sends_back() {
+        let run_id = format!("ga-dispute-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        s.unit_ix = 2;
+        s.team = Some(crate::domain::RunTeamState {
+            dispute: Some(crate::domain::DisputeGate {
+                gate_id: "g-1".into(),
+                ord: 3,
+                attempt: 0,
+                kind: crate::domain::DisputeKind::Finding,
+                finding_ids: vec!["F1".into()],
+            }),
+            ..Default::default()
+        });
+        put_node(&mut store, s.to_node()).unwrap();
+        open_row(&mut store, &run_id, 3, team_gate::TEAM_DISPUTE_GATE);
+        let listed = gate_actions::gate_actions(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let approve = action(&listed, "approve").expect("approve");
+        assert_eq!(
+            approve.note_intent.as_deref(),
+            Some("send_back"),
+            "{listed:#?}"
+        );
     }
 
     /// (core#782) A read-only phase's floor gate: an approve with a note is a FLOOR FIX.

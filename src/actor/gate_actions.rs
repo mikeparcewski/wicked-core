@@ -257,8 +257,6 @@ fn consent_actions(
         })
         .collect();
     actions.splice(at..at, choices);
-    // A consent gate's approve runs the step on the plan's default: never a reassign of it here.
-    actions.retain(|a| a.action != "reassign");
     Ok(actions)
 }
 
@@ -331,6 +329,10 @@ fn answer_actions(
             && super::floor_fix_route_for(store, session, run_id, &noted, adjudication_open)?
         {
             a.note_intent = Some("floor_fix".to_string());
+        } else if note != NoteRule::None && super::team_gate::dispute_gate_open(session) {
+            // A team dispute's approve WITH a note is its send-back (`answer_dispute_gate`:
+            // `DisputeAmended` reworks the step), never a continue.
+            a.note_intent = Some("send_back".to_string());
         }
         actions.push(a);
     }
