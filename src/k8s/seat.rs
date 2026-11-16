@@ -2363,7 +2363,12 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
     for (want, entries, left_out) in checked {
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
-        let retained = retained_links(&entries, &base);
+        let mut retained = retained_links(&entries, &base);
+        retained.extend(
+            left_out_links(&want.host, &base, &left_out).map_err(|e| {
+                format!("the write-back of {} was refused: {e}", want.host.display())
+            })?,
+        );
         let (writes, mut deletes) = delta_keeping(&want.host, &base, entries, &left_out)?;
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             deletes.retain(|d| !in_node_modules(d));
@@ -2689,9 +2694,36 @@ pub(crate) fn delta_keeping(
     entries: Vec<Entry>,
     left_out: &[sync::Skipped],
 ) -> Result<(Vec<Entry>, Vec<String>), String> {
-    let (writes, mut deletes) = delta(host, base, entries)?;
-    deletes.retain(|d| !left_out.iter().any(|s| s.covers(d)));
-    Ok((writes, deletes))
+    // (codex r1) Left out BEFORE the deletion check: a path the host changed meanwhile under a
+    // skip is no conflict, because nothing of it is written or deleted.
+    let kept: HashMap<String, [u8; 32]> = base
+        .iter()
+        .filter(|(p, _)| !left_out.iter().any(|s| s.covers(p)))
+        .map(|(p, d)| (p.clone(), *d))
+        .collect();
+    delta(host, &kept, entries)
+}
+
+/// (codex r1) The host's links a skip keeps as they are (left-out baseline paths the host still
+/// holds unchanged): they join the retained-link check, so what the unit changes around them can
+/// never make one resolve outside its root.
+pub(crate) fn left_out_links(
+    host: &Path,
+    base: &HashMap<String, [u8; 32]>,
+    left_out: &[sync::Skipped],
+) -> Result<Vec<Entry>, String> {
+    let mut out = Vec::new();
+    for (rel, was) in base {
+        if !left_out.iter().any(|s| s.covers(rel)) {
+            continue;
+        }
+        if let Some(e) = sync::read_host_entry(host, rel)? {
+            if e.kind == sync::Kind::Link && &sync::digest(&e) == was {
+                out.push(e);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// What the seat changed in one root against its copy-in `base` (pure over the host's current

@@ -2276,15 +2276,87 @@ fn k8s_a_left_out_path_is_never_a_deletion() {
         3,
         "without the skips every path would have been deleted"
     );
-    for bad in [".git", "a/../b", "/abs"] {
+    for (bad, why) in [
+        (".git", "cache"),
+        ("a/../b", "cache"),
+        ("/abs", "cache"),
+        ("", "cache"),
+        ("x", "anything"),
+    ] {
         let mut r = Root {
             replica: "t".into(),
             mode: Mode::Plain,
-            entries: vec![entry(Kind::Skipped, bad, b"cache")],
+            entries: vec![entry(Kind::Skipped, bad, why.as_bytes())],
         };
-        assert!(sync::take_skipped(&mut r).is_err(), "{bad}");
+        assert!(sync::take_skipped(&mut r).is_err(), "{bad} {why}");
     }
+    // (codex r1) A file left out for the limit covers that path only: a subtree it replaced is
+    // still a deletion.
+    let limit = sync::Skipped {
+        path: "src".into(),
+        why: "limit".into(),
+    };
+    assert!(limit.covers("src") && !limit.covers("src/gone.rs"));
+    // (codex r1) A host change under a skip is no conflict: nothing there is written or deleted.
+    std::fs::write(host.join("target/debug/old.o"), "changed on the host").unwrap();
+    let (_, deletes) = seat::delta_keeping(&host, &base, Vec::new(), &left).unwrap();
+    assert_eq!(deletes, vec!["gone.txt".to_string()]);
+    assert!(
+        seat::delta(&host, &base, Vec::new()).is_err(),
+        "delta alone calls it a conflict"
+    );
     let _ = std::fs::remove_dir_all(&host);
+}
+
+/// (core#1498, codex r1) A planted tag never hides tracked work, an ignored tag still marks its
+/// build dir, and the root is never left out: in a git tree, a tag in a dir holding a tracked file
+/// marks nothing (the tracked edit and deletion still come back); a tag the tree ignores still
+/// marks an untracked dir; a tag at the root marks nothing.
+#[cfg(unix)]
+#[test]
+fn k8s_a_cache_tag_never_hides_tracked_work_and_needs_no_listing() {
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    let replica = tmp("cachepack-guard");
+    let t = replica.join("w");
+    std::fs::create_dir_all(t.join("src")).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("src/changed.rs"), "a").unwrap();
+    std::fs::write(t.join("src/deleted.rs"), "d").unwrap();
+    std::fs::write(t.join(".gitignore"), "CACHEDIR.TAG\n").unwrap();
+    git_in(&t, &["add", "-A"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    std::fs::write(t.join("src/changed.rs"), "b").unwrap();
+    std::fs::remove_file(t.join("src/deleted.rs")).unwrap();
+    std::fs::write(t.join("src/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(t.join("CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::create_dir_all(t.join("baseline-target/debug")).unwrap();
+    std::fs::write(t.join("baseline-target/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(t.join("baseline-target/debug/parser.o"), "obj").unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(
+        left,
+        vec![sync::Skipped {
+            path: "baseline-target".into(),
+            why: "cache".into()
+        }],
+        "only the untracked build dir, though git ignores its tag"
+    );
+    let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    assert!(paths.contains(&"src/changed.rs"), "{paths:?}");
+    assert!(!paths.contains(&"src/deleted.rs"), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.starts_with("baseline-target")),
+        "{paths:?}"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
 }
 
 #[test]

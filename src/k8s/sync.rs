@@ -88,7 +88,7 @@ pub(crate) enum Kind {
     /// Anything else the pod found (a fifo, a socket, a device): always refused on write-back.
     Other,
     /// (core#1498) A path the pod LEFT OUT of a write-back, never written and never a deletion:
-    /// the path (a directory or a file; empty = the whole root) and why in the body (`cache`: a
+    /// the path (a directory or a file, never the root) and why in the body (`cache`: a
     /// build-output directory, marked by a cache-directory tag; `limit`: the file would take the
     /// stream past its limit). Only the pod sends it; [`take_skipped`] removes it before any check.
     Skipped,
@@ -235,8 +235,8 @@ pub(crate) fn decode(r: &mut dyn Read, limit: u64) -> Result<Vec<Root>, String> 
     }
 }
 
-/// (core#1498) One path the pod left out of a write-back ([`Kind::Skipped`]): relative to its root
-/// (empty = the whole root), and why.
+/// (core#1498) One path the pod left out of a write-back ([`Kind::Skipped`]): relative to its root,
+/// and why (`cache` | `limit`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Skipped {
     pub(crate) path: String,
@@ -244,18 +244,19 @@ pub(crate) struct Skipped {
 }
 
 impl Skipped {
-    /// Whether `rel` is this path or lies under it.
+    /// Whether `rel` is left out by this skip: a cache dir covers everything under it; a file left
+    /// out for the limit covers that one path only (codex r1: never a subtree it replaced).
     pub(crate) fn covers(&self, rel: &str) -> bool {
-        self.path.is_empty() || under(rel, &self.path)
+        if self.why == "limit" {
+            fold(rel) == fold(&self.path)
+        } else {
+            under(rel, &self.path)
+        }
     }
 
     /// The step warning's words for it, `root` being the host root it was left out of.
     pub(crate) fn describe(&self, root: &Path) -> String {
-        let at = if self.path.is_empty() {
-            root.display().to_string()
-        } else {
-            format!("{} in {}", self.path, root.display())
-        };
+        let at = format!("{} in {}", self.path, root.display());
         match self.why.as_str() {
             "cache" => format!(
                 "the write-back left out {at}: build output (a directory holding a cache-directory \
@@ -271,8 +272,8 @@ impl Skipped {
 }
 
 /// (core#1498) Remove the [`Kind::Skipped`] entries from a written-back root and return them, each
-/// path checked as a plain relative path (empty = the whole root): nothing the pod skipped is ever
-/// written, and none of it reads as a deletion.
+/// path checked as a plain relative, non-git path with a known reason: nothing the pod skipped is
+/// ever written, and none of it reads as a deletion.
 pub(crate) fn take_skipped(root: &mut Root) -> Result<Vec<Skipped>, String> {
     let mut out = Vec::new();
     let mut kept = Vec::with_capacity(root.entries.len());
@@ -281,16 +282,16 @@ pub(crate) fn take_skipped(root: &mut Root) -> Result<Vec<Skipped>, String> {
             kept.push(e);
             continue;
         }
-        if !e.path.is_empty() {
-            components(&e.path)?;
-            if e.path.split('/').any(is_git_name) {
-                return Err(format!("`{}` is a git path, never a skip", e.path));
-            }
+        // Never the whole root, never a git path, and only the two reasons the pod sends.
+        components(&e.path)?;
+        if e.path.split('/').any(is_git_name) {
+            return Err(format!("`{}` is a git path, never a skip", e.path));
         }
-        out.push(Skipped {
-            path: e.path,
-            why: String::from_utf8_lossy(&e.data).chars().take(40).collect(),
-        });
+        let why = String::from_utf8_lossy(&e.data).into_owned();
+        if why != "cache" && why != "limit" {
+            return Err(format!("`{}` is skipped for an unknown reason", e.path));
+        }
+        out.push(Skipped { path: e.path, why });
     }
     root.entries = kept;
     Ok(out)
@@ -1342,18 +1343,26 @@ def plain_list(rootfd):
     walk(rootfd, "")
     return sorted(out)
 def head(out, k, p, n):
-    global SENT
+    global SENT, ENTRIES
     p = p.encode("utf-8", "surrogateescape")
+    # (core#1498, codex r1) Every record is counted against both limits the engine's decoder
+    # enforces, so a pack that the engine would refuse dies here, never mid-stream.
+    ENTRIES += 1
+    if ENTRIES > MAX_ENTRIES: die("the write-back has more entries than the stream's limit")
+    if SENT + 13 + len(p) + n > MAX: die("the write-back is larger than the stream's limit")
     SENT += 13 + len(p)
     out.write(k + struct.pack(">I", len(p)) + p + struct.pack(">Q", n))
 def put(out, k, p, d):
-    head(out, k, p, len(d)); out.write(d)
+    global SENT
+    head(out, k, p, len(d)); SENT += len(d); out.write(d)
 def isgit(rel): return any(c == ".git" for c in rel.split("/"))
 MAX = 536870912
 # (core#1498) What file bodies and headers may take: the stream's limit less a reserve for the
 # skip markers and the end marker, so a write-back that leaves files out still fits.
 BUDGET = MAX - (64 << 20)
 SENT = 0
+MAX_ENTRIES = 400000
+ENTRIES = 0
 # (core#1498) The cache-directory tag (bford.info/cachedir): cargo writes it into every target
 # dir, whatever its name; a directory holding it is build output and never comes back.
 TAG = "CACHEDIR.TAG"
@@ -1369,13 +1378,29 @@ def is_tag(rootfd, rel):
     with os.fdopen(h, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode): return False
         return fh.read(len(TAG_SIG)) == TAG_SIG
-def caches(rootfd, rels):
-    out = set()
+def caches(rootfd, rels, tracked):
+    # Every directory the listed paths sit in is checked for the tag, listed or not (codex r1: an
+    # ignored CACHEDIR.TAG still marks its dir). Never the root itself, and in a git tree never a
+    # dir that holds a tracked file (codex r1: a planted tag never hides tracked edits or deletions).
+    dirs = set()
     for rel in rels:
-        if (rel == TAG or rel.endswith("/" + TAG)) and is_tag(rootfd, rel):
-            out.add(rel[:-len(TAG)].rstrip("/"))
-    # The outermost only: a tagged dir inside a tagged dir is already left out.
-    return sorted(c for c in out if not any(o != c and (o == "" or c.startswith(o + "/")) for o in out))
+        p = rel.split("/")
+        for i in range(1, len(p)): dirs.add("/".join(p[:i]))
+    held = set()
+    for t in tracked or ():
+        p = t.split("/")
+        for i in range(1, len(p)): held.add("/".join(p[:i]))
+    out = []
+    for d in sorted(dirs, key=lambda x: (x.count("/"), x)):
+        if any(d == o or d.startswith(o + "/") for o in out): continue
+        if d in held: continue
+        if is_tag(rootfd, d + "/" + TAG): out.append(d)
+    return out
+def tracked_list(root):
+    if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"): return []
+    r = git(root, "ls-files", "-z", "-c")
+    if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
+    return [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
 SEEDING = ".wicked-seeding"
 def emit(out, rootfd, rel):
     fd, name = parent(rootfd, rel, False)
@@ -1400,8 +1425,8 @@ def emit(out, rootfd, rel):
                 # changes still come back, and the step says what stayed behind.
                 if n + 13 + len(rel.encode("utf-8", "surrogateescape")) > BUDGET - SENT:
                     put(out, b"s", rel, b"limit"); return
-                SENT += n
                 head(out, b"x" if fs.st_mode & 0o111 else b"f", rel, n)
+                SENT += n
                 left = n
                 while left:
                     b = fh.read(min(left, 1 << 20))
@@ -1522,14 +1547,15 @@ def pack(plan):
             rels = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
             # (core#1498) Build output (a tagged cache dir) never comes back: named once, so
             # the host keeps whatever it had there and the step says it was left out.
-            left = caches(rootfd, [x for x in rels if not any(under(x, s) for s in skip)])
+            left = caches(rootfd, [x for x in rels if not any(under(x, s) for s in skip)],
+                          tracked_list(R + "/" + r) if m == "tree" else None)
             for c in left: put(out, b"s", c, b"cache")
             for rel in rels:
                 if any(under(rel, s) for s in skip): continue
                 # No root but the tree's own `.git` root carries git metadata, either way
                 # (codex b2-sync #17): a plain root's repository stays on the host.
                 if m in ("tree", "plain") and isgit(rel): continue
-                if any(c == "" or under(rel, c) for c in left): continue
+                if any(under(rel, c) for c in left): continue
                 emit(out, rootfd, rel)
         finally: os.close(rootfd)
     put(out, b"E", "", b""); out.flush()
