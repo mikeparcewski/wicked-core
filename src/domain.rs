@@ -2368,10 +2368,11 @@ mod tests {
         };
         let mut bench = vec![b("host floor", true)];
         assert!(!bench_seat(&mut bench, b("host floor again", true)));
-        assert!(bench_seat(&mut bench, b("not_logged_in", false)));
-        assert_eq!(bench, vec![b("not_logged_in", false)]);
+        // A cause that does not lift by itself, so `bench_seat` stamps no backoff (core#1479).
+        assert!(bench_seat(&mut bench, b("not_installed", false)));
+        assert_eq!(bench, vec![b("not_installed", false)]);
         assert!(!bench_seat(&mut bench, b("host floor", true)));
-        assert_eq!(bench, vec![b("not_logged_in", false)]);
+        assert_eq!(bench, vec![b("not_installed", false)]);
         assert!(ungoverned_bench(&[b("host floor", true)]).is_empty());
         let legacy: BenchedSeat =
             serde_json::from_str(r#"{"cli":"pi","reason":"quota_exhausted","source":"ballot"}"#)

@@ -6456,13 +6456,13 @@ fn apply_step_result(
             crate::seat_bench::reconcile_with_refusals(&evidence.bench_reprobes, &refusals);
         let applied = crate::seat_bench::apply_reprobes(&mut session.benched_seats, &reprobes);
         if !applied.is_empty() {
-            // A seat back from a launcher quota bench: the run's launch roster says usable, so a
-            // plan revision that re-reads it does not bench the seat again.
+            // A seat back from a launcher quota or sign-in bench: the run's launch roster says
+            // usable, so a plan revision that re-reads it does not bench the seat again.
             for a in &applied {
                 if let (crate::seat_bench::Applied::Returned { cli, .. }, Some(tp)) =
                     (a, session.team_plan.as_mut())
                 {
-                    crate::seat_bench::clear_launcher_quota_health(&mut tp.roster, cli);
+                    crate::seat_bench::clear_launcher_health(&mut tp.roster, cli);
                 }
             }
             put_node(store, session.to_node())?;
@@ -7143,11 +7143,18 @@ fn apply_step_result(
                         },
                     ) {
                         put_node(store, session.to_node())?;
+                        // (core#1479) A quota or sign-in bench is re-probed when its backoff
+                        // passes (`seat_bench`); only the others last for the run.
+                        let until = crate::seat_bench::until_of(&session.benched_seats, &cli);
                         eprintln!(
                             "wicked-core: seat '{cli}' {} on unit {ord} of {run_id} ({why}); \
-                             benched for the run — never re-dispatched, never a judge (F-7R2-006 \
-                             / F-7R3-001)",
-                            reason.verb()
+                             benched — not dispatched and never a judge {} (F-7R2-006 / \
+                             F-7R3-001)",
+                            reason.verb(),
+                            until.map_or_else(
+                                || "for the run".to_string(),
+                                |u| format!("until its re-probe at {}", crate::seat_bench::iso(u))
+                            )
                         );
                         // The bench on the wire, once, so a launcher can keep the seat out of
                         // its next launches (no ballot tells it any more, core#590 S5).
