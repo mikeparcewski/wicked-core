@@ -1097,8 +1097,23 @@ pub(crate) fn mint_qe_run(ledger_root: &Path, crew_run: &str) -> Result<PathBuf,
                 field(&rec, "id")
             ));
         }
+        // (xreview codex r2) Reused only when wicked-ledger can index it: every NOT NULL column of
+        // `projects` a string (an incomplete row fails its rebuild and orphans the run).
+        if ["created_at", "updated_at"]
+            .iter()
+            .any(|k| field(&rec, k).is_none())
+        {
+            return Err(format!(
+                "the QE project {} is incomplete (no created_at / updated_at)",
+                path.display()
+            ));
+        }
+        // The whole table is read (codex r2): a later unreadable record still refuses the mint,
+        // and two rows under the engine's unique name are refused, not picked between.
+        if project_id.is_some() {
+            return Err(format!("the QE ledger holds two projects named `{name}`"));
+        }
         project_id = Some(stem);
-        break;
     }
     let project_id = match project_id {
         Some(p) => p,

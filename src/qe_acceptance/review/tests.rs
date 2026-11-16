@@ -1910,6 +1910,29 @@ fn the_mint_fails_closed_on_a_bad_project_table_and_reuses_a_deleted_engine_proj
     let e = mint_qe_run(&l.root, RUN).unwrap_err();
     assert!(e.contains("not its filename"), "{e}");
     std::fs::remove_file(projects.join("p-old.json")).unwrap();
+    // (codex r2) An incomplete engine project is refused; a later unreadable record still refuses
+    // even after the engine's own row was found.
+    std::fs::write(
+        projects.join("p-thin.json"),
+        serde_json::json!({"id": "p-thin", "name": engine_project_name(RUN)}).to_string(),
+    )
+    .unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("incomplete"));
+    std::fs::remove_file(projects.join("p-thin.json")).unwrap();
+    std::fs::write(projects.join("a-ok.json"), rec("a-ok", 0)).unwrap();
+    std::fs::write(projects.join("z-broken.json"), "{ not json").unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("z-broken.json"));
+    std::fs::remove_file(projects.join("z-broken.json")).unwrap();
+    std::fs::write(projects.join("b-two.json"), rec("b-two", 0)).unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("two projects"));
+    std::fs::remove_file(projects.join("a-ok.json")).unwrap();
+    std::fs::remove_file(projects.join("b-two.json")).unwrap();
     std::fs::write(projects.join("p-del.json"), rec("p-del", 1)).unwrap();
     let dir = mint_qe_run(&l.root, RUN).unwrap();
     let run = read_record(&l.root.join("runs").join(format!(
