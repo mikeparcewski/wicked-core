@@ -209,6 +209,16 @@ impl PersistentStepRunner {
     }
 }
 
+impl PersistentStepRunner {
+    /// (core#1509) The wall budget one turn runs under on this carrier: its ceiling lowered to the
+    /// unit's own `budget_secs` (`workflow::effective_timeout`), as on every other carrier. The rule
+    /// judge and a seat re-probe set a budget; without this a hung one held the PTY turn for the
+    /// whole ceiling.
+    fn turn_timeout(&self, input: &StepInput) -> std::time::Duration {
+        crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs)
+    }
+}
+
 impl StepRunner for PersistentStepRunner {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         let noop = |_: &str| {};
@@ -499,7 +509,7 @@ impl PersistentStepRunner {
         let result = collect_turn(
             &events,
             &terminal_id,
-            self.timeout,
+            self.turn_timeout(input),
             emit,
             input,
             Some(&self.tx),
@@ -900,6 +910,25 @@ mod tests {
             read_view: None,
             run_context: None,
         }
+    }
+
+    /// (core#1509, codex r1 on #1511) The PTY carrier runs a turn under the unit's own budget when
+    /// it sets one (the rule judge, a re-probe), never only its whole ceiling.
+    #[test]
+    fn a_pty_turn_runs_under_the_units_budget() {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = PersistentStepRunner::new(tx, crate::terminal::new_map());
+        let mut unit = make_unit("judge", "claude -p");
+        let ceiling = runner.timeout;
+        assert_eq!(
+            runner.turn_timeout(&make_input("r", 0, unit.clone())),
+            ceiling
+        );
+        unit.budget_secs = Some(300);
+        assert_eq!(
+            runner.turn_timeout(&make_input("r", 0, unit)),
+            ceiling.min(Duration::from_secs(300))
+        );
     }
 
     fn make_input(run_id: &str, unit_ix: usize, unit: WorkUnit) -> StepInput {
