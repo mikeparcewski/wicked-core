@@ -2365,7 +2365,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
         let mut retained = retained_links(&entries, &base);
         retained.extend(
-            left_out_links(&want.host, &base, &left_out).map_err(|e| {
+            left_out_links(&want.host, &left_out).map_err(|e| {
                 format!("the write-back of {} was refused: {e}", want.host.display())
             })?,
         );
@@ -2704,22 +2704,46 @@ pub(crate) fn delta_keeping(
     delta(host, &kept, entries)
 }
 
-/// (codex r1) The host's links a skip keeps as they are (left-out baseline paths the host still
-/// holds unchanged): they join the retained-link check, so what the unit changes around them can
-/// never make one resolve outside its root.
+/// (codex r1, r2) The host's links a skip keeps as they are: every link the host holds NOW under a
+/// left-out path (a cache dir, or a file left out for the limit), whether or not it changed since
+/// the copy-in. They join the retained-link check, so what the unit changes around them can never
+/// make one resolve outside its root. Only link targets are read, never a regular file's content
+/// (a host file grown past the stream limit under a skip is no refusal).
 pub(crate) fn left_out_links(
     host: &Path,
-    base: &HashMap<String, [u8; 32]>,
     left_out: &[sync::Skipped],
 ) -> Result<Vec<Entry>, String> {
     let mut out = Vec::new();
-    for (rel, was) in base {
-        if !left_out.iter().any(|s| s.covers(rel)) {
-            continue;
+    let mut push_link = |rel: String| -> Result<(), String> {
+        let at = host.join(&rel);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&at)
+                    .map_err(|e| format!("`{rel}` could not be read: {e}"))?;
+                let data = target
+                    .to_str()
+                    .ok_or_else(|| format!("`{rel}` points at a non-UTF-8 path"))?
+                    .as_bytes()
+                    .to_vec();
+                out.push(Entry {
+                    kind: sync::Kind::Link,
+                    path: rel,
+                    data,
+                });
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("`{rel}` could not be read: {e}")),
         }
-        if let Some(e) = sync::read_host_entry(host, rel)? {
-            if e.kind == sync::Kind::Link && &sync::digest(&e) == was {
-                out.push(e);
+    };
+    for s in left_out {
+        push_link(s.path.clone())?;
+        if s.why == "cache"
+            && std::fs::symlink_metadata(host.join(&s.path)).is_ok_and(|m| m.is_dir())
+        {
+            for rel in sync::host_plain_listing(&host.join(&s.path), &[])? {
+                push_link(format!("{}/{rel}", s.path))?;
             }
         }
     }

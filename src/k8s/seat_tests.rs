@@ -3728,3 +3728,56 @@ fn k8s_a_refused_copy_in_is_reported_as_copy_in_refused() {
     assert!(e.contains("larger than"), "{e}");
     let _ = std::fs::remove_dir_all(&host);
 }
+
+/// (core#1498, codex r2) A skip covers its exact spelling only (a folded alias such as a
+/// zero-width-joined or re-cased name never covers another dir's files); the host links a skip keeps
+/// are read as links (a changed one included) and a regular file under it is never read; a tag
+/// inside git metadata marks nothing.
+#[cfg(unix)]
+#[test]
+fn k8s_left_out_paths_are_exact_and_their_host_links_are_checked() {
+    let cache = sync::Skipped {
+        path: "s\u{200c}rc".into(),
+        why: "cache".into(),
+    };
+    assert!(!cache.covers("src/file") && cache.covers("s\u{200c}rc/x.o"));
+    assert!(!sync::Skipped {
+        path: "big".into(),
+        why: "limit".into()
+    }
+    .covers("BIG"));
+    let host = tmp("left-out-links");
+    std::fs::create_dir_all(host.join("cache")).unwrap();
+    std::os::unix::fs::symlink("../a/..", host.join("cache/b")).unwrap();
+    let f = std::fs::File::create(host.join("cache/huge.o")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let links = seat::left_out_links(
+        &host,
+        &[sync::Skipped {
+            path: "cache".into(),
+            why: "cache".into(),
+        }],
+    )
+    .unwrap();
+    assert_eq!(links.len(), 1, "{links:?}");
+    assert_eq!(
+        (links[0].path.as_str(), links[0].data.as_slice()),
+        ("cache/b", &b"../a/.."[..])
+    );
+    let _ = std::fs::remove_dir_all(&host);
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    let replica = tmp("cachepack-git");
+    std::fs::create_dir_all(replica.join("p/.git/objects/cache")).unwrap();
+    std::fs::write(replica.join("p/.git/objects/cache/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(replica.join("p/notes.md"), "n").unwrap();
+    let plan = json!([["p", "plain", [], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&replica);
+}

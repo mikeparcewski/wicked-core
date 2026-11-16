@@ -247,10 +247,16 @@ impl Skipped {
     /// Whether `rel` is left out by this skip: a cache dir covers everything under it; a file left
     /// out for the limit covers that one path only (codex r1: never a subtree it replaced).
     pub(crate) fn covers(&self, rel: &str) -> bool {
+        // (codex r2) EXACT spelling, never folded: the pod lists paths as they are and the copy-in
+        // baseline keeps the host's spelling, so a folded alias (`s\u{200c}rc`, `SRC`) can never
+        // make one directory's tag cover another's files.
         if self.why == "limit" {
-            fold(rel) == fold(&self.path)
+            rel == self.path
         } else {
-            under(rel, &self.path)
+            rel == self.path
+                || rel
+                    .strip_prefix(self.path.as_str())
+                    .is_some_and(|rest| rest.starts_with('/'))
         }
     }
 
@@ -1347,8 +1353,11 @@ def head(out, k, p, n):
     p = p.encode("utf-8", "surrogateescape")
     # (core#1498, codex r1) Every record is counted against both limits the engine's decoder
     # enforces, so a pack that the engine would refuse dies here, never mid-stream.
-    ENTRIES += 1
-    if ENTRIES > MAX_ENTRIES: die("the write-back has more entries than the stream's limit")
+    # Only file, link and skip records count against the decoder's entry limit (roots and the
+    # end marker do not, as in decode()).
+    if k not in (b"R", b"E"):
+        ENTRIES += 1
+        if ENTRIES > MAX_ENTRIES: die("the write-back has more entries than the stream's limit")
     if SENT + 13 + len(p) + n > MAX: die("the write-back is larger than the stream's limit")
     SENT += 13 + len(p)
     out.write(k + struct.pack(">I", len(p)) + p + struct.pack(">Q", n))
@@ -1393,6 +1402,8 @@ def caches(rootfd, rels, tracked):
     out = []
     for d in sorted(dirs, key=lambda x: (x.count("/"), x)):
         if any(d == o or d.startswith(o + "/") for o in out): continue
+        # Never inside git metadata (codex r2): the engine refuses a git skip path.
+        if isgit(d): continue
         if d in held: continue
         if is_tag(rootfd, d + "/" + TAG): out.append(d)
     return out

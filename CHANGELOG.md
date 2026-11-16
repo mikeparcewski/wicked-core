@@ -54,6 +54,14 @@ Two release tracks share this file, newest entry first regardless of track:
   refusing the whole write-back (run ea75313b lost a QE PASS that way). What is left out is never
   written and never read as a deletion, and the step's output names each path. Seats already get a
   default CARGO_TARGET_DIR outside the worktree (`seat-build/<cli>/target`).
+- **Uncommitted build output in a written-back root no longer fails the run (core#1498).** The
+  Kubernetes write-back leaves out a directory holding a cache-directory tag (`CACHEDIR.TAG`, which
+  cargo writes into every target dir whatever its name: `baseline-target/`, a CARGO_TARGET_DIR in a
+  walkthroughs dir), unless it is the root, git metadata or holds a tracked file, and any file that
+  would take the stream past its limit, instead of refusing the whole write-back (run ea75313b lost a
+  QE PASS that way). What is left out is never written and never read as a deletion, and the step's
+  output names each path. Build output a seat COMMITS still lands through its commits, as before.
+  Seats already get a default CARGO_TARGET_DIR outside the worktree (`seat-build/<cli>/target`).
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently
   selecting open egress. Only an unset value selects the open default. Gemini telemetry and
