@@ -239,23 +239,13 @@ impl StepRunner for ScriptedSeat {
                         let root = Path::new(input.unit.qe_ledger_root.as_deref().unwrap());
                         match input.unit.qe_review_session.as_deref() {
                             None => {
-                                let id = "0b6b5f0e-2c1d-4a8e-9f1e-3d2c1b0a9f8e";
-                                let dir = root.join("evidence").join(id);
-                                std::fs::create_dir_all(&dir).unwrap();
-                                std::fs::create_dir_all(root.join("runs")).unwrap();
+                                // (core#1484) The engine made the attempt's QE run and its dir.
+                                let dir = std::path::PathBuf::from(
+                                    input.unit.qe_evidence_dir.clone().expect("engine dir"),
+                                );
                                 std::fs::write(dir.join("test-plan.md"), "# plan\n").unwrap();
                                 std::fs::write(dir.join("scenario.md"), "# scenario\n").unwrap();
                                 std::fs::write(dir.join("evidence.json"), "{}\n").unwrap();
-                                std::fs::write(
-                                    root.join("runs").join(format!("{id}.json")),
-                                    serde_json::json!({
-                                        "id": id, "created_at": iso_now(),
-                                        "status": "running", "crew_run_id": input.run_id,
-                                        "evidence_path": dir.to_string_lossy(),
-                                    })
-                                    .to_string(),
-                                )
-                                .unwrap();
                                 output.push_str(&format!("\nQE-EVIDENCE: {}", dir.display()));
                             }
                             Some(nonce) => {
@@ -265,7 +255,7 @@ impl StepRunner for ScriptedSeat {
                                     verdicts.join("v-review.json"),
                                     serde_json::json!({
                                         "id": "v-review", "created_at": iso_now(),
-                                        "run_id": "0b6b5f0e-2c1d-4a8e-9f1e-3d2c1b0a9f8e",
+                                        "run_id": reviewed_run(input),
                                         "verdict": "PASS", "crew_run_id": input.run_id,
                                         "review_session": nonce,
                                     })
@@ -2136,4 +2126,17 @@ fn a_read_only_understand_step_that_changes_the_tree_is_still_discarded() {
         "the read-only step's write was DISCARDED"
     );
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// (core#1484) The QE run the engine made for this attempt, read off the reviewer's brief
+/// (`… --evidence <dir>. …`): the reviewer records its verdict on that run.
+fn reviewed_run(input: &StepInput) -> String {
+    input
+        .unit
+        .description
+        .split_once("--evidence ")
+        .and_then(|(_, rest)| rest.split_once(". "))
+        .and_then(|(dir, _)| std::path::Path::new(dir).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .expect("the reviewer brief names the evidence dir")
 }

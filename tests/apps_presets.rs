@@ -227,25 +227,20 @@ impl StepRunner for ScriptedSeat {
 /// it on a `QE-EVIDENCE:` line; the engine's isolated reviewer turn (its nonce set) records a PASS
 /// stamped with that nonce.
 fn qe_turn(input: &StepInput, root: &Path, pass: bool) -> String {
-    let id = "5d1e7c2a-9b3f-4e8d-a1c6-0f2e4b6d8a9c";
+    let _ = root;
     match input.unit.qe_review_session.as_deref() {
+        // (core#1484) The engine made the attempt's QE run and its dir; the executor writes there.
         None => {
-            let dir = root.join("evidence").join(id);
-            std::fs::create_dir_all(&dir).unwrap();
-            std::fs::create_dir_all(root.join("runs")).unwrap();
+            let dir = std::path::PathBuf::from(
+                input
+                    .unit
+                    .qe_evidence_dir
+                    .clone()
+                    .expect("the engine made the evidence dir"),
+            );
             std::fs::write(dir.join("test-plan.md"), "# publish check evidence\n").unwrap();
             std::fs::write(dir.join("scenario.md"), "# every page, filter and card\n").unwrap();
             std::fs::write(dir.join("evidence.json"), "{}\n").unwrap();
-            std::fs::write(
-                root.join("runs").join(format!("{id}.json")),
-                serde_json::json!({
-                    "id": id, "created_at": iso_now(),
-                    "status": "running", "crew_run_id": input.run_id,
-                    "evidence_path": dir.to_string_lossy(),
-                })
-                .to_string(),
-            )
-            .unwrap();
             format!("\nQE-EVIDENCE: {}", dir.display())
         }
         Some(nonce) => {
@@ -255,7 +250,7 @@ fn qe_turn(input: &StepInput, root: &Path, pass: bool) -> String {
                 verdicts.join("v-review.json"),
                 serde_json::json!({
                     "id": "v-review", "created_at": iso_now(),
-                    "run_id": id,
+                    "run_id": reviewed_run(input),
                     "verdict": if pass { "PASS" } else { "FAIL" },
                     "crew_run_id": input.run_id,
                     "review_session": nonce,
@@ -266,6 +261,19 @@ fn qe_turn(input: &StepInput, root: &Path, pass: bool) -> String {
             String::new()
         }
     }
+}
+
+/// (core#1484) The QE run the engine made for this attempt, read off the reviewer's brief
+/// (`… --evidence <dir>. …`): the reviewer records its verdict on that run.
+fn reviewed_run(input: &StepInput) -> String {
+    input
+        .unit
+        .description
+        .split_once("--evidence ")
+        .and_then(|(_, rest)| rest.split_once(". "))
+        .and_then(|(dir, _)| std::path::Path::new(dir).file_name())
+        .map(|n| n.to_string_lossy().into_owned())
+        .expect("the reviewer brief names the evidence dir")
 }
 
 fn iso_now() -> String {
