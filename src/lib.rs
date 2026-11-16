@@ -237,6 +237,7 @@ pub(crate) mod test_env {
 }
 
 pub use acp_runner::AcpStepRunner;
+pub use actor::gate_actions::{GateAction, GateActions, NoteRule};
 pub use actor::{NoEligibleSeat, RunBusy, RunExists, CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 pub use actor_stats::{ActorStatsView, CommandTiming, RunningCommand, SlowCommand};
 pub use applications::{
@@ -1242,6 +1243,23 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::RejudgeReadiness {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (studio#1170, crew#1512) Every answer the run's open gate takes NOW — its token, what it
+    /// does at this gate, whether it needs a note, and a reassign's seats — computed by running
+    /// each candidate through the decision path's own pre-checks, so the list is exactly what
+    /// [`Core::confirm_gate`] (and a parked reassign) accepts. `None` when the run is not awaiting
+    /// a human. Read-only.
+    pub fn gate_actions(&self, run_id: &str) -> anyhow::Result<Option<GateActions>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::GateActions {
                 run_id: run_id.to_string(),
                 reply,
             })

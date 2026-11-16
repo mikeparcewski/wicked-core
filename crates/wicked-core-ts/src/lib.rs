@@ -1892,6 +1892,20 @@ impl Core {
         })
     }
 
+    /// (studio#1170, crew#1512) Every answer the run's open gate takes NOW, as a JSON
+    /// `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
+    /// noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
+    /// human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
+    /// approve) accepts; nothing else is. Read-only.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn gate_actions(&self, run_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let r = core.gate_actions(&run_id).map_err(err)?;
+            serde_json::to_string(&r).map_err(err)
+        })
+    }
+
     /// List every registered repository, as a JSON array of `RepoEntry` objects.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn list_repos(&self) -> AsyncTask<CoreTask> {

@@ -36,6 +36,7 @@ use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
 mod dispatch_probe;
+pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
@@ -2684,6 +2685,9 @@ pub(crate) fn run(
             }
             Command::RejudgeReadiness { run_id, reply } => {
                 let _ = reply.send(rejudge_readiness(&store, &run_id));
+            }
+            Command::GateActions { run_id, reply } => {
+                let _ = reply.send(gate_actions::gate_actions(&store, &run_id));
             }
             Command::RegisterDenyPolicy {
                 phase,
@@ -10333,25 +10337,19 @@ fn refuse_ballot_only_target(cli: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn reseat_parked_unit(
-    store: &mut dyn GraphStore,
-    subscribers: &mut crate::event_log::EventSink,
+/// (core#773) Why a run PARKED at a gate refuses to re-seat its cursor unit `ord` on `cli`, or
+/// `Ok` when [`reseat_parked_unit`] would take it — READ-ONLY, so the gate's published actions
+/// ([`gate_actions::gate_actions`]) name exactly the seats a reassign is accepted on.
+pub(crate) fn parked_reseat_refusal(
     session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
     ord: u32,
-    new_cli: Option<&str>,
+    cli: &str,
 ) -> anyhow::Result<()> {
-    // (core#572) An explicit target was already refused if ballot-only (`ReassignUnit`).
     let run_id = &session.id;
     if let Some(why) = team_gate::dispatch_blocked(session) {
         anyhow::bail!("cannot reassign: {why}");
     }
-    let Some(cli) = new_cli.filter(|c| !c.trim().is_empty()) else {
-        anyhow::bail!(
-            "run {run_id} is parked at a gate: name the seat to reassign unit {ord} to (a \
-             re-route needs a running unit)"
-        );
-    };
-    let units = crate::domain::session_units(store, run_id)?;
     let Some(unit) = units.get(session.unit_ix) else {
         anyhow::bail!(
             "run {run_id} cursor unit_ix {} out of range",
@@ -10376,6 +10374,30 @@ fn reseat_parked_unit(
     if let Some(why) = crate::apps::reassign_refusal(session, cli) {
         anyhow::bail!("run {run_id}: {why}");
     }
+    Ok(())
+}
+
+fn reseat_parked_unit(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    session: &crate::domain::AgentSession,
+    ord: u32,
+    new_cli: Option<&str>,
+) -> anyhow::Result<()> {
+    // (core#572) An explicit target was already refused if ballot-only (`ReassignUnit`).
+    let run_id = &session.id;
+    let Some(cli) = new_cli.filter(|c| !c.trim().is_empty()) else {
+        if let Some(why) = team_gate::dispatch_blocked(session) {
+            anyhow::bail!("cannot reassign: {why}");
+        }
+        anyhow::bail!(
+            "run {run_id} is parked at a gate: name the seat to reassign unit {ord} to (a \
+             re-route needs a running unit)"
+        );
+    };
+    let units = crate::domain::session_units(store, run_id)?;
+    parked_reseat_refusal(session, &units, ord, cli)?;
+    let unit = &units[session.unit_ix];
     let previous_cli = unit
         .assigned_cli
         .clone()
@@ -15847,6 +15869,66 @@ fn land_plan_note(
     amend_unit(store, subscribers, run_id, u, note, scope.as_wire())
 }
 
+/// (DES-TEAMING-002 §8.6, T3) Why a `plan_approval` gate refuses `decision`, or `Ok` when
+/// [`confirm_plan_gate`] takes it — READ-ONLY, so the gate's published actions
+/// ([`gate_actions::gate_actions`]) are the answers this accepts. `cursor_not_run`: the gate's unit
+/// has not run; `names_rev`: the answer carries the plan revision it answers.
+pub(crate) fn plan_answer_refusal(
+    decision: &crate::workflow::HumanDecision,
+    ord: u32,
+    cursor_not_run: bool,
+    names_rev: bool,
+) -> anyhow::Result<()> {
+    use crate::workflow::HumanDecision;
+    match decision {
+        // (DES-CATALOG-002 §2.4) A SEND-BACK: accepted only with the plan revision it answers
+        // (an older client's request for changes is refused, as before), before any unit of the
+        // plan has run.
+        HumanDecision::RequestChanges { .. } => {
+            if !names_rev {
+                anyhow::bail!(
+                    "a plan_approval gate reviews a plan, not work — approve, approve with an \
+                     edited plan, or reject (a send-back needs the plan revision it answers)"
+                );
+            }
+            if !cursor_not_run {
+                anyhow::bail!(
+                    "unit {ord} is not pending — a plan is sent back only before it runs"
+                );
+            }
+        }
+        HumanDecision::Approve { .. } | HumanDecision::EditPlan { .. } => {
+            // A finished unit is never re-dispatched: the cursor must not have run.
+            if !cursor_not_run {
+                anyhow::bail!(
+                    "unit {ord} is not pending — a plan_approval gate releases only a unit that \
+                     has not run"
+                );
+            }
+            // (T4, §8.7) An edit at a mid-run gate ADDS to the held plan: the units that ran
+            // are kept as they ran (`stage_edit`), so it is answered like any other edit.
+        }
+        HumanDecision::Reject => {}
+        // (core#555) An intent amendment is refused here too: a plan gate's own edit arm is the
+        // edited plan, and an amendment at intake would change an acceptance list no unit has
+        // been judged against yet.
+        HumanDecision::FloorRerun(_)
+        | HumanDecision::AcceptSuggestion
+        | HumanDecision::AmendIntent { .. }
+        | HumanDecision::ConsentChoice { .. }
+        | HumanDecision::Rejudge
+        | HumanDecision::RetryQe
+        | HumanDecision::RecheckRules { .. }
+        | HumanDecision::OperatorJudgment { .. }
+        | HumanDecision::SkipQe { .. } => anyhow::bail!(
+            "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
+             amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
+             plan, or reject"
+        ),
+    }
+    Ok(())
+}
+
 /// (DES-TEAMING-002 §8.6, T3) The `plan_approval` arm of [`confirm_gate`], entered when the run's
 /// OPEN interaction row is a plan gate (DES-001 §6.7: its `gate_kind` is read before the row is
 /// resolved). Approve releases the held plan (`gate.decided{human_approved}` →
@@ -15899,22 +15981,16 @@ fn confirm_plan_gate(
     // gate's unit and its held plan revision.
     check_gate_expect(run_id, expect, ord, Some(pending.rev))?;
     // REFUSE BEFORE RESOLVING (DES-L1 PR-1B M3): the row stays open on every refusal here.
+    plan_answer_refusal(
+        &decision,
+        ord,
+        cursor.is_some_and(not_run),
+        expect.and_then(|e| e.plan_rev).is_some(),
+    )?;
     match &decision {
-        // (DES-CATALOG-002 §2.4) A SEND-BACK: accepted only with the plan revision it answers
-        // (an older client's request for changes is refused, as before), before any unit of the
-        // plan has run.
+        // (DES-CATALOG-002 §2.4) A SEND-BACK (accepted above only with the plan revision it
+        // answers, before any unit of the plan has run).
         HumanDecision::RequestChanges { note } => {
-            if expect.and_then(|e| e.plan_rev).is_none() {
-                anyhow::bail!(
-                    "a plan_approval gate reviews a plan, not work — approve, approve with an \
-                     edited plan, or reject (a send-back needs the plan revision it answers)"
-                );
-            }
-            if !cursor.is_some_and(not_run) {
-                anyhow::bail!(
-                    "unit {ord} is not pending — a plan is sent back only before it runs"
-                );
-            }
             return start_send_back(
                 store,
                 runner,
@@ -15928,34 +16004,7 @@ fn confirm_plan_gate(
                 note.clone(),
             );
         }
-        HumanDecision::Approve { .. } | HumanDecision::EditPlan { .. } => {
-            // A finished unit is never re-dispatched: the cursor must not have run.
-            if !cursor.is_some_and(not_run) {
-                anyhow::bail!(
-                    "unit {ord} is not pending — a plan_approval gate releases only a unit that \
-                     has not run"
-                );
-            }
-            // (T4, §8.7) An edit at a mid-run gate ADDS to the held plan: the units that ran
-            // are kept as they ran (`stage_edit`), so it is answered like any other edit.
-        }
-        HumanDecision::Reject => {}
-        // (core#555) An intent amendment is refused here too: a plan gate's own edit arm is the
-        // edited plan, and an amendment at intake would change an acceptance list no unit has
-        // been judged against yet.
-        HumanDecision::FloorRerun(_)
-        | HumanDecision::AcceptSuggestion
-        | HumanDecision::AmendIntent { .. }
-        | HumanDecision::ConsentChoice { .. }
-        | HumanDecision::Rejudge
-        | HumanDecision::RetryQe
-        | HumanDecision::RecheckRules { .. }
-        | HumanDecision::OperatorJudgment { .. }
-        | HumanDecision::SkipQe { .. } => anyhow::bail!(
-            "a plan_approval gate reviews a plan, not a floor, an evaluator's edit, an intent \
-             amendment, a judge re-run, a QE redo or a QE skip — approve, approve with an edited \
-             plan, or reject"
-        ),
+        _ => {}
     }
     // (crew#1139) THE OPERATOR'S NOTE: an approve's `amend` (with or without an edited plan) is
     // carried to the steps the plan releases. It is staged with the answer and lands only when the
@@ -17108,222 +17157,24 @@ pub(crate) fn confirm_gate_expecting(
     // (core#782) An approve WITH A NOTE at a read-only phase's floor gate is a FLOOR FIX: the
     // note goes to a seat that can write, then only the floor re-runs (`floor_fix_request`) —
     // never appended to the read-only phase, which could not act on it.
-    let floor_fix_route = !adjudication_open
-        && !team_gate::transport_gate_open(&session)
-        && !team_gate::dispute_gate_open(&session)
-        && matches!(
-            &decision,
-            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if !a.trim().is_empty()
-        )
-        && crate::domain::session_units(store, run_id)?
-            .get(session.unit_ix)
-            .is_some_and(floor_fix_applies);
+    let floor_fix_route =
+        floor_fix_route_for(&*store, &session, run_id, &decision, adjudication_open)?;
 
     // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
-    // second read after it could refuse an answer whose row is already answered.
-    let mut armed_rejudge: Option<crate::domain::RequestedRejudge> = None;
-    // (DES-RULE-CHECK-001 S2) The rule skips a `skip_rules` answer lands with its re-check.
-    let mut armed_rule_skips: Vec<crate::rule_check::RuleSkip> = Vec::new();
-    // (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the two arms that can be refused
-    // are checked here, before the durable prompt below is marked `answered` — a refused answer
-    // must leave the gate row OPEN (the run stays paused and re-answerable, and the prompts surface
-    // keeps showing it). The same rules are re-derived where the arms execute; these are the gate.
-    {
-        let units = crate::domain::session_units(store, run_id)?;
-        let cursor = units.get(session.unit_ix);
-        let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
-        // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
-        // the capped review's "land with carried items" would land it over the reviewer's FAIL.
-        // Refused here, so the adjudication gate stays open for request changes or reject.
-        if let (true, Some(preset), crate::workflow::HumanDecision::Approve { .. }) = (
-            adjudication_open,
-            crate::apps::run_preset(&session),
-            &decision,
-        ) {
-            anyhow::bail!(
-                "run {run_id} is an `{preset}` run, which lands only on a passing review — \
-                 request changes (one more round) or reject"
-            );
-        }
-        // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
-        // refused here, before the row resolves and before its `gate.decided` is published, when
-        // there is no creator to rerun (a member-step dispute reworks the member instead).
-        let dispute_amend = team_gate::dispute_gate_open(&session)
-            && session
-                .team
-                .as_ref()
-                .and_then(|t| t.dispute.as_ref())
-                .is_some_and(|d| d.kind == crate::domain::DisputeKind::Finding)
-            && match &decision {
-                crate::workflow::HumanDecision::RequestChanges { .. } => true,
-                crate::workflow::HumanDecision::Approve { amend: Some(a), .. } => {
-                    !a.trim().is_empty()
-                }
-                _ => false,
-            };
-        if dispute_amend {
-            let has_creator = cursor.is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
-                || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
-            if !has_creator {
-                anyhow::bail!(
-                    "no creator phase precedes unit {cursor_ord} to rework — approve (the work \
-                     counts) or reject"
-                );
-            }
-        }
-        // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
-        // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
-        // that counts it — is refused while a steering rule of that unit is broken or unchecked,
-        // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
-        // or skipped with its reason (`retry_rules` / `skip_rules`).
-        let counts_unit = match &decision {
-            crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
-            crate::workflow::HumanDecision::OperatorJudgment { .. }
-            | crate::workflow::HumanDecision::SkipQe { .. } => true,
-            _ => false,
-        };
-        if counts_unit {
-            if let Some(open) = cursor.and_then(rule_layers_open) {
-                anyhow::bail!(
-                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
-                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
-                     rule with a reason (`{}`), or reject",
-                    crate::rule_check::RETRY_ACTION,
-                    crate::rule_check::SKIP_ACTION
-                );
-            }
-        }
-        match &decision {
-            // (DES-RULE-CHECK-001 rev 2, A.4) …and, while a steering rule of the unit is held,
-            // its rule actions: a dispute behind a third FAIL can still be re-checked or
-            // skipped (`rules_recheck_request` refuses them otherwise).
-            crate::workflow::HumanDecision::FloorRerun(_)
-            | crate::workflow::HumanDecision::AcceptSuggestion
-            | crate::workflow::HumanDecision::AmendIntent { .. }
-            | crate::workflow::HumanDecision::Rejudge
-            | crate::workflow::HumanDecision::RetryQe
-                if adjudication_open =>
-            {
-                anyhow::bail!(
-                    "a review_adjudication gate takes approve (land with carried items), request \
-                     changes (one more round) or reject (stop), and the rule actions while a \
-                     steering rule is held"
-                );
-            }
-            crate::workflow::HumanDecision::RequestChanges { .. } => {
-                // (F-LEARN-2 live, run 55a1fac3) a follow-up on a conversational step is a send-back
-                // too: the pre-check refused it before the rewind could route it.
-                let has_creator = cursor
-                    .is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
-                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some()
-                    || conversation_target(&units, session.unit_ix).is_some();
-                if !has_creator {
-                    anyhow::bail!(
-                        "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
-                    );
-                }
-            }
-            // (core#782) The floor fix is refused here when no seat distinct from the phase
-            // can make it — whatever the amend scope, which it supersedes.
-            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if floor_fix_route => {
-                if let Some(cursor) = cursor {
-                    floor_fix_request(&*store, &session, &units, cursor, a)?;
-                }
-            }
-            crate::workflow::HumanDecision::Approve {
-                amend: Some(a),
-                amend_scope: crate::workflow::AmendScope::Creator,
-            } if !a.is_empty()
-                && !units
-                    .iter()
-                    .skip(session.unit_ix)
-                    .any(|u| u.role == crate::workflow::PhaseRole::Creator) =>
-            {
-                anyhow::bail!(
-                    "amendScope \"creator\": no creator phase at or after unit {cursor_ord} — \
-                     approve without a scope to amend the cursor unit"
-                );
-            }
-            // (core#469 / core#467) The escalation arms answer ONE kind of gate each; a team
-            // pause, or a cursor unit denied for anything else, refuses them here — the row stays
-            // open and the run stays re-answerable.
-            crate::workflow::HumanDecision::FloorRerun(_)
-            | crate::workflow::HumanDecision::AcceptSuggestion
-            | crate::workflow::HumanDecision::AmendIntent { .. }
-            | crate::workflow::HumanDecision::Rejudge
-            | crate::workflow::HumanDecision::RetryQe
-            | crate::workflow::HumanDecision::RecheckRules { .. }
-                if team_gate::transport_gate_open(&session)
-                    || team_gate::dispute_gate_open(&session) =>
-            {
-                anyhow::bail!(
-                    "a team pause takes approve, request changes or reject — not a floor re-run, \
-                     an evaluator's edit, an intent amendment, a judge re-run or a QE redo"
-                );
-            }
-            // (F23) Refused HERE, before the row resolves, unless the cursor unit's QE reviewer
-            // gave no verdict, QE acceptance is still required, the cap allows it and a reviewer
-            // seat can run now.
-            crate::workflow::HumanDecision::RetryQe => {
-                qe_redo_check(&session, &units, cursor, run_id)?;
-            }
-            // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
-            // the engine's judge selection names a seat now — the row stays open otherwise.
-            crate::workflow::HumanDecision::Rejudge => {
-                armed_rejudge = Some(rejudge_request(&*store, run_id)?);
-            }
-            // (DES-RULE-CHECK-001 S2) Refused unless the cursor unit is held `rules_unchecked`
-            // and every skip names one of its unchecked rules with a reason.
-            crate::workflow::HumanDecision::RecheckRules { skips } => {
-                let (request, rule_skips) =
-                    rules_recheck_request(&*store, run_id, skips, actor.as_deref())?;
-                armed_rejudge = Some(request);
-                armed_rule_skips = rule_skips;
-            }
-            // (operator ruling 2026-10-21) The operator's judgment over a failed repo-checks
-            // floor: refused HERE, before the row resolves, unless it applies — the gate stays
-            // open and re-answerable otherwise.
-            crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
-                floor_override_for(&session, cursor, rationale, adjudication_open, run_id)?;
-            }
-            // (j4-gates) A QE skip: refused HERE, before the row resolves, unless it applies.
-            crate::workflow::HumanDecision::SkipQe { reason } => {
-                skip_qe_plan(&session, cursor, reason, adjudication_open, run_id)?;
-            }
-            // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
-            // resolves, so the gate stays open and re-answerable rather than resolving as an
-            // approve that silently changed no acceptance list.
-            crate::workflow::HumanDecision::AmendIntent { text } if text.trim().is_empty() => {
-                anyhow::bail!(
-                    "action `amend_intent` needs the amendment text — what the run's acceptance \
-                     list now says (approve without it to proceed unamended)"
-                );
-            }
-            crate::workflow::HumanDecision::FloorRerun(mode) => {
-                let cursor = cursor.ok_or_else(|| {
-                    anyhow::anyhow!("run {run_id} has no unit at its cursor to re-run the floor of")
-                })?;
-                floor_rerun_request(&*store, cursor, *mode)?;
-            }
-            crate::workflow::HumanDecision::AcceptSuggestion => {
-                let cursor = cursor.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "run {run_id} has no unit at its cursor to take a suggestion from"
-                    )
-                })?;
-                adoptable_suggestion(cursor)?;
-                let has_creator = cursor.role == crate::workflow::PhaseRole::Creator
-                    || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
-                if !has_creator {
-                    anyhow::bail!(
-                        "no creator phase precedes unit {cursor_ord} to adopt the suggestion — \
-                         approve (retry) or reject"
-                    );
-                }
-            }
-            _ => {}
-        }
-    }
+    // second read after it could refuse an answer whose row is already answered. (DES-RULE-CHECK-001
+    // S2) …and the rule skips a `skip_rules` answer lands with its re-check.
+    let ArmedAnswer {
+        rejudge: mut armed_rejudge,
+        rule_skips: mut armed_rule_skips,
+    } = refuse_before_resolving(
+        &*store,
+        &session,
+        run_id,
+        &decision,
+        actor.as_deref(),
+        adjudication_open,
+        floor_fix_route,
+    )?;
 
     // DES-PROJECT-001 §5.3: the durable prompt resolves on the SAME command that resolves the
     // gate — `answered`, with the decision payload. This is what empties `/projects/:id/prompts`
@@ -18786,6 +18637,243 @@ fn current_worktree_tree(
     )
     .ok()
     .map(|s| s.tree)
+}
+
+/// (core#782) Whether `decision` is a FLOOR FIX: an approve WITH A NOTE at a read-only phase's
+/// floor gate (never at the capped review's adjudication or a team pause).
+pub(crate) fn floor_fix_route_for(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+    run_id: &str,
+    decision: &crate::workflow::HumanDecision,
+    adjudication_open: bool,
+) -> anyhow::Result<bool> {
+    Ok(!adjudication_open
+        && !team_gate::transport_gate_open(session)
+        && !team_gate::dispute_gate_open(session)
+        && matches!(
+            decision,
+            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if !a.trim().is_empty()
+        )
+        && crate::domain::session_units(store, run_id)?
+            .get(session.unit_ix)
+            .is_some_and(floor_fix_applies))
+}
+
+/// What a gate answer ARMS once [`refuse_before_resolving`] accepts it: the judge re-run a
+/// `rejudge` / `retry_rules` / `skip_rules` answer requests, and the rule skips it lands.
+#[derive(Default)]
+pub(crate) struct ArmedAnswer {
+    pub(crate) rejudge: Option<crate::domain::RequestedRejudge>,
+    pub(crate) rule_skips: Vec<crate::rule_check::RuleSkip>,
+}
+
+/// (DES-L1 PR-1B, review-L1-517 M3) REFUSE BEFORE RESOLVING: the arms that can be refused are
+/// checked here, before the durable prompt is marked `answered` — a refused answer must leave the
+/// gate row OPEN (the run stays paused and re-answerable, and the prompts surface keeps showing
+/// it). The same rules are re-derived where the arms execute; these are the gate. READ-ONLY: it is
+/// also how [`gate_actions::gate_actions`] knows which answers the open gate takes — one
+/// predicate, so the published list and the accepted set cannot drift.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn refuse_before_resolving(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+    run_id: &str,
+    decision: &crate::workflow::HumanDecision,
+    actor: Option<&str>,
+    adjudication_open: bool,
+    floor_fix_route: bool,
+) -> anyhow::Result<ArmedAnswer> {
+    let mut armed = ArmedAnswer::default();
+    let units = crate::domain::session_units(store, run_id)?;
+    let cursor = units.get(session.unit_ix);
+    let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
+    // the capped review's "land with carried items" would land it over the reviewer's FAIL.
+    // Refused here, so the adjudication gate stays open for request changes or reject.
+    if let (true, Some(preset), crate::workflow::HumanDecision::Approve { .. }) = (
+        adjudication_open,
+        crate::apps::run_preset(&session),
+        &decision,
+    ) {
+        anyhow::bail!(
+            "run {run_id} is an `{preset}` run, which lands only on a passing review — \
+             request changes (one more round) or reject"
+        );
+    }
+    // (T6) A `team_dispute` over a unit's findings answered with changes reruns its creator:
+    // refused here, before the row resolves and before its `gate.decided` is published, when
+    // there is no creator to rerun (a member-step dispute reworks the member instead).
+    let dispute_amend = team_gate::dispute_gate_open(&session)
+        && session
+            .team
+            .as_ref()
+            .and_then(|t| t.dispute.as_ref())
+            .is_some_and(|d| d.kind == crate::domain::DisputeKind::Finding)
+        && match &decision {
+            crate::workflow::HumanDecision::RequestChanges { .. } => true,
+            crate::workflow::HumanDecision::Approve { amend: Some(a), .. } => !a.trim().is_empty(),
+            _ => false,
+        };
+    if dispute_amend {
+        let has_creator = cursor.is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
+            || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+        if !has_creator {
+            anyhow::bail!(
+                "no creator phase precedes unit {cursor_ord} to rework — approve (the work \
+                 counts) or reject"
+            );
+        }
+    }
+    // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
+    // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
+    // that counts it — is refused while a steering rule of that unit is broken or unchecked,
+    // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
+    // or skipped with its reason (`retry_rules` / `skip_rules`).
+    let counts_unit = match &decision {
+        crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
+        crate::workflow::HumanDecision::OperatorJudgment { .. }
+        | crate::workflow::HumanDecision::SkipQe { .. } => true,
+        _ => false,
+    };
+    if counts_unit {
+        if let Some(open) = cursor.and_then(rule_layers_open) {
+            anyhow::bail!(
+                "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                 request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                 rule with a reason (`{}`), or reject",
+                crate::rule_check::RETRY_ACTION,
+                crate::rule_check::SKIP_ACTION
+            );
+        }
+    }
+    match &decision {
+        // (DES-RULE-CHECK-001 rev 2, A.4) …and, while a steering rule of the unit is held,
+        // its rule actions: a dispute behind a third FAIL can still be re-checked or
+        // skipped (`rules_recheck_request` refuses them otherwise).
+        crate::workflow::HumanDecision::FloorRerun(_)
+        | crate::workflow::HumanDecision::AcceptSuggestion
+        | crate::workflow::HumanDecision::AmendIntent { .. }
+        | crate::workflow::HumanDecision::Rejudge
+        | crate::workflow::HumanDecision::RetryQe
+            if adjudication_open =>
+        {
+            anyhow::bail!(
+                "a review_adjudication gate takes approve (land with carried items), request \
+                 changes (one more round) or reject (stop), and the rule actions while a \
+                 steering rule is held"
+            );
+        }
+        crate::workflow::HumanDecision::RequestChanges { .. } => {
+            // (F-LEARN-2 live, run 55a1fac3) a follow-up on a conversational step is a send-back
+            // too: the pre-check refused it before the rewind could route it.
+            let has_creator = cursor.is_some_and(|c| c.role == crate::workflow::PhaseRole::Creator)
+                || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some()
+                || conversation_target(&units, session.unit_ix).is_some();
+            if !has_creator {
+                anyhow::bail!(
+                    "no creator phase precedes unit {cursor_ord} — approve (retry) or reject"
+                );
+            }
+        }
+        // (core#782) The floor fix is refused here when no seat distinct from the phase
+        // can make it — whatever the amend scope, which it supersedes.
+        crate::workflow::HumanDecision::Approve { amend: Some(a), .. } if floor_fix_route => {
+            if let Some(cursor) = cursor {
+                floor_fix_request(&*store, &session, &units, cursor, a)?;
+            }
+        }
+        crate::workflow::HumanDecision::Approve {
+            amend: Some(a),
+            amend_scope: crate::workflow::AmendScope::Creator,
+        } if !a.is_empty()
+            && !units
+                .iter()
+                .skip(session.unit_ix)
+                .any(|u| u.role == crate::workflow::PhaseRole::Creator) =>
+        {
+            anyhow::bail!(
+                "amendScope \"creator\": no creator phase at or after unit {cursor_ord} — \
+                 approve without a scope to amend the cursor unit"
+            );
+        }
+        // (core#469 / core#467) The escalation arms answer ONE kind of gate each; a team
+        // pause, or a cursor unit denied for anything else, refuses them here — the row stays
+        // open and the run stays re-answerable.
+        crate::workflow::HumanDecision::FloorRerun(_)
+        | crate::workflow::HumanDecision::AcceptSuggestion
+        | crate::workflow::HumanDecision::AmendIntent { .. }
+        | crate::workflow::HumanDecision::Rejudge
+        | crate::workflow::HumanDecision::RetryQe
+        | crate::workflow::HumanDecision::RecheckRules { .. }
+            if team_gate::transport_gate_open(&session)
+                || team_gate::dispute_gate_open(&session) =>
+        {
+            anyhow::bail!(
+                "a team pause takes approve, request changes or reject — not a floor re-run, \
+                 an evaluator's edit, an intent amendment, a judge re-run or a QE redo"
+            );
+        }
+        // (F23) Refused HERE, before the row resolves, unless the cursor unit's QE reviewer
+        // gave no verdict, QE acceptance is still required, the cap allows it and a reviewer
+        // seat can run now.
+        crate::workflow::HumanDecision::RetryQe => {
+            qe_redo_check(&session, &units, cursor, run_id)?;
+        }
+        // (rejudge) Refused unless the cursor unit's gate is a `judge_unavailable` denial AND
+        // the engine's judge selection names a seat now — the row stays open otherwise.
+        crate::workflow::HumanDecision::Rejudge => {
+            armed.rejudge = Some(rejudge_request(store, run_id)?);
+        }
+        // (DES-RULE-CHECK-001 S2) Refused unless the cursor unit is held `rules_unchecked`
+        // and every skip names one of its unchecked rules with a reason.
+        crate::workflow::HumanDecision::RecheckRules { skips } => {
+            let (request, rule_skips) = rules_recheck_request(store, run_id, skips, actor)?;
+            armed.rejudge = Some(request);
+            armed.rule_skips = rule_skips;
+        }
+        // (operator ruling 2026-10-21) The operator's judgment over a failed repo-checks
+        // floor: refused HERE, before the row resolves, unless it applies — the gate stays
+        // open and re-answerable otherwise.
+        crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
+            floor_override_for(&session, cursor, rationale, adjudication_open, run_id)?;
+        }
+        // (j4-gates) A QE skip: refused HERE, before the row resolves, unless it applies.
+        crate::workflow::HumanDecision::SkipQe { reason } => {
+            skip_qe_plan(&session, cursor, reason, adjudication_open, run_id)?;
+        }
+        // (core#555) An amendment with no text amends nothing: refuse HERE, before the row
+        // resolves, so the gate stays open and re-answerable rather than resolving as an
+        // approve that silently changed no acceptance list.
+        crate::workflow::HumanDecision::AmendIntent { text } if text.trim().is_empty() => {
+            anyhow::bail!(
+                "action `amend_intent` needs the amendment text — what the run's acceptance \
+                 list now says (approve without it to proceed unamended)"
+            );
+        }
+        crate::workflow::HumanDecision::FloorRerun(mode) => {
+            let cursor = cursor.ok_or_else(|| {
+                anyhow::anyhow!("run {run_id} has no unit at its cursor to re-run the floor of")
+            })?;
+            floor_rerun_request(&*store, cursor, *mode)?;
+        }
+        crate::workflow::HumanDecision::AcceptSuggestion => {
+            let cursor = cursor.ok_or_else(|| {
+                anyhow::anyhow!("run {run_id} has no unit at its cursor to take a suggestion from")
+            })?;
+            adoptable_suggestion(cursor)?;
+            let has_creator = cursor.role == crate::workflow::PhaseRole::Creator
+                || crate::pipeline::most_recent_prior_creator(&units, cursor_ord).is_some();
+            if !has_creator {
+                anyhow::bail!(
+                    "no creator phase precedes unit {cursor_ord} to adopt the suggestion — \
+                     approve (retry) or reject"
+                );
+            }
+        }
+        _ => {}
+    }
+    Ok(armed)
 }
 
 /// (operator ruling 2026-10-11) Whether the operator's plain approve at `u`'s gate IS the judgment:
@@ -30047,6 +30135,444 @@ mod request_changes_tests {
             .to_string()
             .contains("no longer requires QE acceptance"));
     }
+    // ── (studio#1170, crew#1512) THE GATE'S LEGAL ACTIONS: one test per gate shape. Each asserts
+    // the published list EQUALS the accepted set — every candidate answer a skin could send is
+    // tried on a fresh copy of the fixture, and it is accepted iff the list names it — plus what the
+    // shape's issue is about (the label intent, a reassign's seats).
+
+    /// Every answer a skin could send at a non-plan gate, labelled the way [`listed_labels`] expands
+    /// the list: `<token>` without a note, `<token>+note` with one, `skip_rules:<rule>+note`.
+    fn candidate_answers(store: &dyn GraphStore, run_id: &str) -> Vec<(String, HumanDecision)> {
+        use crate::repo_checks::FloorRerunMode as Mode;
+        let s = |t: &str| t.to_string();
+        let mut v = vec![
+            (
+                s("approve"),
+                HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+            ),
+            (
+                s("approve+note"),
+                HumanDecision::Approve {
+                    amend: Some("a note".into()),
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+            ),
+            (
+                s("request_changes"),
+                HumanDecision::RequestChanges { note: None },
+            ),
+            (
+                s("request_changes+note"),
+                HumanDecision::RequestChanges {
+                    note: Some("a note".into()),
+                },
+            ),
+            (s("reject"), HumanDecision::Reject),
+            (s("retry_qe"), HumanDecision::RetryQe),
+            (s("rejudge"), HumanDecision::Rejudge),
+            (
+                s("retry_rules"),
+                HumanDecision::RecheckRules { skips: Vec::new() },
+            ),
+            (
+                s("operator_judgment+note"),
+                HumanDecision::OperatorJudgment {
+                    rationale: "a load flake".into(),
+                },
+            ),
+            (
+                s("skip_qe+note"),
+                HumanDecision::SkipQe {
+                    reason: "covered elsewhere".into(),
+                },
+            ),
+            (s("extend"), HumanDecision::FloorRerun(Mode::Extend)),
+            (s("targeted"), HumanDecision::FloorRerun(Mode::Targeted)),
+            (
+                s("accept_partial"),
+                HumanDecision::FloorRerun(Mode::AcceptPartial),
+            ),
+            (s("accept_suggestion"), HumanDecision::AcceptSuggestion),
+            (
+                s("amend_intent+note"),
+                HumanDecision::AmendIntent {
+                    text: "drop item 3".into(),
+                },
+            ),
+        ];
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(store, run_id).unwrap();
+        for row in units
+            .get(session.unit_ix)
+            .and_then(|u| u.rule_check.as_ref())
+            .map(|r| r.rows.clone())
+            .unwrap_or_default()
+        {
+            v.push((
+                format!("skip_rules:{}+note", row.rule_id),
+                HumanDecision::RecheckRules {
+                    skips: vec![(row.rule_id.clone(), "not this change's".into())],
+                },
+            ));
+        }
+        v
+    }
+
+    /// The labels a listed set stands for (see [`candidate_answers`]); reassign is checked apart.
+    fn listed_labels(listed: &crate::GateActions) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for a in listed.actions.iter().filter(|a| a.action != "reassign") {
+            if a.action == crate::rule_check::SKIP_ACTION {
+                out.extend(a.rules.iter().map(|r| format!("skip_rules:{r}+note")));
+                continue;
+            }
+            if a.note != crate::NoteRule::Required {
+                out.insert(a.action.clone());
+            }
+            if a.note != crate::NoteRule::None {
+                out.insert(format!("{}+note", a.action));
+            }
+        }
+        out
+    }
+
+    /// Seeds `seed` on a fresh store per candidate and asserts the list equals what the engine
+    /// accepts; every listed reassign seat re-seats, every other roster seat is refused.
+    fn listed_is_accepted(
+        name: &str,
+        seed: &dyn Fn(&mut dyn GraphStore, &str),
+    ) -> crate::GateActions {
+        let run_id = format!("ga-{name}-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id);
+        let listed = gate_actions::gate_actions(&store, &run_id)
+            .unwrap()
+            .expect("a gate is open");
+        let mut accepted = std::collections::BTreeSet::new();
+        for (label, d) in candidate_answers(&store, &run_id) {
+            let mut fresh = open_store(Some(":memory:")).unwrap();
+            seed(&mut fresh, &run_id);
+            if answer(&mut fresh, &run_id, d).0.is_ok() {
+                accepted.insert(label);
+            }
+        }
+        assert_eq!(listed_labels(&listed), accepted, "{name}: {listed:#?}");
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let ord = crate::domain::session_units(&store, &run_id).unwrap()[session.unit_ix].ord;
+        let seats: Vec<String> = listed
+            .actions
+            .iter()
+            .find(|a| a.action == "reassign")
+            .map(|a| a.seats.clone())
+            .unwrap_or_default();
+        for cli in session.clis.iter() {
+            let mut fresh = open_store(Some(":memory:")).unwrap();
+            seed(&mut fresh, &run_id);
+            let s = crate::domain::get_session(&fresh, &run_id)
+                .unwrap()
+                .unwrap();
+            let mut subs = crate::event_log::EventSink::default();
+            let current = crate::domain::session_units(&fresh, &run_id).unwrap()[s.unit_ix]
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".into());
+            let took = refuse_ballot_only_target(cli).is_ok()
+                && reseat_parked_unit(&mut fresh, &mut subs, &s, ord, Some(cli)).is_ok();
+            if seats.contains(cli) {
+                assert!(took, "{name}: listed seat {cli} must re-seat");
+            } else if *cli != current && listed.actions.iter().any(|a| a.action == "reassign") {
+                assert!(!took, "{name}: unlisted seat {cli} must be refused");
+            }
+        }
+        listed
+    }
+
+    fn action<'a>(listed: &'a crate::GateActions, token: &str) -> Option<&'a crate::GateAction> {
+        listed.actions.iter().find(|a| a.action == token)
+    }
+
+    fn open_row(store: &mut dyn GraphStore, run_id: &str, ord: u32, kind: &str) {
+        let gate = crate::interaction::open_gate(run_id, ord, None, "the gate", kind, 1);
+        put_node(store, gate.to_node()).unwrap();
+    }
+
+    #[test]
+    fn gate_actions_is_none_off_a_gate() {
+        let run_id = format!("ga-none-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        s.status = SessionStatus::Executing;
+        put_node(&mut store, s.to_node()).unwrap();
+        assert!(gate_actions::gate_actions(&store, &run_id)
+            .unwrap()
+            .is_none());
+    }
+
+    /// A DEF gate before a pending step: approve runs it on, send back, reassign, reject.
+    #[test]
+    fn gate_actions_def_gate() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_bug_with_deliver(store, run_id);
+            let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+            s.unit_ix = 3;
+            s.clis = vec!["claude".into(), "codex".into()];
+            put_node(store, s.to_node()).unwrap();
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            units[3].status = UnitStatus::Pending;
+            units[3].assigned_cli = Some("codex".into());
+            put_node(store, units[3].to_node()).unwrap();
+            open_row(store, run_id, 4, "def");
+        };
+        let listed = listed_is_accepted("def", &seed);
+        assert_eq!(listed.gate_kind, "def");
+        assert_eq!(action(&listed, "approve").unwrap().intent, "continue");
+        assert_eq!(action(&listed, "reject").unwrap().intent, "stop");
+    }
+
+    /// A failed repo-checks floor: approve retries; the operator's judgment needs its rationale.
+    #[test]
+    fn gate_actions_escalation_floor_failed() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_floor_failed_fix(store, run_id, Some(Vec::new()));
+            open_row(store, run_id, 3, "escalation");
+        };
+        let listed = listed_is_accepted("floor", &seed);
+        assert_eq!(action(&listed, "approve").unwrap().intent, "retry");
+        let judgment = action(&listed, crate::workflow::OPERATOR_JUDGMENT_ACTION).unwrap();
+        assert_eq!(judgment.note, crate::NoteRule::Required);
+    }
+
+    /// An escalation only the isolated QE reviewer denied, with no verdict (INCONCLUSIVE): the QE
+    /// redo is listed beside the operator's judgment; a recorded FAIL takes no redo.
+    #[test]
+    fn gate_actions_escalation_qe_inconclusive_and_fail() {
+        let inconclusive = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_judge_unavailable_verify(store, run_id);
+            require_qe(store, run_id);
+            park_qe_gate(
+                store,
+                run_id,
+                qe_inconclusive(),
+                qe_record(
+                    crate::qe_acceptance::review::OUTCOME_INCONCLUSIVE,
+                    Some("FAIL"),
+                ),
+                true,
+            );
+        };
+        let listed = listed_is_accepted("qe-inconclusive", &inconclusive);
+        assert!(
+            action(&listed, crate::workflow::RETRY_QE_ACTION).is_some(),
+            "{listed:#?}"
+        );
+        assert_eq!(
+            action(&listed, "approve").unwrap().intent,
+            "operator_judgment"
+        );
+        assert!(
+            action(&listed, "reassign").is_none(),
+            "approve judges the work: no re-seat"
+        );
+
+        let fail = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_judge_unavailable_verify(store, run_id);
+            require_qe(store, run_id);
+            park_qe_gate(
+                store,
+                run_id,
+                qe_fail(),
+                qe_record(crate::qe_acceptance::review::OUTCOME_FAIL, Some("FAIL")),
+                true,
+            );
+        };
+        let listed = listed_is_accepted("qe-fail", &fail);
+        assert!(
+            action(&listed, crate::workflow::RETRY_QE_ACTION).is_none(),
+            "{listed:#?}"
+        );
+    }
+
+    /// A unit held `rules_unchecked`: re-check, and skip naming exactly the unchecked rule.
+    #[test]
+    fn gate_actions_escalation_rules_unchecked() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_rules_unchecked(store, run_id);
+            open_row(store, run_id, 3, "escalation");
+        };
+        let listed = listed_is_accepted("rules", &seed);
+        assert!(action(&listed, crate::rule_check::RETRY_ACTION).is_some());
+        assert_eq!(
+            action(&listed, crate::rule_check::SKIP_ACTION)
+                .unwrap()
+                .rules,
+            ["R1"]
+        );
+    }
+
+    /// (new issue) A review that ran on the builder's seat under a distinct-evaluator contract:
+    /// the engine's remedy is "reassign it to a distinct signed-in seat", so Reassign is listed,
+    /// on the distinct seat only.
+    #[test]
+    fn gate_actions_escalation_distinct_evaluator_lists_reassign_on_a_distinct_seat() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_bug_with_deliver(store, run_id);
+            let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+            s.unit_ix = 3;
+            s.clis = vec!["claude".into(), "codex".into()];
+            s.assurance = crate::assurance::RunAssurance::new(None, false);
+            put_node(store, s.to_node()).unwrap();
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            units[2].authored_by = vec!["claude".into()];
+            put_node(store, units[2].to_node()).unwrap();
+            let why = "unit 4 checks work built on `claude` and ran on that same seat";
+            units[3].status = UnitStatus::Rejected;
+            units[3].denial = Some(UnitDenial::new(
+                crate::pipeline::DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
+                why,
+            ));
+            units[3].denial_reason = Some(why.into());
+            put_node(store, units[3].to_node()).unwrap();
+            open_row(store, run_id, 4, "escalation");
+        };
+        let listed = listed_is_accepted("distinct", &seed);
+        let reassign = action(&listed, "reassign").expect("Reassign is the engine's remedy");
+        assert_eq!(reassign.seats, ["codex"]);
+        assert_eq!(reassign.intent, "reseat_and_retry");
+        assert_eq!(action(&listed, "approve").unwrap().intent, "retry");
+    }
+
+    /// No judge seat could rule: approve IS the operator's judgment; no re-seat (it would record a
+    /// seat on work it never did).
+    #[test]
+    fn gate_actions_escalation_no_judge_seat() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_rejudge_fix(store, run_id, &["claude", "pi"]);
+            open_row(store, run_id, 3, "escalation");
+        };
+        let listed = listed_is_accepted("no-judge", &seed);
+        assert_eq!(
+            action(&listed, "approve").unwrap().intent,
+            "operator_judgment"
+        );
+        assert!(action(&listed, "reassign").is_none());
+    }
+
+    /// (studio#1155, #1167) The capped review: approve LANDS with carried items (a note rides
+    /// it); never a QE redo, a judge re-run or a re-seat; and with a QE layer behind it the land
+    /// is still listed.
+    #[test]
+    fn gate_actions_review_adjudication_lands_and_takes_no_retry() {
+        let plain = |store: &mut dyn GraphStore, run_id: &str| {
+            let mut subs = crate::event_log::EventSink::default();
+            fold_verify_after_send_backs(store, &mut subs, run_id, 2, THIRD_FAIL);
+        };
+        let listed = listed_is_accepted("adj", &plain);
+        assert_eq!(
+            listed.gate_kind,
+            crate::review_context::REVIEW_ADJUDICATION_GATE
+        );
+        let land = action(&listed, "approve").expect("Land is listed");
+        assert_eq!(land.intent, "land_with_carried_items");
+        assert_eq!(land.note, crate::NoteRule::Optional);
+        assert_eq!(
+            action(&listed, "request_changes").unwrap().intent,
+            "send_back"
+        );
+        for never in [
+            crate::workflow::RETRY_QE_ACTION,
+            crate::workflow::REJUDGE_ACTION,
+            "reassign",
+        ] {
+            assert!(action(&listed, never).is_none(), "{never}: {listed:#?}");
+        }
+
+        let qe_behind = |store: &mut dyn GraphStore, run_id: &str| {
+            let mut subs = crate::event_log::EventSink::default();
+            fold_verify_after_send_backs(store, &mut subs, run_id, 2, THIRD_FAIL);
+            require_qe(store, run_id);
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            units[3].denials_behind = Some(vec![qe_inconclusive()]);
+            put_node(store, units[3].to_node()).unwrap();
+        };
+        let listed = listed_is_accepted("adj-qe", &qe_behind);
+        assert_eq!(
+            action(&listed, "approve").unwrap().intent,
+            "land_with_carried_items"
+        );
+        assert!(action(&listed, crate::workflow::RETRY_QE_ACTION).is_none());
+    }
+
+    /// (studio#1155) A capped review whose rule is held: land is NOT listed until the rule is
+    /// settled; the rule actions are.
+    #[test]
+    fn gate_actions_review_adjudication_with_a_held_rule() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            let mut subs = crate::event_log::EventSink::default();
+            fold_verify_after_send_backs(store, &mut subs, run_id, 2, THIRD_FAIL);
+            let mut units = crate::domain::session_units(store, run_id).unwrap();
+            let row = |id: &str, status| crate::rule_check::RuleVerdict {
+                rule_id: id.into(),
+                status,
+                how: crate::rule_check::RuleHow::Judge,
+                reason: "r".into(),
+                rule_key: "k".into(),
+                evidence_key: Some(format!("ek-{id}")),
+                origin: Some(crate::rule_check::RuleOrigin::Judge),
+                ..Default::default()
+            };
+            let report = crate::rule_check::RuleCheckReport {
+                rows: vec![row("R1", crate::rule_check::RuleStatus::Unchecked)],
+                ..Default::default()
+            };
+            units[3].denials_behind = Some(vec![report.hold().unwrap()]);
+            units[3].rule_check = Some(report);
+            put_node(store, units[3].to_node()).unwrap();
+        };
+        let listed = listed_is_accepted("adj-rules", &seed);
+        assert!(action(&listed, "approve").is_none(), "{listed:#?}");
+        assert!(action(&listed, crate::rule_check::RETRY_ACTION).is_some());
+        assert_eq!(
+            action(&listed, crate::rule_check::SKIP_ACTION)
+                .unwrap()
+                .rules,
+            ["R1"]
+        );
+    }
+
+    /// The deliver gate: approve delivers; with QE acceptance required (no PASS) the in-place skip
+    /// is listed with its reason required; the deliver tool step takes no re-seat.
+    #[test]
+    fn gate_actions_deliver_gate() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_bug_with_deliver(store, run_id);
+            open_row(store, run_id, 5, "deliver");
+        };
+        let listed = listed_is_accepted("deliver", &seed);
+        assert_eq!(listed.gate_kind, "deliver");
+        assert_eq!(action(&listed, "approve").unwrap().intent, "deliver");
+        assert!(action(&listed, "reassign").is_none());
+
+        let with_qe = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_bug_with_deliver(store, run_id);
+            require_qe(store, run_id);
+            open_row(store, run_id, 5, "deliver");
+        };
+        let listed = listed_is_accepted("deliver-qe", &with_qe);
+        assert_eq!(
+            action(&listed, crate::workflow::SKIP_QE_ACTION)
+                .unwrap()
+                .note,
+            crate::NoteRule::Required
+        );
+    }
 }
 
 /// crew#311 / core#297 §2 — the CODE-EVIDENCE floor: a governed `executes_code` CREATOR phase of
@@ -37694,6 +38220,71 @@ mod plan_gate_confirm_tests {
         crate::workflow::HumanDecision::Approve {
             amend: None,
             amend_scope: Default::default(),
+        }
+    }
+
+    /// (studio#1170) The plan gate's published answers are exactly the ones it takes (each with its
+    /// plan revision): approve, approve with an edited plan, send back, reject — and only reject
+    /// once the cursor has run. A chatless run's card is drawn from this list too.
+    #[test]
+    fn gate_actions_plan_approval_lists_what_the_plan_gate_takes() {
+        use crate::workflow::{GateExpect, HumanDecision};
+        for (cursor, want) in [
+            (
+                UnitStatus::Distributed,
+                vec!["approve", "edit_plan", "request_changes", "reject"],
+            ),
+            (UnitStatus::Done, vec!["reject"]),
+        ] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            fixture(&mut store, cursor);
+            let listed = gate_actions::gate_actions(&store, "r").unwrap().unwrap();
+            assert_eq!(listed.gate_kind, "plan_approval");
+            assert_eq!((listed.ord, listed.plan_rev), (2, Some(1)));
+            let tokens: Vec<&str> = listed.actions.iter().map(|a| a.action.as_str()).collect();
+            assert_eq!(tokens, want, "{listed:#?}");
+            for (token, d) in [
+                ("approve", approve()),
+                (
+                    "edit_plan",
+                    HumanDecision::EditPlan {
+                        plan: pending().steps,
+                        note: None,
+                    },
+                ),
+                (
+                    "request_changes",
+                    HumanDecision::RequestChanges {
+                        note: Some("smaller".into()),
+                    },
+                ),
+                ("reject", HumanDecision::Reject),
+            ] {
+                let mut fresh = open_store(Some(":memory:")).unwrap();
+                fixture(&mut fresh, cursor);
+                let mut subs = crate::event_log::EventSink::default();
+                let (tx, _rx) = channel::<Command>();
+                let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+                let r = confirm_gate_expecting(
+                    &mut fresh,
+                    &mut subs,
+                    &runner,
+                    &tx,
+                    &mut HashSet::new(),
+                    "r",
+                    d,
+                    None,
+                    Some(GateExpect {
+                        ord: Some(2),
+                        plan_rev: Some(1),
+                    }),
+                    &None,
+                    &None,
+                    uuid::Uuid::nil(),
+                    false,
+                );
+                assert_eq!(r.is_ok(), want.contains(&token), "{token}: {r:?}");
+            }
         }
     }
 

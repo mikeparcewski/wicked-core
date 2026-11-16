@@ -556,6 +556,14 @@ export declare class Core {
    * Read-only.
    */
   rejudgeReadiness(runId: string): Promise<string>
+  /**
+   * (studio#1170, crew#1512) Every answer the run's open gate takes NOW, as a JSON
+   * `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
+   * noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
+   * human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
+   * approve) accepts; nothing else is. Read-only.
+   */
+  gateActions(runId: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */
   listRepos(): Promise<string>
   /**
