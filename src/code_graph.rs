@@ -230,6 +230,14 @@ pub(crate) const REPO_GRAPH_ROOT_ENV: &str = "WICKED_ESTATE_REPO_GRAPH_ROOT";
 /// so the worker Read fence classifies — and denies — it like every other state-home store.
 pub(crate) const REPO_GRAPHS_DIRNAME: &str = "repo-graphs";
 
+/// crew's per-project graph directory under the state home: `<state home>/project-graphs/<id>/`
+/// (crew `projects/graph-paths.ts`; registered in `state-home-subtrees.json`). The launcher OWNS
+/// this location (`project.rs` `ProjectGraphBinding`); the engine only recognises it for the grant.
+pub(crate) const PROJECT_GRAPHS_DIRNAME: &str = "project-graphs";
+
+/// The file name of a project's co-located graph: `<state home>/project-graphs/<id>/code-graph.db`.
+pub(crate) const PROJECT_GRAPH_DB_FILE: &str = "code-graph.db";
+
 /// Where the pre-core#406 engine kept every repo graph: `<home>/.wicked-estate/repo-graphs`. Read
 /// once, at boot, as the migration SOURCE ([`migrate_legacy_repo_graphs`]); never written.
 pub(crate) const LEGACY_ESTATE_HOME_DIRNAME: &str = ".wicked-estate";
@@ -472,6 +480,70 @@ pub(crate) fn classify_code_graph_db_at(db: &Path, root: Option<&Path>) -> Optio
         return Some(dir.to_path_buf());
     }
     None
+}
+
+/// `<state home>/project-graphs` of THIS daemon — `state_home` (the runner's `operational_home`),
+/// else the default state home. Deliberately NO env override: crew's `WICKED_CREW_PROJECT_GRAPH_ROOT`
+/// is crew's test hatch, and a project graph the engine finds anywhere else grants nothing (fail
+/// closed — the unit still runs, ungrounded, and the launcher logs why).
+pub(crate) fn project_graph_root_for(state_home: Option<&Path>) -> Option<PathBuf> {
+    project_graph_root_from(state_home, home_dir())
+}
+
+fn project_graph_root_from(
+    state_home: Option<&Path>,
+    home: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(sh) = state_home {
+        return Some(sh.join(PROJECT_GRAPHS_DIRNAME));
+    }
+    home.filter(|h| !h.is_empty()).map(|h| {
+        Path::new(&h)
+            .join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME)
+            .join(PROJECT_GRAPHS_DIRNAME)
+    })
+}
+
+/// crew#1497: classify a PROJECT graph path against `root` (= [`project_graph_root_for`]):
+/// `Some(<root>/<key>)` — canonical, the EXACT directory of the ONE project this unit is bound to —
+/// for `<root>/<key>/code-graph.db`, and `None` for everything else. The project graph is the other
+/// store the engine vouches for (`actor::project_code_graph_db`) and hands as `WICKED_ESTATE_DB`;
+/// before this it classified as nothing, so its directory was never granted or mounted and estate,
+/// which opens it in WAL mode, answered every query EMPTY from a directory it could not write.
+///
+/// Stricter than the repo shape because the launcher, not the engine, mints this path:
+///   - the same lexical shape rules (absolute, exact file name, key passes estate's label rule, the
+///     key dir directly under the root — never nested, never the root itself);
+///   - NO link anywhere on the grant: the `project-graphs` root, the key dir and the db must each be
+///     real (lstat) — a symlinked project id could point a unit at another project's graph, or at
+///     any directory, and the grant is read AND write;
+///   - the root resolved through its ancestors (the state home may be reached through a link the
+///     operator configured, `/var` → `/private/var`) must still hold the key dir directly, so the
+///     grant can never land outside THIS state home's `project-graphs`.
+///
+/// Sibling projects stay out of reach: the grant is one key dir, and the boundary's root test is
+/// root-or-descendant.
+pub(crate) fn classify_project_graph_db_at(db: &Path, root: Option<&Path>) -> Option<PathBuf> {
+    if !db.is_absolute() || db.file_name().is_none_or(|n| n != PROJECT_GRAPH_DB_FILE) {
+        return None;
+    }
+    let dir = db.parent()?;
+    let root = root?;
+    let key = dir.file_name().filter(|k| is_valid_key(k))?;
+    if dir.parent() != Some(root) {
+        return None;
+    }
+    let real = |p: &Path, want_dir: bool| {
+        std::fs::symlink_metadata(p).is_ok_and(|m| {
+            !m.file_type().is_symlink() && if want_dir { m.is_dir() } else { m.is_file() }
+        })
+    };
+    if !real(root, true) || !real(dir, true) || !real(db, false) {
+        return None;
+    }
+    let canon_root = std::fs::canonicalize(root).ok()?;
+    let canon_dir = std::fs::canonicalize(dir).ok()?;
+    (canon_dir == canon_root.join(key)).then_some(canon_dir)
 }
 
 /// Estate's label rule (`repo_scope.rs::validate_label`), applied to a key path segment: 1–64
