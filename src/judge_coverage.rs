@@ -1,36 +1,51 @@
 //! (crew#972) Whether a launch's seats can cover an AUTHOR plus an independent JUDGE of its work,
 //! asked before the launch so the launcher can say so up front instead of the run holding at a
-//! `judge_unavailable` gate mid-run.
+//! judge gate mid-run.
 //!
-//! Not a second rule: the answer is the runtime's own. A work seat's judges are the seats the
-//! judge search walks for its work ([`crate::validator::distinct_judge_keys`]: usable, eligible for
-//! work, a different CLI identity), over the roster minus the bench the run would start with
-//! ([`crate::distribute::launcher_benched`] and [`crate::distribute::launch_benched`]; a judge is an
-//! ungoverned call, so a governed-only bench keeps its seat as a judge, as at the gate), minus the
-//! seats KNOWN by observation to call a provider the author was seen calling
-//! ([`crate::observed_provider::shared_with`], core#1547: such a seat's approval is not independent,
-//! and the search passes over it). A seat never observed is never called shared: nothing is
-//! skipped on a guess.
+//! Not a second rule: the answer walks the runtime's own pool with the runtime's own helpers. For
+//! each seat that can author governed work, its judges are the seats the DEFAULT judge rotation of a
+//! gate on that seat's work walks (`cli_runner`'s `eligible_run`, then `agent_validate_in`'s order):
+//! the registry records of the run's seats ([`crate::cli_runner::judge_pool`], registry order),
+//! minus a record the registry marks unusable, minus the bench the run starts with
+//! ([`crate::distribute::launcher_benched`] + [`crate::distribute::launch_benched`], assembled as
+//! `actor.rs`'s launch check does; the ungoverned bench, as a judge is an ungoverned call), minus
+//! seats sharing the author's binary ([`crate::cli_runner::without_author_binaries`]), walked by
+//! [`crate::validator::distinct_judge_keys`]; the seats KNOWN by observation to call a provider the
+//! author was seen calling go last ([`crate::observed_provider::shared_with`], the rule
+//! `known_to_share` sorts the rotation by). Such a seat is still a judge, flagged: its approval
+//! stands only if its own launch at the gate is not seen calling that provider again.
 //!
-//! Not predicted here (named on the launch's own notices): a pinned gate's exclusion of the
-//! validator's author and its re-admission (core#1548, decided on the observed launch at the gate),
-//! the team monitors a step's gate drops (core#1165), and the authors a run's plan picks.
+//! `covered`: some author has a judge not flagged. What this does not predict, named so a launcher
+//! never says more: the fallback ladder's judge-only seats outside the run (operator ruling
+//! 2026-10-14), a pinned gate's exclusion of the validator's author and its re-admission on an
+//! observed launch (core#1548), team monitors (core#1165), and which seats a plan makes authors.
 
 use serde::Serialize;
 
 use crate::domain::BenchedSeat;
 use crate::AgenticCli;
 
-/// Why a seat of the roster is not a judge of one author's work.
+/// A seat that judges one author's work, in rotation order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Judge {
+    pub seat: String,
+    /// Its latest observed launch called this provider, which the author's did too: tried last,
+    /// and its approval stands only if the gate's launch is not seen calling it again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seen_sharing: Option<String>,
+}
+
+/// Why a seat of the run does not judge one author's work.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotJudge {
     pub seat: String,
-    /// `same_identity` (it runs the author's CLI), `shared_provider` (its latest observed launch
-    /// called a provider the author's did), `benched` (the run starts with it benched for every
-    /// call) or `not_eligible` (no invocation, or not eligible for work).
+    /// `same_identity` (it runs the author's CLI), `benched` (the run starts with it benched for
+    /// every call) or `not_eligible` (no registry record, no invocation, not eligible for work, or
+    /// marked unusable).
     pub reason: String,
-    /// The shared provider, for `shared_provider`; the bench's words, for `benched`.
+    /// The bench's words, for `benched`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
 }
@@ -40,9 +55,9 @@ pub struct NotJudge {
 #[serde(rename_all = "camelCase")]
 pub struct AuthorCoverage {
     pub seat: String,
-    /// The judges in the order the runtime search tries them.
-    pub judges: Vec<String>,
-    /// Every other roster seat, with why it does not judge this author's work.
+    /// The judges in the order the runtime rotation tries them.
+    pub judges: Vec<Judge>,
+    /// Every other seat of the run, with why it does not judge this author's work.
     pub not_judges: Vec<NotJudge>,
 }
 
@@ -50,19 +65,27 @@ pub struct AuthorCoverage {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct JudgeCoverage {
-    /// Some work seat's work has a judge.
+    /// Some work seat's work has a judge that is not [seen sharing](Judge::seen_sharing) its provider.
     pub covered: bool,
     /// Every work seat runs one CLI identity (the one-CLI quickstart).
     pub single_identity: bool,
-    /// The seats that can author governed work, in roster order.
+    /// The seats that can author governed work, in launch order.
     pub authors: Vec<AuthorCoverage>,
     /// The seats the run would start with benched, with the bench's words.
     pub benched: Vec<NotJudge>,
 }
 
+/// See the module doc. `clis`: the launch roster (as `launchRun`'s `clisJson`); `bound`: the run is
+/// bound to a repository (the launch's worktree bench). The judges' records are this process's
+/// registry, as at the gate.
+pub fn judge_coverage(clis: &[AgenticCli], bound: bool) -> JudgeCoverage {
+    judge_coverage_in(clis, &crate::registry_roster(), bound)
+}
+
 /// The bench the run would start with: the launcher's word, then the engine's host-floor and
-/// worktree benches, assembled as the launch does (`actor.rs`, the `NoEligibleSeat` check).
-fn launch_bench(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
+/// worktree benches, assembled as the launch does (`actor.rs`, the `NoEligibleSeat` check; a
+/// consumer's question is about a file-backed daemon, whose governed units are armed).
+pub(crate) fn launch_bench(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
     let mut bench: Vec<BenchedSeat> = crate::distribute::launcher_benched(clis);
     for seat in crate::distribute::launch_benched(clis, bound, true) {
         crate::domain::bench_seat(&mut bench, seat);
@@ -70,23 +93,28 @@ fn launch_bench(clis: &[AgenticCli], bound: bool) -> Vec<BenchedSeat> {
     bench
 }
 
-/// `clis` minus the `bench`ed seats: the roster the judge search walks.
-fn without(clis: &[AgenticCli], bench: &[BenchedSeat]) -> Vec<AgenticCli> {
-    clis.iter()
-        .filter(|c| !bench.iter().any(|b| b.cli == c.key))
-        .cloned()
-        .collect()
-}
-
-/// See the module doc. `bound`: the run is bound to a repository (the launch's worktree bench).
-pub fn judge_coverage(clis: &[AgenticCli], bound: bool) -> JudgeCoverage {
-    // The launch's bench, assembled as the launch does: the launcher's word, then the engine's
-    // host-floor and worktree benches (a consumer's question is about a file-backed daemon, whose
-    // governed units are armed: `contained`, as `worktree_benched` answers).
+/// [`judge_coverage`] over an explicit `registry` (the gate's `registry_roster()`).
+pub(crate) fn judge_coverage_in(
+    clis: &[AgenticCli],
+    registry: &[AgenticCli],
+    bound: bool,
+) -> JudgeCoverage {
     let bench = launch_bench(clis, bound);
-    let benched_any = |k: &str| bench.iter().any(|b| b.cli == k);
     let judge_bench = crate::domain::ungoverned_bench(&bench);
-    let judge_roster = without(clis, &judge_bench);
+    let run_roster: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+    // The default judge's pool, as the gate builds it (`eligible_run`).
+    let pool = crate::cli_runner::judge_pool(registry, &run_roster);
+    let run_has_registry_seat = registry
+        .iter()
+        .any(|c| crate::cli_runner::in_run_roster(&run_roster, &c.key));
+    let eligible_run: Vec<AgenticCli> = pool
+        .iter()
+        .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .filter(|c| !judge_bench.iter().any(|b| b.cli == c.key))
+        .filter(|c| !run_has_registry_seat || crate::cli_runner::in_run_roster(&run_roster, &c.key))
+        .map(|c| (*c).clone())
+        .collect();
+    let benched_any = |k: &str| bench.iter().any(|b| b.cli == k);
     let can_work =
         |c: &AgenticCli| c.seat_eligible_for_work && !c.headless_invocation.trim().is_empty();
 
@@ -94,39 +122,38 @@ pub fn judge_coverage(clis: &[AgenticCli], bound: bool) -> JudgeCoverage {
         .iter()
         .filter(|c| can_work(c) && !benched_any(&c.key))
         .map(|author| {
+            let ex = [author.key.as_str()];
+            let ids = crate::cli_runner::author_identities(&ex, registry);
+            let roster = crate::cli_runner::without_author_binaries(&eligible_run, &ex, &ids);
             let avoid = crate::observed_provider::last_seen(&author.key).unwrap_or_default();
-            let mut judges = Vec::new();
-            let mut not_judges = Vec::new();
-            let distinct =
-                crate::validator::distinct_judge_keys(&[author.key.as_str()], &judge_roster);
-            for k in distinct {
-                match crate::observed_provider::shared_with(&k, &avoid) {
-                    Some(p) => not_judges.push(NotJudge {
-                        seat: k,
-                        reason: "shared_provider".into(),
-                        detail: Some(p),
-                    }),
-                    None => judges.push(k),
-                }
-            }
-            for c in clis.iter().filter(|c| c.key != author.key) {
-                if judges.contains(&c.key) || not_judges.iter().any(|n| n.seat == c.key) {
-                    continue;
-                }
-                let (reason, detail) = if let Some(b) = judge_bench.iter().find(|b| b.cli == c.key)
-                {
-                    ("benched", Some(b.reason.clone()))
-                } else if !can_work(c) {
-                    ("not_eligible", None)
-                } else {
-                    ("same_identity", None)
-                };
-                not_judges.push(NotJudge {
-                    seat: c.key.clone(),
-                    reason: reason.into(),
-                    detail,
-                });
-            }
+            let mut judges: Vec<Judge> = crate::validator::distinct_judge_keys(&ex, &roster)
+                .into_iter()
+                .map(|seat| Judge {
+                    seen_sharing: crate::observed_provider::shared_with(&seat, &avoid),
+                    seat,
+                })
+                .collect();
+            // The rotation's own order: a stable sort, seats known to share last.
+            judges.sort_by_key(|j| j.seen_sharing.is_some());
+            let not_judges = clis
+                .iter()
+                .filter(|c| c.key != author.key && !judges.iter().any(|j| j.seat == c.key))
+                .map(|c| {
+                    let (reason, detail) =
+                        if let Some(b) = judge_bench.iter().find(|b| b.cli == c.key) {
+                            ("benched", Some(b.reason.clone()))
+                        } else if !eligible_run.iter().any(|e| e.key == c.key) || !can_work(c) {
+                            ("not_eligible", None)
+                        } else {
+                            ("same_identity", None)
+                        };
+                    NotJudge {
+                        seat: c.key.clone(),
+                        reason: reason.into(),
+                        detail,
+                    }
+                })
+                .collect();
             AuthorCoverage {
                 seat: author.key.clone(),
                 judges,
@@ -141,7 +168,9 @@ pub fn judge_coverage(clis: &[AgenticCli], bound: bool) -> JudgeCoverage {
         .map(crate::validator::seat_identity)
         .collect();
     JudgeCoverage {
-        covered: authors.iter().any(|a| !a.judges.is_empty()),
+        covered: authors
+            .iter()
+            .any(|a| a.judges.iter().any(|j| j.seen_sharing.is_none())),
         single_identity: identities.len() == 1,
         benched: bench
             .iter()
@@ -158,11 +187,7 @@ pub fn judge_coverage(clis: &[AgenticCli], bound: bool) -> JudgeCoverage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::observed_provider::{record_receipt, take_receipts, JudgingWork, Observed};
-    use crate::workflow::{StepInput, StepOutput, StepRunner, StepStatus};
-
-    const ANTHROPIC: &str = "api.anthropic.com:443";
-    const OPENAI: &str = "chatgpt.com:443";
+    use crate::observed_provider::{record_receipt, take_receipts};
 
     fn seat(key: &str, invocation: &str) -> AgenticCli {
         use wicked_council::{Category, Confidence, InputMode};
@@ -190,213 +215,54 @@ mod tests {
         }
     }
 
-    /// A judge that approves everything and is observed calling its seat's provider, as the
-    /// container floor's gateway records it (`None`: unobserved, the host floor).
-    struct Approves(Vec<(String, Option<&'static str>)>);
-    impl StepRunner for Approves {
-        fn run_unit(&self, input: &StepInput) -> StepOutput {
-            let seat = input.unit.assigned_cli.clone().unwrap_or_default();
-            let provider = self
-                .0
-                .iter()
-                .find(|(k, _)| *k == seat)
-                .and_then(|(_, p)| *p);
-            record_receipt(&seat, provider.map(|p| vec![p.to_string()]));
-            StepOutput {
-                run_id: input.run_id.clone(),
-                unit_ix: input.unit_ix,
-                attempt: input.attempt,
-                output: "PASS\nchecked\nPASS".into(),
-                status: StepStatus::Ok,
-                usage: None,
-                files: Vec::new(),
-                tools: Vec::new(),
-                governed: false,
-            }
+    /// Runs `f` with the container floor pinned (the benches read the floor; other tests change it).
+    fn on_container_floor<T>(f: impl FnOnce() -> T) -> T {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prev = std::env::var_os(crate::container_floor::SEAT_FLOOR_ENV);
+        std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, "container");
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var(crate::container_floor::SEAT_FLOOR_ENV, v),
+            None => std::env::remove_var(crate::container_floor::SEAT_FLOOR_ENV),
         }
+        out
     }
 
-    /// The roster and its observed providers. Keys are this module's own (`jc<n>-…`): the
-    /// observation record is process-wide and other tests write `claude`, `codex` and `pi`.
-    fn roster(
-        tag: &str,
-        seats: &[(&str, &str, Option<&'static str>)],
-    ) -> (Vec<AgenticCli>, Approves) {
-        let mut clis = Vec::new();
-        let mut providers = Vec::new();
-        for (name, binary, provider) in seats {
-            let key = format!("{tag}-{name}");
-            clis.push(seat(&key, &format!("{binary} -p {{PROMPT}}")));
-            if let Some(p) = provider {
-                record_receipt(&key, Some(vec![p.to_string()]));
-            }
-            providers.push((key, *provider));
-        }
+    #[test]
+    fn a_seat_seen_on_the_authors_provider_judges_last_and_flagged() {
+        let clis = [
+            seat("jcu1-claude", "claude -p {PROMPT}"),
+            seat("jcu1-pi", "pi -p {PROMPT}"),
+            seat("jcu1-codex", "codex -p {PROMPT}"),
+        ];
+        record_receipt("jcu1-claude", Some(vec!["api.anthropic.com:443".into()]));
+        record_receipt("jcu1-pi", Some(vec!["api.anthropic.com:443".into()]));
+        record_receipt("jcu1-codex", Some(vec!["chatgpt.com:443".into()]));
         let _ = take_receipts();
-        (clis, Approves(providers))
-    }
-
-    /// SAYS == DOES: for every work seat, what the launch says (its judges) is what the runtime's
-    /// judge search does with that seat's work — the first judge named is the seat whose approval
-    /// stands, and no judge named means the search finds no independent judge.
-    fn assert_agrees(clis: &[AgenticCli], runner: &Approves) -> JudgeCoverage {
-        let cov = judge_coverage(clis, false);
-        // The roster the gate's search walks: the run's, minus what the launch benched for every call.
-        let clis = &without(
-            clis,
-            &crate::domain::ungoverned_bench(&launch_bench(clis, false)),
-        );
-        for a in &cov.authors {
-            let work = Observed {
-                providers: crate::observed_provider::last_seen(&a.seat).unwrap_or_default(),
-                complete: true,
-            };
-            let _judging = JudgingWork::of(&work);
-            let runtime_has = crate::validator::distinct_judge_available(&[a.seat.as_str()], clis);
-            let (verdict, _) = crate::validator::agent_validate_with_refusals(
-                "the work is correct",
-                "work",
-                &[a.seat.as_str()],
-                clis,
-                runner,
-            );
-            let _ = take_receipts();
-            match a.judges.first() {
-                Some(first) => {
-                    let v = verdict.unwrap_or_else(|e| {
-                        panic!("{}: launch names {first}, runtime: {e}", a.seat)
-                    });
-                    assert!(v.pass);
-                    assert_eq!(
-                        v.judge_cli.as_deref(),
-                        Some(first.as_str()),
-                        "{}'s work",
-                        a.seat
-                    );
-                    assert_eq!(v.judge_distinct, Some(true));
-                }
-                None => assert!(
-                    !runtime_has || verdict.is_err(),
-                    "{}: launch says no judge, runtime judged on {:?}",
-                    a.seat,
-                    verdict.ok().and_then(|v| v.judge_cli)
-                ),
-            }
-        }
-        cov
-    }
-
-    fn judges_of<'a>(cov: &'a JudgeCoverage, seat: &str) -> &'a [String] {
-        &cov.authors.iter().find(|a| a.seat == seat).unwrap().judges
-    }
-
-    #[test]
-    fn claude_and_codex_cover_each_other() {
-        let (clis, r) = roster(
-            "jc1",
-            &[
-                ("claude", "claude", Some(ANTHROPIC)),
-                ("codex", "codex", Some(OPENAI)),
-            ],
-        );
-        let cov = assert_agrees(&clis, &r);
+        let cov = on_container_floor(|| judge_coverage_in(&clis, &clis, false));
         assert!(cov.covered);
-        assert!(!cov.single_identity);
-        assert_eq!(judges_of(&cov, "jc1-claude"), ["jc1-codex"]);
-        assert_eq!(judges_of(&cov, "jc1-codex"), ["jc1-claude"]);
-    }
-
-    #[test]
-    fn claude_alone_is_not_covered() {
-        let (clis, r) = roster("jc2", &[("claude", "claude", Some(ANTHROPIC))]);
-        let cov = assert_agrees(&clis, &r);
-        assert!(!cov.covered);
-        assert!(cov.single_identity);
-        assert!(judges_of(&cov, "jc2-claude").is_empty());
-    }
-
-    #[test]
-    fn claude_pi_codex_in_both_orders_with_pi_seen_on_claudes_provider() {
-        for (tag, order) in [
-            (
-                "jc3",
-                [("claude", "claude"), ("pi", "pi"), ("codex", "codex")],
-            ),
-            (
-                "jc4",
-                [("codex", "codex"), ("pi", "pi"), ("claude", "claude")],
-            ),
-        ] {
-            let seats: Vec<(&str, &str, Option<&'static str>)> = order
-                .iter()
-                .map(|(n, b)| (*n, *b, Some(if *n == "codex" { OPENAI } else { ANTHROPIC })))
-                .collect();
-            let (clis, r) = roster(tag, &seats);
-            let cov = assert_agrees(&clis, &r);
-            assert!(cov.covered, "{tag}");
-            let k = |n: &str| format!("{tag}-{n}");
-            // Claude's work: pi was seen on Anthropic too, so only codex judges it.
-            assert_eq!(judges_of(&cov, &k("claude")), [k("codex")], "{tag}");
-            let pi = cov.authors.iter().find(|a| a.seat == k("claude")).unwrap();
-            assert!(pi.not_judges.iter().any(|n| n.seat == k("pi")
-                && n.reason == "shared_provider"
-                && n.detail.as_deref() == Some(ANTHROPIC)));
-            assert_eq!(judges_of(&cov, &k("pi")), [k("codex")], "{tag}");
-            assert_eq!(judges_of(&cov, &k("codex")).len(), 2, "{tag}");
-        }
-    }
-
-    #[test]
-    fn an_unobserved_seat_is_never_called_shared() {
-        let (clis, r) = roster(
-            "jc5",
-            &[("claude", "claude", Some(ANTHROPIC)), ("agy", "agy", None)],
+        let claude = &cov.authors[0];
+        assert_eq!(claude.judges[0].seat, "jcu1-codex");
+        assert_eq!(claude.judges[1].seat, "jcu1-pi");
+        assert_eq!(
+            claude.judges[1].seen_sharing.as_deref(),
+            Some("api.anthropic.com:443")
         );
-        let cov = assert_agrees(&clis, &r);
-        assert!(cov.covered);
-        assert_eq!(judges_of(&cov, "jc5-claude"), ["jc5-agy"]);
-    }
-
-    #[test]
-    fn two_seats_seen_on_one_provider_are_not_covered() {
-        let (clis, r) = roster(
-            "jc6",
-            &[
-                ("claude", "claude", Some(ANTHROPIC)),
-                ("pi", "pi", Some(ANTHROPIC)),
-            ],
-        );
-        let cov = assert_agrees(&clis, &r);
-        assert!(!cov.covered);
-        assert!(!cov.single_identity);
-    }
-
-    #[test]
-    fn two_keys_running_one_binary_are_one_identity() {
-        let (clis, r) = roster(
-            "jc7",
-            &[("claude", "claude", None), ("sonnet", "claude", None)],
-        );
-        let cov = assert_agrees(&clis, &r);
-        assert!(!cov.covered);
-        assert!(cov.single_identity);
-        let a = &cov.authors[0];
-        assert_eq!(a.not_judges[0].reason, "same_identity");
     }
 
     #[test]
     fn a_launcher_benched_or_ballot_only_seat_neither_authors_nor_judges() {
-        let (mut clis, r) = roster(
-            "jc8",
-            &[
-                ("claude", "claude", None),
-                ("codex", "codex", None),
-                ("pi", "pi", None),
-            ],
-        );
+        let mut clis = [
+            seat("jcu2-claude", "claude -p {PROMPT}"),
+            seat("jcu2-codex", "codex -p {PROMPT}"),
+            seat("jcu2-pi", "pi -p {PROMPT}"),
+        ];
         clis[1].health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
         clis[2].seat_eligible_for_work = false;
-        let cov = assert_agrees(&clis, &r);
+        let registry = clis.clone();
+        let cov = on_container_floor(|| judge_coverage_in(&clis, &registry, false));
         assert!(!cov.covered);
         assert_eq!(cov.authors.len(), 1);
         let reasons: Vec<&str> = cov.authors[0]
