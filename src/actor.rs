@@ -30312,6 +30312,32 @@ mod request_changes_tests {
                     approved.is_ok(),
                     "{name}: re-seat on {cli}, then approve: {approved:?}"
                 );
+                // …and with the note the reassign carries, where the list offers one.
+                if action(&listed, "reassign").is_some_and(|a| a.note != crate::NoteRule::None) {
+                    let mut noted = open_store(Some(":memory:")).unwrap();
+                    seed(&mut noted, &run_id);
+                    let s = crate::domain::get_session(&noted, &run_id)
+                        .unwrap()
+                        .unwrap();
+                    let mut subs = crate::event_log::EventSink::default();
+                    reseat_parked_unit(&mut noted, &mut subs, &s, unit.ord, Some(cli)).unwrap();
+                    let with_note = HumanDecision::Approve {
+                        amend: Some("try it this way".into()),
+                        amend_scope: crate::workflow::AmendScope::Cursor,
+                    };
+                    assert!(
+                        answer(&mut noted, &run_id, with_note).0.is_ok(),
+                        "{name}: noted reassign"
+                    );
+                    assert_intent_effect(
+                        name,
+                        Some("reseat_and_retry"),
+                        &noted,
+                        &run_id,
+                        unit.ord,
+                        Some(cli),
+                    );
+                }
                 // `reseat_and_retry`: the step runs again, on that seat — never counted as it stood.
                 assert_intent_effect(
                     name,
@@ -30349,11 +30375,21 @@ mod request_changes_tests {
             .find(|u| u.ord == ord)
             .expect("the gated unit");
         let counted = unit.status == UnitStatus::Done;
+        // Runs the step itself: not a floor-only re-run on the old output, not a re-judge of it.
+        let floor_only = unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.requested_rerun.is_some());
+        let rejudged = unit.requested_rejudge.is_some();
         match intent {
             "retry" | "continue" | "deliver" | "reseat_and_retry" => {
                 assert!(
                     !counted,
                     "{name}: `{intent}` counted unit {ord} instead of running it"
+                );
+                assert!(
+                    !floor_only && !rejudged,
+                    "{name}: `{intent}` re-checked unit {ord}'s old output instead of running it"
                 );
             }
             "land_with_carried_items" | "operator_judgment" | "accept_work" => {
@@ -30786,6 +30822,63 @@ mod request_changes_tests {
             .unwrap();
         assert!(action(&listed, "reassign").is_none(), "{listed:#?}");
         assert_eq!(action(&listed, "approve").unwrap().intent, "accept_work");
+    }
+
+    /// (codex r3 on #1512) A team TRANSPORT pause over a dispute (publishing the dispute's answer
+    /// failed): the decision path answers the transport first, running the queued continuation —
+    /// so its approve is `continue_team`, never "accept the work", and no note means send back.
+    #[test]
+    fn gate_actions_transport_over_a_dispute_says_continue_team() {
+        let run_id = format!("ga-transport-dispute-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        s.unit_ix = 2;
+        s.team = Some(crate::domain::RunTeamState {
+            dispute: Some(crate::domain::DisputeGate {
+                gate_id: "g-3".into(),
+                ord: 3,
+                attempt: 0,
+                kind: crate::domain::DisputeKind::Finding,
+                finding_ids: vec!["F1".into()],
+            }),
+            pending: Some(crate::domain::PendingTeamFact {
+                event_type: "gate.decided".into(),
+                key: "k".into(),
+                stage: crate::domain::PendingStage::Paused,
+                then: crate::domain::TeamBlocked::Cancel,
+                staged: None,
+            }),
+            ..Default::default()
+        });
+        put_node(&mut store, s.to_node()).unwrap();
+        open_row(&mut store, &run_id, 3, team_gate::TEAM_TRANSPORT_GATE);
+        let listed = gate_actions::gate_actions(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let approve = action(&listed, "approve").expect("approve");
+        assert_eq!(approve.intent, "continue_team", "{listed:#?}");
+        assert_eq!(approve.note_intent, None);
+        assert!(action(&listed, "reassign").is_none());
+    }
+
+    /// (codex r3 on #1512) At a read-only phase's floor gate a note makes the approve a floor fix
+    /// (the old output re-checked, the new seat never runs): the reassign there takes no note.
+    #[test]
+    fn gate_actions_reassign_takes_no_note_where_a_note_is_a_floor_fix() {
+        let seed = |store: &mut dyn GraphStore, run_id: &str| {
+            seed_floor_red_verify(store, run_id, "codex");
+            let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+            s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+            put_node(store, s.to_node()).unwrap();
+            open_row(store, run_id, 4, "escalation");
+        };
+        let listed = listed_is_accepted("floor-fix-reassign", &seed);
+        if let Some(r) = action(&listed, "reassign") {
+            assert_eq!(r.note, crate::NoteRule::None, "{listed:#?}");
+        }
     }
 
     /// (core#782) A read-only phase's floor gate: an approve with a note is a FLOOR FIX.

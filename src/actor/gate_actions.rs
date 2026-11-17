@@ -333,7 +333,10 @@ fn answer_actions(
             && super::floor_fix_route_for(store, session, run_id, &noted, adjudication_open)?
         {
             a.note_intent = Some("floor_fix".to_string());
-        } else if note != NoteRule::None && super::team_gate::dispute_gate_open(session) {
+        } else if note != NoteRule::None
+            && super::team_gate::dispute_gate_open(session)
+            && !super::team_gate::transport_gate_open(session)
+        {
             // A team dispute's approve WITH a note is its send-back (`answer_dispute_gate`:
             // `DisputeAmended` reworks the step), never a continue.
             a.note_intent = Some("send_back".to_string());
@@ -463,7 +466,18 @@ fn answer_actions(
                 .cloned()
                 .collect();
             if !seats.is_empty() {
-                let mut a = act("reassign", "reseat_and_retry", NoteRule::Optional);
+                // The reassign's note rides the approve that follows the re-seat: offered only where a
+                // noted approve still re-runs the step (never where a note makes it a floor fix, which
+                // would reuse the old output and never run the new seat — codex r3 on #1512).
+                let noted_reruns = actions.iter().any(|a| {
+                    a.action == "approve" && a.note != NoteRule::None && a.note_intent.is_none()
+                });
+                let note = if noted_reruns {
+                    NoteRule::Optional
+                } else {
+                    NoteRule::None
+                };
+                let mut a = act("reassign", "reseat_and_retry", note);
                 a.benched_seats = seats
                     .iter()
                     .filter(|k| session.benched_seats.iter().any(|b| &b.cli == *k))
@@ -496,11 +510,13 @@ fn approve_intent(
     }
     // A team dispute's approve COUNTS the disputed work (`answer_dispute_gate`: `DisputeApproved`); a team transport
     // pause's approve publishes the missing team fact and the run goes on. Neither re-runs the step.
-    if super::team_gate::dispute_gate_open(session) {
-        return "accept_work";
-    }
+    // The transport pause first, as the decision path answers it: a transport pause over a dispute
+    // runs the dispute's queued continuation, whatever it was (codex r3 on #1512).
     if super::team_gate::transport_gate_open(session) {
         return "continue_team";
+    }
+    if super::team_gate::dispute_gate_open(session) {
+        return "accept_work";
     }
     if cursor
         .is_some_and(|u| u.member_step.is_none() && super::approve_is_operator_judgment(session, u))
