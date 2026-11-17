@@ -11936,6 +11936,11 @@ fn dispatch_unit_with(
     // (the fallback judge) Whether this unit was dispatched before THIS dispatch, read before the
     // stamp below: a Creator unit with no recorded binary then has an unrecorded author.
     let previously_dispatched = unit.last_attempt.is_some();
+    // (codex review of #1525) An agent unit dispatched before the seat-ID record (an author
+    // history with no `launched_seats`, which every dispatch now stamps) may have run under a seat
+    // ID its recorded names do not show: its history is marked incomplete, so the validator's
+    // author is never re-admitted and no fallback judge is seated for it.
+    crate::domain::mark_pre_seat_record_history(&mut unit, previously_dispatched);
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
@@ -11965,7 +11970,12 @@ fn dispatch_unit_with(
             // (core#1525) …and every other registry seat that launch runs as, by seat ID.
             let aliases =
                 crate::cli_runner::launch_aliases(&seat, unit.assigned_invocation.clone());
-            let before = (!unit.authored_by.contains(&seat)).then(|| {
+            // (codex review of #1525) A probe whenever this dispatch adds an author — its seat, or
+            // only a new seat ID it runs as — so an attempt that changes nothing takes all of it back.
+            let adds = std::iter::once(&seat)
+                .chain(&aliases)
+                .any(|s| !unit.authored_by.contains(s));
+            let before = adds.then(|| {
                 (
                     seat.clone(),
                     unit.authored_binaries.clone(),

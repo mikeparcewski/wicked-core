@@ -6539,6 +6539,38 @@ mod guarded_read_step_tests {
         assert_eq!(u.authored_by, vec!["pi".to_string()]);
     }
 
+    /// (codex review of core#1525) A history from before the seat-ID record is marked incomplete
+    /// at its next dispatch, so the validator author is never re-admitted on it; a recorded one,
+    /// a first dispatch or a tool unit is left alone.
+    #[test]
+    fn core_1525_a_pre_record_author_history_is_incomplete() {
+        let mut legacy = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
+        legacy.authored_by = vec!["codex".into()];
+        legacy.authored_binaries = vec!["cx".into()];
+        assert!(crate::pipeline::author_binaries_known(&legacy));
+        assert!(crate::domain::mark_pre_seat_record_history(
+            &mut legacy,
+            true
+        ));
+        assert!(!crate::pipeline::author_binaries_known(&legacy));
+        assert!(
+            !crate::domain::mark_pre_seat_record_history(&mut legacy, true),
+            "once"
+        );
+        let mut recorded = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
+        recorded.authored_binaries = vec!["codex".into()];
+        recorded.launched_seats = vec!["codex".into()];
+        assert!(!crate::domain::mark_pre_seat_record_history(
+            &mut recorded,
+            true
+        ));
+        let mut first = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
+        first.authored_binaries = vec!["codex".into()];
+        assert!(!crate::domain::mark_pre_seat_record_history(
+            &mut first, false
+        ));
+    }
+
     /// (DES-CATALOG-002 §5.1, report-author provenance) For a unit whose rubric excludes gatherers,
     /// the seats of the plan's earlier agent `understand` units are its authors — a GUARDED read
     /// step (no author by dispatch, J6) included, and every seat it ran on — but never the PA's

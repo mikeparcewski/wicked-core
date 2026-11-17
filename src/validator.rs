@@ -2251,25 +2251,16 @@ pub(crate) fn seat_identities(c: &AgenticCli) -> Vec<String> {
     invocation_identities(&c.headless_invocation)
 }
 
-/// (crew#972, coord codex-checks on #1525) EVERY identity an invocation template runs as, resolved
-/// once per template for the process (its first use is the roster's load) and never re-parsed at
-/// check time: the binary dispatch launches, read quote-aware and normalized (basename, case-folded),
-/// then — when that binary resolves to a file (a path, or a name on `PATH`) — the canonical
-/// executable's full path (symlinks followed), so one binary registered under two names is one
-/// identity. The full path, not its basename: npm-installed CLIs canonicalize to generic entry
-/// scripts (`cli.js`), on which two different CLIs must not collide.
+/// (crew#972, coord codex-checks on #1525) EVERY identity an invocation template runs as: the
+/// binary dispatch launches, read quote-aware and normalized (basename, case-folded), then — when
+/// that binary resolves to an executable (a path, or a name on `PATH`, as the launcher finds it) —
+/// the canonical executable's full path (symlinks followed), so one binary registered under two
+/// names is one identity. The full path, not its basename: npm-installed CLIs canonicalize to
+/// generic entry scripts (`cli.js`), on which two different CLIs must not collide. Resolved at each
+/// read (the registry's load, each dispatch, each judge selection), never cached: a retargeted
+/// symlink is read as what it now runs (codex review of #1525). Compared in-process only; run
+/// records keep names ([`crate::cli_runner::launched_identities`]).
 pub(crate) fn invocation_identities(invocation: &str) -> Vec<String> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-    static RESOLVED: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
-    let cache = RESOLVED.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(ids) = cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(invocation)
-    {
-        return ids.clone();
-    }
     let bin = crate::execute_wrapped::template_binary(invocation);
     let mut ids = vec![normalize_identity(&bin)];
     if let Some(real) = resolve_executable(&bin).and_then(|p| std::fs::canonicalize(p).ok()) {
@@ -2278,22 +2269,30 @@ pub(crate) fn invocation_identities(invocation: &str) -> Vec<String> {
             ids.push(real);
         }
     }
-    cache
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(invocation.to_string(), ids.clone());
     ids
 }
 
-/// The file `bin` launches: itself when it names a path, else the first `PATH` entry holding it
-/// (with `.exe` too on Windows).
+/// The file `bin` launches: itself when it names a path, else the first `PATH` entry holding an
+/// EXECUTABLE file of that name (with `.exe` too on Windows) — the one the launcher's own lookup
+/// takes; a non-executable file earlier on `PATH` is skipped as it skips it.
 fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
     if bin.is_empty() {
         return None;
     }
+    let runnable = |c: &std::path::Path| -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        }
+        #[cfg(not(unix))]
+        {
+            c.is_file()
+        }
+    };
     let p = std::path::Path::new(bin);
     if bin.contains(['/', '\\']) {
-        return p.is_file().then(|| p.to_path_buf());
+        return runnable(p).then(|| p.to_path_buf());
     }
     let names: Vec<String> = if cfg!(windows) {
         vec![bin.to_string(), format!("{bin}.exe")]
@@ -2302,7 +2301,7 @@ fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
     };
     std::env::split_paths(&std::env::var_os("PATH")?)
         .flat_map(|d| names.iter().map(move |n| d.join(n)).collect::<Vec<_>>())
-        .find(|c| c.is_file())
+        .find(|c| runnable(c))
 }
 
 /// Whether two identity sets ([`seat_identities`], [`excluded_identities`]) name one identity.

@@ -4230,9 +4230,43 @@ pub(crate) fn launched_identity(key: &str, invocation: Option<String>) -> String
 /// Names only (no executable path): these are recorded on the run ([`crate::domain::WorkUnit::
 /// authored_binaries`], rule rows' `judge_ids`), host-independent. The canonical executable is
 /// compared in-process only, through seat IDs ([`launched_seat_ids`]).
+///
+/// (codex review of #1525) …and the names of every registry seat whose EXECUTABLE the launch runs
+/// ([`launched_seat_ids`] against the full registry): `cx -> claude` records `claude` too, so the
+/// author history every guard reads carries the alias by name, cumulatively, on every authoring
+/// role, and a later failover cannot erase it.
 pub(crate) fn launched_identities(key: &str, invocation: Option<String>) -> Vec<String> {
+    launched_identities_in(key, invocation, &full_registry())
+}
+
+/// [`launched_identities`] against `registry`.
+fn launched_identities_in(
+    key: &str,
+    invocation: Option<String>,
+    registry: &[crate::AgenticCli],
+) -> Vec<String> {
+    let mut out = own_launch_identities(key, invocation.clone(), registry);
+    let ran = launch_tokens(key, invocation, registry);
+    for c in registry {
+        if c.key != key && crate::validator::same_identity(&seat_tokens(c), &ran) {
+            for id in record_identities(c) {
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The names a launch of `key` with `invocation` runs as, from the launch and the key's own
+/// registry record's carriers (`binary`, ACP adapter).
+fn own_launch_identities(
+    key: &str,
+    invocation: Option<String>,
+    registry: &[crate::AgenticCli],
+) -> Vec<String> {
     let mut out = vec![launched_identity(key, invocation)];
-    let registry = full_registry();
     let cli = wicked_apps_core::spawn::seat_cli_key(key);
     if let Some(rec) = registry
         .iter()
@@ -4248,6 +4282,26 @@ pub(crate) fn launched_identities(key: &str, invocation: Option<String>) -> Vec<
     out
 }
 
+/// In-process: what a launch runs, names and canonical executable.
+fn launch_tokens(
+    key: &str,
+    invocation: Option<String>,
+    registry: &[crate::AgenticCli],
+) -> Vec<String> {
+    let mut ran = crate::validator::invocation_identities(
+        &crate::execute_wrapped::launch_invocation(key, invocation.clone()),
+    );
+    ran.extend(own_launch_identities(key, invocation, registry));
+    ran
+}
+
+/// In-process: what a registry seat runs, names and canonical executable.
+fn seat_tokens(c: &crate::AgenticCli) -> Vec<String> {
+    let mut ids = crate::validator::seat_identities(c);
+    ids.extend(record_identities(c));
+    ids
+}
+
 /// (crew#972, coord ruling on core#1525) The roster seat IDs ONE launch of `key` with
 /// `invocation` runs as: `key` first, then every seat of `registry` whose identity
 /// ([`record_identities`]) the launch shares ([`launched_identities`]: the binary dispatch
@@ -4259,16 +4313,13 @@ pub(crate) fn launched_seat_ids(
     invocation: Option<String>,
     registry: &[crate::AgenticCli],
 ) -> Vec<String> {
-    // What the launch runs, with the canonical executable (in-process, never recorded).
-    let mut ran = crate::validator::invocation_identities(
-        &crate::execute_wrapped::launch_invocation(key, invocation.clone()),
-    );
+    // What the launch runs, with the canonical executable (in-process, never recorded), and the
+    // names it ran as by the full registry (an alias another roster knows).
+    let mut ran = launch_tokens(key, invocation.clone(), registry);
     ran.extend(launched_identities(key, invocation));
     let mut out = vec![key.to_string()];
     for c in registry {
-        let mut ids = crate::validator::seat_identities(c);
-        ids.extend(record_identities(c));
-        if !out.contains(&c.key) && crate::validator::same_identity(&ids, &ran) {
+        if !out.contains(&c.key) && crate::validator::same_identity(&seat_tokens(c), &ran) {
             out.push(c.key.clone());
         }
     }
@@ -4360,13 +4411,7 @@ pub(crate) fn full_registry() -> Vec<crate::AgenticCli> {
     // The same user path the execution carriers resolve (HOME, then USERPROFILE), so the records
     // checked are the records run (codex r7).
     let user = wicked_council::registry::default_user_path();
-    let registry = wicked_council::registry::load(user.as_deref()).unwrap_or_default();
-    // (core#1525) Each seat's identity is resolved here, at roster load, once per invocation
-    // template for the process ([`crate::validator::invocation_identities`] caches it).
-    for c in &registry {
-        crate::validator::invocation_identities(&c.headless_invocation);
-    }
-    registry
+    wicked_council::registry::load(user.as_deref()).unwrap_or_default()
 }
 
 /// The fallback seats' records from `registry` (the full one), in fallback order. Unfiltered on
@@ -7848,7 +7893,9 @@ mod tests {
         crate::AgenticCli {
             key: key.into(),
             display_name: key.into(),
-            binary: "unused".into(),
+            // The binary the invocation runs, as a real record names it (one shared placeholder
+            // would make every test seat one identity by its `binary` carrier).
+            binary: crate::execute_wrapped::template_binary(invocation),
             headless_invocation: invocation.into(),
             category: Category::default(),
             input_mode: InputMode::default(),
@@ -9472,8 +9519,13 @@ mod tests {
         // judges it.
         #[cfg(unix)]
         {
+            let mode = |p: &std::path::Path, m: u32| {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+            };
             let real = dir.join("codex");
             std::fs::write(&real, "#!/bin/sh\n").unwrap();
+            mode(&real, 0o755);
             let alias = dir.join("cx");
             let _ = std::fs::remove_file(&alias);
             std::os::unix::fs::symlink(&real, &alias).unwrap();
@@ -9491,6 +9543,44 @@ mod tests {
                 assert_eq!(seen, vec!["claude".to_string()], "never {other}");
                 assert_eq!(ready, seen);
             }
+            // (codex review) Read at each use, never cached: `cx` retargeted to claude's
+            // executable now runs claude, and its launch is claude's seat ID and name.
+            let claude_bin = dir.join("claude");
+            std::fs::write(&claude_bin, "#!/bin/sh\n").unwrap();
+            let both = vec![
+                seat("claude", &format!("{} -p {{PROMPT}}", claude_bin.display())),
+                seat("codex", &format!("{} exec {{PROMPT}}", real.display())),
+                seat("cx", &format!("{} exec {{PROMPT}}", alias.display())),
+            ];
+            mode(&claude_bin, 0o755);
+            let inv = Some(both[2].headless_invocation.clone());
+            assert_eq!(
+                launched_seat_ids("cx", inv.clone(), &both),
+                vec!["cx", "codex"]
+            );
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&claude_bin, &alias).unwrap();
+            assert_eq!(
+                launched_seat_ids("cx", inv.clone(), &both),
+                vec!["cx", "claude"]
+            );
+            // …and the recorded names carry the alias, so a later failover keeps it in history.
+            assert!(launched_identities_in("cx", inv.clone(), &both).contains(&"claude".into()));
+            let mut history = unit_on("codex", None, &both);
+            history.authored_binaries = launched_identities_in("cx", inv, &both);
+            history.authored_binaries.push("codex".into());
+            history.authored_by = vec!["cx".into(), "codex".into()];
+            let (seen, _, ready) = judge(history, &both);
+            assert!(
+                seen.is_empty() && ready.is_empty(),
+                "claude ran it as cx: {seen:?}"
+            );
+            // A non-executable file is not what a launch runs: no executable identity.
+            mode(&claude_bin, 0o644);
+            assert_eq!(
+                crate::validator::invocation_identities(&both[0].headless_invocation).len(),
+                1
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

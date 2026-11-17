@@ -652,6 +652,27 @@ pub fn stamp_author(
     changed
 }
 
+/// (codex review of core#1525) An agent unit dispatched before the seat-ID record — it carries
+/// author binaries but no [`WorkUnit::launched_seats`], which every dispatch now stamps — may have
+/// run under a seat ID its recorded names do not show: its history is marked incomplete
+/// ([`UNKNOWN_AUTHOR_BINARY`]), so the validator's author is never re-admitted and no fallback judge
+/// is seated for it. Called at dispatch, before the stamp. Returns whether it marked.
+pub fn mark_pre_seat_record_history(unit: &mut WorkUnit, previously_dispatched: bool) -> bool {
+    let legacy = previously_dispatched
+        && unit.tool_cmd.is_none()
+        && unit.launched_seats.is_empty()
+        && !unit.authored_binaries.is_empty()
+        && !unit
+            .authored_binaries
+            .iter()
+            .any(|b| b == UNKNOWN_AUTHOR_BINARY);
+    if legacy {
+        unit.authored_binaries
+            .insert(0, UNKNOWN_AUTHOR_BINARY.to_string());
+    }
+    legacy
+}
+
 /// Record `binaries` (every identity one authoring launch may execute) on `unit`. `had_authors`:
 /// the unit was authored before this stamp — with no binary recorded yet, that history is from
 /// before the record, so [`UNKNOWN_AUTHOR_BINARY`] goes first and stays.
