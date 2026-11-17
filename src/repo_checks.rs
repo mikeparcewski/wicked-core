@@ -5009,22 +5009,25 @@ pub(crate) fn floor_min_free_gib() -> u64 {
         .unwrap_or(15)
 }
 
-/// The bytes free (to an unprivileged user) on the volume holding `path`; `None` when unreadable.
-#[cfg(unix)]
+/// The bytes free on the volume holding `path` (the cache cap's own reading, `volume_space`);
+/// `None` when unreadable. Test builds read [`test_free_bytes`] instead, so a nearly full CI
+/// runner never decides a fixture's outcome (the cache cap's `DiskProbe::Off` rule).
+#[cfg(not(test))]
 pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statvfs.
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
-    }
-    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+    volume_space(path).map(|s| s.free)
 }
 
-#[cfg(not(unix))]
+#[cfg(test)]
 pub(crate) fn free_bytes(_path: &Path) -> Option<u64> {
-    None
+    let v = TEST_FREE_BYTES.with(std::cell::Cell::get);
+    (v != u64::MAX - 1).then_some(v)
+}
+
+// (core#1482) Test seam: the free space the floor's disk guard reads in test builds, per test
+// thread (plenty by default; `u64::MAX - 1` = unreadable).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
 /// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
@@ -5058,12 +5061,6 @@ fn run_floor_inner(
             "the run was cancelled: its floor does not start".into(),
         );
     }
-    if let Some(why) = check_cache_root()
-        .ok()
-        .and_then(|root| disk_guard(free_bytes(&root), floor_min_free_gib()))
-    {
-        return runner_refused(worktree, ctx, why);
-    }
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -5075,6 +5072,15 @@ fn run_floor_inner(
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
+    // (core#1482) The disk guard, measured AFTER the scratch's preparation: that runs the cache
+    // cap's lease-protected eviction (which frees stale leaves when the volume is short), and it
+    // creates the cache root, so its volume can be read on a fresh home.
+    if let Some(why) = check_cache_root()
+        .ok()
+        .and_then(|root| disk_guard(free_bytes(&root), floor_min_free_gib()))
+    {
+        return runner_refused(worktree, ctx, why);
+    }
     // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
     if let Some(root) = scratch.logs.parent() {
         crate::floor_log::gc(

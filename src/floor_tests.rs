@@ -5665,5 +5665,24 @@ fn core_1482_the_floor_refuses_to_start_below_its_free_space_minimum() {
         "unknown free space never refuses"
     );
     assert_eq!(disk_guard(Some(1), 0), None, "0 turns the guard off");
-    assert!(free_bytes(&std::env::temp_dir()).is_some_and(|b| b > 0) || cfg!(not(unix)));
+}
+
+/// (core#1482) The guard runs before any check, after the cache's own reclamation: a floor on a
+/// volume reading 1 GiB free refuses with the environment reason and runs nothing (the test seam
+/// stands in for the volume, so a nearly full runner never decides another fixture).
+#[test]
+fn core_1482_a_floor_short_of_disk_runs_nothing_and_says_environment() {
+    let wt = scratch("disk-guard");
+    std::fs::write(wt.join("package.json"), r#"{"scripts":{"test":"exit 1"}}"#).unwrap();
+    TEST_FREE_BYTES.with(|c| c.set(1 << 30));
+    let r = run_floor(&wt, &FloorContext::default());
+    TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+    assert!(r.checks.is_empty(), "no check ran: {r:?}");
+    assert!(
+        r.sandbox_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("environment:") && e.contains("1.0 GiB free")),
+        "{r:?}"
+    );
+    let _ = std::fs::remove_dir_all(&wt);
 }
