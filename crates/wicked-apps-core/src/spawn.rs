@@ -675,18 +675,10 @@ pub fn nopush_git_config_env() -> Vec<(String, String)> {
 pub fn seat_git_config_files(
     cwd: Option<&std::path::Path>,
 ) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
-    seat_git_config_files_for(&operator_git_identity_config(cwd))
-}
-
-/// [`seat_git_config_files`] over entries already read by [`operator_git_identity_config`], so
-/// one spawn reads the operator's config once for both the file and [`seat_git_identity_env`].
-fn seat_git_config_files_for(
-    copied: &[(String, Option<String>)],
-) -> anyhow::Result<(std::path::PathBuf, std::path::PathBuf)> {
     use anyhow::Context;
     let dir = seat_gh_config_dir()?;
     ensure_private_dir(&dir)?;
-    let content = seat_global_git_config(copied);
+    let content = seat_global_git_config(&operator_git_identity_config(cwd));
     let global = dir.join(format!("gitconfig-{}", content_hash(&content)));
     let system = dir.join("gitconfig-system");
     write_if_changed(&global, &content).context("seat global gitconfig")?;
@@ -698,31 +690,52 @@ fn seat_git_config_files_for(
     Ok((global, system))
 }
 
-/// The operator's identity as git's identity ENVIRONMENT (wicked-core#1485): `GIT_AUTHOR_NAME`,
-/// `GIT_COMMITTER_NAME` from `user.name` and `GIT_AUTHOR_EMAIL`, `GIT_COMMITTER_EMAIL` from
-/// `user.email` of the entries [`operator_git_identity_config`] copied (the last entry wins, as in
-/// git). git ranks these above every config source, `-c` included, so a seat's own
-/// `git -c user.name=pi commit`, a `user.name` it writes into the worktree's `.git/config`, or a
-/// pod whose copied file did not arrive cannot change who its commits are by; only `--author`
-/// changes the author, and the committer stays. A key that is absent, empty, or carries a control
-/// character sets nothing (git would refuse or mangle it); an operator with no identity gets
-/// nothing, and the seat's inherited environment is left as it is.
-pub fn seat_git_identity_env(copied: &[(String, Option<String>)]) -> Vec<(String, String)> {
-    let last = |key: &str| {
-        copied
-            .iter()
-            .rev()
-            .find(|(k, _)| k.eq_ignore_ascii_case(key))
-            .and_then(|(_, v)| v.as_deref())
-            .map(str::trim)
-            .filter(|v| !v.is_empty() && !v.chars().any(char::is_control))
+/// The identity the operator's own git resolves in `cwd` (wicked-core#1485): `user.name` and
+/// `user.email` as `git config --get` reads them there — system, global, the repository's own
+/// config, and every `include`/`includeIf "gitdir:…"` they name — exactly what the operator's own
+/// `git commit` in that worktree (and the deliver step's commit) would use. Environment-injected
+/// config (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) is not read. `None` for a key git does not
+/// resolve (or when git cannot run). Read on the HOST before the spawn: a container seat's
+/// `.git` is the engine's replica, rebuilt at every copy-in and never written back
+/// (`src/k8s/sync.rs`), so nothing a seat configures in a pod reaches this read.
+pub fn operator_git_identity(cwd: Option<&std::path::Path>) -> (Option<String>, Option<String>) {
+    let get = |key: &str| -> Option<String> {
+        let mut git = Command::new("git");
+        git.hardened();
+        git.args(["config", "--null", "--get", key]);
+        git.env("GIT_TERMINAL_PROMPT", "0");
+        git.env_remove("GIT_CONFIG_PARAMETERS");
+        git.env_remove("GIT_CONFIG_COUNT");
+        if let Some(dir) = cwd {
+            git.current_dir(dir);
+        }
+        let out = git.output().ok().filter(|o| o.status.success())?;
+        let value = String::from_utf8(out.stdout).ok()?;
+        Some(value.strip_suffix('\0').unwrap_or(&value).to_string())
     };
+    (get("user.name"), get("user.email"))
+}
+
+/// The operator's identity ([`operator_git_identity`]) as git's identity ENVIRONMENT
+/// (wicked-core#1485): `GIT_AUTHOR_NAME`/`GIT_COMMITTER_NAME` from the name and
+/// `GIT_AUTHOR_EMAIL`/`GIT_COMMITTER_EMAIL` from the email, each value exactly as git resolved it.
+/// git ranks this environment above every config source, `-c` included, so every commit a seat
+/// AUTHORS is the operator's, whatever identity the seat configures for itself (`-c`, its replica's
+/// `.git/config`) and whether or not a pod's copied config file arrived. What stays possible is
+/// git's own: `--author` sets the author (the committer stays the operator), and an operation
+/// that keeps an existing commit's author (`commit --amend`, `rebase`, `cherry-pick`) keeps it.
+/// A value that is blank or carries a control character sets nothing (git would refuse or mangle
+/// it); an operator with no identity gets nothing, and the seat's inherited environment stays.
+pub fn seat_git_identity_env(name: Option<&str>, email: Option<&str>) -> Vec<(String, String)> {
+    fn usable(v: Option<&str>) -> Option<&str> {
+        v.filter(|v| !v.trim().is_empty() && !v.chars().any(char::is_control))
+    }
     let mut env = Vec::new();
-    if let Some(name) = last("user.name") {
+    if let Some(name) = usable(name) {
         env.push(("GIT_AUTHOR_NAME".to_string(), name.to_string()));
         env.push(("GIT_COMMITTER_NAME".to_string(), name.to_string()));
     }
-    if let Some(email) = last("user.email") {
+    if let Some(email) = usable(email) {
         env.push(("GIT_AUTHOR_EMAIL".to_string(), email.to_string()));
         env.push(("GIT_COMMITTER_EMAIL".to_string(), email.to_string()));
     }
@@ -1019,8 +1032,9 @@ pub fn seat_gh_config_dir() -> anyhow::Result<std::path::PathBuf> {
 /// helpers reset, `protocol.ssh|git|ext.allow = never`; (4) `GIT_CONFIG_GLOBAL`/
 /// `GIT_CONFIG_SYSTEM` → the seat-owned files ([`seat_git_config_files`]): the operator's
 /// identity COPIED (never included), their credential helpers, URL rewrites and
-/// `~/.git-credentials` never consulted; (5) that identity also as `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
-/// ([`seat_git_identity_env`], wicked-core#1485), so a seat's commits are the operator's.
+/// `~/.git-credentials` never consulted; (5) the identity the operator's git resolves in the
+/// seat's worktree as `GIT_AUTHOR_*`/`GIT_COMMITTER_*` ([`seat_git_identity_env`],
+/// wicked-core#1485), so the commits a seat authors are the operator's.
 ///
 /// What this guarantees, exactly (review of #449, r2): a `git` that runs with the seat's
 /// environment intact cannot push anywhere — https/http, `ssh://`, `git@host:`, `user@host:`,
@@ -1071,8 +1085,7 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
         ),
     }
     let cwd = cmd.get_current_dir().map(|p| p.to_path_buf());
-    let copied = operator_git_identity_config(cwd.as_deref());
-    match seat_git_config_files_for(&copied) {
+    match seat_git_config_files(cwd.as_deref()) {
         Ok((global, system)) => {
             cmd.env("GIT_CONFIG_GLOBAL", global);
             cmd.env("GIT_CONFIG_SYSTEM", system);
@@ -1085,8 +1098,9 @@ pub fn fence_remote_credentials(cmd: &mut Command) {
     }
     // (5) wicked-core#1485: the seat's commits carry the operator's identity, whatever the seat
     // configures for itself (the file above is the lowest identity source git reads).
-    for (name, value) in seat_git_identity_env(&copied) {
-        cmd.env(name, value);
+    let (name, email) = operator_git_identity(cwd.as_deref());
+    for (key, value) in seat_git_identity_env(name.as_deref(), email.as_deref()) {
+        cmd.env(key, value);
     }
 }
 
@@ -3266,83 +3280,110 @@ rebase.autosquash\0";
         let _ = std::fs::remove_dir_all(&base);
     }
 
-    /// wicked-core#1485: identity entries become git's identity environment, last entry wins, and
-    /// an absent, empty or control-character value sets nothing.
+    /// wicked-core#1485: the resolved identity becomes git's identity environment, each value
+    /// exactly as git resolved it; a blank value or one carrying a control character (anywhere,
+    /// leading and trailing included) sets nothing.
     #[test]
-    fn seat_git_identity_env_carries_the_operators_name_and_email_only() {
-        let e = |k: &str, v: Option<&str>| (k.to_string(), v.map(str::to_string));
-        let env = seat_git_identity_env(&[
-            e("user.name", Some("Old")),
-            e("user.email", Some("op@example.invalid")),
-            e("user.signingkey", Some("ABC")),
-            e("user.name", Some("Operator Name")),
-        ]);
-        let pairs: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    fn seat_git_identity_env_carries_the_operators_name_and_email_as_resolved() {
+        let pairs = |env: Vec<(String, String)>| -> Vec<(String, String)> { env };
         assert_eq!(
-            pairs,
+            pairs(seat_git_identity_env(
+                Some("\u{a0}Operator Name\u{a0}"),
+                Some("op@example.invalid")
+            )),
             vec![
-                ("GIT_AUTHOR_NAME", "Operator Name"),
-                ("GIT_COMMITTER_NAME", "Operator Name"),
-                ("GIT_AUTHOR_EMAIL", "op@example.invalid"),
-                ("GIT_COMMITTER_EMAIL", "op@example.invalid"),
+                ("GIT_AUTHOR_NAME".into(), "\u{a0}Operator Name\u{a0}".into()),
+                (
+                    "GIT_COMMITTER_NAME".into(),
+                    "\u{a0}Operator Name\u{a0}".into()
+                ),
+                ("GIT_AUTHOR_EMAIL".into(), "op@example.invalid".into()),
+                ("GIT_COMMITTER_EMAIL".into(), "op@example.invalid".into()),
             ]
         );
         assert!(
-            seat_git_identity_env(&[]).is_empty(),
+            seat_git_identity_env(None, None).is_empty(),
             "no identity sets nothing"
         );
-        for bad in [None, Some(""), Some("  "), Some("a\nb"), Some("a\u{7}b")] {
+        assert_eq!(
+            seat_git_identity_env(None, Some("op@example.invalid")).len(),
+            2,
+            "an email alone sets the two email variables"
+        );
+        for bad in [
+            "",
+            "  ",
+            "a\nb",
+            "a\u{7}b",
+            "\tOperator",
+            "Operator\n",
+            "\u{0}x",
+        ] {
             assert!(
-                seat_git_identity_env(&[e("user.name", bad), e("user.email", bad)]).is_empty(),
+                seat_git_identity_env(Some(bad), Some(bad)).is_empty(),
                 "{bad:?} sets nothing"
             );
         }
     }
 
-    /// wicked-core#1485, from the seat's side: a seat that configures its OWN identity (`-c` on
-    /// the command line, and `user.*` written into the worktree's `.git/config`) still commits as
-    /// the operator, author and committer; with no operator identity the fence sets none and the
-    /// seat's own wins (nothing forged by the engine).
+    /// Restores the process variables a fixture changes, also when an assertion unwinds.
+    struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+
+    impl EnvRestore {
+        fn take(keys: &[&'static str]) -> Self {
+            Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
+        }
+    }
+
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            for (k, v) in &self.0 {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    /// wicked-core#1485, from the seat's side: a seat that names ITSELF (`-c user.name=pi`, as the
+    /// four wicked-studio#1151 commits did) still commits as the identity the operator's own git
+    /// resolves in that worktree, author and committer: the global identity, a repository's own
+    /// identity, and an `includeIf "gitdir:…"` identity. With no operator identity the fence
+    /// forges none: the seat's own wins, and an identity the daemon inherited stays.
     #[test]
-    fn a_fenced_seats_commits_carry_the_operators_identity_whatever_the_seat_configures() {
+    fn a_fenced_seats_commits_carry_the_operators_resolved_identity_whatever_the_seat_configures() {
         let _env = lock_env();
+        let _restore = EnvRestore::take(&[
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ]);
+        for k in [
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+        ] {
+            std::env::remove_var(k);
+        }
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
         let base = std::env::temp_dir().join(format!(
             "wicked-ident-{}-{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
         let _ = std::fs::remove_dir_all(&base);
-        let repo = base.join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        let op_global = base.join("operator-gitconfig");
-        let none_global = base.join("operator-gitconfig-none");
-        std::fs::write(
-            &op_global,
-            "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n",
-        )
-        .unwrap();
-        std::fs::write(&none_global, "[core]\n\teditor = true\n").unwrap();
-        let prior_global = std::env::var_os("GIT_CONFIG_GLOBAL");
-        let prior_ident: Vec<(&str, Option<std::ffi::OsString>)> = [
-            "GIT_AUTHOR_NAME",
-            "GIT_AUTHOR_EMAIL",
-            "GIT_COMMITTER_NAME",
-            "GIT_COMMITTER_EMAIL",
-        ]
-        .into_iter()
-        .map(|k| (k, std::env::var_os(k)))
-        .collect();
-        for (k, _) in &prior_ident {
-            std::env::remove_var(k);
-        }
+        std::fs::create_dir_all(&base).unwrap();
+        let base = base.canonicalize().unwrap();
         // spawn-audit: test-only fixture spawns; the fence under test is applied when `fenced`.
-        let git = |args: &[&str], global: &std::path::Path, fenced: bool| -> (bool, String) {
-            std::env::set_var("GIT_CONFIG_GLOBAL", global);
+        let git = |repo: &std::path::Path, args: &[&str], fenced: bool| -> (bool, String) {
             let mut c = Command::new("git");
             c.hardened();
-            c.args(args).current_dir(&repo);
-            c.env("GIT_CONFIG_NOSYSTEM", "1");
-            c.env("GIT_CONFIG_GLOBAL", global);
+            c.args(args).current_dir(repo);
             if fenced {
                 fence_remote_credentials(&mut c);
             }
@@ -3359,35 +3400,24 @@ rebase.autosquash\0";
                 ),
             )
         };
-        let restore = || {
-            match &prior_global {
-                Some(v) => std::env::set_var("GIT_CONFIG_GLOBAL", v),
-                None => std::env::remove_var("GIT_CONFIG_GLOBAL"),
+        // One case: the operator's global config, an optional repository identity, then a fenced
+        // seat commit that names itself `pi <pi@local>`; returns `author|committer`.
+        let case = |name: &str, global: &str, local: Option<(&str, &str)>| -> String {
+            let repo = base.join(name);
+            std::fs::create_dir_all(&repo).unwrap();
+            let global_file = base.join(format!("{name}-gitconfig"));
+            std::fs::write(&global_file, global).unwrap();
+            std::env::set_var("GIT_CONFIG_GLOBAL", &global_file);
+            assert!(git(&repo, &["init", "-q"], false).0, "{name}: init");
+            assert!(git(&repo, &["config", "commit.gpgsign", "false"], false).0);
+            if let Some((n, e)) = local {
+                assert!(git(&repo, &["config", "user.name", n], false).0);
+                assert!(git(&repo, &["config", "user.email", e], false).0);
             }
-            for (k, v) in &prior_ident {
-                if let Some(v) = v {
-                    std::env::set_var(k, v);
-                }
-            }
-        };
-        if !git(&["init", "-q"], &op_global, false).0 {
-            eprintln!("no usable git on this host — skipping the seat identity fixture");
-            restore();
-            let _ = std::fs::remove_dir_all(&base);
-            return;
-        }
-        // What the seat configures for itself: its own name in the worktree's config.
-        for (k, v) in [
-            ("user.name", "pi"),
-            ("user.email", "pi@local"),
-            ("commit.gpgsign", "false"),
-        ] {
-            assert!(git(&["config", k, v], &op_global, false).0);
-        }
-        let commit_as_pi = |n: &str, global: &std::path::Path| {
-            std::fs::write(repo.join(format!("{n}.txt")), n).unwrap();
-            assert!(git(&["add", "."], global, true).0);
+            std::fs::write(repo.join("a.txt"), name).unwrap();
+            assert!(git(&repo, &["add", "."], true).0);
             let (ok, out) = git(
+                &repo,
                 &[
                     "-c",
                     "user.name=pi",
@@ -3395,32 +3425,80 @@ rebase.autosquash\0";
                     "user.email=pi@local",
                     "commit",
                     "-qm",
-                    n,
+                    name,
                 ],
-                global,
                 true,
             );
-            assert!(ok, "the fenced commit {n} lands: {out}");
-            git(
-                &["log", "-1", "--format=%an <%ae>|%cn <%ce>"],
-                global,
-                false,
-            )
-            .1
+            assert!(ok, "{name}: the fenced commit lands: {out}");
+            git(&repo, &["log", "-1", "--format=%an <%ae>|%cn <%ce>"], false)
+                .1
+                .trim()
+                .to_string()
         };
-        let who = commit_as_pi("one", &op_global);
-        restore();
+        if !git(&base, &["--version"], false).0 {
+            eprintln!("no usable git on this host — skipping the seat identity fixture");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let op = "Operator Name <op@example.invalid>";
         assert_eq!(
-            who.trim(),
-            "Operator Name <op@example.invalid>|Operator Name <op@example.invalid>",
-            "author and committer are the operator's, not the seat's own"
+            case(
+                "global",
+                "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n",
+                None
+            ),
+            format!("{op}|{op}"),
+            "the global identity, not the seat's own"
         );
-        let who = commit_as_pi("two", &none_global);
-        restore();
+        let repo_id = "Repo Identity <repo@example.invalid>";
         assert_eq!(
-            who.trim(),
+            case(
+                "local",
+                "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n",
+                Some(("Repo Identity", "repo@example.invalid"))
+            ),
+            format!("{repo_id}|{repo_id}"),
+            "the repository's own identity, as the operator's git resolves it there"
+        );
+        let work_cfg = base.join("work-gitconfig");
+        std::fs::write(
+            &work_cfg,
+            "[user]\n\tname = Work Identity\n\temail = work@example.invalid\n",
+        )
+        .unwrap();
+        let work = "Work Identity <work@example.invalid>";
+        assert_eq!(
+            case(
+                "included",
+                &format!(
+                    "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n\
+                     [includeIf \"gitdir:{}/included/\"]\n\tpath = {}\n",
+                    base.to_string_lossy(),
+                    work_cfg.to_string_lossy()
+                ),
+                None
+            ),
+            format!("{work}|{work}"),
+            "an includeIf identity for this worktree"
+        );
+        assert_eq!(
+            case("none", "[core]\n\teditor = true\n", None),
             "pi <pi@local>|pi <pi@local>",
-            "no operator identity: the fence sets none (the control for the case above)"
+            "no operator identity: the fence forges none (the control for the cases above)"
+        );
+        for (k, v) in [
+            ("GIT_AUTHOR_NAME", "Inherited"),
+            ("GIT_AUTHOR_EMAIL", "inh@example.invalid"),
+            ("GIT_COMMITTER_NAME", "Inherited"),
+            ("GIT_COMMITTER_EMAIL", "inh@example.invalid"),
+        ] {
+            std::env::set_var(k, v);
+        }
+        let inh = "Inherited <inh@example.invalid>";
+        assert_eq!(
+            case("inherited", "[core]\n\teditor = true\n", None),
+            format!("{inh}|{inh}"),
+            "no operator identity: an identity the daemon inherited stays"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
