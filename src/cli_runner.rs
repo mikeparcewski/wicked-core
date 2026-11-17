@@ -9406,105 +9406,248 @@ mod tests {
         );
         let baseline = crate::worktree_guard::snapshot(&wt, &repo).unwrap();
 
-        // (name, invocation, provider seen before the launch, provider at the gate)
-        type Seat = (
-            &'static str,
-            &'static str,
-            Option<&'static str>,
-            Option<&'static str>,
-        );
-        let cases: Vec<(&str, Vec<Seat>, Option<bool>)> = vec![
-            (
-                "cc",
-                vec![
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("codex", "codex", Some(OPENAI), Some(OPENAI)),
+        /// One seat: name (an instance key `x#2` allowed), the launch record's binary, the registry
+        /// record's binary (`None`: no registry record), provider seen before the launch, provider at
+        /// the gate.
+        struct S {
+            name: &'static str,
+            launch: &'static str,
+            registry: Option<&'static str>,
+            seen: Option<&'static str>,
+            now: Option<&'static str>,
+        }
+        fn s(
+            name: &'static str,
+            bin: &'static str,
+            seen: Option<&'static str>,
+            now: Option<&'static str>,
+        ) -> S {
+            S {
+                name,
+                launch: bin,
+                registry: Some(bin),
+                seen,
+                now,
+            }
+        }
+        struct Case {
+            tag: &'static str,
+            seats: Vec<S>,
+            /// The registry lists the run's records in reverse launch order.
+            registry_reversed: bool,
+            /// Launch records the launcher benched (health unusable); their registry records stay healthy.
+            benched: &'static [&'static str],
+            /// Launch records marked ballot-only; their registry records stay work-eligible.
+            ballot_only: &'static [&'static str],
+            /// The work seats, said independently of the code under test.
+            authors: &'static [&'static str],
+            /// `Some(covered)` when the gate's providers are the observed history.
+            covered: Option<bool>,
+        }
+        let a = Some(ANTHROPIC);
+        let o = Some(OPENAI);
+        let cases = vec![
+            Case {
+                tag: "cc",
+                seats: vec![s("claude", "claude", a, a), s("codex", "codex", o, o)],
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "codex"],
+                covered: Some(true),
+            },
+            Case {
+                tag: "c1",
+                seats: vec![s("claude", "claude", a, a)],
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude"],
+                covered: Some(false),
+            },
+            Case {
+                tag: "cpx",
+                seats: vec![
+                    s("claude", "claude", a, a),
+                    s("pi", "pi", a, a),
+                    s("codex", "codex", o, o),
                 ],
-                Some(true),
-            ),
-            (
-                "c1",
-                vec![("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC))],
-                Some(false),
-            ),
-            (
-                "cpx",
-                vec![
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("pi", "pi", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("codex", "codex", Some(OPENAI), Some(OPENAI)),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "pi", "codex"],
+                covered: Some(true),
+            },
+            Case {
+                tag: "xpc",
+                seats: vec![
+                    s("codex", "codex", o, o),
+                    s("pi", "pi", a, a),
+                    s("claude", "claude", a, a),
                 ],
-                Some(true),
-            ),
-            (
-                "xpc",
-                vec![
-                    ("codex", "codex", Some(OPENAI), Some(OPENAI)),
-                    ("pi", "pi", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["codex", "pi", "claude"],
+                covered: Some(true),
+            },
+            // The registry's order is not the launch's: the gate walks the registry's.
+            Case {
+                tag: "rev",
+                seats: vec![
+                    s("claude", "claude", None, None),
+                    s("pi", "pi", None, None),
+                    s("codex", "codex", None, None),
                 ],
-                Some(true),
-            ),
-            (
-                "unobs",
-                vec![
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("agy", "agy", None, None),
+                registry_reversed: true,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "pi", "codex"],
+                covered: Some(true),
+            },
+            // The registry's record of `pi` runs claude: the gate reads the registry's record.
+            Case {
+                tag: "rec",
+                seats: vec![
+                    s("claude", "claude", None, None),
+                    S {
+                        name: "pi",
+                        launch: "pi",
+                        registry: Some("claude"),
+                        seen: None,
+                        now: None,
+                    },
                 ],
-                Some(true),
-            ),
-            (
-                "shared",
-                vec![
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("pi", "pi", Some(ANTHROPIC), Some(ANTHROPIC)),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "pi"],
+                covered: Some(false),
+            },
+            Case {
+                tag: "unobs",
+                seats: vec![s("claude", "claude", a, a), s("agy", "agy", None, None)],
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "agy"],
+                covered: Some(true),
+            },
+            Case {
+                tag: "shared",
+                seats: vec![s("claude", "claude", a, a), s("pi", "pi", a, a)],
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "pi"],
+                covered: Some(false),
+            },
+            // Seen sharing before, unobserved at the gate: the gate takes the approval, and the
+            // launch named that seat (flagged, not counted as covered).
+            Case {
+                tag: "drift",
+                seats: vec![s("claude", "claude", a, a), s("pi", "pi", a, None)],
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "pi"],
+                covered: None,
+            },
+            Case {
+                tag: "quoted",
+                seats: vec![
+                    s("a", "\"/opt/Seat Tools/claude\"", None, None),
+                    s("b", "\"/opt/Seat Tools/codex\"", None, None),
                 ],
-                Some(false),
-            ),
-            // Seen sharing before, unobserved at the gate: the gate takes pi's approval; the launch
-            // named pi (flagged) and did not call it covered.
-            (
-                "drift",
-                vec![
-                    ("claude", "claude", Some(ANTHROPIC), Some(ANTHROPIC)),
-                    ("pi", "pi", Some(ANTHROPIC), None),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["a", "b"],
+                covered: Some(false),
+            },
+            Case {
+                tag: "alias",
+                seats: vec![
+                    s("claude", "claude", None, None),
+                    s("sonnet", "claude", None, None),
                 ],
-                None,
-            ),
-            (
-                "quoted",
-                vec![
-                    ("a", "\"/opt/Seat Tools/claude\"", None, None),
-                    ("b", "\"/opt/Seat Tools/codex\"", None, None),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "sonnet"],
+                covered: Some(false),
+            },
+            // An instance seat: the gate anchors its rotation on the instance's CLI record.
+            Case {
+                tag: "inst",
+                seats: vec![
+                    s("claude", "claude", None, None),
+                    s("codex#2", "codex", None, None),
+                    s("pi", "pi", None, None),
                 ],
-                Some(false),
-            ),
-            (
-                "alias",
-                vec![
-                    ("claude", "claude", None, None),
-                    ("sonnet", "claude", None, None),
+                registry_reversed: false,
+                benched: &[],
+                ballot_only: &[],
+                authors: &["claude", "codex#2", "pi"],
+                covered: Some(true),
+            },
+            // A launcher bench (signed out) and a ballot-only launch record whose registry record works.
+            Case {
+                tag: "bench",
+                seats: vec![
+                    s("claude", "claude", None, None),
+                    s("codex", "codex", None, None),
+                    s("pi", "pi", None, None),
                 ],
-                Some(false),
-            ),
+                registry_reversed: false,
+                benched: &["codex"],
+                ballot_only: &["pi"],
+                authors: &["claude"],
+                covered: Some(true),
+            },
         ];
-        for (tag, seats, current_is_history) in cases {
+        for case in cases {
+            let tag = case.tag;
             let key = |n: &str| format!("jc-{tag}-{n}");
-            let clis: Vec<crate::AgenticCli> = seats
+            let clis: Vec<crate::AgenticCli> = case
+                .seats
                 .iter()
-                .map(|(n, bin, ..)| seat(&key(n), &format!("{bin} -p {{PROMPT}}")))
+                .map(|x| {
+                    let mut c = seat(&key(x.name), &format!("{} -p {{PROMPT}}", x.launch));
+                    if case.benched.contains(&x.name) {
+                        c.health = Some(wicked_council::types::SeatHealth::unusable("signed out"));
+                    }
+                    if case.ballot_only.contains(&x.name) {
+                        c.seat_eligible_for_work = false;
+                    }
+                    c
+                })
                 .collect();
-            // The registry holds one more seat than the run: the gate projects it away.
-            let mut registry = clis.clone();
+            let mut registry: Vec<crate::AgenticCli> = case
+                .seats
+                .iter()
+                // An instance's record is its CLI's (`codex#2` runs on the registry's `codex`).
+                .filter_map(|x| {
+                    x.registry.map(|bin| {
+                        seat(
+                            &key(crate::team::runner::seat_key(x.name)),
+                            &format!("{bin} -p {{PROMPT}}"),
+                        )
+                    })
+                })
+                .collect();
+            if case.registry_reversed {
+                registry.reverse();
+            }
             registry.push(seat(&key("outside"), "outsider -p {PROMPT}"));
-            for (n, _, seen, _) in &seats {
-                if let Some(p) = seen {
-                    record_receipt(&key(n), Some(vec![p.to_string()]));
+            for x in &case.seats {
+                if let Some(p) = x.seen {
+                    record_receipt(&key(x.name), Some(vec![p.to_string()]));
                 }
             }
             let _ = take_receipts();
-            // The launch's bench reads the floor: pinned to the container floor (no launch bench) while
-            // the answer is computed; the gate is handed that same empty bench below.
+            // The launch's bench reads the floor: pinned to the container floor (no engine bench)
+            // while the answer is computed.
             let cov = {
                 let _env = crate::test_env::ENV_LOCK
                     .write()
@@ -9518,22 +9661,38 @@ mod tests {
                 }
                 cov
             };
-            assert!(cov.benched.is_empty(), "{tag}: {cov:?}");
-            if let Some(expect) = current_is_history {
-                assert_eq!(cov.covered, expect, "{tag}: {cov:?}");
+            let named: Vec<String> = cov.authors.iter().map(|x| x.seat.clone()).collect();
+            let expected: Vec<String> = case.authors.iter().map(|n| key(n)).collect();
+            assert_eq!(named, expected, "{tag}: the work seats");
+            if let Some(c) = case.covered {
+                assert_eq!(cov.covered, c, "{tag}: {cov:?}");
+            }
+            for x in &cov.authors {
+                assert!(
+                    x.judges.iter().all(|j| j.seat != key("outside")),
+                    "{tag}: {x:?}"
+                );
+                // No seat is both a judge and a non-judge (an instance maps onto its CLI's record).
+                for n in &x.not_judges {
+                    assert!(
+                        !x.judges.iter().any(|j| j.seat == n.seat
+                            || j.seat == crate::team::runner::seat_key(&n.seat)),
+                        "{tag}: {n:?} is also a judge: {x:?}"
+                    );
+                }
             }
             let run_roster: Vec<String> = clis.iter().map(|c| c.key.clone()).collect();
+            let bench: Vec<String> = case.benched.iter().map(|n| key(n)).collect();
             let gate = Gate {
-                now: seats.iter().map(|(n, _, _, now)| (key(n), *now)).collect(),
+                now: case.seats.iter().map(|x| (key(x.name), x.now)).collect(),
             };
             let r: Arc<dyn StepRunner> = Arc::new(gate);
-            for a in &cov.authors {
-                assert!(
-                    a.judges.iter().all(|j| j.seat != key("outside")),
-                    "{tag}: {a:?}"
-                );
+            for author in &expected {
+                let x = cov.authors.iter().find(|x| &x.seat == author).unwrap();
                 let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "Add a note");
-                unit.assigned_cli = Some(a.seat.clone());
+                unit.assigned_cli = Some(author.clone());
+                // As dispatch stamps it.
+                unit.authored_by = vec![author.clone()];
                 unit.default_floor = true;
                 unit.worktree_baseline = Some(baseline.clone());
                 let input = StepInput {
@@ -9559,28 +9718,29 @@ mod tests {
                     noop,
                     &registry,
                     &run_roster,
-                    &[],
+                    &bench,
                 );
                 let _ = take_receipts();
                 let stood = v
                     .as_ref()
                     .filter(|v| v.pass)
                     .and_then(|v| v.judge_cli.clone());
-                let first_unflagged = a
+                let first_unflagged = x
                     .judges
                     .iter()
                     .find(|j| j.seen_sharing.is_none())
                     .map(|j| j.seat.clone());
-                if current_is_history.is_some() {
+                if case.covered.is_some() {
                     assert_eq!(
                         stood, first_unflagged,
-                        "{tag}: {}'s work: {a:?} / {v:?}",
-                        a.seat
+                        "{tag}: {author}'s work: {x:?} / {v:?}"
                     );
-                } else if let Some(s) = &stood {
+                } else {
+                    let s = stood
+                        .unwrap_or_else(|| panic!("{tag}: {author}: no approval stood: {v:?}"));
                     assert!(
-                        a.judges.iter().any(|j| &j.seat == s),
-                        "{tag}: {s} judged, not named: {a:?}"
+                        x.judges.iter().any(|j| j.seat == s),
+                        "{tag}: {s} judged, not named: {x:?}"
                     );
                 }
             }

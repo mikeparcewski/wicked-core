@@ -15,8 +15,9 @@
 //! `known_to_share` sorts the rotation by). Such a seat is still a judge, flagged: its approval
 //! stands only if its own launch at the gate is not seen calling that provider again.
 //!
-//! `covered`: some author has a judge not flagged. What this does not predict, named so a launcher
-//! never says more: the fallback ladder's judge-only seats outside the run (operator ruling
+//! `covered`: some author has a judge not flagged. A roster none of whose keys names a registry
+//! seat (wholly ad hoc) is judged, as at the gate, from the registry's default pool, so its judges
+//! may be seats outside the launch. What this does not predict, named so a launcher never says more: the fallback ladder's judge-only seats outside the run (operator ruling
 //! 2026-10-14), a pinned gate's exclusion of the validator's author and its re-admission on an
 //! observed launch (core#1548), team monitors (core#1165), and which seats a plan makes authors.
 
@@ -122,7 +123,14 @@ pub(crate) fn judge_coverage_in(
         .iter()
         .filter(|c| can_work(c) && !benched_any(&c.key))
         .map(|author| {
-            let ex = [author.key.as_str()];
+            // As the gate excludes a dispatched unit's author: its seat, then (from `authored_by`)
+            // instance and CLI key, so an instance's rotation anchors on its CLI's record.
+            let cli_key = crate::team::runner::seat_key(&author.key);
+            let ex: Vec<&str> = if cli_key == author.key {
+                vec![author.key.as_str()]
+            } else {
+                vec![author.key.as_str(), cli_key]
+            };
             let ids = crate::cli_runner::author_identities(&ex, registry);
             let roster = crate::cli_runner::without_author_binaries(&eligible_run, &ex, &ids);
             let avoid = crate::observed_provider::last_seen(&author.key).unwrap_or_default();
@@ -135,14 +143,20 @@ pub(crate) fn judge_coverage_in(
                 .collect();
             // The rotation's own order: a stable sort, seats known to share last.
             judges.sort_by_key(|j| j.seen_sharing.is_some());
+            // A judge is a registry record; a configured instance seat is judged through its CLI's.
+            let on_record =
+                |c: &AgenticCli, k: &str| k == c.key || k == crate::team::runner::seat_key(&c.key);
             let not_judges = clis
                 .iter()
-                .filter(|c| c.key != author.key && !judges.iter().any(|j| j.seat == c.key))
+                .filter(|c| c.key != author.key && !judges.iter().any(|j| on_record(c, &j.seat)))
                 .map(|c| {
                     let (reason, detail) =
                         if let Some(b) = judge_bench.iter().find(|b| b.cli == c.key) {
                             ("benched", Some(b.reason.clone()))
-                        } else if !eligible_run.iter().any(|e| e.key == c.key) || !can_work(c) {
+                        } else if !eligible_run
+                            .iter()
+                            .any(|e| on_record(c, &e.key) && can_work(e))
+                        {
                             ("not_eligible", None)
                         } else {
                             ("same_identity", None)
