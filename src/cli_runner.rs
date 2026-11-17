@@ -5114,6 +5114,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .requested_rejudge
         .as_ref()
         .filter(|j| !j.consumed && floor_rerun.is_none());
+    // (core#1543) The receipts of THIS unit's own launch, read back below.
+    crate::observed_provider::take_receipts();
     let output = match floor_rerun {
         Some(r) => {
             engine_note(
@@ -5189,6 +5191,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // failed (a nonzero exit after the answer, a stderr line) but whose answer carries its verdict
     // completed its work. It folds as a completed turn, so a FAIL is judged as a FAIL — the gate, or
     // a send-back — and is never failed over to another seat that might say PASS.
+    // (core#1543) The providers the unit's own launch was observed calling (`None`: unobserved).
+    let work_observed = crate::observed_provider::observed_for(
+        &crate::observed_provider::take_receipts(),
+        input.unit.assigned_cli.as_deref().unwrap_or("claude"),
+    );
     let output = verdict_completes_the_turn(&input.unit, output, emit_delta);
     // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below), so
     // none of the floor's inputs below is computed for it.
@@ -5674,6 +5681,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
+    // (core#1543) Only the judge's own launches are read back after the verdict.
+    crate::observed_provider::take_receipts();
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
         // early without a closure (closures cannot mutate `judge_skipped`).
@@ -6163,6 +6172,31 @@ fn run_unit_and_judge_in<'scope, 'env>(
             emit_delta,
         )
     });
+    // (core#1543) VERIFY what each launch called: a judge the seat gateway saw calling the provider
+    // the work's launch called is not independent of it, whatever its seat is called. Its verdict
+    // is discarded and the gate says why (a required judge then holds the gate).
+    let judge_receipts = crate::observed_provider::take_receipts();
+    let agent_verdict = match agent_verdict {
+        Some(av) => {
+            let judge_observed = av
+                .judge_cli
+                .as_deref()
+                .and_then(|seat| crate::observed_provider::observed_for(&judge_receipts, seat));
+            match crate::observed_provider::same_provider(
+                judge_observed.as_deref(),
+                work_observed.as_deref(),
+            ) {
+                Some(why) => {
+                    engine_note(emit_delta, &format!("agent validator: {why}"));
+                    eprintln!("wicked-core: unit {}: {why} (core#1543)", input.unit.ord);
+                    judge_skipped = Some(why);
+                    None
+                }
+                None => Some(av),
+            }
+        }
+        None => None,
+    };
     // F-039 REPO CHECKS FLOOR ([`FloorPlan`]). A floor on a clean checkout started right after the
     // seat's turn (`early_floor`) and is joined here; a floor in the live worktree runs here, LAST
     // (slowest, and its build artifacts must not colour the guard's comparison or the judge's
@@ -8875,6 +8909,103 @@ mod tests {
     /// the pinned validator's author, a benched seat and an unusable one are each named missing
     /// with why, and the seat the rotation would ask is eligible. With every other seat out, no
     /// seat is eligible.
+    /// (core#1543, KEY + SILENT-OK) Verify what each launch called: whatever the judge's seat is
+    /// called, a judge the seat gateway saw calling the provider the work's launch called is not
+    /// independent of it — its verdict is discarded and the gate says why (a required judge then
+    /// holds it). A judge seen calling another provider stands; anything unobserved changes nothing.
+    #[test]
+    fn core_1543_a_judge_seen_calling_the_works_provider_is_discarded() {
+        struct Gatewayed {
+            providers: std::collections::HashMap<&'static str, Option<Vec<String>>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                // What the carrier records when it releases the launch's gateway lease.
+                crate::observed_provider::record_receipt(
+                    &seat,
+                    self.providers.get(seat.as_str()).cloned().flatten(),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1543-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("codex".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        // `pi` is the only judge distinct by key from codex (the work) and claude (the
+        // validator's author).
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let noop: &DeltaSink = &|_: &str| {};
+        let run = |judge: Option<Vec<String>>, work: Option<Vec<String>>| {
+            let runner: Arc<dyn StepRunner> = Arc::new(Gatewayed {
+                providers: [("codex", work), ("pi", judge)].into_iter().collect(),
+            });
+            let (_o, v, e) =
+                run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+            (v, e.judge_skipped)
+        };
+        let chatgpt = Some(vec!["chatgpt.com:443".to_string()]);
+        // The attacker's roster: `pi` turns out to call codex's provider.
+        let (v, skipped) = run(chatgpt.clone(), chatgpt.clone());
+        assert!(
+            v.is_none(),
+            "a shared provider is never an independent verdict"
+        );
+        assert!(
+            skipped
+                .as_deref()
+                .is_some_and(|w| w.contains("same provider")),
+            "{skipped:?}"
+        );
+        // Another provider stands.
+        let (v, skipped) = run(Some(vec!["api.anthropic.com:443".into()]), chatgpt.clone());
+        assert_eq!(
+            v.and_then(|v| v.judge_cli).as_deref(),
+            Some("pi"),
+            "{skipped:?}"
+        );
+        // Unobserved (either side): nothing proven here, today's rules stand.
+        assert!(run(None, chatgpt.clone()).0.is_some());
+        assert!(run(chatgpt, None).0.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn rejudge_seats_name_the_eligible_judge_and_why_the_rest_cannot() {
         let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
