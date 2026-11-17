@@ -542,9 +542,9 @@ pub const RULE_COUNCIL_SIZE: usize = 3;
 pub enum DecisionFrame {
     /// The team councils' routing ballot, with the system's size and deadline settings.
     Routing,
-    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: exactly
-    /// [`RULE_COUNCIL_SIZE`] seats or none (fewer eligible = no ballot at all), the nonce-framed
-    /// dispute ballot, one ABSOLUTE `deadline` and the most bytes any ballot may hold.
+    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: exactly `size` seats or
+    /// none (fewer eligible = no ballot at all), the nonce-framed dispute ballot, one ABSOLUTE
+    /// `deadline` and the most bytes any ballot may hold.
     Dispute {
         deadline: std::time::Instant,
         prompt_budget: usize,
@@ -617,9 +617,10 @@ pub(crate) fn convene_decision(
 }
 
 /// [`convene_decision`] in a frame: [`DecisionFrame::Routing`] is exactly it;
-/// [`DecisionFrame::Dispute`] seats exactly [`RULE_COUNCIL_SIZE`] (fewer eligible voters convene
-/// nothing: a verdict with no ruling, reason `seats_benched`, and no ballot), frames every ballot
-/// and bounds the whole council by its absolute deadline.
+/// [`DecisionFrame::Dispute`] seats exactly its `size` ([`RULE_COUNCIL_SIZE`] for a council, 1
+/// for the single arbiter of crew#972; fewer eligible voters convene nothing: a verdict with no
+/// ruling, reason `seats_benched`, and no ballot), frames every ballot and bounds the whole council
+/// by its absolute deadline.
 pub(crate) fn convene_decision_with(
     req: &DecisionRequest,
     clis: &[AgenticCli],

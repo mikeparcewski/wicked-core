@@ -3298,7 +3298,7 @@ pub(crate) fn run(
                 let _ = reply.send(reserve_rule_council(&mut store, &run_id, ord));
             }
             // (DES-RULE-CHECK-001 rev 2) A rule council: the same narrowing and carrier as a
-            // decision council, in the dispute frame (three seats or none, framed ballots, one
+            // decision council, in the dispute frame (`size` seats or none, framed ballots, one
             // absolute deadline). The host slot rides into the council thread and is dropped there
             // after the last ballot.
             Command::ConveneRuleCouncil {
