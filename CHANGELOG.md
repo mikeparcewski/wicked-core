@@ -20,11 +20,12 @@ Two release tracks share this file, newest entry first regardless of track:
   napi static `Core.checkRunTree(runId, workdir, repoRoot, baseCommit)`: the verify floor the deliver re-verify runs,
   on a guarded checkout of exactly the tree `workdir`'s `HEAD` commit holds (a container floor checks that tree), held
   to it, measured against `baseCommit` (the full id of a commit, an ancestor of `HEAD`; a failure the floor can
-  attribute to that base is excluded, an inseparable one still denies), with the full suite and under its own floor
-  id (a finished run's cancel never refuses it). Resolves `{head, tree, base, passed, checksRun, report}`; inputs that
-  do not name a rebased worktree of `repoRoot` are refused before any check runs, and a refusing floor, or one that ran
-  no check but provisioning, reads `passed: false`. crew uses it to re-deliver a finished run's conflicting pull
-  request without pushing an unchecked tree. Additive binding; no actor or `LaunchSpec` change.
+  attribute to that base is excluded, an inseparable one still denies). It runs the full test command where the
+  repository has one, under its own floor id (a finished run's cancel never refuses it; its namespace is released
+  after). Resolves `{head, tree, base, passed, checksRun, report}`; inputs that do not name a rebased worktree of
+  `repoRoot` are refused before any check runs, and a refusing floor, or one that ran no check but provisioning,
+  reads `passed: false`. crew uses it to re-deliver a finished run's conflicting pull request without pushing an
+  unchecked tree. Additive binding; no actor or `LaunchSpec` change.
 
 - **The engine publishes every answer an open gate takes** (studio#1170, crew#1512). `Core::gate_actions` /
   napi `gateActions(runId)`: per open gate, each answer's token, what it does at this gate (`intent`), whether it

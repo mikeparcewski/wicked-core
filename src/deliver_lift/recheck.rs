@@ -17,7 +17,8 @@
 //! - The floor runs under its own id (`<run>-recheck-<n>`), not the run's: a finished run's id is
 //!   in the floor-cancel set (its completion cancels its workers), which would refuse every
 //!   recheck; and a cancel of the run never reaches a recheck it does not own.
-//! - The full suite always runs (the power full-suite rule set for that id): a finished run's own
+//! - The full test command runs where the repository has one (the power full-suite rule set for
+//!   that id; a repository whose only test is its targeted command keeps it): a finished run's own
 //!   policy is gone with it (`power::forget_run`), and a re-delivery is a delivery checkpoint.
 //! - A floor that ran no check (only provisioning, or none detected) does not pass: a re-delivery
 //!   is never unverified (coord's ruling on crew#1493).
@@ -43,7 +44,8 @@ pub struct TreeRecheck {
     /// True iff the floor passed on `tree` AND ran at least one check that is not provisioning
     /// (`report.passed`, which is set false otherwise).
     pub passed: bool,
-    /// How many checks ran that are not provisioning (`install`, `native-build`).
+    /// How many checks the floor attempted that are not provisioning (`install`, `native-build`);
+    /// one that could not start still counts here and still denies.
     pub checks_run: usize,
     /// The verify floor's report, as the run's own `repoChecksEvaluated` carries it.
     pub report: RepoChecksReport,
@@ -68,19 +70,24 @@ fn recheck_floor_id(run_id: &str) -> String {
     )
 }
 
-/// Clears the full-suite mark of a recheck's floor id however the floor ends.
-struct FullSuite<'a>(&'a str);
+/// The recheck's floor id for the floor's duration: marked full-suite, and on drop (every path,
+/// unwinding included) unmarked and its run namespace released (a container floor arms one under
+/// the floor id; no actor ever ends that id, so the recheck does: `k8s::end_run` +
+/// `k8s::release_run`, a no-op without a cluster — codex r2).
+struct FloorRun<'a>(&'a str);
 
-impl<'a> FullSuite<'a> {
-    fn mark(id: &'a str) -> Self {
+impl<'a> FloorRun<'a> {
+    fn start(id: &'a str) -> Self {
         crate::power::set_full_suite(id, true);
         Self(id)
     }
 }
 
-impl Drop for FullSuite<'_> {
+impl Drop for FloorRun<'_> {
     fn drop(&mut self) {
         crate::power::set_full_suite(self.0, false);
+        let epoch = crate::k8s::end_run(self.0);
+        crate::k8s::release_run(self.0, epoch);
     }
 }
 
@@ -143,7 +150,7 @@ pub fn check_run_tree(
         code_graph: None,
     };
     let mut report = {
-        let _full = FullSuite::mark(&floor_id);
+        let _floor = FloorRun::start(&floor_id);
         match crate::repo_checks::checkout_guarded_tree(workdir, &git_dir, &tree, &floor_id) {
             Ok(checkout) => {
                 let r = checkout.run_floor_journaled(
