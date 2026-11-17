@@ -519,6 +519,7 @@ fn an_earlier_gates_council_ruling_is_reused_only_on_equal_keys() {
                 deliver_tokens: &[],
                 deferred: &[],
                 settled: std::slice::from_ref(&ruled),
+                carried: &[],
             },
             judge,
             &NoMachine,

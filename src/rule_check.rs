@@ -347,6 +347,21 @@ pub struct RuleSkip {
     /// When it confirms a WAIVER: the person's instruction the rule was waived by, quoted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
+    /// (core#1493) The carry key of the check it answered ([`RuleCheckReport::carry_key`]): the run's
+    /// LATER steps take it as carried only while their own carry key is the same — the exact same
+    /// change bytes, floor result and match facts. Absent on a skip recorded before this field:
+    /// never carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carry_key: Option<String>,
+    /// (core#1493) The unit it was given at, named when a later step carries it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ord: Option<u32>,
+    /// (core#1493, coord codex-check on #1516) The revision of the person's words when it was
+    /// given (`actor::rulings_revision`): a later step carries it only while that has not moved,
+    /// so a newer ruling ("enforce R") puts R back before a judge. Absent on a skip recorded
+    /// before this field: never carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rulings_rev: Option<String>,
 }
 
 /// One attempt's rule check: every in-force rule's row, plus how the check ran.
@@ -384,6 +399,13 @@ pub struct RuleCheckReport {
     /// when it fits one call.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parts: u32,
+    /// (core#1493) Per rule id, what a skip given on this check must find unchanged to carry to a
+    /// later step: a digest of the change's exact bytes, the floor's result, the match facts and
+    /// the rule's own match result — everything the judge reads but the person's instructions,
+    /// which the caller checks instead by their revision (`RuleSkip::rulings_rev`). Review stage
+    /// only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub carry_keys: BTreeMap<String, String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1205,6 +1227,13 @@ pub struct CheckInput<'a> {
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's EARLIER gates (stamped at
     /// dispatch): reused, like the unit's own cache, only on an equal rule key and evidence key.
     pub settled: &'a [RuleVerdict],
+    /// (core#1493) The person's skips at the run's OTHER steps (stamped at dispatch). One answers a
+    /// rule here, as carried, only when its carry key equals this check's
+    /// ([`RuleCheckReport::carry_key`]: the same change bytes, floor result and match facts), the
+    /// rule content is the same, it is not a waiver's confirmation, and the rule is judged on the
+    /// change alone (not a process rule, a step-record clause or a machine obligation). Anything
+    /// else is judged again.
+    pub carried: &'a [RuleSkip],
 }
 
 /// (Part B) One creator step's record, as the run stored it (its last output), for POL-2101's
@@ -3164,6 +3193,19 @@ pub fn check(
         }
         digest_bytes(&parts)
     };
+    // (core#1493) The carry key: everything the judge reads except the person's instructions.
+    let carry_key: Option<String> = match input.stage {
+        CheckStage::Review => Some(digest_bytes(&[
+            b"carry",
+            &input.change.raw,
+            floor.as_bytes(),
+            serde_json::to_string(input.facts)
+                .unwrap_or_default()
+                .as_bytes(),
+        ])),
+        CheckStage::Delivery => None,
+    };
+    let mut carry_keys: BTreeMap<String, String> = BTreeMap::new();
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     // (Part B) POL-2101's ids whose two parts the engine combines.
     let mut combine: Vec<String> = Vec::new();
@@ -3316,6 +3358,51 @@ pub fn check(
                 ),
                 None => format!("skipped by {}: {}", s.by, s.reason),
             };
+            rows.insert(
+                rule.id.clone(),
+                row(RuleStatus::Skipped, RuleHow::Operator, why, None, Some(ek)),
+            );
+            continue;
+        }
+        // (core#1493) …or the person's skip at an earlier step of the run, carried: the same rule
+        // content on the same carry key (the change's exact bytes, the floor's result, the match
+        // facts and the rule's own match), given while the person's words were what they are now
+        // (the caller filters on `RuleSkip::rulings_rev`). A waiver's confirmation is not
+        // carried: it answers the instruction it quoted. Only a rule judged on the change alone
+        // carries: a process rule, or one with a step-record clause (POL-2101), reads evidence a
+        // later step adds, which the person never saw (codex on #1516).
+        // (codex on #1516) …nor a machine obligation, whose base-test run is evidence a later
+        // step may first be able to obtain.
+        let change_only = !is_machine
+            && !matches!(
+                pack,
+                Some(PackKind::Process(_)) | Some(PackKind::WorkWithRecord)
+            );
+        // (codex on #1516) …and the rule's own derived match (its source reference can make it
+        // "applies here" with no other change): part of this rule's carry key.
+        let rule_carry = carry_key
+            .as_ref()
+            .map(|k| digest(&[k, &match_note(m, input.stage)]));
+        if let Some(rc) = &rule_carry {
+            carry_keys.insert(rule.id.clone(), rc.clone());
+        }
+        if let Some(s) = (change_only && rule_carry.is_some())
+            .then(|| {
+                input.carried.iter().rev().find(|s| {
+                    s.rule_id == rule.id
+                        && s.rule_key == rk
+                        && s.instruction.is_none()
+                        && s.carry_key.is_some()
+                        && s.carry_key == rule_carry
+                })
+            })
+            .flatten()
+        {
+            let at = s.ord.map(|o| format!(" at unit {o}")).unwrap_or_default();
+            let why = format!(
+                "skipped by {}{at}, carried (the change, the checks and the facts are the ones it was given on): {}",
+                s.by, s.reason
+            );
             rows.insert(
                 rule.id.clone(),
                 row(RuleStatus::Skipped, RuleHow::Operator, why, None, Some(ek)),
@@ -3497,6 +3584,7 @@ pub fn check(
         } else {
             0
         },
+        carry_keys,
         ..Default::default()
     };
     // (S3) The machine check runs beside the judge batches; one base run answers every rule that

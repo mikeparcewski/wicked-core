@@ -222,6 +222,7 @@ fn run_steps(
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         judge,
         machine,
@@ -548,6 +549,7 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachine,
@@ -566,6 +568,9 @@ fn skip_of(row: &RuleVerdict, reason: &str) -> RuleSkip {
         rule_key: row.rule_key.clone(),
         evidence_key: row.evidence_key.clone().unwrap(),
         instruction: None,
+        carry_key: None,
+        ord: None,
+        rulings_rev: None,
     }
 }
 
@@ -788,6 +793,7 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachine,
@@ -1425,6 +1431,7 @@ fn run_told(
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         judge,
         &NoMachine,
@@ -1498,6 +1505,9 @@ fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
         rule_key: row.rule_key.clone(),
         evidence_key: row.evidence_key.clone().unwrap(),
         instruction: row.cite.clone(),
+        carry_key: None,
+        ord: None,
+        rulings_rev: None,
     };
     let r = run_told(&[rule], &judge, &[skip], Some(&first));
     assert_eq!(r.rows[0].status, RuleStatus::Skipped);
@@ -1651,6 +1661,7 @@ fn changed_instructions_check_the_rule_again() {
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachine,
@@ -1829,6 +1840,7 @@ fn run_packs(
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         judge,
         &NoMachine,
@@ -2779,6 +2791,9 @@ fn a_changed_record_re_judges_and_an_old_skip_no_longer_applies() {
         rule_key: held.rule_key.clone(),
         evidence_key: held.evidence_key.clone().unwrap(),
         instruction: None,
+        carry_key: None,
+        ord: None,
+        rulings_rev: None,
     };
     let skips = [skip];
     let same = run_packs(
@@ -3046,6 +3061,7 @@ fn pol_2101_needs_no_judge_when_no_agent_wrote_code_and_holds_when_creators_are_
                 deliver_tokens: &[],
                 deferred: &[],
                 settled: &[],
+                carried: &[],
             },
             &judge,
             &NoMachine,
@@ -3122,6 +3138,7 @@ fn run_stage(
             deliver_tokens,
             deferred,
             settled: &[],
+            carried: &[],
         },
         judge,
         &NoMachine,
@@ -3339,6 +3356,7 @@ fn run_seated(
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         judge,
         &NoMachine,
@@ -3839,6 +3857,7 @@ fn run_pol_2101(
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         judge,
         &NoMachine,
@@ -4265,6 +4284,7 @@ fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachine,
@@ -4420,6 +4440,7 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
             deliver_tokens: &[],
             deferred: &[],
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachine,
@@ -4495,6 +4516,7 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
                 deliver_tokens: &[],
                 deferred: &[],
                 settled: &[],
+                carried: &[],
             },
             judge,
             &NoMachine,
@@ -4600,4 +4622,320 @@ fn core_1474_long_lines_and_long_paths_survive_the_parts() {
         .iter()
         .any(|l| l.contains("safe_config.rs") && !l.contains("sensitive")));
     assert!(continued.iter().any(|l| l.contains("sensitive_config.rs")));
+}
+
+// ── core#1493: a person's skip carries to the run's later steps on the same evidence ──
+
+fn run_carried_floor(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    told: &str,
+    floor: &str,
+    carried: &[RuleSkip],
+) -> RuleCheckReport {
+    run_carried_in(rules, c, judge, told, floor, carried, None)
+}
+
+fn run_carried_in(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    told: &str,
+    floor: &str,
+    carried: &[RuleSkip],
+    repo: Option<&str>,
+) -> RuleCheckReport {
+    let f = job_facts(&bug_steps(), None, repo, c);
+    let seats = seats();
+    check(
+        &CheckInput {
+            rules,
+            facts: &f,
+            change: c,
+            floor: Some(floor),
+            prior: None,
+            skips: &[],
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: Some(told),
+            engine_record: None,
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried,
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+fn run_carried(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    told: &str,
+    carried: &[RuleSkip],
+) -> RuleCheckReport {
+    run_carried_floor(rules, c, judge, told, "repo checks passed", carried)
+}
+
+/// A skip given on `report`'s row for `rule_id`, as `rules_recheck_request` records it.
+fn carried_skip(report: &RuleCheckReport, reason: &str) -> RuleSkip {
+    let mut s = skip_of(&report.rows[0], reason);
+    s.carry_key = report.carry_keys.get(&s.rule_id).cloned();
+    s.ord = Some(3);
+    s
+}
+
+/// (core#1493) The tiny-math repro: the person skips a rule with a reason at Challenge, and the
+/// same rule on the same change, checks and facts does not come back at Test or Review — even
+/// when the later step's evidence key differs (this fixture changes the instructions text to show
+/// the carry key ignores it; in production a skip adds no ruling, and a newer ruling stops the
+/// carry by the rulings revision: `actor::carried_skip_tests`).
+#[test]
+fn core_1493_a_skip_carries_to_later_steps_on_the_same_evidence() {
+    let rules = [rule("R1", "no duplicated built-in")];
+    let silent = Fake::new(&[]);
+    let challenge = run_carried(&rules, &change(), &silent, "add max(xs)", &[]);
+    assert_eq!(challenge.rows[0].status, RuleStatus::Unchecked);
+    assert!(challenge.carry_keys.contains_key("R1"));
+    let skip = carried_skip(
+        &challenge,
+        "the manual loop avoids Math.max's argument limit",
+    );
+    let calls = silent.calls.load(Ordering::SeqCst);
+    let test = run_carried(
+        &rules,
+        &change(),
+        &silent,
+        "add max(xs)\nR1 skipped",
+        std::slice::from_ref(&skip),
+    );
+    let row = &test.rows[0];
+    assert_ne!(
+        row.evidence_key, challenge.rows[0].evidence_key,
+        "another evidence key"
+    );
+    assert_eq!(
+        (row.status, row.how),
+        (RuleStatus::Skipped, RuleHow::Operator)
+    );
+    assert!(row.reason.contains("at unit 3, carried") && row.reason.contains("argument limit"));
+    assert!(test.hold().is_none() && test.denial().is_none());
+    assert_eq!(
+        silent.calls.load(Ordering::SeqCst),
+        calls,
+        "no judge call for a carried skip"
+    );
+    // An edited rule, a waiver and a skip without a key are judged again.
+    let edited = [rule("R1", "no duplicated built-in, and no new dependency")];
+    assert_eq!(
+        run_carried(
+            &edited,
+            &change(),
+            &silent,
+            "x",
+            std::slice::from_ref(&skip)
+        )
+        .rows[0]
+            .status,
+        RuleStatus::Unchecked
+    );
+    let mut waiver = skip.clone();
+    waiver.instruction = Some("touch no test".into());
+    assert_eq!(
+        run_carried(&rules, &change(), &silent, "x", &[waiver]).rows[0].status,
+        RuleStatus::Unchecked
+    );
+    let mut legacy = skip;
+    legacy.carry_key = None;
+    assert_eq!(
+        run_carried(&rules, &change(), &silent, "x", &[legacy]).rows[0].status,
+        RuleStatus::Unchecked
+    );
+}
+
+/// (codex rounds on #1516) Every way a later step's evidence differs from what the person saw is
+/// judged again: the same lines at another place, the same edit in another function, a removed
+/// compensating hunk, a new or doubled hunk, a mode change, different bytes behind lossy text, a
+/// submodule log entry, a changed floor result, and a rule with a step-record clause.
+#[test]
+fn core_1493_a_skip_carries_only_onto_exactly_the_evidence_the_person_saw() {
+    let rules = [rule("SEC-1", "every handler checks auth")];
+    let judge = Fake::new(&[]);
+    let hunk = |at: &str, func: &str| {
+        format!("@@ -{at},3 +{at},2 @@ fn {func}() {{\n     prepare();\n-    require_auth();\n     respond();\n")
+    };
+    let file = |h: String| format!("diff --git a/r.rs b/r.rs\n--- a/r.rs\n+++ b/r.rs\n{h}");
+    let given = file(format!(
+        "{}{}",
+        hunk("2", "public_health"),
+        "@@ -20,1 +19,1 @@ fn routes() {\n-    register(admin);\n+    register_with_auth(admin);\n"
+    ));
+    let g = run_carried(&rules, &change_of(&given, &["r.rs"]), &judge, "x", &[]);
+    let skip = carried_skip(&g, "health checks may omit auth");
+    let carried = |diff: &str, floor: &str| {
+        run_carried_floor(
+            &rules,
+            &change_of(diff, &["r.rs"]),
+            &judge,
+            "y",
+            floor,
+            std::slice::from_ref(&skip),
+        )
+        .rows[0]
+            .status
+    };
+    assert_eq!(
+        carried(&given, "repo checks passed"),
+        RuleStatus::Skipped,
+        "the same evidence carries"
+    );
+    let later: Vec<(&str, String)> = vec![
+        (
+            "the same edit in another function",
+            file(hunk("12", "private_admin")),
+        ),
+        (
+            "the compensating hunk removed",
+            file(hunk("2", "public_health")),
+        ),
+        (
+            "moved lines",
+            given.replace("@@ -2,3 +2,2 @@", "@@ -5,3 +5,2 @@"),
+        ),
+        (
+            "a doubled hunk",
+            format!("{given}{}", hunk("40", "public_health")),
+        ),
+        (
+            "a mode change",
+            given.replace(
+                "+++ b/r.rs\n",
+                "+++ b/r.rs\nold mode 100644\nnew mode 100755\n",
+            ),
+        ),
+        (
+            "a submodule log entry",
+            format!("Submodule aaa 1..2:\n  > new code\n{given}"),
+        ),
+    ];
+    for (why, diff) in &later {
+        assert_eq!(
+            carried(diff, "repo checks passed"),
+            RuleStatus::Unchecked,
+            "{why}"
+        );
+    }
+    assert_eq!(
+        carried(&given, "repo checks FAILED: security"),
+        RuleStatus::Unchecked,
+        "a new floor result"
+    );
+    // Different bytes that read the same lossily.
+    let raw = |b: u8| {
+        let mut v = b"diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1 +1 @@\n+new ".to_vec();
+        v.push(b);
+        v.push(b'\n');
+        v
+    };
+    let lossy = |b: u8| Change {
+        diff: String::from_utf8_lossy(&raw(b)).into_owned(),
+        paths: vec![("f".into(), true)],
+        raw: raw(b),
+        tree: None,
+    };
+    let g2 = run_carried(&rules, &lossy(0xff), &judge, "x", &[]);
+    let s2 = carried_skip(&g2, "r");
+    assert_eq!(
+        run_carried(&rules, &lossy(0xfe), &judge, "y", &[s2]).rows[0].status,
+        RuleStatus::Unchecked
+    );
+    // POL-2101 (a step-record clause) is judged again even on the same evidence.
+    let pol = [pack("POL-2101")];
+    let gp = run_carried(&pol, &change(), &judge, "x", &[]);
+    let sp = carried_skip(&gp, "a manual loop is fine here");
+    assert_ne!(
+        run_carried(&pol, &change(), &judge, "y", &[sp]).rows[0].status,
+        RuleStatus::Skipped
+    );
+}
+
+/// (codex on #1516) A machine-obligation rule never carries: its base-test run is evidence a later
+/// step may first be able to obtain, and the carry key does not hold it.
+#[test]
+fn core_1493_a_machine_obligation_rule_is_never_carried() {
+    let rules = [learn_unscoped()];
+    let judge = Fake::new(&[]);
+    let first = run_carried(&rules, &change(), &judge, "x", &[]);
+    let skip = carried_skip(&first, "the base tests could not run yet");
+    let later = run_carried(&rules, &change(), &judge, "y", &[skip]);
+    assert_ne!(
+        later.rows[0].status,
+        RuleStatus::Skipped,
+        "{:?}",
+        later.rows[0]
+    );
+}
+
+/// (codex on #1516) A rule's own derived match is part of what its skip carries on: the same rule
+/// text and facts with a source reference that now names this repository ("applies here") is
+/// judged again, not carried.
+#[test]
+fn core_1493_a_changed_rule_match_is_judged_again() {
+    let silent = Fake::new(&[]);
+    let plain = [rule("R1", "no duplicated built-in")];
+    let given = run_carried_in(
+        &plain,
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        &[],
+        Some("tiny-math"),
+    );
+    assert_eq!(given.rows[0].status, RuleStatus::Unchecked);
+    let skip = carried_skip(&given, "fine here");
+    let same = run_carried_in(
+        &plain,
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        std::slice::from_ref(&skip),
+        Some("tiny-math"),
+    );
+    assert_eq!(
+        same.rows[0].status,
+        RuleStatus::Skipped,
+        "the same match carries"
+    );
+    let mut sourced = rule("R1", "no duplicated built-in");
+    sourced.provenance.reference = Some("docs/tiny-math.md@abc#R1".into());
+    assert_eq!(
+        rule_key(&sourced),
+        rule_key(&plain[0]),
+        "the rule key alone cannot tell"
+    );
+    let moved = run_carried_in(
+        &[sourced],
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        std::slice::from_ref(&skip),
+        Some("tiny-math"),
+    );
+    assert_ne!(moved.carry_keys.get("R1"), given.carry_keys.get("R1"));
+    assert_ne!(
+        moved.rows[0].status,
+        RuleStatus::Skipped,
+        "a changed match is judged again"
+    );
 }

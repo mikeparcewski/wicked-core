@@ -1862,6 +1862,7 @@ pub(crate) fn delivery_rule_check(
             deliver_tokens: &ctx.deliver_tokens,
             deferred: &ctx.deferred,
             settled: &[],
+            carried: &[],
         },
         &judge,
         &NoMachineHere,
@@ -2343,6 +2344,7 @@ fn run_rule_check_with(
                     deliver_tokens: &input.unit.rule_deliver_tokens,
                     deferred: &[],
                     settled: &settled,
+                    carried: &input.unit.rule_carried_skips,
                 },
                 &judge,
                 &FloorMachine {

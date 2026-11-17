@@ -12289,6 +12289,14 @@ fn dispatch_unit_with(
                 .cloned()
                 .collect();
         }
+        // (core#1493) …and the person's skips at its other gates, carried on the same carry key
+        // (`rule_check::CheckInput::carried`) and only while the person's words have not moved
+        // since the skip (`rulings_revision`).
+        if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
+            let all = crate::domain::session_units(&*store, run_id)?;
+            stamped.rule_carried_skips =
+                carried_skips(&session.problem, &session.intent_amendments, &all, unit.ord);
+        }
         // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
         // (F19/F1, operator Q1=B) Their gate rulings ride along, so a ruling reaches the judge and
         // a new one re-judges instead of reusing the cached verdict.
@@ -12310,6 +12318,7 @@ fn dispatch_unit_with(
             || unit.rule_instructions != stamped.rule_instructions
             || unit.rule_deliver_tokens != stamped.rule_deliver_tokens
             || unit.rule_settled != stamped.rule_settled
+            || unit.rule_carried_skips != stamped.rule_carried_skips
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -15765,6 +15774,41 @@ const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
 const RULING_SHOWN_MAX: usize = 2 * 1024;
 const RULINGS_SHOWN_MAX: usize = 6 * 1024;
 
+/// (core#1493, coord codex-check on #1516) The revision of the person's words a rule judge reads
+/// ([`rule_instructions_words`]: their gate rulings, the problem, every approved amendment): a
+/// digest of exactly that text. A skip records it when given ([`crate::rule_check::RuleSkip::
+/// rulings_rev`]) and is carried to a later step only while it has not moved: any newer ruling or
+/// amendment ("enforce R", or anything else the person says) puts every carried skip back before
+/// a judge. No phrase is matched; one function produces the words and their revision.
+pub(crate) fn rulings_revision(
+    problem: &str,
+    amendments: &[crate::domain::IntentAmendment],
+    units: &[crate::domain::WorkUnit],
+) -> String {
+    use sha2::Digest;
+    let words = rule_instructions_words(problem, amendments, units);
+    format!("{:x}", sha2::Sha256::digest(words.as_bytes()))
+}
+
+/// (core#1493) The person's skips at the run's OTHER gates that the rule check of the unit at `ord`
+/// may carry: each recorded with a carry key and at the person's current [`rulings_revision`].
+/// The check carries one only on an equal carry key (`rule_check::CheckInput::carried`).
+pub(crate) fn carried_skips(
+    problem: &str,
+    amendments: &[crate::domain::IntentAmendment],
+    units: &[crate::domain::WorkUnit],
+    ord: u32,
+) -> Vec<crate::rule_check::RuleSkip> {
+    let rev = rulings_revision(problem, amendments, units);
+    units
+        .iter()
+        .filter(|u| u.ord != ord)
+        .flat_map(|u| u.rule_skips.iter())
+        .filter(|s| s.carry_key.is_some() && s.rulings_rev.as_deref() == Some(rev.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// (DES-RULE-CHECK-001 addendum F19/F1, operator Q1=B) The person's words a rule judge reads,
 /// from the run's RECORD only: the gate rulings ([`RULE_INSTRUCTION_ACTIONS`]) on any of the run's
 /// units, newest first, then the run's problem and each approved intent amendment. Never a unit's
@@ -18454,6 +18498,7 @@ fn rules_recheck_request(
         .unwrap_or("operator")
         .to_string();
     let at = crate::interaction::now_millis();
+    let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
     let mut landed = Vec::new();
     for (id, reason) in skips {
         if reason.trim().is_empty() {
@@ -18494,6 +18539,16 @@ fn rules_recheck_request(
             evidence_key,
             instruction: (row.status == crate::rule_check::RuleStatus::Waived)
                 .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+            // (core#1493) The carry key of the check it answered, so the run's later steps carry
+            // it on the same evidence…
+            carry_key: cursor
+                .rule_check
+                .as_ref()
+                .and_then(|r| r.carry_keys.get(id))
+                .cloned(),
+            ord: Some(cursor.ord),
+            // …while the person's words stay at this revision.
+            rulings_rev: Some(rulings_rev.clone()),
         });
     }
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
@@ -28658,6 +28713,7 @@ mod request_changes_tests {
                     row("R1", crate::rule_check::RuleStatus::Disputed),
                     row("R9", crate::rule_check::RuleStatus::Broken),
                 ],
+                carry_keys: [("R1".to_string(), "ck".to_string())].into(),
                 ..Default::default()
             };
             v.denials_behind = Some(vec![report.denial().unwrap(), report.hold().unwrap()]);
@@ -28685,6 +28741,9 @@ mod request_changes_tests {
             assert_eq!(v.rule_skips.len(), 1);
             assert_eq!(v.rule_skips[0].rule_id, "R1");
             assert_eq!(v.rule_skips[0].evidence_key, "ek-R1");
+            // (core#1493) …recording the carry key it was given on and its unit, so later steps carry it.
+            assert_eq!(v.rule_skips[0].carry_key.as_deref(), Some("ck"));
+            assert_eq!(v.rule_skips[0].ord, Some(v.ord));
             assert!(v.requested_rejudge.is_some(), "the re-check is armed");
         }
     }
@@ -39928,5 +39987,85 @@ mod council_ballot_tests {
             validate_session_id("council").is_ok(),
             "a caller may still name a run so"
         );
+    }
+}
+
+#[cfg(test)]
+mod carried_skip_tests {
+    use super::*;
+
+    /// (coord codex-check on #1516) The attacker's order, SILENT-OK/KEY: skip R at unit 3, then the
+    /// person rules "enforce R" (or says anything new), code unchanged: the skip is no longer
+    /// carried, so R goes back before a judge (an uncarried skip is judged: core_1493_* in
+    /// rule_check_tests). No phrase is matched: a ruling that never names R moves it too.
+    #[test]
+    fn a_newer_ruling_stops_a_carried_skip() {
+        let problem = "add max(xs)";
+        let mut u3 = crate::domain::WorkUnit::pending("r:u3", "r", 3, "w");
+        let u5 = crate::domain::WorkUnit::pending("r:u5", "r", 5, "w");
+        let mut units = vec![u3.clone(), u5.clone()];
+        // The skip, as `rules_recheck_request` records it: at the revision of that moment.
+        u3.rule_skips.push(crate::rule_check::RuleSkip {
+            rule_id: "POL-7".into(),
+            reason: "fine here".into(),
+            by: "operator".into(),
+            at: 10,
+            rule_key: "k".into(),
+            evidence_key: "e".into(),
+            instruction: None,
+            carry_key: Some("ck".into()),
+            ord: Some(3),
+            rulings_rev: Some(rulings_revision(problem, &[], &units)),
+        });
+        units[0] = u3.clone();
+        let ids = |v: Vec<crate::rule_check::RuleSkip>| -> Vec<String> {
+            v.into_iter().map(|s| s.rule_id).collect()
+        };
+        assert_eq!(ids(carried_skips(problem, &[], &units, 5)), vec!["POL-7"]);
+        assert!(
+            carried_skips(problem, &[], &units, 3).is_empty(),
+            "not onto its own gate"
+        );
+        let ruled = |action: &str, text: &str| {
+            let mut v = units.clone();
+            v[1].operator_rulings.push(crate::domain::OperatorRuling {
+                action: action.into(),
+                text: text.into(),
+                attempt: 1,
+                at: 20,
+            });
+            v
+        };
+        for (action, text) in [
+            ("amend", "enforce POL-7 after all"),
+            ("request_changes", "check the auth rules again"),
+            ("land", "ship it"),
+        ] {
+            assert!(
+                carried_skips(problem, &[], &ruled(action, text), 5).is_empty(),
+                "{action}: {text}"
+            );
+        }
+        // A newer approved amendment moves it too.
+        let amended = [crate::domain::IntentAmendment {
+            text: "Enforce the security rules".into(),
+            ord: 5,
+            at: 30,
+        }];
+        assert!(carried_skips(problem, &amended, &units, 5).is_empty());
+        // A gate action that is not the person's instruction (a skip of another rule) does not.
+        assert_eq!(
+            ids(carried_skips(
+                problem,
+                &[],
+                &ruled("skip_rules", "POL-8 n/a"),
+                5
+            )),
+            vec!["POL-7"]
+        );
+        // A skip recorded before the revision existed is never carried.
+        let mut legacy = units.clone();
+        legacy[0].rule_skips[0].rulings_rev = None;
+        assert!(carried_skips(problem, &[], &legacy, 5).is_empty());
     }
 }
