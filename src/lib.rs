@@ -2949,6 +2949,9 @@ mod tests {
 /// The integration-test binaries each carry their own copy of this block (enforced by
 /// `tests/harness_hygiene.rs`); this one covers the inline `#[cfg(test)]` modules.
 #[cfg(test)]
+mod two_seat_e2e_tests;
+
+#[cfg(test)]
 mod test_harness_hygiene {
     /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets process env vars
     /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.

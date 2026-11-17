@@ -4088,6 +4088,86 @@ impl<'a> CreatorIds<'a> {
 /// [`crate::assurance::JudgeFallback`] (no preferred seat — there was none), `judgeDistinct: false`,
 /// and named in the run's live output. A verdict no seat rendered, or one a fallback seat already
 /// labels, passes through.
+/// Whether `seat` is the pinned validator's author seat (an instance of it included).
+fn is_validator_author(seat: &str) -> bool {
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    seat == v || crate::team::runner::seat_key(seat) == v
+}
+
+/// (crew#972 decision 2, core#1543) GAP B keeps the agent judge distinct from the pinned
+/// validator's author "when the roster allows". With only Claude Code and Codex signed in it never
+/// allowed for a unit codex ran (codex's own Test or Review step, or codex's build): no judge was
+/// left, and every such gate held for the person. When no judge distinct from `excluded` remains
+/// (creators of reviewed work counted as eligible — they are the core#954 fallback's to decide),
+/// the validator author is dropped from `excluded` if that leaves one, and the reason returned.
+/// Never when it is this unit's own author by key (its seat, a recorded author, a launch
+/// exclusion), and never when this unit's own launch was not OBSERVED (`work_observed`): the
+/// verdict is then verified against what each launch ran ([`crate::observed_identity`]), never
+/// against what a name predicts.
+fn readmit_validator_author(
+    excluded: &mut Vec<&str>,
+    unit: &crate::domain::WorkUnit,
+    work_author: &str,
+    work_observed: Option<&[crate::observed_identity::Identity]>,
+    has_judge: &impl Fn(&[&str]) -> bool,
+) -> Option<String> {
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    work_observed?;
+    if !excluded.contains(&v)
+        || is_validator_author(work_author)
+        || unit
+            .authored_by
+            .iter()
+            .chain(&unit.exclude_seats)
+            .any(|k| is_validator_author(k))
+        || has_judge(excluded)
+    {
+        return None;
+    }
+    let without: Vec<&str> = excluded.iter().copied().filter(|k| *k != v).collect();
+    if !has_judge(&without) {
+        return None;
+    }
+    *excluded = without;
+    Some(format!(
+        "no eligible judge seat distinct from the work's author '{work_author}' and the pinned \
+         validator's author '{v}'"
+    ))
+}
+
+/// (crew#972 decision 2) A verdict the re-admitted validator author rendered, labelled on the gate,
+/// its receipt and the delivery receipt. A fallback label already there (the creator fallback, when
+/// it also built the work under review) gains this reason too. Any other verdict passes through.
+fn disclose_validator_author_judge(
+    mut av: crate::validator::AgentVerdict,
+    validator_fallback: Option<&str>,
+    emit_delta: &DeltaSink,
+) -> crate::validator::AgentVerdict {
+    let (Some(why), Some(seat)) = (validator_fallback, av.judge_cli.clone()) else {
+        return av;
+    };
+    if !is_validator_author(&seat) {
+        return av;
+    }
+    let note = format!("also the pinned validator's author; {why}; verified by observation");
+    let fb = match av.judge_fallback.take() {
+        Some(mut fb) => {
+            fb.label = format!("{} ({note})", fb.label);
+            fb
+        }
+        None => crate::assurance::JudgeFallback {
+            label: format!("judge: {seat} ({note})"),
+            seat,
+            preferred: Vec::new(),
+            reason: why.to_string(),
+        },
+    };
+    engine_note(emit_delta, &fb.label);
+    eprintln!("wicked-core: {} (crew#972)", fb.label);
+    av.judge_fallback = Some(fb);
+    av
+}
+
 fn disclose_creator_judge(
     mut av: crate::validator::AgentVerdict,
     seat: Option<String>,
@@ -5680,6 +5760,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
+    // (crew#972 decision 2, core#1543) Set when the pinned validator's author was re-admitted.
+    let mut validator_fallback: Option<String> = None;
     // (core#1543) Only the judge's own launches are read back after the verdict.
     crate::observed_identity::take_receipts();
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
@@ -5738,6 +5820,32 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 let configured = without_author_binaries(&eligible_configured, ex, &ids);
                 crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
             };
+            // (crew#972 decision 2, core#1543) The validator author's exclusion is the weakest:
+            // with no other judge left it is re-admitted — only when this unit's own launch was
+            // OBSERVED and it is none of the unit's own authors, and its verdict then stands only
+            // if its own launch is observed running another program (verified below).
+            let has_any_judge = |ex: &[&str]| {
+                let ids = author_identities(ex, roster);
+                let all = without_author_binaries(&eligible, ex, &ids);
+                let configured = without_author_binaries(&eligible_configured, ex, &ids);
+                crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
+            };
+            validator_fallback = readmit_validator_author(
+                &mut excluded,
+                &input.unit,
+                work_author,
+                work_observed.as_deref(),
+                &has_any_judge,
+            );
+            if let Some(why) = &validator_fallback {
+                engine_note(
+                    emit_delta,
+                    &format!(
+                        "agent validator: {why} — the pinned validator's author may judge it, \
+                         disclosed and verified by what each launch runs"
+                    ),
+                );
+            }
             // (crew#972) The monitors first, so a monitor is re-admitted before a creator is.
             monitor_fallback =
                 exclude_monitors(&mut excluded, &team_monitors, &creators, has_judge);
@@ -6181,17 +6289,35 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 .judge_cli
                 .as_deref()
                 .and_then(|seat| crate::observed_identity::observed_for(&judge_receipts, seat));
-            match crate::observed_identity::judged_own_work(
-                judge_observed.as_deref(),
-                work_observed.as_deref(),
-            ) {
+            // A re-admitted validator author proves its distinctness by being observed: an
+            // unobserved launch of it is never taken on trust.
+            let readmitted_unobserved = validator_fallback.is_some()
+                && av.judge_cli.as_deref().is_some_and(is_validator_author)
+                && judge_observed.is_none();
+            let verdict_refused = if readmitted_unobserved {
+                Some(
+                    "the pinned validator's author judged with no other seat left, but its own \
+                     launch could not be observed: its verdict is discarded"
+                        .to_string(),
+                )
+            } else {
+                crate::observed_identity::judged_own_work(
+                    judge_observed.as_deref(),
+                    work_observed.as_deref(),
+                )
+            };
+            match verdict_refused {
                 Some(why) => {
                     engine_note(emit_delta, &format!("agent validator: {why}"));
                     eprintln!("wicked-core: unit {}: {why} (core#1543)", input.unit.ord);
                     judge_skipped = Some(why);
                     None
                 }
-                None => Some(av),
+                None => Some(disclose_validator_author_judge(
+                    av,
+                    validator_fallback.as_deref(),
+                    emit_delta,
+                )),
             }
         }
         None => None,
