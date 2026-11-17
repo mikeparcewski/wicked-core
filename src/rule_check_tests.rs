@@ -1997,6 +1997,7 @@ fn b52_mcp_rules_on_a_non_mcp_change_are_na_quoting_their_scope_and_a_council_ca
             rule_text: &words,
             established: council_established(&rule, &m),
             instructions: None,
+            arbiter: false,
         },
     );
     assert_eq!(

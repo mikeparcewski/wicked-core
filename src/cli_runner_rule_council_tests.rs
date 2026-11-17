@@ -100,6 +100,7 @@ impl DisputeCouncil for FakeCouncil {
         &self,
         req: DecisionRequest,
         clis: Vec<crate::AgenticCli>,
+        _size: usize,
         lock: HostCouncilLock,
         deadline: std::time::Instant,
     ) -> DisputeOutcome {
@@ -152,6 +153,22 @@ fn broken_3_0(_: &DecisionRequest, c: &[crate::AgenticCli]) -> DisputeOutcome {
     ]))
 }
 
+/// (crew#972) One arbiter's vote: BROKEN.
+fn broken_1(_: &DecisionRequest, c: &[crate::AgenticCli]) -> DisputeOutcome {
+    DisputeOutcome::Ruled(DecisionVerdict {
+        seated: 1,
+        ..votes(&[(&c[0].key, 0, "1 src/a.rs:2 still untyped")])
+    })
+}
+
+/// (crew#972) One arbiter's vote: KEPT.
+fn kept_1(_: &DecisionRequest, c: &[crate::AgenticCli]) -> DisputeOutcome {
+    DisputeOutcome::Ruled(DecisionVerdict {
+        seated: 1,
+        ..votes(&[(&c[0].key, 1, "2 src/a.rs:2 types both numbers")])
+    })
+}
+
 fn kept_3_0(_: &DecisionRequest, c: &[crate::AgenticCli]) -> DisputeOutcome {
     DisputeOutcome::Ruled(votes(&[
         (&c[0].key, 1, "2 src/a.rs:2 types both numbers"),
@@ -184,6 +201,18 @@ fn settle_with(
     council: &FakeCouncil,
     registry: &[crate::AgenticCli],
 ) -> crate::rule_check::RuleCheckReport {
+    settle_in(input, judge, reviewer_output, council, registry, registry)
+}
+
+/// [`settle_with`] on a run whose own seats are `run_seats` (a council or arbiter sits only there).
+fn settle_in(
+    input: &StepInput,
+    judge: &dyn StepRunner,
+    reviewer_output: &str,
+    council: &FakeCouncil,
+    registry: &[crate::AgenticCli],
+    run_seats: &[crate::AgenticCli],
+) -> crate::rule_check::RuleCheckReport {
     let pool = vec![seat("claude"), seat("pi")];
     let ctx = CouncilCtx {
         council,
@@ -202,6 +231,7 @@ fn settle_with(
         Some(Settle {
             reviewer_output,
             council: Some(&ctx),
+            council_pool: run_seats,
         }),
     )
     .expect("a report")
@@ -429,8 +459,10 @@ fn a_carried_dispute_keeps_its_original_reviewer_out_whatever_the_seat_now_runs(
     let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
     let council = FakeCouncil::new("carried-id", timeout);
     let first = settle_with(&input, &judge, REVIEWER_KEPT, &council, &registry());
-    // opencode is a party (the reviewer ran it): two seats left, no council, a recorded dispute.
-    assert_eq!(council.convened(), 0);
+    // opencode is a party (the reviewer ran it): two seats left, so one arbiter (crew#972), never
+    // opencode; it timed out, so the dispute is recorded.
+    assert_eq!(council.convened(), 1);
+    assert_eq!(council.seats(0), vec!["agy".to_string()]);
     let r1 = row(&first, "R1");
     assert_eq!(r1.status, RuleStatus::Disputed);
     let rec = &r1.council.as_ref().unwrap().positions[1];
@@ -438,21 +470,15 @@ fn a_carried_dispute_keeps_its_original_reviewer_out_whatever_the_seat_now_runs(
     // Attempt 2: the same key now launches codex. opencode read the dispute: it does not sit.
     input.unit.rule_check = Some(first);
     input.unit.assigned_invocation = Some("codex -p {PROMPT}".into());
-    let again = FakeCouncil::new("carried-id-2", kept_3_0);
+    let again = FakeCouncil::new("carried-id-2", kept_1);
     let r = settle_with(&input, &judge, "VERDICT: PASS", &again, &registry());
-    assert_eq!(again.convened(), 0, "two seats left: no council");
-    let why = row(&r, "R1")
-        .council
-        .as_ref()
-        .unwrap()
-        .reason
-        .clone()
-        .unwrap();
-    assert!(why.starts_with("seats_benched"), "{why}");
-    // (core#1379) …and the refusal accounts for it: opencode, which the recorded reviewer ran.
+    // The arbiter of the carried dispute is still never opencode, which read it.
+    assert_eq!(again.convened(), 1);
+    assert_eq!(again.seats(0), vec!["agy".to_string()]);
+    let c = row(&r, "R1").council.clone().unwrap();
     assert!(
-        why.contains("codex reviewed the step; opencode was what the reviewer launched"),
-        "{why}"
+        c.arbiter.as_deref().is_some_and(|a| a.starts_with("agy")),
+        "{c:?}"
     );
 }
 
@@ -472,20 +498,67 @@ fn a_fifo_at_the_slot_path_is_refused_without_blocking() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// A.7.4, end to end: too few distinct seats convenes nothing (zero ballots), and the row holds.
+/// (crew#972, two seats) Too few distinct seats for a council: ONE arbiter settles the dispute,
+/// disclosed on the row — a seat distinct from every party first, else the rule judge's own seat
+/// when it built none of the work. With neither (the judge excluded at launch), the row holds.
 #[test]
-fn too_few_distinct_seats_convene_nothing_and_the_rule_holds() {
+fn too_few_distinct_seats_get_one_arbiter_and_the_rule_is_settled() {
     let input = reviewed("few");
     let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
-    let council = FakeCouncil::new("few", broken_3_0);
+    let council = FakeCouncil::new("few", broken_1);
     let small: Vec<crate::AgenticCli> = ["claude", "codex", "pi", "agy", "opencode"]
         .into_iter()
         .map(seat)
         .collect();
     let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &small);
-    assert_eq!(council.convened(), 0);
-    assert_eq!(r.councils, 0);
-    assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
+    assert_eq!(council.convened(), 1);
+    assert_eq!(
+        council.seats(0),
+        vec!["agy".to_string()],
+        "the first seat distinct from every party"
+    );
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Broken, "{r1:?}");
+    let c = r1.council.as_ref().unwrap();
+    assert_eq!(
+        c.arbiter.as_deref(),
+        Some("agy (distinct from every party)")
+    );
+    // No seat distinct from every party: the rule judge's own seat (pi, which built nothing)
+    // arbitrates.
+    let mut two = reviewed("few-two");
+    let codex_judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council2 = FakeCouncil::new("few-two", kept_1);
+    let pair: Vec<crate::AgenticCli> = ["claude", "codex", "pi"].into_iter().map(seat).collect();
+    let r = settle_with(&two, &codex_judge, REVIEWER_KEPT, &council2, &pair);
+    assert_eq!(council2.convened(), 1);
+    assert_eq!(
+        council2.seats(0),
+        vec!["pi".to_string()],
+        "pi judged the rule, built nothing"
+    );
+    let r1 = row(&r, "R1");
+    assert_eq!(r1.status, RuleStatus::Kept, "{r1:?}");
+    assert!(r1
+        .council
+        .as_ref()
+        .unwrap()
+        .arbiter
+        .as_deref()
+        .is_some_and(|a| a.contains("it judged the rule")));
+    // The judge excluded at launch: no arbiter, the hold stands.
+    two.unit.exclude_seats = vec!["pi".into()];
+    let council3 = FakeCouncil::new("few-three", kept_1);
+    let r = settle_with(&two, &codex_judge, REVIEWER_KEPT, &council3, &pair);
+    assert_eq!(council3.convened(), 0);
+    assert!(
+        matches!(
+            row(&r, "R1").status,
+            RuleStatus::Disputed | RuleStatus::Unchecked
+        ),
+        "{:?}",
+        row(&r, "R1")
+    );
     assert!(r.hold().is_some());
 }
 
@@ -765,7 +838,7 @@ fn the_host_slot_is_one_at_a_time_and_outlives_a_caller_that_stops_waiting() {
         evidence: "e".into(),
     };
     assert!(matches!(
-        port.convene(req, Vec::new(), lock, past),
+        port.convene(req, Vec::new(), 3, lock, past),
         DisputeOutcome::TimedOut
     ));
     assert!(
@@ -866,43 +939,30 @@ fn a_record_part_dispute_says_the_record_part_holds_it() {
 fn a_roster_too_short_for_a_council_names_its_seats_and_the_parties() {
     let input = reviewed("short-roster");
     let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
-    let council = FakeCouncil::new("short-roster", kept_3_0);
+    let council = FakeCouncil::new("short-roster", kept_1);
     let reg: Vec<crate::AgenticCli> = ["claude", "codex", "pi", "agy"]
         .into_iter()
         .map(seat)
         .collect();
     let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &reg);
-    assert_eq!(council.convened(), 0);
-    let r1 = row(&r, "R1");
-    assert_eq!(r1.status, RuleStatus::Disputed);
-    let c = r1.council.as_ref().unwrap();
-    assert_eq!(c.eligible, vec!["agy".to_string()]);
+    // (crew#972) One seat distinct from every party: it arbitrates, named.
+    assert_eq!(council.convened(), 1);
+    assert_eq!(council.seats(0), vec!["agy".to_string()]);
+    let c = row(&r, "R1").council.clone().unwrap();
     assert_eq!(
-        c.reason.as_deref(),
-        Some(
-            "seats_benched: 1 seat(s) distinct from every party (agy), a rule council needs 3; \
-             the parties: claude built the work; pi judged the rule; codex reviewed the step"
-        )
+        c.arbiter.as_deref(),
+        Some("agy (distinct from every party)")
     );
-    // The reviewer `codex` launched running opencode: opencode is a party, and says so.
+    // The reviewer `codex` launched running opencode: opencode is a party and never arbitrates.
     let mut input = reviewed("short-roster-launch");
     input.unit.assigned_invocation = Some("opencode run {PROMPT}".into());
     let reg: Vec<crate::AgenticCli> = ["claude", "codex", "pi", "agy", "opencode"]
         .into_iter()
         .map(seat)
         .collect();
-    let r = settle_with(&input, &judge, REVIEWER_KEPT, &council, &reg);
-    let why = row(&r, "R1")
-        .council
-        .as_ref()
-        .unwrap()
-        .reason
-        .clone()
-        .unwrap();
-    assert!(
-        why.contains("codex reviewed the step; opencode was what the reviewer launched"),
-        "{why}"
-    );
+    let council = FakeCouncil::new("short-roster-launch", kept_1);
+    let _ = settle_with(&input, &judge, REVIEWER_KEPT, &council, &reg);
+    assert_eq!(council.seats(0), vec!["agy".to_string()]);
 }
 
 /// core#1379, the production path: the registry leaves three seats, but the run's roster and
@@ -943,5 +1003,38 @@ fn a_council_short_of_voters_names_them_and_the_parties() {
             "seats_benched: 1 eligible seat(s) (agy), a rule council needs 3; the parties: \
              claude built the work; pi judged the rule; codex reviewed the step"
         )
+    );
+}
+
+/// (codex on #1526, W12) The two-seat case with the SHIPPED registry: three seats outside the run
+/// are distinct from every party, but only the run's own seats can sit. The run is claude (built
+/// it), codex (reviewed) and pi (judged): no council, and pi, the rule judge, arbitrates.
+#[test]
+fn a_run_of_two_seats_gets_its_arbiter_even_when_the_registry_has_more() {
+    let input = reviewed("two-seat-run");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("two-seat-run", kept_1);
+    let run_seats: Vec<crate::AgenticCli> =
+        ["claude", "codex", "pi"].into_iter().map(seat).collect();
+    let r = settle_in(
+        &input,
+        &judge,
+        REVIEWER_KEPT,
+        &council,
+        &registry(),
+        &run_seats,
+    );
+    assert_eq!(council.convened(), 1);
+    assert_eq!(
+        council.seats(0),
+        vec!["pi".to_string()],
+        "the run's own judge seat, not agy/opencode"
+    );
+    let c = row(&r, "R1").council.clone().unwrap();
+    assert!(
+        c.arbiter
+            .as_deref()
+            .is_some_and(|a| a.starts_with("pi (it judged the rule")),
+        "{c:?}"
     );
 }

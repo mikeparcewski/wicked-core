@@ -233,6 +233,11 @@ pub struct RuleCouncil {
     /// `incomplete_evidence`, `identity_unknown`, then the detail).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// (crew#972, two seats) Set when ONE arbiter settled the dispute because no three seats
+    /// distinct from every party could sit: who, and on what footing (`claude (distinct from every
+    /// party)`, or `codex (it judged the rule; the only seat that built none of the work)`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arbiter: Option<String>,
 }
 
 impl RuleCouncil {
@@ -2719,6 +2724,9 @@ pub struct VoteBars<'a> {
     pub established: bool,
     /// The person's instructions: a KEPT that rests on them is a waiver.
     pub instructions: Option<&'a str>,
+    /// (crew#972, two seats) One arbiter sat instead of a council: its one counted vote, put to the
+    /// same bars, is the ruling (a council needs a majority of three).
+    pub arbiter: bool,
 }
 
 /// (DES-RULE-CHECK-001 rev 2, A.4) A council's verdict on one dispute as the receipt row: every vote
@@ -2796,7 +2804,10 @@ pub fn settle(
         .as_deref()
         .and_then(|w| w.trim().parse::<usize>().ok())
         .and_then(|n| n.checked_sub(1))
-        .filter(|_| tally.consensus && verdict.no_ruling_reason.is_none());
+        .filter(|_| {
+            (tally.consensus || (bars.arbiter && counted.len() == 1))
+                && verdict.no_ruling_reason.is_none()
+        });
     let mut ruling = winner.and_then(|i| options.get(i).copied());
     if ruling == Some(RuleStatus::Kept) && leans_on_instruction {
         ruling = Some(RuleStatus::Waived);
@@ -2825,6 +2836,7 @@ pub fn settle(
         eligible: verdict.eligible.clone(),
         ballots_in: verdict.ballots_in.clone(),
         reason: reason.clone(),
+        arbiter: None,
     };
     match ruling {
         Some(status) => {

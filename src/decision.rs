@@ -542,12 +542,15 @@ pub const RULE_COUNCIL_SIZE: usize = 3;
 pub enum DecisionFrame {
     /// The team councils' routing ballot, with the system's size and deadline settings.
     Routing,
-    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: exactly
-    /// [`RULE_COUNCIL_SIZE`] seats or none (fewer eligible = no ballot at all), the nonce-framed
-    /// dispute ballot, one ABSOLUTE `deadline` and the most bytes any ballot may hold.
+    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: exactly `size` seats or
+    /// none (fewer eligible = no ballot at all), the nonce-framed dispute ballot, one ABSOLUTE
+    /// `deadline` and the most bytes any ballot may hold.
     Dispute {
         deadline: std::time::Instant,
         prompt_budget: usize,
+        /// (crew#972, two seats) How many seats sit: [`RULE_COUNCIL_SIZE`] for a council, 1 for
+        /// the single arbiter a roster too small for a council gets.
+        size: usize,
     },
 }
 
@@ -614,9 +617,10 @@ pub(crate) fn convene_decision(
 }
 
 /// [`convene_decision`] in a frame: [`DecisionFrame::Routing`] is exactly it;
-/// [`DecisionFrame::Dispute`] seats exactly [`RULE_COUNCIL_SIZE`] (fewer eligible voters convene
-/// nothing: a verdict with no ruling, reason `seats_benched`, and no ballot), frames every ballot
-/// and bounds the whole council by its absolute deadline.
+/// [`DecisionFrame::Dispute`] seats exactly its `size` ([`RULE_COUNCIL_SIZE`] for a council, 1
+/// for the single arbiter of crew#972; fewer eligible voters convene nothing: a verdict with no
+/// ruling, reason `seats_benched`, and no ballot), frames every ballot and bounds the whole council
+/// by its absolute deadline.
 pub(crate) fn convene_decision_with(
     req: &DecisionRequest,
     clis: &[AgenticCli],
@@ -645,8 +649,9 @@ pub(crate) fn convene_decision_with(
     let eligible: Vec<String> = voters.iter().map(|c| c.key.clone()).collect();
     let size = match frame {
         DecisionFrame::Routing => pick.size.max(1),
-        DecisionFrame::Dispute { .. } => {
-            if voters.len() < RULE_COUNCIL_SIZE {
+        DecisionFrame::Dispute { size, .. } => {
+            let need = size.clamp(1, RULE_COUNCIL_SIZE);
+            if voters.len() < need {
                 // (core#1379) Named: the person sees who could sit.
                 let why = format!(
                     "seats_benched: {} eligible seat(s) ({}), a rule council needs \
@@ -674,7 +679,7 @@ pub(crate) fn convene_decision_with(
                     votes: Vec::new(),
                 });
             }
-            RULE_COUNCIL_SIZE
+            need
         }
     };
     let drawn = wicked_council::pick::pick_seats(&voters, size, pick.seed);
@@ -728,6 +733,7 @@ pub(crate) fn convene_decision_with(
         DecisionFrame::Dispute {
             deadline,
             prompt_budget,
+            ..
         } => worker.with_dispute(deadline, prompt_budget + context.len()),
     };
     let task = CouncilTask {
@@ -1085,6 +1091,7 @@ mod tests {
         let frame = DecisionFrame::Dispute {
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
             prompt_budget: 112 * 1024,
+            size: RULE_COUNCIL_SIZE,
         };
         let pick = CouncilPick {
             size: 5,
@@ -1177,6 +1184,7 @@ mod tests {
             DecisionFrame::Dispute {
                 deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
                 prompt_budget: 112 * 1024,
+                size: RULE_COUNCIL_SIZE,
             },
         )
         .expect("a verdict");
@@ -1217,6 +1225,7 @@ mod tests {
                 rule_text: "a rule",
                 established: false,
                 instructions: None,
+                arbiter: false,
             },
         );
         assert_eq!(out.status, crate::rule_check::RuleStatus::Disputed);
