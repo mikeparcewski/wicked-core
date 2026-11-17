@@ -1630,7 +1630,7 @@ pub struct BuildArm {
 }
 
 /// The longest note a turn restates.
-const NOTE_MAX: usize = 4000;
+const NOTE_MAX: usize = 20_000;
 
 /// (core#1486) The notes a build attempt was sent with: the latest round's operator notes (`amend`
 /// rulings of the unit's last attempt, oldest first) and, on a send-back, the findings it carries
@@ -1649,12 +1649,14 @@ pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
             ));
         }
     }
-    // (codex r1) The notes for THIS dispatch: amendments recorded against the attempt it re-runs
-    // (`last_attempt`, read before this dispatch stamps its own), or, for a first dispatch, a
-    // pre-dispatch (plan-gate) amendment. A later retry with no new note restates none.
+    // (codex r1) The notes for THIS dispatch: amendments recorded against the attempt it re-runs,
+    // or, for a first dispatch, a pre-dispatch (plan-gate) amendment. A later retry with no new
+    // note restates none.
+    // (codex r2) The dispatch stamps `last_attempt` with the attempt it mints before the build is
+    // armed, so the attempt this one re-runs is the one before it.
     let this_round = |r: &crate::domain::OperatorRuling| match unit.last_attempt {
-        Some(a) => r.attempt == a,
-        None => r.attempt == 0,
+        Some(a) if a > 0 => r.attempt == a - 1,
+        _ => r.attempt == 0,
     };
     for r in unit
         .operator_rulings
@@ -2188,9 +2190,10 @@ pub fn orchestrate(
                 (a, b) => a.or(b),
             };
         }
-        // (core#1486, core#1495) A `NO-CHANGE:` line an earlier turn wrote survives the fold.
-        if let Some(why) = crate::actor::no_change_line(&out.output) {
-            no_change = Some((turn, why));
+        // (core#1486, core#1495) A `NO-CHANGE:` line an earlier turn wrote survives the fold; a
+        // later turn's field (valid or not) replaces it, so an invalid one withdraws it (codex r2).
+        if let Some(field) = crate::actor::no_change_field(&out.output) {
+            no_change = field.map(|why| (turn, why));
         }
         let finish = |status: StepStatus, text: &str, summaries: &[String]| StepOutput {
             run_id: input.run_id.clone(),
@@ -2348,7 +2351,8 @@ mod tests {
             attempt: 1,
             at: 2,
         });
-        u.last_attempt = Some(1);
+        // At arm time the dispatch has stamped the attempt it mints (2): it re-runs attempt 1.
+        u.last_attempt = Some(2);
         let notes = attempt_notes(&u);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].contains("ITEM 2 FAIL") && notes[1].contains("CITE src/lib.rs:42"));
@@ -2376,7 +2380,7 @@ mod tests {
         // (codex r1) A later retry with no new note restates no older one, and the restated task
         // drops every amendment segment (the notes block carries this round's).
         let mut later = u.clone();
-        later.last_attempt = Some(2);
+        later.last_attempt = Some(3);
         later.rework_of = None;
         assert!(attempt_notes(&later).is_empty());
         let mut amended = crate::domain::WorkUnit::pending("r:fix", "r", 2, "do the fix");

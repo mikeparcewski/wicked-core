@@ -8059,8 +8059,8 @@ fn apply_step_result(
     // passed or never ran (crew#972: a creator whose writes were refused), and only for a reply
     // with words in it.
     // The floor must have NAMED its failing tests (a structured split): a build or compile
-    // failure has nothing a no-change answer could be about. And a reply that mentions the marker
-    // only to negate, condition or quote it has said it is NOT declaring it (xreview on #1146).
+    // failure has nothing a no-change answer could be about. (core#1486) Any non-empty reply takes
+    // this red-floor arm; an explicit declaration is only the structured `NO-CHANGE:` field.
     let floor_red = evidence
         .repo_checks
         .as_ref()
@@ -8076,7 +8076,11 @@ fn apply_step_result(
     // The prose arm rejects only over a clean worktree (a diff is substance of its own) — except
     // under the answer exemption, where `no_prose` already means "no answer at all": an
     // empty answer is no answer however dirty the worktree is (core#970, codex r5).
-    let prose_rejects = no_prose && (clean || answer_is_enough);
+    // (core#1486, codex r2) A structured no-change declaration on an unchanged tree IS the step's
+    // substance: a minimal `NO-CHANGE: <why>` answer is never refused for being short.
+    let prose_rejects = no_prose
+        && (clean || answer_is_enough)
+        && !(declared && evidence.tree_changed != Some(true));
     if output.governed
         && (prose_rejects || (code_without_diff && !declared_no_change && left_no_change))
     {
@@ -15297,19 +15301,41 @@ pub(crate) fn declares_no_change(output: &str) -> bool {
 /// a code fence and not a `>` quote, with a real reason after it (not empty, not an unfilled
 /// `<placeholder>`). A mid-sentence mention is not one. Capped at 300 characters.
 pub(crate) fn no_change_line(output: &str) -> Option<String> {
-    // (codex r1) The LAST field decides, valid or not: an empty or placeholder reason after an
-    // earlier declaration withdraws it, never revives it. Lines inside a ``` fence and `>` quotes
-    // are examples or quotations, never the seat's own field.
+    no_change_field(output).flatten()
+}
+
+/// (core#1486) The LAST `NO-CHANGE:` field of `output` ([`no_change_line`]): `None` when it has none,
+/// `Some(None)` when its last field is invalid (no reason, or an unfilled `<placeholder>`; it
+/// withdraws an earlier one), `Some(Some(why))` when it declares. Lines inside a code fence (``` or
+/// ~~~, closed only by the same character at least as long) and `>` quotes are never fields.
+pub(crate) fn no_change_field(output: &str) -> Option<Option<String>> {
     let decoration = |c: char| c.is_whitespace() || "-*`#_".contains(c);
-    let mut fenced = false;
+    let mut fence: Option<(char, usize)> = None;
     let mut last: Option<&str> = None;
     for line in output.lines() {
         let t = line.trim_start();
-        if t.starts_with("```") {
-            fenced = !fenced;
-            continue;
+        let run = |ch: char| t.chars().take_while(|c| *c == ch).count();
+        let (ticks, tildes) = (run('`'), run('~'));
+        let opener = if ticks >= 3 {
+            Some(('`', ticks))
+        } else if tildes >= 3 {
+            Some(('~', tildes))
+        } else {
+            None
+        };
+        match (fence, opener) {
+            (None, Some(o)) => {
+                fence = Some(o);
+                continue;
+            }
+            (Some((ch, len)), Some((c2, l2))) if ch == c2 && l2 >= len => {
+                fence = None;
+                continue;
+            }
+            (Some(_), _) => continue,
+            (None, None) => {}
         }
-        if fenced || t.starts_with('>') {
+        if t.starts_with('>') {
             continue;
         }
         let bare = t.trim_start_matches(decoration);
@@ -15320,10 +15346,10 @@ pub(crate) fn no_change_line(output: &str) -> Option<String> {
             last = Some(&bare[NO_CHANGE_FIELD.len()..]);
         }
     }
-    let why = last?.trim().trim_end_matches(decoration).trim();
-    // An unfilled placeholder (`<why>`, `<the reason>`) is the instruction, not a reason.
+    let why = last?.trim_matches(decoration);
+    // An unfilled placeholder (`<why>`, `**<the reason>**`) is the instruction, not a reason.
     let placeholder = why.starts_with('<') && why.ends_with('>');
-    (!why.is_empty() && !placeholder).then(|| why.chars().take(300).collect())
+    Some((!why.is_empty() && !placeholder).then(|| why.chars().take(300).collect()))
 }
 
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
@@ -29172,9 +29198,13 @@ mod request_changes_tests {
         // unfilled placeholders never declare.
         for no in [
             "NO-CHANGE: already fixed\nNO-CHANGE:",
-            "```\nNO-CHANGE: <why>\n```\nI could not edit the repository.",
+            "```\nNO-CHANGE: the fix already exists\n```\nI could not edit the repository.",
+            "~~~text\nNO-CHANGE: the fix already exists\n~~~",
+            "````\n```\nNO-CHANGE: the fix already exists\n````",
             "> NO-CHANGE: quoted from the note",
             "NO-CHANGE: <the reason>",
+            "**NO-CHANGE:** <why>",
+            "NO-CHANGE: **<why>**",
         ] {
             assert!(!declares_no_change(no), "{no:?}");
         }
@@ -29183,6 +29213,12 @@ mod request_changes_tests {
             Some("two"),
             "the last line decides"
         );
+        // The same declaration outside a fence declares (the fence cases below are not vacuous).
+        assert!(declares_no_change(
+            "```\nexample\n```\nNO-CHANGE: the fix already exists"
+        ));
+        assert_eq!(no_change_field("nothing here"), None);
+        assert_eq!(no_change_field("NO-CHANGE:"), Some(None));
         for no in [
             "NO CHANGE NEEDED",
             "Checked the tree. NO CHANGE NEEDED",
@@ -31374,6 +31410,42 @@ mod code_evidence_floor_tests {
             "{:?}",
             unit.denial
         );
+    }
+
+    /// (core#1486, codex r2) The minimal structured answer on a CLEAN, unchanged tree clears the
+    /// floor too: the declaration is the step's substance, not too-short prose. Without it the same
+    /// short answer is still refused.
+    #[test]
+    fn a_minimal_no_change_declaration_on_a_clean_tree_clears_the_floor() {
+        for (text, refused) in [
+            (
+                "NO-CHANGE: the fix is already present\nHANDOFF: verified",
+                false,
+            ),
+            ("HANDOFF: verified", true),
+        ] {
+            let wt = git_worktree(&format!("no-change-minimal-{refused}"));
+            let run_id = format!("code-floor-no-change-minimal-{refused}");
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(
+                &mut store,
+                &run_id,
+                PhaseRole::Creator,
+                true,
+                Some(wt.to_string_lossy().into_owned()),
+            );
+            let mut subs = crate::event_log::EventSink::default();
+            let evidence = crate::workflow::UnitEvidence {
+                tree_changed: Some(false),
+                ..Default::default()
+            };
+            let (_session, unit) = fold_ev(&mut store, &mut subs, &run_id, text, true, evidence);
+            let substance = unit
+                .denial
+                .as_ref()
+                .is_some_and(|d| d.source == "substance");
+            assert_eq!(substance, refused, "{text:?}: {:?}", unit.denial);
+        }
     }
 
     /// (j4-gates, core#1113; core#1142, rig run 85ddad0d) When the unit's own floor ran and FAILED,
