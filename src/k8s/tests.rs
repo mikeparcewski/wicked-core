@@ -1080,7 +1080,7 @@ fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
 #[test]
 fn an_ended_run_arms_no_seat_until_it_is_resumed() {
     let run = format!("ended-run-{}", std::process::id());
-    assert!(super::arming_live(&run));
+    assert!(super::arming_live(&run, super::lifecycle(&run)));
     let before = super::run_epoch(&run) - 1;
     // The end is recorded on the actor thread at the transition, before any cleanup runs.
     let e = super::end_run(&run);
@@ -1088,7 +1088,10 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
         super::run_ended_since(&run, before),
         "an attempt from before stops"
     );
-    assert!(!super::arming_live(&run), "an ended run arms nothing");
+    assert!(
+        !super::arming_live(&run, super::lifecycle(&run)),
+        "an ended run arms nothing"
+    );
     assert_eq!(super::run_epoch(&run), e, "and its epoch is untouched");
     let generation = super::lifecycle(&run);
     super::forget_ended(&run);
@@ -1097,7 +1100,10 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
         generation,
         "an attempt of the ended lifecycle sees the resume and stops"
     );
-    assert!(super::arming_live(&run), "a resumed run arms again");
+    assert!(
+        super::arming_live(&run, super::lifecycle(&run)),
+        "a resumed run arms again"
+    );
 }
 
 /// (codex confirmation on #1527, SILENT-OK) The attacker's order: the run ends at epoch E (its
@@ -1106,13 +1112,37 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
 #[test]
 fn an_obsolete_cleanup_never_fences_a_resumed_run() {
     let run = format!("obsolete-{}", uuid::Uuid::new_v4().simple());
-    assert!(super::arming_live(&run));
+    assert!(super::arming_live(&run, super::lifecycle(&run)));
     let e = super::end_run(&run);
     super::forget_ended(&run);
-    assert!(super::arming_live(&run), "resumed: arms (E+1)");
+    assert!(
+        super::arming_live(&run, super::lifecycle(&run)),
+        "resumed: arms (E+1)"
+    );
     super::release_run(&run, e);
     assert!(
-        super::arming_live(&run),
+        super::arming_live(&run, super::lifecycle(&run)),
         "the late cleanup of E fenced nothing"
+    );
+}
+
+/// (coord codex-check on #1527, SILENT-OK) The attacker's interleaving: a retry captured its
+/// generation, passed its last stop check, and THEN the run ended and was resumed (the end marker
+/// cleared). Its admission is refused: the generation moved. The resumed lifecycle's own launch
+/// arms.
+#[test]
+fn a_stale_retry_is_never_admitted_into_a_resumed_lifecycle() {
+    let run = format!("stale-retry-{}", uuid::Uuid::new_v4().simple());
+    let generation = super::lifecycle(&run);
+    assert!(super::arming_live(&run, generation), "first attempt arms");
+    super::end_run(&run);
+    super::forget_ended(&run);
+    assert!(
+        !super::arming_live(&run, generation),
+        "the old lifecycle's retry is refused"
+    );
+    assert!(
+        super::arming_live(&run, super::lifecycle(&run)),
+        "the resumed one arms"
     );
 }

@@ -2557,8 +2557,12 @@ pub(crate) fn arm_noting(
         .collect();
     // The run's node_modules cache for this tree, when the unit's provisioning filled one (B14).
     let deps = crate::checks_container::seat_claim(run_id, &tree);
+    // The lifecycle this launch arms in, captured before the first attempt (codex confirmation
+    // and coord codex-check on #1527).
+    let generation = crate::k8s::lifecycle(run_id);
     let arm_spec = crate::k8s::seat::ArmSpec {
         run_id,
+        generation,
         ord,
         cli,
         image: &image,
@@ -2586,7 +2590,6 @@ pub(crate) fn arm_noting(
     // …and never into another lifecycle: an attempt asleep through the run's end and a resume
     // stops (codex confirmation on #1527).
     let before = crate::k8s::run_epoch(run_id);
-    let generation = crate::k8s::lifecycle(run_id);
     let (seat, wrapper) = crate::k8s::seat::retry_arm(
         &crate::k8s::seat::ARM_RETRY_BACKOFF,
         &std::thread::sleep,

@@ -1317,6 +1317,9 @@ pub(crate) fn copy_in(
 #[derive(Debug, Clone)]
 pub(crate) struct ArmSpec<'a> {
     pub(crate) run_id: &'a str,
+    /// (coord codex-check on #1527) The run's lifecycle generation when this launch's arming
+    /// began ([`super::lifecycle`]): a retry of an ended lifecycle is never admitted.
+    pub(crate) generation: u64,
     pub(crate) ord: u32,
     pub(crate) cli: &'a str,
     /// The seat image (in the builder's store, which the cluster shares: D2).
@@ -1514,6 +1517,17 @@ pub(crate) fn note_states(seen: &mut Vec<String>, pod: &Value) {
         if !seen.contains(&st) {
             seen.push(st);
         }
+    }
+}
+
+/// (coord codex-check on #1527, HIDE) An arm that ends on an API error (a pod or Sandbox GET
+/// failed) still carries every container state its earlier polls saw: the runtime's own words
+/// (`CreateContainerError: context deadline exceeded`) survive a failed read.
+pub(crate) fn with_history(err: String, seen: &[String]) -> String {
+    if seen.is_empty() {
+        err
+    } else {
+        format!("{err}; seen during the wait: {}", seen.join(" | "))
     }
 }
 
@@ -1804,7 +1818,7 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
-    if !super::arming_live(s.run_id) {
+    if !super::arming_live(s.run_id, s.generation) {
         return Err((
             FloorUnarmed::PodNotReady,
             "the run ended before its seat could arm".into(),
@@ -1930,7 +1944,7 @@ pub(crate) fn arm(
     loop {
         let pod = kube
             .get_json(Some(&ns), "pod", &sandbox)
-            .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+            .map_err(|e| (FloorUnarmed::ClusterUnreachable, with_history(e, &seen)))?;
         if let Some(p) = pod.as_ref() {
             note_states(&mut seen, p);
         }
@@ -1969,7 +1983,10 @@ pub(crate) fn arm(
             let why = match kube.get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox) {
                 Err(e) => (
                     FloorUnarmed::ClusterUnreachable,
-                    format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                    with_history(
+                        format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                        &seen,
+                    ),
                 ),
                 Ok(sb) => match sb.as_ref().and_then(sandbox_refusal) {
                     Some((why, msg)) => (why, format!("{msg} ({})", diagnose(pod.as_ref()))),

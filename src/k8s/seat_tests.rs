@@ -4438,3 +4438,27 @@ fn a_transient_runtime_error_seen_by_an_earlier_poll_stays_in_the_diagnosis() {
     seat::note_states(&mut quiet, &last);
     assert!(!seat::pod_diagnosis_seen(Some(&last), None, 5, &quiet).contains("seen during"));
 }
+
+/// (coord codex-check on #1527, HIDE) First poll: the runtime's `CreateContainerError: context
+/// deadline exceeded` (transient, the wait goes on); next poll: the GET fails. The API error the
+/// arm returns still carries what the earlier poll saw.
+#[test]
+fn a_failed_read_after_a_runtime_error_keeps_that_error() {
+    let first = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"name": "seat", "state": {"waiting": {
+            "reason": "CreateContainerError", "message": "context deadline exceeded"}}}
+    ]}});
+    let mut seen = Vec::new();
+    seat::note_states(&mut seen, &first);
+    let msg = seat::with_history("Unable to connect to the server".to_string(), &seen);
+    assert!(msg.starts_with("Unable to connect to the server"), "{msg}");
+    assert!(
+        msg.contains("CreateContainerError context deadline exceeded"),
+        "{msg}"
+    );
+    assert_eq!(
+        seat::with_history("e".into(), &[]),
+        "e",
+        "nothing seen, nothing added"
+    );
+}

@@ -350,7 +350,11 @@ pub(crate) fn run_epoch(run_id: &str) -> u64 {
 /// (core#1491) A seat arms only for a run that has not ended since it was last resumed: under the
 /// run's lifecycle lock (the same one `release_run` holds), so an arm retry racing the run's end
 /// can never re-create its namespace. `false`: the run ended; nothing was armed.
-pub(crate) fn arming_live(run_id: &str) -> bool {
+///
+/// (coord codex-check on #1527) …and only for the lifecycle the attempt began in (`generation`,
+/// [`lifecycle`] when it started): an end and a resume landing between a retry's last check and
+/// this admission clear the end marker, but move the generation, so the stale retry is refused.
+pub(crate) fn arming_live(run_id: &str, generation: u64) -> bool {
     let l = life(run_id);
     let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     let ended = ENDED
@@ -358,7 +362,7 @@ pub(crate) fn arming_live(run_id: &str) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .as_ref()
         .is_some_and(|m| m.contains_key(run_id));
-    if ended {
+    if ended || lifecycle(run_id) != generation {
         return false;
     }
     l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -368,15 +372,17 @@ pub(crate) fn arming_live(run_id: &str) -> bool {
 /// (core#1491) A resumed run may arm again — a NEW lifecycle: an arm attempt of the ended one
 /// (asleep in its backoff through the end and the resume) never arms in it ([`lifecycle`]).
 pub(crate) fn forget_ended(run_id: &str) {
-    if let Some(m) = ENDED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-        m.remove(run_id);
-    }
+    // The new generation FIRST, then the end marker cleared: an admission that sees the marker
+    // gone also sees the new generation ([`arming_live`]).
     *RESUMES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_or_insert_with(std::collections::HashMap::new)
         .entry(run_id.to_string())
         .or_default() += 1;
+    if let Some(m) = ENDED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        m.remove(run_id);
+    }
 }
 
 /// (core#1491) How many times run `run_id` was resumed in this process: an arm attempt checks it
