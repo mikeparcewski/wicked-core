@@ -204,10 +204,6 @@ jobs:
   publish:
     name: publish to npm
     needs: build
-    # The npm dist-tag this version went out under: `latest`, or `release-X.Y` for a maintenance
-    # release. The github-release job reads it, so the Releases page's Latest follows npm's (core#1552).
-    outputs:
-      dist_tag: ${{ steps.dist_tag.outputs.tag }}
     # The ONLY job that needs the OIDC publishing credential.
     permissions:
       contents: read
@@ -325,7 +321,6 @@ jobs:
       # take the implicit `latest` tag — npm refuses it — and must not move `latest` backwards.
       # It publishes under `release-<major>.<minor>`; a range pin (`^0.8.5`) resolves it either way.
       - name: Choose the npm dist-tag
-        id: dist_tag
         shell: bash
         run: |
           set -euo pipefail
@@ -337,7 +332,6 @@ jobs:
           fi
           echo "wicked-core-ts@$VERSION publishes under dist-tag '$TAG' (npm latest: ${LATEST:-none})"
           echo "NPM_DIST_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
       # Publish the 5 platform packages first, then the main package (whose optionalDependencies
       # reference them). --provenance emits a build-provenance attestation via OIDC (id-token: write);
@@ -355,53 +349,96 @@ jobs:
         shell: bash
         run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
 
-  # ── the GitHub Release for the tag, once all six packages published (core#1552) ─────────────────
+  # ── wait until npm serves all six packages at the tag's version (#427, moved here for core#1552) ──
   #
-  # npm shipped every core-ts version, but nothing created a GitHub Release, so the Releases page sat at
-  # a hand-backfilled 0.7.29 while npm went through 0.15.x (estate#170 / studio#191 closed the same gap).
-  # `needs: publish`: a Release is advertised only for a version that actually published. Idempotent:
-  # an existing Release (a hand-made one, a draft, a re-run of this job) is updated in place and
-  # published, never an "already exists" error. Notes are this version's CHANGELOG block
-  # (scripts/changelog-section.py: exit 1 = no block, so a generic note; any other failure fails this
-  # job rather than ship a fallback). Latest follows npm: only a version published under the npm
-  # `latest` dist-tag (the publish job's own choice), and still not older than npm's latest when this
-  # job runs, becomes the page's Latest; a maintenance release (`release-X.Y`) never does. It does
-  # not wait for the lockfile job: both follow the publish.
-  github-release:
-    name: create or update the GitHub Release
+  # npm processes a publish asynchronously, so `publish` succeeding does not yet mean `npm install`
+  # resolves the version. The lockfile re-stamp and the GitHub Release draft both wait on this job,
+  # so neither acts on a version the registry does not serve yet. The packages awaited are the tag's
+  # own package.json optionalDependencies plus the main package (the same set publish stamps).
+  registry:
+    name: wait until the registry serves every package
     needs: publish
     if: startsWith(github.ref, 'refs/tags/core-ts-v')
     runs-on: ubuntu-latest
-    permissions:
-      contents: write # create/edit this tag's Release (the workflow default stays read; lockfile has its own grant)
+    defaults:
+      run:
+        working-directory: crates/wicked-core-ts
     steps:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
 
-      - name: Create or update the GitHub Release from CHANGELOG
+      - name: Wait until the registry serves every package (up to 15 min)
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#core-ts-v}"
+          # `--prefer-online`: the registry serves packuments with `cache-control: max-age=300`, so
+          # without it a 30 s poll can keep re-reading the stale, pre-publish packument from npm's
+          # local cache for five minutes after the registry has caught up.
+          # `timeout 60` on every lookup: npm's own fetch timeout is 5 min with retries, so an
+          # unbounded `npm view` could outlive the deadline below (Copilot on #427).
+          #
+          # The platform packages are whatever package.json's optionalDependencies declare — the
+          # same entries the publish job stamps — so a new target cannot be left un-awaited here
+          # (Copilot on #427).
+          packages="wicked-core-ts $(node -p "Object.keys(require('./package.json').optionalDependencies).join(' ')")"
+          count="$(echo "$packages" | wc -w | tr -d ' ')"
+          echo "  awaiting ${count} packages:${packages}"
+          started="$(date +%s)"
+          deadline=$(( started + 15 * 60 ))
+          attempt=0
+          while :; do
+            attempt=$(( attempt + 1 ))
+            missing=""
+            for pkg in $packages; do
+              if served="$(timeout 60 npm view --prefer-online "${pkg}@${VERSION}" version 2>/dev/null)" \
+                 && [ "$served" = "$VERSION" ]; then
+                continue
+              fi
+              missing="${missing} ${pkg}"
+            done
+            if [ -z "$missing" ]; then
+              echo "  ok — all ${count} packages resolve at ${VERSION} after $(( $(date +%s) - started ))s (attempt ${attempt})"
+              break
+            fi
+            now="$(date +%s)"
+            if [ "$now" -ge "$deadline" ]; then
+              echo "::error::the registry still does not serve${missing} at ${VERSION} after 15 minutes. The publish job succeeded, so this is npm's asynchronous processing, not a publish failure — re-run failed jobs (this one and the jobs after it), never the publish job (a second publish fails with EPUBLISHCONFLICT)."
+              exit 1
+            fi
+            echo "  not yet:${missing} — attempt ${attempt}, $(( now - started ))s elapsed of 15 min; next check in 30s"
+            sleep 30
+          done
+
+  # ── a DRAFT GitHub Release for the tag (core#1552) ─────────────────────────────────────────────
+  #
+  # npm shipped every core-ts version but nothing made a GitHub Release, so the Releases page sat at a
+  # hand-made 0.7.29. This job drafts the tag's Release with its CHANGELOG block as notes, once npm
+  # serves all six packages (`needs: registry`). It is only ever a DRAFT and never sets Latest: a
+  # release is advertised only after JOURNEY CERTIFIED, when the operator/coord publishes the draft
+  # (and sets Latest) by hand. Idempotent: an existing Release for the tag, draft or published, is
+  # left alone. Notes: scripts/changelog-section.py (exit 1 = no block, so a generic note; any other
+  # failure fails this job rather than draft fallback notes).
+  github-release:
+    name: draft the GitHub Release (published after certification)
+    needs: registry
+    if: startsWith(github.ref, 'refs/tags/core-ts-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create this tag's draft Release (the workflow default stays read; lockfile has its own grant)
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Draft the GitHub Release from CHANGELOG
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-          DIST_TAG: ${{ needs.publish.outputs.dist_tag }}
         run: |
           set -euo pipefail
           VERSION="${TAG#core-ts-v}"
-          case "$DIST_TAG" in
-            latest) latest=true ;;
-            release-*) latest=false ;;
-            *) echo "::error::the publish job reported no npm dist-tag ('$DIST_TAG'); refusing to guess Latest"; exit 1 ;;
-          esac
-          # A late run (a retried or delayed job) must not take Latest back from a newer version that
-          # has published since: npm's current latest decides, and a failed lookup fails the job.
-          if [ "$latest" = true ]; then
-            NPM_LATEST="$(npm view wicked-core-ts dist-tags.latest)"
-            if [ -z "$NPM_LATEST" ]; then
-              echo "::error::npm reported no dist-tags.latest for wicked-core-ts; refusing to guess Latest"; exit 1
-            fi
-            if [ "$NPM_LATEST" != "$VERSION" ] && [ "$(printf '%s\n%s\n' "$VERSION" "$NPM_LATEST" | sort -V | tail -n1)" != "$VERSION" ]; then
-              latest=false
-              echo "npm latest is now ${NPM_LATEST}, newer than ${VERSION}: this Release does not take Latest"
-            fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "a GitHub Release for $TAG already exists (draft or published); left as it is"
+            exit 0
           fi
           set +e
           python3 scripts/changelog-section.py "$TAG" > "$RUNNER_TEMP/relnotes.md"
@@ -409,22 +446,14 @@ jobs:
           set -e
           if [ "$code" -eq 1 ]; then
             printf 'wicked-core-ts %s\n' "$VERSION" > "$RUNNER_TEMP/relnotes.md"
-            echo "::warning::CHANGELOG.md has no block for core-ts ${VERSION}; the Release gets a generic note"
+            echo "::warning::CHANGELOG.md has no block for core-ts ${VERSION}; the draft gets a generic note"
           elif [ "$code" -ne 0 ]; then
-            echo "::error::changelog-section.py failed (exit $code); refusing to publish a Release with fallback notes"
+            echo "::error::changelog-section.py failed (exit $code); refusing to draft a Release with fallback notes"
             exit "$code"
           fi
-          echo "core-ts ${VERSION}: npm dist-tag ${DIST_TAG}, latest=${latest}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            # A hand-made draft or prerelease is published as the stable Release it now is.
-            gh release edit "$TAG" --title "wicked-core-ts ${VERSION}" --notes-file "$RUNNER_TEMP/relnotes.md" \
-              --draft=false --prerelease=false --latest="$latest"
-            echo "updated the existing GitHub Release $TAG"
-          else
-            gh release create "$TAG" --verify-tag --title "wicked-core-ts ${VERSION}" \
-              --notes-file "$RUNNER_TEMP/relnotes.md" --latest="$latest"
-            echo "created the GitHub Release $TAG"
-          fi
+          gh release create "$TAG" --draft --verify-tag --title "wicked-core-ts ${VERSION}" \
+            --notes-file "$RUNNER_TEMP/relnotes.md"
+          echo "drafted the GitHub Release $TAG; it is published (and Latest set) after JOURNEY CERTIFIED"
 
   # ── re-stamp main's lockfile against the packages that now exist on npm (#422) ───────────────────
   #
@@ -445,7 +474,7 @@ jobs:
   # #514), regenerates the lockfile on `main`, and opens a lockfile-only PR. It never pushes to main.
   lockfile:
     name: re-stamp main's lockfile (opens a PR)
-    needs: publish
+    needs: registry # publish, then npm serving all six packages
     if: startsWith(github.ref, 'refs/tags/core-ts-v')
     runs-on: ubuntu-latest
     # `contents: write` pushes the `chore/core-ts-<ver>-lockfile` branch; `pull-requests: write`
@@ -497,51 +526,6 @@ jobs:
             echo "restamp=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Wait until the registry serves every package (up to 15 min)
-        if: steps.version.outputs.restamp == 'true'
-        shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-        run: |
-          set -euo pipefail
-          # `--prefer-online`: the registry serves packuments with `cache-control: max-age=300`, so
-          # without it a 30 s poll can keep re-reading the stale, pre-publish packument from npm's
-          # local cache for five minutes after the registry has caught up.
-          # `timeout 60` on every lookup: npm's own fetch timeout is 5 min with retries, so an
-          # unbounded `npm view` could outlive the deadline below (Copilot on #427).
-          #
-          # The platform packages are whatever package.json's optionalDependencies declare — the
-          # same entries the publish job stamps — so a new target cannot be left un-awaited here
-          # (Copilot on #427).
-          packages="wicked-core-ts $(node -p "Object.keys(require('./package.json').optionalDependencies).join(' ')")"
-          count="$(echo "$packages" | wc -w | tr -d ' ')"
-          echo "  awaiting ${count} packages:${packages}"
-          started="$(date +%s)"
-          deadline=$(( started + 15 * 60 ))
-          attempt=0
-          while :; do
-            attempt=$(( attempt + 1 ))
-            missing=""
-            for pkg in $packages; do
-              if served="$(timeout 60 npm view --prefer-online "${pkg}@${VERSION}" version 2>/dev/null)" \
-                 && [ "$served" = "$VERSION" ]; then
-                continue
-              fi
-              missing="${missing} ${pkg}"
-            done
-            if [ -z "$missing" ]; then
-              echo "  ok — all ${count} packages resolve at ${VERSION} after $(( $(date +%s) - started ))s (attempt ${attempt})"
-              break
-            fi
-            now="$(date +%s)"
-            if [ "$now" -ge "$deadline" ]; then
-              echo "::error::the registry still does not serve${missing} at ${VERSION} after 15 minutes. The publish job succeeded, so this is npm's asynchronous processing, not a publish failure — re-run ONLY this job (Re-run failed jobs), never the publish job (a second publish fails with EPUBLISHCONFLICT)."
-              exit 1
-            fi
-            echo "  not yet:${missing} — attempt ${attempt}, $(( now - started ))s elapsed of 15 min; next check in 30s"
-            sleep 30
-          done
-
       - name: Regenerate the lockfile against the published packages
         id: lockfile
         if: steps.version.outputs.restamp == 'true'
@@ -550,7 +534,7 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
-          # The wait above can last 15 minutes; re-base on the current main and re-check the manifest
+          # The registry job's wait can last 15 minutes; re-base on the current main and re-check the manifest
           # so the re-stamp cannot pair a newer package.json with this release's entries (Copilot on
           # #427).
           git fetch -q origin main
