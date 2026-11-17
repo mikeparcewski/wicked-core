@@ -12289,19 +12289,13 @@ fn dispatch_unit_with(
                 .cloned()
                 .collect();
         }
-        // (core#1493) …and the person's skips at its other gates, carried while the change has no
-        // hunk a skip was not given on (`rule_check::CheckInput::carried`).
+        // (core#1493) …and the person's skips at its other gates, carried on the same carry key
+        // (`rule_check::CheckInput::carried`) and only while the person's words have not moved
+        // since the skip (`rulings_revision`).
         if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
             let all = crate::domain::session_units(&*store, run_id)?;
-            stamped.rule_carried_skips = all
-                .iter()
-                .filter(|u| u.ord != unit.ord)
-                .flat_map(|u| u.rule_skips.iter())
-                .filter(|s| {
-                    s.carry_key.is_some() && !skip_withdrawn(s, &all, &session.intent_amendments)
-                })
-                .cloned()
-                .collect();
+            stamped.rule_carried_skips =
+                carried_skips(&session.problem, &session.intent_amendments, &all, unit.ord);
         }
         // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
         // (F19/F1, operator Q1=B) Their gate rulings ride along, so a ruling reaches the judge and
@@ -15780,28 +15774,39 @@ const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
 const RULING_SHOWN_MAX: usize = 2 * 1024;
 const RULINGS_SHOWN_MAX: usize = 6 * 1024;
 
-/// (core#1493, coord codex-check on #1516) A person's skip of rule R is withdrawn, and no longer
-/// carried, once the person gives a NEWER ruling (an amend, request-changes or land note, the
-/// rulings a rule judge reads) that names R: "enforce R" on unchanged code puts R back before a
-/// judge. So does a newer approved intent amendment that names R (codex on #1516). The skip's own
-/// time (`at`) is the revision it was given at.
-pub(crate) fn skip_withdrawn(
-    skip: &crate::rule_check::RuleSkip,
-    units: &[crate::domain::WorkUnit],
+/// (core#1493, coord codex-check on #1516) The revision of the person's words a rule judge reads
+/// ([`rule_instructions_words`]: their gate rulings, the problem, every approved amendment): a
+/// digest of exactly that text. A skip records it when given ([`crate::rule_check::RuleSkip::
+/// rulings_rev`]) and is carried to a later step only while it has not moved: any newer ruling or
+/// amendment ("enforce R", or anything else the person says) puts every carried skip back before
+/// a judge. No phrase is matched; one function produces the words and their revision.
+pub(crate) fn rulings_revision(
+    problem: &str,
     amendments: &[crate::domain::IntentAmendment],
-) -> bool {
-    let id = skip.rule_id.to_ascii_lowercase();
-    let names = |t: &str| t.to_ascii_lowercase().contains(&id);
+    units: &[crate::domain::WorkUnit],
+) -> String {
+    use sha2::Digest;
+    let words = rule_instructions_words(problem, amendments, units);
+    format!("{:x}", sha2::Sha256::digest(words.as_bytes()))
+}
+
+/// (core#1493) The person's skips at the run's OTHER gates that the rule check of the unit at `ord`
+/// may carry: each recorded with a carry key and at the person's current [`rulings_revision`].
+/// The check carries one only on an equal carry key (`rule_check::CheckInput::carried`).
+pub(crate) fn carried_skips(
+    problem: &str,
+    amendments: &[crate::domain::IntentAmendment],
+    units: &[crate::domain::WorkUnit],
+    ord: u32,
+) -> Vec<crate::rule_check::RuleSkip> {
+    let rev = rulings_revision(problem, amendments, units);
     units
         .iter()
-        .flat_map(|u| u.operator_rulings.iter())
-        .any(|r| {
-            r.at > skip.at
-                && RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str())
-                && names(&r.text)
-        })
-        // (codex on #1516) …or a newer intent amendment naming it.
-        || amendments.iter().any(|a| a.at > skip.at && names(&a.text))
+        .filter(|u| u.ord != ord)
+        .flat_map(|u| u.rule_skips.iter())
+        .filter(|s| s.carry_key.is_some() && s.rulings_rev.as_deref() == Some(rev.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// (DES-RULE-CHECK-001 addendum F19/F1, operator Q1=B) The person's words a rule judge reads,
@@ -18493,6 +18498,7 @@ fn rules_recheck_request(
         .unwrap_or("operator")
         .to_string();
     let at = crate::interaction::now_millis();
+    let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
     let mut landed = Vec::new();
     for (id, reason) in skips {
         if reason.trim().is_empty() {
@@ -18533,13 +18539,16 @@ fn rules_recheck_request(
             evidence_key,
             instruction: (row.status == crate::rule_check::RuleStatus::Waived)
                 .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
-            // (core#1493) The hunks it was given on, so the run's later steps carry it.
+            // (core#1493) The carry key of the check it answered, so the run's later steps carry
+            // it on the same evidence…
             carry_key: cursor
                 .rule_check
                 .as_ref()
                 .and_then(|r| r.carry_keys.get(id))
                 .cloned(),
             ord: Some(cursor.ord),
+            // …while the person's words stay at this revision.
+            rulings_rev: Some(rulings_rev.clone()),
         });
     }
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
@@ -39982,15 +39991,21 @@ mod council_ballot_tests {
 }
 
 #[cfg(test)]
-mod skip_withdrawn_tests {
+mod carried_skip_tests {
     use super::*;
 
-    /// (coord codex-check on #1516) skip R → a newer ruling "enforce R" → unchanged code: R is no
-    /// longer carried (it is judged). An older ruling, one naming another rule, or a skip action
-    /// does not withdraw it.
+    /// (coord codex-check on #1516) The attacker's order, SILENT-OK/KEY: skip R at unit 3, then the
+    /// person rules "enforce R" (or says anything new), code unchanged: the skip is no longer
+    /// carried, so R goes back before a judge (an uncarried skip is judged: core_1493_* in
+    /// rule_check_tests). No phrase is matched: a ruling that never names R moves it too.
     #[test]
-    fn a_newer_ruling_naming_the_rule_withdraws_its_carried_skip() {
-        let skip = crate::rule_check::RuleSkip {
+    fn a_newer_ruling_stops_a_carried_skip() {
+        let problem = "add max(xs)";
+        let mut u3 = crate::domain::WorkUnit::pending("r:u3", "r", 3, "w");
+        let u5 = crate::domain::WorkUnit::pending("r:u5", "r", 5, "w");
+        let mut units = vec![u3.clone(), u5.clone()];
+        // The skip, as `rules_recheck_request` records it: at the revision of that moment.
+        u3.rule_skips.push(crate::rule_check::RuleSkip {
             rule_id: "POL-7".into(),
             reason: "fine here".into(),
             by: "operator".into(),
@@ -40000,40 +40015,57 @@ mod skip_withdrawn_tests {
             instruction: None,
             carry_key: Some("ck".into()),
             ord: Some(3),
+            rulings_rev: Some(rulings_revision(problem, &[], &units)),
+        });
+        units[0] = u3.clone();
+        let ids = |v: Vec<crate::rule_check::RuleSkip>| -> Vec<String> {
+            v.into_iter().map(|s| s.rule_id).collect()
         };
-        let ruled = |action: &str, text: &str, at: i64| {
-            let mut u = crate::domain::WorkUnit::pending("r:u4", "r", 4, "w");
-            u.operator_rulings.push(crate::domain::OperatorRuling {
+        assert_eq!(ids(carried_skips(problem, &[], &units, 5)), vec!["POL-7"]);
+        assert!(
+            carried_skips(problem, &[], &units, 3).is_empty(),
+            "not onto its own gate"
+        );
+        let ruled = |action: &str, text: &str| {
+            let mut v = units.clone();
+            v[1].operator_rulings.push(crate::domain::OperatorRuling {
                 action: action.into(),
                 text: text.into(),
                 attempt: 1,
-                at,
+                at: 20,
             });
-            vec![u]
+            v
         };
-        let none: &[crate::domain::IntentAmendment] = &[];
-        let w = |units: &[crate::domain::WorkUnit]| skip_withdrawn(&skip, units, none);
-        assert!(w(&ruled("amend", "enforce pol-7 after all", 20)));
-        assert!(w(&ruled("request_changes", "POL-7 applies", 11)));
-        assert!(!w(&ruled("amend", "enforce POL-7", 5)), "older");
-        assert!(!w(&ruled("amend", "enforce POL-8", 20)), "another rule");
-        assert!(!w(&ruled("skip_rules", "POL-7 again", 20)), "not a ruling");
-        assert!(!w(&[]));
-        // (codex on #1516) A newer intent amendment naming the rule withdraws it too; an older
-        // one, or one naming another rule, does not.
-        let amend = |text: &str, at: i64| {
-            vec![crate::domain::IntentAmendment {
-                text: text.into(),
-                ord: 5,
-                at,
-            }]
-        };
-        assert!(skip_withdrawn(
-            &skip,
-            &[],
-            &amend("Enforce POL-7 after all", 30)
-        ));
-        assert!(!skip_withdrawn(&skip, &[], &amend("Enforce POL-7", 5)));
-        assert!(!skip_withdrawn(&skip, &[], &amend("Enforce POL-8", 30)));
+        for (action, text) in [
+            ("amend", "enforce POL-7 after all"),
+            ("request_changes", "check the auth rules again"),
+            ("land", "ship it"),
+        ] {
+            assert!(
+                carried_skips(problem, &[], &ruled(action, text), 5).is_empty(),
+                "{action}: {text}"
+            );
+        }
+        // A newer approved amendment moves it too.
+        let amended = [crate::domain::IntentAmendment {
+            text: "Enforce the security rules".into(),
+            ord: 5,
+            at: 30,
+        }];
+        assert!(carried_skips(problem, &amended, &units, 5).is_empty());
+        // A gate action that is not the person's instruction (a skip of another rule) does not.
+        assert_eq!(
+            ids(carried_skips(
+                problem,
+                &[],
+                &ruled("skip_rules", "POL-8 n/a"),
+                5
+            )),
+            vec!["POL-7"]
+        );
+        // A skip recorded before the revision existed is never carried.
+        let mut legacy = units.clone();
+        legacy[0].rule_skips[0].rulings_rev = None;
+        assert!(carried_skips(problem, &[], &legacy, 5).is_empty());
     }
 }

@@ -801,6 +801,7 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
         instruction: None,
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     };
     let deferred = vec!["learn-linked-issue".to_string(), "retired-rule".to_string()];
     let held =
@@ -1032,6 +1033,7 @@ fn an_operator_ruling_reaches_the_judge_re_judges_the_cache_and_waives_only_on_c
         instruction: Some(waived.cite.clone().unwrap_or_else(|| waived.reason.clone())),
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     }];
     let confirmed = judge_with(&input, &judge);
     let row = r2(&confirmed);
@@ -1487,6 +1489,7 @@ fn confirm(input: &mut StepInput, report: &crate::rule_check::RuleCheckReport, i
         instruction: w.cite.clone(),
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     }];
 }
 
@@ -2467,6 +2470,7 @@ fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
         instruction: None,
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     }];
     let again = judge(&input, None);
     let row = again.rows.iter().find(|r| r.rule_id == "R2").unwrap();

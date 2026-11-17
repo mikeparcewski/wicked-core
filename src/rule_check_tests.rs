@@ -570,6 +570,7 @@ fn skip_of(row: &RuleVerdict, reason: &str) -> RuleSkip {
         instruction: None,
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     }
 }
 
@@ -1506,6 +1507,7 @@ fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
         instruction: row.cite.clone(),
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     };
     let r = run_told(&[rule], &judge, &[skip], Some(&first));
     assert_eq!(r.rows[0].status, RuleStatus::Skipped);
@@ -2791,6 +2793,7 @@ fn a_changed_record_re_judges_and_an_old_skip_no_longer_applies() {
         instruction: None,
         carry_key: None,
         ord: None,
+        rulings_rev: None,
     };
     let skips = [skip];
     let same = run_packs(

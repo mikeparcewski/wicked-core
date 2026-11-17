@@ -356,6 +356,12 @@ pub struct RuleSkip {
     /// (core#1493) The unit it was given at, named when a later step carries it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ord: Option<u32>,
+    /// (core#1493, coord codex-check on #1516) The revision of the person's words when it was
+    /// given (`actor::rulings_revision`): a later step carries it only while that has not moved,
+    /// so a newer ruling ("enforce R") puts R back before a judge. Absent on a skip recorded
+    /// before this field: never carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rulings_rev: Option<String>,
 }
 
 /// One attempt's rule check: every in-force rule's row, plus how the check ran.
@@ -3358,8 +3364,9 @@ pub fn check(
             continue;
         }
         // (core#1493) …or the person's skip at an earlier step of the run, carried: the same rule
-        // content on exactly the same change (every hunk the skip was given on, and no other: a
-        // hunk removed since may have been the reason for the skip). A waiver's confirmation is not
+        // content on the same carry key (the change's exact bytes, the floor's result, the match
+        // facts and the rule's own match), given while the person's words were what they are now
+        // (the caller filters on `RuleSkip::rulings_rev`). A waiver's confirmation is not
         // carried: it answers the instruction it quoted. Only a rule judged on the change alone
         // carries: a process rule, or one with a step-record clause (POL-2101), reads evidence a
         // later step adds, which the person never saw (codex on #1516).
