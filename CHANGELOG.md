@@ -3091,8 +3091,8 @@ Two release tracks share this file, newest entry first regardless of track:
     Apps publish consent is listed from the QE record's tree, so after the worktree changes since QE the list can offer
     an approve that answering refuses (core#1534). Studio's gate contract (studio#1172, #1178) reads it.
   - **Reviews and judging:** a reviewer's FAIL is never a worker error or a failover (#1519); the rule judge reads a
-    big change in up to eight parts (#1514; beyond that the report is marked cut, and only a BROKEN verdict counts on
-    the unread part); the rule judge and a seat re-probe run under their own wall
+    big change in up to eight parts (#1514; if any part remains unread, only BROKEN verdicts from the shown parts count
+    and other results stay unchecked); the rule judge and a seat re-probe run under their own wall
     budget (#1511); a person's rule skip carries to later steps while the hunks are unchanged (#1516).
   - **Seats and floors:** seat egress is open by default, and an invalid `WICKED_SEAT_EGRESS_HOSTS` fails closed
     (#1487); a sign-in refusal is judged in the CLI's own frame and a sign-in bench is re-probed (#1510); a seat pod
