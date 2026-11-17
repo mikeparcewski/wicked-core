@@ -165,27 +165,6 @@ pub(crate) fn observed_for(receipts: &[LaunchReceipt], seat: &str) -> Observed {
     out
 }
 
-/// Whether a judge's verdict stands against what the work was observed calling: a judge seen
-/// calling a provider the work was seen calling is not independent of it, and the reason is
-/// returned. A KNOWN shared provider is proof even when other turns went unobserved; with no
-/// shared provider seen nothing is proven here (`None`) and the caller's own rules decide —
-/// nothing is ever re-admitted on an incomplete observation ([`Observed::known`]).
-pub(crate) fn same_provider(judge: &Observed, work: &Observed) -> Option<String> {
-    let shared: Vec<&str> = judge
-        .providers
-        .iter()
-        .filter(|p| work.providers.contains(p))
-        .map(String::as_str)
-        .collect();
-    (!shared.is_empty()).then(|| {
-        format!(
-            "the judge called the same provider as the work it judged ({}), as the seat gateway \
-             recorded both: its approval is not independent and is discarded",
-            shared.join(", ")
-        )
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,23 +239,25 @@ mod tests {
         let m = observed_for(&mixed, "codex");
         assert_eq!(m.providers, vec!["a".to_string()]);
         assert!(!m.complete && m.known().is_none());
-        let seen = |p: &[&str], complete: bool| Observed {
-            providers: p.iter().map(|s| s.to_string()).collect(),
-            complete,
+        // The judge's search: an approval from a seat seen calling the work's provider is not
+        // independent; another provider, or an unobserved launch, proves nothing against it.
+        let work = Observed {
+            providers: vec!["chatgpt.com:443".into()],
+            complete: true,
         };
-        assert!(same_provider(&seen(&["a"], true), &seen(&["a"], true))
-            .is_some_and(|w| w.contains("same provider")));
+        let _judging = JudgingWork::of(&work);
+        take_receipts();
+        record_receipt("pi", Some(vec!["chatgpt.com:443".into()]));
+        record_receipt("claude", Some(vec!["api.anthropic.com:443".into()]));
+        record_receipt("agy", None);
+        assert!(!approval_is_independent("pi"));
+        assert!(approval_is_independent("claude"));
+        assert!(approval_is_independent("agy"));
+        drop(_judging);
         assert!(
-            same_provider(&seen(&["a"], true), &m).is_some(),
-            "proof despite a gap"
+            approval_is_independent("pi"),
+            "outside a search nothing is avoided"
         );
-        assert_eq!(
-            same_provider(&seen(&["a"], true), &seen(&["c"], true)),
-            None
-        );
-        assert_eq!(
-            same_provider(&Observed::default(), &seen(&["c"], true)),
-            None
-        );
+        take_receipts();
     }
 }

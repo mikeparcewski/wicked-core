@@ -1999,6 +1999,16 @@ impl AgentVerdict {
                 judge_fallback: None,
             };
         }
+        if let Some(ni) = e.downcast_ref::<NoIndependentJudge>() {
+            return AgentVerdict {
+                pass: false,
+                reasoning: format!("{who} could not be judged independently — {ni}"),
+                judge_cli: None,
+                judge_distinct: None,
+                seat_failure: Some(ni.summary()),
+                judge_fallback: None,
+            };
+        }
         match e.downcast_ref::<JudgeUnavailable>() {
             Some(u) => AgentVerdict {
                 pass: false,
@@ -2019,6 +2029,39 @@ impl AgentVerdict {
         }
     }
 }
+
+/// (core#1543, coord codex-check 2 on #1547) The search for an INDEPENDENT judge ran out: every
+/// seat that answered approved while seen calling the provider the judged work called (`seats`),
+/// and every other seat refused as a seat (`refusals`). No independent verdict exists — the caller
+/// tries the fallback seats the search did not walk ([`crate::cli_runner`]'s ladder), then holds
+/// as a seat failure, never as a REJECT and never on a same-provider approval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NoIndependentJudge {
+    pub(crate) seats: Vec<String>,
+    pub(crate) refusals: Vec<String>,
+}
+
+impl NoIndependentJudge {
+    pub(crate) fn summary(&self) -> String {
+        let mut s = format!(
+            "no judge independent of the work: {} approved while calling the provider the work \
+             called",
+            self.seats.join(", ")
+        );
+        if !self.refusals.is_empty() {
+            s.push_str(&format!("; {}", self.refusals.join("; ")));
+        }
+        s
+    }
+}
+
+impl std::fmt::Display for NoIndependentJudge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary())
+    }
+}
+
+impl std::error::Error for NoIndependentJudge {}
 
 /// (core#772) The agent judge could not run: every eligible identity-distinct seat failed AS A
 /// SEAT (`refusals` names each one with its cause), so no verdict exists. Raised by
@@ -2556,12 +2599,12 @@ fn agent_validate_in(
     // moves on. The rule against verdict-shopping stands: a seat that said ANYTHING of its own
     // ends the rotation.
     let mut refusals: Vec<String> = Vec::new();
-    // (core#1543, coord codex-check on #1547) The seats not known to call the judged work's
-    // provider go first (a stable re-order: roster order otherwise), and an APPROVAL from a seat
-    // seen calling it is not independent: the rotation moves on to the next seat. Only when every
-    // seat that answered approved on the work's own provider is that approval returned — the
-    // caller then discards it and the gate holds.
-    let mut not_independent: Option<AgentVerdict> = None;
+    // (core#1543, coord codex-checks on #1547) THE search for an independent judge: the seats not
+    // known to call the judged work's provider go first (a stable re-order: roster order
+    // otherwise), and an APPROVAL from a seat seen calling it is not independent — the search moves
+    // on to the next seat and never ends on it. When it runs out it says so
+    // ([`NoIndependentJudge`]); the fallback ladder runs this same search over its own seats.
+    let mut not_independent: Vec<String> = Vec::new();
     let mut seats: Vec<&AgenticCli> = eligible_agent_seats(excluded_seats, roster);
     seats.sort_by_key(|c| crate::observed_provider::known_to_share(&c.key));
     for seat in seats {
@@ -2595,7 +2638,7 @@ fn agent_validate_in(
                          provider: not independent — trying the next seat (core#1543)",
                         seat.key
                     );
-                    not_independent.get_or_insert(verdict);
+                    not_independent.push(seat.key.clone());
                     continue;
                 }
                 return Ok(verdict);
@@ -2632,10 +2675,14 @@ fn agent_validate_in(
             }
         }
     }
-    // (core#1543) Every seat that answered approved on the work's own provider: that approval goes
-    // back to the caller, which discards it and holds the gate (no independent judge was left).
-    if let Some(v) = not_independent {
-        return Ok(v);
+    // (core#1543) The search ran out with only same-provider approvals (and seat refusals): no
+    // independent judge among these seats.
+    if !not_independent.is_empty() {
+        return Err(NoIndependentJudge {
+            seats: not_independent,
+            refusals,
+        }
+        .into());
     }
     // Every eligible seat refused to run. Fail CLOSED, naming each one — the operator needs to know
     // this was an environment problem, not a rejected verdict. Typed (core#772) so the caller
