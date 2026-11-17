@@ -11993,6 +11993,19 @@ fn dispatch_unit_with(
     // (the fallback judge) Whether this unit was dispatched before THIS dispatch, read before the
     // stamp below: a Creator unit with no recorded binary then has an unrecorded author.
     let previously_dispatched = unit.last_attempt.is_some();
+    // (core#1543) An earlier dispatch whose observation never folded (a worker that died), or a
+    // history from before the record: that launch's providers are unknown.
+    if unit.tool_cmd.is_none()
+        && (unit.observation_pending
+            || (previously_dispatched
+                && unit.observed_providers.is_empty()
+                && !unit.providers_unobserved))
+    {
+        unit.providers_unobserved = true;
+    }
+    if unit.tool_cmd.is_none() {
+        unit.observation_pending = true;
+    }
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
@@ -13511,6 +13524,8 @@ fn dispatch_unit_with(
                 // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
                 // here so the fold persists it on the unit and names the floor on the gate.
                 evidence: Box::new(crate::workflow::UnitEvidence {
+                    // A Tool unit launches no seat: nothing to observe.
+                    observed_providers: None,
                     worktree_guard: None,
                     repo_checks: lift_checks,
                     verified_tree: lift_verified_tree,

@@ -612,6 +612,8 @@ pub fn retract_unproductive_author(
     if unchanged {
         unit.authored_by.retain(|s| s != seat);
         unit.authored_binaries = probe.binaries_before;
+        // (core#1543) An attempt that produced nothing called nothing that matters.
+        unit.observation_pending = false;
     }
     true
 }
@@ -1304,6 +1306,19 @@ pub struct WorkUnit {
     /// whose binaries cannot be established, and no fallback judge is seated for its work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authored_binaries: Vec<String>,
+    /// (core#1543) Every provider this unit's folded launches were OBSERVED calling at the seat
+    /// gateway (the union over its attempts), what a re-admitted judge must not share.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub observed_providers: Vec<String>,
+    /// (core#1543) Some launch of this unit was not observed (the host floor, an unread log, a
+    /// worker that died before its fold, a floor fix, a history from before the record): its
+    /// providers are unknown, so nothing is re-admitted on this unit's work.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub providers_unobserved: bool,
+    /// (core#1543) A dispatch whose observation has not been folded yet: still set at the next
+    /// dispatch, that launch's providers are unknown.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observation_pending: bool,
     /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
     /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
     /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
@@ -1902,6 +1917,9 @@ impl WorkUnit {
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
+            observed_providers: Vec::new(),
+            providers_unobserved: false,
+            observation_pending: false,
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,

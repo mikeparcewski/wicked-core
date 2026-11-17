@@ -205,6 +205,11 @@ pub(super) fn after_pass(
                 u.authored_by.clear();
                 u.authored_binaries.clear();
                 u.author_probe = None;
+                // (core#1543) …and so are the providers the previous page's launches called: a
+                // fresh page's judge is compared with this page's work only (codex on the re-land).
+                // A launch whose observation never folded still leaves this page incomplete.
+                u.observed_providers.clear();
+                u.providers_unobserved = u.observation_pending;
                 u.review_rounds.clear();
                 u.operator_rulings.clear();
                 u.floor_auto_retries = 0;

@@ -4088,6 +4088,109 @@ impl<'a> CreatorIds<'a> {
 /// [`crate::assurance::JudgeFallback`] (no preferred seat — there was none), `judgeDistinct: false`,
 /// and named in the run's live output. A verdict no seat rendered, or one a fallback seat already
 /// labels, passes through.
+/// Whether `seat` is the pinned validator's author seat (an instance of it included).
+fn is_validator_author(seat: &str) -> bool {
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    seat == v || crate::team::runner::seat_key(seat) == v
+}
+
+/// (crew#972 decision 2, core#1543) GAP B keeps the agent judge distinct from the pinned
+/// validator's author "when the roster allows". With only Claude Code and Codex signed in it never
+/// allowed for a unit codex ran (codex's own Test or Review step, or codex's build): no judge was
+/// left, and every such gate held for the person. When no judge distinct from `excluded` remains
+/// (creators of reviewed work counted as eligible — they are the core#954 fallback's to decide),
+/// the validator author is dropped from `excluded` if that leaves one, and the reason returned.
+/// Never when it is this unit's own author by key (its seat, a recorded author, a launch
+/// exclusion), and never when this unit's own launch was not OBSERVED (`work_observed`): the
+/// verdict is then verified against the provider each launch was observed calling
+/// ([`crate::observed_provider`]), never against what a name predicts.
+fn readmit_validator_author(
+    excluded: &mut Vec<&str>,
+    unit: &crate::domain::WorkUnit,
+    work_author: &str,
+    work_observed: Option<&[crate::observed_provider::Provider]>,
+    has_judge: &impl Fn(&[&str]) -> bool,
+) -> Option<String> {
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    work_observed?;
+    // (codex review on the re-land) This unit's own history must be the current launch's alone:
+    // an earlier attempt on another seat (or recorded running another binary) may have been the
+    // validator author under another name, and only the CURRENT launch was observed.
+    use crate::team::runner::seat_key;
+    let own = |k: &str| k == work_author || seat_key(k) == seat_key(work_author);
+    let own_binaries =
+        crate::cli_runner::launched_identities(work_author, unit.assigned_invocation.clone());
+    let history_is_this_launch = !unit.providers_unobserved
+        && unit.authored_by.iter().all(|k| own(k))
+        && unit
+            .authored_binaries
+            .iter()
+            .all(|b| own_binaries.contains(b));
+    if !excluded.contains(&v)
+        || !history_is_this_launch
+        || is_validator_author(work_author)
+        || unit
+            .authored_by
+            .iter()
+            .chain(&unit.exclude_seats)
+            .any(|k| is_validator_author(k))
+        || has_judge(excluded)
+    {
+        return None;
+    }
+    let without: Vec<&str> = excluded.iter().copied().filter(|k| *k != v).collect();
+    if !has_judge(&without) {
+        return None;
+    }
+    *excluded = without;
+    Some(format!(
+        "no eligible judge seat distinct from the work's author '{work_author}' and the pinned \
+         validator's author '{v}'"
+    ))
+}
+
+/// (crew#972 decision 2) A verdict rendered on a gate where the pinned validator's author was
+/// re-admitted, labelled on the gate, its receipt and the delivery receipt — whichever seat judged.
+/// A fallback label already there (the creator fallback) gains this reason too. `verified`: an
+/// approval that passed the observed-provider check; a denial says it stands unverified.
+fn disclose_validator_author_judge(
+    mut av: crate::validator::AgentVerdict,
+    validator_fallback: Option<&str>,
+    verified: bool,
+    emit_delta: &DeltaSink,
+) -> crate::validator::AgentVerdict {
+    let (Some(why), Some(seat)) = (validator_fallback, av.judge_cli.clone()) else {
+        return av;
+    };
+    let role = if is_validator_author(&seat) {
+        "also the pinned validator's author"
+    } else {
+        "the pinned validator's author was re-admitted"
+    };
+    let check = if verified {
+        "verified by observation: it called another provider than the work"
+    } else {
+        "a denial, which stands without that check"
+    };
+    let note = format!("{role}; {why}; {check}");
+    let fb = match av.judge_fallback.take() {
+        Some(mut fb) => {
+            fb.label = format!("{} ({note})", fb.label);
+            fb
+        }
+        None => crate::assurance::JudgeFallback {
+            label: format!("judge: {seat} ({note})"),
+            seat,
+            preferred: Vec::new(),
+            reason: why.to_string(),
+        },
+    };
+    engine_note(emit_delta, &fb.label);
+    eprintln!("wicked-core: {} (crew#972)", fb.label);
+    av.judge_fallback = Some(fb);
+    av
+}
+
 fn disclose_creator_judge(
     mut av: crate::validator::AgentVerdict,
     seat: Option<String>,
@@ -4584,7 +4687,12 @@ fn judge_error_or_fallback(
         note_refusals,
         emit_delta,
     );
-    held_with_fallback_failures(who, held, refusals, fb)
+    // The hold names the rotation's own same-provider approvals too, not only the ladder's.
+    let preferred_refusals = match &independent {
+        Some(ni) => vec![ni.summary()],
+        None => refusals,
+    };
+    held_with_fallback_failures(who, held, preferred_refusals, fb)
 }
 
 /// F-039 REPO CHECKS FLOOR — what a unit's floor runs on, owned, so it can run on its own thread
@@ -5217,6 +5325,17 @@ fn run_unit_and_judge_in<'scope, 'env>(
         &crate::observed_provider::take_receipts(),
         input.unit.assigned_cli.as_deref().unwrap_or("claude"),
     );
+    // …and every provider this unit's earlier folded launches were seen calling: a judge sharing
+    // any of them is not independent of the work either (codex confirmation on the re-land).
+    let work_history = {
+        let mut all = work_observed.clone();
+        for p in &input.unit.observed_providers {
+            if !all.providers.contains(p) {
+                all.providers.push(p.clone());
+            }
+        }
+        all
+    };
     let output = verdict_completes_the_turn(&input.unit, output, emit_delta);
     // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below), so
     // none of the floor's inputs below is computed for it.
@@ -5702,10 +5821,12 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
+    // (crew#972 decision 2, core#1543) Set when the pinned validator's author was re-admitted.
+    let mut validator_fallback: Option<String> = None;
     // (core#1543) The judge's search knows what the work called: an approval on that provider is
     // never independent (`validator::NoIndependentJudge`, the fallback ladder continues it).
     crate::observed_provider::take_receipts();
-    let _judging = crate::observed_provider::JudgingWork::of(&work_observed);
+    let _judging = crate::observed_provider::JudgingWork::of(&work_history);
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
         // early without a closure (closures cannot mutate `judge_skipped`).
@@ -5762,6 +5883,36 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 let configured = without_author_binaries(&eligible_configured, ex, &ids);
                 crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
             };
+            // (crew#972 decision 2, core#1543) The validator author's exclusion is the weakest:
+            // with no other judge left it is re-admitted — only when this unit's own launch was
+            // OBSERVED and it is none of the unit's own authors, and its verdict then stands only
+            // if its own launch is observed calling another provider (verified below).
+            let has_any_judge = |ex: &[&str]| {
+                let ids = author_identities(ex, roster);
+                let all = without_author_binaries(&eligible, ex, &ids);
+                let configured = without_author_binaries(&eligible_configured, ex, &ids);
+                crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
+            };
+            validator_fallback = readmit_validator_author(
+                &mut excluded,
+                &input.unit,
+                work_author,
+                work_observed.known(),
+                &has_any_judge,
+            );
+            if let Some(why) = &validator_fallback {
+                // Every approval on this gate from here on (claude, a seat that runs it under
+                // another key, a fallback seat the relaxation made reachable) proves independence
+                // by being observed: the search moves past any other approval.
+                _judging.require_observed();
+                engine_note(
+                    emit_delta,
+                    &format!(
+                        "agent validator: {why} — the pinned validator's author may judge it, \
+                         disclosed and verified by the provider each launch calls"
+                    ),
+                );
+            }
             // (crew#972) The monitors first, so a monitor is re-admitted before a creator is.
             monitor_fallback =
                 exclude_monitors(&mut excluded, &team_monitors, &creators, has_judge);
@@ -6195,6 +6346,13 @@ fn run_unit_and_judge_in<'scope, 'env>(
             emit_delta,
         )
     });
+    // (crew#972 decision 2) After a re-admission the search took an approval only from a judge
+    // observed, fully, calling another provider than the work's history; a denial stands
+    // unverified. Disclosed either way.
+    let agent_verdict = agent_verdict.map(|av| {
+        let verified = av.pass;
+        disclose_validator_author_judge(av, validator_fallback.as_deref(), verified, emit_delta)
+    });
     // F-039 REPO CHECKS FLOOR ([`FloorPlan`]). A floor on a clean checkout started right after the
     // seat's turn (`early_floor`) and is joined here; a floor in the live worktree runs here, LAST
     // (slowest, and its build artifacts must not colour the guard's comparison or the judge's
@@ -6358,6 +6516,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .map(|r| r.seat.clone())
         .collect();
     let evidence = crate::workflow::UnitEvidence {
+        observed_providers: work_observed.known().map(<[String]>::to_vec),
         worktree_guard,
         repo_checks,
         verified_tree,
@@ -9012,6 +9171,151 @@ mod tests {
         // Unobserved (either side): nothing proven here, today's rules stand.
         assert!(run(None, chatgpt.clone()).0.is_some());
         assert!(run(chatgpt, None).0.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (codex review on the re-land, KEY + SILENT-OK) The re-admission is never a route around
+    /// observation: (1) a seat that runs claude under another key, picked once claude's exclusion
+    /// lifted, has its UNOBSERVED approval discarded too; (2) a unit whose own history holds
+    /// another seat is never re-admitted on (only the current launch was observed).
+    #[test]
+    fn core_1543_a_readmission_never_admits_an_unobserved_approval_or_history() {
+        struct Gatewayed(std::collections::HashMap<&'static str, Option<Vec<String>>>);
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                crate::observed_provider::record_receipt(
+                    &seat,
+                    self.0.get(seat.as_str()).cloned().flatten(),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1543-re-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("codex".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        let chatgpt = Some(vec!["chatgpt.com:443".to_string()]);
+        // (1) `claude-alias` runs claude: listed first, it is the rotation's pick once claude's
+        // exclusion lifts, and its launch went unobserved.
+        let roster = vec![
+            seat("claude-alias", "claude -p {PROMPT}"),
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(Gatewayed(
+            [
+                ("codex", chatgpt.clone()),
+                ("claude-alias", None),
+                ("claude", None),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let (_o, v, _) =
+            run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+        // The search moves past it and runs out: the gate holds (a seat failure), never that
+        // approval.
+        let held = |v: Option<crate::validator::AgentVerdict>, what: &str| {
+            let v = v.unwrap_or_else(|| panic!("{what}: no verdict"));
+            assert!(!v.pass && v.judge_cli.is_none(), "{what}: {v:?}");
+            assert!(
+                v.seat_failure
+                    .as_deref()
+                    .is_some_and(|w| w.contains("no judge independent")),
+                "{what}: {v:?}"
+            );
+        };
+        held(
+            v,
+            "an unobserved approval after a re-admission never stands",
+        );
+        // (2) The unit's own history holds another seat: no re-admission at all.
+        let mut history = input.unit.clone();
+        history.authored_by = vec!["pi".into(), "codex".into()];
+        let judge_without_claude = |ex: &[&str]| !ex.contains(&"claude");
+        let mut ex = vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, "codex"];
+        assert!(readmit_validator_author(
+            &mut ex,
+            &history,
+            "codex",
+            Some(&["chatgpt.com:443".to_string()]),
+            &judge_without_claude,
+        )
+        .is_none());
+        // (codex confirmation) The same seat's earlier attempt went unobserved: no re-admission.
+        let mut gap = input.unit.clone();
+        gap.providers_unobserved = true;
+        let mut ex = vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, "codex"];
+        assert!(readmit_validator_author(
+            &mut ex,
+            &gap,
+            "codex",
+            Some(&["chatgpt.com:443".to_string()]),
+            &judge_without_claude,
+        )
+        .is_none());
+        // …and an earlier attempt seen calling Anthropic: claude, re-admitted on the current
+        // ChatGPT launch, is observed calling Anthropic — its approval is discarded.
+        let mut earlier = input.clone();
+        earlier.unit.observed_providers = vec!["api.anthropic.com:443".into()];
+        let runner: Arc<dyn StepRunner> = Arc::new(Gatewayed(
+            [
+                ("codex", chatgpt.clone()),
+                ("claude", Some(vec!["api.anthropic.com:443".to_string()])),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let two = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let (_o, v, _) =
+            run_unit_and_judge_with_roster(&runner, &earlier, None, noop, &two, &[], &[]);
+        held(v, "the unit's earlier provider counts");
+        // …while the same unit with only this launch in its history is re-admitted on.
+        let mut ex = vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, "codex"];
+        assert!(readmit_validator_author(
+            &mut ex,
+            &input.unit,
+            "codex",
+            Some(&["chatgpt.com:443".to_string()]),
+            &judge_without_claude,
+        )
+        .is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

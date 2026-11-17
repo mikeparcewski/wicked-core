@@ -2948,6 +2948,11 @@ mod tests {
 /// queue. Pre-main is single-threaded, so no test thread can emit before the override is set.
 /// The integration-test binaries each carry their own copy of this block (enforced by
 /// `tests/harness_hygiene.rs`); this one covers the inline `#[cfg(test)]` modules.
+// macOS and Linux only: the verify gate's repo-checks floor has no OS write boundary on Windows,
+// where a code-verifying phase fails closed by design (see the module).
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod two_seat_e2e_tests;
+
 #[cfg(test)]
 mod test_harness_hygiene {
     /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets process env vars

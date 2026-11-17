@@ -2044,8 +2044,8 @@ pub(crate) struct NoIndependentJudge {
 impl NoIndependentJudge {
     pub(crate) fn summary(&self) -> String {
         let mut s = format!(
-            "no judge independent of the work: {} approved while calling the provider the work \
-             called",
+            "no judge independent of the work: {} approved without being observed calling only \
+             another provider than the work's",
             self.seats.join(", ")
         );
         if !self.refusals.is_empty() {
@@ -2634,8 +2634,9 @@ fn agent_validate_in(
                 let verdict = parse_agent_verdict(&out.output).judged_by(&seat.key, true);
                 if verdict.pass && !crate::observed_provider::approval_is_independent(&seat.key) {
                     eprintln!(
-                        "wicked-core: judge seat '{}' approved, but was seen calling the work's own \
-                         provider: not independent — trying the next seat (core#1543)",
+                        "wicked-core: judge seat '{}' approved, but was not observed calling only \
+                         another provider than the work's: not independent — trying the next seat \
+                         (core#1543)",
                         seat.key
                     );
                     not_independent.push(seat.key.clone());
