@@ -1896,7 +1896,9 @@ impl Core {
     /// `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
     /// noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
     /// human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
-    /// approve) accepts; nothing else is. Writes nothing to the store (wicked-core#1522: the
+    /// approve) accepts; nothing else is — except at an Apps publish's consent gate, judged on the
+    /// QE record's tree, where a tree changed since the QE PASS is refused on answer
+    /// (wicked-core#1534). Writes nothing to the store (wicked-core#1522: the
     /// rejudge probe's seat-directory preparation).
     #[napi(ts_return_type = "Promise<string>")]
     pub fn gate_actions(&self, run_id: String) -> AsyncTask<CoreTask> {

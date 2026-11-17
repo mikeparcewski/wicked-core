@@ -1264,7 +1264,9 @@ impl Core {
     /// (studio#1170, crew#1512) Every answer the run's open gate takes NOW — its token, what it
     /// does at this gate, whether it needs a note, and a reassign's seats — computed by running
     /// each candidate through the decision path's own pre-checks, so the list is exactly what
-    /// [`Core::confirm_gate`] (and a parked reassign) accepts. `None` when the run is not awaiting
+    /// [`Core::confirm_gate`] (and a parked reassign) accepts — except at an Apps publish's consent
+    /// gate, judged on the QE record's tree (a tree changed since the QE PASS is refused on answer,
+    /// wicked-core#1534). `None` when the run is not awaiting
     /// a human. Writes nothing to the store (the rejudge probe's seat-directory preparation is
     /// wicked-core#1522).
     pub fn gate_actions(&self, run_id: &str) -> anyhow::Result<Option<GateActions>> {

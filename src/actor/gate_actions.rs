@@ -226,7 +226,7 @@ fn plan_actions(cursor: Option<&WorkUnit>, ord: u32, rev: Option<u32>) -> GateAc
 /// choices after the approve, and reject. An Apps publish's consent takes only reject until it can
 /// produce (the publish QE backstop) — judged on the QE record's own tree: the current tree's
 /// snapshot writes git objects, which this read never does, so a tree changed since the QE PASS is
-/// refused when the answer arrives.
+/// refused when the answer arrives (wicked-core#1534).
 fn consent_actions(
     store: &dyn GraphStore,
     session: &AgentSession,
