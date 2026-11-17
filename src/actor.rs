@@ -10072,7 +10072,8 @@ fn sweep_expired_retained_worktrees(store: &dyn GraphStore) {
 fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
-    let epoch = crate::k8s::run_epoch(&rid);
+    // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
+    let epoch = crate::k8s::end_run(&rid);
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
@@ -10087,7 +10088,8 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
 fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::AgentSession) {
     let repo = run_repo(store, session);
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
-    let epoch = crate::k8s::run_epoch(&rid);
+    // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
+    let epoch = crate::k8s::end_run(&rid);
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
         // A run that armed again since it ended keeps its tree (codex r2): its live edits
@@ -10113,7 +10115,8 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
     // A run with no workdir can still have a namespace (codex b5 #12): it goes regardless.
     let workdir = session.workdir.clone();
     let rid = session.id.clone();
-    let epoch = crate::k8s::run_epoch(&rid);
+    // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
+    let epoch = crate::k8s::end_run(&rid);
     crate::repo::spawn_bound(move || remove_run_floor_cache(workdir.as_deref(), &rid, epoch));
 }
 

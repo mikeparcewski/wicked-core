@@ -2557,8 +2557,12 @@ pub(crate) fn arm_noting(
         .collect();
     // The run's node_modules cache for this tree, when the unit's provisioning filled one (B14).
     let deps = crate::checks_container::seat_claim(run_id, &tree);
+    // The lifecycle this launch arms in, captured before the first attempt (codex confirmation
+    // and coord codex-check on #1527).
+    let generation = crate::k8s::lifecycle(run_id);
     let arm_spec = crate::k8s::seat::ArmSpec {
         run_id,
+        generation,
         ord,
         cli,
         image: &image,
@@ -2581,7 +2585,20 @@ pub(crate) fn arm_noting(
         role,
         deps: deps.as_deref(),
     };
-    let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;
+    // (core#1491) A pod that did not become ready (or was held for the node) is retried after a
+    // backoff, each time a fresh Sandbox; any other refusal is final.
+    // …and never into another lifecycle: an attempt asleep through the run's end and a resume
+    // stops (codex confirmation on #1527).
+    let before = crate::k8s::run_epoch(run_id);
+    let (seat, wrapper) = crate::k8s::seat::retry_arm(
+        &crate::k8s::seat::ARM_RETRY_BACKOFF,
+        &std::thread::sleep,
+        &|| {
+            crate::k8s::run_ended_since(run_id, before)
+                || crate::k8s::lifecycle(run_id) != generation
+        },
+        || crate::k8s::seat::arm(&kube, &arm_spec, landrun.clone()),
+    )?;
     // The gate hook judges this unit as a pod seat's (B17).
     let mut env = env;
     env.push((crate::gate_hook::SEAT_POD_ENV.to_string(), "1".to_string()));

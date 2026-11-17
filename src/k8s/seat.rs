@@ -1317,6 +1317,9 @@ pub(crate) fn copy_in(
 #[derive(Debug, Clone)]
 pub(crate) struct ArmSpec<'a> {
     pub(crate) run_id: &'a str,
+    /// (coord codex-check on #1527) The run's lifecycle generation when this launch's arming
+    /// began ([`super::lifecycle`]): a retry of an ended lifecycle is never admitted.
+    pub(crate) generation: u64,
     pub(crate) ord: u32,
     pub(crate) cli: &'a str,
     /// The seat image (in the builder's store, which the cluster shares: D2).
@@ -1410,7 +1413,13 @@ pub(crate) fn pod_state(pod: &Value, sandbox: &str, unit: &str) -> PodState {
             let msg = c
                 .pointer("/state/waiting/message")
                 .and_then(Value::as_str)
-                .unwrap_or(reason);
+                .unwrap_or("");
+            // (core#1491) A container runtime that timed out (or said nothing) under load is
+            // transient: the kubelet retries it, and the arm's deadline decides.
+            if reason != "CreateContainerConfigError" && transient_create_error(msg) {
+                continue;
+            }
+            let msg = if msg.trim().is_empty() { reason } else { msg };
             return PodState::Failed(FloorUnarmed::PolicyRefused, msg.to_string());
         }
         if let Some(code) = c
@@ -1444,6 +1453,229 @@ pub(crate) fn pod_state(pod: &Value, sandbox: &str, unit: &str) -> PodState {
     }
 }
 
+/// (core#1491) A container create/run error that is the runtime timing out (or saying nothing)
+/// under load, not a refusal: `context deadline exceeded`, `DeadlineExceeded`, `timed out`, empty.
+pub(crate) fn transient_create_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    // A denial is never a timeout, whatever else the message says (codex on #1527: a path named
+    // `timeout-service` in a mount denial).
+    if [
+        "denied",
+        "permission",
+        "forbidden",
+        "policy",
+        "not allowed",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|d| m.contains(d))
+    {
+        return false;
+    }
+    m.trim().is_empty()
+        || m.contains("context deadline exceeded")
+        || m.contains("code = deadlineexceeded")
+        || m.contains("i/o timeout")
+}
+
+/// (core#1491) Each (init) container's state that is not running, as `<kind> <name> <state>
+/// <reason> <message>` (pure): the runtime's own words about why a seat is not up.
+pub(crate) fn container_states(p: &Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for (kind, list) in [
+        ("init container", "/status/initContainerStatuses"),
+        ("container", "/status/containerStatuses"),
+    ] {
+        for c in p
+            .pointer(list)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+            for st in ["waiting", "terminated"] {
+                if let Some(v) = c.pointer(&format!("/state/{st}")) {
+                    let f = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
+                    out.push(
+                        format!("{kind} {name} {st} {} {}", f("reason"), f("message"))
+                            .trim()
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    out
+}
+
+/// (coord codex-check on #1527, HIDE) Record every container state an arm's polls saw (`seen`,
+/// first sighting order, no repeats): a transient runtime error (`CreateContainerError: context
+/// deadline exceeded`) the wait went on through is kept even when a later poll shows only
+/// `ContainerCreating` and no event survives.
+pub(crate) fn note_states(seen: &mut Vec<String>, pod: &Value) {
+    for st in container_states(pod) {
+        if !seen.contains(&st) {
+            seen.push(st);
+        }
+    }
+}
+
+/// (coord codex-check on #1527, HIDE) An arm that ends on an API error (a pod or Sandbox GET
+/// failed) still carries every container state its earlier polls saw: the runtime's own words
+/// (`CreateContainerError: context deadline exceeded`) survive a failed read.
+pub(crate) fn with_history(err: String, seen: &[String]) -> String {
+    if seen.is_empty() {
+        err
+    } else {
+        format!("{err}; seen during the wait: {}", seen.join(" | "))
+    }
+}
+
+/// [`pod_diagnosis`] plus every state an earlier poll saw that the final snapshot no longer shows.
+pub(crate) fn pod_diagnosis_seen(
+    pod: Option<&Value>,
+    events: Option<&Value>,
+    n: usize,
+    seen: &[String],
+) -> String {
+    let mut d = pod_diagnosis(pod, events, n);
+    let now = pod.map(container_states).unwrap_or_default();
+    let earlier: Vec<&str> = seen
+        .iter()
+        .filter(|s| !now.contains(s))
+        .map(String::as_str)
+        .collect();
+    if !earlier.is_empty() {
+        d.push_str(&format!("; seen during the wait: {}", earlier.join(" | ")));
+    }
+    d
+}
+
+/// (core#1491) What a pod that did not become ready looks like, for the failure's message (pure):
+/// its phase, every condition that is not True (type, reason, message), and its last `n` events
+/// (reason: message), newest last, with how many earlier ones are not shown. Evidence that
+/// outlives the run's namespace.
+pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usize) -> String {
+    let mut out = Vec::new();
+    match pod {
+        None => out.push("no pod was created".to_string()),
+        Some(p) => {
+            out.push(format!(
+                "phase {}",
+                p.pointer("/status/phase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ));
+            for c in p
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.get("status").and_then(Value::as_str) != Some("True"))
+            {
+                let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
+                out.push(
+                    format!("{} {} {}", field("type"), field("reason"), field("message"))
+                        .trim()
+                        .to_string(),
+                );
+            }
+            // (codex confirmation on #1527, HIDE) Each container's own state that is not
+            // running — the runtime's words, init containers first — so it outlives the pod even
+            // when no event kept it.
+            out.extend(container_states(p));
+        }
+    }
+    let mut items: Vec<&Value> = events
+        .and_then(|e| e.get("items"))
+        .and_then(Value::as_array)
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    // Newest LAST by when each event last occurred (RFC 3339 sorts as text), not by list order.
+    let when = |e: &Value| {
+        [
+            "/lastTimestamp",
+            "/eventTime",
+            "/metadata/creationTimestamp",
+        ]
+        .iter()
+        .find_map(|p| {
+            e.pointer(p)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string()
+    };
+    items.sort_by_key(|e| when(e));
+    let last: Vec<String> = items
+        .iter()
+        .rev()
+        .take(n)
+        .rev()
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.get("reason").and_then(Value::as_str).unwrap_or("?"),
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+            )
+        })
+        .collect();
+    if !last.is_empty() {
+        // (lane-c2, HIDE) Never a silent cut: the count left out is said.
+        let earlier = items.len().saturating_sub(last.len());
+        let note = if earlier > 0 {
+            format!(" ({earlier} earlier event(s) not shown)")
+        } else {
+            String::new()
+        };
+        out.push(format!("last events{note}: {}", last.join(" | ")));
+    }
+    out.join("; ")
+}
+
+/// (core#1491) The backoff before each retry of an arm whose pod did not become ready.
+pub(crate) const ARM_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// (core#1491) Run `arm` again after each backoff while it fails as `pod_not_ready` (a slow node:
+/// waiting can help) and `stop` does not say the run ended; any other result is final. The last
+/// failure says how many arms were tried.
+pub(crate) fn retry_arm<T>(
+    backoff: &[Duration],
+    sleep: &dyn Fn(Duration),
+    stop: &dyn Fn() -> bool,
+    mut arm: impl FnMut() -> Result<T, (FloorUnarmed, String)>,
+) -> Result<T, (FloorUnarmed, String)> {
+    let mut tries = 0usize;
+    loop {
+        match arm() {
+            Err((why @ FloorUnarmed::PodNotReady, msg)) if tries < backoff.len() && !stop() => {
+                eprintln!(
+                    "wicked-core: seat arm {} ({msg}); retrying in {:?}",
+                    why.as_str(),
+                    backoff[tries]
+                );
+                sleep(backoff[tries]);
+                tries += 1;
+                if stop() {
+                    return Err((
+                        why,
+                        format!("{msg} (the run ended during the arm's backoff)"),
+                    ));
+                }
+            }
+            Err((why, msg)) if tries > 0 => {
+                return Err((why, format!("{msg} (after {} arm attempts)", tries + 1)))
+            }
+            other => return other,
+        }
+    }
+}
+
 /// A Sandbox the controller could not make a pod for: why, from its status (pure).
 pub(crate) fn sandbox_refusal(sbx: &Value) -> Option<(FloorUnarmed, String)> {
     let conds = sbx
@@ -1453,7 +1685,13 @@ pub(crate) fn sandbox_refusal(sbx: &Value) -> Option<(FloorUnarmed, String)> {
         let msg = c.get("message").and_then(Value::as_str).unwrap_or("");
         if msg.contains("exceeded quota") || msg.contains("Insufficient memory") {
             Some((FloorUnarmed::AdmissionPending, msg.to_string()))
-        } else if msg.contains("violates PodSecurity") || msg.contains("forbidden") {
+        } else if msg.contains("violates PodSecurity")
+            || msg.contains("forbidden")
+            || msg.contains("Forbidden")
+            // (codex on #1527) An admission webhook's denial is a policy refusal too.
+            || msg.contains("admission webhook")
+            || msg.contains("denied the request")
+        {
             Some((FloorUnarmed::PolicyRefused, msg.to_string()))
         } else {
             None
@@ -1580,7 +1818,12 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
-    super::arming(s.run_id);
+    if !super::arming_live(s.run_id, s.generation) {
+        return Err((
+            FloorUnarmed::PodNotReady,
+            "the run ended before its seat could arm".into(),
+        ));
+    }
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
     super::clock::mark("namespace");
@@ -1696,28 +1939,66 @@ pub(crate) fn arm(
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
     super::clock::mark("sandbox_apply");
     let start = Instant::now();
+    // Every container state any poll saw, for the diagnosis (coord codex-check on #1527).
+    let mut seen: Vec<String> = Vec::new();
     loop {
         let pod = kube
             .get_json(Some(&ns), "pod", &sandbox)
-            .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+            .map_err(|e| (FloorUnarmed::ClusterUnreachable, with_history(e, &seen)))?;
+        if let Some(p) = pod.as_ref() {
+            note_states(&mut seen, p);
+        }
+        // (core#1491) The pod's phase, conditions and last events, read before the reap.
+        let diagnose = |pod: Option<&Value>| {
+            let events = kube
+                .call(
+                    Some(&ns),
+                    &[
+                        "get",
+                        "events",
+                        "--field-selector",
+                        &format!("involvedObject.name={sandbox}"),
+                        "-o",
+                        "json",
+                    ],
+                    None,
+                    Duration::from_secs(15),
+                )
+                .stdout;
+            let events: Option<Value> = serde_json::from_slice(&events).ok();
+            pod_diagnosis_seen(pod, events.as_ref(), 5, &seen)
+        };
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
+                let msg = format!("{msg} ({})", diagnose(pod.as_ref()));
                 reap(&id);
                 return Err((why, msg));
             }
             _ => {}
         }
         if start.elapsed() > POD_START {
-            let why = kube
-                .get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox)
-                .ok()
-                .flatten()
-                .and_then(|sb| sandbox_refusal(&sb))
-                .unwrap_or((
-                    FloorUnarmed::AdmissionPending,
-                    format!("the seat pod {sandbox} did not start in {POD_START:?}"),
-                ));
+            // (codex on #1527) A Sandbox that cannot be read is no proof of "no refusal": the
+            // cluster did not answer. Every outcome carries the pod's diagnosis.
+            let why = match kube.get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox) {
+                Err(e) => (
+                    FloorUnarmed::ClusterUnreachable,
+                    with_history(
+                        format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                        &seen,
+                    ),
+                ),
+                Ok(sb) => match sb.as_ref().and_then(sandbox_refusal) {
+                    Some((why, msg)) => (why, format!("{msg} ({})", diagnose(pod.as_ref()))),
+                    None => (
+                        FloorUnarmed::PodNotReady,
+                        format!(
+                            "the seat pod {sandbox} was not ready in {POD_START:?}: {}",
+                            diagnose(pod.as_ref())
+                        ),
+                    ),
+                },
+            };
             reap(&id);
             return Err(why);
         }

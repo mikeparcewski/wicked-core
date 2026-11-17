@@ -537,6 +537,7 @@ fn k8s_live_a_seat_pod_round_trip_writes_back_only_what_it_may() {
     ];
     let spec = |view: bool, run: &'static str, ord: u32| super::seat::ArmSpec {
         run_id: run,
+        generation: super::lifecycle(run),
         ord,
         cli: "codex",
         image: &seat_image,

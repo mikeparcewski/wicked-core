@@ -350,6 +350,11 @@ pub(crate) enum FloorUnarmed {
     /// Kubernetes runner: the cluster refused the pod or one of its policies (PodSecurity,
     /// admission, a policy the engine requires that did not apply).
     PolicyRefused,
+    /// (core#1491) Kubernetes runner: the seat's pod was applied but did not become ready by the
+    /// arm's deadline, with no refusal on record (a slow node under load): a timeout, retried with
+    /// a backoff, never the seat's or a policy's failure. Its message carries the pod's phase,
+    /// not-ready conditions and last events.
+    PodNotReady,
     #[allow(dead_code)]
     /// Kubernetes runner: the exec stream to the seat was lost before the CLI's exit code was
     /// known: never read as the CLI's own result.
@@ -473,6 +478,11 @@ impl FloorUnarmed {
                  pull from a registry) — `wicked-core seat-image build <cli>` builds it into the \
                  store the cluster shares"
             }
+            FloorUnarmed::PodNotReady => {
+                "pod_not_ready: the seat's pod was created but did not become ready in time (a \
+                 slow node under load, no refusal on record); the arm was retried with a backoff \
+                 (its phase, conditions and last events follow)"
+            }
             FloorUnarmed::PolicyRefused => {
                 "policy_refused: the cluster refused the seat's pod or a policy it needs (its error \
                  follows) — fix what it names, then retry"
@@ -521,6 +531,7 @@ impl FloorUnarmed {
             FloorUnarmed::AdmissionPending => "admission_pending",
             FloorUnarmed::ImageUnavailable => "image_unavailable",
             FloorUnarmed::PolicyRefused => "policy_refused",
+            FloorUnarmed::PodNotReady => "pod_not_ready",
             FloorUnarmed::ExecStreamLost => "exec_stream_lost",
             FloorUnarmed::PidsUnlimited => "pids_unlimited",
             FloorUnarmed::CopyInRefused => "copy_in_refused",

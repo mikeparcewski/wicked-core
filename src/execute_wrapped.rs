@@ -2969,6 +2969,8 @@ impl WrappedCliStepRunner {
     /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
     pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
         crate::repo_checks::clear_floor_cancel(run_id);
+        // (core#1491) A resumed run's seats arm again.
+        crate::k8s::forget_ended(run_id);
         self.sessions.reopen_run(run_id, min_launch_seq);
         // A launch of the resumed lifecycle runs; one of the ended lifecycle stays fenced:
         // `min_launch_seq` is the HIGHEST sequence the ended lifecycle minted (codex c5-r2).
@@ -4358,6 +4360,10 @@ impl WrappedCliStepRunner {
                             why,
                             crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted
                                 | crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable
+                                // (core#1491) The pod's phase, conditions and events are the
+                                // evidence: kept in the unit's output, not only the daemon log.
+                                | crate::worker_sandbox::FloorUnarmed::PodNotReady
+                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused
                         ) && !detail.is_empty()
                         {
                             // core#1356: the runtime's own network error (the network's name and

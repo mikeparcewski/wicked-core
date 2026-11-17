@@ -3,6 +3,7 @@
 //! Each names its PARITY row.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::json;
 use wicked_apps_core::HardenedCommand as _;
@@ -4217,4 +4218,247 @@ fn k8s_left_out_paths_are_exact_and_their_host_links_are_checked() {
     let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
     assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1491) A container runtime that timed out (or said nothing) under load is transient: the pod
+/// waits for the arm's deadline. Any other create error is still the cluster's refusal, never
+/// message-less.
+#[test]
+fn a_create_timeout_under_load_waits_and_other_create_errors_are_refused() {
+    let waiting = |reason: &str, message: &str| {
+        let mut p = pod("seat-1-abc", "u1", "Pending", false);
+        p["status"]["containerStatuses"][0]["state"] =
+            json!({"waiting": {"reason": reason, "message": message}});
+        p
+    };
+    for (reason, msg) in [
+        ("CreateContainerError", "context deadline exceeded"),
+        (
+            "RunContainerError",
+            "rpc error: code = DeadlineExceeded desc = timed out",
+        ),
+        ("CreateContainerError", ""),
+    ] {
+        assert_eq!(
+            seat::pod_state(&waiting(reason, msg), "seat-1-abc", "u1"),
+            PodState::Waiting,
+            "{reason}: {msg}"
+        );
+    }
+    assert_eq!(
+        seat::pod_state(
+            &waiting("CreateContainerError", "mount denied by policy"),
+            "seat-1-abc",
+            "u1"
+        ),
+        PodState::Failed(FloorUnarmed::PolicyRefused, "mount denied by policy".into())
+    );
+    assert_eq!(
+        seat::pod_state(
+            &waiting("CreateContainerConfigError", ""),
+            "seat-1-abc",
+            "u1"
+        ),
+        PodState::Failed(
+            FloorUnarmed::PolicyRefused,
+            "CreateContainerConfigError".into()
+        ),
+        "a config error is never transient, and never message-less"
+    );
+}
+
+/// (core#1491) The evidence a not-ready pod leaves: its phase, the conditions that are not True,
+/// and its last events.
+#[test]
+fn a_not_ready_pods_diagnosis_names_phase_conditions_and_last_events() {
+    let mut p = pod("seat-1-abc", "u1", "Pending", false);
+    p["status"]["conditions"] = json!([
+        {"type": "PodScheduled", "status": "True"},
+        {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": "containers with unready status: [seat]"}
+    ]);
+    let events = json!({"items": [
+        {"reason": "Scheduled", "message": "assigned to node"},
+        {"reason": "Pulled", "message": "image present"},
+        {"reason": "Failed", "message": "Error: context deadline exceeded"}
+    ]});
+    let d = seat::pod_diagnosis(Some(&p), Some(&events), 2);
+    assert!(d.starts_with("phase Pending"), "{d}");
+    assert!(
+        d.contains("ContainersReady ContainersNotReady containers with unready status"),
+        "{d}"
+    );
+    assert!(
+        !d.contains("PodScheduled"),
+        "a True condition is not news: {d}"
+    );
+    assert!(
+        d.ends_with(
+            "last events (1 earlier event(s) not shown): Pulled: image present | Failed: Error: \
+             context deadline exceeded"
+        ),
+        "{d}"
+    );
+    assert_eq!(seat::pod_diagnosis(None, None, 5), "no pod was created");
+}
+
+/// (core#1491) An arm whose pod was not ready is retried after each backoff, then reports how many
+/// arms were tried; a refusal (policy, admission) is never retried, and a run that ended during a
+/// backoff gets no further arm.
+#[test]
+fn a_not_ready_arm_is_retried_with_the_backoff_and_a_refusal_is_not() {
+    use std::cell::{Cell, RefCell};
+    let slept = RefCell::new(Vec::new());
+    let sleep = |d: Duration| slept.borrow_mut().push(d);
+    let never = || false;
+    let tries = Cell::new(0);
+    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &sleep, &never, || {
+        tries.set(tries.get() + 1);
+        Err((FloorUnarmed::PodNotReady, "not ready".into()))
+    });
+    let (why, msg) = r.unwrap_err();
+    assert_eq!((why, tries.get()), (FloorUnarmed::PodNotReady, 3));
+    assert!(msg.contains("after 3 arm attempts"), "{msg}");
+    assert_eq!(*slept.borrow(), seat::ARM_RETRY_BACKOFF.to_vec());
+    tries.set(0);
+    let r = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, &never, || {
+        tries.set(tries.get() + 1);
+        if tries.get() == 1 {
+            Err((FloorUnarmed::PodNotReady, "slow".into()))
+        } else {
+            Ok(7)
+        }
+    });
+    assert_eq!((r.unwrap(), tries.get()), (7, 2));
+    for refusal in [FloorUnarmed::PolicyRefused, FloorUnarmed::AdmissionPending] {
+        tries.set(0);
+        let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, &never, || {
+            tries.set(tries.get() + 1);
+            Err((refusal, "refused".into()))
+        });
+        assert_eq!((r.unwrap_err().0, tries.get()), (refusal, 1), "{refusal:?}");
+    }
+    // The run ended during the first backoff: no second arm.
+    tries.set(0);
+    let ended = Cell::new(false);
+    let r: Result<(), _> = seat::retry_arm(
+        &seat::ARM_RETRY_BACKOFF,
+        &|_| ended.set(true),
+        &|| ended.get(),
+        || {
+            tries.set(tries.get() + 1);
+            Err((FloorUnarmed::PodNotReady, "slow".into()))
+        },
+    );
+    assert_eq!(tries.get(), 1);
+    assert!(r.unwrap_err().1.contains("the run ended"));
+}
+
+/// (codex on #1527) A denial is never read as a timeout, whatever path it names; an admission
+/// webhook's denial is a policy refusal.
+#[test]
+fn a_denial_is_never_a_timeout_and_a_webhook_denial_is_a_policy_refusal() {
+    for m in [
+        "error mounting /replica/home/timeout-service: permission denied",
+        "context deadline exceeded: denied by policy",
+    ] {
+        assert!(!seat::transient_create_error(m), "{m}");
+    }
+    assert!(seat::transient_create_error(
+        "rpc error: code = DeadlineExceeded desc = context deadline exceeded"
+    ));
+    let sbx = json!({"status": {"conditions": [{"type": "Ready", "status": "False",
+        "message": "admission webhook \"policy.example\" denied the request: unsigned image"}]}});
+    assert_eq!(
+        seat::sandbox_refusal(&sbx).map(|r| r.0),
+        Some(FloorUnarmed::PolicyRefused)
+    );
+}
+
+/// (codex on #1527) The last events are the most recent by when they last occurred, not list order.
+#[test]
+fn the_diagnosis_takes_the_most_recent_events() {
+    let events = json!({"items": [
+        {"reason": "Old", "message": "o", "lastTimestamp": "2026-11-17T01:00:00Z"},
+        {"reason": "Newest", "message": "n", "lastTimestamp": "2026-11-17T03:00:00Z"},
+        {"reason": "Middle", "message": "m", "lastTimestamp": "2026-11-17T02:00:00Z"}
+    ]});
+    let d = seat::pod_diagnosis(None, Some(&events), 2);
+    // (lane-c2, HIDE) The event left out is counted, never silently cut.
+    assert!(
+        d.ends_with("last events (1 earlier event(s) not shown): Middle: m | Newest: n"),
+        "{d}"
+    );
+    // (codex confirmation, HIDE) The runtime's own error the poll waited through is kept even
+    // with no event: the container's waiting state is in the diagnosis.
+    let mut p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"name": "seat", "state": {"waiting": {
+            "reason": "CreateContainerError", "message": "context deadline exceeded"}}}
+    ]}});
+    let d = seat::pod_diagnosis(Some(&p), None, 5);
+    assert!(
+        d.contains("container seat waiting CreateContainerError context deadline exceeded"),
+        "{d}"
+    );
+    p["status"]["initContainerStatuses"] =
+        json!([{"name": "sync", "state": {"terminated": {"reason": "Error", "message": "x"}}}]);
+    assert!(
+        seat::pod_diagnosis(Some(&p), None, 5).contains("init container sync terminated Error x")
+    );
+    let all = seat::pod_diagnosis(None, Some(&events), 5);
+    assert!(
+        all.ends_with("last events: Old: o | Middle: m | Newest: n"),
+        "{all}"
+    );
+}
+
+/// (coord codex-check on #1527, HIDE) The two-snapshot repro: one poll sees the runtime's
+/// `CreateContainerError: context deadline exceeded` (transient, so the wait goes on), the next
+/// only `ContainerCreating`, and no event is readable. The error is still in the diagnosis.
+#[test]
+fn a_transient_runtime_error_seen_by_an_earlier_poll_stays_in_the_diagnosis() {
+    let snap = |reason: &str, message: &str| {
+        json!({"status": {"phase": "Pending", "containerStatuses": [
+            {"name": "seat", "state": {"waiting": {"reason": reason, "message": message}}}
+        ]}})
+    };
+    let first = snap("CreateContainerError", "context deadline exceeded");
+    let last = snap("ContainerCreating", "");
+    let mut seen = Vec::new();
+    seat::note_states(&mut seen, &first);
+    seat::note_states(&mut seen, &last);
+    seat::note_states(&mut seen, &last);
+    let d = seat::pod_diagnosis_seen(Some(&last), None, 5, &seen);
+    assert!(
+        d.contains("seen during the wait: container seat waiting CreateContainerError context deadline exceeded"),
+        "{d}"
+    );
+    assert_eq!(d.matches("ContainerCreating").count(), 1, "no repeat: {d}");
+    // Without an earlier error, nothing is added.
+    let mut quiet = Vec::new();
+    seat::note_states(&mut quiet, &last);
+    assert!(!seat::pod_diagnosis_seen(Some(&last), None, 5, &quiet).contains("seen during"));
+}
+
+/// (coord codex-check on #1527, HIDE) First poll: the runtime's `CreateContainerError: context
+/// deadline exceeded` (transient, the wait goes on); next poll: the GET fails. The API error the
+/// arm returns still carries what the earlier poll saw.
+#[test]
+fn a_failed_read_after_a_runtime_error_keeps_that_error() {
+    let first = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"name": "seat", "state": {"waiting": {
+            "reason": "CreateContainerError", "message": "context deadline exceeded"}}}
+    ]}});
+    let mut seen = Vec::new();
+    seat::note_states(&mut seen, &first);
+    let msg = seat::with_history("Unable to connect to the server".to_string(), &seen);
+    assert!(msg.starts_with("Unable to connect to the server"), "{msg}");
+    assert!(
+        msg.contains("CreateContainerError context deadline exceeded"),
+        "{msg}"
+    );
+    assert_eq!(
+        seat::with_history("e".into(), &[]),
+        "e",
+        "nothing seen, nothing added"
+    );
 }
