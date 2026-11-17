@@ -1286,12 +1286,14 @@ fn rule_council_candidates(
 /// judge's own seat (`judge`, a registry record) when it is none of the work's creators, authors
 /// or launch-excluded seats — it then reads the reviewer's argument beside its own. `None`: no
 /// arbiter (the hold stands).
+#[allow(clippy::too_many_arguments)]
 fn dispute_arbiter(
     candidates: &[crate::AgenticCli],
     judge: Option<&str>,
     creators: &[String],
     authored_by: &[String],
     exclude_seats: &[String],
+    author_bins: &[&str],
     registry: &[crate::AgenticCli],
 ) -> Option<(crate::AgenticCli, String)> {
     use wicked_apps_core::spawn::seat_cli_key;
@@ -1311,6 +1313,24 @@ fn dispute_arbiter(
     let seat = registry
         .iter()
         .find(|c| c.key == judge && c.enabled_for_council)?;
+    // (codex on #1526) …by identity too: a creator, author or launch-excluded seat registered
+    // under another key, or a binary an author ran, that IS what this seat launches.
+    let id = crate::validator::seat_identity(seat);
+    let excluded_ids: Vec<String> = creators
+        .iter()
+        .chain(authored_by)
+        .chain(exclude_seats)
+        .map(|k| crate::validator::excluded_identity(k, registry))
+        .chain(
+            author_bins
+                .iter()
+                .filter(|b| **b != judge)
+                .map(|b| crate::validator::normalize_identity(b)),
+        )
+        .collect();
+    if excluded_ids.contains(&id) {
+        return None;
+    }
     Some((
         seat.clone(),
         format!(
@@ -1480,6 +1500,7 @@ fn settle_rule_disputes(
     creators: &[String],
     creator_bins: Option<&[String]>,
     registry: &[crate::AgenticCli],
+    pool: &[crate::AgenticCli],
     council: Option<&CouncilCtx<'_>>,
     emit_delta: &DeltaSink,
     no_agent_creator: bool,
@@ -1584,7 +1605,14 @@ fn settle_rule_disputes(
             was_carried.then_some(pos.as_slice()),
             registry,
             no_agent_creator,
-        );
+        )
+        // (codex on #1526) Only seats of the run's own pool can sit: deciding council-or-arbiter
+        // on the whole registry asked a three-seat council the actor's roster then emptied.
+        .map(|s| {
+            s.into_iter()
+                .filter(|c| pool.is_empty() || pool.iter().any(|p| p.key == c.key))
+                .collect::<Vec<_>>()
+        });
         let parties = council_parties(
             creators,
             &input.unit.authored_by,
@@ -1662,7 +1690,14 @@ fn settle_rule_disputes(
                 creators,
                 &input.unit.authored_by,
                 &input.unit.exclude_seats,
-                registry,
+                creator_bins
+                    .unwrap_or_default()
+                    .iter()
+                    .chain(&input.unit.authored_binaries)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                if pool.is_empty() { registry } else { pool },
             ) {
                 Some((seat, footing)) => (vec![seat], 1, Some(footing)),
                 None => {
@@ -1779,8 +1814,10 @@ fn settle_rule_disputes(
                 {
                     r.push_str(&format!("; the parties: {parties}"));
                 }
+                let sat = v.seated == 1 && !v.votes.is_empty();
                 let mut settled = crate::rule_check::settle(&row, pos.clone(), &v, &bars);
-                if let (Some(a), Some(c)) = (&arbiter, settled.council.as_mut()) {
+                // Named only when the arbiter actually sat (codex on #1526).
+                if let (Some(a), Some(c), true) = (&arbiter, settled.council.as_mut(), sat) {
                     c.arbiter = Some(a.clone());
                 }
                 settled
@@ -2192,6 +2229,8 @@ fn run_rule_check(
 pub(crate) struct Settle<'a> {
     pub reviewer_output: &'a str,
     pub council: Option<&'a CouncilCtx<'a>>,
+    /// (crew#972) The run's own unbenched seats: only they can sit on a council or arbitrate.
+    pub council_pool: &'a [crate::AgenticCli],
 }
 
 /// [`run_rule_check`], then (DES-RULE-CHECK-001 rev 2) the settle step on the reviewer's output.
@@ -2440,6 +2479,7 @@ fn run_rule_check_with(
             creators,
             creator_bins,
             registry,
+            st.council_pool,
             st.council,
             emit_delta,
             no_agent_creator,
@@ -6174,6 +6214,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             Some(Settle {
                 reviewer_output: &output.output,
                 council: fallback.rule_council,
+                council_pool: &eligible_run,
             }),
         )
     } else {

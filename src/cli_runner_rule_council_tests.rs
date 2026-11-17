@@ -201,6 +201,18 @@ fn settle_with(
     council: &FakeCouncil,
     registry: &[crate::AgenticCli],
 ) -> crate::rule_check::RuleCheckReport {
+    settle_in(input, judge, reviewer_output, council, registry, registry)
+}
+
+/// [`settle_with`] on a run whose own seats are `run_seats` (a council or arbiter sits only there).
+fn settle_in(
+    input: &StepInput,
+    judge: &dyn StepRunner,
+    reviewer_output: &str,
+    council: &FakeCouncil,
+    registry: &[crate::AgenticCli],
+    run_seats: &[crate::AgenticCli],
+) -> crate::rule_check::RuleCheckReport {
     let pool = vec![seat("claude"), seat("pi")];
     let ctx = CouncilCtx {
         council,
@@ -219,6 +231,7 @@ fn settle_with(
         Some(Settle {
             reviewer_output,
             council: Some(&ctx),
+            council_pool: run_seats,
         }),
     )
     .expect("a report")
@@ -990,5 +1003,38 @@ fn a_council_short_of_voters_names_them_and_the_parties() {
             "seats_benched: 1 eligible seat(s) (agy), a rule council needs 3; the parties: \
              claude built the work; pi judged the rule; codex reviewed the step"
         )
+    );
+}
+
+/// (codex on #1526, W12) The two-seat case with the SHIPPED registry: three seats outside the run
+/// are distinct from every party, but only the run's own seats can sit. The run is claude (built
+/// it), codex (reviewed) and pi (judged): no council, and pi, the rule judge, arbitrates.
+#[test]
+fn a_run_of_two_seats_gets_its_arbiter_even_when_the_registry_has_more() {
+    let input = reviewed("two-seat-run");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let council = FakeCouncil::new("two-seat-run", kept_1);
+    let run_seats: Vec<crate::AgenticCli> =
+        ["claude", "codex", "pi"].into_iter().map(seat).collect();
+    let r = settle_in(
+        &input,
+        &judge,
+        REVIEWER_KEPT,
+        &council,
+        &registry(),
+        &run_seats,
+    );
+    assert_eq!(council.convened(), 1);
+    assert_eq!(
+        council.seats(0),
+        vec!["pi".to_string()],
+        "the run's own judge seat, not agy/opencode"
+    );
+    let c = row(&r, "R1").council.clone().unwrap();
+    assert!(
+        c.arbiter
+            .as_deref()
+            .is_some_and(|a| a.starts_with("pi (it judged the rule")),
+        "{c:?}"
     );
 }
