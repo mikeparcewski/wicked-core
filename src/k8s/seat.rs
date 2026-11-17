@@ -1454,11 +1454,25 @@ pub(crate) fn pod_state(pod: &Value, sandbox: &str, unit: &str) -> PodState {
 /// under load, not a refusal: `context deadline exceeded`, `DeadlineExceeded`, `timed out`, empty.
 pub(crate) fn transient_create_error(msg: &str) -> bool {
     let m = msg.to_ascii_lowercase();
+    // A denial is never a timeout, whatever else the message says (codex on #1527: a path named
+    // `timeout-service` in a mount denial).
+    if [
+        "denied",
+        "permission",
+        "forbidden",
+        "policy",
+        "not allowed",
+        "unauthorized",
+    ]
+    .iter()
+    .any(|d| m.contains(d))
+    {
+        return false;
+    }
     m.trim().is_empty()
         || m.contains("context deadline exceeded")
-        || m.contains("deadlineexceeded")
-        || m.contains("timed out")
-        || m.contains("timeout")
+        || m.contains("code = deadlineexceeded")
+        || m.contains("i/o timeout")
 }
 
 /// (core#1491) What a pod that did not become ready looks like, for the failure's message (pure):
@@ -1491,11 +1505,28 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
             }
         }
     }
-    let items: Vec<&Value> = events
+    let mut items: Vec<&Value> = events
         .and_then(|e| e.get("items"))
         .and_then(Value::as_array)
         .map(|v| v.iter().collect())
         .unwrap_or_default();
+    // Newest LAST by when each event last occurred (RFC 3339 sorts as text), not by list order.
+    let when = |e: &Value| {
+        [
+            "/lastTimestamp",
+            "/eventTime",
+            "/metadata/creationTimestamp",
+        ]
+        .iter()
+        .find_map(|p| {
+            e.pointer(p)
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("")
+        .to_string()
+    };
+    items.sort_by_key(|e| when(e));
     let last: Vec<String> = items
         .iter()
         .rev()
@@ -1522,20 +1553,19 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
 pub(crate) const ARM_RETRY_BACKOFF: [Duration; 2] =
     [Duration::from_secs(10), Duration::from_secs(30)];
 
-/// (core#1491) Run `arm` again after each backoff while it fails as `pod_not_ready` or
-/// `admission_pending` (a slow or full node: waiting can help); any other result is final. The
-/// last failure says how many arms were tried.
+/// (core#1491) Run `arm` again after each backoff while it fails as `pod_not_ready` (a slow node:
+/// waiting can help) and `stop` does not say the run ended; any other result is final. The last
+/// failure says how many arms were tried.
 pub(crate) fn retry_arm<T>(
     backoff: &[Duration],
     sleep: &dyn Fn(Duration),
+    stop: &dyn Fn() -> bool,
     mut arm: impl FnMut() -> Result<T, (FloorUnarmed, String)>,
 ) -> Result<T, (FloorUnarmed, String)> {
     let mut tries = 0usize;
     loop {
         match arm() {
-            Err((why @ (FloorUnarmed::PodNotReady | FloorUnarmed::AdmissionPending), msg))
-                if tries < backoff.len() =>
-            {
+            Err((why @ FloorUnarmed::PodNotReady, msg)) if tries < backoff.len() && !stop() => {
                 eprintln!(
                     "wicked-core: seat arm {} ({msg}); retrying in {:?}",
                     why.as_str(),
@@ -1543,6 +1573,12 @@ pub(crate) fn retry_arm<T>(
                 );
                 sleep(backoff[tries]);
                 tries += 1;
+                if stop() {
+                    return Err((
+                        why,
+                        format!("{msg} (the run ended during the arm's backoff)"),
+                    ));
+                }
             }
             Err((why, msg)) if tries > 0 => {
                 return Err((why, format!("{msg} (after {} arm attempts)", tries + 1)))
@@ -1561,7 +1597,13 @@ pub(crate) fn sandbox_refusal(sbx: &Value) -> Option<(FloorUnarmed, String)> {
         let msg = c.get("message").and_then(Value::as_str).unwrap_or("");
         if msg.contains("exceeded quota") || msg.contains("Insufficient memory") {
             Some((FloorUnarmed::AdmissionPending, msg.to_string()))
-        } else if msg.contains("violates PodSecurity") || msg.contains("forbidden") {
+        } else if msg.contains("violates PodSecurity")
+            || msg.contains("forbidden")
+            || msg.contains("Forbidden")
+            // (codex on #1527) An admission webhook's denial is a policy refusal too.
+            || msg.contains("admission webhook")
+            || msg.contains("denied the request")
+        {
             Some((FloorUnarmed::PolicyRefused, msg.to_string()))
         } else {
             None
@@ -1838,20 +1880,24 @@ pub(crate) fn arm(
             _ => {}
         }
         if start.elapsed() > POD_START {
-            let why = kube
-                .get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox)
-                .ok()
-                .flatten()
-                .and_then(|sb| sandbox_refusal(&sb))
-                .unwrap_or_else(|| {
-                    (
+            // (codex on #1527) A Sandbox that cannot be read is no proof of "no refusal": the
+            // cluster did not answer. Every outcome carries the pod's diagnosis.
+            let why = match kube.get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox) {
+                Err(e) => (
+                    FloorUnarmed::ClusterUnreachable,
+                    format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                ),
+                Ok(sb) => match sb.as_ref().and_then(sandbox_refusal) {
+                    Some((why, msg)) => (why, format!("{msg} ({})", diagnose(pod.as_ref()))),
+                    None => (
                         FloorUnarmed::PodNotReady,
                         format!(
                             "the seat pod {sandbox} was not ready in {POD_START:?}: {}",
                             diagnose(pod.as_ref())
                         ),
-                    )
-                });
+                    ),
+                },
+            };
             reap(&id);
             return Err(why);
         }

@@ -4358,6 +4358,10 @@ impl WrappedCliStepRunner {
                             why,
                             crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted
                                 | crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable
+                                // (core#1491) The pod's phase, conditions and events are the
+                                // evidence: kept in the unit's output, not only the daemon log.
+                                | crate::worker_sandbox::FloorUnarmed::PodNotReady
+                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused
                         ) && !detail.is_empty()
                         {
                             // core#1356: the runtime's own network error (the network's name and

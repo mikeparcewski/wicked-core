@@ -4300,39 +4300,86 @@ fn a_not_ready_pods_diagnosis_names_phase_conditions_and_last_events() {
 }
 
 /// (core#1491) An arm whose pod was not ready is retried after each backoff, then reports how many
-/// arms were tried; a policy refusal is never retried.
+/// arms were tried; a refusal (policy, admission) is never retried, and a run that ended during a
+/// backoff gets no further arm.
 #[test]
 fn a_not_ready_arm_is_retried_with_the_backoff_and_a_refusal_is_not() {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     let slept = RefCell::new(Vec::new());
     let sleep = |d: Duration| slept.borrow_mut().push(d);
-    let tries = RefCell::new(0);
-    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &sleep, || {
-        *tries.borrow_mut() += 1;
+    let never = || false;
+    let tries = Cell::new(0);
+    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &sleep, &never, || {
+        tries.set(tries.get() + 1);
         Err((FloorUnarmed::PodNotReady, "not ready".into()))
     });
     let (why, msg) = r.unwrap_err();
-    assert_eq!((why, *tries.borrow()), (FloorUnarmed::PodNotReady, 3));
+    assert_eq!((why, tries.get()), (FloorUnarmed::PodNotReady, 3));
     assert!(msg.contains("after 3 arm attempts"), "{msg}");
     assert_eq!(*slept.borrow(), seat::ARM_RETRY_BACKOFF.to_vec());
-    // Ready on the second try: no further arm.
-    *tries.borrow_mut() = 0;
-    let r = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, || {
-        *tries.borrow_mut() += 1;
-        if *tries.borrow() == 1 {
-            Err((FloorUnarmed::AdmissionPending, "held".into()))
+    tries.set(0);
+    let r = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, &never, || {
+        tries.set(tries.get() + 1);
+        if tries.get() == 1 {
+            Err((FloorUnarmed::PodNotReady, "slow".into()))
         } else {
             Ok(7)
         }
     });
-    assert_eq!((r.unwrap(), *tries.borrow()), (7, 2));
-    *tries.borrow_mut() = 0;
-    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, || {
-        *tries.borrow_mut() += 1;
-        Err((FloorUnarmed::PolicyRefused, "forbidden".into()))
-    });
-    assert_eq!(
-        (r.unwrap_err().0, *tries.borrow()),
-        (FloorUnarmed::PolicyRefused, 1)
+    assert_eq!((r.unwrap(), tries.get()), (7, 2));
+    for refusal in [FloorUnarmed::PolicyRefused, FloorUnarmed::AdmissionPending] {
+        tries.set(0);
+        let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, &never, || {
+            tries.set(tries.get() + 1);
+            Err((refusal, "refused".into()))
+        });
+        assert_eq!((r.unwrap_err().0, tries.get()), (refusal, 1), "{refusal:?}");
+    }
+    // The run ended during the first backoff: no second arm.
+    tries.set(0);
+    let ended = Cell::new(false);
+    let r: Result<(), _> = seat::retry_arm(
+        &seat::ARM_RETRY_BACKOFF,
+        &|_| ended.set(true),
+        &|| ended.get(),
+        || {
+            tries.set(tries.get() + 1);
+            Err((FloorUnarmed::PodNotReady, "slow".into()))
+        },
     );
+    assert_eq!(tries.get(), 1);
+    assert!(r.unwrap_err().1.contains("the run ended"));
+}
+
+/// (codex on #1527) A denial is never read as a timeout, whatever path it names; an admission
+/// webhook's denial is a policy refusal.
+#[test]
+fn a_denial_is_never_a_timeout_and_a_webhook_denial_is_a_policy_refusal() {
+    for m in [
+        "error mounting /replica/home/timeout-service: permission denied",
+        "context deadline exceeded: denied by policy",
+    ] {
+        assert!(!seat::transient_create_error(m), "{m}");
+    }
+    assert!(seat::transient_create_error(
+        "rpc error: code = DeadlineExceeded desc = context deadline exceeded"
+    ));
+    let sbx = json!({"status": {"conditions": [{"type": "Ready", "status": "False",
+        "message": "admission webhook \"policy.example\" denied the request: unsigned image"}]}});
+    assert_eq!(
+        seat::sandbox_refusal(&sbx).map(|r| r.0),
+        Some(FloorUnarmed::PolicyRefused)
+    );
+}
+
+/// (codex on #1527) The last events are the most recent by when they last occurred, not list order.
+#[test]
+fn the_diagnosis_takes_the_most_recent_events() {
+    let events = json!({"items": [
+        {"reason": "Old", "message": "o", "lastTimestamp": "2026-11-17T01:00:00Z"},
+        {"reason": "Newest", "message": "n", "lastTimestamp": "2026-11-17T03:00:00Z"},
+        {"reason": "Middle", "message": "m", "lastTimestamp": "2026-11-17T02:00:00Z"}
+    ]});
+    let d = seat::pod_diagnosis(None, Some(&events), 2);
+    assert!(d.ends_with("last events: Middle: m | Newest: n"), "{d}");
 }

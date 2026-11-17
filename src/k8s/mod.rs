@@ -327,6 +327,21 @@ fn life(run_id: &str) -> Life {
         .clone()
 }
 
+/// (core#1491) The arm epoch at which each run last ended ([`release_run`]).
+static ENDED: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// (core#1491) Whether run `run_id` ended after its arm epoch was `before`: an arm attempt that
+/// started then must not try again.
+pub(crate) fn run_ended_since(run_id: &str, before: u64) -> bool {
+    ENDED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(run_id))
+        .is_some_and(|e| *e > before)
+}
+
 /// The run's arm epoch now (0 = never armed by this process); never blocks.
 pub(crate) fn run_epoch(run_id: &str) -> u64 {
     life(run_id).1.load(std::sync::atomic::Ordering::SeqCst)
@@ -345,6 +360,13 @@ pub(crate) fn arming(run_id: &str) {
 /// cache claims, and is waited out, unless the run armed again since. A resumed run gets a new
 /// one. Nothing happens when the daemon has no cluster configured.
 pub(crate) fn release_run(run_id: &str, epoch: u64) {
+    // (core#1491) Recorded first: an arm retry in backoff stops instead of re-creating the
+    // namespace of a run that ended after it armed.
+    ENDED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(std::collections::HashMap::new)
+        .insert(run_id.to_string(), epoch);
     let l = life(run_id);
     let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {
