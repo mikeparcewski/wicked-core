@@ -298,6 +298,19 @@ fn approve_at_the_turn_gate_applies_the_held_edit_before_choosing_the_cursor_uni
         .propose_plan("rt", plan(json!({"steps": [answer("answer-2")]})), "turn-2")
         .unwrap();
     assert!(!proposal.duplicate);
+    // (wicked-core#1512) The published approve says what it will do: the held revision applies
+    // first and runs the added step, so it is a `continue`, never `complete`.
+    let listed = rig
+        .core
+        .gate_actions("rt")
+        .unwrap()
+        .expect("the turn gate is open");
+    let intent = listed
+        .actions
+        .iter()
+        .find(|a| a.action == "approve")
+        .map(|a| a.intent.clone());
+    assert_eq!(intent.as_deref(), Some("continue"), "{listed:?}");
     let st = rig.core.confirm_gate("rt", approve()).unwrap();
     assert_ne!(
         st,
@@ -357,6 +370,17 @@ fn approve_at_the_turn_gate_with_nothing_held_finalizes_as_before() {
         .unwrap();
     rig.tap
         .until("the turn gate", |seen| awaiting(seen, "rp") >= 1);
+    let listed = rig
+        .core
+        .gate_actions("rp")
+        .unwrap()
+        .expect("the turn gate is open");
+    let intent = listed
+        .actions
+        .iter()
+        .find(|a| a.action == "approve")
+        .map(|a| a.intent.clone());
+    assert_eq!(intent.as_deref(), Some("complete"), "{listed:?}");
     let st = rig.core.confirm_gate("rp", approve()).unwrap();
     assert_eq!(st, SessionStatus::Completed);
     rig.tap

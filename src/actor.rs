@@ -30395,7 +30395,18 @@ mod request_changes_tests {
             "land_with_carried_items" | "operator_judgment" | "accept_work" => {
                 assert!(counted, "{name}: `{intent}` did not count unit {ord}");
             }
-            _ => {}
+            "complete" => {
+                let s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+                assert_eq!(
+                    s.status,
+                    SessionStatus::Completed,
+                    "{name}: `complete` left the run going"
+                );
+            }
+            // Answered by their own gates' tests (no unit counted or run here): a plan's release, a
+            // team fact published, a consent or loop choice.
+            "approve_plan" | "edit_plan" | "continue_team" | "consent_choice" => {}
+            other => panic!("{name}: no check for the intent `{other}`: add one"),
         }
         if let Some(seat) = seat {
             assert_eq!(

@@ -326,7 +326,13 @@ fn answer_actions(
         amend: Some(PROBE.to_string()),
         amend_scope: AmendScope::Cursor,
     };
-    let approve_intent = approve_intent(session, cursor, gate_kind, adjudication_open);
+    let approve_intent = approve_intent(
+        session,
+        cursor,
+        gate_kind,
+        adjudication_open,
+        super::team_gate::held_revision_applies(session, units),
+    );
     if let Some(note) = note_rule(takes(&plain), takes(&noted)) {
         let mut a = act("approve", approve_intent, note);
         if note != NoteRule::None
@@ -504,6 +510,7 @@ fn approve_intent(
     cursor: Option<&WorkUnit>,
     gate_kind: &str,
     adjudication_open: bool,
+    held_revision: bool,
 ) -> &'static str {
     if adjudication_open {
         return "land_with_carried_items";
@@ -525,6 +532,9 @@ fn approve_intent(
     }
     match gate_kind {
         "deliver" => "deliver",
+        // A terminal approve completes the run, unless a held revision applies first and runs the
+        // step it added (`confirm_gate_expecting` → `apply_held_revision`).
+        "terminal" if held_revision => "continue",
         "terminal" => "complete",
         // A failed step's gate (triage could not apply its flag, or escalated): approve re-runs it.
         "failure" | "triage" => "retry",
@@ -542,12 +552,26 @@ mod tests {
     fn a_failure_or_triage_gates_approve_is_a_retry() {
         let session = crate::actor::sessions_detail_fold_tests::session("r");
         for kind in ["failure", "triage"] {
-            assert_eq!(approve_intent(&session, None, kind, false), "retry");
+            assert_eq!(approve_intent(&session, None, kind, false, false), "retry");
         }
-        assert_eq!(approve_intent(&session, None, "def", false), "continue");
-        assert_eq!(approve_intent(&session, None, "deliver", false), "deliver");
         assert_eq!(
-            approve_intent(&session, None, "x", true),
+            approve_intent(&session, None, "def", false, false),
+            "continue"
+        );
+        assert_eq!(
+            approve_intent(&session, None, "deliver", false, false),
+            "deliver"
+        );
+        assert_eq!(
+            approve_intent(&session, None, "terminal", false, false),
+            "complete"
+        );
+        assert_eq!(
+            approve_intent(&session, None, "terminal", false, true),
+            "continue"
+        );
+        assert_eq!(
+            approve_intent(&session, None, "x", true, false),
             "land_with_carried_items"
         );
     }
