@@ -11802,7 +11802,7 @@ fn dispatch_probe_job(
     session: &AgentSession,
     units: &[crate::domain::WorkUnit],
     unit: &crate::domain::WorkUnit,
-    new_author: &Option<(String, Vec<String>)>,
+    new_author: &Option<(String, Vec<String>, Vec<String>)>,
 ) -> Option<dispatch_probe::ProbeJob> {
     let workdir = std::path::PathBuf::from(session.workdir.as_deref()?);
     let repo = crate::repo::get_repo(store, session.repo_ref.as_deref()?)
@@ -11956,15 +11956,23 @@ fn dispatch_unit_with(
     // (PRODUCT-WORKS J6) A seat this dispatch makes a NEW author, with the binaries before it: the
     // probe below records the tree the attempt starts on, so a worker failure that changes nothing
     // takes the stamp back (`domain::retract_unproductive_author`).
-    let mut new_author: Option<(String, Vec<String>)> = None;
+    let mut new_author: Option<(String, Vec<String>, Vec<String>)> = None;
     if builds {
         if let Some(seat) = unit.assigned_cli.clone() {
             // …and every binary that dispatch may run (the fallback judge never shares one).
             let binaries =
                 crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
-            let before = (!unit.authored_by.contains(&seat))
-                .then(|| (seat.clone(), unit.authored_binaries.clone()));
-            if crate::domain::stamp_author(&mut unit, seat, binaries) {
+            // (core#1525) …and every other registry seat that launch runs as, by seat ID.
+            let aliases =
+                crate::cli_runner::launch_aliases(&seat, unit.assigned_invocation.clone());
+            let before = (!unit.authored_by.contains(&seat)).then(|| {
+                (
+                    seat.clone(),
+                    unit.authored_binaries.clone(),
+                    unit.authored_by.clone(),
+                )
+            });
+            if crate::domain::stamp_author(&mut unit, seat, binaries, aliases) {
                 team_changed = true;
             }
             new_author = before;
@@ -12009,6 +12017,22 @@ fn dispatch_unit_with(
             let binaries =
                 crate::cli_runner::launched_identities(&seat, unit.assigned_invocation.clone());
             if crate::domain::stamp_author_binaries(&mut unit, previously_dispatched, binaries) {
+                team_changed = true;
+            }
+        }
+    }
+    // (crew#972, coord ruling on core#1525) The roster seat IDs THIS dispatch runs as, recorded at
+    // launch for every agent unit (after the re-seat above, so for the seat that runs): the unit's
+    // judge is excluded by them (`cli_runner::launched_seat_ids`), never by re-reading strings.
+    if unit.tool_cmd.is_none() {
+        if let Some(seat) = unit.assigned_cli.clone() {
+            let ids = crate::cli_runner::launched_seat_ids(
+                &seat,
+                unit.assigned_invocation.clone(),
+                &crate::cli_runner::full_registry(),
+            );
+            if unit.launched_seats != ids {
+                unit.launched_seats = ids;
                 team_changed = true;
             }
         }
@@ -12125,7 +12149,9 @@ fn dispatch_unit_with(
     // (PRODUCT-WORKS J6) The tree a NEW author's attempt starts on: the baseline just taken, or a
     // fresh snapshot through the baseline's pinned git dir. No baseline or a failed snapshot leaves
     // no probe, and the stamp then stays whatever happens (fail toward "authored").
-    if let (Some((seat, binaries_before)), Some(wd)) = (new_author, session.workdir.as_deref()) {
+    if let (Some((seat, binaries_before, authored_before)), Some(wd)) =
+        (new_author, session.workdir.as_deref())
+    {
         let from_baseline = unit.worktree_baseline.as_ref().and_then(|b| {
             let git_dir = b.git_dir.clone()?;
             let tree = if baseline_fresh {
@@ -12168,6 +12194,7 @@ fn dispatch_unit_with(
                 tree,
                 git_dir,
                 binaries_before,
+                authored_before: Some(authored_before),
             });
             put_node(store, unit.to_node())?;
         }
@@ -32831,6 +32858,7 @@ mod seat_failover_tests {
                 tree: start.tree.clone(),
                 git_dir: git_dir.to_string_lossy().into_owned(),
                 binaries_before: vec!["/bin/claude".into()],
+                authored_before: None,
             });
             put_node(&mut store, u.to_node()).unwrap();
             if edit {
@@ -32865,6 +32893,13 @@ mod seat_failover_tests {
                     .as_ref()
                     .is_none_or(|p| p.seat == "agy"),
                 "{tag}: codex's probe is consumed"
+            );
+            // (core#1525) …and records the seat IDs it launched as, for the judge to exclude.
+            assert_eq!(
+                units[0].launched_seats.first().map(String::as_str),
+                Some("agy"),
+                "{tag}: {:?}",
+                units[0].launched_seats
             );
             // The failover's own dispatch makes agy an author; codex is one only if it changed the tree.
             let authors = &units[0].authored_by;
@@ -39665,6 +39700,37 @@ mod work_author_tests {
         assert_eq!(
             distinct_evaluator_seat(&s, &[build.clone(), on_pi.clone()], &on_pi),
             None
+        );
+    }
+
+    /// (core#1525) Evaluators are kept off a creator by the seat IDs its launch ran as: a build
+    /// dispatched on `codex` with a frozen `claude -p` is authored by both, so a test seated on
+    /// claude moves too (KEY: the attacker's frozen invocation).
+    #[test]
+    fn core_1525_a_review_never_dispatches_onto_a_seat_id_the_build_ran_as() {
+        let s = session(&["claude", "pi", "codex"], &[]);
+        let mut build = unit(4, StageKind::Build, "codex", &[]);
+        let roster: Vec<crate::AgenticCli> = wicked_council::registry::builtin()
+            .into_iter()
+            .filter(|c| c.key == "claude" || c.key == "codex")
+            .collect();
+        let ids = crate::cli_runner::launched_seat_ids(
+            "codex",
+            Some("claude -p \"{PROMPT}\"".into()),
+            &roster,
+        );
+        assert_eq!(ids, vec!["codex", "claude"]);
+        assert!(crate::domain::stamp_author(
+            &mut build,
+            "codex".into(),
+            Vec::new(),
+            ids[1..].to_vec()
+        ));
+        let test = unit(5, StageKind::Test, "claude", &[]);
+        let units = vec![build, test.clone()];
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &test).as_deref(),
+            Some("pi")
         );
     }
 

@@ -589,6 +589,11 @@ pub struct AuthorProbe {
     pub git_dir: String,
     /// [`WorkUnit::authored_binaries`] before the stamp, restored if the seat is taken back out.
     pub binaries_before: Vec<String>,
+    /// (core#1525) [`WorkUnit::authored_by`] before the stamp, restored if the seat is taken back
+    /// out: the stamp also adds every registry seat the launch ran as (its seat IDs), and those go
+    /// with it. `None` on a probe persisted before this field: only `seat` is taken back.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authored_before: Option<Vec<String>>,
 }
 
 /// (PRODUCT-WORKS J6) Take back the author stamp of a failed attempt that changed nothing: when
@@ -610,7 +615,10 @@ pub fn retract_unproductive_author(
     let unchanged = tree_now.is_some_and(|t| t == probe.tree);
     let probe = unit.author_probe.take().expect("checked above");
     if unchanged {
-        unit.authored_by.retain(|s| s != seat);
+        match probe.authored_before {
+            Some(before) => unit.authored_by = before,
+            None => unit.authored_by.retain(|s| s != seat),
+        }
         unit.authored_binaries = probe.binaries_before;
     }
     true
@@ -625,11 +633,21 @@ pub const UNKNOWN_AUTHOR_BINARY: &str = "(unrecorded)";
 /// Record that `seat`, running `binary`, authored `unit` (a dispatch, a floor fix). Returns whether
 /// anything changed. A unit that already had authors but no recorded binary gets
 /// [`UNKNOWN_AUTHOR_BINARY`] first.
-pub fn stamp_author(unit: &mut WorkUnit, seat: String, binaries: Vec<String>) -> bool {
+///
+/// (core#1525) `also_ran_as`: the other registry seats that launch ran as
+/// ([`crate::cli_runner::launched_seat_ids`]) — each is an author too, by seat ID.
+pub fn stamp_author(
+    unit: &mut WorkUnit,
+    seat: String,
+    binaries: Vec<String>,
+    also_ran_as: Vec<String>,
+) -> bool {
     let mut changed = stamp_author_binaries(unit, !unit.authored_by.is_empty(), binaries);
-    if !unit.authored_by.contains(&seat) {
-        unit.authored_by.push(seat);
-        changed = true;
+    for s in std::iter::once(seat).chain(also_ran_as) {
+        if !unit.authored_by.contains(&s) {
+            unit.authored_by.push(s);
+            changed = true;
+        }
     }
     changed
 }
@@ -1304,6 +1322,14 @@ pub struct WorkUnit {
     /// whose binaries cannot be established, and no fallback judge is seated for its work.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub authored_binaries: Vec<String>,
+    /// (crew#972, coord ruling on core#1525) The roster seat IDs this unit's LATEST dispatch ran
+    /// as, recorded at launch ([`crate::cli_runner::launched_seat_ids`]): the key dispatch chose,
+    /// then every registry seat whose identity the launched invocation shares (a frozen
+    /// `claude -p` under key `codex` is `[codex, claude]`; one binary under two roster names is
+    /// both). The unit's judge is excluded by these seat IDs, never by re-reading invocation
+    /// strings. Replaced at each dispatch. Absent on the wire when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub launched_seats: Vec<String>,
     /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
     /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
     /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
@@ -1902,6 +1928,7 @@ impl WorkUnit {
             worker_failed_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
+            launched_seats: Vec::new(),
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,

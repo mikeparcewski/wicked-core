@@ -3433,7 +3433,7 @@ fn in_run_roster(run_roster: &[String], key: &str) -> bool {
 fn author_identities(excluded: &[&str], registry: &[crate::AgenticCli]) -> Vec<String> {
     excluded
         .iter()
-        .map(|k| crate::validator::excluded_identity(k, registry))
+        .flat_map(|k| crate::validator::excluded_identities(k, registry))
         .collect()
 }
 
@@ -3449,7 +3449,10 @@ fn without_author_binaries(
         .iter()
         .filter(|c| {
             excluded.contains(&c.key.as_str())
-                || !author_ids.contains(&crate::validator::seat_identity(c))
+                || !crate::validator::same_identity(
+                    &crate::validator::seat_identities(c),
+                    author_ids,
+                )
         })
         .cloned()
         .collect()
@@ -3576,6 +3579,12 @@ pub(crate) fn rejudge_seats(
         "ran this step, so it never judges its own output"
     };
     party(&mut parties, &work_author, own_why);
+    // (coord ruling on core#1525) …and every other seat ID its launch ran as, as the rotation
+    // excludes them ([`unit_launched_seats`]).
+    let launched = unit_launched_seats(unit, roster);
+    for a in &launched {
+        party(&mut parties, a, own_why);
+    }
     for a in &unit.authored_by {
         party(&mut parties, a, BUILT_THIS_WORK);
     }
@@ -3585,7 +3594,10 @@ pub(crate) fn rejudge_seats(
     for (k, why) in parties.iter_mut() {
         if built(k) {
             *why = BUILT_THIS_WORK;
-        } else if *k == work_author || seat_key(k) == seat_key(&work_author) {
+        } else if *k == work_author
+            || seat_key(k) == seat_key(&work_author)
+            || launched.iter().any(|l| l == k)
+        {
             *why = own_why;
         }
     }
@@ -3671,6 +3683,7 @@ pub(crate) fn rejudge_seats(
                 unit.authored_by
                     .iter()
                     .chain(&unit.exclude_seats)
+                    .chain(&launched)
                     .chain(work_authors)
                     .chain(&unit.authored_binaries)
                     .chain(b)
@@ -3924,10 +3937,10 @@ fn validator_author_ids(roster: &[crate::AgenticCli]) -> Vec<String> {
         .find(|c| c.key == v)
         .map(|c| c.headless_invocation.clone());
     let mut ids = launched_identities(v, invocation);
-    for id in [
-        crate::validator::excluded_identity(v, roster),
-        crate::validator::normalize_identity(v),
-    ] {
+    for id in crate::validator::excluded_identities(v, roster)
+        .into_iter()
+        .chain([crate::validator::normalize_identity(v)])
+    {
         if !ids.contains(&id) {
             ids.push(id);
         }
@@ -3953,8 +3966,10 @@ fn validator_author_built<'a>(
     let is_v = |k: &str| {
         k == v
             || seat_key(k) == v
-            || v_ids.contains(&crate::validator::normalize_identity(k))
-            || v_ids.contains(&crate::validator::excluded_identity(k, roster))
+            || crate::validator::same_identity(
+                &crate::validator::excluded_identities(k, roster),
+                &v_ids,
+            )
     };
     is_v(work_author)
         || launched_identities(work_author, unit.assigned_invocation.clone())
@@ -4032,8 +4047,10 @@ fn disclose_validator_author_judge(
     };
     let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
     if crate::team::runner::seat_key(&seat) != v
-        && crate::validator::excluded_identity(&seat, roster)
-            != crate::validator::excluded_identity(v, roster)
+        && !crate::validator::same_identity(
+            &crate::validator::excluded_identities(&seat, roster),
+            &crate::validator::excluded_identities(v, roster),
+        )
     {
         return av;
     }
@@ -4122,7 +4139,10 @@ fn disclose_monitor_judge(
     if !monitors
         .iter()
         .any(|m| m == &seat || crate::team::runner::seat_key(m) == cli)
-        && !ids.contains(&crate::validator::excluded_identity(&seat, roster))
+        && !crate::validator::same_identity(
+            &crate::validator::excluded_identities(&seat, roster),
+            &ids,
+        )
     {
         return av;
     }
@@ -4157,9 +4177,10 @@ impl<'a> CreatorIds<'a> {
     fn names(&self, seat: &str) -> bool {
         let cli = wicked_apps_core::spawn::seat_cli_key(seat);
         self.keys.iter().any(|k| k == seat || k == cli)
-            || self
-                .ids
-                .contains(&crate::validator::excluded_identity(seat, self.roster))
+            || crate::validator::same_identity(
+                &crate::validator::excluded_identities(seat, self.roster),
+                &self.ids,
+            )
     }
 }
 
@@ -4205,6 +4226,10 @@ pub(crate) fn launched_identity(key: &str, invocation: Option<String>) -> String
 /// invocation's binary ([`launched_identity`]) and its registry record's other carriers — the
 /// `binary` field and the ACP adapter's CLI ([`record_identities`]) — so an author is excluded by
 /// whichever carrier actually ran it.
+///
+/// Names only (no executable path): these are recorded on the run ([`crate::domain::WorkUnit::
+/// authored_binaries`], rule rows' `judge_ids`), host-independent. The canonical executable is
+/// compared in-process only, through seat IDs ([`launched_seat_ids`]).
 pub(crate) fn launched_identities(key: &str, invocation: Option<String>) -> Vec<String> {
     let mut out = vec![launched_identity(key, invocation)];
     let registry = full_registry();
@@ -4223,9 +4248,66 @@ pub(crate) fn launched_identities(key: &str, invocation: Option<String>) -> Vec<
     out
 }
 
+/// (crew#972, coord ruling on core#1525) The roster seat IDs ONE launch of `key` with
+/// `invocation` runs as: `key` first, then every seat of `registry` whose identity
+/// ([`record_identities`]) the launch shares ([`launched_identities`]: the binary dispatch
+/// launches, resolved once by [`crate::validator::invocation_identities`], and the key's own
+/// record's carriers). Dispatch records it ([`crate::domain::WorkUnit::launched_seats`], and the
+/// authors of Build/Recon work); judges, evaluators and arbiters are excluded by these seat IDs.
+pub(crate) fn launched_seat_ids(
+    key: &str,
+    invocation: Option<String>,
+    registry: &[crate::AgenticCli],
+) -> Vec<String> {
+    // What the launch runs, with the canonical executable (in-process, never recorded).
+    let mut ran = crate::validator::invocation_identities(
+        &crate::execute_wrapped::launch_invocation(key, invocation.clone()),
+    );
+    ran.extend(launched_identities(key, invocation));
+    let mut out = vec![key.to_string()];
+    for c in registry {
+        let mut ids = crate::validator::seat_identities(c);
+        ids.extend(record_identities(c));
+        if !out.contains(&c.key) && crate::validator::same_identity(&ids, &ran) {
+            out.push(c.key.clone());
+        }
+    }
+    out
+}
+
+/// (crew#972, coord ruling on core#1525) The seat IDs an agent unit's own work ran as: its launch
+/// record ([`crate::domain::WorkUnit::launched_seats`]) and, for a unit dispatched before the
+/// record, its seat and frozen invocation resolved by the same [`launched_seat_ids`] against
+/// `roster`. Empty for a tool unit (its `assigned_cli` is its program, not a seat).
+pub(crate) fn unit_launched_seats(
+    unit: &crate::domain::WorkUnit,
+    roster: &[crate::AgenticCli],
+) -> Vec<String> {
+    if unit.tool_cmd.is_some() {
+        return Vec::new();
+    }
+    let mut out = unit.launched_seats.clone();
+    if let Some(k) = unit.assigned_cli.as_deref() {
+        for id in launched_seat_ids(k, unit.assigned_invocation.clone(), roster) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// [`launched_seat_ids`] without `key` itself: the OTHER registry seats a launch of `key` ran as,
+/// stamped beside it as authors ([`crate::domain::stamp_author`]).
+pub(crate) fn launch_aliases(key: &str, invocation: Option<String>) -> Vec<String> {
+    let mut ids = launched_seat_ids(key, invocation, &full_registry());
+    ids.remove(0);
+    ids
+}
+
 /// Every identity a registry record may execute: its headless invocation's binary (quote-aware),
 /// its `binary` field, and its ACP adapter's CLI (`claude-agent-acp` → `claude`, `codex-acp` →
-/// `codex`, `agy-acp` → `agy`).
+/// `codex`, `agy-acp` → `agy`). Names only: rows record them.
 pub(crate) fn record_identities(c: &crate::AgenticCli) -> Vec<String> {
     let mut out = vec![invocation_identity(&c.headless_invocation)];
     let bin = crate::validator::normalize_identity(&c.binary);
@@ -4278,7 +4360,13 @@ pub(crate) fn full_registry() -> Vec<crate::AgenticCli> {
     // The same user path the execution carriers resolve (HOME, then USERPROFILE), so the records
     // checked are the records run (codex r7).
     let user = wicked_council::registry::default_user_path();
-    wicked_council::registry::load(user.as_deref()).unwrap_or_default()
+    let registry = wicked_council::registry::load(user.as_deref()).unwrap_or_default();
+    // (core#1525) Each seat's identity is resolved here, at roster load, once per invocation
+    // template for the process ([`crate::validator::invocation_identities`] caches it).
+    for c in &registry {
+        crate::validator::invocation_identities(&c.headless_invocation);
+    }
+    registry
 }
 
 /// The fallback seats' records from `registry` (the full one), in fallback order. Unfiltered on
@@ -4385,7 +4473,7 @@ fn fallback_candidates(
             .filter(|c| {
                 // Both spellings: the launcher's quote-aware read and the rotation's (codex r3).
                 !ids.contains(&invocation_identity(&c.headless_invocation))
-                    && !ids.contains(&crate::validator::seat_identity(c))
+                    && !crate::validator::same_identity(&crate::validator::seat_identities(c), &ids)
             })
             .map(|c| {
                 let mut c = c.clone();
@@ -5475,6 +5563,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
     }
     // Instance AND cli key: excluding `claude#2` excludes a `claude` seat too.
     let mut team_excluded: Vec<String> = Vec::new();
+    // (crew#972, coord ruling on core#1525) The seat IDs this unit's own work ran as, by its
+    // launch record: a frozen `claude -p` under key `codex` keeps claude out, by seat ID.
+    let launched = unit_launched_seats(&input.unit, roster);
     // (EP-K3) The launch's judge exclusion is UNIONED in (never replaces): it can only narrow.
     // (crew#972) So is every seat this unit was ever dispatched on: a reassigned or failed-over
     // creator authored part of the work and never judges it.
@@ -5483,6 +5574,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .exclude_seats
         .iter()
         .chain(&input.unit.authored_by)
+        .chain(&launched)
     {
         for k in [a.as_str(), crate::team::runner::seat_key(a)] {
             if !team_excluded.iter().any(|e| e == k) {
@@ -5529,12 +5621,14 @@ fn run_unit_and_judge_in<'scope, 'env>(
     };
     // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
     let mut bus_excluded: Vec<String> = team_authors.clone();
-    // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path.
+    // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path,
+    // and every seat ID its own work ran as (core#1525).
     for s in input
         .unit
         .exclude_seats
         .iter()
         .chain(&input.unit.authored_by)
+        .chain(&launched)
     {
         if !bus_excluded.contains(s) {
             bus_excluded.push(s.clone());
@@ -9239,6 +9333,166 @@ mod tests {
             std::iter::empty(),
             &roster
         ));
+    }
+
+    /// (crew#972, coord ruling on core#1525) A seat that ran the work never judges it, by the seat
+    /// ID dispatch recorded — the attacker's rosters, each on a pinned gate with the validator
+    /// author's re-admission in play:
+    /// KEY: (1) a frozen `claude -p` under key `codex`; (2) a quoted wrapper path the validator seat
+    /// runs, recorded as an author binary; (3) a quoted-path alias of the author; (4) one binary
+    /// under two roster names. SILENT-OK: with no seat left that did not run the work, no judge is
+    /// dispatched and the skip says why. SAYS-VS-DOES: the re-judge readiness names exactly the
+    /// seat the rotation dispatches (or none when it dispatches none).
+    #[test]
+    fn core_1525_a_seat_that_ran_the_work_never_judges_it_by_seat_id() {
+        struct Rec(std::sync::Mutex<Vec<Option<String>>>);
+        impl StepRunner for Rec {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                self.0.lock().unwrap().push(input.unit.assigned_cli.clone());
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nrecorded\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1525-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let noop: &DeltaSink = &|_: &str| {};
+        // The unit as dispatch leaves it: its seat, invocation and launch record (one function).
+        let unit_on = |seat: &str, invocation: Option<&str>, roster: &[crate::AgenticCli]| {
+            let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+            u.assigned_cli = Some(seat.into());
+            u.assigned_invocation = invocation.map(str::to_string);
+            u.launched_seats = launched_seat_ids(seat, u.assigned_invocation.clone(), roster);
+            u.validator = Some(crate::validator::DeterministicValidator {
+                criterion: "the work is correct".into(),
+                script: "test -f x".into(),
+                approved: true,
+            });
+            u
+        };
+        // Runs the gate's judge; returns (seats dispatched after the work, judge_skipped, the
+        // re-judge readiness's eligible seats).
+        let judge = |unit: crate::domain::WorkUnit, roster: &[crate::AgenticCli]| {
+            let rec = Arc::new(Rec(std::sync::Mutex::new(Vec::new())));
+            let runner: Arc<dyn StepRunner> = rec.clone();
+            let run: Vec<String> = roster.iter().map(|c| c.key.clone()).collect();
+            let input = StepInput {
+                run_id: "r".into(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: unit.clone(),
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let (_o, _v, evidence) = run_unit_and_judge_with_launches(
+                &runner,
+                &input,
+                noop,
+                roster,
+                &run,
+                &[],
+                roster,
+                &[],
+                Some(&[]),
+            );
+            let seen: Vec<String> = rec.0.lock().unwrap()[1..]
+                .iter()
+                .map(|s| s.clone().unwrap_or_default())
+                .collect();
+            let (ready, _) =
+                rejudge_seats(&unit, roster, &run, &[], &[], Some(&[]), roster, roster);
+            (seen, evidence.judge_skipped, ready)
+        };
+        let two = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        // Baseline: codex built it, claude (the validator's author) judges, disclosed elsewhere.
+        let (seen, skipped, ready) = judge(unit_on("codex", None, &two), &two);
+        assert_eq!(seen, vec!["claude".to_string()], "{skipped:?}");
+        assert_eq!(ready, seen, "readiness says what the rotation does");
+
+        // (1) KEY + SILENT-OK: the frozen invocation ran claude under codex's name. The record says
+        // so, by seat ID, and no seat that did not run the work is left: no judge, and why.
+        let frozen = unit_on("codex", Some("claude -p {PROMPT}"), &two);
+        assert_eq!(frozen.launched_seats, vec!["codex", "claude"]);
+        let (seen, skipped, ready) = judge(frozen.clone(), &two);
+        assert!(seen.is_empty(), "claude ran the work: {seen:?}");
+        assert!(skipped.is_some_and(|w| !w.is_empty()), "the skip names why");
+        assert!(ready.is_empty(), "readiness agrees: {ready:?}");
+        // …and a unit dispatched before the record resolves the same seat IDs at judge time.
+        let mut legacy = frozen;
+        legacy.launched_seats.clear();
+        let (seen, _, ready) = judge(legacy, &two);
+        assert!(seen.is_empty() && ready.is_empty(), "{seen:?} {ready:?}");
+
+        // (2) KEY: the validator seat runs a quoted wrapper an author recorded running.
+        let wrapped = vec![
+            seat("claude", "\"/opt/Seat Tools/claude-wrapper\" -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let mut ran = unit_on("codex", None, &wrapped);
+        ran.authored_by = vec!["codex".into()];
+        ran.authored_binaries = vec!["claude-wrapper".into(), "codex".into()];
+        let (seen, skipped, ready) = judge(ran, &wrapped);
+        assert!(seen.is_empty(), "an author ran claude's wrapper: {seen:?}");
+        assert!(skipped.is_some());
+        assert!(ready.is_empty(), "{ready:?}");
+
+        // (3) KEY: a quoted-path alias of the author. Its seat ID is recorded with the author's, so
+        // it never judges; claude (a different binary behind another quoted path) does.
+        let aliased = vec![
+            seat("claude", "\"/opt/Seat Tools/claude\" -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("reviewer", "\"/opt/Seat Tools/codex\" exec {PROMPT}"),
+        ];
+        let u = unit_on("codex", None, &aliased);
+        assert_eq!(u.launched_seats, vec!["codex", "reviewer"]);
+        let (seen, _, ready) = judge(u, &aliased);
+        assert_eq!(seen, vec!["claude".to_string()], "never the codex alias");
+        assert_eq!(ready, seen);
+
+        // (4) KEY: one binary under two roster names (a symlink): either name built it, neither
+        // judges it.
+        #[cfg(unix)]
+        {
+            let real = dir.join("codex");
+            std::fs::write(&real, "#!/bin/sh\n").unwrap();
+            let alias = dir.join("cx");
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let one_bin = vec![
+                seat("claude", "claude -p {PROMPT}"),
+                seat("codex", &format!("{} exec {{PROMPT}}", real.display())),
+                seat("cx", &format!("{} exec {{PROMPT}}", alias.display())),
+            ];
+            for (author, other) in [("codex", "cx"), ("cx", "codex")] {
+                // Dispatched with its roster template, as distribution freezes it.
+                let inv = one_bin.iter().find(|c| c.key == author).unwrap();
+                let u = unit_on(author, Some(&inv.headless_invocation), &one_bin);
+                assert!(u.launched_seats.contains(&other.to_string()), "{u:?}");
+                let (seen, _, ready) = judge(u, &one_bin);
+                assert_eq!(seen, vec!["claude".to_string()], "never {other}");
+                assert_eq!(ready, seen);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -13110,7 +13364,8 @@ mod judge_fallback_tests {
         assert!(crate::domain::stamp_author(
             &mut legacy,
             "pi".into(),
-            vec!["pi".into()]
+            vec!["pi".into()],
+            Vec::new()
         ));
         assert_eq!(
             legacy.authored_binaries,
@@ -13125,13 +13380,15 @@ mod judge_fallback_tests {
         assert!(crate::domain::stamp_author(
             &mut fresh,
             "copilot".into(),
-            vec!["agy".into()]
+            vec!["agy".into()],
+            Vec::new()
         ));
         assert_eq!(fresh.authored_binaries, vec!["agy".to_string()]);
         assert!(!crate::domain::stamp_author(
             &mut fresh,
             "copilot".into(),
-            vec!["agy".into()]
+            vec!["agy".into()],
+            Vec::new()
         ));
         // (codex r6) A non-build Creator dispatched before the record: its next stamp keeps the
         // unknown mark, so a reassign never makes that history look complete.

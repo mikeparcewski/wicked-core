@@ -2236,28 +2236,108 @@ pub(crate) fn normalize_identity(tok: &str) -> String {
 /// binary under different KEYS (e.g. `claude` + `claude-sonnet`, both running `claude`) resolve to ONE
 /// identity, so a same-binary seat is never a valid "distinct" judge. NOT the `binary` registry field
 /// (which the ad-hoc/test seats leave unset) — the invocation is the ground truth of what runs.
+///
+/// (coord codex-checks on #1525) Read quote-aware, with the tokenizer dispatch launches with
+/// ([`crate::execute_wrapped::template_binary`]): a whitespace split read every quoted path as its
+/// first word, so two different CLIs could look like one and one CLI like two. It is the first of
+/// [`seat_identities`]; a distinctness check compares the whole set.
 pub(crate) fn seat_identity(c: &AgenticCli) -> String {
-    let argv0 = c
-        .headless_invocation
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    normalize_identity(argv0)
+    seat_identities(c).swap_remove(0)
+}
+
+/// (crew#972, coord codex-checks on #1525) EVERY identity a seat runs as ([`invocation_identities`]
+/// of its headless invocation). Two seats are the same identity when their sets meet.
+pub(crate) fn seat_identities(c: &AgenticCli) -> Vec<String> {
+    invocation_identities(&c.headless_invocation)
+}
+
+/// (crew#972, coord codex-checks on #1525) EVERY identity an invocation template runs as, resolved
+/// once per template for the process (its first use is the roster's load) and never re-parsed at
+/// check time: the binary dispatch launches, read quote-aware and normalized (basename, case-folded),
+/// then — when that binary resolves to a file (a path, or a name on `PATH`) — the canonical
+/// executable's full path (symlinks followed), so one binary registered under two names is one
+/// identity. The full path, not its basename: npm-installed CLIs canonicalize to generic entry
+/// scripts (`cli.js`), on which two different CLIs must not collide.
+pub(crate) fn invocation_identities(invocation: &str) -> Vec<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static RESOLVED: OnceLock<Mutex<HashMap<String, Vec<String>>>> = OnceLock::new();
+    let cache = RESOLVED.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(ids) = cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(invocation)
+    {
+        return ids.clone();
+    }
+    let bin = crate::execute_wrapped::template_binary(invocation);
+    let mut ids = vec![normalize_identity(&bin)];
+    if let Some(real) = resolve_executable(&bin).and_then(|p| std::fs::canonicalize(p).ok()) {
+        let real = real.to_string_lossy().into_owned();
+        if !ids.contains(&real) {
+            ids.push(real);
+        }
+    }
+    cache
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(invocation.to_string(), ids.clone());
+    ids
+}
+
+/// The file `bin` launches: itself when it names a path, else the first `PATH` entry holding it
+/// (with `.exe` too on Windows).
+fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
+    if bin.is_empty() {
+        return None;
+    }
+    let p = std::path::Path::new(bin);
+    if bin.contains(['/', '\\']) {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let names: Vec<String> = if cfg!(windows) {
+        vec![bin.to_string(), format!("{bin}.exe")]
+    } else {
+        vec![bin.to_string()]
+    };
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .flat_map(|d| names.iter().map(move |n| d.join(n)).collect::<Vec<_>>())
+        .find(|c| c.is_file())
+}
+
+/// Whether two identity sets ([`seat_identities`], [`excluded_identities`]) name one identity.
+pub(crate) fn same_identity(a: &[String], b: &[String]) -> bool {
+    a.iter().any(|x| b.contains(x))
 }
 
 /// The normalized identity to EXCLUDE for an author key: if the key names a roster seat, its invocation
 /// identity; otherwise the normalized key itself. So excluding the deterministic author `claude` also
 /// excludes a `claude-sonnet` seat that invokes `claude` (C2), whether or not `claude` is itself listed.
 pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
+    excluded_identities(key, roster).swap_remove(0)
+}
+
+/// (crew#972, coord codex-checks on #1525) EVERY identity to exclude for an author key: its roster
+/// seat's [`seat_identities`], or, for a key no roster seat has (a recorded binary, an off-roster
+/// author), the key itself as recorded and normalized.
+pub(crate) fn excluded_identities(key: &str, roster: &[AgenticCli]) -> Vec<String> {
     // (core#937, codex r2) An instance key (`pi#2`) is its CLI's seat: the judge pool maps it to
     // that seat, so the exclusion must resolve it the same way or `pi` would judge `pi#2`'s work.
     let cli = wicked_apps_core::spawn::seat_cli_key(key);
-    roster
+    match roster
         .iter()
         .find(|c| c.key == key)
         .or_else(|| roster.iter().find(|c| c.key == cli))
-        .map(seat_identity)
-        .unwrap_or_else(|| normalize_identity(key))
+    {
+        Some(c) => seat_identities(c),
+        None => {
+            let mut ids = vec![normalize_identity(key)];
+            if !ids.iter().any(|i| i == key) {
+                ids.push(key.to_string());
+            }
+            ids
+        }
+    }
 }
 
 /// Choose a council seat for the agent judge whose NORMALIZED identity ([`seat_identity`]) is DISTINCT
@@ -2267,7 +2347,7 @@ pub(crate) fn excluded_identity(key: &str, roster: &[AgenticCli]) -> String {
 /// (wrapping), skipping any seat whose identity is excluded and any seat with an empty invocation.
 /// Returns `None` when NO usable, identity-distinct seat exists — the caller then falls back to the single
 /// default runner. Pure + deterministic, so it is unit-testable with a fabricated roster and no live CLI.
-fn select_agent_seat<'a>(
+pub(crate) fn select_agent_seat<'a>(
     excluded_keys: &[&str],
     roster: &'a [AgenticCli],
 ) -> Option<&'a AgenticCli> {
@@ -2304,11 +2384,11 @@ fn eligible_agent_seats<'a>(
     // (core#572) Judging is work: a ballot-only seat is never the agent judge.
     let usable =
         |c: &AgenticCli| !c.headless_invocation.trim().is_empty() && c.seat_eligible_for_work;
-    let excluded_ids: std::collections::HashSet<String> = excluded_keys
+    let excluded_ids: Vec<String> = excluded_keys
         .iter()
-        .map(|k| excluded_identity(k, roster))
+        .flat_map(|k| excluded_identities(k, roster))
         .collect();
-    let distinct = |c: &AgenticCli| usable(c) && !excluded_ids.contains(&seat_identity(c));
+    let distinct = |c: &AgenticCli| usable(c) && !same_identity(&seat_identities(c), &excluded_ids);
     // Anchor the wrap on the FIRST excluded key that names a roster seat (mirrors next_cli_in_roster);
     // the anchor itself is excluded by identity, so we only need to visit the OTHER seats once.
     let anchor = excluded_keys

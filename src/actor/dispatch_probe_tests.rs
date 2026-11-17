@@ -345,6 +345,7 @@ fn post_step_reads_cover_every_attempt_the_fold_treats_as_failed() {
         tree: String::new(),
         git_dir: git_dir.clone(),
         binaries_before: Vec::new(),
+        authored_before: None,
     });
     let input = StepInput {
         run_id: "p".into(),
@@ -430,6 +431,7 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         tree: String::new(),
         git_dir: git_dir.clone(),
         binaries_before: Vec::new(),
+        authored_before: None,
     });
     let input = StepInput {
         run_id: "e".into(),

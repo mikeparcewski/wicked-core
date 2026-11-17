@@ -1111,7 +1111,11 @@ pub(crate) fn apply_and_finish_unit(
                             &seat,
                             unit.assigned_invocation.clone(),
                         );
-                        crate::domain::stamp_author(unit, seat, binaries);
+                        let aliases = crate::cli_runner::launch_aliases(
+                            &seat,
+                            unit.assigned_invocation.clone(),
+                        );
+                        crate::domain::stamp_author(unit, seat, binaries, aliases);
                     }
                 }
                 emit(CoreEvent::EvaluatorMutatedWorktree {
@@ -1969,7 +1973,8 @@ pub(crate) fn apply_and_finish_unit(
     if let Some(seat) = floor_fixer {
         // The floor fix runs with no recorded invocation (`cli_runner::floor_fix_unit`).
         let binaries = crate::cli_runner::launched_identities(&seat, None);
-        crate::domain::stamp_author(unit, seat, binaries);
+        let aliases = crate::cli_runner::launch_aliases(&seat, None);
+        crate::domain::stamp_author(unit, seat, binaries, aliases);
     }
     // (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record — evidence on the persisted unit,
     // kept whichever way it went; `None` (no reviewer this attempt) leaves the last one.
@@ -6465,6 +6470,7 @@ mod guarded_read_step_tests {
             tree: "t0".into(),
             git_dir: "/g".into(),
             binaries_before: vec!["/bin/claude".into()],
+            authored_before: None,
         };
         let base = || {
             let mut u = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
@@ -6508,6 +6514,29 @@ mod guarded_read_step_tests {
         ));
         assert_eq!(u.author_probe, Some(probe()));
         assert_eq!(u.authored_by.len(), 2);
+        // (core#1525) A launch that ran as another seat too (a frozen `claude -p` under `codex`)
+        // stamps both seat IDs; an unproductive attempt takes both back (J6), never only its key.
+        let mut u = unit(6, StageKind::Build, PhaseRole::Creator, "codex");
+        u.authored_by = vec!["pi".into()];
+        let before = u.authored_by.clone();
+        assert!(crate::domain::stamp_author(
+            &mut u,
+            "codex".into(),
+            vec!["claude".into()],
+            vec!["claude".into()]
+        ));
+        assert_eq!(u.authored_by, vec!["pi", "codex", "claude"]);
+        u.author_probe = Some(crate::domain::AuthorProbe {
+            authored_before: Some(before),
+            ..probe()
+        });
+        assert!(crate::domain::retract_unproductive_author(
+            &mut u,
+            "codex",
+            3,
+            Some("t0")
+        ));
+        assert_eq!(u.authored_by, vec!["pi".to_string()]);
     }
 
     /// (DES-CATALOG-002 §5.1, report-author provenance) For a unit whose rubric excludes gatherers,
