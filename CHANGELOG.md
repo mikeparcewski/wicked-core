@@ -42,7 +42,8 @@ Two release tracks share this file, newest entry first regardless of track:
   tripwire would have failed it over, so no other seat is asked in its place (the classifier's
   substring match had read "tests all exited 0" in a FAIL's own text as a crash, run 4ff99f51). A
   failed turn's PASS is not promoted: it may have been cut off or echoed, and it still fails over.
-  A seat-credential refusal never erases a FAIL either: the refusal leads the gate's text and the
+  A seat-credential refusal never erases a FAIL either: the refusal is appended after the
+  reviewer's answer (so the gate's bounded findings, the answer's tail, always carry it) and the
   FAIL stays the result (delivery still scans the work before any push).
   Every escalation and adjudication gate, and the def gate that reviews a unit, says which seats
   gave no verdict first and which seat's result it shows (or that none produced one).
