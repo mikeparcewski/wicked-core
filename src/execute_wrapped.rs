@@ -4913,6 +4913,9 @@ impl WrappedCliStepRunner {
                     crate::hook_relay::register(t, crate::hook_relay::HookContext { env, cwd })
                 });
             let bounded = run_bounded(cmd, timeout, emit, adapter, Some(cancel_token.clone()));
+            // (core#1543) The launch's receipt: what it was observed to run, under the seat it
+            // was launched as (`None` when it was not observed: a pod, a container, Windows).
+            crate::observed_identity::record_receipt(&cli_key, take_last_observed());
             // Revoking waits for the unit's calls still being judged, so its decisions log is
             // complete here; a refusal the relay could not record in it fails the unit (below).
             let unrecorded_refusal = hook_registration.is_some_and(|r| r.finish());
@@ -7607,6 +7610,35 @@ pub(crate) fn wrapped_exit_code(output: &str) -> Option<i32> {
     code.trim().parse().ok()
 }
 
+/// (core#1543) How often a running launch's process tree is looked at.
+const OBSERVE_EVERY: Duration = Duration::from_millis(250);
+
+thread_local! {
+    /// (core#1543) What the last [`run_bounded`] on this thread observed its launch to run:
+    /// read once by the carrier, which records it as the launch's receipt.
+    static LAST_OBSERVED: std::cell::RefCell<Option<Vec<crate::observed_identity::Identity>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take what the last [`run_bounded`] on this thread observed (`None`: unobserved).
+pub(crate) fn take_last_observed() -> Option<Vec<crate::observed_identity::Identity>> {
+    LAST_OBSERVED.with(|o| o.borrow_mut().take())
+}
+
+/// (core#1543) Whether `cmd` is a container or pod CLIENT: the process it starts is the client,
+/// not the seat, so the launch is not observed on this host.
+fn is_container_client(cmd: &Command) -> bool {
+    Path::new(cmd.get_program())
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| {
+            matches!(
+                s.to_ascii_lowercase().as_str(),
+                "docker" | "podman" | "nerdctl" | "kubectl" | "ctr" | "lima" | "colima"
+            )
+        })
+}
+
 pub(crate) fn run_bounded(
     cmd: Command,
     timeout: Duration,
@@ -7616,6 +7648,8 @@ pub(crate) fn run_bounded(
     // the poll loop kills the child instead of letting it orphan past the run's death.
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> std::io::Result<BoundedRun> {
+    // (core#1543) Nothing a previous launch observed is ever read as this one's.
+    LAST_OBSERVED.with(|o| *o.borrow_mut() = None);
     // Pre-spawn guard (core#358): a token born cancelled means `ReassignUnit` landed in the
     // dispatch-to-registration window. Never spawn the child — otherwise the superseded worker
     // mutates the newly reassigned worktree for one poll tick before the loop below kills it.
@@ -7687,9 +7721,26 @@ pub(crate) fn run_bounded(
         // guard's comparison and still fold as clean).
         cmd.process_group(0);
     }
+    // (core#1543) Observe what this launch runs, from the live process tree. Never a container
+    // or pod client: what runs in there is not this host's process (unobserved, so callers fail
+    // closed).
+    let observe = pod_seat.is_none() && !is_container_client(&cmd);
     let mut child = cmd.spawn()?;
     drop(child.stdin.take());
     let so = child.stdout.take().expect("piped stdout");
+    #[cfg(unix)]
+    let mut observer = if observe {
+        use std::os::unix::io::AsRawFd;
+        crate::observed_identity::Observer::new(child.id(), so.as_raw_fd())
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let mut observer: Option<crate::observed_identity::Observer> = {
+        let _ = observe;
+        None
+    };
+    let mut last_sample = Instant::now();
     let se = child.stderr.take().expect("piped stderr");
     let child_ref = &mut child;
 
@@ -7791,6 +7842,12 @@ pub(crate) fn run_bounded(
                     if let Some(h) = heartbeat.as_ref() {
                         h.tick(last_line.load(std::sync::atomic::Ordering::Relaxed));
                     }
+                    if let Some(o) = observer.as_mut() {
+                        if last_sample.elapsed() >= OBSERVE_EVERY {
+                            o.sample();
+                            last_sample = Instant::now();
+                        }
+                    }
                     std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(_) => {
@@ -7806,6 +7863,9 @@ pub(crate) fn run_bounded(
         let err = err_h.join().unwrap_or_default();
         (code, killed_by, out, usage, files, tools, err)
     });
+    // (core#1543) What this launch was observed to run, for the carrier's receipt.
+    let observed = observer.and_then(crate::observed_identity::Observer::finish);
+    LAST_OBSERVED.with(|o| *o.borrow_mut() = observed);
 
     // The seat pod: its exit code is read back from the pod (a lost stream is no result), the
     // pod is deleted and waited out, and only then does the unit's work come back (B11).
@@ -12331,6 +12391,76 @@ mod tests {
             out.output
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (core#1543) The wrapped carrier records what each launch was OBSERVED to run, under the seat
+    /// it was launched as: two different programs are two identities, and the same program under
+    /// another seat key and another path is one.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn core_1543_the_carrier_records_what_each_launch_ran() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            std::path::Path::new("host"),
+        );
+        let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        let dir = std::env::temp_dir().join(format!("wcore-1543-carrier-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = |name: &str, tag: &str| {
+            let p = dir.join(name);
+            // Long enough for several looks; its children never hold the launch's stdout.
+            std::fs::write(
+                &p,
+                format!("#!/bin/sh\n# {tag}\nsleep 1.2 >/dev/null 2>&1\necho PASS\n"),
+            )
+            .unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let a = script("agent-a", "A");
+        let b = script("agent-b", "B");
+        std::os::unix::fs::symlink(&a, dir.join("alias-of-a")).unwrap();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let runner = WrappedCliStepRunner::with_tx(tx);
+        let launch = |seat: &str, program: &std::path::Path| {
+            let mut u = WorkUnit::pending("o:u1", "o", 1, "say PASS");
+            u.assigned_cli = Some(seat.to_string());
+            u.assigned_invocation = Some(format!("{} {{PROMPT}}", program.display()));
+            let input = StepInput {
+                run_id: "run-observe".to_string(),
+                unit_ix: 0,
+                attempt: 0,
+                unit: u,
+                workflow_id: "wf-o".to_string(),
+                entity_mode: crate::scope::EntityMode::Shared,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            crate::observed_identity::take_receipts();
+            let _ = runner.run_unit(&input);
+            let r = crate::observed_identity::take_receipts();
+            crate::observed_identity::observed_for(&r, seat)
+        };
+        let seen_a = launch("codex", &a).expect("observed on this host");
+        let seen_b = launch("claude", &b).expect("observed on this host");
+        assert!(
+            !crate::observed_identity::meets(&seen_a, &seen_b),
+            "two programs"
+        );
+        let seen_alias = launch("pi", &dir.join("alias-of-a")).expect("observed");
+        assert!(
+            crate::observed_identity::meets(&seen_a, &seen_alias),
+            "one program under another seat and path: {seen_a:?} vs {seen_alias:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A fake CLI whose RESOLVED stem is `name` — an executable shell script at `<dir>/<name>` that
