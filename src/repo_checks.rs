@@ -3547,6 +3547,39 @@ impl Drop for CheckScratch {
         if orphan_path(&self.root).exists() {
             drop(self.lease.take());
             retire_leaf(&self.root);
+            return;
+        }
+        // (core#1482) The floor's base build output goes when the run's LAST floor on this leaf
+        // ends ([`drop_base_output`]); the head target stays for incremental re-floors.
+        drop(self.lease.take());
+        drop_base_output(&self.root);
+    }
+}
+
+/// (core#1482) Remove `<leaf>/cargo-target/base` — about half a floor's peak disk; its results are
+/// in the run's log store — once no floor of the run holds the leaf: only under the leaf's
+/// EXCLUSIVE lock (non-blocking: a floor still building keeps it, review r1 on #1530), and never
+/// through a symlink a check left (`cargo-target` or `base` made a link is unlinked, not followed;
+/// `remove_dir_all` does not follow links inside). Returns whether the base output is gone.
+fn drop_base_output(leaf: &Path) -> bool {
+    let Ok(Some(_held)) = lock_leaf(leaf, true) else {
+        return false;
+    };
+    let target = leaf.join("cargo-target");
+    match std::fs::symlink_metadata(&target) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
+        Err(_) => return false,
+        Ok(m) if !m.is_dir() => return std::fs::remove_file(&target).is_ok(),
+        Ok(_) => {}
+    }
+    match remove_leaf_dir(&target.join("base")) {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not drop the floor's base build output under {}: {e}",
+                leaf.display()
+            );
+            false
         }
     }
 }
@@ -13263,6 +13296,57 @@ exit 1
         );
         assert!(!orphan_path(&leaf).exists());
         drop(lease);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1482) Each floor's base build output goes when the run's last floor on the leaf ends;
+    /// the head target stays. Adversarial (SILENT-OK / data loss): a second floor still building
+    /// keeps it, and a check that turned `base` or `cargo-target` into a symlink never gets the
+    /// removal followed out of the scratch.
+    #[test]
+    fn core_1482_the_last_floor_out_drops_its_base_output_and_follows_no_link() {
+        let base = scratch("cache-drop-base");
+        let cache = base.join("cache");
+        let wt = base.join("repo").join("wicked-worktrees").join("r1");
+        std::fs::create_dir_all(&wt).unwrap();
+        let fill = |leaf: &Path| {
+            std::fs::write(leaf.join("cargo-target/head/h.bin"), "h").unwrap();
+            std::fs::write(leaf.join("cargo-target/base/b.bin"), "b").unwrap();
+        };
+        // Two floors of one run share the leaf: the first out leaves the other's base alone.
+        let a = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+        let leaf = a.root().to_path_buf();
+        let b = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+        fill(&leaf);
+        drop(a);
+        assert!(
+            leaf.join("cargo-target/base/b.bin").is_file(),
+            "b still builds"
+        );
+        drop(b);
+        assert!(
+            !leaf.join("cargo-target/base").exists(),
+            "the last out drops base"
+        );
+        assert!(leaf.join("cargo-target/head/h.bin").is_file(), "head stays");
+        // A link a check left: unlinked, its target untouched.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("keep"), "k").unwrap();
+            let c = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+            let _ = std::fs::remove_dir_all(leaf.join("cargo-target/base"));
+            std::os::unix::fs::symlink(&outside, leaf.join("cargo-target/base")).unwrap();
+            drop(c);
+            assert!(outside.join("keep").is_file(), "never followed");
+            assert!(std::fs::symlink_metadata(leaf.join("cargo-target/base")).is_err());
+            let d = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+            std::fs::remove_dir_all(leaf.join("cargo-target")).unwrap();
+            std::os::unix::fs::symlink(&outside, leaf.join("cargo-target")).unwrap();
+            drop(d);
+            assert!(outside.join("keep").is_file(), "never followed");
+        }
         let _ = std::fs::remove_dir_all(&base);
     }
 
