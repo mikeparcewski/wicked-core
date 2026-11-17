@@ -15913,13 +15913,28 @@ fn amend_unit(
     // carries the words (a plan's own text) never stands for the record, and a record kept through
     // a plan revision (whose description is the new plan's) still gets its words back.
     let in_text = u.description.contains(&segment);
-    let on_record = u
+    let attempt = u.last_attempt.unwrap_or(0);
+    let recorded = u
         .operator_rulings
         .iter()
-        .any(|r| r.action == "amend" && r.text == text);
-    if in_text && on_record {
+        .position(|r| r.action == "amend" && r.text == text);
+    // (core#1521 codex-check) The same note given again at a LATER attempt's gate is that
+    // attempt's note too: its record moves to the attempt (`attempt_notes` restates the notes of
+    // the attempt a dispatch re-runs), keeping its first `at`, so the person's words and their
+    // revision (`rulings_revision`) are unchanged. A replay at the same attempt changes nothing.
+    let moved = recorded.is_some_and(|i| u.operator_rulings[i].attempt != attempt);
+    if in_text && recorded.is_some() && !moved {
         return Ok(());
     }
+    if let Some(i) = recorded.filter(|_| moved) {
+        u.operator_rulings[i].attempt = attempt;
+    }
+    if in_text && moved {
+        // Nothing new to announce: the words and the record were already there.
+        put_node(store, u.to_node())?;
+        return Ok(());
+    }
+    let on_record = recorded.is_some();
     if !in_text {
         u.description.push_str(&segment);
     }
@@ -24975,6 +24990,59 @@ mod request_changes_tests {
         assert_eq!(
             stored.description,
             "fix it, revised (operator amendment: learn-small-prs is waived)"
+        );
+    }
+
+    /// (core#1521 codex-check, W12) The same note given at the gates of retries 1 and 2 still
+    /// reaches every turn of the attempt after them, including a continuation re-armed after a
+    /// restart (which rebuilds the notes from the stored unit): the record follows the latest
+    /// attempt it was given at. The note is recorded once, keeps its first time, and a replay at
+    /// the same attempt changes nothing.
+    #[test]
+    fn a_note_repeated_on_a_later_retry_reaches_the_turn_after_a_restart() {
+        let run_id = format!("amend-repeat-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug(&mut store, &run_id, true);
+        let mut u = crate::domain::session_units(&store, &run_id).unwrap()[2].clone();
+        let mut subs = crate::event_log::EventSink::default();
+        const NOTE: &str = "keep the public API unchanged";
+        // Retry 1's gate (attempt 0 ran), its dispatch (attempt 1), then retry 2's gate.
+        u.last_attempt = Some(0);
+        amend_unit(&mut store, &mut subs, &run_id, &mut u, NOTE, "cursor").unwrap();
+        let first_at = u.operator_rulings[0].at;
+        u.last_attempt = Some(1);
+        assert_eq!(
+            crate::power::attempt_notes(&u),
+            vec![format!("The operator's note: {NOTE}")]
+        );
+        amend_unit(&mut store, &mut subs, &run_id, &mut u, NOTE, "cursor").unwrap();
+        amend_unit(&mut store, &mut subs, &run_id, &mut u, NOTE, "cursor").unwrap();
+        // The restart: retry 2's dispatch re-armed from the STORED unit.
+        let mut stored = crate::domain::session_units(&store, &run_id).unwrap()[2].clone();
+        assert_eq!(
+            stored.operator_rulings.len(),
+            1,
+            "{:?}",
+            stored.operator_rulings
+        );
+        assert_eq!(stored.operator_rulings[0].attempt, 1);
+        assert_eq!(
+            stored.operator_rulings[0].at, first_at,
+            "its first time is kept"
+        );
+        stored.last_attempt = Some(2);
+        assert_eq!(
+            crate::power::attempt_notes(&stored),
+            vec![format!("The operator's note: {NOTE}")],
+            "the repeated note rides the attempt after retry 2"
+        );
+        assert!(!crate::power::authored_task(&stored).contains(NOTE));
+        assert_eq!(
+            stored
+                .description
+                .matches(&format!(" (operator amendment: {NOTE})"))
+                .count(),
+            1
         );
     }
 
