@@ -2464,7 +2464,7 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
     std::fs::create_dir_all(outer.join("scratch-target")).unwrap();
     for bad in ["extra/target", "extra", "extra/TARGET"] {
         let err = sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk(bad, "cache")]).unwrap_err();
-        assert!(err.contains("fixture.bin"), "{bad}: {err}");
+        assert!(err.contains("extra/target/fixture.bin"), "{bad}: {err}");
     }
     sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk("scratch-target", "cache")]).unwrap();
     sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk("extra/new-target", "cache")]).unwrap();
@@ -2513,6 +2513,109 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
         seat::delta_keeping(&t, &base, Vec::new(), &[sk("SRC/file.rs", "limit")]).unwrap();
     assert_eq!(deletes, vec!["lib".to_string()]);
     for d in [plain, t, replica] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// (core#1518 codex-check b, W20) A dir is skipped only when it holds no `.git` entry at any
+/// depth and no file any repository tracks: a repository nested BELOW a tagged dir (the codex
+/// repro), one BESIDE it (the skip inside another repository), and a submodule each refuse on the
+/// host, naming the path; in the pod a tagged dir holding a repository is no cache at all.
+#[cfg(unix)]
+#[test]
+fn k8s_a_skip_never_covers_a_repository_below_beside_or_a_submodule() {
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    let sk = |p: &str| sync::Skipped {
+        path: p.into(),
+        why: "cache".into(),
+    };
+    // Below: plain root, `build/CACHEDIR.TAG` + repository `build/extra` tracking `file.rs`.
+    let replica = tmp("git-below");
+    let host = replica.join("p");
+    let extra = host.join("build/extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(host.join("build/CACHEDIR.TAG"), SIG).unwrap();
+    git_in(&extra, &["init", "-q"]);
+    std::fs::write(extra.join("file.rs"), "old\n").unwrap();
+    git_in(&extra, &["add", "file.rs"]);
+    git_in(&extra, &["commit", "-q", "-m", "a"]);
+    for bad in ["build", "BUILD", "b\u{200c}uild"] {
+        let err = sync::refuse_unsafe_skips(&host, Mode::Plain, &[sk(bad)]).unwrap_err();
+        assert!(
+            err.contains("extra/.git") && err.contains("nothing was written back"),
+            "{bad}: {err}"
+        );
+    }
+    // The pod never calls it a cache: the nested repository's edit comes back.
+    std::fs::write(extra.join("file.rs"), "edited\n").unwrap();
+    let plan = json!([["p", "plain", [], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
+    assert!(roots[0]
+        .entries
+        .iter()
+        .any(|e| e.path == "build/extra/file.rs" && e.data == b"edited\n"));
+    // Beside: the skip sits inside another repository that tracks a file under it.
+    let beside = host.join("build/extra");
+    std::fs::create_dir_all(beside.join("target")).unwrap();
+    std::fs::write(beside.join("target/fixture.bin"), "f").unwrap();
+    git_in(&beside, &["add", "target/fixture.bin"]);
+    git_in(&beside, &["commit", "-q", "-m", "b"]);
+    let err =
+        sync::refuse_unsafe_skips(&host, Mode::Plain, &[sk("build/extra/target")]).unwrap_err();
+    assert!(err.contains("build/extra/target/fixture.bin"), "{err}");
+    // A submodule of the tree: the dir itself, and a tagged dir inside it holding its tracked file.
+    let tree = tmp("git-sub");
+    git_in(&tree, &["init", "-q"]);
+    std::fs::write(tree.join("lib.rs"), "a").unwrap();
+    git_in(&tree, &["add", "lib.rs"]);
+    git_in(&tree, &["commit", "-q", "-m", "a"]);
+    git_in(
+        &tree,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            &extra.to_string_lossy(),
+            "sub",
+        ],
+    );
+    for bad in ["sub", "sub/target"] {
+        let err = sync::refuse_unsafe_skips(&tree, Mode::Tree, &[sk(bad)]).unwrap_err();
+        assert!(err.contains("nothing was written back"), "{bad}: {err}");
+    }
+    sync::refuse_unsafe_skips(&tree, Mode::Tree, &[sk("baseline-target")]).unwrap();
+    // (confirm 3, HIDE) A closer repository never masks an enclosing one: `r` tracks
+    // `inner/target/file.rs`, `r/inner` is a repository that does not.
+    let enc = tmp("git-enclosing");
+    let r = enc.join("r");
+    std::fs::create_dir_all(r.join("inner/target")).unwrap();
+    git_in(&r, &["init", "-q"]);
+    std::fs::write(r.join("inner/target/file.rs"), "old\n").unwrap();
+    git_in(&r, &["add", "inner/target/file.rs"]);
+    git_in(&r, &["commit", "-q", "-m", "a"]);
+    git_in(&r.join("inner"), &["init", "-q"]);
+    std::fs::write(r.join("inner/target/CACHEDIR.TAG"), SIG).unwrap();
+    let err = sync::refuse_unsafe_skips(&enc, Mode::Plain, &[sk("r/inner/target")]).unwrap_err();
+    assert!(err.contains("r/inner/target/file.rs"), "{err}");
+    // (confirm 3, KEY) A folded alias of a repository is asked too (`R` for `r`), and an exact
+    // dir never hides a folded sibling holding a repository (`build` beside `b<ZWNJ>uild`).
+    let err = sync::refuse_unsafe_skips(&enc, Mode::Plain, &[sk("R/inner/target")]).unwrap_err();
+    assert!(err.contains("file.rs"), "{err}");
+    std::fs::create_dir_all(enc.join("build")).unwrap();
+    std::fs::create_dir_all(enc.join("b\u{200c}uild/extra")).unwrap();
+    git_in(&enc.join("b\u{200c}uild/extra"), &["init", "-q"]);
+    let err = sync::refuse_unsafe_skips(&enc, Mode::Plain, &[sk("build")]).unwrap_err();
+    assert!(err.contains("extra/.git"), "{err}");
+    for d in [replica, tree, enc] {
         let _ = std::fs::remove_dir_all(d);
     }
 }

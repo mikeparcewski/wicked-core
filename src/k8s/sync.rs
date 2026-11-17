@@ -336,53 +336,120 @@ pub(crate) fn refuse_unsafe_skips(host: &Path, mode: Mode, left: &[Skipped]) -> 
             mode.as_str()
         ));
     }
-    // (codex confirm r2) Asked where each skip sits, not only at the root: from the deepest host
-    // dir on the skip's path, so a repository nested in a plain root (or rooted at the skip dir
-    // itself) answers for its own tracked files. One git listing per distinct dir.
+    // (core#1518 codex-check b, confirm 3) One rule: a skip covers no `.git` entry at any depth
+    // and no file ANY repository on the host tracks. Every host dir on the skip's path is found
+    // by folded name from the root (an exact dir never hides a folded sibling); the repository of
+    // the root and every repository rooted on that path (an enclosing one, a nested one, a folded
+    // alias of one) is asked for its tracked files under the skip; every dir the skip names is
+    // walked for a `.git` entry. Each dir is listed once and each repository asked once.
     let mut asked: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
         std::collections::HashMap::new();
     asked.insert(host.to_path_buf(), tracked);
+    let mut listed: std::collections::HashMap<PathBuf, Vec<(String, PathBuf)>> =
+        std::collections::HashMap::new();
     for s in left {
         let parts: Vec<&str> = s.path.split('/').collect();
-        let mut at = 0;
-        for i in 1..=parts.len() {
-            let d = host.join(parts[..i].join("/"));
-            if std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) {
-                at = i;
-            } else {
+        let mut level: Vec<PathBuf> = vec![host.to_path_buf()];
+        for i in 0..=parts.len() {
+            let suffix = fold(&parts[i..].join("/"));
+            for d in &level {
+                let repo_root =
+                    d.as_path() == host || std::fs::symlink_metadata(d.join(".git")).is_ok();
+                if !repo_root {
+                    continue;
+                }
+                if !asked.contains_key(d) {
+                    let t = host_tracked(d)?;
+                    asked.insert(d.clone(), t);
+                }
+                let Some(tracked) = asked.get(d).and_then(|t| t.as_ref()) else {
+                    continue;
+                };
+                if let Some(t) = tracked.iter().find(|t| {
+                    let ft = fold(t);
+                    suffix.is_empty()
+                        || ft == suffix
+                        || ft
+                            .strip_prefix(suffix.as_str())
+                            .is_some_and(|r| r.starts_with('/'))
+                }) {
+                    let at = d.join(t);
+                    return Err(format!(
+                        "`{}` was left out ({}), but it holds `{}`, which a repository on the host \
+                         tracks; nothing was written back",
+                        s.path,
+                        s.why,
+                        at.strip_prefix(host).unwrap_or(&at).display()
+                    ));
+                }
+            }
+            if i == parts.len() {
                 break;
             }
+            let want = fold(parts[i]);
+            let mut next = Vec::new();
+            for d in &level {
+                if !listed.contains_key(d) {
+                    let mut kids = Vec::new();
+                    if let Ok(rd) = std::fs::read_dir(d) {
+                        for e in rd.flatten() {
+                            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                                kids.push((fold(&e.file_name().to_string_lossy()), e.path()));
+                            }
+                        }
+                    }
+                    listed.insert(d.clone(), kids);
+                }
+                next.extend(
+                    listed[d]
+                        .iter()
+                        .filter(|(n, _)| *n == want)
+                        .map(|(_, p)| p.clone()),
+                );
+            }
+            level = next;
         }
-        let dir = host.join(parts[..at].join("/"));
-        let rest = fold(&parts[at..].join("/"));
-        if !asked.contains_key(&dir) {
-            let t = host_tracked(&dir)?;
-            asked.insert(dir.clone(), t);
-        }
-        let Some(tracked) = asked.get(&dir).and_then(|t| t.as_ref()) else {
-            continue;
-        };
-        if let Some(t) = tracked.iter().find(|t| {
-            let ft = fold(t);
-            rest.is_empty()
-                || ft == rest
-                || ft
-                    .strip_prefix(rest.as_str())
-                    .is_some_and(|r| r.starts_with('/'))
-        }) {
-            let held = if at == 0 {
-                t.clone()
-            } else {
-                format!("{}/{t}", parts[..at].join("/"))
-            };
-            return Err(format!(
-                "`{}` was left out ({}), but it holds `{held}`, which the host's repository \
-                 tracks; nothing was written back",
-                s.path, s.why
-            ));
+        for d in &level {
+            if let Some(g) = git_entry_below(d)? {
+                return Err(format!(
+                    "`{}` was left out ({}), but it holds `{}`, a repository's git entry; \
+                     nothing was written back",
+                    s.path,
+                    s.why,
+                    g.strip_prefix(host).unwrap_or(&g).display()
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// (core#1518 codex-check b) The first `.git` entry (any spelling a folding host reads as one) at
+/// any depth below `dir` on the host, links never followed; `Err` when it cannot be checked (an
+/// unreadable dir, or more than 200,000 entries): a skip is refused when in doubt.
+fn git_entry_below(dir: &Path) -> Result<Option<PathBuf>, String> {
+    let mut left = 200_000usize;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let rd = std::fs::read_dir(&d)
+            .map_err(|e| format!("{} could not be checked for a repository: {e}", d.display()))?;
+        for e in rd {
+            let e = e.map_err(|e| format!("{} could not be checked: {e}", d.display()))?;
+            left = left.checked_sub(1).ok_or_else(|| {
+                format!(
+                    "{} holds too many entries to check for a repository",
+                    dir.display()
+                )
+            })?;
+            if is_git_name(&e.file_name().to_string_lossy()) {
+                return Ok(Some(e.path()));
+            }
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                todo.push(e.path());
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// The files the host's repository tracks under `root` (relative to it), or `None` when `root`
@@ -1489,6 +1556,17 @@ ENTRIES = 0
 # dir, whatever its name; a directory holding it is build output and never comes back.
 TAG = "CACHEDIR.TAG"
 TAG_SIG = b"Signature: 8a477f597d28d172789f06886806bc55"
+def isgitname(n):
+    f = fold(n).rstrip(". ")
+    return f == ".git" or f == "git~1"
+def holds_git(rootfd, rel):
+    # True when `rel` holds a `.git` entry at any depth, or cannot be read through (no links).
+    def boom(e): raise e
+    try:
+        for _, dirs, files, _ in os.fwalk(rel, dir_fd=rootfd, follow_symlinks=False, onerror=boom):
+            if any(isgitname(n) for n in dirs) or any(isgitname(n) for n in files): return True
+    except OSError: return True
+    return False
 def is_tag(rootfd, rel):
     fd, name = parent(rootfd, rel, False)
     if fd is None: return False
@@ -1523,7 +1601,9 @@ def caches(rootfd, rels, tracked):
         # Never inside git metadata (codex r2): the engine refuses a git skip path.
         if isgit(d): continue
         if fold(d) in held: continue
-        if is_tag(rootfd, d + "/" + TAG): out.append(d)
+        # (core#1518 codex-check b) Never a dir with a `.git` entry at any depth (a nested
+        # repository or a submodule below it): when in doubt, it is not skipped.
+        if is_tag(rootfd, d + "/" + TAG) and not holds_git(rootfd, d): out.append(d)
     return out
 def tracked_list(root):
     # None: no repository (a session's scratch tree), so nothing of it is untracked output.
