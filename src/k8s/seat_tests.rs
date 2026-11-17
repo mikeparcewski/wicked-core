@@ -4388,6 +4388,22 @@ fn the_diagnosis_takes_the_most_recent_events() {
         d.ends_with("last events (1 earlier event(s) not shown): Middle: m | Newest: n"),
         "{d}"
     );
+    // (codex confirmation, HIDE) The runtime's own error the poll waited through is kept even
+    // with no event: the container's waiting state is in the diagnosis.
+    let mut p = json!({"status": {"phase": "Pending", "containerStatuses": [
+        {"name": "seat", "state": {"waiting": {
+            "reason": "CreateContainerError", "message": "context deadline exceeded"}}}
+    ]}});
+    let d = seat::pod_diagnosis(Some(&p), None, 5);
+    assert!(
+        d.contains("container seat waiting CreateContainerError context deadline exceeded"),
+        "{d}"
+    );
+    p["status"]["initContainerStatuses"] =
+        json!([{"name": "sync", "state": {"terminated": {"reason": "Error", "message": "x"}}}]);
+    assert!(
+        seat::pod_diagnosis(Some(&p), None, 5).contains("init container sync terminated Error x")
+    );
     let all = seat::pod_diagnosis(None, Some(&events), 5);
     assert!(
         all.ends_with("last events: Old: o | Middle: m | Newest: n"),

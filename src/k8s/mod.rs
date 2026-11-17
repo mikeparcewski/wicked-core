@@ -365,11 +365,48 @@ pub(crate) fn arming_live(run_id: &str) -> bool {
     true
 }
 
-/// (core#1491) A resumed run may arm again.
+/// (core#1491) A resumed run may arm again — a NEW lifecycle: an arm attempt of the ended one
+/// (asleep in its backoff through the end and the resume) never arms in it ([`lifecycle`]).
 pub(crate) fn forget_ended(run_id: &str) {
     if let Some(m) = ENDED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
         m.remove(run_id);
     }
+    *RESUMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(run_id.to_string())
+        .or_default() += 1;
+}
+
+/// (core#1491) How many times run `run_id` was resumed in this process: an arm attempt checks it
+/// has not moved since it started before each retry.
+static RESUMES: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> =
+    std::sync::Mutex::new(None);
+
+/// The run's lifecycle generation (its resumes so far); never blocks.
+pub(crate) fn lifecycle(run_id: &str) -> u64 {
+    RESUMES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(run_id).copied())
+        .unwrap_or(0)
+}
+
+/// (core#1491, codex confirmation on #1527) The run reached a terminal state — called ON the actor
+/// thread at the transition, before its cleanup is scheduled: returns its arm epoch now (what
+/// [`release_run`] is given) and records the end at once, so no arm attempt of it starts or
+/// retries from now on (until a resume, [`forget_ended`]). Monotonic: never lowers a newer end.
+pub(crate) fn end_run(run_id: &str) -> u64 {
+    let epoch = run_epoch(run_id);
+    let mut g = ENDED.lock().unwrap_or_else(|p| p.into_inner());
+    let e = g
+        .get_or_insert_with(std::collections::HashMap::new)
+        .entry(run_id.to_string())
+        .or_insert(epoch);
+    *e = (*e).max(epoch);
+    epoch
 }
 
 /// The run arms (a seat or a floor is about to use its namespace): waits out a release in
@@ -385,17 +422,9 @@ pub(crate) fn arming(run_id: &str) {
 /// cache claims, and is waited out, unless the run armed again since. A resumed run gets a new
 /// one. Nothing happens when the daemon has no cluster configured.
 pub(crate) fn release_run(run_id: &str, epoch: u64) {
-    // (core#1491) Recorded first: an arm retry in backoff stops instead of re-creating the
-    // namespace of a run that ended after it armed.
-    {
-        // Monotonic: a late cleanup of an earlier epoch never lowers a newer end.
-        let mut g = ENDED.lock().unwrap_or_else(|p| p.into_inner());
-        let e = g
-            .get_or_insert_with(std::collections::HashMap::new)
-            .entry(run_id.to_string())
-            .or_insert(epoch);
-        *e = (*e).max(epoch);
-    }
+    // (core#1491, codex confirmation on #1527) The end was recorded on the actor thread
+    // ([`end_run`]); an obsolete release (the run resumed and armed since) records nothing, so it
+    // never fences the resumed run.
     let l = life(run_id);
     let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {

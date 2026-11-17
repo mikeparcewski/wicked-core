@@ -1081,12 +1081,38 @@ fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
 fn an_ended_run_arms_no_seat_until_it_is_resumed() {
     let run = format!("ended-run-{}", std::process::id());
     assert!(super::arming_live(&run));
-    let e = super::run_epoch(&run);
-    super::release_run(&run, e + 5);
-    super::release_run(&run, e);
-    assert!(super::run_ended_since(&run, e + 4), "the newer end stands");
+    let before = super::run_epoch(&run) - 1;
+    // The end is recorded on the actor thread at the transition, before any cleanup runs.
+    let e = super::end_run(&run);
+    assert!(
+        super::run_ended_since(&run, before),
+        "an attempt from before stops"
+    );
     assert!(!super::arming_live(&run), "an ended run arms nothing");
     assert_eq!(super::run_epoch(&run), e, "and its epoch is untouched");
+    let generation = super::lifecycle(&run);
     super::forget_ended(&run);
+    assert_ne!(
+        super::lifecycle(&run),
+        generation,
+        "an attempt of the ended lifecycle sees the resume and stops"
+    );
     assert!(super::arming_live(&run), "a resumed run arms again");
+}
+
+/// (codex confirmation on #1527, SILENT-OK) The attacker's order: the run ends at epoch E (its
+/// cleanup scheduled), is resumed, a seat arms (E+1), THEN the delayed cleanup of E runs. It is
+/// obsolete: it records no end, so the resumed run's seats still arm.
+#[test]
+fn an_obsolete_cleanup_never_fences_a_resumed_run() {
+    let run = format!("obsolete-{}", uuid::Uuid::new_v4().simple());
+    assert!(super::arming_live(&run));
+    let e = super::end_run(&run);
+    super::forget_ended(&run);
+    assert!(super::arming_live(&run), "resumed: arms (E+1)");
+    super::release_run(&run, e);
+    assert!(
+        super::arming_live(&run),
+        "the late cleanup of E fenced nothing"
+    );
 }

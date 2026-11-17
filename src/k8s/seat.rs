@@ -1504,6 +1504,33 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
                         .to_string(),
                 );
             }
+            // (codex confirmation on #1527, HIDE) Each container's own state that is not
+            // running — the runtime's words (a `CreateContainerError: context deadline exceeded`
+            // the poll waited through), init containers first — so it outlives the pod even when
+            // no event kept it.
+            for (kind, list) in [
+                ("init container", "/status/initContainerStatuses"),
+                ("container", "/status/containerStatuses"),
+            ] {
+                for c in p
+                    .pointer(list)
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let name = c.get("name").and_then(Value::as_str).unwrap_or("?");
+                    for st in ["waiting", "terminated"] {
+                        if let Some(v) = c.pointer(&format!("/state/{st}")) {
+                            let f = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("");
+                            out.push(
+                                format!("{kind} {name} {st} {} {}", f("reason"), f("message"))
+                                    .trim()
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     let mut items: Vec<&Value> = events
