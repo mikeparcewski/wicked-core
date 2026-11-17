@@ -9304,6 +9304,7 @@ fn escalate_denied_unit(
     if class == "verdict_not_pass"
         && unit.role == crate::workflow::PhaseRole::Evaluator
         && unit.tool_cmd.is_none()
+        && !power_gate::qe_binding_miss(unit)
     {
         let rounds = record_review_round(store, &session.id, &unit.id, attempt, &reason)?;
         if !power_rounds_left
@@ -9352,7 +9353,12 @@ fn escalate_denied_unit(
     // of rounds; the gate still opens first, so the answer is the ordinary, audited arm.
     // The failed hand-off step is recorded either way; past the review's own rework cap
     // (`review_adjudication`, core#761) the operator decides, never the engine.
-    let send_back = power_gate::auto_send_back(subscribers, session, unit, class, &reason)
+    // (crew#1554) …except a QE binding miss: nothing the builder does can bind QE evidence, so the
+    // hand-off re-runs the QE step instead (the gate's own `RetryQe` checks still decide).
+    let redo_qe = power_gate::auto_redo_qe(subscribers, session, unit, &reason);
+    let send_back = (!redo_qe)
+        .then(|| power_gate::auto_send_back(subscribers, session, unit, class, &reason))
+        .flatten()
         .filter(|_| adjudication.is_none());
     let (gate_kind, prompt) = match adjudication {
         Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
@@ -9374,11 +9380,17 @@ fn escalate_denied_unit(
         prompt,
     );
     if paused.is_ok() {
-        if let Some(note) = send_back {
+        let decision = if redo_qe {
+            Some(crate::workflow::HumanDecision::RetryQe)
+        } else {
+            send_back
+                .map(|note| crate::workflow::HumanDecision::RequestChanges { note: Some(note) })
+        };
+        if let Some(decision) = decision {
             let (reply, _rx) = std::sync::mpsc::channel();
             let _ = self_tx.send(Command::ConfirmGate {
                 run_id: session.id.clone(),
-                decision: crate::workflow::HumanDecision::RequestChanges { note: Some(note) },
+                decision,
                 actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
                 expect: None,
                 reply,
@@ -29704,6 +29716,85 @@ mod request_changes_tests {
                 tool_activity: true,
                 attempt: 0,
             }],
+        }
+    }
+
+    /// (crew#1554) On a power run, a QE step whose fresh evidence could not be bound (no reviewer
+    /// ran) opens its gate and the hand-off answers it with `retry_qe` — never a `request_changes`
+    /// rewind to the build. A record whose reviewer ran (its verdict could not be bound) keeps the
+    /// review path: it still goes back to the build.
+    #[test]
+    fn a_power_qe_binding_miss_answers_its_gate_with_retry_qe_not_a_build_rewind() {
+        for (reviewer_ran, want_redo) in [(false, true), (true, false)] {
+            let run_id = format!("pw-qe-miss-{}-{reviewer_ran}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_judge_unavailable_verify(&mut store, &run_id);
+            require_qe(&mut store, &run_id);
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            let mut power = crate::power::PowerState::launched(true, 0);
+            power.orchestrator.ord = Some(1);
+            session.power = Some(power);
+            put_node(&mut store, session.to_node()).unwrap();
+            let mut record = qe_record(crate::qe_acceptance::review::OUTCOME_INVALID, None);
+            record.reason = "the QE evidence could not be bound: the evidence dir holds no \
+                             `scenario.md`"
+                .into();
+            record.qe_run_id = None;
+            record.evidence_dir = None;
+            if !reviewer_ran {
+                record.attempts.clear();
+            }
+            let denial = crate::qe_acceptance::review::denial(&record).unwrap();
+            park_qe_gate(&mut store, &run_id, denial, record, true);
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            let unit = &mut units[3];
+            unit.role = crate::workflow::PhaseRole::Evaluator;
+            unit.catalog = Some("test".into());
+            let (tx, rx) = channel();
+            let mut sink = crate::event_log::EventSink::default();
+            escalate_denied_unit(
+                &mut store,
+                &mut sink,
+                &tx,
+                &mut session,
+                unit,
+                1,
+                false,
+                true,
+                false,
+                "",
+            )
+            .unwrap();
+            // Other commands may be queued first (the pause's own notices): the hand-off's answer
+            // is the gate confirmation among them.
+            let (decision, actor) = rx
+                .try_iter()
+                .find_map(|c| match c {
+                    Command::ConfirmGate {
+                        decision, actor, ..
+                    } => Some((decision, actor)),
+                    _ => None,
+                })
+                .expect("the hand-off answers the gate");
+            assert_eq!(actor.as_deref(), Some(crate::power::HANDOFF_ACTOR));
+            if want_redo {
+                assert!(
+                    matches!(decision, HumanDecision::RetryQe),
+                    "redo, not a rewind"
+                );
+                let p = session.power.as_ref().unwrap().handoff.clone().unwrap();
+                assert_eq!(p.round, 1, "no hand-off round spent");
+            } else {
+                assert!(
+                    matches!(decision, HumanDecision::RequestChanges { .. }),
+                    "a reviewer that ran keeps the review path"
+                );
+            }
         }
     }
 

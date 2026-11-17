@@ -248,11 +248,18 @@ fn evidence_binds_only_to_this_runs_ledger_dir_from_this_attempt() {
     assert!(bind_evidence(&l.root, &odd.to_string_lossy(), RUN, 0, None)
         .unwrap_err()
         .contains("not a QE run id"));
-    // No plan.
+    // (core#1484) No plan still binds: the plan is the reviewer's to judge, not identity.
     std::fs::remove_file(dir.join("test-plan.md")).unwrap();
-    assert!(bind_evidence(&l.root, &d, RUN, 0, None)
-        .unwrap_err()
-        .contains("test-plan.md"));
+    assert_eq!(bind_evidence(&l.root, &d, RUN, 0, None).unwrap().0, id);
+    // No scenario copy: denied, naming the dir the executor should have written to.
+    std::fs::remove_file(dir.join("scenario.md")).unwrap();
+    let why = bind_evidence(&l.root, &d, RUN, 0, None).unwrap_err();
+    assert!(
+        why.contains("scenario.md")
+            && why.contains(&d)
+            && why.contains("never into a dir of its own"),
+        "{why}"
+    );
 }
 
 #[cfg(unix)]
@@ -475,16 +482,32 @@ fn the_reviewer_session_variable_never_reaches_a_hardened_child() {
 fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
     let ledger = Path::new("/l/.wicked-qe");
     let mut u = qe_unit("pi", ledger);
+    // (core#1484) The engine names the dir it made; the seat names nothing.
+    let made = "/home/someone/.wicked/walkthroughs/0b6f8a4e-1111-4222-8333-944455556666/.wicked-qe/evidence/7d0c5e2a-1b3c-4d5e-8f60-718293a4b5c6";
+    u.qe_evidence_dir = Some(made.into());
     let line = super::super::unit_directive(&u, "wicked-garden-qe");
     assert!(
-        line.contains("accept --phase evidence (writer and executor only"),
+        line.contains(&format!(
+            "accept --phase evidence --resume {made} (writer and executor only"
+        )),
         "{line}"
     );
-    assert!(line.contains(EVIDENCE_MARKER) && line.contains("$WICKED_QE_LEDGER_DIR"));
+    assert!(
+        !line.contains(EVIDENCE_MARKER),
+        "no marker is asked for: {line}"
+    );
+    assert!(line.contains("never in a dir of your own"), "{line}");
     assert!(
         line.len() < 520,
         "the directive rides the PTY line budget: {}",
         line.len()
+    );
+    // A run the engine could not create is said, not hidden.
+    u.qe_evidence_dir = None;
+    let line = super::super::unit_directive(&u, "q");
+    assert!(
+        line.contains("could not create this attempt's QE run"),
+        "{line}"
     );
     assert_eq!(resume_dir(&u), None);
     u.qe_review = Some(QeReview {
@@ -497,7 +520,6 @@ fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
         attempts: Vec::new(),
     });
     assert_eq!(resume_dir(&u), Some("/l/.wicked-qe/evidence/abc"));
-    assert!(super::super::unit_directive(&u, "q").contains("--resume /l/.wicked-qe/evidence/abc"));
     u.worktree_baseline = Some(baseline("t2"));
     assert_eq!(resume_dir(&u), None, "a changed tree starts a fresh QE run");
     // Without a ledger root the unit keeps the full-pipeline directive (no reviewer can bind).
@@ -505,6 +527,8 @@ fn the_executor_directive_is_evidence_only_and_resumes_a_same_tree_run() {
     bare.qe_ledger_root = None;
     assert!(super::super::unit_directive(&bare, "q").contains("accept (writer, executor, isolated"));
     assert!(reviewer_brief("/d", None).len() < 520);
+    // (xreview codex r1) A dir with no plan is still judged: the brief says how.
+    assert!(reviewer_brief("/d", None).contains("no plan: judge the scenario's assertions"));
     // (core#928) The scratch line, with a realistic notes root, keeps the brief one short line.
     let scratch = std::path::Path::new(
         "/var/folders/4c/rvzl16px0yx907_m1rx6mwrw0000gp/T/wicked-core-notes/run-0123456789ab/unit-6/tmp",
@@ -528,6 +552,20 @@ struct Scripted {
 impl StepRunner for Scripted {
     fn run_unit(&self, input: &StepInput) -> StepOutput {
         self.seen.lock().unwrap().push(input.clone());
+        // (core#1484) An empty `qe_run`: the QE run the engine made, read off the brief's path.
+        let brief_run = input
+            .unit
+            .description
+            .split_once("--evidence ")
+            .and_then(|(_, rest)| rest.split_once(". "))
+            .and_then(|(dir, _)| Path::new(dir).file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let qe_run = if self.qe_run.is_empty() {
+            brief_run
+        } else {
+            self.qe_run.clone()
+        };
         let seat = input.unit.assigned_cli.clone().unwrap_or_default();
         let answer = self
             .answers
@@ -539,7 +577,7 @@ impl StepRunner for Scripted {
             "inconclusive" => {
                 write_verdict(
                     &self.ledger,
-                    &self.qe_run,
+                    &qe_run,
                     "FAIL",
                     input.unit.qe_review_session.as_deref(),
                     &input.run_id,
@@ -556,7 +594,7 @@ impl StepRunner for Scripted {
                 let verdict = if answer == "pass" { "PASS" } else { "FAIL" };
                 write_verdict(
                     &self.ledger,
-                    &self.qe_run,
+                    &qe_run,
                     verdict,
                     input.unit.qe_review_session.as_deref(),
                     &input.run_id,
@@ -620,6 +658,13 @@ fn input_for(unit: WorkUnit) -> StepInput {
     }
 }
 
+/// (core#1484) The unit as the worker seam hands it to the executor and the bind: carrying the
+/// evidence dir the engine made (or resumes) for this attempt.
+fn with_dir(mut u: WorkUnit, dir: &Path) -> WorkUnit {
+    u.qe_evidence_dir = Some(dir.to_string_lossy().into_owned());
+    u
+}
+
 fn executor_output(marker: &str) -> StepOutput {
     StepOutput {
         run_id: RUN.into(),
@@ -660,7 +705,7 @@ fn review_with(
     let runner: Arc<dyn StepRunner> = scripted.clone();
     let got = run(
         &runner,
-        &input_for(u),
+        &input_for(with_dir(u, &dir)),
         &executor_output(&dir.to_string_lossy()),
         0,
         &|_: &str| {},
@@ -910,7 +955,11 @@ fn no_marker_or_no_requirement_runs_no_reviewer() {
     out.output = "VERDICT: PASS".into();
     let got = run(&runner, &input_for(u.clone()), &out, 0, &|_: &str| {}).unwrap();
     assert_eq!(got.outcome, OUTCOME_INVALID);
-    assert!(got.reason.contains("QE-EVIDENCE"), "{}", got.reason);
+    assert!(
+        got.reason.contains("created no QE run"),
+        "no engine dir, nothing to bind: {}",
+        got.reason
+    );
     let mut waived = u.clone();
     waived.qe_acceptance.as_mut().unwrap().status = a::QE_WAIVED.into();
     assert!(run(&runner, &input_for(waived), &out, 0, &|_: &str| {}).is_none());
@@ -941,10 +990,12 @@ fn a_floor_rerun_carries_on_the_same_tree_and_a_floor_fix_that_changed_it_invali
     assert_eq!(on_floor_rerun(&u, true).unwrap().outcome, OUTCOME_INVALID);
 }
 
-/// A seat that answers the EXECUTOR turn with the evidence marker and every reviewer turn per
-/// `Scripted` — the worker seam end to end.
+/// A seat that answers the EXECUTOR turn and every reviewer turn per `Scripted` — the worker seam
+/// end to end. (core#1484) Its executor turn writes into the evidence dir the engine handed it (when
+/// `write` is set) and names `marker` on its `QE-EVIDENCE:` line, whatever that is.
 struct Seam {
     marker: String,
+    write: bool,
     reviewer: Scripted,
     executor_inputs: Mutex<Vec<StepInput>>,
 }
@@ -955,27 +1006,31 @@ impl StepRunner for Seam {
             return self.reviewer.run_unit(input);
         }
         self.executor_inputs.lock().unwrap().push(input.clone());
+        if let (true, Some(dir)) = (self.write, input.unit.qe_evidence_dir.as_deref()) {
+            // Hand-written, as the seats of 2026-11-16 did: a scenario copy and a log, no plan, no
+            // garden step 0.
+            std::fs::write(Path::new(dir).join("scenario.md"), "# scenario").unwrap();
+            std::fs::write(Path::new(dir).join("targeted-test.log"), "ok").unwrap();
+        }
         let mut out = executor_output(&self.marker);
         out.tools = vec!["pi:Bash".into()];
         out
     }
 }
 
-/// (DES-QE-EVERY-SEAT §3.1) Through the real worker seam (`run_unit_and_judge_on`): the pi
-/// executor turn produces evidence, the engine runs the isolated reviewer on the distinct seat,
-/// the unit's output stays the executor's, the reviewer's tool calls join the envelope, and the
-/// record rides `UnitEvidence.qe_review` to the fold.
-#[test]
-fn the_worker_seam_runs_the_executor_then_the_isolated_reviewer() {
-    let l = Ledger::new("seam");
-    let (id, dir) = l.evidence(RUN, &now_iso());
+fn seam_run(
+    l: &Ledger,
+    marker: &str,
+    write: bool,
+) -> (StepOutput, crate::workflow::UnitEvidence, Arc<Seam>) {
     let mut u = qe_unit("pi", &l.root);
     u.qe_reviewer_seats = vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)];
     let seam = Arc::new(Seam {
-        marker: dir.to_string_lossy().into_owned(),
+        marker: marker.to_string(),
+        write,
         reviewer: Scripted {
             ledger: l.root.clone(),
-            qe_run: id.clone(),
+            qe_run: String::new(),
             answers: vec![("claude", "pass")],
             seen: Mutex::new(Vec::new()),
         },
@@ -990,22 +1045,168 @@ fn the_worker_seam_runs_the_executor_then_the_isolated_reviewer() {
         None,
         None,
     );
+    (output, evidence, seam)
+}
+
+/// (DES-QE-EVERY-SEAT §3.1) Through the real worker seam (`run_unit_and_judge_on`): the engine
+/// makes the attempt's QE run, the pi executor turn produces evidence in it, the engine runs the
+/// isolated reviewer on the distinct seat, the unit's output stays the executor's, the reviewer's
+/// tool calls join the envelope, and the record rides `UnitEvidence.qe_review` to the fold.
+///
+/// (core#1484 / crew#1554 regression, the shapes of 2026-11-16) The seat never ran garden's step 0
+/// (no run record of its own), wrote no `test-plan.md`, and named a hand-made non-UUID dir
+/// (`run-471`), prose, or a parent dir on its `QE-EVIDENCE:` line: the engine's own dir binds anyway
+/// and the reviewer's PASS is the record.
+#[test]
+fn the_worker_seam_runs_the_executor_then_the_isolated_reviewer() {
+    let l = Ledger::new("seam");
+    let run_471 = l.root.join("evidence").join("run-471");
+    for marker in [
+        run_471.to_string_lossy().into_owned(),
+        "line. I'm not inventing a path.".to_string(),
+        l.root.join("evidence").to_string_lossy().into_owned(),
+        l.root.to_string_lossy().into_owned(),
+    ] {
+        let (output, evidence, seam) = seam_run(&l, &marker, true);
+        assert!(
+            output.output.contains("QE-EVIDENCE:"),
+            "the unit's output is the executor's"
+        );
+        // The envelope stays the executor's: the reviewer turn's governance is folded from its own
+        // decisions log, by the flags its attempt record carries.
+        assert_eq!(output.tools, vec!["pi:Bash".to_string()]);
+        assert!(!output.governed);
+        let review = evidence.qe_review.expect("the reviewer ran");
+        assert!(review.attempts[0].governed && review.attempts[0].tool_activity);
+        assert_eq!(review.outcome, OUTCOME_PASS, "{marker}: {review:?}");
+        let executed = seam.executor_inputs.lock().unwrap();
+        assert_eq!(executed.len(), 1);
+        let made = executed[0]
+            .unit
+            .qe_evidence_dir
+            .clone()
+            .expect("the engine made the dir");
+        let id = Path::new(&made)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(uuid::Uuid::parse_str(&id).is_ok(), "{made}");
+        assert_eq!(review.qe_run_id.as_deref(), Some(id.as_str()));
+        assert_eq!(review.evidence_dir.as_deref(), Some(made.as_str()));
+        // The directive the seat read named that dir.
+        assert!(crate::qe_acceptance::unit_directive(&executed[0].unit, "q")
+            .contains(&format!("--resume {made}")),);
+        let reviewed = seam.reviewer.seen.lock().unwrap();
+        assert_eq!(reviewed.len(), 1);
+        assert_eq!(reviewed[0].unit.assigned_cli.as_deref(), Some("claude"));
+        assert!(reviewed[0]
+            .unit
+            .description
+            .contains(&format!("--evidence {made}")));
+        assert!(reviewed[0].unit.qe_evidence_dir.is_none());
+    }
+}
+
+/// (core#1484) A seat that put its evidence somewhere else (its own dir) gets a denial naming the
+/// dir the engine made and the one it named, and no reviewer runs on an empty dir.
+#[test]
+fn evidence_written_outside_the_engines_dir_is_denied_by_name() {
+    let l = Ledger::new("seam-elsewhere");
+    let own = l.root.join("evidence").join("run-471");
+    let (_, evidence, seam) = seam_run(&l, &own.to_string_lossy(), false);
+    let review = evidence.qe_review.expect("a record");
+    assert_eq!(review.outcome, OUTCOME_INVALID);
+    assert!(review.verdict.is_none());
+    let made = seam.executor_inputs.lock().unwrap()[0]
+        .unit
+        .qe_evidence_dir
+        .clone()
+        .unwrap();
     assert!(
-        output.output.contains("QE-EVIDENCE:"),
-        "the unit's output is the executor's"
+        review.reason.contains(&made)
+            && review.reason.contains("scenario.md")
+            && review.reason.contains("run-471"),
+        "{}",
+        review.reason
     );
-    // The envelope stays the executor's: the reviewer turn's governance is folded from its own
-    // decisions log, by the flags its attempt record carries.
-    assert_eq!(output.tools, vec!["pi:Bash".to_string()]);
-    assert!(!output.governed);
-    let review = evidence.qe_review.expect("the reviewer ran");
-    assert!(review.attempts[0].governed && review.attempts[0].tool_activity);
-    assert_eq!(review.outcome, OUTCOME_PASS, "{review:?}");
-    assert_eq!(review.qe_run_id.as_deref(), Some(id.as_str()));
-    assert_eq!(seam.executor_inputs.lock().unwrap().len(), 1);
-    let reviewed = seam.reviewer.seen.lock().unwrap();
-    assert_eq!(reviewed.len(), 1);
-    assert_eq!(reviewed[0].unit.assigned_cli.as_deref(), Some("claude"));
+    assert!(seam.reviewer.seen.lock().unwrap().is_empty());
+}
+
+/// (core#1484) The QE run the engine makes is one wicked-ledger can index and garden can resume:
+/// complete project, scenario and run rows (every NOT NULL column of migration 001, the FK chain
+/// intact), stamped with the crew run, the drift marker so the index rebuilds, garden's
+/// `config.json` when absent (kept when present), and a fresh empty `evidence/<uuid>` dir. A
+/// second attempt reuses the crew run's project and makes a new run.
+#[test]
+fn the_engine_made_qe_run_is_a_complete_ledger_record() {
+    let l = Ledger::new("mint");
+    let dir = mint_qe_run(&l.root, RUN).unwrap();
+    let id = dir.file_name().unwrap().to_string_lossy().into_owned();
+    assert!(uuid::Uuid::parse_str(&id).is_ok());
+    assert_eq!(dir, l.root.join("evidence").join(&id));
+    // Only the engine's mark: a files-only copy-in (the k8s replica) still creates the dir.
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(names, [EVIDENCE_SENTINEL]);
+    let read = |t: &str, i: &str| read_record(&l.root.join(t).join(format!("{i}.json"))).unwrap();
+    let run = read("runs", &id);
+    for k in [
+        "project_id",
+        "scenario_id",
+        "started_at",
+        "status",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(field(&run, k).is_some(), "runs.{k}: {run:?}");
+    }
+    assert_eq!(field(&run, "crew_run_id"), Some(RUN));
+    assert_eq!(field(&run, "status"), Some("running"));
+    assert_eq!(
+        field(&run, "evidence_path"),
+        Some(dir.to_string_lossy().as_ref())
+    );
+    assert_eq!(run.get("deleted"), Some(&serde_json::json!(0)));
+    let scenario = read("scenarios", field(&run, "scenario_id").unwrap());
+    for k in [
+        "project_id",
+        "name",
+        "format_version",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(field(&scenario, k).is_some(), "scenarios.{k}: {scenario:?}");
+    }
+    let pid = field(&run, "project_id").unwrap().to_string();
+    assert_eq!(field(&scenario, "project_id"), Some(pid.as_str()));
+    let project = read("projects", &pid);
+    assert_eq!(
+        field(&project, "name"),
+        Some(engine_project_name(RUN).as_str())
+    );
+    assert!(l.root.join(LEDGER_DRIFT_MARKER).is_file());
+    assert!(l.root.join("config.json").is_file());
+    // It binds as this attempt's run once the executor wrote the scenario copy.
+    std::fs::write(dir.join("scenario.md"), "# s").unwrap();
+    let d = dir.to_string_lossy().into_owned();
+    assert_eq!(bind_evidence(&l.root, &d, RUN, 0, None).unwrap().0, id);
+    // A second attempt: the same project, a new run; a seat's own config.json is kept.
+    std::fs::write(l.root.join("config.json"), r#"{"project":"repo"}"#).unwrap();
+    let dir2 = mint_qe_run(&l.root, RUN).unwrap();
+    assert_ne!(dir2, dir);
+    let run2 = read("runs", &dir2.file_name().unwrap().to_string_lossy());
+    assert_eq!(field(&run2, "project_id"), Some(pid.as_str()));
+    assert_eq!(
+        std::fs::read_dir(l.root.join("projects")).unwrap().count(),
+        1
+    );
+    assert_eq!(
+        std::fs::read_to_string(l.root.join("config.json")).unwrap(),
+        r#"{"project":"repo"}"#
+    );
 }
 
 /// (codex r1 on the code) Rotation only on a FAILED turn the classifiers name: a timeout or a
@@ -1183,7 +1384,7 @@ fn resumed_review(prior: &str, prior_at: &str, answer: &'static str) -> (QeRevie
     // Dispatched long after the QE run was created: only the resume lets its evidence bind.
     let got = run(
         &runner,
-        &input_for(u),
+        &input_for(with_dir(u, &dir)),
         &executor_output(&dir.to_string_lossy()),
         iso_millis("2026-10-28T09:32:00.000Z").unwrap(),
         &|_: &str| {},
@@ -1449,7 +1650,7 @@ fn a_redo_takes_fresh_evidence_on_a_fresh_seat_and_its_pass_is_the_reviewers() {
     let runner: Arc<dyn StepRunner> = scripted.clone();
     let got = run(
         &runner,
-        &input_for(u.clone()),
+        &input_for(with_dir(u.clone(), &dir2)),
         &executor_output(&dir2.to_string_lossy()),
         0,
         &|_: &str| {},
@@ -1595,7 +1796,7 @@ fn a_redo_never_rebinds_the_retired_qe_run_and_an_unknown_tree_still_counts() {
     let runner: Arc<dyn StepRunner> = scripted.clone();
     let got = run(
         &runner,
-        &input_for(u.clone()),
+        &input_for(with_dir(u.clone(), &old_dir)),
         &executor_output(&old_dir.to_string_lossy()),
         0,
         &|_: &str| {},
@@ -1628,7 +1829,7 @@ fn a_redo_never_rebinds_the_retired_qe_run_and_an_unknown_tree_still_counts() {
     assert!(resume_dir(&later).is_some());
     let got = run(
         &runner,
-        &input_for(later),
+        &input_for(with_dir(later, &old_dir)),
         &executor_output(&old_dir.to_string_lossy()),
         0,
         &|_: &str| {},
@@ -1686,4 +1887,109 @@ fn the_reviewer_keeps_the_engines_requirements_record() {
         "{}",
         r.unit.description
     );
+}
+
+/// (xreview codex r1) The mint fails closed on the project table: an unreadable project record, or
+/// the engine's project under a filename that is not its id, refuses it; a soft-deleted engine
+/// project (its unique name still held in the index) is reused, never duplicated.
+#[test]
+fn the_mint_fails_closed_on_a_bad_project_table_and_reuses_a_deleted_engine_project() {
+    let l = Ledger::new("mint-projects");
+    let projects = l.root.join("projects");
+    std::fs::create_dir_all(&projects).unwrap();
+    std::fs::write(projects.join("broken.json"), "{ not json").unwrap();
+    let e = mint_qe_run(&l.root, RUN).unwrap_err();
+    assert!(e.contains("broken.json"), "{e}");
+    std::fs::remove_file(projects.join("broken.json")).unwrap();
+    let rec = |id: &str, deleted: i64| {
+        serde_json::json!({"id": id, "name": engine_project_name(RUN), "description": null,
+            "created_at": now_iso(), "updated_at": now_iso(), "deleted": deleted, "deleted_at": null})
+        .to_string()
+    };
+    std::fs::write(projects.join("p-old.json"), rec("different-id", 0)).unwrap();
+    let e = mint_qe_run(&l.root, RUN).unwrap_err();
+    assert!(e.contains("not its filename"), "{e}");
+    std::fs::remove_file(projects.join("p-old.json")).unwrap();
+    // (codex r2) An incomplete engine project is refused; a later unreadable record still refuses
+    // even after the engine's own row was found.
+    std::fs::write(
+        projects.join("p-thin.json"),
+        serde_json::json!({"id": "p-thin", "name": engine_project_name(RUN)}).to_string(),
+    )
+    .unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("incomplete"));
+    std::fs::remove_file(projects.join("p-thin.json")).unwrap();
+    std::fs::write(projects.join("a-ok.json"), rec("a-ok", 0)).unwrap();
+    std::fs::write(projects.join("z-broken.json"), "{ not json").unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("z-broken.json"));
+    std::fs::remove_file(projects.join("z-broken.json")).unwrap();
+    std::fs::write(projects.join("b-two.json"), rec("b-two", 0)).unwrap();
+    assert!(mint_qe_run(&l.root, RUN)
+        .unwrap_err()
+        .contains("two projects"));
+    std::fs::remove_file(projects.join("a-ok.json")).unwrap();
+    std::fs::remove_file(projects.join("b-two.json")).unwrap();
+    std::fs::write(projects.join("p-del.json"), rec("p-del", 1)).unwrap();
+    let dir = mint_qe_run(&l.root, RUN).unwrap();
+    let run = read_record(&l.root.join("runs").join(format!(
+        "{}.json",
+        dir.file_name().unwrap().to_string_lossy()
+    )))
+    .unwrap();
+    assert_eq!(field(&run, "project_id"), Some("p-del"));
+    assert_eq!(std::fs::read_dir(&projects).unwrap().count(), 1);
+}
+
+/// (xreview codex r1) A same-tree retry resumes its QE run with the dir EMPTIED by the engine (the
+/// run and verdict rows stay), so a seat that writes nothing can never re-submit the last attempt's
+/// artifacts; a resume dir outside this ledger is refused.
+#[test]
+fn a_resumed_runs_evidence_dir_is_emptied_by_the_engine() {
+    let l = Ledger::new("resume-reset");
+    let (id, dir) = l.evidence(RUN, "2020-01-01T00:00:00.000Z");
+    std::fs::create_dir_all(dir.join("logs")).unwrap();
+    std::fs::write(dir.join("logs/old.log"), "old").unwrap();
+    l.verdict(&id, "FAIL", Some("n0"), RUN, "2020-01-01T00:00:01.000Z");
+    let mut u = qe_unit("pi", &l.root);
+    u.qe_review = Some(QeReview {
+        outcome: OUTCOME_FAIL.into(),
+        reason: "r".into(),
+        evidence_dir: Some(dir.to_string_lossy().into_owned()),
+        qe_run_id: Some(id.clone()),
+        tree: Some("t1".into()),
+        verdict: Some("FAIL".into()),
+        attempts: Vec::new(),
+    });
+    let got = prepare_evidence(&u, RUN).unwrap().unwrap();
+    assert_eq!(got, dir.to_string_lossy());
+    let names: Vec<String> = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(
+        names,
+        [EVIDENCE_SENTINEL],
+        "the last attempt's artifacts are gone"
+    );
+    assert!(l.root.join("runs").join(format!("{id}.json")).is_file());
+    assert_eq!(
+        verdicts_of(&l.root, &id).unwrap().len(),
+        1,
+        "the verdict rows stay"
+    );
+    // Nothing the executor did not write binds: no scenario copy, no bind.
+    assert!(bind_evidence(&l.root, &got, RUN, 0, Some(&got))
+        .unwrap_err()
+        .contains("scenario.md"));
+    // A resume dir that is not this ledger's own is refused, never emptied.
+    let outside = l.base.join(&id);
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), "k").unwrap();
+    u.qe_review.as_mut().unwrap().evidence_dir = Some(outside.to_string_lossy().into_owned());
+    assert!(prepare_evidence(&u, RUN).unwrap().is_err());
+    assert!(outside.join("keep").is_file());
 }

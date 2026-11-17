@@ -797,6 +797,79 @@ pub(super) fn on_counted(
     }
 }
 
+/// (crew#1554) Whether `unit`'s denial is a QE record that bound NOTHING: outcome `invalid`, no
+/// verdict, no QE run bound (no lineage either) and no reviewer turn run — the evidence of a fresh
+/// QE run could not be bound, so no reviewer ever judged it. Not a finding on the work, so it is
+/// never a review round and never goes back to the builder, who cannot fix it. (xreview codex r1)
+/// A record whose reviewer DID run (its reply or its ledger verdict could not be bound), or that
+/// resumes a QE run holding an earlier verdict, is not one: a FAIL there must never be retired by
+/// an automatic redo.
+pub(super) fn qe_binding_miss(unit: &crate::domain::WorkUnit) -> bool {
+    crate::qe_acceptance::review::non_verdict(unit).is_some_and(|r| {
+        r.outcome == crate::qe_acceptance::review::OUTCOME_INVALID
+            && r.attempts.is_empty()
+            && r.qe_run_id.is_none()
+    })
+}
+
+/// (crew#1554) On a power run, a QE binding miss ([`qe_binding_miss`]) re-runs the QE step — the
+/// operator's "redo the QE check" arm, answered by the hand-off — instead of a `request_changes`
+/// rewind to the build (a full build, floor and review round that cannot change the outcome). The
+/// failed step is recorded on the hand-off; no round is spent. `true` when the caller should
+/// answer the gate with `RetryQe` (its own checks — the redo cap, QE still required, a reviewer
+/// seat free now — still decide; refused, the gate stays for the operator).
+pub(super) fn auto_redo_qe(
+    subscribers: &mut crate::event_log::EventSink,
+    session: &mut AgentSession,
+    unit: &crate::domain::WorkUnit,
+    reason: &str,
+) -> bool {
+    let run_id = session.id.clone();
+    let Some(power) = session.power.as_mut().filter(|p| p.on) else {
+        return false;
+    };
+    let Some(build) = power.orchestrator.ord else {
+        return false;
+    };
+    if unit.ord < build || !qe_binding_miss(unit) {
+        return false;
+    }
+    let handoff = power.handoff.get_or_insert_with(|| crate::power::Handoff {
+        round: 1,
+        max_rounds: crate::power::MAX_HANDOFF_ROUNDS,
+        steps: Vec::new(),
+    });
+    let row = crate::power::HandoffStep {
+        round: handoff.round.max(1),
+        step: "qe".into(),
+        ord: Some(unit.ord),
+        status: "failed".into(),
+        seat: unit.assigned_cli.clone(),
+        summary: Some(format!(
+            "QE re-runs (no build round): {}",
+            reason
+                .lines()
+                .next()
+                .unwrap_or("")
+                .chars()
+                .take(260)
+                .collect::<String>()
+        )),
+        at: crate::interaction::now_millis(),
+    };
+    handoff.steps.push(row.clone());
+    emit(
+        subscribers,
+        CoreEvent::PowerHandoffStepped {
+            session: run_id,
+            round: row.round,
+            max_rounds: handoff.max_rounds,
+            step: Box::new(row),
+        },
+    );
+    true
+}
+
 /// (program DES-POWER-MODE §6) A hand-off NOT-PASS on a power run goes back to the SAME
 /// orchestrator session on its own — a `request_changes` rewind to the build, whose seat resumes
 /// its session — up to [`crate::power::MAX_HANDOFF_ROUNDS`]; the next asks the operator. `Some`
@@ -818,7 +891,8 @@ pub(super) fn auto_send_back(
     }
     let evaluator_fail = class == "verdict_not_pass"
         && unit.role == crate::workflow::PhaseRole::Evaluator
-        && unit.tool_cmd.is_none();
+        && unit.tool_cmd.is_none()
+        && !qe_binding_miss(unit);
     // The build's own floor at hand-off: a red check goes back too, unless the base itself is
     // red (that needs the operator's judgment, not another turn).
     let lower = reason.to_ascii_lowercase();
@@ -927,4 +1001,120 @@ pub(super) fn set_outcome(store: &dyn GraphStore, session: &mut AgentSession, ou
     power.orchestrator.in_turn = false;
     power.pause = None;
     crate::power::forget_run(&run_id);
+}
+
+/// (crew#1554) A power run's QE binding miss re-runs the QE step, never the build.
+#[cfg(test)]
+mod qe_binding_tests {
+    use super::*;
+    use crate::qe_acceptance::review as r;
+
+    fn power_session() -> AgentSession {
+        let mut s = crate::actor::sessions_detail_fold_tests::session("pw-qe");
+        let mut p = crate::power::PowerState::launched(true, 0);
+        p.orchestrator.ord = Some(2);
+        s.power = Some(p);
+        s
+    }
+
+    /// The QE unit (ord 4) as the fold leaves it: denied by its QE record.
+    fn qe_unit(outcome: &str, verdict: Option<&str>) -> crate::domain::WorkUnit {
+        let mut u = crate::domain::WorkUnit::pending("pw-qe:test", "pw-qe", 4, "verify");
+        u.role = crate::workflow::PhaseRole::Evaluator;
+        u.catalog = Some("test".into());
+        u.assigned_cli = Some("claude".into());
+        let review = crate::domain::QeReview {
+            outcome: outcome.into(),
+            reason: "the QE evidence could not be bound: the evidence dir's run id `run-471` is \
+                     not a QE run id (a UUID)"
+                .into(),
+            evidence_dir: None,
+            qe_run_id: None,
+            tree: Some("t1".into()),
+            verdict: verdict.map(str::to_string),
+            attempts: Vec::new(),
+        };
+        u.denial = r::denial(&review);
+        u.qe_review = Some(review);
+        u
+    }
+
+    #[test]
+    fn a_qe_binding_miss_re_runs_qe_and_spends_no_build_round() {
+        let mut s = power_session();
+        let mut sink = crate::event_log::EventSink::default();
+        let u = qe_unit(r::OUTCOME_INVALID, None);
+        let reason = u.denial.as_ref().unwrap().reason.clone();
+        assert!(qe_binding_miss(&u));
+        assert_eq!(
+            auto_send_back(&mut sink, &mut s, &u, "verdict_not_pass", &reason),
+            None,
+            "never back to the build"
+        );
+        assert!(auto_redo_qe(&mut sink, &mut s, &u, &reason));
+        let h = s.power.as_ref().unwrap().handoff.clone().unwrap();
+        assert_eq!(h.round, 1, "no hand-off round spent");
+        let row = h.steps.last().unwrap();
+        assert_eq!((row.step.as_str(), row.status.as_str()), ("qe", "failed"));
+        assert!(
+            row.summary.as_deref().unwrap().contains("QE re-runs"),
+            "{row:?}"
+        );
+    }
+
+    #[test]
+    fn a_bound_qe_fail_still_goes_back_to_the_build() {
+        let mut s = power_session();
+        let mut sink = crate::event_log::EventSink::default();
+        let u = qe_unit(r::OUTCOME_FAIL, Some("FAIL"));
+        assert!(!qe_binding_miss(&u));
+        assert!(!auto_redo_qe(&mut sink, &mut s, &u, "QE acceptance: FAIL"));
+        let note = auto_send_back(&mut sink, &mut s, &u, "verdict_not_pass", "QE: FAIL");
+        assert!(note.is_some_and(|n| n.contains("round 1 of")));
+    }
+
+    /// (xreview codex r1) Only a record that bound NOTHING is a miss: once a reviewer turn ran, or
+    /// the record resumes a QE run that may hold an earlier verdict, an automatic redo could retire
+    /// a FAIL, so it stays a review outcome (and on a power run goes back to the build as today).
+    #[test]
+    fn a_record_whose_reviewer_ran_or_that_resumes_a_run_is_never_a_binding_miss() {
+        let mut ran = qe_unit(r::OUTCOME_INVALID, None);
+        ran.qe_review
+            .as_mut()
+            .unwrap()
+            .attempts
+            .push(crate::domain::QeReviewAttempt {
+                seat: "codex".into(),
+                basis: r::BASIS_DISTINCT.into(),
+                same_cli: false,
+                status: r::OUTCOME_INVALID.into(),
+                session: "n-1".into(),
+                governed: true,
+                tool_activity: true,
+                attempt: 1,
+            });
+        assert!(!qe_binding_miss(&ran));
+        let mut lineage = qe_unit(r::OUTCOME_INVALID, None);
+        lineage.qe_review.as_mut().unwrap().qe_run_id = Some("dd76".into());
+        assert!(!qe_binding_miss(&lineage));
+        let mut s = power_session();
+        let mut sink = crate::event_log::EventSink::default();
+        assert!(!auto_redo_qe(&mut sink, &mut s, &ran, "x"));
+        assert!(auto_send_back(&mut sink, &mut s, &ran, "verdict_not_pass", "x").is_some());
+    }
+
+    #[test]
+    fn off_power_or_before_the_build_nothing_is_answered() {
+        let u = qe_unit(r::OUTCOME_INVALID, None);
+        let mut sink = crate::event_log::EventSink::default();
+        let mut phased = power_session();
+        phased.power.as_mut().unwrap().on = false;
+        assert!(!auto_redo_qe(&mut sink, &mut phased, &u, "x"));
+        let mut early = power_session();
+        early.power.as_mut().unwrap().orchestrator.ord = Some(5);
+        assert!(!auto_redo_qe(&mut sink, &mut early, &u, "x"));
+        // An inconclusive record keeps the operator's gate (unchanged): not a binding miss.
+        let inc = qe_unit(r::OUTCOME_INCONCLUSIVE, Some("FAIL"));
+        assert!(!qe_binding_miss(&inc));
+    }
 }

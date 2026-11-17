@@ -1533,6 +1533,12 @@ pub struct WorkUnit {
     /// records. Never persisted on a stored unit (the reviewer input is built on the worker).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub qe_review_session: Option<String>,
+    /// (core#1484) Set ONLY on the QE unit's executor input, for one attempt: the evidence dir the
+    /// engine created (or resumes) for it before the executor turn
+    /// ([`crate::qe_acceptance::review::prepare_evidence`]). The directive names it and the bind
+    /// reads it; no seat chooses it. Never persisted on a stored unit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qe_evidence_dir: Option<String>,
     /// (DES-QE-EVERY-SEAT §3.5) What the isolated QE reviewer of this unit's last attempt did:
     /// the evidence it was handed, the verdict it recorded, the seats it was tried on. `None` for
     /// every unit that ran no reviewer (skipped on the wire).
@@ -1915,6 +1921,7 @@ impl WorkUnit {
             qe_reviewer_seats: Vec::new(),
             qe_floor_note: None,
             qe_review_session: None,
+            qe_evidence_dir: None,
             qe_review: None,
             qe_redos: Vec::new(),
             rule_steps: Vec::new(),
