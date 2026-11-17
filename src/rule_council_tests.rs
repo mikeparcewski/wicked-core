@@ -549,9 +549,10 @@ fn a_fresh_judge_row_says_whether_its_evidence_was_whole() {
     let r = run(&rules, &judge, None);
     assert_eq!(r.rows[0].origin, Some(RuleOrigin::Judge));
     assert_eq!(r.rows[0].evidence_complete, Some(true));
-    // A diff larger than one call can show: a BROKEN still counts, but it is not whole.
+    // A diff larger than MAX_PARTS calls can show (core#1474): a BROKEN still counts, but it is
+    // not whole.
     let big = change_of(
-        &format!("{DIFF}{}", "+// pad\n".repeat(20_000)),
+        &format!("{DIFF}{}", "+// pad\n".repeat(80_000)),
         &["src/add.rs"],
     );
     let judge = Fake::new(&[("R1", "BROKEN — src/add.rs:1 untyped")]);

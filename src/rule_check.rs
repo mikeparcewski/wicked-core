@@ -1272,6 +1272,111 @@ const PROMPT_OVERHEAD: usize = 6 * 1024;
 /// The least diff a batch shows; a batch whose rules leave less is split.
 const MIN_EVIDENCE: usize = 16 * 1024;
 
+/// (core#1474) The most parts one batch's change is judged in. A change needing more is judged on
+/// its first `MAX_PARTS` parts and the rest is named as not shown (today's cut rule: only a BROKEN
+/// counts), so a check makes at most `MAX_PARTS` times the calls of an unsplit one.
+pub const MAX_PARTS: usize = 8;
+
+/// (core#1474) `diff` cut into parts of at most `cap` bytes, nothing left out and nothing reordered:
+/// at `diff --git` file boundaries first, a file bigger than a part at its `@@` hunk boundaries
+/// (each later part repeats the file's header lines, so the judge always sees which file it reads),
+/// and a hunk bigger than a part at line boundaries. A single line bigger than `cap` is a part of
+/// its own (the prompt then cuts it, and the check says so). The concatenation of the parts, less
+/// the repeated headers, is `diff`.
+pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
+    let cap = cap.max(1);
+    // Units: (header to repeat, text). A file's header is its lines before the first `@@`.
+    let mut units: Vec<(String, String)> = Vec::new();
+    let mut header = String::new();
+    let mut in_header = false;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            header = line.to_string();
+            in_header = true;
+            units.push((String::new(), line.to_string()));
+        } else if line.starts_with("@@") {
+            in_header = false;
+            units.push((header.clone(), line.to_string()));
+        } else {
+            if in_header {
+                header.push_str(line);
+            }
+            match units.last_mut() {
+                // A unit and the header a part may repeat before it fit one part.
+                Some((h, text)) if h.len() + text.len() + line.len() <= cap || text.is_empty() => {
+                    text.push_str(line)
+                }
+                Some((h, _)) => {
+                    let h = h.clone();
+                    units.push((h, line.to_string()));
+                }
+                None => units.push((String::new(), line.to_string())),
+            }
+        }
+    }
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for (h, text) in units {
+        if !cur.is_empty() && cur.len() + text.len() > cap {
+            parts.push(std::mem::take(&mut cur));
+        }
+        // A hunk unit starts each part with its file's header (counted in the unit's limit).
+        if cur.is_empty() && !text.starts_with("diff --git ") {
+            cur.push_str(&h);
+        }
+        cur.push_str(&text);
+    }
+    if !cur.is_empty() {
+        parts.push(cur);
+    }
+    parts
+}
+
+/// (core#1474) The part note that leads a part's prompt (outside the evidence fence).
+fn part_note(k: usize, n: usize) -> String {
+    format!(
+        "PART {k} OF {n} of the change: the change is too big for one call, so it is judged in {n} \
+         parts, each in its own call, and the answers are combined (a rule BROKEN in any part is \
+         broken). Judge each rule on THIS part only: BROKEN or KEPT on what this part shows, N/A for \
+         a rule this part does not touch, UNKNOWN only when this part cannot decide it.\n\n"
+    )
+}
+
+/// (core#1474) The answers of one batch's parts, combined per rule: BROKEN if any part broke it
+/// (its cite names the part); else the first miss, a holding miss first (no answer); else WAIVED if
+/// any part waived it; else KEPT if any part kept it; else the first part's answer (N/A).
+fn combine_parts(parts: &[Parsed], ids: &[&str]) -> Parsed {
+    let n = parts.len();
+    let mut out = Parsed::default();
+    for id in ids {
+        let answers: Vec<(usize, &Answer)> = parts
+            .iter()
+            .enumerate()
+            .filter_map(|(k, p)| p.answers.get(*id).map(|a| (k + 1, a)))
+            .collect();
+        let misses: Vec<&Miss> = parts.iter().filter_map(|p| p.misses.get(*id)).collect();
+        let named = |k: usize, a: &Answer| Answer {
+            status: a.status,
+            cite: format!("part {k} of {n}: {}", a.cite),
+        };
+        if let Some((k, a)) = answers.iter().find(|(_, a)| a.status == RuleStatus::Broken) {
+            out.answers.insert(id.to_string(), named(*k, a));
+        } else if let Some(m) = misses.iter().find(|m| m.holds()).or_else(|| misses.first()) {
+            out.misses.insert(id.to_string(), (*m).clone());
+        } else if let Some((k, a)) = [RuleStatus::Waived, RuleStatus::Kept]
+            .iter()
+            .find_map(|st| answers.iter().find(|(_, a)| a.status == *st))
+        {
+            out.answers.insert(id.to_string(), named(*k, a));
+        } else if let Some((k, a)) = answers.first() {
+            out.answers.insert(id.to_string(), named(*k, a));
+        } else {
+            out.misses.insert(id.to_string(), Miss::NoLine);
+        }
+    }
+    out
+}
+
 /// Split `ids` into batches of at most `size` rules whose texts fit the prompt beside at least
 /// [`MIN_EVIDENCE`] of diff. A rule too long for that is a batch alone.
 fn batches_for(texts: &[usize], size: usize) -> Vec<Vec<usize>> {
@@ -3913,7 +4018,50 @@ fn run_pool(
                 let engine = input.engine_record.unwrap_or("");
                 // The records a record call cut (a cut record proves presence, never absence).
                 let mut cut_records: Vec<usize> = Vec::new();
+                // (core#1474) The change in parts when it is bigger than this prompt's evidence
+                // budget: nothing is left out, each part is asked in its own call.
+                let parts: Vec<String> = match subject {
+                    EvidenceSubject::Change => {
+                        let frame = prompt_for(
+                            &asked,
+                            "",
+                            &paths,
+                            input.floor,
+                            input.instructions,
+                            &nonce,
+                            input.stage,
+                        );
+                        // Never more than the prompt itself would show (`prompt_for`'s own cap):
+                        // the frame already holds the rules, floor, files and instructions.
+                        let cap = EVIDENCE_CAP
+                            .min(PROMPT_BUDGET.saturating_sub(frame.len() + PROMPT_OVERHEAD))
+                            .max(4 * 1024);
+                        if input.change.diff.len() <= cap {
+                            Vec::new()
+                        } else {
+                            diff_parts(&input.change.diff, cap)
+                        }
+                    }
+                    _ => Vec::new(),
+                };
+                let total_parts = parts.len();
+                let part_text = |k: usize| {
+                    format!(
+                        "{}{}",
+                        part_note(k + 1, total_parts),
+                        prompt_for(
+                            &asked,
+                            &parts[k],
+                            &paths,
+                            input.floor,
+                            input.instructions,
+                            &nonce,
+                            input.stage,
+                        )
+                    )
+                };
                 let text = match subject {
+                    EvidenceSubject::Change if total_parts > 0 => part_text(0),
                     EvidenceSubject::Change => prompt_for(
                         &asked,
                         &input.change.diff,
@@ -3996,6 +4144,55 @@ fn run_pool(
                         }
                     }
                 }
+                // (core#1474) The other parts go to the seat that answered the first, so one judge
+                // read the whole change. A part it cannot answer ends the batch like a timeout:
+                // its rules are asked again alone on another seat.
+                let mut later: Vec<String> = Vec::new();
+                if let (Some((seat, _)), true) = (&got, total_parts > 1) {
+                    for k in 1..total_parts.min(MAX_PARTS) {
+                        if pool.stopped() {
+                            got = None;
+                            break;
+                        }
+                        pool.calls
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        match judge.ask(seat, &part_text(k)) {
+                            JudgeAnswer::Answered(out) => later.push(out),
+                            other => {
+                                let stopped = matches!(other, JudgeAnswer::Stopped(_));
+                                let w = match other {
+                                    JudgeAnswer::SeatFailed(w)
+                                    | JudgeAnswer::TimedOut(w)
+                                    | JudgeAnswer::Stopped(w) => w,
+                                    JudgeAnswer::Answered(_) => String::new(),
+                                };
+                                if stopped {
+                                    pool.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                                } else {
+                                    let mut l = left.lock().unwrap();
+                                    for i in &batch {
+                                        l.insert(
+                                            *i,
+                                            Retry {
+                                                avoid: seat.clone(),
+                                                told: format!(
+                                                    "the judge first asked did not answer part \
+                                                     {} of {total_parts} of the change",
+                                                    k + 1
+                                                ),
+                                                holds: false,
+                                            },
+                                        );
+                                    }
+                                }
+                                failures
+                                    .push(format!("{seat}: part {} of {total_parts}: {w}", k + 1));
+                                got = None;
+                                break;
+                            }
+                        }
+                    }
+                }
                 match got {
                     Some((seat, out)) => {
                         // A KEPT on the change cites a changed file; on a record it quotes it.
@@ -4003,12 +4200,30 @@ fn run_pool(
                             EvidenceSubject::Change => &paths,
                             _ => &[],
                         };
-                        let parsed =
-                            parse_rule_answers(&out, &ids, &nonce, bar, input.instructions);
+                        let parsed = if total_parts > 1 {
+                            let mut each = vec![parse_rule_answers(
+                                &out,
+                                &ids,
+                                &nonce,
+                                bar,
+                                input.instructions,
+                            )];
+                            each.extend(later.iter().map(|o| {
+                                parse_rule_answers(o, &ids, &nonce, bar, input.instructions)
+                            }));
+                            combine_parts(&each, &ids)
+                        } else {
+                            parse_rule_answers(&out, &ids, &nonce, bar, input.instructions)
+                        };
                         // (pi r2) A judge shown only part of the diff can find a rule broken, never
-                        // kept or not applicable: what it did not see may break it.
-                        let cut =
-                            subject == EvidenceSubject::Change && prompt_was_cut(&text, &nonce);
+                        // kept or not applicable: what it did not see may break it. (core#1474) In
+                        // parts, the change is shown whole unless it needed more than MAX_PARTS, or
+                        // a part's own prompt still had to cut a single huge line.
+                        let cut = subject == EvidenceSubject::Change
+                            && (total_parts > MAX_PARTS
+                                || (total_parts == 0 && prompt_was_cut(&text, &nonce))
+                                || (0..total_parts.min(MAX_PARTS))
+                                    .any(|k| prompt_was_cut(&part_text(k), &nonce)));
                         // (Part B) A cut step record can prove a check was recorded, never that
                         // it was not: a BROKEN counts only when it names a record shown whole.
                         let record_cut = !cut_records.is_empty();
