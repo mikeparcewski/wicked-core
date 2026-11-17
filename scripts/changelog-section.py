@@ -45,7 +45,8 @@ def section(changelog: str, version: str):
     lines = changelog.splitlines()
     esc = re.escape(version)
     bullet = re.compile(rf"^- \*\*core-ts {esc}\*\*(?=[\s—]|$)")
-    heading = re.compile(rf"^## \[core-ts {esc}\](?=[\s—]|$)")
+    # `## [core-ts X.Y.Z] — …`, or a combined one such as `## [0.4.0] / [core-ts 0.4.1]`.
+    heading = re.compile(rf"^## (?:.*\s)?\[core-ts {esc}\](?=[\s—]|$)")
     for i, line in enumerate(lines):
         if bullet.match(line):
             body = [line[2:]]
@@ -77,7 +78,7 @@ def main(argv) -> int:
     try:
         with open(_changelog_path(), encoding="utf-8") as fh:
             text = fh.read()
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         sys.stderr.write(f"cannot read CHANGELOG.md: {exc}\n")
         return 2
     notes = section(text, version)
@@ -87,5 +88,14 @@ def main(argv) -> int:
     return 0
 
 
+def run(argv) -> int:
+    """`main`, with any unexpected failure as exit 2: exit 1 means only "no block for this version"."""
+    try:
+        return main(argv)
+    except Exception as exc:  # noqa: BLE001 — the caller must fail, never fall back to a generic note
+        sys.stderr.write(f"changelog-section.py failed: {exc.__class__.__name__}: {exc}\n")
+        return 2
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(run(sys.argv[1:]))

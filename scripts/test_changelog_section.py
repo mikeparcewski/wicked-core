@@ -41,6 +41,14 @@ CHANGELOG = """# Changelog
 ## [core-ts 0.7.0] — 2026-08-19
 
 - First.
+
+## [0.4.0] / [core-ts 0.4.1] — 2026-08-01
+
+- Combined heading.
+
+## [0.3.0] — 2026-07-01
+
+- Not core-ts.
 """.replace("HOME_DIR", HOME_DIR).replace("TMP_DIR", TMP_DIR)
 
 
@@ -89,6 +97,28 @@ class ChangelogSection(unittest.TestCase):
         self.assertIn("~/.wicked/x.log", out)
         self.assertIn("<tmp>/run-1", out)
 
+    def test_a_combined_heading_is_found(self):
+        code, out = run(["0.4.1"])
+        self.assertEqual((code, out.strip()), (0, "- Combined heading."))
+        self.assertEqual(run(["0.4.0"])[0], 1)  # 0.4.0 there is the engine's version, not core-ts
+
+    def test_an_undecodable_changelog_is_exit_2_never_1(self):
+        with tempfile.TemporaryDirectory() as d:
+            Path(d, "CHANGELOG.md").write_bytes(b"- **core-ts 0.15.45** \xff\xfe broken\n")
+            cwd = os.getcwd()
+            os.chdir(d)
+            try:
+                with redirect_stdout(io.StringIO()) as out, redirect_stderr(io.StringIO()):
+                    code = cs.run(["0.15.45"])
+            finally:
+                os.chdir(cwd)
+        self.assertEqual((code, out.getvalue()), (2, ""))
+
+    def test_an_unexpected_error_is_exit_2(self):
+        from unittest import mock
+        with mock.patch.object(cs, "section", side_effect=RuntimeError("boom")), redirect_stderr(io.StringIO()):
+            self.assertEqual(cs.run(["0.15.45"]), 2)
+
     def test_no_block_is_exit_1_with_nothing_written(self):
         self.assertEqual(run(["0.9.9"]), (1, ""))
 
@@ -103,9 +133,17 @@ class ChangelogSection(unittest.TestCase):
         real = Path(__file__).resolve().parent.parent / "CHANGELOG.md"
         if not real.exists():
             self.skipTest("no CHANGELOG.md beside scripts/")
-        notes = cs.section(real.read_text(encoding="utf-8"), "0.15.45")
-        self.assertIsNotNone(notes)
-        self.assertTrue(notes.startswith("**core-ts 0.15.45**"))
+        text = real.read_text(encoding="utf-8")
+        for version, older in (("0.15.45", "0.15.44"), ("0.15.44", "0.15.43")):
+            notes = cs.section(text, version)
+            self.assertIsNotNone(notes)
+            self.assertTrue(notes.startswith(f"**core-ts {version}**"))
+            # The whole block: every indented line up to the next release bullet, and nothing of it.
+            lines = text.splitlines()
+            start = next(i for i, l in enumerate(lines) if l.startswith(f"- **core-ts {version}**"))
+            end = next(i for i, l in enumerate(lines) if l.startswith(f"- **core-ts {older}**"))
+            self.assertEqual(len(notes.splitlines()), end - start)
+            self.assertNotIn(f"**core-ts {older}**", notes)
 
 
 if __name__ == "__main__":
