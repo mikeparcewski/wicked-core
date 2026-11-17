@@ -3087,27 +3087,32 @@ Two release tracks share this file, newest entry first regardless of track:
     core#1486, core#1495).** A worker that changes nothing says `NO-CHANGE: <why>`; a note repeated at a later retry
     still reaches every later turn, including a continuation re-armed after a restart.
   - **The engine publishes every answer an open gate takes (#1512).** New binding method `gateActions(runId)`; the
-    list is the accepted set (each candidate runs through the decision path's own pre-checks). Studio's gate contract
-    (studio#1172, #1178) reads it.
-  - **Reviews and judging:** a reviewer's FAIL is never a worker error or a failover (#1519); the rule judge reads every
-    changed line, in parts when the change is big (#1514); the rule judge and a seat re-probe run under their own wall
+    list is the accepted set (each candidate runs through the decision path's own pre-checks), with one exception: an
+    Apps publish consent is listed from the QE record's tree, so after the worktree changes since QE the list can offer
+    an approve that answering refuses (core#1534). Studio's gate contract (studio#1172, #1178) reads it.
+  - **Reviews and judging:** a reviewer's FAIL is never a worker error or a failover (#1519); the rule judge reads a
+    big change in up to eight parts (#1514; beyond that the report is marked cut, and only a BROKEN verdict counts on
+    the unread part); the rule judge and a seat re-probe run under their own wall
     budget (#1511); a person's rule skip carries to later steps while the hunks are unchanged (#1516).
   - **Seats and floors:** seat egress is open by default, and an invalid `WICKED_SEAT_EGRESS_HOSTS` fails closed
     (#1487); a sign-in refusal is judged in the CLI's own frame and a sign-in bench is re-probed (#1510); a seat pod
     never ready by the deadline is `pod_not_ready` with its evidence and the arm is retried (#1527); the k8s write-back
-    leaves build output and over-limit files out instead of failing the unit (#1518); cancel kills the floor's checks
-    and a host short of disk refuses the floor (#1530); the engine owns the QE evidence dir and a binding miss re-runs QE
-    (#1515).
+    leaves eligible build-output directories and oversized untracked files out instead of failing the unit, while tracked
+    changes and QE evidence that cannot fit still refuse the write-back (#1518); cancel kills the floor's checks and a
+    host short of disk refuses the floor (#1530); the engine owns the QE evidence dir, and in power mode a fresh QE
+    binding miss before any review re-runs QE, within the redo checks (#1515).
   - **Tests and lockfile:** #1539 (launch-bench comparison without the re-probe stamp); #1490 re-stamped the 0.15.44
     platform lock entries.
   - **Known limits.** core#1546 (W10 and below: a re-judge or floor re-run carries no work observation; payload
     redaction drops a record's endpoint; gateway log lifecycle; a 32-bit launch nonce; the bus judge path skips the
-    provider check); all fail toward "unobserved", which holds as before. core#1549 (W6): the first judging after a
+    provider check). A launch with no observation proves nothing: an ordinary judge's approval then stands under the
+    existing identity rules (as before #1547), and only a validator author's re-admission (#1548) requires a fully
+    observed launch, so it is refused. The bus judge path returns its verdict without the provider check. core#1549 (W6): the first judging after a
     repeat-page reset reads as unobserved and holds for a person. core#1531 (W10 x2, W8): arbiter identity edge cases on
     carried disputes and the seated count of a rejected arbiter ballot. core#1520 (W6, W4, W2): an undecodable running
     unit reads as between units for a steer; turn 1 still carries older amendment segments; nested amendment text.
     wicked-ci#76 (W6): the advisory selftest shows green over a U04 FAIL, so its green tick is not evidence. Observation
-    covers the container floor only: the host floor has no gateway, so a host-floor judging reads as unobserved (and
+    covers the container floor only: the host floor has no gateway, so a host-floor judging is unobserved (and
     codex stays benched for repo-bound host runs unless `WICKED_CODEX_WORKTREE_OK=1`).
   - **Upgrade notes.** One new binding method, `gateActions(runId)`; no `LaunchSpec` field change; gate protocol 3 is
     unchanged. No Dockerfile change, so no image rebuild. With `WICKED_SEAT_EGRESS_HOSTS` unset seats now get open
