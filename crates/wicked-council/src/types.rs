@@ -984,17 +984,20 @@ impl SeatFailureReason {
     }
 
     /// (F-7R3-001) Classify a WORKER's or JUDGE's failed transcript — the engine's single output
-    /// string, not a ballot's two streams. Authentication signatures are judged over the WHOLE
-    /// text as before (they are rare in prose); the quota REFUSAL FRAME ([`quota_refusal_frame`])
-    /// only over its last [`REFUSAL_TAIL_BYTES`] — a CLI states its final refusal last, and the
-    /// body of a long transcript is the unit's subject matter, not the seat's condition. A
-    /// refusal straddling the tail cut is missed by design: a real refusal is terminal, so it
-    /// never does (review F4). A ballot's output goes through [`Self::classify`] whole.
+    /// string, not a ballot's two streams. Every rule is judged over the transcript's last
+    /// [`REFUSAL_TAIL_BYTES`] only — a CLI states its final refusal last, and the body of a long
+    /// transcript is the unit's subject matter, not the seat's condition. A refusal straddling
+    /// the tail cut is missed by design: a real refusal is terminal, so it never does (review
+    /// F4). A ballot's output goes through [`Self::classify`] whole.
+    /// (core#1479) A sign-in refusal counts only in the CLI's own frame
+    /// ([`sign_in_refusal_frame`]): a worker's REPORT that says another tool "is not logged in"
+    /// is the unit's subject matter, and matching it over the whole text benched a signed-in
+    /// claude seat for the run (runs 1bae451d, fd897d8a).
     /// `nonzero_exit` — the runner's own failure marker (`(cli … exited N)`, N ≠ 0) — is the
     /// exit evidence the generic quota rule needs (r2-N2); a carrier that hands the engine no
     /// exit status classifies provider sentences only.
     pub fn classify_refusal(output: &str, nonzero_exit: bool) -> Option<Self> {
-        if matches_any(output, NOT_LOGGED_IN) {
+        if sign_in_refusal_frame(tail_bytes(output, REFUSAL_TAIL_BYTES)) {
             return Some(SeatFailureReason::NotLoggedIn);
         }
         // (core#670) Judged over the TAIL only, by the same reasoning the quota rule uses: the
@@ -1099,6 +1102,71 @@ const NOT_LOGGED_IN: &[&str] = &[
     "login required",
     "not signed in",
 ];
+
+/// (core#1479) Sign-in tokens that are complete in themselves — no prose about a sign-on system
+/// phrases them this way: claude's own login instruction (`Not logged in · Please run /login`,
+/// `Invalid API key · Please run /login`), the Anthropic API's error type (`API Error: 401
+/// {"type":"error","error":{"type":"authentication_error",…}}`), and the engine's own floor token
+/// for an agent with no usable sign-in in its broker (`worker_sandbox::floor_refusal_text`).
+/// ASCII-case-insensitive substrings, counted on a terminal line only.
+const SIGN_IN_SELF_FRAMED: &[&str] = &["run /login", "authentication_error", "agent_signed_out:"];
+
+/// (core#1479) The labels a CLI prints before its error words (`error: Not logged in`, `API
+/// Error: …`, `✗ Not signed in`), stripped before a [`NOT_LOGGED_IN`] phrase must lead the line.
+/// A markdown bullet or a quote mark is NOT one: a report's list item or a quoted harness answer is
+/// prose.
+const ERROR_LABELS: &[&str] = &["api error:", "error:", "fatal:", "[error]", "✗", "×"];
+
+/// (core#1479) Is there a sign-in refusal in the CLI's own frame in `text` (a transcript's tail)?
+/// Judged on the last [`REFUSAL_FRAME_LINES`] non-empty lines — a CLI that cannot sign in stops
+/// there, and the launcher's few lines under it are noise. A line counts when it carries a
+/// [`SIGN_IN_SELF_FRAMED`] token, or when a [`NOT_LOGGED_IN`] phrase LEADS it once the wrapped
+/// runner's `(cli `<key>` exited N)` marker and an [`ERROR_LABELS`] label are stripped. A sentence
+/// that merely uses the phrase (`the rule model in this seat is not logged in, so …`, `it returned
+/// "Not logged in"`) is the unit's subject matter.
+fn sign_in_refusal_frame(text: &str) -> bool {
+    text.lines()
+        .rev()
+        .filter(|l| !l.trim().is_empty())
+        .take(REFUSAL_FRAME_LINES)
+        .any(|line| {
+            SIGN_IN_SELF_FRAMED
+                .iter()
+                .any(|p| contains_ignore_ascii_case(line, p))
+                || {
+                    let head = refusal_line_head(line).as_bytes();
+                    NOT_LOGGED_IN.iter().any(|p| {
+                        head.len() >= p.len() && head[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+                    })
+                }
+        })
+}
+
+/// (core#1479) `line` with the wrapped runner's exit marker (`(cli `claude` exited 1) `) and any
+/// [`ERROR_LABELS`] stripped from its front: what the CLI itself led its line with.
+fn refusal_line_head(line: &str) -> &str {
+    let mut s = line.trim_start();
+    if let Some(rest) = s.strip_prefix("(cli `") {
+        if let Some((_, after)) = rest
+            .split_once("` exited ")
+            .and_then(|(_, r)| r.split_once(')'))
+        {
+            s = after.trim_start();
+        }
+    }
+    loop {
+        let before = s.len();
+        for label in ERROR_LABELS {
+            let b = s.as_bytes();
+            if b.len() >= label.len() && b[..label.len()].eq_ignore_ascii_case(label.as_bytes()) {
+                s = s[label.len()..].trim_start();
+            }
+        }
+        if s.len() == before {
+            return s;
+        }
+    }
+}
 
 /// (core#670) The launcher's own words when a HOST-forced approval policy stops it running a
 /// command, each paired with the FRAME it arrives in — ASCII-case-insensitive substrings, all of
@@ -2475,11 +2543,11 @@ mod failure_reason_tests {
         );
     }
 
-    /// (F-7R3-001) A worker's / judge's transcript is judged for quota over its TAIL only: the
-    /// same words deep in a long body (the unit's subject matter) do not bench the seat, while
-    /// the refusal a CLI prints last does — and an auth refusal anywhere still classifies.
+    /// (F-7R3-001) A worker's / judge's transcript is judged over its TAIL only: the same words
+    /// deep in a long body (the unit's subject matter) do not bench the seat, while the refusal a
+    /// CLI prints last does. (core#1479) That holds for a sign-in refusal too.
     #[test]
-    fn a_transcript_refusal_is_judged_over_its_tail_for_quota_but_whole_for_auth() {
+    fn a_transcript_refusal_is_judged_over_its_tail() {
         let filler = "x".repeat(REFUSAL_TAIL_BYTES * 2);
         let body_mentions_it = format!("implementing the rate limit middleware\n{filler}\nexit 1");
         assert_eq!(
@@ -2494,6 +2562,12 @@ mod failure_reason_tests {
         let auth_first = format!("Not logged in · Please run /login\n{filler}");
         assert_eq!(
             SeatFailureReason::classify_refusal(&auth_first, false),
+            None,
+            "a sign-in line deep in the body is subject matter (core#1479)"
+        );
+        let auth_last = format!("{filler}\nNot logged in · Please run /login");
+        assert_eq!(
+            SeatFailureReason::classify_refusal(&auth_last, false),
             Some(SeatFailureReason::NotLoggedIn)
         );
         // The tail cut lands on a char boundary — 2-, 3- and 4-byte text does not panic, and
@@ -2657,6 +2731,73 @@ mod failure_reason_tests {
     }
 
     /// Records persisted before `stdout`/`reason` existed still read (both default).
+    /// (core#1479) A worker's REPORT that says another component "is not logged in" is the unit's
+    /// subject matter: it never classifies as the seat's sign-in refusal, even as the last line of
+    /// a failed transcript with a non-zero exit. The two report sentences are verbatim from runs
+    /// 1bae451d and fd897d8a, where they benched a signed-in claude seat for the run.
+    #[test]
+    fn a_report_that_mentions_a_sign_in_is_not_the_seats_refusal() {
+        for prose in [
+            "The rule model in this seat is not logged in, so I stated the rules myself.",
+            "the rule model in this seat returned \"Not logged in\", so the harness stated nothing (exit 2)",
+            "- Not logged in: the harness's rule model (the seat's own claude is fine)",
+            "> Not logged in",
+            "Implemented the auth guard: a user who is not signed in is redirected.",
+            "The handler accepts unauthenticated requests.",
+            "the login page says please sign in when the session expires",
+        ] {
+            for text in [
+                prose.to_string(),
+                format!("(cli `claude` exited 1) Report:\n500/500 units stated.\n{prose}"),
+                format!("{prose}\nwicked-seat-launch: floor canary passed"),
+            ] {
+                assert_eq!(
+                    SeatFailureReason::classify_refusal(&text, true),
+                    None,
+                    "{text:?}"
+                );
+            }
+        }
+    }
+
+    /// (core#1479) The CLIs' real sign-in refusals still classify in their own frame: claude's
+    /// login instruction (bare, under the wrapped runner's exit marker, after an error label), the
+    /// API's `authentication_error`, a phrase that leads an error line, and the engine's own floor
+    /// token — each with the launcher's few noise lines under it.
+    #[test]
+    fn a_sign_in_refusal_in_the_clis_own_frame_still_classifies() {
+        for refusal in [
+            "Not logged in · Please run /login",
+            "(cli `claude` exited 1) Not logged in · Please run /login",
+            "error: Not logged in · Please run /login",
+            "Invalid API key · Please run /login",
+            "API Error: 401 {\"type\":\"error\",\"error\":{\"type\":\"authentication_error\",\"message\":\"OAuth token has expired.\"}}",
+            "Error: not signed in",
+            "(cli `pi` exited 1) error: authentication required",
+            "fatal: not authenticated",
+            "✗ Not logged in",
+            "(claude is signed out: sign it in (Agents → Sign in), then retry — its seat 'claude' could not run this unit: agent_signed_out: this agent is not signed in for container seats)",
+        ] {
+            for text in [
+                refusal.to_string(),
+                format!("{}\n{refusal}", "work output\n".repeat(400)),
+                format!("{refusal}\nwicked-seat-launch: floor canary passed\n"),
+            ] {
+                assert_eq!(
+                    SeatFailureReason::classify_refusal(&text, true),
+                    Some(SeatFailureReason::NotLoggedIn),
+                    "{text:?}"
+                );
+            }
+        }
+        // A refusal followed by more than the frame's lines of output is not terminal.
+        let buried = format!(
+            "Error: not signed in\n{}",
+            "more work\n".repeat(REFUSAL_FRAME_LINES)
+        );
+        assert_eq!(SeatFailureReason::classify_refusal(&buried, true), None);
+    }
+
     #[test]
     fn a_record_without_the_new_fields_deserializes() {
         let legacy = r#"{"kind":"non_zero_exit","exit_code":1,"stderr":"","detail":""}"#;

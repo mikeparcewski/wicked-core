@@ -2905,9 +2905,9 @@ pub(crate) fn run_unit_and_judge(
     )
 }
 
-/// (PRODUCT-WORKS J4) Re-probe every seat of `bench` whose QUOTA bench has fallen due at `now`
-/// ([`crate::seat_bench::due_for_reprobe`]) with one cheap call ([`crate::validator::reprobe_seat`])
-/// on its `registry` record, and return the bench as it stands after them (a seat that answered
+/// (PRODUCT-WORKS J4, core#1479) Re-probe every seat of `bench` whose quota or sign-in bench has
+/// fallen due at `now` ([`crate::seat_bench::due_for_reprobe`]) with one cheap call
+/// ([`crate::validator::reprobe_seat`]) on its `registry` record, and return the bench as it stands after them (a seat that answered
 /// is dropped; one that did not is re-benched for longer) with the outcomes, for the actor to fold
 /// ([`crate::workflow::UnitEvidence::bench_reprobes`]). A due seat with no registry record cannot be
 /// asked and stays benched. Nothing is due: the bench comes back unchanged and nothing runs.
@@ -2939,19 +2939,26 @@ pub(crate) fn reprobe_due_benches(
             );
             engine_note(
                 emit_delta,
-                &match r.benched_until {
-                    None => format!(
-                        "seat {} answered its re-probe after its quota bench ({}): back on the \
-                         run's roster",
+                &match (r.returned, r.benched_until) {
+                    (true, _) => format!(
+                        "seat {} answered its re-probe after its bench ({}): back on the run's \
+                         roster",
                         b.cli, b.reason
                     ),
-                    Some(until) => format!(
-                        "seat {} did not answer its re-probe after its quota bench ({}): benched \
-                         again until {} (strike {})",
+                    (false, Some(until)) => format!(
+                        "seat {} did not answer its re-probe after its bench ({}): benched again \
+                         until {} (strike {})",
                         b.cli,
                         b.reason,
                         crate::seat_bench::iso(until),
                         r.strikes
+                    ),
+                    (false, None) => format!(
+                        "seat {} did not answer its re-probe after its bench ({}): benched for \
+                         the run ({})",
+                        b.cli,
+                        b.reason,
+                        r.reason.as_deref().unwrap_or("its refusal does not lift")
                     ),
                 },
             );
@@ -5328,6 +5335,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
     } else {
         (fallback.bench.to_vec(), Vec::new())
     };
+    // (core#1479, codex r2 on #1510) The judge reads the UNGOVERNED bench: a seat whose lifting
+    // bench was over a host-floor bench is back under that one (`apply_reprobes`), which still lets
+    // it judge. The full bench is the actor's to persist, from `bench_reprobes`.
+    let bench_now = crate::domain::ungoverned_bench(&bench_now);
     let benched_now: Vec<String> = benched
         .iter()
         .filter(|k| bench_now.iter().any(|b| &b.cli == *k) || !fallback.reprobe)
@@ -5381,8 +5392,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // an authentication failure, a quota refusal, a binary that could not start — reported for
     // the fold to bench (`source: "judge"`; a quota refusal benches only a seat with no
     // successful unit in the run — review F3) so they are never re-tried by the next unit. The
-    // transcript is judged by `classify_refusal` (authentication over the whole text, the quota
-    // refusal frame over its tail) and a wrapped `(could not run …)` line by the spawn error it
+    // transcript is judged by `classify_refusal` (over its tail; a sign-in refusal only in the
+    // CLI's own frame, core#1479) and a wrapped `(could not run …)` line by the spawn error it
     // carries.
     let judge_refusals: std::cell::RefCell<Vec<crate::workflow::JudgeRefusal>> =
         std::cell::RefCell::new(Vec::new());
@@ -8775,6 +8786,7 @@ mod tests {
         );
         // Every preferred judge benched, and an author whose binary is unknown: no fallback judge
         // can be shown distinct from it, so none is eligible.
+        // (core#1479) A sign-in bench lifts after its backoff: these are freshly stamped, not due.
         let all_benched: Vec<crate::domain::BenchedSeat> = ["pi", "opencode"]
             .iter()
             .map(|k| crate::domain::BenchedSeat {
@@ -8782,8 +8794,8 @@ mod tests {
                 reason: "signed out".into(),
                 source: "judge".into(),
                 governed_only: false,
-                benched_until: None,
-                strikes: 0,
+                benched_until: Some(crate::seat_bench::now_ms() + 3_600_000),
+                strikes: 1,
                 replaced: None,
             })
             .collect();
@@ -10381,6 +10393,46 @@ mod tests {
             Some("copilot")
         );
         *seats.work_ms.lock().unwrap() = 0;
+
+        // 6b. (core#1479, codex r2 on #1510) A sign-in bench over a host-floor bench: the probe
+        //     answers, the seat is back under its governed-only bench only, and THIS gate's judge
+        //     is that seat (a governed-only bench lets it judge).
+        let mut over_host = Vec::new();
+        crate::domain::bench_seat(
+            &mut over_host,
+            crate::domain::BenchedSeat {
+                cli: "copilot".into(),
+                reason: "host floor".into(),
+                source: "launcher".into(),
+                governed_only: true,
+                benched_until: None,
+                strikes: 0,
+                replaced: None,
+            },
+        );
+        crate::domain::bench_seat(
+            &mut over_host,
+            crate::domain::BenchedSeat {
+                cli: "copilot".into(),
+                reason: "not_logged_in".into(),
+                source: "judge".into(),
+                governed_only: false,
+                benched_until: Some(crate::seat_bench::now_ms() - 1),
+                strikes: 1,
+                replaced: None,
+            },
+        );
+        let (_, v, ev, after) = judge(&over_host, &run_roster);
+        assert!(ev.bench_reprobes[0].returned, "{:?}", ev.bench_reprobes);
+        assert!(
+            after.len() == 1 && after[0].governed_only,
+            "still kept off governed work: {after:?}"
+        );
+        assert_eq!(
+            v.expect("a judge ran").judge_cli.as_deref(),
+            Some("copilot"),
+            "the returned seat judges this gate"
+        );
 
         // 6. An instance bench probes THAT instance (its own configuration home), not the
         //    registry record's primary key.
