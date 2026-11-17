@@ -4246,7 +4246,9 @@ fn launched_identities_in(
     registry: &[crate::AgenticCli],
 ) -> Vec<String> {
     let mut out = own_launch_identities(key, invocation.clone(), registry);
-    let ran = launch_tokens(key, invocation, registry);
+    let ran = crate::validator::invocation_identities(&crate::execute_wrapped::launch_invocation(
+        key, invocation,
+    ));
     for c in registry {
         // (codex review r2) Matched on the carrier that ran (its headless invocation: name and
         // executable), and only that carrier's name is recorded — never the record's other
@@ -4286,26 +4288,6 @@ fn own_launch_identities(
     out
 }
 
-/// In-process: what a launch runs, names and canonical executable.
-fn launch_tokens(
-    key: &str,
-    invocation: Option<String>,
-    registry: &[crate::AgenticCli],
-) -> Vec<String> {
-    let mut ran = crate::validator::invocation_identities(
-        &crate::execute_wrapped::launch_invocation(key, invocation.clone()),
-    );
-    ran.extend(own_launch_identities(key, invocation, registry));
-    ran
-}
-
-/// In-process: what a registry seat runs, names and canonical executable.
-fn seat_tokens(c: &crate::AgenticCli) -> Vec<String> {
-    let mut ids = crate::validator::seat_identities(c);
-    ids.extend(record_identities(c));
-    ids
-}
-
 /// (crew#972, coord ruling on core#1525) The roster seat IDs ONE launch of `key` with
 /// `invocation` runs as: `key` first, then every seat of `registry` whose identity
 /// ([`record_identities`]) the launch shares ([`launched_identities`]: the binary dispatch
@@ -4317,13 +4299,17 @@ pub(crate) fn launched_seat_ids(
     invocation: Option<String>,
     registry: &[crate::AgenticCli],
 ) -> Vec<String> {
-    // What the launch runs, with the canonical executable (in-process, never recorded), and the
-    // names it ran as by the full registry (an alias another roster knows).
-    let mut ran = launch_tokens(key, invocation.clone(), registry);
-    ran.extend(launched_identities(key, invocation));
+    // The carrier that runs: the launch's headless invocation (name and canonical executable,
+    // in-process, never recorded), matched against each seat's own headless invocation — never
+    // another carrier of either record (`binary`, ACP adapter), which did not run (codex r2).
+    let ran = crate::validator::invocation_identities(&crate::execute_wrapped::launch_invocation(
+        key, invocation,
+    ));
     let mut out = vec![key.to_string()];
     for c in registry {
-        if !out.contains(&c.key) && crate::validator::same_identity(&seat_tokens(c), &ran) {
+        if !out.contains(&c.key)
+            && crate::validator::same_identity(&crate::validator::seat_identities(c), &ran)
+        {
             out.push(c.key.clone());
         }
     }
@@ -5671,13 +5657,19 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
     let mut bus_excluded: Vec<String> = team_authors.clone();
     // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path,
-    // and every seat ID its own work ran as (core#1525).
+    // and every OTHER seat ID its own work ran as (core#1525; the work author itself rides
+    // `work_author`).
+    let work_author_key = input.unit.assigned_cli.as_deref().unwrap_or_default();
     for s in input
         .unit
         .exclude_seats
         .iter()
         .chain(&input.unit.authored_by)
-        .chain(&launched)
+        .chain(launched.iter().filter(|k| {
+            k.as_str() != work_author_key
+                && crate::team::runner::seat_key(k)
+                    != crate::team::runner::seat_key(work_author_key)
+        }))
     {
         if !bus_excluded.contains(s) {
             bus_excluded.push(s.clone());
