@@ -12289,6 +12289,18 @@ fn dispatch_unit_with(
                 .cloned()
                 .collect();
         }
+        // (core#1493) …and the person's skips at its other gates, carried while the change has no
+        // hunk a skip was not given on (`rule_check::CheckInput::carried`).
+        if unit.role == crate::workflow::PhaseRole::Evaluator && unit.tool_cmd.is_none() {
+            let all = crate::domain::session_units(&*store, run_id)?;
+            stamped.rule_carried_skips = all
+                .iter()
+                .filter(|u| u.ord != unit.ord)
+                .flat_map(|u| u.rule_skips.iter())
+                .filter(|s| s.carry_key.is_some() && !skip_withdrawn(s, &all))
+                .cloned()
+                .collect();
+        }
         // (codex r3) The person's words, from the run's record: the only authority a waiver cites.
         // (F19/F1, operator Q1=B) Their gate rulings ride along, so a ruling reaches the judge and
         // a new one re-judges instead of reusing the cached verdict.
@@ -12310,6 +12322,7 @@ fn dispatch_unit_with(
             || unit.rule_instructions != stamped.rule_instructions
             || unit.rule_deliver_tokens != stamped.rule_deliver_tokens
             || unit.rule_settled != stamped.rule_settled
+            || unit.rule_carried_skips != stamped.rule_carried_skips
         {
             unit = stamped;
             put_node(store, unit.to_node())?;
@@ -15773,6 +15786,25 @@ const RULINGS_SHOWN_MAX: usize = 6 * 1024;
 /// person's words. The rulings lead, within their own budget, and their header carries a digest of
 /// the whole record: a new or changed ruling, even past a cut, changes the judge's evidence key, so
 /// the rule is judged again. With no ruling the words are the problem and amendments, as before.
+/// (core#1493, coord codex-check on #1516) A person's skip of rule R is withdrawn, and no longer
+/// carried, once the person gives a NEWER ruling (an amend, request-changes or land note, the
+/// rulings a rule judge reads) that names R: "enforce R" on unchanged code puts R back before a
+/// judge. The skip's own time (`at`) is the revision it was given at.
+pub(crate) fn skip_withdrawn(
+    skip: &crate::rule_check::RuleSkip,
+    units: &[crate::domain::WorkUnit],
+) -> bool {
+    let id = skip.rule_id.to_ascii_lowercase();
+    units
+        .iter()
+        .flat_map(|u| u.operator_rulings.iter())
+        .any(|r| {
+            r.at > skip.at
+                && RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str())
+                && r.text.to_ascii_lowercase().contains(&id)
+        })
+}
+
 pub(crate) fn rule_instructions_words(
     problem: &str,
     amendments: &[crate::domain::IntentAmendment],
@@ -18494,6 +18526,9 @@ fn rules_recheck_request(
             evidence_key,
             instruction: (row.status == crate::rule_check::RuleStatus::Waived)
                 .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+            // (core#1493) The hunks it was given on, so the run's later steps carry it.
+            carry_key: cursor.rule_check.as_ref().and_then(|r| r.carry_key.clone()),
+            ord: Some(cursor.ord),
         });
     }
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
@@ -28658,6 +28693,7 @@ mod request_changes_tests {
                     row("R1", crate::rule_check::RuleStatus::Disputed),
                     row("R9", crate::rule_check::RuleStatus::Broken),
                 ],
+                carry_key: Some("ck".into()),
                 ..Default::default()
             };
             v.denials_behind = Some(vec![report.denial().unwrap(), report.hold().unwrap()]);
@@ -28685,6 +28721,9 @@ mod request_changes_tests {
             assert_eq!(v.rule_skips.len(), 1);
             assert_eq!(v.rule_skips[0].rule_id, "R1");
             assert_eq!(v.rule_skips[0].evidence_key, "ek-R1");
+            // (core#1493) …recording the carry key it was given on and its unit, so later steps carry it.
+            assert_eq!(v.rule_skips[0].carry_key.as_deref(), Some("ck"));
+            assert_eq!(v.rule_skips[0].ord, Some(v.ord));
             assert!(v.requested_rejudge.is_some(), "the re-check is armed");
         }
     }
@@ -39928,5 +39967,59 @@ mod council_ballot_tests {
             validate_session_id("council").is_ok(),
             "a caller may still name a run so"
         );
+    }
+}
+
+#[cfg(test)]
+mod skip_withdrawn_tests {
+    use super::*;
+
+    /// (coord codex-check on #1516) skip R → a newer ruling "enforce R" → unchanged code: R is no
+    /// longer carried (it is judged). An older ruling, one naming another rule, or a skip action
+    /// does not withdraw it.
+    #[test]
+    fn a_newer_ruling_naming_the_rule_withdraws_its_carried_skip() {
+        let skip = crate::rule_check::RuleSkip {
+            rule_id: "POL-7".into(),
+            reason: "fine here".into(),
+            by: "operator".into(),
+            at: 10,
+            rule_key: "k".into(),
+            evidence_key: "e".into(),
+            instruction: None,
+            carry_key: Some("ck".into()),
+            ord: Some(3),
+        };
+        let ruled = |action: &str, text: &str, at: i64| {
+            let mut u = crate::domain::WorkUnit::pending("r:u4", "r", 4, "w");
+            u.operator_rulings.push(crate::domain::OperatorRuling {
+                action: action.into(),
+                text: text.into(),
+                attempt: 1,
+                at,
+            });
+            vec![u]
+        };
+        assert!(skip_withdrawn(
+            &skip,
+            &ruled("amend", "enforce pol-7 after all", 20)
+        ));
+        assert!(skip_withdrawn(
+            &skip,
+            &ruled("request_changes", "POL-7 applies", 11)
+        ));
+        assert!(
+            !skip_withdrawn(&skip, &ruled("amend", "enforce POL-7", 5)),
+            "older"
+        );
+        assert!(
+            !skip_withdrawn(&skip, &ruled("amend", "enforce POL-8", 20)),
+            "another rule"
+        );
+        assert!(
+            !skip_withdrawn(&skip, &ruled("skip_rules", "POL-7 again", 20)),
+            "not a ruling"
+        );
+        assert!(!skip_withdrawn(&skip, &[]));
     }
 }

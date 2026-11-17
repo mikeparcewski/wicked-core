@@ -799,6 +799,8 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
             .clone()
             .expect("a skip needs the row's evidence key"),
         instruction: None,
+        carry_key: None,
+        ord: None,
     };
     let deferred = vec!["learn-linked-issue".to_string(), "retired-rule".to_string()];
     let held =
@@ -1028,6 +1030,8 @@ fn an_operator_ruling_reaches_the_judge_re_judges_the_cache_and_waives_only_on_c
         rule_key: waived.rule_key.clone(),
         evidence_key: waived.evidence_key.clone().expect("an evidence key"),
         instruction: Some(waived.cite.clone().unwrap_or_else(|| waived.reason.clone())),
+        carry_key: None,
+        ord: None,
     }];
     let confirmed = judge_with(&input, &judge);
     let row = r2(&confirmed);
@@ -1481,6 +1485,8 @@ fn confirm(input: &mut StepInput, report: &crate::rule_check::RuleCheckReport, i
         rule_key: w.rule_key.clone(),
         evidence_key: w.evidence_key.clone().expect("an evidence key"),
         instruction: w.cite.clone(),
+        carry_key: None,
+        ord: None,
     }];
 }
 
@@ -2459,6 +2465,8 @@ fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
         rule_key: r2.rule_key.clone(),
         evidence_key: r2.evidence_key.clone().expect("an evidence key"),
         instruction: None,
+        carry_key: None,
+        ord: None,
     }];
     let again = judge(&input, None);
     let row = again.rows.iter().find(|r| r.rule_id == "R2").unwrap();

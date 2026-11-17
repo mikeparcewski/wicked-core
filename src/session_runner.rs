@@ -902,6 +902,7 @@ mod tests {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            rule_carried_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,
             draft_render: None,

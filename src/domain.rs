@@ -1576,6 +1576,11 @@ pub struct WorkUnit {
     /// action `skip_rules`); each applies while the rule's evidence is the one it was given on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_skips: Vec<crate::rule_check::RuleSkip>,
+    /// (core#1493) The person's skips at the run's OTHER units, stamped at dispatch on a review
+    /// unit: a later step carries one only on the exact evidence it was given on
+    /// ([`crate::rule_check::CheckInput::carried`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rule_carried_skips: Vec<crate::rule_check::RuleSkip>,
     /// (DES-RULE-CHECK-001 rev 2) Rule councils this unit's attempts have convened: each one is
     /// charged here by the actor BEFORE it starts (`Command::ReserveRuleCouncil`), never reset, so
     /// an attempt that is superseded or never folds still spent it. The run's budget is their sum.
@@ -1940,6 +1945,7 @@ impl WorkUnit {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            rule_carried_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,
             draft_render: None,
