@@ -3044,6 +3044,41 @@ pub(crate) fn verdict_completes_the_turn(
     output
 }
 
+/// (core#1024 follow-up, core#1519 codex-check) The seat-secret guard's `refusal` applied to a
+/// unit's output: the refusal leads the text, and a unit that folded Ok fails, so the work is not
+/// carried on. Except an evaluator's FAIL (core#1496): a parsed FAIL stays the step's result and is
+/// judged as one (its gate or send-back), never turned into a seat failure that fails over to a
+/// seat that might say PASS; the refusal still leads the text the gate shows, saying so. Delivery
+/// scans the work again before anything is pushed.
+pub(crate) fn with_credential_refusal(
+    unit: &crate::domain::WorkUnit,
+    mut output: StepOutput,
+    refusal: Option<String>,
+) -> StepOutput {
+    let Some(text) = refusal else {
+        return output;
+    };
+    let fail_stands = output.status == StepStatus::Ok && evaluator_says_fail(unit, &output.output);
+    output.output = if output.output.is_empty() {
+        text
+    } else if fail_stands {
+        // AFTER the answer (codex confirm on core#1519): the gate shows a long answer's bounded
+        // TAIL as its findings, so the refusal is never cut from them. Its line starts with the
+        // marker, never `VERDICT`, so the reviewer's FAIL stays the decisive line.
+        format!(
+            "{}\n\n{text} The reviewer's VERDICT: FAIL above still stands as this step's result; \
+             no other seat is asked in its place.",
+            output.output
+        )
+    } else {
+        format!("{text}\n\n{}", output.output)
+    };
+    if output.status == StepStatus::Ok && !fail_stands {
+        output.status = StepStatus::Failed;
+    }
+    output
+}
+
 pub(crate) fn engine_note(emit_delta: &DeltaSink, text: &str) {
     emit_delta(&format!("\n{}\n", text.trim()));
 }
@@ -6153,16 +6188,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 input.unit.ord
             )),
         };
-        if let Some(text) = refusal {
-            if output.status == StepStatus::Ok {
-                output.status = StepStatus::Failed;
-            }
-            output.output = if output.output.is_empty() {
-                text
-            } else {
-                format!("{text}\n\n{}", output.output)
-            };
-        }
+        output = with_credential_refusal(&input.unit, output, refusal);
     }
     // A unit that did not fold Ok fails on its own account and never reaches the gate this
     // evidence feeds — the outcome was taken (and any mutation undone) above; hand the fold
@@ -13011,5 +13037,57 @@ mod verdict_completes_the_turn_tests {
                 .status,
             StepStatus::Failed
         );
+    }
+
+    /// (core#1519 codex-check, W12) A credential refusal never erases a FAIL: the reviewer's FAIL
+    /// (a completed turn, or one the runner marked failed and the fold promoted) plus a refusal
+    /// stays `Ok` with its FAIL still the decisive verdict, so it reaches the gate as a FAIL and
+    /// never fails over; the text says the refusal and that the FAIL stands. A PASS, a creator and
+    /// an unscanned-failure text still fail as before.
+    #[test]
+    fn a_credential_refusal_never_erases_a_reviewers_fail() {
+        let mut eval = crate::domain::WorkUnit::pending("r:review", "r", 2, "review");
+        eval.role = crate::workflow::PhaseRole::Evaluator;
+        let refusal =
+            || Some("SEAT-CREDENTIAL — unit 2 left a credential in the work.".to_string());
+        let sink: Box<DeltaSink> = Box::new(|_: &str| {});
+        let promoted = verdict_completes_the_turn(
+            &eval,
+            out(
+                StepStatus::Failed,
+                "tests all exited 0\nVERDICT: FAIL\n(cli `codex` exited 1)",
+            ),
+            &*sink,
+        );
+        // (codex confirm) A long answer: the gate's findings are its bounded tail (4,096 chars),
+        // and the refusal is in them.
+        let long = format!("{}VERDICT: FAIL", "finding line\n".repeat(1000));
+        for fail in [
+            out(StepStatus::Ok, "finding: x\nVERDICT: FAIL"),
+            promoted,
+            out(StepStatus::Ok, &long),
+        ] {
+            let got = with_credential_refusal(&eval, fail, refusal());
+            assert_eq!(got.status, StepStatus::Ok, "{}", got.output);
+            assert!(evaluator_says_fail(&eval, &got.output), "{}", got.output);
+            let v = crate::validator::parse_evaluator_verdict(&got.output);
+            assert!(!v.pass);
+            assert!(
+                v.findings.contains("SEAT-CREDENTIAL")
+                    && v.findings.contains("FAIL above still stands"),
+                "the gate's findings carry the refusal: {}",
+                v.findings
+            );
+        }
+        let pass = with_credential_refusal(&eval, out(StepStatus::Ok, "VERDICT: PASS"), refusal());
+        assert_eq!(pass.status, StepStatus::Failed);
+        assert!(!pass.output.contains("still stands"));
+        let mut creator = eval.clone();
+        creator.role = crate::workflow::PhaseRole::Creator;
+        let made =
+            with_credential_refusal(&creator, out(StepStatus::Ok, "VERDICT: FAIL"), refusal());
+        assert_eq!(made.status, StepStatus::Failed);
+        let clean = with_credential_refusal(&eval, out(StepStatus::Ok, "VERDICT: FAIL"), None);
+        assert_eq!(clean.output, "VERDICT: FAIL");
     }
 }

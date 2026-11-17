@@ -9478,15 +9478,17 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
         .join(", ");
     // (codex r2) Whether a result exists is the gate's own fact (a dead-seat gate has none), never
     // inferred from the history list: a seat that failed once and then answered gave this result.
-    match unit.assigned_cli.as_deref().filter(|_| has_result)     {
+    match unit.assigned_cli.as_deref().filter(|_| has_result) {
         Some(by) => format!(
-            " [failover: this step's earlier attempts on {seats} ended with no verdict (a seat \
-             failure) and moved on; this result is from `{by}`]"
+            " [failover: this step's earlier attempts on {seats} ended without a result the step \
+             could use (a seat failure, or an answer the engine refused) and moved on; this result \
+             is from `{by}`]"
         ),
         // (codex r1) Every seat tried failed: there is no result to attribute.
         None => format!(
-            " [failover: every seat this step was tried on ({seats}) ended with no verdict; no seat \
-             produced a result]"
+            " [failover: every seat this step was tried on ({seats}) ended without a result the \
+             step could use (a seat failure, or an answer the engine refused); no seat produced a \
+             result]"
         ),
     }
 }
