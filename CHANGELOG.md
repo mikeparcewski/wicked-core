@@ -3089,7 +3089,7 @@ Two release tracks share this file, newest entry first regardless of track:
   - **The engine publishes every answer an open gate takes (#1512).** New binding method `gateActions(runId)`; the
     list is the accepted set (each candidate runs through the decision path's own pre-checks), with one exception: an
     Apps publish consent is listed from the QE record's tree, so after the worktree changes since QE the list can offer
-    an approve that answering refuses (core#1534). Studio's gate contract (studio#1172, #1178) reads it.
+    an approve that answering refuses (core#1534). Studio's gate contract (studio#1178, for studio#1170) reads it.
   - **Reviews and judging:** a reviewer's FAIL is never a worker error or a failover (#1519); the rule judge reads a
     big change in up to eight parts (#1514; if any part remains unread, only BROKEN verdicts from the shown parts count
     and other results stay unchecked); the rule judge and a seat re-probe run under their own wall
