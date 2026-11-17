@@ -25,6 +25,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **napi-release creates the GitHub Release for each core-ts tag (core#1552).** npm got every core-ts version, but the
+  Releases page's Latest stayed a hand-made 0.7.29. A `github-release` job now runs after the publish job succeeds
+  (`needs: publish`; `contents: write` on that job only). It creates the tag's Release, or updates one that already
+  exists, so a re-run never errors. The notes are the version's CHANGELOG block (`scripts/changelog-section.py` reads
+  both the `- **core-ts X.Y.Z**` bullet and the older `## [core-ts X.Y.Z]` heading, drops link refs and scrubs home
+  paths). A maintenance tag below the newest core-ts tag is not marked Latest. Earlier versions are not backfilled.
+  The extractor's tests run on CI's Linux leg.
+
 - **The engine owns the QE evidence dir, and a QE binding miss re-runs QE (core#1484, crew#1554).**
   Before the QE executor turn the engine creates the attempt's QE run in the run's ledger (complete
   project, scenario and run rows, `config.json` when absent, the `evidence/<uuid>` dir) and the

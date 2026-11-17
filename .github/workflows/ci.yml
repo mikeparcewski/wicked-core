@@ -93,6 +93,10 @@ jobs:
           # A probe fixture that would skip here (no tool, no sandbox) fails instead.
           echo "WICKED_REQUIRE_PROBE_TOOLS=1" >> "$GITHUB_ENV"
 
+      - name: Release-notes extractor tests (scripts/changelog-section.py, core#1552)
+        if: runner.os == 'Linux'
+        run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
+
       - name: cargo test
         run: cargo test --workspace
 

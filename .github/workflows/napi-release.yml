@@ -349,6 +349,62 @@ jobs:
         shell: bash
         run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
 
+  # ── the GitHub Release for the tag, once all six packages published (core#1552) ─────────────────
+  #
+  # npm shipped every core-ts version, but nothing created a GitHub Release, so the Releases page sat at
+  # a hand-backfilled 0.7.29 while npm went through 0.15.x (estate#170 / studio#191 closed the same gap).
+  # `needs: publish`: a Release is advertised only for a version that actually published. Idempotent:
+  # an existing Release (a hand-made one, a re-run) is updated in place, never an "already exists"
+  # error. Notes are this version's CHANGELOG block (scripts/changelog-section.py: exit 1 = no block,
+  # so a generic note; exit 2 = a real error, so this job fails rather than ship a fallback). A
+  # maintenance release (below the highest core-ts tag) never becomes the page's Latest. It does not
+  # wait for the lockfile job: the two are independent follow-ups of the publish.
+  github-release:
+    name: create or update the GitHub Release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/core-ts-v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # create/edit the Release on the pushed tag; nothing else in this run gets it
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0 # every core-ts tag, to tell a maintenance release from the newest one
+
+      - name: Create or update the GitHub Release from CHANGELOG
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#core-ts-v}"
+          set +e
+          python3 scripts/changelog-section.py "$TAG" > "$RUNNER_TEMP/relnotes.md"
+          code=$?
+          set -e
+          if [ "$code" -eq 1 ]; then
+            printf 'wicked-core-ts %s\n' "$VERSION" > "$RUNNER_TEMP/relnotes.md"
+            echo "::warning::CHANGELOG.md has no block for core-ts ${VERSION}; the Release gets a generic note"
+          elif [ "$code" -ne 0 ]; then
+            echo "::error::changelog-section.py failed (exit $code); refusing to publish a Release with fallback notes"
+            exit "$code"
+          fi
+          # Latest only for the newest core-ts version (a maintenance tag below it must not take Latest).
+          newest="$(git tag --list 'core-ts-v*' | sed 's/^core-ts-v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)"
+          latest=true
+          if [ -n "$newest" ] && [ "$newest" != "$VERSION" ] && [ "$(printf '%s\n%s\n' "$VERSION" "$newest" | sort -V | tail -n1)" != "$VERSION" ]; then
+            latest=false
+          fi
+          echo "core-ts ${VERSION}: newest core-ts tag ${newest:-none}, latest=${latest}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --notes-file "$RUNNER_TEMP/relnotes.md" --latest="$latest"
+            echo "updated the existing GitHub Release $TAG"
+          else
+            gh release create "$TAG" --verify-tag --title "wicked-core-ts ${VERSION}" --notes-file "$RUNNER_TEMP/relnotes.md" --latest="$latest"
+            echo "created the GitHub Release $TAG"
+          fi
+
   # ── re-stamp main's lockfile against the packages that now exist on npm (#422) ───────────────────
   #
   # The release PR structurally CANNOT carry resolvable platform entries: the five
