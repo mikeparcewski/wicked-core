@@ -5601,3 +5601,69 @@ fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&graph_dir);
 }
+
+/// (core#1482) A cancelled run's running check is killed at its next poll (its whole process group),
+/// reported as not having run, and a resume clears the cancel.
+#[cfg(unix)]
+#[test]
+fn core_1482_a_cancelled_runs_check_is_killed() {
+    let wt = scratch("cancel-floor");
+    let run = format!("cancel-floor-{}", std::process::id());
+    let checks = CheckScratch::prepare_for(&wt, Some(&run)).unwrap();
+    let none = crate::validator::WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: Some("test".into()),
+    };
+    let long = RepoCheck {
+        name: "test".into(),
+        argv: s(&["sh", "-c", "sleep 60"]),
+        source: "test".into(),
+        timeout_s: Some(120),
+        dir: String::new(),
+    };
+    let r2 = run.clone();
+    let canceller = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(400));
+        cancel_floor(&r2);
+    });
+    let started = std::time::Instant::now();
+    let r = run_one(&wt, &long, &none, &checks, Tree::Head);
+    canceller.join().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        r.spawn_error.as_deref(),
+        Some("the run was cancelled"),
+        "{r:?}"
+    );
+    assert!(floor_cancelled(Some(&run)));
+    clear_floor_cancel(&run);
+    assert!(!floor_cancelled(Some(&run)));
+    drop(checks);
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// (core#1482) The disk guard: under the minimum free space the floor refuses to start, as an
+/// environment failure; unknown free space or a zero minimum never refuses.
+#[test]
+fn core_1482_the_floor_refuses_to_start_below_its_free_space_minimum() {
+    const GIB: u64 = 1 << 30;
+    let why = disk_guard(Some(8 * GIB), 15).expect("refused");
+    assert!(
+        why.starts_with("environment:") && why.contains("8.0 GiB free") && why.contains("15 GiB"),
+        "{why}"
+    );
+    assert!(why.contains("not a failure of the change"), "{why}");
+    assert_eq!(disk_guard(Some(40 * GIB), 15), None);
+    assert_eq!(
+        disk_guard(None, 15),
+        None,
+        "unknown free space never refuses"
+    );
+    assert_eq!(disk_guard(Some(1), 0), None, "0 turns the guard off");
+    assert!(free_bytes(&std::env::temp_dir()).is_some_and(|b| b > 0) || cfg!(not(unix)));
+}

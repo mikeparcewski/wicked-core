@@ -3532,6 +3532,8 @@ pub(crate) struct CheckScratch {
     /// (DES-FLOOR-CONTAINER) Set when this floor's checks run in a fresh Linux container: every
     /// check is spawned there ([`run_one_with`]) instead of under the host's OS sandbox.
     pub(crate) container: Option<std::sync::Arc<crate::checks_container::ChecksFloor>>,
+    /// (core#1482) The run this floor belongs to: a cancel of it ends the floor's checks.
+    run_id: Option<String>,
 }
 
 impl Drop for CheckScratch {
@@ -3542,6 +3544,10 @@ impl Drop for CheckScratch {
         // (DES-FLOOR-CONTAINER) The container floor first: its containers and volume leases go
         // before the leaf can be retired, so the leaf's target volumes go with it.
         drop(self.container.take());
+        // (core#1482) The base side's build output goes after each floor: its results are cached
+        // in the log store (`BaseSide`), and it is half of a floor's peak disk (~20 GB of an
+        // estate floor's 41 GB). The head's target stays for the next floor's incremental build.
+        let _ = std::fs::remove_dir_all(self.root.join("cargo-target").join("base"));
         if orphan_path(&self.root).exists() {
             drop(self.lease.take());
             retire_leaf(&self.root);
@@ -3889,6 +3895,7 @@ impl CheckScratch {
             logs,
             log_cap: log_cap(),
             container: None,
+            run_id: run_id.map(str::to_string),
         })
     }
 
@@ -4958,6 +4965,87 @@ pub fn run_floor_journaled(
 /// [`run_floor_journaled`] with the probe a guarded checkout gives
 /// ([`FloorCheckout::run_floor_journaled`]): a check is journaled only while the checkout still
 /// holds the journal's tree.
+/// (core#1482) Runs whose floor must stop: a cancel marks the run here, every running check of it
+/// is killed at its next poll (its process group), and no floor of it starts. A resume clears it.
+static CANCELLED_FLOORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// How many ended runs [`CANCELLED_FLOORS`] remembers.
+const CANCELLED_FLOORS_KEPT: usize = 512;
+
+/// (core#1482) Mark run `run_id` cancelled for its floor (called with the run's worker cancel).
+pub(crate) fn cancel_floor(run_id: &str) {
+    let mut g = CANCELLED_FLOORS.lock().unwrap_or_else(|p| p.into_inner());
+    if !g.iter().any(|r| r == run_id) {
+        g.push(run_id.to_string());
+    }
+    // Bounded: every ended run (and engine one-shot) passes here; the newest are the ones a
+    // still-running floor can belong to.
+    let excess = g.len().saturating_sub(CANCELLED_FLOORS_KEPT);
+    g.drain(..excess);
+}
+
+/// (core#1482) A resumed run's floor may run again.
+pub(crate) fn clear_floor_cancel(run_id: &str) {
+    CANCELLED_FLOORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|r| r != run_id);
+}
+
+/// (core#1482) Whether run `run_id`'s floor was cancelled.
+pub(crate) fn floor_cancelled(run_id: Option<&str>) -> bool {
+    run_id.is_some_and(|id| {
+        CANCELLED_FLOORS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|r| r == id)
+    })
+}
+
+/// (core#1482) The free space a floor needs on the check cache's volume before it starts, in GiB:
+/// `WICKED_FLOOR_MIN_FREE_GB`, else 15 (an estate floor peaks near 41 GB; two at once filled a
+/// 90 GB host). `0` turns the guard off.
+pub(crate) fn floor_min_free_gib() -> u64 {
+    std::env::var("WICKED_FLOOR_MIN_FREE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(15)
+}
+
+/// The bytes free (to an unprivileged user) on the volume holding `path`; `None` when unreadable.
+#[cfg(unix)]
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `c` is a valid NUL-terminated path and `st` a writable statvfs.
+    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+        return None;
+    }
+    Some((st.f_bavail as u64).saturating_mul(st.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn free_bytes(_path: &Path) -> Option<u64> {
+    None
+}
+
+/// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
+/// failure), or `None`: `free` bytes against `min_gib`. Unknown free space never refuses.
+pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
+    let free = free?;
+    let min = min_gib.saturating_mul(1 << 30);
+    (min > 0 && free < min).then(|| {
+        format!(
+            "environment: the host has {:.1} GiB free on the check cache's volume, under the \
+             floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
+             space, then retry the step — this is not a failure of the change",
+            free as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
 fn run_floor_inner(
     worktree: &Path,
     ctx: &FloorContext,
@@ -4965,6 +5053,21 @@ fn run_floor_inner(
     journal: Option<&FloorJournal>,
     untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
+    // (core#1482) A cancelled run starts no floor; a host short of disk refuses one as an
+    // environment failure (the checks would only fill the disk and fail the link step).
+    if floor_cancelled(ctx.run_id.as_deref()) {
+        return runner_refused(
+            worktree,
+            ctx,
+            "the run was cancelled: its floor does not start".into(),
+        );
+    }
+    if let Some(why) = check_cache_root()
+        .ok()
+        .and_then(|root| disk_guard(free_bytes(&root), floor_min_free_gib()))
+    {
+        return runner_refused(worktree, ctx, why);
+    }
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -10609,6 +10712,13 @@ pub(crate) fn run_one_with(
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
                 result.timed_out = true;
+                break None;
+            }
+            // (core#1482) The run was cancelled: the check's whole process group ends now.
+            Ok(false) if floor_cancelled(scratch.run_id.as_deref()) => {
+                crate::validator::kill_child_tree(&mut child);
+                crate::validator::reap_bounded(&mut child);
+                result.spawn_error = Some("the run was cancelled".into());
                 break None;
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
