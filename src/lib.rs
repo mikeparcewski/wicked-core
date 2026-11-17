@@ -69,6 +69,7 @@ mod hook_relay;
 mod index_budget;
 mod install_fence;
 mod interaction;
+mod judge_coverage;
 mod k8s;
 mod knowledge;
 #[cfg(test)]
@@ -287,6 +288,7 @@ pub use index_budget::{
     index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
     INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,
 };
+pub use judge_coverage::{judge_coverage, AuthorCoverage, JudgeCoverage, NotJudge};
 pub use k8s::cli::cluster_main;
 pub use mcp_gate::{
     classify as mcp_tool_class, evaluate_mcp_call_json, judge_mcp_call_json, list_mcp_tools_json,

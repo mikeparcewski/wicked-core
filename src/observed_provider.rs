@@ -101,13 +101,23 @@ impl Drop for JudgingWork {
 /// provider the work being judged on this thread called: tried last, never skipped on a guess.
 pub(crate) fn known_to_share(seat: &str) -> bool {
     let avoid = AVOID.with(|a| a.borrow().avoid.clone());
-    if avoid.is_empty() {
-        return false;
-    }
+    shared_with(seat, &avoid).is_some()
+}
+
+/// The providers `seat`'s latest observed launch in this process called (`None`: never observed).
+pub(crate) fn last_seen(seat: &str) -> Option<Vec<Provider>> {
     let seen = LAST_SEEN.lock().unwrap_or_else(|p| p.into_inner());
-    seen.as_ref()
-        .and_then(|m| m.get(seat))
-        .is_some_and(|ps| ps.iter().any(|p| avoid.contains(p)))
+    seen.as_ref().and_then(|m| m.get(seat)).cloned()
+}
+
+/// THE "known to share" rule ([`known_to_share`] for the judge rotation, and the launch's
+/// [`crate::judge_coverage`]): the first of `avoid` that `seat`'s latest observed launch called.
+/// `None` when the seat was never observed or called none of them: never a guess.
+pub(crate) fn shared_with(seat: &str, avoid: &[Provider]) -> Option<Provider> {
+    if avoid.is_empty() {
+        return None;
+    }
+    last_seen(seat)?.into_iter().find(|p| avoid.contains(p))
 }
 
 /// Whether an approval `seat` just gave on this thread stands as independent of the work being
