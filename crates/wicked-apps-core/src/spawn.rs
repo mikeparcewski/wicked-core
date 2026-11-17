@@ -694,7 +694,8 @@ pub fn seat_git_config_files(
 /// `user.email` as `git config --get` reads them there — system, global, the repository's own
 /// config, and every `include`/`includeIf "gitdir:…"` they name — exactly what the operator's own
 /// `git commit` in that worktree (and the deliver step's commit) would use. Environment-injected
-/// config (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) is not read. `None` for a key git does not
+/// config (`GIT_CONFIG_PARAMETERS`, `GIT_CONFIG_COUNT`) and a `GIT_CONFIG` file (which `git config`
+/// alone would read instead) are not read. `None` for a key git does not
 /// resolve (or when git cannot run). Read on the HOST before the spawn: a container seat's
 /// `.git` is the engine's replica, rebuilt at every copy-in and never written back
 /// (`src/k8s/sync.rs`), so nothing a seat configures in a pod reaches this read.
@@ -706,6 +707,8 @@ pub fn operator_git_identity(cwd: Option<&std::path::Path>) -> (Option<String>, 
         git.env("GIT_TERMINAL_PROMPT", "0");
         git.env_remove("GIT_CONFIG_PARAMETERS");
         git.env_remove("GIT_CONFIG_COUNT");
+        // `GIT_CONFIG` makes `git config` read that one file only; `git commit` ignores it.
+        git.env_remove("GIT_CONFIG");
         if let Some(dir) = cwd {
             git.current_dir(dir);
         }
@@ -3355,6 +3358,7 @@ rebase.autosquash\0";
     fn a_fenced_seats_commits_carry_the_operators_resolved_identity_whatever_the_seat_configures() {
         let _env = lock_env();
         let _restore = EnvRestore::take(&[
+            "GIT_CONFIG",
             "GIT_CONFIG_GLOBAL",
             "GIT_CONFIG_NOSYSTEM",
             "GIT_AUTHOR_NAME",
@@ -3386,6 +3390,9 @@ rebase.autosquash\0";
             c.args(args).current_dir(repo);
             if fenced {
                 fence_remote_credentials(&mut c);
+            } else {
+                // The fixture's own setup writes the repository's config, never a `GIT_CONFIG` file.
+                c.env_remove("GIT_CONFIG");
             }
             let out = match c.output() {
                 Ok(o) => o,
@@ -3460,6 +3467,28 @@ rebase.autosquash\0";
             format!("{repo_id}|{repo_id}"),
             "the repository's own identity, as the operator's git resolves it there"
         );
+        // A `GIT_CONFIG` the daemon inherited names another identity (or none): `git commit` ignores
+        // it, so the fence must too (codex r2).
+        for other in ["pi-gitconfig", "/dev/null"] {
+            let path = if other.starts_with('/') {
+                std::path::PathBuf::from(other)
+            } else {
+                let p = base.join(other);
+                std::fs::write(&p, "[user]\n\tname = pi\n\temail = pi@local\n").unwrap();
+                p
+            };
+            std::env::set_var("GIT_CONFIG", &path);
+            assert_eq!(
+                case(
+                    &format!("gitconfig-env-{}", other.replace('/', "-")),
+                    "[user]\n\tname = Operator Name\n\temail = op@example.invalid\n",
+                    None
+                ),
+                format!("{op}|{op}"),
+                "GIT_CONFIG={other} does not select the identity"
+            );
+            std::env::remove_var("GIT_CONFIG");
+        }
         let work_cfg = base.join("work-gitconfig");
         std::fs::write(
             &work_cfg,
