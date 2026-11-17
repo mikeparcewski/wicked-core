@@ -4410,3 +4410,31 @@ fn the_diagnosis_takes_the_most_recent_events() {
         "{all}"
     );
 }
+
+/// (coord codex-check on #1527, HIDE) The two-snapshot repro: one poll sees the runtime's
+/// `CreateContainerError: context deadline exceeded` (transient, so the wait goes on), the next
+/// only `ContainerCreating`, and no event is readable. The error is still in the diagnosis.
+#[test]
+fn a_transient_runtime_error_seen_by_an_earlier_poll_stays_in_the_diagnosis() {
+    let snap = |reason: &str, message: &str| {
+        json!({"status": {"phase": "Pending", "containerStatuses": [
+            {"name": "seat", "state": {"waiting": {"reason": reason, "message": message}}}
+        ]}})
+    };
+    let first = snap("CreateContainerError", "context deadline exceeded");
+    let last = snap("ContainerCreating", "");
+    let mut seen = Vec::new();
+    seat::note_states(&mut seen, &first);
+    seat::note_states(&mut seen, &last);
+    seat::note_states(&mut seen, &last);
+    let d = seat::pod_diagnosis_seen(Some(&last), None, 5, &seen);
+    assert!(
+        d.contains("seen during the wait: container seat waiting CreateContainerError context deadline exceeded"),
+        "{d}"
+    );
+    assert_eq!(d.matches("ContainerCreating").count(), 1, "no repeat: {d}");
+    // Without an earlier error, nothing is added.
+    let mut quiet = Vec::new();
+    seat::note_states(&mut quiet, &last);
+    assert!(!seat::pod_diagnosis_seen(Some(&last), None, 5, &quiet).contains("seen during"));
+}
