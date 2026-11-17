@@ -47,20 +47,19 @@ Two release tracks share this file, newest entry first regardless of track:
   FAIL stays the result (delivery still scans the work before any push).
   Every escalation and adjudication gate, and the def gate that reviews a unit, says which seats
   gave no verdict first and which seat's result it shows (or that none produced one).
-- **Build output in a written-back root no longer fails the run (core#1498).** The Kubernetes
-  write-back leaves out every directory holding a cache-directory tag (`CACHEDIR.TAG`, which cargo
-  writes into every target dir whatever its name: `target/`, `baseline-target/`, a CARGO_TARGET_DIR
-  in a walkthroughs dir) and any file that would take the stream past its limit, instead of
-  refusing the whole write-back (run ea75313b lost a QE PASS that way). What is left out is never
-  written and never read as a deletion, and the step's output names each path. Seats already get a
-  default CARGO_TARGET_DIR outside the worktree (`seat-build/<cli>/target`).
 - **Uncommitted build output in a written-back root no longer fails the run (core#1498).** The
   Kubernetes write-back leaves out a directory holding a cache-directory tag (`CACHEDIR.TAG`, which
   cargo writes into every target dir whatever its name: `baseline-target/`, a CARGO_TARGET_DIR in a
-  walkthroughs dir), unless it is the root, git metadata or holds a tracked file, and any file that
-  would take the stream past its limit, instead of refusing the whole write-back (run ea75313b lost a
-  QE PASS that way). What is left out is never written and never read as a deletion, and the step's
-  output names each path. Build output a seat COMMITS still lands through its commits, as before.
+  walkthroughs dir), unless it is the root, git metadata or holds a tracked file (matched exactly,
+  and never a dir whose name folds to a tracked file's dir), instead of refusing the whole write-back
+  (run ea75313b lost a QE PASS that way). The stream's budget only ever leaves out an untracked file
+  of a git tree: tracked changes, plain roots (the QE evidence) and bound files are sized first and
+  always come back, and when they cannot fit the write-back is refused, naming the largest, never a
+  success without them. The host checks what the pod left out against what no seat can change: a
+  file left out for the limit outside a git tree, or anything left out that holds a file the host's
+  repository tracks (compared folded), refuses the write-back naming it. What is left out is never
+  written and never read as a deletion, and the step's output names each path. Build output a seat
+  COMMITS still lands through its commits, as before.
   Seats already get a default CARGO_TARGET_DIR outside the worktree (`seat-build/<cli>/target`).
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently

@@ -2295,6 +2295,8 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         }
         let left_out = sync::take_skipped(got)
             .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        sync::refuse_unsafe_skips(&want.host, want.mode, &left_out)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
         warnings.extend(left_out.iter().map(|s| s.describe(&want.host)));
         let empty = HashMap::new();
         let mut entries = sync::check_entries_against(
@@ -2696,9 +2698,16 @@ pub(crate) fn delta_keeping(
 ) -> Result<(Vec<Entry>, Vec<String>), String> {
     // (codex r1) Left out BEFORE the deletion check: a path the host changed meanwhile under a
     // skip is no conflict, because nothing of it is written or deleted.
+    // (core#1518 codex confirm #5) Nor a host path the pod sent nothing for that a skip may alias
+    // on a folding host (`src/file.rs` under a skipped `SRC/file.rs`): kept, never deleted.
+    let sent: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
     let kept: HashMap<String, [u8; 32]> = base
         .iter()
-        .filter(|(p, _)| !left_out.iter().any(|s| s.covers(p)))
+        .filter(|(p, _)| {
+            !left_out
+                .iter()
+                .any(|s| s.covers(p) || (!sent.contains(p.as_str()) && s.may_alias(p)))
+        })
         .map(|(p, d)| (p.clone(), *d))
         .collect();
     delta(host, &kept, entries)

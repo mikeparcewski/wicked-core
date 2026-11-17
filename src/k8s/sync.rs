@@ -244,6 +244,16 @@ pub(crate) struct Skipped {
 }
 
 impl Skipped {
+    /// (core#1518 codex confirm #5) Whether `rel` may be the same host path as one this skip left
+    /// out, on a folding host (`cache/x` under a skipped `CACHE`): such a path is never deleted.
+    pub(crate) fn may_alias(&self, rel: &str) -> bool {
+        let (r, p) = (fold(rel), fold(&self.path));
+        r == p
+            || (self.why != "limit"
+                && r.strip_prefix(p.as_str())
+                    .is_some_and(|x| x.starts_with('/')))
+    }
+
     /// Whether `rel` is left out by this skip: a cache dir covers everything under it; a file left
     /// out for the limit covers that one path only (codex r1: never a subtree it replaced).
     pub(crate) fn covers(&self, rel: &str) -> bool {
@@ -269,8 +279,9 @@ impl Skipped {
                  tag, as cargo's target dirs do); it stays in the seat"
             ),
             "limit" => format!(
-                "the write-back left out {at}: the file would take the write-back past its \
-                 {MAX_STREAM}-byte stream limit; it stays in the seat"
+                "the write-back left out {at}: an untracked file with no room left in the \
+                 write-back's {MAX_STREAM}-byte stream limit (tracked changes and evidence come \
+                 back first); it stays in the seat"
             ),
             other => format!("the write-back left out {at} ({other})"),
         }
@@ -301,6 +312,107 @@ pub(crate) fn take_skipped(root: &mut Root) -> Result<Vec<Skipped>, String> {
     }
     root.entries = kept;
     Ok(out)
+}
+
+/// (core#1518 codex-check) The host's own check of what the pod left out, against what the host
+/// knows and no seat can change: a `limit` skip only in a written-back git tree (a `tree` root
+/// with a repository), and no skip of either kind covering a file the host's repository tracks,
+/// compared folded (a zero-width or re-cased alias of a tracked dir is caught). Either refuses the
+/// whole write-back naming the path: tracked work and the QE evidence (a plain root) are never
+/// left behind under a success, whatever the seat did to its own index or names.
+pub(crate) fn refuse_unsafe_skips(host: &Path, mode: Mode, left: &[Skipped]) -> Result<(), String> {
+    if left.is_empty() {
+        return Ok(());
+    }
+    let tracked = host_tracked(host)?;
+    if let Some(s) = left
+        .iter()
+        .find(|s| s.why == "limit" && (mode != Mode::Tree || tracked.is_none()))
+    {
+        return Err(format!(
+            "`{}` was left out for the stream limit, but only an untracked file of a git tree \
+             may be (this is a {} root); nothing was written back",
+            s.path,
+            mode.as_str()
+        ));
+    }
+    // (codex confirm r2) Asked where each skip sits, not only at the root: from the deepest host
+    // dir on the skip's path, so a repository nested in a plain root (or rooted at the skip dir
+    // itself) answers for its own tracked files. One git listing per distinct dir.
+    let mut asked: std::collections::HashMap<PathBuf, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    asked.insert(host.to_path_buf(), tracked);
+    for s in left {
+        let parts: Vec<&str> = s.path.split('/').collect();
+        let mut at = 0;
+        for i in 1..=parts.len() {
+            let d = host.join(parts[..i].join("/"));
+            if std::fs::symlink_metadata(&d).is_ok_and(|m| m.is_dir()) {
+                at = i;
+            } else {
+                break;
+            }
+        }
+        let dir = host.join(parts[..at].join("/"));
+        let rest = fold(&parts[at..].join("/"));
+        if !asked.contains_key(&dir) {
+            let t = host_tracked(&dir)?;
+            asked.insert(dir.clone(), t);
+        }
+        let Some(tracked) = asked.get(&dir).and_then(|t| t.as_ref()) else {
+            continue;
+        };
+        if let Some(t) = tracked.iter().find(|t| {
+            let ft = fold(t);
+            rest.is_empty()
+                || ft == rest
+                || ft
+                    .strip_prefix(rest.as_str())
+                    .is_some_and(|r| r.starts_with('/'))
+        }) {
+            let held = if at == 0 {
+                t.clone()
+            } else {
+                format!("{}/{t}", parts[..at].join("/"))
+            };
+            return Err(format!(
+                "`{}` was left out ({}), but it holds `{held}`, which the host's repository \
+                 tracks; nothing was written back",
+                s.path, s.why
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The files the host's repository tracks under `root` (relative to it), or `None` when `root`
+/// is in no git work tree; `Err` when git cannot list a repository that is there.
+fn host_tracked(root: &Path) -> Result<Option<Vec<String>>, String> {
+    let inside = git(root)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output()
+        .map_err(|e| format!("git rev-parse in {}: {e}", root.display()))?;
+    if !inside.status.success() || String::from_utf8_lossy(&inside.stdout).trim() != "true" {
+        return Ok(None);
+    }
+    let out = git(root)
+        .args(["ls-files", "-z", "-c"])
+        .output()
+        .map_err(|e| format!("git ls-files in {}: {e}", root.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "git ls-files in {} failed: {}",
+            root.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(Some(
+        out.stdout
+            .split(|b| *b == 0)
+            .filter(|x| !x.is_empty())
+            .map(|x| String::from_utf8_lossy(x).into_owned())
+            .collect(),
+    ))
 }
 
 /// Characters a case-insensitive, normalizing file system ignores in a name (HFS+), so `.g\u{200c}it`
@@ -1358,7 +1470,8 @@ def head(out, k, p, n):
     if k not in (b"R", b"E"):
         ENTRIES += 1
         if ENTRIES > MAX_ENTRIES: die("the write-back has more entries than the stream's limit")
-    if SENT + 13 + len(p) + n > MAX: die("the write-back is larger than the stream's limit")
+    if SENT + 13 + len(p) + n > MAX:
+        die("the write-back is larger than the stream's limit at " + repr(p.decode("utf-8", "surrogateescape")))
     SENT += 13 + len(p)
     out.write(k + struct.pack(">I", len(p)) + p + struct.pack(">Q", n))
 def put(out, k, p, d):
@@ -1387,10 +1500,13 @@ def is_tag(rootfd, rel):
     with os.fdopen(h, "rb") as fh:
         if not stat.S_ISREG(os.fstat(fh.fileno()).st_mode): return False
         return fh.read(len(TAG_SIG)) == TAG_SIG
+def inside(rel, d): return rel == d or rel.startswith(d + "/")
 def caches(rootfd, rels, tracked):
     # Every directory the listed paths sit in is checked for the tag, listed or not (codex r1: an
     # ignored CACHEDIR.TAG still marks its dir). Never the root itself, and in a git tree never a
-    # dir that holds a tracked file (codex r1: a planted tag never hides tracked edits or deletions).
+    # dir that holds a tracked file (codex r1: a planted tag never hides tracked edits or deletions),
+    # compared folded (core#1518 codex-check: a tagged `s<ZWNJ>rc` is `src` on a folding host, so
+    # it would hide tracked `src/file.rs` and the host would delete it).
     dirs = set()
     for rel in rels:
         p = rel.split("/")
@@ -1398,22 +1514,25 @@ def caches(rootfd, rels, tracked):
     held = set()
     for t in tracked or ():
         p = t.split("/")
-        for i in range(1, len(p)): held.add("/".join(p[:i]))
+        # The tracked path itself too (codex confirm #4): a tracked file `src` replaced by a
+        # tagged dir `src/` is no cache.
+        for i in range(1, len(p) + 1): held.add(fold("/".join(p[:i])))
     out = []
     for d in sorted(dirs, key=lambda x: (x.count("/"), x)):
         if any(d == o or d.startswith(o + "/") for o in out): continue
         # Never inside git metadata (codex r2): the engine refuses a git skip path.
         if isgit(d): continue
-        if d in held: continue
+        if fold(d) in held: continue
         if is_tag(rootfd, d + "/" + TAG): out.append(d)
     return out
 def tracked_list(root):
-    if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"): return []
+    # None: no repository (a session's scratch tree), so nothing of it is untracked output.
+    if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"): return None
     r = git(root, "ls-files", "-z", "-c")
     if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
     return [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
 SEEDING = ".wicked-seeding"
-def emit(out, rootfd, rel):
+def emit(out, rootfd, rel, leave=None):
     fd, name = parent(rootfd, rel, False)
     if fd is None: return
     try:
@@ -1432,9 +1551,14 @@ def emit(out, rootfd, rel):
                 fs = os.fstat(fh.fileno())
                 if not stat.S_ISREG(fs.st_mode): die("not a regular file: " + rel)
                 n = fs.st_size
-                # (core#1498) Left out, never the whole write-back refused: the seat's other
-                # changes still come back, and the step says what stayed behind.
-                if n + 13 + len(rel.encode("utf-8", "surrogateescape")) > BUDGET - SENT:
+                # (core#1498) An untracked file of a git tree the plan could not fit is left
+                # out, never the whole write-back refused: the seat's other changes still come
+                # back, and the step says what stayed behind. A tracked file or anything of a
+                # plain root (QE evidence) is never left out (core#1518 codex-check): past the
+                # limit, `head` refuses the write-back and names it.
+                # `leave`: None = never left out, "out" = no room was left for it, "fit" = it had
+                # room when sized (left out only if it grew past it since).
+                if leave == "out" or (leave == "fit" and n + 13 + len(rel.encode("utf-8", "surrogateescape")) > BUDGET - SENT):
                     put(out, b"s", rel, b"limit"); return
                 head(out, b"x" if fs.st_mode & 0o111 else b"f", rel, n)
                 SENT += n
@@ -1544,31 +1668,76 @@ def unpack(plan):
         finally: os.close(fd)
         wrote.add(rel)
     finish()
+def planned(rootfd, rel):
+    # (bytes on the stream, whether it is a regular file), or None for a path that is gone or a dir.
+    fd, name = parent(rootfd, rel, False)
+    if fd is None: return None
+    try:
+        try: st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError: return None
+        if stat.S_ISDIR(st.st_mode): return None
+        reg = stat.S_ISREG(st.st_mode)
+        n = st.st_size if reg or stat.S_ISLNK(st.st_mode) else 0
+        return 13 + len(rel.encode("utf-8", "surrogateescape")) + n, reg
+    finally: os.close(fd)
 def pack(plan):
     out = sys.stdout.buffer; out.write(b"WKS1\n")
-    for item in plan:
-        r, m, skip = item[0], item[1], item[2]
-        rootfd = openroot(r, False)
-        put(out, b"R", r, m.encode())
-        if rootfd is None: continue
-        try:
+    work = []; fits = set()
+    try:
+        for item in plan:
+            r, m, skip = item[0], item[1], item[2]
+            rootfd = openroot(r, False)
+            work.append((r, m, rootfd, [], []))
+            if rootfd is None: continue
             if m == "files":
-                for rel in skip: emit(out, rootfd, rel)
+                work[-1][4].extend((rel, False) for rel in skip)
                 continue
             rels = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
+            # No root but the tree's own `.git` root carries git metadata, either way (codex
+            # b2-sync #17): a plain root's repository stays on the host.
+            rels = [x for x in rels if not any(under(x, s) for s in skip)
+                    and not (m in ("tree", "plain") and isgit(x))]
+            tracked = tracked_list(R + "/" + r) if m == "tree" else None
             # (core#1498) Build output (a tagged cache dir) never comes back: named once, so
-            # the host keeps whatever it had there and the step says it was left out.
-            left = caches(rootfd, [x for x in rels if not any(under(x, s) for s in skip)],
-                          tracked_list(R + "/" + r) if m == "tree" else None)
+            # the host keeps whatever it had there and the step says it was left out. Matched
+            # exactly (core#1518 codex-check), as the host matches it.
+            left = caches(rootfd, rels, tracked)
+            work[-1][3].extend(left)
+            # Only an untracked file of a tree WITH a repository may be left out for the limit
+            # (codex confirm #2): a repository-free tree's files all come back, like a plain root's.
+            held = set(tracked or ())
+            work[-1][4].extend((rel, tracked is not None and rel not in held) for rel in rels
+                               if not any(inside(rel, c) for c in left))
+        # (core#1518 codex-check) What MUST come back (a tree's tracked files, everything of a
+        # plain root, the planned files) is sized first, and only the room it leaves goes to the
+        # untracked files of a git tree, smallest first: a large artifact never pushes a tracked
+        # edit or the QE evidence out. If what must come back cannot fit, the write-back is
+        # refused naming the largest of it, never a success that silently dropped it.
+        must, may = [], []
+        for r, m, rootfd, left, items in work:
+            for rel, leavable in items:
+                got = planned(rootfd, rel)
+                if got is None: continue
+                cost, reg = got
+                (may if leavable and reg else must).append((cost, r, rel))
+        need = sum(c for c, _, _ in must)
+        if need > MAX:
+            big = ", ".join("%s/%s (%d bytes)" % (r, rel, c) for c, r, rel in sorted(must, reverse=True)[:5])
+            die("the unit's tracked changes and evidence need %d bytes, more than the write-back's "
+                "limit of %d; nothing was written back. Largest: %s" % (need, MAX, big))
+        room = BUDGET - need
+        for c, r, rel in sorted(may):
+            if c > room: break
+            fits.add((r, rel)); room -= c
+        for r, m, rootfd, left, items in work:
+            put(out, b"R", r, m.encode())
+            if rootfd is None: continue
             for c in left: put(out, b"s", c, b"cache")
-            for rel in rels:
-                if any(under(rel, s) for s in skip): continue
-                # No root but the tree's own `.git` root carries git metadata, either way
-                # (codex b2-sync #17): a plain root's repository stays on the host.
-                if m in ("tree", "plain") and isgit(rel): continue
-                if any(under(rel, c) for c in left): continue
-                emit(out, rootfd, rel)
-        finally: os.close(rootfd)
+            for rel, leavable in items:
+                emit(out, rootfd, rel, ("fit" if (r, rel) in fits else "out") if leavable else None)
+    finally:
+        for w in work:
+            if w[2] is not None: os.close(w[2])
     put(out, b"E", "", b""); out.flush()
 def bundle(tree, base):
     root = R + "/" + tree

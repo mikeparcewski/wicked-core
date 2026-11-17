@@ -2134,18 +2134,22 @@ fn k8s_a_file_and_a_directory_of_one_folded_name_are_refused_however_they_sort()
     assert!(sync::check_entries(&r, &[]).is_err());
 }
 
-/// (core#1498, run ea75313b seq 6215-6217) A file that would take the write-back past the stream's
-/// limit is LEFT OUT, never read and never the whole write-back refused: the seat's other files
-/// still come back, and the stream names what stayed behind.
+/// (core#1498, run ea75313b seq 6215-6217) An untracked file of a git tree that would take the
+/// write-back past the stream's limit is LEFT OUT, never read and never the whole write-back refused:
+/// the seat's other files still come back, and the stream names what stayed behind.
 #[cfg(unix)]
 #[test]
-fn k8s_the_pod_codec_leaves_an_oversized_file_out_before_reading_it() {
+fn k8s_the_pod_codec_leaves_an_oversized_untracked_file_out_before_reading_it() {
     let replica = tmp("bigpack");
-    std::fs::create_dir_all(replica.join("w")).unwrap();
-    let f = std::fs::File::create(replica.join("w/big")).unwrap();
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    let f = std::fs::File::create(t.join("big")).unwrap();
     f.set_len(sync::MAX_STREAM + 1).unwrap();
-    std::fs::write(replica.join("w/verdict.json"), "{}").unwrap();
-    let plan = json!([["w", "plain", [], []]]).to_string();
+    std::fs::write(t.join("notes.md"), "n").unwrap();
+    std::fs::create_dir_all(replica.join("e")).unwrap();
+    std::fs::write(replica.join("e/verdict.json"), "{}").unwrap();
+    let plan = json!([["w", "tree", [".git"], []], ["e", "plain", [], []]]).to_string();
     let out = codec(&replica, &["pack", &plan], b"");
     assert!(
         out.status.success(),
@@ -2162,13 +2166,173 @@ fn k8s_the_pod_codec_leaves_an_oversized_file_out_before_reading_it() {
         }]
     );
     let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
-    assert_eq!(
-        paths,
-        ["verdict.json"],
-        "the seat's other output comes back"
-    );
+    assert_eq!(paths, ["notes.md"], "the seat's other output comes back");
+    let paths: Vec<&str> = roots[1].entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(paths, ["verdict.json"], "the evidence comes back");
     assert!(left[0].describe(Path::new("/h/w")).contains("stream limit"));
     assert!(sync::POD_CODEC.contains(&format!("MAX = {}", sync::MAX_STREAM)));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1518 codex-check, W 20) The limit only ever leaves out an untracked file of a git tree: an
+/// untracked artifact that fills the budget never pushes out a tracked edit or the QE evidence (the
+/// codex repro: a 23-byte tracked change and a 19-byte verdict after a ~448 MiB artifact were both
+/// left out while the pack exited 0). A small new file still comes back (smallest first).
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_never_leaves_a_tracked_edit_or_evidence_out_for_an_artifact() {
+    let replica = tmp("budgetpack");
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("z_source.rs"), "old\n").unwrap();
+    git_in(&t, &["add", "z_source.rs"]);
+    std::fs::write(t.join("z_source.rs"), "new source should land\n").unwrap();
+    std::fs::write(t.join("zz_new.rs"), "fn new() {}\n").unwrap();
+    let f = std::fs::File::create(t.join("a_generated.bin")).unwrap();
+    // Sparse: fills the budget less what the two small files take (the codex repro's size).
+    f.set_len((448 << 20) - 46).unwrap();
+    std::fs::create_dir_all(replica.join("e")).unwrap();
+    std::fs::write(replica.join("e/verdict.json"), "{\"verdict\":\"FAIL\"}\n").unwrap();
+    let plan = json!([["w", "tree", [".git"], []], ["e", "plain", [], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(
+        left,
+        vec![sync::Skipped {
+            path: "a_generated.bin".into(),
+            why: "limit".into()
+        }]
+    );
+    let got: Vec<(&str, &[u8])> = roots[0]
+        .entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.data.as_slice()))
+        .collect();
+    assert_eq!(
+        got,
+        [
+            ("z_source.rs", &b"new source should land\n"[..]),
+            ("zz_new.rs", &b"fn new() {}\n"[..])
+        ]
+    );
+    let got: Vec<(&str, &[u8])> = roots[1]
+        .entries
+        .iter()
+        .map(|e| (e.path.as_str(), e.data.as_slice()))
+        .collect();
+    assert_eq!(got, [("verdict.json", &b"{\"verdict\":\"FAIL\"}\n"[..])]);
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1518 codex-check) A tracked file or a plain root's file (QE evidence) that cannot fit is
+/// never left out: the write-back is refused, loudly, naming it, never a success without it.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_refuses_a_write_back_whose_tracked_files_or_evidence_cannot_fit() {
+    let replica = tmp("mustpack");
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("data.bin"), "old").unwrap();
+    git_in(&t, &["add", "data.bin"]);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .open(t.join("data.bin"))
+        .unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a tracked file was left out silently"
+    );
+    assert!(
+        err.contains("w/data.bin") && err.contains("nothing was written back"),
+        "{err}"
+    );
+    std::fs::create_dir_all(replica.join("e")).unwrap();
+    let f = std::fs::File::create(replica.join("e/evidence.log")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let plan = json!([["e", "plain", [], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "evidence was left out silently");
+    assert!(err.contains("e/evidence.log"), "{err}");
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1518 codex-check, W 10) A tagged dir whose name folds to a tracked file's dir (`s<ZWNJ>rc`
+/// against `src`) is no cache: it never hides tracked `src/file.rs` (the host would delete it).
+/// And a cache dir covers exactly its own paths: `cache/x.txt` beside a tagged `c<ZWNJ>ache` comes back.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_matches_cache_dirs_exactly_and_never_over_tracked_files() {
+    const SIG: &[u8] = b"Signature: 8a477f597d28d172789f06886806bc55\n";
+    let replica = tmp("aliaspack");
+    let t = replica.join("w");
+    std::fs::create_dir_all(t.join("src")).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("src/file.rs"), "old\n").unwrap();
+    git_in(&t, &["add", "src/file.rs"]);
+    std::fs::write(t.join("src/file.rs"), "changed\n").unwrap();
+    std::fs::create_dir_all(t.join("s\u{200c}rc")).unwrap();
+    std::fs::write(t.join("s\u{200c}rc/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::create_dir_all(t.join("c\u{200c}ache")).unwrap();
+    std::fs::write(t.join("c\u{200c}ache/CACHEDIR.TAG"), SIG).unwrap();
+    std::fs::write(t.join("c\u{200c}ache/obj.o"), "obj").unwrap();
+    std::fs::create_dir_all(t.join("cache")).unwrap();
+    std::fs::write(t.join("cache/x.txt"), "x").unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(
+        left,
+        vec![sync::Skipped {
+            path: "c\u{200c}ache".into(),
+            why: "cache".into()
+        }]
+    );
+    let mut paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(
+        paths,
+        ["cache/x.txt", "src/file.rs", "s\u{200c}rc/CACHEDIR.TAG"]
+    );
+    // The host half (codex's host probe): the edit is written, nothing is deleted.
+    let host = tmp("aliashost");
+    std::fs::create_dir_all(host.join("src")).unwrap();
+    std::fs::write(host.join("src/file.rs"), "old\n").unwrap();
+    let base: std::collections::HashMap<String, [u8; 32]> = [(
+        "src/file.rs".to_string(),
+        sync::digest(&entry(Kind::File, "src/file.rs", b"old\n")),
+    )]
+    .into_iter()
+    .collect();
+    let mut entries = sync::check_entries_against(&roots[0], &[], &base).unwrap();
+    entries.retain(|e| !left.iter().any(|s| s.covers(&e.path)));
+    let (writes, deletes) = seat::delta_keeping(&host, &base, entries, &left).unwrap();
+    assert!(deletes.is_empty(), "{deletes:?}");
+    assert!(
+        writes
+            .iter()
+            .any(|e| e.path == "src/file.rs" && e.data == b"changed\n"),
+        "the tracked edit lands"
+    );
+    let _ = std::fs::remove_dir_all(&host);
     let _ = std::fs::remove_dir_all(&replica);
 }
 
@@ -2233,6 +2397,176 @@ fn k8s_the_pod_codec_leaves_tagged_build_output_out() {
     let paths: Vec<&str> = roots[1].entries.iter().map(|e| e.path.as_str()).collect();
     assert_eq!(paths, ["lib.rs"], "the seat's real change still comes back");
     assert!(left_w[0].describe(&t).contains("build output"));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1518 codex-check and confirm, SILENT-OK / KEY / HIDE) The host's own check of what the
+/// pod left out, against what no seat can change: a `limit` skip only in a git tree, and no skip
+/// covering a file the host's repository tracks, folded. Each refuses the write-back, naming it.
+#[cfg(unix)]
+#[test]
+fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
+    let sk = |p: &str, why: &str| sync::Skipped {
+        path: p.into(),
+        why: why.into(),
+    };
+    // A plain root (the QE evidence) and a repository-free tree never lose a file to the limit.
+    let plain = tmp("skip-plain");
+    for mode in [Mode::Plain, Mode::Files, Mode::Tree] {
+        let err =
+            sync::refuse_unsafe_skips(&plain, mode, &[sk("verdict.json", "limit")]).unwrap_err();
+        assert!(
+            err.contains("verdict.json") && err.contains("nothing was written back"),
+            "{mode:?}: {err}"
+        );
+    }
+    sync::refuse_unsafe_skips(&plain, Mode::Plain, &[sk("cargo-target", "cache")]).unwrap();
+    // A git tree: an untracked file may be left out; tracked work never, through any alias.
+    let t = tmp("skip-tree");
+    git_in(&t, &["init", "-q"]);
+    std::fs::create_dir_all(t.join("src")).unwrap();
+    std::fs::write(t.join("src/file.rs"), "old\n").unwrap();
+    std::fs::write(t.join("lib"), "a tracked file named like a dir\n").unwrap();
+    git_in(&t, &["add", "src/file.rs", "lib"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    sync::refuse_unsafe_skips(
+        &t,
+        Mode::Tree,
+        &[
+            sk("a_generated.bin", "limit"),
+            sk("baseline-target", "cache"),
+        ],
+    )
+    .unwrap();
+    for (bad, why) in [
+        ("src/file.rs", "limit"),
+        ("SRC/file.rs", "limit"),
+        ("src", "cache"),
+        ("s\u{200c}rc", "cache"),
+        ("SRC", "cache"),
+        ("lib", "cache"),
+    ] {
+        let err = sync::refuse_unsafe_skips(&t, Mode::Tree, &[sk(bad, why)]).unwrap_err();
+        assert!(err.contains("tracks"), "{bad} {why}: {err}");
+    }
+    // An additional writable repository is a plain root: its tracked files are protected too.
+    let err = sync::refuse_unsafe_skips(&t, Mode::Plain, &[sk("src", "cache")]).unwrap_err();
+    assert!(err.contains("src/file.rs"), "{err}");
+    // (codex confirm r2) A repository NESTED in a plain root answers for its own tracked files:
+    // cargo's tag in `extra/target` (tracked fixture) or a tag at the nested repository's root.
+    let outer = tmp("skip-nested");
+    let extra = outer.join("extra");
+    std::fs::create_dir_all(extra.join("target")).unwrap();
+    git_in(&extra, &["init", "-q"]);
+    std::fs::write(extra.join("target/fixture.bin"), "f").unwrap();
+    git_in(&extra, &["add", "target/fixture.bin"]);
+    git_in(&extra, &["commit", "-q", "-m", "a"]);
+    std::fs::create_dir_all(outer.join("scratch-target")).unwrap();
+    for bad in ["extra/target", "extra", "extra/TARGET"] {
+        let err = sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk(bad, "cache")]).unwrap_err();
+        assert!(err.contains("fixture.bin"), "{bad}: {err}");
+    }
+    sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk("scratch-target", "cache")]).unwrap();
+    sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk("extra/new-target", "cache")]).unwrap();
+    let _ = std::fs::remove_dir_all(&outer);
+    // The seat rewrote its own index (`git rm --cached`) and planted a tag beside its edit: the
+    // pod calls `src` a cache, the host's index still tracks it and refuses.
+    let replica = tmp("skip-index");
+    let w = replica.join("w");
+    std::fs::create_dir_all(w.join("src")).unwrap();
+    git_in(&w, &["init", "-q"]);
+    std::fs::write(w.join("src/file.rs"), "old\n").unwrap();
+    git_in(&w, &["add", "src/file.rs"]);
+    git_in(&w, &["commit", "-q", "-m", "a"]);
+    std::fs::write(w.join("src/file.rs"), "the seat's edit\n").unwrap();
+    git_in(&w, &["rm", "-q", "--cached", "src/file.rs"]);
+    std::fs::write(
+        w.join("src/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let left = sync::take_skipped(&mut roots[0]).unwrap();
+    assert_eq!(left, vec![sk("src", "cache")], "the pod trusts its index");
+    let err = sync::refuse_unsafe_skips(&t, Mode::Tree, &left).unwrap_err();
+    assert!(
+        err.contains("src/file.rs") && err.contains("nothing was written back"),
+        "{err}"
+    );
+    // A path a skip may alias on a folding host is never deleted (`src/file.rs` vs a skipped
+    // `SRC/file.rs`), while a path the pod really dropped still is.
+    let base: std::collections::HashMap<String, [u8; 32]> = ["src/file.rs", "lib"]
+        .iter()
+        .map(|r| {
+            let d = std::fs::read(t.join(r)).unwrap();
+            (r.to_string(), sync::digest(&entry(Kind::File, r, &d)))
+        })
+        .collect();
+    let (_, deletes) =
+        seat::delta_keeping(&t, &base, Vec::new(), &[sk("SRC/file.rs", "limit")]).unwrap();
+    assert_eq!(deletes, vec!["lib".to_string()]);
+    for d in [plain, t, replica] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+/// (core#1518 codex confirm #2, #4) A repository-free tree's files all come back (none is
+/// "untracked output"): past the limit the pack is refused, never a success without them. A tracked
+/// FILE replaced by a tagged dir of its name is no cache.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_codec_never_leaves_out_a_repository_free_trees_files_or_a_tracked_leaf() {
+    let replica = tmp("norepo");
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    let f = std::fs::File::create(t.join("result.bin")).unwrap();
+    f.set_len(sync::MAX_STREAM + 1).unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a repository-free tree's file was left out"
+    );
+    assert!(
+        err.contains("w/result.bin") && err.contains("nothing was written back"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+
+    let replica = tmp("leaf");
+    let t = replica.join("w");
+    std::fs::create_dir_all(&t).unwrap();
+    git_in(&t, &["init", "-q"]);
+    std::fs::write(t.join("src"), "a file\n").unwrap();
+    git_in(&t, &["add", "src"]);
+    git_in(&t, &["commit", "-q", "-m", "a"]);
+    std::fs::remove_file(t.join("src")).unwrap();
+    std::fs::create_dir_all(t.join("src")).unwrap();
+    std::fs::write(
+        t.join("src/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    std::fs::write(t.join("src/new.rs"), "fn n() {}\n").unwrap();
+    let out = codec(&replica, &["pack", &plan], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
+    let mut paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
+    paths.sort();
+    assert_eq!(paths, ["src/CACHEDIR.TAG", "src/new.rs"]);
     let _ = std::fs::remove_dir_all(&replica);
 }
 
