@@ -393,12 +393,12 @@ pub struct RuleCheckReport {
     /// when it fits one call.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub parts: u32,
-    /// (core#1493) What a skip given on this check must find unchanged to carry to a later step:
-    /// a digest of the change's exact bytes, the floor's result and the match facts — everything
-    /// the judge reads but the person's instructions (which a skip itself changes). Review stage
-    /// only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub carry_key: Option<String>,
+    /// (core#1493) Per rule id, what a skip given on this check must find unchanged to carry to a
+    /// later step: a digest of the change's exact bytes, the floor's result, the match facts and
+    /// the rule's own match result — everything the judge reads but the person's instructions
+    /// (which a skip itself changes). Review stage only.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub carry_keys: BTreeMap<String, String>,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -3198,6 +3198,7 @@ pub fn check(
         ])),
         CheckStage::Delivery => None,
     };
+    let mut carry_keys: BTreeMap<String, String> = BTreeMap::new();
     let mut rows: BTreeMap<String, RuleVerdict> = BTreeMap::new();
     // (Part B) POL-2101's ids whose two parts the engine combines.
     let mut combine: Vec<String> = Vec::new();
@@ -3369,14 +3370,22 @@ pub fn check(
                 pack,
                 Some(PackKind::Process(_)) | Some(PackKind::WorkWithRecord)
             );
-        if let Some(s) = (change_only && carry_key.is_some())
+        // (codex on #1516) …and the rule's own derived match (its source reference can make it
+        // "applies here" with no other change): part of this rule's carry key.
+        let rule_carry = carry_key
+            .as_ref()
+            .map(|k| digest(&[k, &match_note(m, input.stage)]));
+        if let Some(rc) = &rule_carry {
+            carry_keys.insert(rule.id.clone(), rc.clone());
+        }
+        if let Some(s) = (change_only && rule_carry.is_some())
             .then(|| {
                 input.carried.iter().rev().find(|s| {
                     s.rule_id == rule.id
                         && s.rule_key == rk
                         && s.instruction.is_none()
                         && s.carry_key.is_some()
-                        && s.carry_key == carry_key
+                        && s.carry_key == rule_carry
                 })
             })
             .flatten()
@@ -3567,7 +3576,7 @@ pub fn check(
         } else {
             0
         },
-        carry_key: carry_key.clone(),
+        carry_keys,
         ..Default::default()
     };
     // (S3) The machine check runs beside the judge batches; one base run answers every rule that

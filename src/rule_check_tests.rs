@@ -4631,7 +4631,19 @@ fn run_carried_floor(
     floor: &str,
     carried: &[RuleSkip],
 ) -> RuleCheckReport {
-    let f = job_facts(&bug_steps(), None, None, c);
+    run_carried_in(rules, c, judge, told, floor, carried, None)
+}
+
+fn run_carried_in(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    told: &str,
+    floor: &str,
+    carried: &[RuleSkip],
+    repo: Option<&str>,
+) -> RuleCheckReport {
+    let f = job_facts(&bug_steps(), None, repo, c);
     let seats = seats();
     check(
         &CheckInput {
@@ -4673,7 +4685,7 @@ fn run_carried(
 /// A skip given on `report`'s row for `rule_id`, as `rules_recheck_request` records it.
 fn carried_skip(report: &RuleCheckReport, reason: &str) -> RuleSkip {
     let mut s = skip_of(&report.rows[0], reason);
-    s.carry_key = report.carry_key.clone();
+    s.carry_key = report.carry_keys.get(&s.rule_id).cloned();
     s.ord = Some(3);
     s
 }
@@ -4687,7 +4699,7 @@ fn core_1493_a_skip_carries_to_later_steps_on_the_same_evidence() {
     let silent = Fake::new(&[]);
     let challenge = run_carried(&rules, &change(), &silent, "add max(xs)", &[]);
     assert_eq!(challenge.rows[0].status, RuleStatus::Unchecked);
-    assert!(challenge.carry_key.is_some());
+    assert!(challenge.carry_keys.contains_key("R1"));
     let skip = carried_skip(
         &challenge,
         "the manual loop avoids Math.max's argument limit",
@@ -4864,5 +4876,61 @@ fn core_1493_a_machine_obligation_rule_is_never_carried() {
         RuleStatus::Skipped,
         "{:?}",
         later.rows[0]
+    );
+}
+
+/// (codex on #1516) A rule's own derived match is part of what its skip carries on: the same rule
+/// text and facts with a source reference that now names this repository ("applies here") is
+/// judged again, not carried.
+#[test]
+fn core_1493_a_changed_rule_match_is_judged_again() {
+    let silent = Fake::new(&[]);
+    let plain = [rule("R1", "no duplicated built-in")];
+    let given = run_carried_in(
+        &plain,
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        &[],
+        Some("tiny-math"),
+    );
+    assert_eq!(given.rows[0].status, RuleStatus::Unchecked);
+    let skip = carried_skip(&given, "fine here");
+    let same = run_carried_in(
+        &plain,
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        std::slice::from_ref(&skip),
+        Some("tiny-math"),
+    );
+    assert_eq!(
+        same.rows[0].status,
+        RuleStatus::Skipped,
+        "the same match carries"
+    );
+    let mut sourced = rule("R1", "no duplicated built-in");
+    sourced.provenance.reference = Some("docs/tiny-math.md@abc#R1".into());
+    assert_eq!(
+        rule_key(&sourced),
+        rule_key(&plain[0]),
+        "the rule key alone cannot tell"
+    );
+    let moved = run_carried_in(
+        &[sourced],
+        &change(),
+        &silent,
+        "x",
+        "repo checks passed",
+        std::slice::from_ref(&skip),
+        Some("tiny-math"),
+    );
+    assert_ne!(moved.carry_keys.get("R1"), given.carry_keys.get("R1"));
+    assert_ne!(
+        moved.rows[0].status,
+        RuleStatus::Skipped,
+        "a changed match is judged again"
     );
 }

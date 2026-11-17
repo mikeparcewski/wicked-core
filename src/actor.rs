@@ -12297,7 +12297,9 @@ fn dispatch_unit_with(
                 .iter()
                 .filter(|u| u.ord != unit.ord)
                 .flat_map(|u| u.rule_skips.iter())
-                .filter(|s| s.carry_key.is_some() && !skip_withdrawn(s, &all))
+                .filter(|s| {
+                    s.carry_key.is_some() && !skip_withdrawn(s, &all, &session.intent_amendments)
+                })
                 .cloned()
                 .collect();
         }
@@ -15778,6 +15780,30 @@ const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
 const RULING_SHOWN_MAX: usize = 2 * 1024;
 const RULINGS_SHOWN_MAX: usize = 6 * 1024;
 
+/// (core#1493, coord codex-check on #1516) A person's skip of rule R is withdrawn, and no longer
+/// carried, once the person gives a NEWER ruling (an amend, request-changes or land note, the
+/// rulings a rule judge reads) that names R: "enforce R" on unchanged code puts R back before a
+/// judge. So does a newer approved intent amendment that names R (codex on #1516). The skip's own
+/// time (`at`) is the revision it was given at.
+pub(crate) fn skip_withdrawn(
+    skip: &crate::rule_check::RuleSkip,
+    units: &[crate::domain::WorkUnit],
+    amendments: &[crate::domain::IntentAmendment],
+) -> bool {
+    let id = skip.rule_id.to_ascii_lowercase();
+    let names = |t: &str| t.to_ascii_lowercase().contains(&id);
+    units
+        .iter()
+        .flat_map(|u| u.operator_rulings.iter())
+        .any(|r| {
+            r.at > skip.at
+                && RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str())
+                && names(&r.text)
+        })
+        // (codex on #1516) …or a newer intent amendment naming it.
+        || amendments.iter().any(|a| a.at > skip.at && names(&a.text))
+}
+
 /// (DES-RULE-CHECK-001 addendum F19/F1, operator Q1=B) The person's words a rule judge reads,
 /// from the run's RECORD only: the gate rulings ([`RULE_INSTRUCTION_ACTIONS`]) on any of the run's
 /// units, newest first, then the run's problem and each approved intent amendment. Never a unit's
@@ -15786,25 +15812,6 @@ const RULINGS_SHOWN_MAX: usize = 6 * 1024;
 /// person's words. The rulings lead, within their own budget, and their header carries a digest of
 /// the whole record: a new or changed ruling, even past a cut, changes the judge's evidence key, so
 /// the rule is judged again. With no ruling the words are the problem and amendments, as before.
-/// (core#1493, coord codex-check on #1516) A person's skip of rule R is withdrawn, and no longer
-/// carried, once the person gives a NEWER ruling (an amend, request-changes or land note, the
-/// rulings a rule judge reads) that names R: "enforce R" on unchanged code puts R back before a
-/// judge. The skip's own time (`at`) is the revision it was given at.
-pub(crate) fn skip_withdrawn(
-    skip: &crate::rule_check::RuleSkip,
-    units: &[crate::domain::WorkUnit],
-) -> bool {
-    let id = skip.rule_id.to_ascii_lowercase();
-    units
-        .iter()
-        .flat_map(|u| u.operator_rulings.iter())
-        .any(|r| {
-            r.at > skip.at
-                && RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str())
-                && r.text.to_ascii_lowercase().contains(&id)
-        })
-}
-
 pub(crate) fn rule_instructions_words(
     problem: &str,
     amendments: &[crate::domain::IntentAmendment],
@@ -18527,7 +18534,11 @@ fn rules_recheck_request(
             instruction: (row.status == crate::rule_check::RuleStatus::Waived)
                 .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
             // (core#1493) The hunks it was given on, so the run's later steps carry it.
-            carry_key: cursor.rule_check.as_ref().and_then(|r| r.carry_key.clone()),
+            carry_key: cursor
+                .rule_check
+                .as_ref()
+                .and_then(|r| r.carry_keys.get(id))
+                .cloned(),
             ord: Some(cursor.ord),
         });
     }
@@ -28693,7 +28704,7 @@ mod request_changes_tests {
                     row("R1", crate::rule_check::RuleStatus::Disputed),
                     row("R9", crate::rule_check::RuleStatus::Broken),
                 ],
-                carry_key: Some("ck".into()),
+                carry_keys: [("R1".to_string(), "ck".to_string())].into(),
                 ..Default::default()
             };
             v.denials_behind = Some(vec![report.denial().unwrap(), report.hold().unwrap()]);
@@ -40000,26 +40011,29 @@ mod skip_withdrawn_tests {
             });
             vec![u]
         };
+        let none: &[crate::domain::IntentAmendment] = &[];
+        let w = |units: &[crate::domain::WorkUnit]| skip_withdrawn(&skip, units, none);
+        assert!(w(&ruled("amend", "enforce pol-7 after all", 20)));
+        assert!(w(&ruled("request_changes", "POL-7 applies", 11)));
+        assert!(!w(&ruled("amend", "enforce POL-7", 5)), "older");
+        assert!(!w(&ruled("amend", "enforce POL-8", 20)), "another rule");
+        assert!(!w(&ruled("skip_rules", "POL-7 again", 20)), "not a ruling");
+        assert!(!w(&[]));
+        // (codex on #1516) A newer intent amendment naming the rule withdraws it too; an older
+        // one, or one naming another rule, does not.
+        let amend = |text: &str, at: i64| {
+            vec![crate::domain::IntentAmendment {
+                text: text.into(),
+                ord: 5,
+                at,
+            }]
+        };
         assert!(skip_withdrawn(
             &skip,
-            &ruled("amend", "enforce pol-7 after all", 20)
+            &[],
+            &amend("Enforce POL-7 after all", 30)
         ));
-        assert!(skip_withdrawn(
-            &skip,
-            &ruled("request_changes", "POL-7 applies", 11)
-        ));
-        assert!(
-            !skip_withdrawn(&skip, &ruled("amend", "enforce POL-7", 5)),
-            "older"
-        );
-        assert!(
-            !skip_withdrawn(&skip, &ruled("amend", "enforce POL-8", 20)),
-            "another rule"
-        );
-        assert!(
-            !skip_withdrawn(&skip, &ruled("skip_rules", "POL-7 again", 20)),
-            "not a ruling"
-        );
-        assert!(!skip_withdrawn(&skip, &[]));
+        assert!(!skip_withdrawn(&skip, &[], &amend("Enforce POL-7", 5)));
+        assert!(!skip_withdrawn(&skip, &[], &amend("Enforce POL-8", 30)));
     }
 }
