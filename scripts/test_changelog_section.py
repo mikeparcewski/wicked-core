@@ -42,6 +42,10 @@ CHANGELOG = """# Changelog
 
 - First.
 
+## Migration from [core-ts 0.4.1] — engine only
+
+- Prose, not the release.
+
 ## [0.4.0] / [core-ts 0.4.1] — 2026-08-01
 
 - Combined heading.
@@ -101,6 +105,10 @@ class ChangelogSection(unittest.TestCase):
         code, out = run(["0.4.1"])
         self.assertEqual((code, out.strip()), (0, "- Combined heading."))
         self.assertEqual(run(["0.4.0"])[0], 1)  # 0.4.0 there is the engine's version, not core-ts
+
+    def test_a_heading_naming_the_version_in_prose_is_not_its_release(self):
+        prose = "# Changelog\n\n## Migration from [core-ts 0.4.1] — engine only\n\n- Prose.\n"
+        self.assertEqual(run(["0.4.1"], text=prose), (1, ""))
 
     def test_an_undecodable_changelog_is_exit_2_never_1(self):
         with tempfile.TemporaryDirectory() as d:

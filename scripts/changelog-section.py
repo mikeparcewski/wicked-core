@@ -46,7 +46,8 @@ def section(changelog: str, version: str):
     esc = re.escape(version)
     bullet = re.compile(rf"^- \*\*core-ts {esc}\*\*(?=[\s—]|$)")
     # `## [core-ts X.Y.Z] — …`, or a combined one such as `## [0.4.0] / [core-ts 0.4.1]`.
-    heading = re.compile(rf"^## (?:.*\s)?\[core-ts {esc}\](?=[\s—]|$)")
+    # Only bracketed versions may precede it (`[X.Y.Z] / `); a heading that names it in prose is not its release.
+    heading = re.compile(rf"^## (?:\[[^\]\s]+\] / )*\[core-ts {esc}\](?=[\s—]|$)")
     for i, line in enumerate(lines):
         if bullet.match(line):
             body = [line[2:]]

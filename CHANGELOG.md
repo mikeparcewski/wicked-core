@@ -31,8 +31,8 @@ Two release tracks share this file, newest entry first regardless of track:
   exists, so a re-run never errors. The notes are the version's CHANGELOG block (`scripts/changelog-section.py` reads
   both the `- **core-ts X.Y.Z**` bullet and the older `## [core-ts X.Y.Z]` heading, drops link refs and scrubs home
   paths, and finds combined `## [0.4.0] / [core-ts 0.4.1]` headings). Latest follows npm: the publish job exports the
-  dist-tag it used, and only a `latest` publish becomes the page's Latest (a `release-X.Y` maintenance one never does;
-  anything else fails the job). An existing hand-made draft or prerelease is published as the stable Release. Any
+  dist-tag it used, and only a `latest` publish that is not older than npm's latest when the job runs becomes the
+  page's Latest (a `release-X.Y` maintenance one never does; a missing dist-tag or a failed npm lookup fails the job). An existing hand-made draft or prerelease is published as the stable Release. Any
   extractor failure other than "no block" fails the job instead of shipping a generic note. Earlier versions are not
   backfilled. The extractor's tests run on CI's Linux leg. A full re-run after a publish still fails at npm (core#1556).
 

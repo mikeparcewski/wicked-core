@@ -364,8 +364,9 @@ jobs:
   # published, never an "already exists" error. Notes are this version's CHANGELOG block
   # (scripts/changelog-section.py: exit 1 = no block, so a generic note; any other failure fails this
   # job rather than ship a fallback). Latest follows npm: only a version published under the npm
-  # `latest` dist-tag (the publish job's own choice) becomes the page's Latest; a maintenance release
-  # (`release-X.Y`) never does. It does not wait for the lockfile job: both follow the publish.
+  # `latest` dist-tag (the publish job's own choice), and still not older than npm's latest when this
+  # job runs, becomes the page's Latest; a maintenance release (`release-X.Y`) never does. It does
+  # not wait for the lockfile job: both follow the publish.
   github-release:
     name: create or update the GitHub Release
     needs: publish
@@ -390,6 +391,18 @@ jobs:
             release-*) latest=false ;;
             *) echo "::error::the publish job reported no npm dist-tag ('$DIST_TAG'); refusing to guess Latest"; exit 1 ;;
           esac
+          # A late run (a retried or delayed job) must not take Latest back from a newer version that
+          # has published since: npm's current latest decides, and a failed lookup fails the job.
+          if [ "$latest" = true ]; then
+            NPM_LATEST="$(npm view wicked-core-ts dist-tags.latest)"
+            if [ -z "$NPM_LATEST" ]; then
+              echo "::error::npm reported no dist-tags.latest for wicked-core-ts; refusing to guess Latest"; exit 1
+            fi
+            if [ "$NPM_LATEST" != "$VERSION" ] && [ "$(printf '%s\n%s\n' "$VERSION" "$NPM_LATEST" | sort -V | tail -n1)" != "$VERSION" ]; then
+              latest=false
+              echo "npm latest is now ${NPM_LATEST}, newer than ${VERSION}: this Release does not take Latest"
+            fi
+          fi
           set +e
           python3 scripts/changelog-section.py "$TAG" > "$RUNNER_TEMP/relnotes.md"
           code=$?
