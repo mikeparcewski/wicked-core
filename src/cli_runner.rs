@@ -3656,29 +3656,28 @@ pub(crate) fn rejudge_seats(
     // (crew#972, two seats) As the rotation does ([`readmit_validator_author`]): with no judge left,
     // the pinned validator's author is re-admitted first, when it is a party for that alone.
     let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
-    let is_v = |k: &str| k == v || seat_key(k) == v;
     // (codex on #1525) The SAME guard the rotation applies (`readmit_validator_author` and its
-    // `validator_never`): no author, launch exclusion, work author or recorded binary is the
-    // validator seat, by key or by the identity it launches; every author binary is known; and the
-    // validator seat is not a team monitor of this step (that exclusion would stay).
-    let v_id = crate::validator::excluded_identity(v, roster);
-    let is_v_any = |k: &str| {
-        is_v(k)
-            || crate::validator::normalize_identity(k) == v_id
-            || crate::validator::excluded_identity(k, roster) == v_id
-    };
+    // `validator_never`, [`validator_author_built`]): no author, launch exclusion, work author,
+    // recorded binary or the unit's own launch is the validator seat, by key or by any identity it
+    // launches as; every author binary is known; and the validator seat is not a team monitor of
+    // this step (that exclusion would stay).
+    let monitors = unit_team_monitors(unit);
     let validator_only = pinned
-        && !is_v_any(&work_author)
-        && !unit
-            .authored_by
-            .iter()
-            .chain(&unit.exclude_seats)
-            .chain(work_authors)
-            .chain(&unit.authored_binaries)
-            .any(|a| is_v_any(a))
         && crate::pipeline::author_binaries_known(unit)
-        && author_binaries.is_some_and(|b| !b.iter().any(|a| is_v_any(a)))
-        && !unit_team_monitors(unit).iter().any(|m| is_v_any(m));
+        && author_binaries.is_some_and(|b| {
+            !validator_author_built(
+                unit,
+                &work_author,
+                unit.authored_by
+                    .iter()
+                    .chain(&unit.exclude_seats)
+                    .chain(work_authors)
+                    .chain(&unit.authored_binaries)
+                    .chain(b)
+                    .chain(&monitors),
+                roster,
+            )
+        });
     if preferred.is_empty() && validator_only {
         let without: Vec<(String, &'static str)> = parties
             .iter()
@@ -3912,6 +3911,56 @@ fn exclude_creators<'a>(
         "no eligible judge seat distinct from the work's creators [{}]",
         creators.join(", ")
     ))
+}
+
+/// (coord codex-check on #1525) Every identity the pinned validator's author seat launches as:
+/// its roster invocation read the way dispatch reads it (quote-aware, [`launched_identities`] with
+/// its registry carriers) and the way the judge pool reads it ([`crate::validator::excluded_identity`]),
+/// plus its key.
+fn validator_author_ids(roster: &[crate::AgenticCli]) -> Vec<String> {
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    let invocation = roster
+        .iter()
+        .find(|c| c.key == v)
+        .map(|c| c.headless_invocation.clone());
+    let mut ids = launched_identities(v, invocation);
+    for id in [
+        crate::validator::excluded_identity(v, roster),
+        crate::validator::normalize_identity(v),
+    ] {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// (crew#972, coord codex-check on #1525) Whether the pinned validator's author built `unit`'s
+/// work, so it may never judge it: one of `names` (seat keys, recorded author binaries, launch
+/// exclusions, monitors) is that seat by key or by any identity it launches as
+/// ([`validator_author_ids`]), or the unit's own launch is — `work_author` with the unit's frozen
+/// `assigned_invocation`, resolved as dispatch resolves it ([`launched_identities`]). A creator is
+/// excluded under every name it ran as.
+fn validator_author_built<'a>(
+    unit: &crate::domain::WorkUnit,
+    work_author: &str,
+    names: impl IntoIterator<Item = &'a String>,
+    roster: &[crate::AgenticCli],
+) -> bool {
+    use crate::team::runner::seat_key;
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    let v_ids = validator_author_ids(roster);
+    let is_v = |k: &str| {
+        k == v
+            || seat_key(k) == v
+            || v_ids.contains(&crate::validator::normalize_identity(k))
+            || v_ids.contains(&crate::validator::excluded_identity(k, roster))
+    };
+    is_v(work_author)
+        || launched_identities(work_author, unit.assigned_invocation.clone())
+            .iter()
+            .any(|id| v_ids.contains(id))
+        || names.into_iter().any(|k| is_v(k))
 }
 
 /// (crew#972, two seats) GAP B keeps the agent judge distinct from the pinned validator's author
@@ -5782,17 +5831,12 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     .then(|| crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string()),
                 )
                 .collect();
-            // (codex on #1525) …by the validator seat's own invocation identity too: a recorded
-            // author binary (or author) that IS what the validator seat launches built the work.
+            // (codex on #1525) …by any identity the validator seat launches as too: a recorded
+            // author binary (or author) that IS what the validator seat launches built the work,
+            // and so did the unit's own launch when its frozen invocation runs that binary
+            // (coord codex-check on #1525: `assigned_cli = codex` launched as `claude -p`).
             let mut validator_never = validator_never;
-            let v_id = crate::validator::excluded_identity(
-                crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
-                roster,
-            );
-            if validator_never.iter().any(|k| {
-                crate::validator::normalize_identity(k) == v_id
-                    || crate::validator::excluded_identity(k, roster) == v_id
-            }) {
+            if validator_author_built(&input.unit, work_author, &validator_never, roster) {
                 validator_never.push(crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string());
             }
             validator_fallback = readmit_validator_author(
@@ -9132,6 +9176,69 @@ mod tests {
             eligible.is_empty(),
             "claude monitored the step: {eligible:?}"
         );
+        // (coord codex-check on #1525, W20) The unit was assigned to codex but its frozen launch
+        // invocation ran claude: claude built the work under codex's name, so it never judges it
+        // (main let nobody in; the fallback must not let claude in either).
+        let mut frozen = unit.clone();
+        frozen.assigned_invocation = Some("claude -p {PROMPT}".into());
+        assert!(validator_author_built(
+            &frozen,
+            "codex",
+            std::iter::empty(),
+            &roster
+        ));
+        let (eligible, _) = rejudge_seats(
+            &frozen,
+            &roster,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &roster,
+            &roster,
+        );
+        assert!(
+            eligible.is_empty(),
+            "claude ran this unit under codex's name: {eligible:?}"
+        );
+        // (core#1528 item 1, W10) A quoted wrapper path: dispatch records `claude-wrapper` for
+        // the validator seat's `"/opt/Seat Tools/claude-wrapper"`, and the guard reads it the same
+        // way, so an author that ran it keeps the validator seat out.
+        let quoted = vec![
+            seat("claude", "\"/opt/Seat Tools/claude-wrapper\" -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let mut ran_quoted = unit.clone();
+        ran_quoted.authored_by = vec!["codex".into()];
+        ran_quoted.authored_binaries = vec!["claude-wrapper".into(), "codex".into()];
+        assert!(validator_author_built(
+            &ran_quoted,
+            "codex",
+            &ran_quoted.authored_binaries,
+            &quoted
+        ));
+        let (eligible, _) = rejudge_seats(
+            &ran_quoted,
+            &quoted,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &quoted,
+            &quoted,
+        );
+        assert!(
+            eligible.is_empty(),
+            "an author ran the quoted wrapper: {eligible:?}"
+        );
+        // The plain two-seat case still re-admits it: codex launched as codex built nothing of
+        // claude's.
+        assert!(!validator_author_built(
+            &unit,
+            "codex",
+            std::iter::empty(),
+            &roster
+        ));
     }
 
     #[test]
