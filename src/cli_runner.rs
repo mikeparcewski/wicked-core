@@ -950,6 +950,7 @@ pub(crate) trait DisputeCouncil: Sync {
         &self,
         req: crate::decision::DecisionRequest,
         clis: Vec<crate::AgenticCli>,
+        size: usize,
         lock: HostCouncilLock,
         deadline: std::time::Instant,
     ) -> DisputeOutcome;
@@ -991,6 +992,7 @@ impl DisputeCouncil for ActorDisputeCouncil {
         &self,
         req: crate::decision::DecisionRequest,
         clis: Vec<crate::AgenticCli>,
+        size: usize,
         lock: HostCouncilLock,
         deadline: std::time::Instant,
     ) -> DisputeOutcome {
@@ -1000,6 +1002,7 @@ impl DisputeCouncil for ActorDisputeCouncil {
             .send(crate::command::Command::ConveneRuleCouncil {
                 req,
                 clis,
+                size,
                 deadline,
                 lock,
                 reply,
@@ -1276,6 +1279,46 @@ fn rule_council_candidates(
         .cloned()
         .collect();
     Ok(seats)
+}
+
+/// (crew#972, two seats) The ONE arbiter of a dispute no three-seat council can sit for, with its
+/// footing for the record: the first seat distinct from every party (`candidates`), else the rule
+/// judge's own seat (`judge`, a registry record) when it is none of the work's creators, authors
+/// or launch-excluded seats — it then reads the reviewer's argument beside its own. `None`: no
+/// arbiter (the hold stands).
+fn dispute_arbiter(
+    candidates: &[crate::AgenticCli],
+    judge: Option<&str>,
+    creators: &[String],
+    authored_by: &[String],
+    exclude_seats: &[String],
+    registry: &[crate::AgenticCli],
+) -> Option<(crate::AgenticCli, String)> {
+    use wicked_apps_core::spawn::seat_cli_key;
+    if let Some(c) = candidates.first() {
+        return Some((c.clone(), format!("{} (distinct from every party)", c.key)));
+    }
+    let judge = judge?;
+    let party = |k: &str| k == judge || seat_cli_key(k) == seat_cli_key(judge);
+    if creators
+        .iter()
+        .chain(authored_by)
+        .chain(exclude_seats)
+        .any(|k| party(k))
+    {
+        return None;
+    }
+    let seat = registry
+        .iter()
+        .find(|c| c.key == judge && c.enabled_for_council)?;
+    Some((
+        seat.clone(),
+        format!(
+            "{} (it judged the rule; no seat distinct from every party, and it built none of the \
+             work)",
+            seat.key
+        ),
+    ))
 }
 
 /// (core#1379) A POL-2101 record part that is not settled, in words.
@@ -1604,16 +1647,30 @@ fn settle_rule_disputes(
             report.rows[i] = hold("error: the rule is no longer in force as it was judged".into());
             continue;
         };
-        let seats = match (candidates, too_few) {
+        // (crew#972, two seats) Too few seats for a council: ONE arbiter settles it instead of a
+        // hold. A seat distinct from every party first; else the rule judge's own seat, which read
+        // the reviewer's argument only now, when it built none of the work. A creator never
+        // arbitrates; with neither, the hold stands.
+        let (seats, size, arbiter) = match (candidates, too_few) {
             (Err(why), _) => {
                 report.rows[i] = hold(why);
                 continue;
             }
-            (Ok(_), Some((why, eligible))) => {
-                report.rows[i] = hold_with(why, eligible);
-                continue;
-            }
-            (Ok(s), None) => s,
+            (Ok(s), Some((why, eligible))) => match dispute_arbiter(
+                &s,
+                row.judge.as_deref(),
+                creators,
+                &input.unit.authored_by,
+                &input.unit.exclude_seats,
+                registry,
+            ) {
+                Some((seat, footing)) => (vec![seat], 1, Some(footing)),
+                None => {
+                    report.rows[i] = hold_with(why, eligible);
+                    continue;
+                }
+            },
+            (Ok(s), None) => (s, crate::decision::RULE_COUNCIL_SIZE, None),
         };
         // One absolute deadline from here: the host slot is taken on THIS thread (the unit's own
         // worker) before any council thread or envelope copy exists.
@@ -1685,13 +1742,19 @@ fn settle_rule_disputes(
         report.councils += 1;
         let outcome = with_floor_heartbeat(
             emit_delta,
-            &format!(
-                "rule council: settling {} ({} seats)",
-                row.rule_id,
-                crate::decision::RULE_COUNCIL_SIZE
-            ),
+            &match &arbiter {
+                Some(a) => format!(
+                    "rule dispute: settling {} with one arbiter: {a}",
+                    row.rule_id
+                ),
+                None => format!(
+                    "rule council: settling {} ({} seats)",
+                    row.rule_id,
+                    crate::decision::RULE_COUNCIL_SIZE
+                ),
+            },
             Duration::from_secs(60),
-            || ctx.council.convene(req, seats, lock, deadline),
+            || ctx.council.convene(req, seats, size, lock, deadline),
         );
         // The rule's own words an N/A must quote: its statement and criteria, never the header
         // the engine writes around them (`RULE <id> (<severity>, …)`).
@@ -1703,6 +1766,7 @@ fn settle_rule_disputes(
                 .as_ref()
                 .is_some_and(|m| crate::rule_check::council_established(rule, m)),
             instructions,
+            arbiter: arbiter.is_some(),
         };
         report.rows[i] = match outcome {
             DisputeOutcome::Ruled(mut v) => {
@@ -1715,7 +1779,11 @@ fn settle_rule_disputes(
                 {
                     r.push_str(&format!("; the parties: {parties}"));
                 }
-                crate::rule_check::settle(&row, pos.clone(), &v, &bars)
+                let mut settled = crate::rule_check::settle(&row, pos.clone(), &v, &bars);
+                if let (Some(a), Some(c)) = (&arbiter, settled.council.as_mut()) {
+                    c.arbiter = Some(a.clone());
+                }
+                settled
             }
             DisputeOutcome::TimedOut => hold(format!(
                 "timeout: the council gave no answer within {} s",

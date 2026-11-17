@@ -3304,6 +3304,7 @@ pub(crate) fn run(
             Command::ConveneRuleCouncil {
                 req,
                 clis,
+                size,
                 deadline,
                 lock,
                 reply,
@@ -3336,6 +3337,7 @@ pub(crate) fn run(
                             crate::decision::DecisionFrame::Dispute {
                                 deadline,
                                 prompt_budget: crate::rule_check::PROMPT_BUDGET,
+                                size,
                             },
                         )
                         .map(|mut v| {

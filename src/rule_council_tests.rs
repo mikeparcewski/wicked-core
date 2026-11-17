@@ -71,6 +71,7 @@ fn bars<'a>(established: bool, instructions: Option<&'a str>) -> VoteBars<'a> {
         rule_text: "add() takes typed numbers when it is a public API\n",
         established,
         instructions,
+        arbiter: false,
     }
 }
 

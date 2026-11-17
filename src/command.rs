@@ -455,6 +455,8 @@ pub(crate) enum Command {
     ConveneRuleCouncil {
         req: crate::decision::DecisionRequest,
         clis: Vec<wicked_council::AgenticCli>,
+        /// (crew#972) Seats to sit: a council's three, or one arbiter.
+        size: usize,
         deadline: std::time::Instant,
         lock: crate::cli_runner::HostCouncilLock,
         reply: std::sync::mpsc::Sender<anyhow::Result<crate::decision::DecisionVerdict>>,
