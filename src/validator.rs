@@ -2273,32 +2273,43 @@ pub(crate) fn invocation_identities(invocation: &str) -> Vec<String> {
 }
 
 /// The file `bin` launches: itself when it names a path, else the first `PATH` entry holding an
-/// EXECUTABLE file of that name (with `.exe` too on Windows) — the one the launcher's own lookup
-/// takes; a non-executable file earlier on `PATH` is skipped as it skips it.
+/// EXECUTABLE file of that name (`name.exe` on Windows when it has no extension) — the one the
+/// launcher's own lookup takes; a file it cannot execute earlier on `PATH` is skipped as it skips
+/// it. Not found: no executable identity (the name still is one).
 fn resolve_executable(bin: &str) -> Option<std::path::PathBuf> {
     if bin.is_empty() {
         return None;
     }
+    // (codex review r2) Executable for THIS process, as the launcher's exec decides: access(2)
+    // with X_OK (owner/group/other bits and ACLs), not any execute bit.
     let runnable = |c: &std::path::Path| -> bool {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::metadata(c).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            use std::os::unix::ffi::OsStrExt;
+            let Ok(path) = std::ffi::CString::new(c.as_os_str().as_bytes()) else {
+                return false;
+            };
+            c.is_file() && unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0
         }
         #[cfg(not(unix))]
         {
             c.is_file()
         }
     };
-    let p = std::path::Path::new(bin);
-    if bin.contains(['/', '\\']) {
-        return runnable(p).then(|| p.to_path_buf());
-    }
-    let names: Vec<String> = if cfg!(windows) {
-        vec![bin.to_string(), format!("{bin}.exe")]
-    } else {
-        vec![bin.to_string()]
+    // (codex review r2) On Windows the launcher appends `.exe` to a program with no extension
+    // and never runs the extensionless file: so is it read here.
+    let exe = |b: &str| -> String {
+        if cfg!(windows) && std::path::Path::new(b).extension().is_none() {
+            format!("{b}.exe")
+        } else {
+            b.to_string()
+        }
     };
+    if bin.contains(['/', '\\']) {
+        let p = std::path::PathBuf::from(exe(bin));
+        return runnable(&p).then_some(p);
+    }
+    let names: Vec<String> = vec![exe(bin)];
     std::env::split_paths(&std::env::var_os("PATH")?)
         .flat_map(|d| names.iter().map(move |n| d.join(n)).collect::<Vec<_>>())
         .find(|c| runnable(c))
@@ -7611,5 +7622,27 @@ mod budget_tests {
             Ok("READY")
         );
         assert_eq!(*probe.seen.lock().unwrap(), vec![Some(REPROBE_BUDGET_SECS)]);
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_lookup_tests {
+    /// (codex review r2 on core#1525) The launcher appends `.exe` to a program with no extension
+    /// and never runs the extensionless file beside it: identity reads the same file.
+    #[test]
+    fn a_program_without_extension_is_its_exe() {
+        let dir = std::env::temp_dir().join(format!("wcore-winexe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("tool"), "shadow").unwrap();
+        std::fs::write(dir.join("tool.exe"), "real").unwrap();
+        let inv = format!("\"{}\" -p {{PROMPT}}", dir.join("tool").display());
+        let ids = super::invocation_identities(&inv);
+        let real = std::fs::canonicalize(dir.join("tool.exe")).unwrap();
+        assert!(
+            ids.contains(&real.to_string_lossy().into_owned()),
+            "{ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

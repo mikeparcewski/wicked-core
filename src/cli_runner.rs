@@ -3926,32 +3926,26 @@ fn exclude_creators<'a>(
     ))
 }
 
-/// (coord codex-check on #1525) Every identity the pinned validator's author seat launches as:
-/// its roster invocation read the way dispatch reads it (quote-aware, [`launched_identities`] with
-/// its registry carriers) and the way the judge pool reads it ([`crate::validator::excluded_identity`]),
-/// plus its key.
-fn validator_author_ids(roster: &[crate::AgenticCli]) -> Vec<String> {
+/// The NAMES the pinned validator's author seat runs as (its launch and its own record's
+/// carriers, quote-aware; no executable path, no alias): what a recorded history is compared with.
+fn validator_author_names(roster: &[crate::AgenticCli]) -> Vec<String> {
     let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
     let invocation = roster
         .iter()
         .find(|c| c.key == v)
         .map(|c| c.headless_invocation.clone());
-    let mut ids = launched_identities(v, invocation);
-    for id in crate::validator::excluded_identities(v, roster)
-        .into_iter()
-        .chain([crate::validator::normalize_identity(v)])
-    {
-        if !ids.contains(&id) {
-            ids.push(id);
-        }
+    let mut ids = own_launch_identities(v, invocation, &full_registry());
+    if let Some(c) = roster.iter().find(|c| c.key == v) {
+        ids.extend(record_identities(c));
     }
+    ids.push(crate::validator::normalize_identity(v));
     ids
 }
 
 /// (crew#972, coord codex-check on #1525) Whether the pinned validator's author built `unit`'s
 /// work, so it may never judge it: one of `names` (seat keys, recorded author binaries, launch
 /// exclusions, monitors) is that seat by key or by any identity it launches as
-/// ([`validator_author_ids`]), or the unit's own launch is — `work_author` with the unit's frozen
+/// ([`validator_author_names`]), or the unit's own launch is — `work_author` with the unit's frozen
 /// `assigned_invocation`, resolved as dispatch resolves it ([`launched_identities`]). A creator is
 /// excluded under every name it ran as.
 fn validator_author_built<'a>(
@@ -3962,19 +3956,23 @@ fn validator_author_built<'a>(
 ) -> bool {
     use crate::team::runner::seat_key;
     let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
-    let v_ids = validator_author_ids(roster);
+    // (codex review r2 on #1525) The history is read as dispatch recorded it: a recorded name or
+    // seat ID is compared by NAME with the names the validator seat runs as, never re-resolved
+    // through today's filesystem (a symlink retargeted since would rewrite who built the work).
+    // Aliases the launch ran as were recorded then, by seat ID and name.
+    let v_names = validator_author_names(roster);
     let is_v = |k: &str| {
         k == v
             || seat_key(k) == v
-            || crate::validator::same_identity(
-                &crate::validator::excluded_identities(k, roster),
-                &v_ids,
-            )
+            || v_names.contains(&crate::validator::normalize_identity(k))
+            // A seat key runs what its record names (`claude-sonnet` running `claude`).
+            || roster
+                .iter()
+                .find(|c| c.key == k || c.key == seat_key(k))
+                .is_some_and(|c| record_identities(c).iter().any(|n| v_names.contains(n)))
     };
     is_v(work_author)
-        || launched_identities(work_author, unit.assigned_invocation.clone())
-            .iter()
-            .any(|id| v_ids.contains(id))
+        || unit_launched_seats(unit, roster).iter().any(|k| is_v(k))
         || names.into_iter().any(|k| is_v(k))
 }
 
@@ -4248,11 +4246,15 @@ fn launched_identities_in(
     let mut out = own_launch_identities(key, invocation.clone(), registry);
     let ran = launch_tokens(key, invocation, registry);
     for c in registry {
-        if c.key != key && crate::validator::same_identity(&seat_tokens(c), &ran) {
-            for id in record_identities(c) {
-                if !out.contains(&id) {
-                    out.push(id);
-                }
+        // (codex review r2) Matched on the carrier that ran (its headless invocation: name and
+        // executable), and only that carrier's name is recorded — never the record's other
+        // carriers (`binary`, ACP adapter), which did not run.
+        if c.key != key
+            && crate::validator::same_identity(&crate::validator::seat_identities(c), &ran)
+        {
+            let id = invocation_identity(&c.headless_invocation);
+            if !out.contains(&id) {
+                out.push(id);
             }
         }
     }
@@ -9575,13 +9577,46 @@ mod tests {
                 seen.is_empty() && ready.is_empty(),
                 "claude ran it as cx: {seen:?}"
             );
-            // A non-executable file is not what a launch runs: no executable identity.
-            mode(&claude_bin, 0o644);
-            assert_eq!(
-                crate::validator::invocation_identities(&both[0].headless_invocation).len(),
-                1
-            );
+            // (codex review r2) A history is read as recorded: `cx` ran codex when it was
+            // recorded; retargeted to claude since, it does not make claude an author of it.
+            let mut was_codex = unit_on("codex", Some(&both[1].headless_invocation), &both);
+            was_codex.authored_by = vec!["codex".into(), "cx".into()];
+            was_codex.authored_binaries = vec!["codex".into(), "cx".into()];
+            assert!(!validator_author_built(
+                &was_codex,
+                "codex",
+                was_codex
+                    .authored_by
+                    .iter()
+                    .chain(&was_codex.authored_binaries),
+                &both
+            ));
+            // A file this process cannot execute is not what a launch runs: no executable
+            // identity — no execute bit, or only another class's (`0641` on our own file).
+            for m in [0o644, 0o641] {
+                mode(&claude_bin, m);
+                assert_eq!(
+                    crate::validator::invocation_identities(&both[0].headless_invocation).len(),
+                    1,
+                    "{m:o}"
+                );
+            }
         }
+        // (codex review r2) A record matched on the carrier that ran (its headless codex) does not
+        // import its other carriers: a `binary = claude` on that record never makes a codex launch
+        // claude's.
+        let mut odd = seat("codex-alt", "codex exec {PROMPT}");
+        odd.binary = "claude".into();
+        let odd_roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            odd,
+        ];
+        let inv = Some("codex exec {PROMPT}".to_string());
+        assert!(
+            !launched_identities_in("codex", inv.clone(), &odd_roster).contains(&"claude".into())
+        );
+        assert!(!launched_seat_ids("codex", inv, &odd_roster).contains(&"claude".into()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
