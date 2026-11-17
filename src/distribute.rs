@@ -2944,7 +2944,17 @@ mod tests {
                 .expect("typed"),
         );
         assert_eq!(t.benched, l.benched);
-        assert_eq!(t.benched_seats, l.benched_seats);
+        // (core#1479) A sign-in bench is stamped with its re-probe time at the launch: two launches
+        // a millisecond apart differ only there.
+        let unstamped = |b: &[crate::domain::BenchedSeat]| {
+            b.iter()
+                .map(|s| crate::domain::BenchedSeat {
+                    benched_until: None,
+                    ..s.clone()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(unstamped(&t.benched_seats), unstamped(&l.benched_seats));
         assert_eq!(
             t.benched,
             "evaluator\u{2260}creator unsatisfiable for unit(s) [2]: distinct seat(s) benched; \
