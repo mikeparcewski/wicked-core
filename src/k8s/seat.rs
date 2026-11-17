@@ -1477,7 +1477,8 @@ pub(crate) fn transient_create_error(msg: &str) -> bool {
 
 /// (core#1491) What a pod that did not become ready looks like, for the failure's message (pure):
 /// its phase, every condition that is not True (type, reason, message), and its last `n` events
-/// (reason: message), newest last. Evidence that outlives the run's namespace.
+/// (reason: message), newest last, with how many earlier ones are not shown. Evidence that
+/// outlives the run's namespace.
 pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usize) -> String {
     let mut out = Vec::new();
     match pod {
@@ -1544,7 +1545,14 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
         })
         .collect();
     if !last.is_empty() {
-        out.push(format!("last events: {}", last.join(" | ")));
+        // (lane-c2, HIDE) Never a silent cut: the count left out is said.
+        let earlier = items.len().saturating_sub(last.len());
+        let note = if earlier > 0 {
+            format!(" ({earlier} earlier event(s) not shown)")
+        } else {
+            String::new()
+        };
+        out.push(format!("last events{note}: {}", last.join(" | ")));
     }
     out.join("; ")
 }

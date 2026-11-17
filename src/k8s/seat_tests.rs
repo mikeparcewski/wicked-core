@@ -4218,6 +4218,7 @@ fn k8s_left_out_paths_are_exact_and_their_host_links_are_checked() {
     let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
     assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&replica);
+}
 
 /// (core#1491) A container runtime that timed out (or said nothing) under load is transient: the pod
 /// waits for the arm's deadline. Any other create error is still the cluster's refusal, never
@@ -4292,7 +4293,8 @@ fn a_not_ready_pods_diagnosis_names_phase_conditions_and_last_events() {
     );
     assert!(
         d.ends_with(
-            "last events: Pulled: image present | Failed: Error: context deadline exceeded"
+            "last events (1 earlier event(s) not shown): Pulled: image present | Failed: Error: \
+             context deadline exceeded"
         ),
         "{d}"
     );
@@ -4381,5 +4383,14 @@ fn the_diagnosis_takes_the_most_recent_events() {
         {"reason": "Middle", "message": "m", "lastTimestamp": "2026-11-17T02:00:00Z"}
     ]});
     let d = seat::pod_diagnosis(None, Some(&events), 2);
-    assert!(d.ends_with("last events: Middle: m | Newest: n"), "{d}");
+    // (lane-c2, HIDE) The event left out is counted, never silently cut.
+    assert!(
+        d.ends_with("last events (1 earlier event(s) not shown): Middle: m | Newest: n"),
+        "{d}"
+    );
+    let all = seat::pod_diagnosis(None, Some(&events), 5);
+    assert!(
+        all.ends_with("last events: Old: o | Middle: m | Newest: n"),
+        "{all}"
+    );
 }
