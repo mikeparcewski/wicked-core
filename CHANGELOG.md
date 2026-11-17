@@ -36,7 +36,13 @@ Two release tracks share this file, newest entry first regardless of track:
   `## [core-ts X.Y.Z]` heading (also the combined `## [0.4.0] / [core-ts 0.4.1]`), drops link refs and scrubs home
   paths; exit 1 (no block) drafts a generic note, any other failure fails the job. Its tests run on CI's Linux leg.
   Earlier versions are not backfilled. A full re-run after a publish still fails at npm (core#1556).
-
+- **A seat's commits carry the operator's git identity, whatever the seat configures (core#1485).** Every seat
+  spawn now also sets `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` and `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` from the
+  operator's `user.name`/`user.email` (the same copy the seat-owned git config already carries, read from the seat's
+  worktree). git ranks this environment above every config source, so a seat that sets its own identity with
+  `git -c user.name=…` or in the worktree's `.git/config`, or a pod whose copied config did not arrive, no longer
+  commits as itself (wicked-studio#1151 was delivered with four `pi <pi@local>` commits). It reaches Kubernetes seat
+  pods through the existing unit-env hand-off. An operator with no git identity gets nothing set, as before.
 - **The engine owns the QE evidence dir, and a QE binding miss re-runs QE (core#1484, crew#1554).**
   Before the QE executor turn the engine creates the attempt's QE run in the run's ledger (complete
   project, scenario and run rows, `config.json` when absent, the `evidence/<uuid>` dir) and the
