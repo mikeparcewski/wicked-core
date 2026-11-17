@@ -379,6 +379,11 @@ pub struct RuleCheckReport {
     /// the run's budget, [`RUN_COUNCILS`], whatever it ruled).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub councils: u32,
+    /// (core#1474) How many parts the change needs at the full evidence budget when it is too big
+    /// for one call (each batch of rules is asked once per part, at most [`MAX_PARTS`]); absent
+    /// when it fits one call.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parts: u32,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -1285,6 +1290,20 @@ pub const MAX_PARTS: usize = 8;
 /// the repeated headers, is `diff`.
 pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
     let cap = cap.max(1);
+    // The header a later part repeats: the file's whole header when it is small, else one short
+    // line naming the file (codex on #1514 v2: a long header must never crowd out the change).
+    let repeat = |h: &str| -> String {
+        if h.len() <= cap / 4 {
+            h.to_string()
+        } else {
+            let first = h.lines().next().unwrap_or("");
+            let mut end = first.len().min(cap / 8);
+            while !first.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("[continued: {}]\n", &first[..end])
+        }
+    };
     // Units: (header to repeat, text). A file's header is its lines before the first `@@`.
     let mut units: Vec<(String, String)> = Vec::new();
     let mut header = String::new();
@@ -1296,7 +1315,7 @@ pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
             units.push((String::new(), line.to_string()));
         } else if line.starts_with("@@") {
             in_header = false;
-            units.push((header.clone(), line.to_string()));
+            units.push((repeat(&header), line.to_string()));
         } else {
             if in_header {
                 header.push_str(line);
@@ -1345,8 +1364,7 @@ fn part_note(k: usize, n: usize) -> String {
 /// (core#1474) The answers of one batch's parts, combined per rule: BROKEN if any part broke it
 /// (its cite names the part); else the first miss, a holding miss first (no answer); else WAIVED if
 /// any part waived it; else KEPT if any part kept it; else the first part's answer (N/A).
-fn combine_parts(parts: &[Parsed], ids: &[&str]) -> Parsed {
-    let n = parts.len();
+fn combine_parts(parts: &[Parsed], ids: &[&str], n: usize) -> Parsed {
     let mut out = Parsed::default();
     for id in ids {
         let answers: Vec<(usize, &Answer)> = parts
@@ -3460,6 +3478,11 @@ pub fn check(
 
     let mut report = RuleCheckReport {
         seats: input.seats.to_vec(),
+        parts: if input.change.diff.len() > EVIDENCE_CAP && input.stage == CheckStage::Review {
+            u32::try_from(diff_parts(&input.change.diff, EVIDENCE_CAP).len()).unwrap_or(u32::MAX)
+        } else {
+            0
+        },
         ..Default::default()
     };
     // (S3) The machine check runs beside the judge batches; one base run answers every rule that
@@ -4148,49 +4171,69 @@ fn run_pool(
                 // read the whole change. A part it cannot answer ends the batch like a timeout:
                 // its rules are asked again alone on another seat.
                 let mut later: Vec<String> = Vec::new();
-                if let (Some((seat, _)), true) = (&got, total_parts > 1) {
+                // (codex on #1514 v2) A part that could not be answered after earlier parts were:
+                // what they found that holds (a BROKEN, a holding miss) is kept, marked cut (the
+                // whole change was not read); with nothing holding, the batch is retried elsewhere.
+                let mut unread_from: Option<usize> = None;
+                if let (Some((seat, first)), true) = (&got, total_parts > 1) {
+                    let bar: &[&str] = &paths;
+                    let holds_any = |outs: &[&String]| {
+                        outs.iter().any(|o| {
+                            let p = parse_rule_answers(o, &ids, &nonce, bar, input.instructions);
+                            p.answers.values().any(|a| a.status == RuleStatus::Broken)
+                                || p.misses.values().any(Miss::holds)
+                        })
+                    };
                     for k in 1..total_parts.min(MAX_PARTS) {
-                        if pool.stopped() {
-                            got = None;
-                            break;
-                        }
-                        pool.calls
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        match judge.ask(seat, &part_text(k)) {
-                            JudgeAnswer::Answered(out) => later.push(out),
-                            other => {
-                                let stopped = matches!(other, JudgeAnswer::Stopped(_));
-                                let w = match other {
-                                    JudgeAnswer::SeatFailed(w)
-                                    | JudgeAnswer::TimedOut(w)
-                                    | JudgeAnswer::Stopped(w) => w,
-                                    JudgeAnswer::Answered(_) => String::new(),
-                                };
-                                if stopped {
-                                    pool.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                                } else {
-                                    let mut l = left.lock().unwrap();
-                                    for i in &batch {
-                                        l.insert(
-                                            *i,
-                                            Retry {
-                                                avoid: seat.clone(),
-                                                told: format!(
-                                                    "the judge first asked did not answer part \
-                                                     {} of {total_parts} of the change",
-                                                    k + 1
-                                                ),
-                                                holds: false,
-                                            },
-                                        );
-                                    }
-                                }
-                                failures
-                                    .push(format!("{seat}: part {} of {total_parts}: {w}", k + 1));
-                                got = None;
-                                break;
+                        let dead = pool.dead.lock().unwrap().contains(seat);
+                        let answer = if pool.stopped() || dead {
+                            None
+                        } else {
+                            pool.calls
+                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            Some(judge.ask(seat, &part_text(k)))
+                        };
+                        let w = match answer {
+                            Some(JudgeAnswer::Answered(out)) => {
+                                later.push(out);
+                                continue;
                             }
+                            Some(JudgeAnswer::SeatFailed(w)) => {
+                                pool.dead.lock().unwrap().insert(seat.clone());
+                                w
+                            }
+                            Some(JudgeAnswer::Stopped(w)) => {
+                                pool.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                                w
+                            }
+                            Some(JudgeAnswer::TimedOut(w)) => w,
+                            None => "the check stopped, or the seat failed elsewhere".into(),
+                        };
+                        failures.push(format!("{seat}: part {} of {total_parts}: {w}", k + 1));
+                        let read: Vec<&String> = std::iter::once(first).chain(&later).collect();
+                        if holds_any(&read) {
+                            unread_from = Some(k);
+                        } else {
+                            if !pool.stopped() {
+                                let mut l = left.lock().unwrap();
+                                for i in &batch {
+                                    l.insert(
+                                        *i,
+                                        Retry {
+                                            avoid: seat.clone(),
+                                            told: format!(
+                                                "the judge first asked did not answer part {} \
+                                                 of {total_parts} of the change",
+                                                k + 1
+                                            ),
+                                            holds: false,
+                                        },
+                                    );
+                                }
+                            }
+                            got = None;
                         }
+                        break;
                     }
                 }
                 match got {
@@ -4211,7 +4254,7 @@ fn run_pool(
                             each.extend(later.iter().map(|o| {
                                 parse_rule_answers(o, &ids, &nonce, bar, input.instructions)
                             }));
-                            combine_parts(&each, &ids)
+                            combine_parts(&each, &ids, total_parts)
                         } else {
                             parse_rule_answers(&out, &ids, &nonce, bar, input.instructions)
                         };
@@ -4221,6 +4264,7 @@ fn run_pool(
                         // a part's own prompt still had to cut a single huge line.
                         let cut = subject == EvidenceSubject::Change
                             && (total_parts > MAX_PARTS
+                                || unread_from.is_some()
                                 || (total_parts == 0 && prompt_was_cut(&text, &nonce))
                                 || (0..total_parts.min(MAX_PARTS))
                                     .any(|k| prompt_was_cut(&part_text(k), &nonce)));
