@@ -4694,8 +4694,10 @@ fn carried_skip(report: &RuleCheckReport, reason: &str) -> RuleSkip {
 }
 
 /// (core#1493) The tiny-math repro: the person skips a rule with a reason at Challenge, and the
-/// same rule on the same change, checks and facts does not come back at Test or Review — though
-/// the later steps' evidence key differs (the person's ruling rides the instructions).
+/// same rule on the same change, checks and facts does not come back at Test or Review — even
+/// when the later step's evidence key differs (this fixture changes the instructions text to show
+/// the carry key ignores it; in production a skip adds no ruling, and a newer ruling stops the
+/// carry by the rulings revision: `actor::carried_skip_tests`).
 #[test]
 fn core_1493_a_skip_carries_to_later_steps_on_the_same_evidence() {
     let rules = [rule("R1", "no duplicated built-in")];

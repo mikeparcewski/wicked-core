@@ -401,8 +401,9 @@ pub struct RuleCheckReport {
     pub parts: u32,
     /// (core#1493) Per rule id, what a skip given on this check must find unchanged to carry to a
     /// later step: a digest of the change's exact bytes, the floor's result, the match facts and
-    /// the rule's own match result — everything the judge reads but the person's instructions
-    /// (which a skip itself changes). Review stage only.
+    /// the rule's own match result — everything the judge reads but the person's instructions,
+    /// which the caller checks instead by their revision (`RuleSkip::rulings_rev`). Review stage
+    /// only.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub carry_keys: BTreeMap<String, String>,
 }
