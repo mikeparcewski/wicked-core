@@ -3,6 +3,7 @@
 //! Each names its PARITY row.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde_json::json;
 use wicked_apps_core::HardenedCommand as _;
@@ -4217,4 +4218,121 @@ fn k8s_left_out_paths_are_exact_and_their_host_links_are_checked() {
     let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
     assert!(sync::take_skipped(&mut roots[0]).unwrap().is_empty());
     let _ = std::fs::remove_dir_all(&replica);
+
+/// (core#1491) A container runtime that timed out (or said nothing) under load is transient: the pod
+/// waits for the arm's deadline. Any other create error is still the cluster's refusal, never
+/// message-less.
+#[test]
+fn a_create_timeout_under_load_waits_and_other_create_errors_are_refused() {
+    let waiting = |reason: &str, message: &str| {
+        let mut p = pod("seat-1-abc", "u1", "Pending", false);
+        p["status"]["containerStatuses"][0]["state"] =
+            json!({"waiting": {"reason": reason, "message": message}});
+        p
+    };
+    for (reason, msg) in [
+        ("CreateContainerError", "context deadline exceeded"),
+        (
+            "RunContainerError",
+            "rpc error: code = DeadlineExceeded desc = timed out",
+        ),
+        ("CreateContainerError", ""),
+    ] {
+        assert_eq!(
+            seat::pod_state(&waiting(reason, msg), "seat-1-abc", "u1"),
+            PodState::Waiting,
+            "{reason}: {msg}"
+        );
+    }
+    assert_eq!(
+        seat::pod_state(
+            &waiting("CreateContainerError", "mount denied by policy"),
+            "seat-1-abc",
+            "u1"
+        ),
+        PodState::Failed(FloorUnarmed::PolicyRefused, "mount denied by policy".into())
+    );
+    assert_eq!(
+        seat::pod_state(
+            &waiting("CreateContainerConfigError", ""),
+            "seat-1-abc",
+            "u1"
+        ),
+        PodState::Failed(
+            FloorUnarmed::PolicyRefused,
+            "CreateContainerConfigError".into()
+        ),
+        "a config error is never transient, and never message-less"
+    );
+}
+
+/// (core#1491) The evidence a not-ready pod leaves: its phase, the conditions that are not True,
+/// and its last events.
+#[test]
+fn a_not_ready_pods_diagnosis_names_phase_conditions_and_last_events() {
+    let mut p = pod("seat-1-abc", "u1", "Pending", false);
+    p["status"]["conditions"] = json!([
+        {"type": "PodScheduled", "status": "True"},
+        {"type": "ContainersReady", "status": "False", "reason": "ContainersNotReady", "message": "containers with unready status: [seat]"}
+    ]);
+    let events = json!({"items": [
+        {"reason": "Scheduled", "message": "assigned to node"},
+        {"reason": "Pulled", "message": "image present"},
+        {"reason": "Failed", "message": "Error: context deadline exceeded"}
+    ]});
+    let d = seat::pod_diagnosis(Some(&p), Some(&events), 2);
+    assert!(d.starts_with("phase Pending"), "{d}");
+    assert!(
+        d.contains("ContainersReady ContainersNotReady containers with unready status"),
+        "{d}"
+    );
+    assert!(
+        !d.contains("PodScheduled"),
+        "a True condition is not news: {d}"
+    );
+    assert!(
+        d.ends_with(
+            "last events: Pulled: image present | Failed: Error: context deadline exceeded"
+        ),
+        "{d}"
+    );
+    assert_eq!(seat::pod_diagnosis(None, None, 5), "no pod was created");
+}
+
+/// (core#1491) An arm whose pod was not ready is retried after each backoff, then reports how many
+/// arms were tried; a policy refusal is never retried.
+#[test]
+fn a_not_ready_arm_is_retried_with_the_backoff_and_a_refusal_is_not() {
+    use std::cell::RefCell;
+    let slept = RefCell::new(Vec::new());
+    let sleep = |d: Duration| slept.borrow_mut().push(d);
+    let tries = RefCell::new(0);
+    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &sleep, || {
+        *tries.borrow_mut() += 1;
+        Err((FloorUnarmed::PodNotReady, "not ready".into()))
+    });
+    let (why, msg) = r.unwrap_err();
+    assert_eq!((why, *tries.borrow()), (FloorUnarmed::PodNotReady, 3));
+    assert!(msg.contains("after 3 arm attempts"), "{msg}");
+    assert_eq!(*slept.borrow(), seat::ARM_RETRY_BACKOFF.to_vec());
+    // Ready on the second try: no further arm.
+    *tries.borrow_mut() = 0;
+    let r = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, || {
+        *tries.borrow_mut() += 1;
+        if *tries.borrow() == 1 {
+            Err((FloorUnarmed::AdmissionPending, "held".into()))
+        } else {
+            Ok(7)
+        }
+    });
+    assert_eq!((r.unwrap(), *tries.borrow()), (7, 2));
+    *tries.borrow_mut() = 0;
+    let r: Result<(), _> = seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, || {
+        *tries.borrow_mut() += 1;
+        Err((FloorUnarmed::PolicyRefused, "forbidden".into()))
+    });
+    assert_eq!(
+        (r.unwrap_err().0, *tries.borrow()),
+        (FloorUnarmed::PolicyRefused, 1)
+    );
 }

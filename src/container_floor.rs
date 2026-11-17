@@ -2581,7 +2581,13 @@ pub(crate) fn arm_noting(
         role,
         deps: deps.as_deref(),
     };
-    let (seat, wrapper) = crate::k8s::seat::arm(&kube, &arm_spec, landrun)?;
+    // (core#1491) A pod that did not become ready (or was held for the node) is retried after a
+    // backoff, each time a fresh Sandbox; any other refusal is final.
+    let (seat, wrapper) = crate::k8s::seat::retry_arm(
+        &crate::k8s::seat::ARM_RETRY_BACKOFF,
+        &std::thread::sleep,
+        || crate::k8s::seat::arm(&kube, &arm_spec, landrun.clone()),
+    )?;
     // The gate hook judges this unit as a pod seat's (B17).
     let mut env = env;
     env.push((crate::gate_hook::SEAT_POD_ENV.to_string(), "1".to_string()));

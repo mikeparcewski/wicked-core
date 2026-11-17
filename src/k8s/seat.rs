@@ -1410,7 +1410,13 @@ pub(crate) fn pod_state(pod: &Value, sandbox: &str, unit: &str) -> PodState {
             let msg = c
                 .pointer("/state/waiting/message")
                 .and_then(Value::as_str)
-                .unwrap_or(reason);
+                .unwrap_or("");
+            // (core#1491) A container runtime that timed out (or said nothing) under load is
+            // transient: the kubelet retries it, and the arm's deadline decides.
+            if reason != "CreateContainerConfigError" && transient_create_error(msg) {
+                continue;
+            }
+            let msg = if msg.trim().is_empty() { reason } else { msg };
             return PodState::Failed(FloorUnarmed::PolicyRefused, msg.to_string());
         }
         if let Some(code) = c
@@ -1441,6 +1447,108 @@ pub(crate) fn pod_state(pod: &Value, sandbox: &str, unit: &str) -> PodState {
         PodState::Ready
     } else {
         PodState::Waiting
+    }
+}
+
+/// (core#1491) A container create/run error that is the runtime timing out (or saying nothing)
+/// under load, not a refusal: `context deadline exceeded`, `DeadlineExceeded`, `timed out`, empty.
+pub(crate) fn transient_create_error(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    m.trim().is_empty()
+        || m.contains("context deadline exceeded")
+        || m.contains("deadlineexceeded")
+        || m.contains("timed out")
+        || m.contains("timeout")
+}
+
+/// (core#1491) What a pod that did not become ready looks like, for the failure's message (pure):
+/// its phase, every condition that is not True (type, reason, message), and its last `n` events
+/// (reason: message), newest last. Evidence that outlives the run's namespace.
+pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usize) -> String {
+    let mut out = Vec::new();
+    match pod {
+        None => out.push("no pod was created".to_string()),
+        Some(p) => {
+            out.push(format!(
+                "phase {}",
+                p.pointer("/status/phase")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown")
+            ));
+            for c in p
+                .pointer("/status/conditions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|c| c.get("status").and_then(Value::as_str) != Some("True"))
+            {
+                let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
+                out.push(
+                    format!("{} {} {}", field("type"), field("reason"), field("message"))
+                        .trim()
+                        .to_string(),
+                );
+            }
+        }
+    }
+    let items: Vec<&Value> = events
+        .and_then(|e| e.get("items"))
+        .and_then(Value::as_array)
+        .map(|v| v.iter().collect())
+        .unwrap_or_default();
+    let last: Vec<String> = items
+        .iter()
+        .rev()
+        .take(n)
+        .rev()
+        .map(|e| {
+            format!(
+                "{}: {}",
+                e.get("reason").and_then(Value::as_str).unwrap_or("?"),
+                e.get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+            )
+        })
+        .collect();
+    if !last.is_empty() {
+        out.push(format!("last events: {}", last.join(" | ")));
+    }
+    out.join("; ")
+}
+
+/// (core#1491) The backoff before each retry of an arm whose pod did not become ready.
+pub(crate) const ARM_RETRY_BACKOFF: [Duration; 2] =
+    [Duration::from_secs(10), Duration::from_secs(30)];
+
+/// (core#1491) Run `arm` again after each backoff while it fails as `pod_not_ready` or
+/// `admission_pending` (a slow or full node: waiting can help); any other result is final. The
+/// last failure says how many arms were tried.
+pub(crate) fn retry_arm<T>(
+    backoff: &[Duration],
+    sleep: &dyn Fn(Duration),
+    mut arm: impl FnMut() -> Result<T, (FloorUnarmed, String)>,
+) -> Result<T, (FloorUnarmed, String)> {
+    let mut tries = 0usize;
+    loop {
+        match arm() {
+            Err((why @ (FloorUnarmed::PodNotReady | FloorUnarmed::AdmissionPending), msg))
+                if tries < backoff.len() =>
+            {
+                eprintln!(
+                    "wicked-core: seat arm {} ({msg}); retrying in {:?}",
+                    why.as_str(),
+                    backoff[tries]
+                );
+                sleep(backoff[tries]);
+                tries += 1;
+            }
+            Err((why, msg)) if tries > 0 => {
+                return Err((why, format!("{msg} (after {} arm attempts)", tries + 1)))
+            }
+            other => return other,
+        }
     }
 }
 
@@ -1700,9 +1808,30 @@ pub(crate) fn arm(
         let pod = kube
             .get_json(Some(&ns), "pod", &sandbox)
             .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+        // (core#1491) The pod's phase, conditions and last events, read before the reap.
+        let diagnose = |pod: Option<&Value>| {
+            let events = kube
+                .call(
+                    Some(&ns),
+                    &[
+                        "get",
+                        "events",
+                        "--field-selector",
+                        &format!("involvedObject.name={sandbox}"),
+                        "-o",
+                        "json",
+                    ],
+                    None,
+                    Duration::from_secs(15),
+                )
+                .stdout;
+            let events: Option<Value> = serde_json::from_slice(&events).ok();
+            pod_diagnosis(pod, events.as_ref(), 5)
+        };
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
+                let msg = format!("{msg} ({})", diagnose(pod.as_ref()));
                 reap(&id);
                 return Err((why, msg));
             }
@@ -1714,10 +1843,15 @@ pub(crate) fn arm(
                 .ok()
                 .flatten()
                 .and_then(|sb| sandbox_refusal(&sb))
-                .unwrap_or((
-                    FloorUnarmed::AdmissionPending,
-                    format!("the seat pod {sandbox} did not start in {POD_START:?}"),
-                ));
+                .unwrap_or_else(|| {
+                    (
+                        FloorUnarmed::PodNotReady,
+                        format!(
+                            "the seat pod {sandbox} was not ready in {POD_START:?}: {}",
+                            diagnose(pod.as_ref())
+                        ),
+                    )
+                });
             reap(&id);
             return Err(why);
         }
