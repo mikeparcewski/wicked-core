@@ -854,15 +854,17 @@ export declare class Core {
   static floorCacheUsage(): Promise<string>
   /**
    * (crew#1493) The repository's own checks on a finished run's REBASED tree, before crew
-   * re-delivers its pull request: the verify floor the deliver re-verify runs (a clean checkout
-   * of the tree `workdir`'s `HEAD` holds, the run's Verify-stage floor, the dependency install
-   * forced), measured against `baseCommit` (a full commit id, an ancestor of `HEAD`: the base
-   * the branch was rebased onto; a failure the base shares does not deny). `workdir` is a
-   * worktree of the registered repository at `repoRoot`. Resolves to a JSON
-   * `{ head, tree, base, passed, report }` (`report` is the floor's `RepoChecksReport`, as
-   * `repoChecksEvaluated` carries it); rejects when the inputs do not name that shape. A floor
-   * that refuses (no OS write boundary, a short disk) resolves with `passed: false`. Runs for
-   * the floor's duration (minutes); writes nothing to the run's record.
+   * re-delivers its pull request: the verify floor the deliver re-verify runs, on a clean checkout
+   * of exactly the tree `workdir`'s `HEAD` commit holds (a container floor checks that tree, never
+   * a re-snapshot), held to it afterwards, measured against `baseCommit` (the full id of a commit
+   * object, an ancestor of `HEAD`: the base the branch was rebased onto; a failure the floor can
+   * attribute to that base is excluded, an inseparable one still denies). The full suite always
+   * runs, under the recheck's own floor id. `workdir` is a worktree of the registered repository at
+   * `repoRoot`. Resolves to a JSON `{ head, tree, base, passed, checksRun, report }` (`head` is the
+   * commit id to push, `report` the floor's `RepoChecksReport`); rejects when the inputs do not name
+   * that shape. `passed` is false when the floor refuses (no OS write boundary, a checkout that
+   * could not be made, a short disk) or ran no check but provisioning. Runs for the floor's
+   * duration (minutes); writes nothing to the run's record.
    */
   static checkRunTree(runId: string, workdir: string, repoRoot: string, baseCommit: string): Promise<string>
   /**
