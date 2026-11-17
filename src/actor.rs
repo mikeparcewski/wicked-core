@@ -3448,24 +3448,39 @@ pub(crate) fn run(
                                 )
                             });
                         // (core#1486) The unit executing now owns the message: never heard by
-                        // another unit dispatched after it.
-                        let for_ord = crate::domain::get_session(&store, &run_id)
-                            .ok()
-                            .flatten()
-                            .filter(|s| s.status == SessionStatus::Executing)
-                            .and_then(|s| {
-                                crate::domain::session_units(&store, &run_id)
-                                    .ok()?
-                                    .get(s.unit_ix)
-                                    .filter(|u| {
-                                        matches!(
-                                            u.status,
-                                            crate::domain::UnitStatus::Distributed
-                                                | crate::domain::UnitStatus::Pending
-                                        )
-                                    })
-                                    .map(|u| u.ord)
-                            });
+                        // another unit dispatched after it. Owned only when the message is for that
+                        // unit's seat (or all); an unreadable owner refuses the inject (codex r1),
+                        // never queues it unscoped.
+                        let owner = (|| -> anyhow::Result<Option<u32>> {
+                            let Some(s) = crate::domain::get_session(&store, &run_id)? else {
+                                return Ok(None);
+                            };
+                            if s.status != SessionStatus::Executing {
+                                return Ok(None);
+                            }
+                            let units = crate::domain::session_units(&store, &run_id)?;
+                            Ok(units
+                                .get(s.unit_ix)
+                                .filter(|u| {
+                                    matches!(
+                                        u.status,
+                                        crate::domain::UnitStatus::Distributed
+                                            | crate::domain::UnitStatus::Pending
+                                    ) && (target_str == "all"
+                                        || u.assigned_cli.as_deref() == Some(target_str.as_str()))
+                                })
+                                .map(|u| u.ord))
+                        })();
+                        let for_ord = match owner {
+                            Ok(o) => o,
+                            Err(e) => {
+                                let _ = reply.send(Err(anyhow::anyhow!(
+                                    "run {run_id}: could not tell which step is running ({e}); \
+                                     the message was not queued"
+                                )));
+                                continue;
+                            }
+                        };
                         if live {
                             crate::power::queue_operator_message(
                                 &run_id,
@@ -8825,7 +8840,7 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
      human.";
 
 /// (rig run ea73afc0) The automatic round's SCOPE, on every variant of its note: its retry turn
-/// answered NO CHANGE NEEDED for the failures but also applied a team member's unrelated Windows
+/// answered that no change was needed for the failures but also applied a team member's unrelated Windows
 /// advice, so the tree changed, the whole floor ran again (27 min) and the review then failed on
 /// that very edit (another 32-min floor). The round is for the failing checks only.
 const FLOOR_AUTO_RETRY_SCOPE_NOTE: &str = " This round is ONLY for these failing checks: make no \
@@ -8839,8 +8854,8 @@ const FLOOR_AUTO_RETRY_SCOPE_NOTE: &str = " This round is ONLY for these failing
 /// results ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY
 /// failures (head minus base) and says the base's own are not the worker's. Head-only is one head
 /// run against one base run, often under different host load, so a head-only test can still be a
-/// flake or sit outside the change: the note says how to answer then (change nothing, say NO
-/// CHANGE NEEDED and why) instead of only "fix those" (rig run 85ddad0d: the worker chased three
+/// flake or sit outside the change: the note says how to answer then (change nothing, end with
+/// `NO-CHANGE: <why>`) instead of only "fix those" (rig run 85ddad0d: the worker chased three
 /// load flakes in another crate, then its honest no-edit answer was refused). A floor with no
 /// head-only failure (all base-shared or unseparated) takes no automatic round at all ([`floor_auto_retry_applies`]). With no structured result
 /// it is [`FLOOR_AUTO_RETRY_NOTE`].
@@ -11660,7 +11675,9 @@ fn power_dispatch(
             }
             let power = s.power.as_ref().unwrap_or(power);
             let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
-            let task = unit.description.clone();
+            // (core#1486) The task as authored: older rounds' amendment segments are dropped from
+            // what later turns restate; this round's notes ride their own block.
+            let task = crate::power::authored_task(&unit);
             // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
             // hand-off's reviewers, judges and QE are dispatched without it.
             unit.description.push_str(&crate::power::orchestrator_brief(
@@ -15276,22 +15293,37 @@ pub(crate) fn declares_no_change(output: &str) -> bool {
 }
 
 /// (core#1486) The reason on the LAST [`NO_CHANGE_FIELD`] line of `output`: a line whose first word,
-/// past list or emphasis decoration (`-`, `*`, `>`, `` ` ``, `#`), is `NO-CHANGE:` (any case) with a
-/// reason after it. A line that mentions the field mid-sentence, quotes it after `>` inside prose,
-/// or names no reason is not one. Capped at 300 characters.
+/// past list or emphasis decoration (`-`, `*`, `_`, `` ` ``, `#`), is `NO-CHANGE:` (any case), outside
+/// a code fence and not a `>` quote, with a real reason after it (not empty, not an unfilled
+/// `<placeholder>`). A mid-sentence mention is not one. Capped at 300 characters.
 pub(crate) fn no_change_line(output: &str) -> Option<String> {
-    output.lines().rev().find_map(|line| {
-        let bare = line.trim_start_matches(|c: char| c.is_whitespace() || "-*>`#".contains(c));
-        let head = bare.get(..NO_CHANGE_FIELD.len())?;
-        if !head.eq_ignore_ascii_case(NO_CHANGE_FIELD) {
-            return None;
+    // (codex r1) The LAST field decides, valid or not: an empty or placeholder reason after an
+    // earlier declaration withdraws it, never revives it. Lines inside a ``` fence and `>` quotes
+    // are examples or quotations, never the seat's own field.
+    let decoration = |c: char| c.is_whitespace() || "-*`#_".contains(c);
+    let mut fenced = false;
+    let mut last: Option<&str> = None;
+    for line in output.lines() {
+        let t = line.trim_start();
+        if t.starts_with("```") {
+            fenced = !fenced;
+            continue;
         }
-        let why = bare[NO_CHANGE_FIELD.len()..]
-            .trim()
-            .trim_end_matches(['*', '`'])
-            .trim();
-        (!why.is_empty()).then(|| why.chars().take(300).collect())
-    })
+        if fenced || t.starts_with('>') {
+            continue;
+        }
+        let bare = t.trim_start_matches(decoration);
+        let Some(head) = bare.get(..NO_CHANGE_FIELD.len()) else {
+            continue;
+        };
+        if head.eq_ignore_ascii_case(NO_CHANGE_FIELD) {
+            last = Some(&bare[NO_CHANGE_FIELD.len()..]);
+        }
+    }
+    let why = last?.trim().trim_end_matches(decoration).trim();
+    // An unfilled placeholder (`<why>`, `<the reason>`) is the instruction, not a reason.
+    let placeholder = why.starts_with('<') && why.ends_with('>');
+    (!why.is_empty() && !placeholder).then(|| why.chars().take(300).collect())
 }
 
 fn worktree_is_clean(workdir: Option<&str>) -> bool {
@@ -29131,9 +29163,20 @@ mod request_changes_tests {
             "- **NO-CHANGE: the three failures are load flakes**",
             "`NO-CHANGE: outside my diff`",
             "no-change: the fix landed on main",
-            "> NO-CHANGE: base-shared failures only",
+            "__NO-CHANGE: base-shared failures only__",
+            "_NO-CHANGE: base-shared failures only_",
         ] {
             assert!(declares_no_change(yes), "{yes:?}");
+        }
+        // (codex r1) The last field decides even when invalid; quotes, fenced examples and
+        // unfilled placeholders never declare.
+        for no in [
+            "NO-CHANGE: already fixed\nNO-CHANGE:",
+            "```\nNO-CHANGE: <why>\n```\nI could not edit the repository.",
+            "> NO-CHANGE: quoted from the note",
+            "NO-CHANGE: <the reason>",
+        ] {
+            assert!(!declares_no_change(no), "{no:?}");
         }
         assert_eq!(
             no_change_line("x\nNO-CHANGE: one\nNO-CHANGE: two").as_deref(),
@@ -31404,7 +31447,7 @@ mod code_evidence_floor_tests {
     }
 
     /// (core#1142) Every automatic round's note says how to answer when a named failure is not
-    /// the change's — change nothing and say NO CHANGE NEEDED with the reason — and an echo of
+    /// the change's — change nothing and end with `NO-CHANGE: <why>` — and an echo of
     /// that instruction never reads as the declaration itself.
     #[test]
     fn the_automatic_round_note_offers_the_no_change_answer() {

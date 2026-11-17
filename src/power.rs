@@ -1310,6 +1310,13 @@ pub fn continuation_prompt(
     }
     // (core#1486) The attempt's notes ride every turn, ahead of the task (clipped below).
     out.push_str(&notes_block(notes));
+    // (codex r1) A restarted session never read the first brief: the no-change field rides every
+    // later turn too.
+    out.push_str(&format!(
+        "\n\nIf the change needs no edit, leave the tree as it is and write the line `{} <why>` \
+         before your `{HANDOFF_PREFIX}` line.",
+        crate::actor::NO_CHANGE_FIELD
+    ));
     if turn >= max_turns {
         out.push_str(&format!(
             "\n\nThis is your LAST turn: finish, commit, and end with `{HANDOFF_PREFIX} …`."
@@ -1623,7 +1630,7 @@ pub struct BuildArm {
 }
 
 /// The longest note a turn restates.
-const NOTE_MAX: usize = 1500;
+const NOTE_MAX: usize = 4000;
 
 /// (core#1486) The notes a build attempt was sent with: the latest round's operator notes (`amend`
 /// rulings of the unit's last attempt, oldest first) and, on a send-back, the findings it carries
@@ -1642,11 +1649,17 @@ pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
             ));
         }
     }
-    let last = unit.operator_rulings.iter().map(|r| r.attempt).max();
+    // (codex r1) The notes for THIS dispatch: amendments recorded against the attempt it re-runs
+    // (`last_attempt`, read before this dispatch stamps its own), or, for a first dispatch, a
+    // pre-dispatch (plan-gate) amendment. A later retry with no new note restates none.
+    let this_round = |r: &crate::domain::OperatorRuling| match unit.last_attempt {
+        Some(a) => r.attempt == a,
+        None => r.attempt == 0,
+    };
     for r in unit
         .operator_rulings
         .iter()
-        .filter(|r| r.action == "amend" && Some(r.attempt) == last)
+        .filter(|r| r.action == "amend" && this_round(r))
     {
         let note = format!("The operator's note: {}", clip(r.text.trim(), NOTE_MAX));
         if !out.contains(&note) {
@@ -1654,6 +1667,17 @@ pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
         }
     }
     out
+}
+
+/// (core#1486, codex r1) The unit's task without the operator-amendment segments `amend_unit`
+/// appended to it (` (operator amendment: <text>)`, exact text from its rulings): the continuation
+/// restates the task as authored plus this attempt's [`attempt_notes`], never older rounds' notes.
+pub fn authored_task(unit: &crate::domain::WorkUnit) -> String {
+    let mut task = unit.description.clone();
+    for r in unit.operator_rulings.iter().filter(|r| r.action == "amend") {
+        task = task.replace(&format!(" (operator amendment: {})", r.text), "");
+    }
+    task
 }
 
 /// (core#1486) The block every turn of the attempt carries for its [`attempt_notes`].
@@ -2324,6 +2348,7 @@ mod tests {
             attempt: 1,
             at: 2,
         });
+        u.last_attempt = Some(1);
         let notes = attempt_notes(&u);
         assert_eq!(notes.len(), 2, "{notes:?}");
         assert!(notes[0].contains("ITEM 2 FAIL") && notes[1].contains("CITE src/lib.rs:42"));
@@ -2348,6 +2373,27 @@ mod tests {
             "the clip drops the tail without it"
         );
         assert!(notes_block(&[]).is_empty());
+        // (codex r1) A later retry with no new note restates no older one, and the restated task
+        // drops every amendment segment (the notes block carries this round's).
+        let mut later = u.clone();
+        later.last_attempt = Some(2);
+        later.rework_of = None;
+        assert!(attempt_notes(&later).is_empty());
+        let mut amended = crate::domain::WorkUnit::pending("r:fix", "r", 2, "do the fix");
+        amended.description = "do the fix (operator amendment: old note)".into();
+        amended
+            .operator_rulings
+            .push(crate::domain::OperatorRuling {
+                action: "amend".into(),
+                text: "old note".into(),
+                attempt: 0,
+                at: 1,
+            });
+        assert_eq!(authored_task(&amended), "do the fix");
+        assert!(
+            p.contains("write the line `NO-CHANGE: <why>` before your"),
+            "{p}"
+        );
     }
 
     /// (core#1486, core#1495) A `NO-CHANGE:` line an earlier turn wrote survives the fold that keeps

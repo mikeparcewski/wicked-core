@@ -3207,7 +3207,7 @@ pub(crate) fn author_binaries_known(u: &crate::domain::WorkUnit) -> bool {
             .any(|b| b == crate::domain::UNKNOWN_AUTHOR_BINARY)
 }
 
-/// (rig run ea73afc0) The lead of a floor denial whose attempt said NO CHANGE NEEDED but changed
+/// (rig run ea73afc0) The lead of a floor denial whose attempt declared no change but changed
 /// the tree anyway: the engine read it as a change (the floor ran on the new tree), and the gate
 /// says so, so the operator sees why the floor ran again. Empty otherwise.
 pub(crate) fn no_change_contradicted_note(
@@ -5624,7 +5624,7 @@ mod judge_bench_tests {
         let outcome = apply_and_finish_unit(
             &mut store,
             unit,
-            "the step's output, unchanged tree: NO CHANGE NEEDED, the failures are load-bound",
+            "the step's output, unchanged tree:\nNO-CHANGE: the failures are load-bound",
             &workflow_id,
             EntityMode::Shared,
             sid,
@@ -5773,7 +5773,7 @@ mod judge_bench_tests {
         units[0].denial_reason.clone()
     }
 
-    /// (rig run ea73afc0) An automatic retry turn that said NO CHANGE NEEDED but changed the tree
+    /// (rig run ea73afc0) An automatic retry turn that declared no change but changed the tree
     /// (it applied a team member's unrelated advice) is a change: its floor ran on the new tree,
     /// and the floor's denial says so first. Without the declaration, or on an unchanged tree,
     /// the denial reads as before.
