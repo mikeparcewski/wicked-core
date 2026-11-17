@@ -3965,11 +3965,13 @@ fn validator_author_built<'a>(
         k == v
             || seat_key(k) == v
             || v_names.contains(&crate::validator::normalize_identity(k))
-            // A seat key runs what its record names (`claude-sonnet` running `claude`).
+            // A seat ID runs what its headless invocation names (`claude-sonnet` running
+            // `claude`) — the carrier a seat-ID alias was matched on; the record's other carriers
+            // count only where dispatch recorded them as names (codex confirmation on #1525).
             || roster
                 .iter()
                 .find(|c| c.key == k || c.key == seat_key(k))
-                .is_some_and(|c| record_identities(c).iter().any(|n| v_names.contains(n)))
+                .is_some_and(|c| v_names.contains(&invocation_identity(&c.headless_invocation)))
     };
     is_v(work_author)
         || unit_launched_seats(unit, roster).iter().any(|k| is_v(k))
@@ -4329,9 +4331,9 @@ pub(crate) fn launched_seat_ids(
 }
 
 /// (crew#972, coord ruling on core#1525) The seat IDs an agent unit's own work ran as: its launch
-/// record ([`crate::domain::WorkUnit::launched_seats`]) and, for a unit dispatched before the
-/// record, its seat and frozen invocation resolved by the same [`launched_seat_ids`] against
-/// `roster`. Empty for a tool unit (its `assigned_cli` is its program, not a seat).
+/// record ([`crate::domain::WorkUnit::launched_seats`]); only for a unit with no record (never
+/// dispatched since the record existed), its seat and frozen invocation resolved by the same
+/// [`launched_seat_ids`] against `roster`. Empty for a tool unit (its `assigned_cli` is its program, not a seat).
 pub(crate) fn unit_launched_seats(
     unit: &crate::domain::WorkUnit,
     roster: &[crate::AgenticCli],
@@ -4339,15 +4341,15 @@ pub(crate) fn unit_launched_seats(
     if unit.tool_cmd.is_some() {
         return Vec::new();
     }
-    let mut out = unit.launched_seats.clone();
-    if let Some(k) = unit.assigned_cli.as_deref() {
-        for id in launched_seat_ids(k, unit.assigned_invocation.clone(), roster) {
-            if !out.contains(&id) {
-                out.push(id);
-            }
-        }
+    // The record is authoritative: never re-resolved through today's filesystem (a symlink
+    // retargeted since would rewrite what the launch ran — codex confirmation on #1525).
+    if !unit.launched_seats.is_empty() {
+        return unit.launched_seats.clone();
     }
-    out
+    unit.assigned_cli
+        .as_deref()
+        .map(|k| launched_seat_ids(k, unit.assigned_invocation.clone(), roster))
+        .unwrap_or_default()
 }
 
 /// [`launched_seat_ids`] without `key` itself: the OTHER registry seats a launch of `key` ran as,
@@ -9591,6 +9593,21 @@ mod tests {
                     .chain(&was_codex.authored_binaries),
                 &both
             ));
+            // …nor for a unit whose own launch ran as `cx` (recorded while it ran codex).
+            mode(&claude_bin, 0o755);
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&real, &alias).unwrap();
+            let on_cx = unit_on("cx", Some(&both[2].headless_invocation), &both);
+            assert_eq!(on_cx.launched_seats, vec!["cx", "codex"]);
+            std::fs::remove_file(&alias).unwrap();
+            std::os::unix::fs::symlink(&claude_bin, &alias).unwrap();
+            assert_eq!(unit_launched_seats(&on_cx, &both), vec!["cx", "codex"]);
+            assert!(!validator_author_built(
+                &on_cx,
+                "cx",
+                std::iter::empty(),
+                &both
+            ));
             // A file this process cannot execute is not what a launch runs: no executable
             // identity — no execute bit, or only another class's (`0641` on our own file).
             for m in [0o644, 0o641] {
@@ -9616,7 +9633,22 @@ mod tests {
         assert!(
             !launched_identities_in("codex", inv.clone(), &odd_roster).contains(&"claude".into())
         );
-        assert!(!launched_seat_ids("codex", inv, &odd_roster).contains(&"claude".into()));
+        assert!(!launched_seat_ids("codex", inv.clone(), &odd_roster).contains(&"claude".into()));
+        // …nor through the alias seat ID it records: `codex-alt` is read by what it runs.
+        let alt = unit_on("codex", inv.as_deref(), &odd_roster);
+        assert!(
+            alt.launched_seats.contains(&"codex-alt".to_string()),
+            "{alt:?}"
+        );
+        assert!(!validator_author_built(
+            &alt,
+            "codex",
+            alt.launched_seats.iter(),
+            &odd_roster
+        ));
+        let (seen, _, ready) = judge(alt, &odd_roster);
+        assert_eq!(seen, vec!["claude".to_string()]);
+        assert_eq!(ready, seen);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
