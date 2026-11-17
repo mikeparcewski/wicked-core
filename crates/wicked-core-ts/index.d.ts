@@ -853,6 +853,19 @@ export declare class Core {
    */
   static floorCacheUsage(): Promise<string>
   /**
+   * (crew#1493) The repository's own checks on a finished run's REBASED tree, before crew
+   * re-delivers its pull request: the verify floor the deliver re-verify runs (a clean checkout
+   * of the tree `workdir`'s `HEAD` holds, the run's Verify-stage floor, the dependency install
+   * forced), measured against `baseCommit` (a full commit id, an ancestor of `HEAD`: the base
+   * the branch was rebased onto; a failure the base shares does not deny). `workdir` is a
+   * worktree of the registered repository at `repoRoot`. Resolves to a JSON
+   * `{ head, tree, base, passed, report }` (`report` is the floor's `RepoChecksReport`, as
+   * `repoChecksEvaluated` carries it); rejects when the inputs do not name that shape. A floor
+   * that refuses (no OS write boundary, a short disk) resolves with `passed: false`. Runs for
+   * the floor's duration (minutes); writes nothing to the run's record.
+   */
+  static checkRunTree(runId: string, workdir: string, repoRoot: string, baseCommit: string): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

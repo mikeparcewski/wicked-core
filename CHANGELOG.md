@@ -16,6 +16,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Added
 
+- **The engine runs a run's repository checks on a rebased tree on request (crew#1493).** `check_run_tree` /
+  napi static `Core.checkRunTree(runId, workdir, repoRoot, baseCommit)`: the verify floor the deliver re-verify runs
+  (a guarded checkout of exactly the tree `workdir`'s `HEAD` holds, the run's Verify-stage floor with the install
+  forced, held to that tree), measured against `baseCommit` (a full commit id that must be an ancestor of `HEAD`; a
+  failure the base shares does not deny). Resolves `{head, tree, base, passed, report}`; inputs that do not name a
+  rebased worktree of `repoRoot` are refused before any check runs, and a refusing floor reads `passed: false`. crew
+  uses it to re-deliver a finished run's conflicting pull request without pushing an unchecked tree. Additive binding;
+  no actor or `LaunchSpec` change.
+
 - **The engine publishes every answer an open gate takes** (studio#1170, crew#1512). `Core::gate_actions` /
   napi `gateActions(runId)`: per open gate, each answer's token, what it does at this gate (`intent`), whether it
   takes a note, a reassign's seats (benched ones flagged), a rule skip's rule ids, and whether a plan answer names its

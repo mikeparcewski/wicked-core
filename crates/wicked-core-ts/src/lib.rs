@@ -2546,6 +2546,35 @@ impl Core {
         task(move || serde_json::to_string(&wicked_core::floor_cache_usage()).map_err(err))
     }
 
+    /// (crew#1493) The repository's own checks on a finished run's REBASED tree, before crew
+    /// re-delivers its pull request: the verify floor the deliver re-verify runs (a clean checkout
+    /// of the tree `workdir`'s `HEAD` holds, the run's Verify-stage floor, the dependency install
+    /// forced), measured against `baseCommit` (a full commit id, an ancestor of `HEAD`: the base
+    /// the branch was rebased onto; a failure the base shares does not deny). `workdir` is a
+    /// worktree of the registered repository at `repoRoot`. Resolves to a JSON
+    /// `{ head, tree, base, passed, report }` (`report` is the floor's `RepoChecksReport`, as
+    /// `repoChecksEvaluated` carries it); rejects when the inputs do not name that shape. A floor
+    /// that refuses (no OS write boundary, a short disk) resolves with `passed: false`. Runs for
+    /// the floor's duration (minutes); writes nothing to the run's record.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn check_run_tree(
+        run_id: String,
+        workdir: String,
+        repo_root: String,
+        base_commit: String,
+    ) -> AsyncTask<CoreTask> {
+        task(move || {
+            let r = wicked_core::check_run_tree(
+                &run_id,
+                std::path::Path::new(&workdir),
+                std::path::Path::new(&repo_root),
+                &base_commit,
+            )
+            .map_err(err)?;
+            serde_json::to_string(&r).map_err(err)
+        })
+    }
+
     /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
     /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
     /// `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED
