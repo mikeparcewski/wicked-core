@@ -4563,3 +4563,41 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
     // No part is bigger than the budget, so the prompt never cuts a part (the change is never
     // crowded out by a header the prompt truncates).
 }
+
+/// (codex r2 on #1514 v2) A line near or over the budget is never cut away: every byte of it reaches
+/// a part no bigger than the budget; and two long paths sharing a prefix keep apart in the
+/// continuation lines (the file's own name is kept).
+#[test]
+fn core_1474_long_lines_and_long_paths_survive_the_parts() {
+    let cap = 64 * 1024;
+    for n in [cap - 10, cap + 5000, 3 * cap] {
+        let payload = format!("{}END-MARKER", "x".repeat(n));
+        let diff = format!(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-old\n+{payload}\n{}",
+            big_file("b.txt", 100, 30)
+        );
+        let parts = diff_parts(&diff, cap);
+        assert!(parts.iter().all(|p| p.len() <= cap), "{n}");
+        let total_x: usize = parts.iter().map(|p| p.matches('x').count()).sum();
+        assert!(total_x >= n, "{n}: every byte of the line is in a part");
+        assert!(
+            parts.iter().any(|p| p.contains("END-MARKER")),
+            "{n}: its end too"
+        );
+    }
+    let prefix = "d".repeat(6000);
+    let diff = format!(
+        "{}{}",
+        big_file(&format!("{prefix}/safe_config.rs"), 3000, 30),
+        big_file(&format!("{prefix}/sensitive_config.rs"), 3000, 30)
+    );
+    let parts = diff_parts(&diff, 16 * 1024);
+    let continued: Vec<&str> = parts
+        .iter()
+        .filter_map(|p| p.lines().next().filter(|l| l.starts_with("[continued:")))
+        .collect();
+    assert!(continued
+        .iter()
+        .any(|l| l.contains("safe_config.rs") && !l.contains("sensitive")));
+    assert!(continued.iter().any(|l| l.contains("sensitive_config.rs")));
+}

@@ -1285,9 +1285,9 @@ pub const MAX_PARTS: usize = 8;
 /// (core#1474) `diff` cut into parts of at most `cap` bytes, nothing left out and nothing reordered:
 /// at `diff --git` file boundaries first, a file bigger than a part at its `@@` hunk boundaries
 /// (each later part repeats the file's header lines, so the judge always sees which file it reads),
-/// and a hunk bigger than a part at line boundaries. A single line bigger than `cap` is a part of
-/// its own (the prompt then cuts it, and the check says so). The concatenation of the parts, less
-/// the repeated headers, is `diff`.
+/// a hunk bigger than a part at line boundaries, and a line bigger than a part (beside its header)
+/// at char boundaries. No part is bigger than `cap`, so the prompt never cuts one. The
+/// concatenation of the parts, less the repeated headers, is `diff`.
 pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
     let cap = cap.max(1);
     // The header a later part repeats: the file's whole header when it is small, else one short
@@ -1296,12 +1296,15 @@ pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
         if h.len() <= cap / 4 {
             h.to_string()
         } else {
+            // The END of the `diff --git` line: ` b/<path>` ends it, so the file's own name and its
+            // nearest directories are kept, which tell two long paths apart (codex r2).
             let first = h.lines().next().unwrap_or("");
-            let mut end = first.len().min(cap / 8);
-            while !first.is_char_boundary(end) {
-                end -= 1;
+            let mut start = first.len().saturating_sub(cap / 8);
+            while !first.is_char_boundary(start) {
+                start += 1;
             }
-            format!("[continued: {}]\n", &first[..end])
+            let cut = if start > 0 { "…" } else { "" };
+            format!("[continued: {cut}{}]\n", &first[start..])
         }
     };
     // Units: (header to repeat, text). A file's header is its lines before the first `@@`.
@@ -1320,16 +1323,27 @@ pub fn diff_parts(diff: &str, cap: usize) -> Vec<String> {
             if in_header {
                 header.push_str(line);
             }
+            let h = units.last().map(|(h, _)| h.clone()).unwrap_or_default();
             match units.last_mut() {
                 // A unit and the header a part may repeat before it fit one part.
-                Some((h, text)) if h.len() + text.len() + line.len() <= cap || text.is_empty() => {
-                    text.push_str(line)
+                Some((h, text)) if h.len() + text.len() + line.len() <= cap => text.push_str(line),
+                _ => {
+                    // A line too long for a part beside its header is split at char boundaries
+                    // into pieces that each fit (codex r2: never a part the prompt must cut).
+                    let room = cap.saturating_sub(h.len()).max(1);
+                    let mut rest = line;
+                    while !rest.is_empty() {
+                        let mut end = rest.len().min(room);
+                        while end > 0 && !rest.is_char_boundary(end) {
+                            end -= 1;
+                        }
+                        if end == 0 {
+                            end = rest.chars().next().map_or(rest.len(), char::len_utf8);
+                        }
+                        units.push((h.clone(), rest[..end].to_string()));
+                        rest = &rest[end..];
+                    }
                 }
-                Some((h, _)) => {
-                    let h = h.clone();
-                    units.push((h, line.to_string()));
-                }
-                None => units.push((String::new(), line.to_string())),
             }
         }
     }
