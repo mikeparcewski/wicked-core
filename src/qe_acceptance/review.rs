@@ -1367,11 +1367,17 @@ pub(crate) fn run(
             tool_activity: !out.tools.is_empty(),
             attempt: input.attempt,
         };
-        if let Some(why) = seat_failure(&out) {
+        // (core#1496, codex r2) A reviewer that answered FAIL gave a verdict: never rotated to the
+        // next seat as a seat failure, whatever its turn's status or its refusal text says.
+        let says_fail = crate::validator::parse_evaluator_verdict(&out.output)
+            .token
+            .as_deref()
+            == Some("FAIL");
+        if let Some(why) = seat_failure(&out).filter(|_| !says_fail) {
             review.attempts.push(attempt(format!("seat_failure:{why}")));
             continue;
         }
-        if out.status != StepStatus::Ok {
+        if out.status != StepStatus::Ok && !says_fail {
             review.attempts.push(attempt(OUTCOME_INVALID.to_string()));
             review.reason = format!(
                 "the reviewer turn on `{}` ended {:?} without a seat failure the engine can \

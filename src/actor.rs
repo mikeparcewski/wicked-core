@@ -6528,7 +6528,10 @@ fn apply_step_result(
     // Without this, three "done" units of refusal one-liners reached the coverage gate looking
     // like finished phases. Non-skill units are exempt: free-text work could legitimately quote
     // such a line.
-    if unknown_command_noop(unit, &output) {
+    // (core#1496) An evaluator's FAIL is judged as its verdict: no tripwire turns it into a seat
+    // failure that fails over to another seat (codex r1 on the tripwire after normalization).
+    let says_fail = crate::cli_runner::evaluator_says_fail(unit, &output.output);
+    if unknown_command_noop(unit, &output) && !says_fail {
         output.status = crate::workflow::StepStatus::Failed;
     }
     // (core#769) IN-TOOL APPROVAL REFUSAL TRIPWIRE: an Ok agent step whose every command was
@@ -6537,7 +6540,7 @@ fn apply_step_result(
     // path, where the appended line — the launcher's own frame, last — classifies as
     // `approval_unavailable`: the seat is benched for the run and the unit fails over.
     {
-        if let Some(n) = approval_refusals(unit, &output) {
+        if let Some(n) = approval_refusals(unit, &output).filter(|_| !says_fail) {
             output.status = crate::workflow::StepStatus::Failed;
             output.output.push_str(&format!(
                 "\n(wicked-core: the seat ran no command — {n} exec_command failed: \
@@ -9373,7 +9376,11 @@ fn escalate_denied_unit(
         .flatten()
         .filter(|_| adjudication.is_none());
     let (gate_kind, prompt) = match adjudication {
-        Some(p) => (crate::review_context::REVIEW_ADJUDICATION_GATE, p),
+        // (core#1496, codex r1) The adjudication round says where the result came from too.
+        Some(p) => (
+            crate::review_context::REVIEW_ADJUDICATION_GATE,
+            format!("{p}{}", failover_note(unit, true)),
+        ),
         None => (
             ESCALATION_GATE_KIND,
             denial_gate_prompt(unit, class, &reason, mutation, note),
@@ -9445,6 +9452,48 @@ fn record_review_round(
 /// the restore failed (the re-dispatch re-baselines, and says so), the same tree for every other
 /// class. The worktree-guard text names the paths that were reverted (bounded, core#464 item 3).
 fn denial_gate_prompt(
+    unit: &crate::domain::WorkUnit,
+    class: &str,
+    reason: &str,
+    mutation: Option<&crate::worktree_guard::WorktreeMutation>,
+    note: &str,
+) -> String {
+    let mut prompt = denial_gate_prompt_body(unit, class, reason, mutation, note);
+    prompt.push_str(&failover_note(unit, class != "dead_seat"));
+    prompt
+}
+
+/// (core#1496) What a gate says when the step's result came from a seat it was failed over to:
+/// every seat that gave no verdict on it first, and the seat whose result the gate shows. Empty
+/// when the step never failed over.
+pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) -> String {
+    if unit.worker_failed_clis.is_empty() {
+        return String::new();
+    }
+    let seats = unit
+        .worker_failed_clis
+        .iter()
+        .map(|c| format!("`{c}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    // (codex r2) Whether a result exists is the gate's own fact (a dead-seat gate has none), never
+    // inferred from the history list: a seat that failed once and then answered gave this result.
+    match unit.assigned_cli.as_deref().filter(|_| has_result) {
+        Some(by) => format!(
+            " [failover: this step's earlier attempts on {seats} ended without a result the step \
+             could use (a seat failure, or an answer the engine refused) and moved on; this result \
+             is from `{by}`]"
+        ),
+        // (codex r1) Every seat tried failed: there is no result to attribute.
+        None => format!(
+            " [failover: every seat this step was tried on ({seats}) ended without a result the \
+             step could use (a seat failure, or an answer the engine refused); no seat produced a \
+             result]"
+        ),
+    }
+}
+
+fn denial_gate_prompt_body(
     unit: &crate::domain::WorkUnit,
     class: &str,
     reason: &str,
@@ -10817,19 +10866,21 @@ fn advance_or_pause_with(
         }
         let (reviewing_ord, prompt) = match reason {
             PauseReason::DefGate { reviewing_ord } => {
-                let done = units.iter().find(|u| u.ord == reviewing_ord).map_or_else(
+                let reviewed = units.iter().find(|u| u.ord == reviewing_ord);
+                let done = reviewed.map_or_else(
                     || format!("unit {reviewing_ord}"),
                     |p| p.description.clone(),
                 );
                 (
                     Some(reviewing_ord),
                     format!(
-                        "Approve the output of unit {} ({}) before unit {} runs: {}{}",
+                        "Approve the output of unit {} ({}) before unit {} runs: {}{}{}",
                         reviewing_ord,
                         done,
                         unit.ord,
                         unit.description,
-                        unsuppressed_gate_note(session.human_confirm)
+                        unsuppressed_gate_note(session.human_confirm),
+                        reviewed.map(|r| failover_note(r, true)).unwrap_or_default()
                     ),
                 )
             }
