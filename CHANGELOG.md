@@ -3070,6 +3070,49 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.45** — 2026-11-17 — patch release on main 7a4a048, carrying 17 PRs since 0.15.44: #1487, #1490,
+  #1510, #1511, #1512, #1514, #1515, #1516, #1518, #1519, #1521, #1526, #1527, #1530, #1539, #1547 and #1548.
+  - **Judge independence is what the seat gateway observed (#1547, core#1543 P1).** A seat's identity for judging is the
+    provider its launch was seen calling at the seat gateway. An approval from a judge seen calling the work's own
+    provider is not independent: the one independent-judge search (used by both the judge rotation and the fallback
+    ladder) moves on to the next seat, seats known to share the work's provider go last, and a denial always stands.
+    The gate holds only when no independent seat is left. On the supported roster (Claude Code, Codex, Pi) Pi on its
+    Anthropic route shares Claude's provider, so Codex judges Claude's work.
+  - **Two seats complete a bug run, and a self-grade never passes (#1548, crew#972 decision 2).** With only two seats,
+    the validator's author may judge when no other seat is left, but only from a fully observed launch on a provider
+    outside the unit's history; acceptance test `two_seats_complete_a_bug_run_and_a_self_grade_never_passes`.
+  - **One arbiter settles a rule dispute no three-seat council can sit for (#1526, crew#972).** Never a creator; the
+    row says when the arbiter is the rule judge's own seat re-reading.
+  - **Power-mode notes reach every turn; "no change" is a structured field; a steer stays with its step (#1521,
+    core#1486, core#1495).** A worker that changes nothing says `NO-CHANGE: <why>`; a note repeated at a later retry
+    still reaches every later turn, including a continuation re-armed after a restart.
+  - **The engine publishes every answer an open gate takes (#1512).** New binding method `gateActions(runId)`; the
+    list is the accepted set (each candidate runs through the decision path's own pre-checks). Studio's gate contract
+    (studio#1172, #1178) reads it.
+  - **Reviews and judging:** a reviewer's FAIL is never a worker error or a failover (#1519); the rule judge reads every
+    changed line, in parts when the change is big (#1514); the rule judge and a seat re-probe run under their own wall
+    budget (#1511); a person's rule skip carries to later steps while the hunks are unchanged (#1516).
+  - **Seats and floors:** seat egress is open by default, and an invalid `WICKED_SEAT_EGRESS_HOSTS` fails closed
+    (#1487); a sign-in refusal is judged in the CLI's own frame and a sign-in bench is re-probed (#1510); a seat pod
+    never ready by the deadline is `pod_not_ready` with its evidence and the arm is retried (#1527); the k8s write-back
+    leaves build output and over-limit files out instead of failing the unit (#1518); cancel kills the floor's checks
+    and a host short of disk refuses the floor (#1530); the engine owns the QE evidence dir and a binding miss re-runs QE
+    (#1515).
+  - **Tests and lockfile:** #1539 (launch-bench comparison without the re-probe stamp); #1490 re-stamped the 0.15.44
+    platform lock entries.
+  - **Known limits.** core#1546 (W10 and below: a re-judge or floor re-run carries no work observation; payload
+    redaction drops a record's endpoint; gateway log lifecycle; a 32-bit launch nonce; the bus judge path skips the
+    provider check); all fail toward "unobserved", which holds as before. core#1549 (W6): the first judging after a
+    repeat-page reset reads as unobserved and holds for a person. core#1531 (W10 x2, W8): arbiter identity edge cases on
+    carried disputes and the seated count of a rejected arbiter ballot. core#1520 (W6, W4, W2): an undecodable running
+    unit reads as between units for a steer; turn 1 still carries older amendment segments; nested amendment text.
+    wicked-ci#76 (W6): the advisory selftest shows green over a U04 FAIL, so its green tick is not evidence. Observation
+    covers the container floor only: the host floor has no gateway, so a host-floor judging reads as unobserved (and
+    codex stays benched for repo-bound host runs unless `WICKED_CODEX_WORKTREE_OK=1`).
+  - **Upgrade notes.** One new binding method, `gateActions(runId)`; no `LaunchSpec` field change; gate protocol 3 is
+    unchanged. No Dockerfile change, so no image rebuild. With `WICKED_SEAT_EGRESS_HOSTS` unset seats now get open
+    egress (an empty or `none` value keeps the no-route behaviour). A note that asks a seat to write
+    "NO CHANGE NEEDED" no longer declares no change; ask for `NO-CHANGE: <why>`.
 - **core-ts 0.15.44** — 2026-11-14 — patch release on main 4c1b431, carrying 2 PRs since 0.15.43: #1473 and #1480.
   - **Seats get the Rust toolchain (#1480, core#1476 slice A).** A builder or QE seat on a Rust repository has `cargo`:
     every seat image includes the checks floor recipe as a named stage, which links the pinned toolchain into
