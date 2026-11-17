@@ -3012,8 +3012,11 @@ pub(crate) fn floor_fix_unit(
 /// nothing here: a failed turn's PASS stays a failure (the turn may have been cut off, refused, or
 /// echoed a verdict it never gave — codex r1), and the ladder moves it on.
 pub(crate) fn evaluator_says_fail(unit: &crate::domain::WorkUnit, output: &str) -> bool {
+    // The fold's own eligibility for an evaluator verdict (pipeline: role, no tool, not an engine-
+    // internal unit), so a FAIL promoted here is always one the fold then judges (codex r2).
     unit.role == crate::workflow::PhaseRole::Evaluator
         && unit.tool_cmd.is_none()
+        && !crate::execute_wrapped::is_engine_internal(unit)
         && crate::validator::parse_evaluator_verdict(output)
             .token
             .as_deref()

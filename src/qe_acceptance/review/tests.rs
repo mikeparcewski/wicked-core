@@ -615,6 +615,12 @@ impl StepRunner for Scripted {
                 StepStatus::Failed,
                 "Error: not logged in. Run /login".to_string(),
             ),
+            // (core#1496) A reviewer whose failed turn carries a refusal line AND its FAIL.
+            "signed-out-fail" => (
+                StepStatus::Failed,
+                "Error: not logged in. Run /login\nITEM 1: FAIL — the guard is missing\nVERDICT: FAIL"
+                    .to_string(),
+            ),
             "timeout-signed-out" => (
                 StepStatus::TimedOut,
                 "Error: not logged in. Run /login".to_string(),
@@ -1992,4 +1998,19 @@ fn a_resumed_runs_evidence_dir_is_emptied_by_the_engine() {
     u.qe_review.as_mut().unwrap().evidence_dir = Some(outside.to_string_lossy().into_owned());
     assert!(prepare_evidence(&u, RUN).unwrap().is_err());
     assert!(outside.join("keep").is_file());
+}
+
+/// (core#1496, codex r2) A reviewer that answered FAIL gave a verdict: it is never rotated to the
+/// next reviewer seat as a seat failure, even when its failed turn also carries a sign-in refusal.
+/// The FAIL is recorded (by the engine, from its terminal VERDICT line) and binds.
+#[test]
+fn a_reviewers_fail_is_never_rotated_away_as_a_seat_failure() {
+    let (got, seen) = review_with(
+        vec![("claude", "signed-out-fail"), ("pi", "pass")],
+        vec![seat("claude", BASIS_DISTINCT), seat("pi", BASIS_EXECUTOR)],
+    );
+    let got = got.unwrap();
+    assert_eq!(seen.len(), 1, "no second reviewer was asked");
+    assert_eq!(got.outcome, OUTCOME_FAIL, "{got:?}");
+    assert_eq!(got.verdict.as_deref(), Some("FAIL"));
 }

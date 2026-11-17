@@ -9379,7 +9379,7 @@ fn escalate_denied_unit(
         // (core#1496, codex r1) The adjudication round says where the result came from too.
         Some(p) => (
             crate::review_context::REVIEW_ADJUDICATION_GATE,
-            format!("{p}{}", failover_note(unit)),
+            format!("{p}{}", failover_note(unit, true)),
         ),
         None => (
             ESCALATION_GATE_KIND,
@@ -9459,14 +9459,14 @@ fn denial_gate_prompt(
     note: &str,
 ) -> String {
     let mut prompt = denial_gate_prompt_body(unit, class, reason, mutation, note);
-    prompt.push_str(&failover_note(unit));
+    prompt.push_str(&failover_note(unit, class != "dead_seat"));
     prompt
 }
 
 /// (core#1496) What a gate says when the step's result came from a seat it was failed over to:
 /// every seat that gave no verdict on it first, and the seat whose result the gate shows. Empty
 /// when the step never failed over.
-pub(crate) fn failover_note(unit: &crate::domain::WorkUnit) -> String {
+pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) -> String {
     if unit.worker_failed_clis.is_empty() {
         return String::new();
     }
@@ -9476,11 +9476,9 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit) -> String {
         .map(|c| format!("`{c}`"))
         .collect::<Vec<_>>()
         .join(", ");
-    match unit
-        .assigned_cli
-        .as_deref()
-        .filter(|by| !unit.worker_failed_clis.iter().any(|c| c == by))
-    {
+    // (codex r2) Whether a result exists is the gate's own fact (a dead-seat gate has none), never
+    // inferred from the history list: a seat that failed once and then answered gave this result.
+    match unit.assigned_cli.as_deref().filter(|_| has_result)     {
         Some(by) => format!(
             " [failover: this step's earlier attempts on {seats} ended with no verdict (a seat \
              failure) and moved on; this result is from `{by}`]"
@@ -10880,7 +10878,7 @@ fn advance_or_pause_with(
                         unit.ord,
                         unit.description,
                         unsuppressed_gate_note(session.human_confirm),
-                        reviewed.map(failover_note).unwrap_or_default()
+                        reviewed.map(|r| failover_note(r, true)).unwrap_or_default()
                     ),
                 )
             }
