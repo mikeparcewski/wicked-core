@@ -1039,6 +1039,20 @@ pub(crate) fn apply_and_finish_unit(
     emit: &mut dyn FnMut(CoreEvent),
     db_path: Option<&str>,
 ) -> anyhow::Result<UnitOutcome> {
+    // (core#1543) What this attempt's own launch was observed calling joins the unit's record.
+    if unit.tool_cmd.is_none() && unit.observation_pending {
+        match &evidence.observed_providers {
+            Some(ps) => {
+                for p in ps {
+                    if !unit.observed_providers.contains(p) {
+                        unit.observed_providers.push(p.clone());
+                    }
+                }
+            }
+            None => unit.providers_unobserved = true,
+        }
+        unit.observation_pending = false;
+    }
     // ── PRE-RESOLVE every deny-dominant signal BEFORE the governance gate resolves the phase, so a
     //    deny drives the phase to Rejected and NO approved phase / work_output can leak past it (seam
     //    finding #2 / ADR-0003). Each signal is pure + actor-safe: the deterministic re-verify runs a
@@ -1970,6 +1984,8 @@ pub(crate) fn apply_and_finish_unit(
         // The floor fix runs with no recorded invocation (`cli_runner::floor_fix_unit`).
         let binaries = crate::cli_runner::launched_identities(&seat, None);
         crate::domain::stamp_author(unit, seat, binaries);
+        // (core#1543) The floor fix's own launch is not observed here.
+        unit.providers_unobserved = true;
     }
     // (DES-QE-EVERY-SEAT §3.5) The isolated QE reviewer's record — evidence on the persisted unit,
     // kept whichever way it went; `None` (no reviewer this attempt) leaves the last one.

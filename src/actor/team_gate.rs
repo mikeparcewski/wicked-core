@@ -3752,6 +3752,11 @@ pub(super) fn revise_units(
                     k.repeat_choice = o.repeat_choice.clone();
                 }
                 k.last_attempt = o.last_attempt.max(floor);
+                // (core#1543) …and what its launches were observed calling: a retained unit keeps
+                // its provider history (codex on the re-land).
+                k.observed_providers = o.observed_providers.clone();
+                k.providers_unobserved = o.providers_unobserved;
+                k.observation_pending = o.observation_pending;
                 kept.push(k);
             }
             None => {

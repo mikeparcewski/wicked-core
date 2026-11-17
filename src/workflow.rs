@@ -343,6 +343,10 @@ pub struct StepOutput {
 /// payload arrives with. Serde-`default` on every field so older payloads parse.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitEvidence {
+    /// (core#1543) The providers this attempt's own launch was observed calling at the seat
+    /// gateway, every turn of it; `None`: not fully observed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observed_providers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_guard: Option<crate::worktree_guard::WorktreeGuardOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

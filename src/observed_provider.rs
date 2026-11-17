@@ -48,8 +48,10 @@ thread_local! {
 
 thread_local! {
     /// (coord codex-check on #1547) The providers the work being judged on this thread was seen
-    /// calling, while its judge rotation runs ([`judging_work_that_called`]).
-    static AVOID: std::cell::RefCell<Vec<Provider>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// calling, while its judge search runs ([`JudgingWork`]).
+    static AVOID: std::cell::RefCell<Judging> = const {
+        std::cell::RefCell::new(Judging { avoid: Vec::new(), require_observed: false })
+    };
 }
 
 /// The providers each seat's latest observed launch called, process-wide: the judge rotation
@@ -57,14 +59,34 @@ thread_local! {
 static LAST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<Provider>>>> =
     std::sync::Mutex::new(None);
 
+/// What the judge search on this thread must be independent of ([`JudgingWork`]).
+#[derive(Debug, Default)]
+struct Judging {
+    avoid: Vec<Provider>,
+    /// (crew#972 decision 2) The pinned validator's author was re-admitted: an approval stands
+    /// only from a launch observed, fully, calling none of `avoid`.
+    require_observed: bool,
+}
+
 /// While held, the judge rotations on this thread judge work known to have called `work`'s
 /// providers: they try first the seats not known to share them, and pass over an APPROVAL from a
 /// seat seen calling one of them to the next seat ([`approval_is_independent`]). Restored on drop.
-pub(crate) struct JudgingWork(Vec<Provider>);
+pub(crate) struct JudgingWork(Judging);
 
 impl JudgingWork {
     pub(crate) fn of(work: &Observed) -> Self {
-        Self(AVOID.with(|a| std::mem::replace(&mut *a.borrow_mut(), work.providers.clone())))
+        let now = Judging {
+            avoid: work.providers.clone(),
+            require_observed: false,
+        };
+        Self(AVOID.with(|a| std::mem::replace(&mut *a.borrow_mut(), now)))
+    }
+
+    /// (crew#972 decision 2) From here on, the search takes an approval only from a judge whose
+    /// own launch was observed, fully, calling another provider than the work's: the validator
+    /// author's re-admission rests on observation, never on trust.
+    pub(crate) fn require_observed(&self) {
+        AVOID.with(|a| a.borrow_mut().require_observed = true);
     }
 }
 
@@ -78,7 +100,7 @@ impl Drop for JudgingWork {
 /// Whether `seat` is KNOWN (by its latest observed launch anywhere in this process) to call a
 /// provider the work being judged on this thread called: tried last, never skipped on a guess.
 pub(crate) fn known_to_share(seat: &str) -> bool {
-    let avoid = AVOID.with(|a| a.borrow().clone());
+    let avoid = AVOID.with(|a| a.borrow().avoid.clone());
     if avoid.is_empty() {
         return false;
     }
@@ -90,13 +112,15 @@ pub(crate) fn known_to_share(seat: &str) -> bool {
 
 /// Whether an approval `seat` just gave on this thread stands as independent of the work being
 /// judged: `false` when this thread's receipts show its launch calling one of the work's providers.
-/// Unobserved: `true` (nothing proven; the caller's own rules stand).
+/// Unobserved: `true` (nothing proven; the caller's own rules stand) — unless the search
+/// [requires observation](JudgingWork::require_observed), when it is `false`.
 pub(crate) fn approval_is_independent(seat: &str) -> bool {
-    let avoid = AVOID.with(|a| a.borrow().clone());
-    if avoid.is_empty() {
-        return true;
-    }
+    let (avoid, require_observed) =
+        AVOID.with(|a| (a.borrow().avoid.clone(), a.borrow().require_observed));
     let mine = RECEIPTS.with(|r| observed_for(&r.borrow(), seat));
+    if require_observed && mine.known().is_none() {
+        return false;
+    }
     !mine.providers.iter().any(|p| avoid.contains(p))
 }
 
@@ -134,8 +158,7 @@ pub(crate) struct Observed {
 
 impl Observed {
     /// Fully observed, with at least one provider: what independence can be proven on (the
-    /// validator author's re-admission, crew#972 decision 2, builds on it).
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// validator author's re-admission, crew#972 decision 2).
     pub(crate) fn known(&self) -> Option<&[Provider]> {
         (self.complete && !self.providers.is_empty()).then_some(self.providers.as_slice())
     }
@@ -253,10 +276,20 @@ mod tests {
         assert!(!approval_is_independent("pi"));
         assert!(approval_is_independent("claude"));
         assert!(approval_is_independent("agy"));
+        // (crew#972 decision 2) After a re-admission the search requires observation: an
+        // unobserved or partly observed launch is never independent; a fully observed one on
+        // another provider is.
+        _judging.require_observed();
+        record_receipt("opencode", Some(vec!["api.anthropic.com:443".into()]));
+        record_receipt("opencode", None);
+        assert!(approval_is_independent("claude"));
+        assert!(!approval_is_independent("agy"), "unobserved");
+        assert!(!approval_is_independent("opencode"), "partly observed");
+        assert!(!approval_is_independent("pi"));
         drop(_judging);
         assert!(
-            approval_is_independent("pi"),
-            "outside a search nothing is avoided"
+            approval_is_independent("pi") && approval_is_independent("agy"),
+            "outside a search nothing is avoided or required"
         );
         take_receipts();
     }
