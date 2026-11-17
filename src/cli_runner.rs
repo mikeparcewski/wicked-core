@@ -5191,7 +5191,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // failed (a nonzero exit after the answer, a stderr line) but whose answer carries its verdict
     // completed its work. It folds as a completed turn, so a FAIL is judged as a FAIL — the gate, or
     // a send-back — and is never failed over to another seat that might say PASS.
-    // (core#1543) The providers the unit's own launch was observed calling (`None`: unobserved).
+    // (core#1543) The providers the unit's own launch was observed calling.
     let work_observed = crate::observed_provider::observed_for(
         &crate::observed_provider::take_receipts(),
         input.unit.assigned_cli.as_deref().unwrap_or("claude"),
@@ -6181,11 +6181,15 @@ fn run_unit_and_judge_in<'scope, 'env>(
             let judge_observed = av
                 .judge_cli
                 .as_deref()
-                .and_then(|seat| crate::observed_provider::observed_for(&judge_receipts, seat));
-            match crate::observed_provider::same_provider(
-                judge_observed.as_deref(),
-                work_observed.as_deref(),
-            ) {
+                .map(|seat| crate::observed_provider::observed_for(&judge_receipts, seat))
+                .unwrap_or_default();
+            // Only an APPROVAL needs independence: a judge that rejected the work keeps its
+            // denial (deny dominates), whoever it shares a provider with (codex review on P1).
+            let shared = av
+                .pass
+                .then(|| crate::observed_provider::same_provider(&judge_observed, &work_observed))
+                .flatten();
+            match shared {
                 Some(why) => {
                     engine_note(emit_delta, &format!("agent validator: {why}"));
                     eprintln!("wicked-core: unit {}: {why} (core#1543)", input.unit.ord);
@@ -8917,6 +8921,7 @@ mod tests {
     fn core_1543_a_judge_seen_calling_the_works_provider_is_discarded() {
         struct Gatewayed {
             providers: std::collections::HashMap<&'static str, Option<Vec<String>>>,
+            answer: &'static str,
         }
         impl StepRunner for Gatewayed {
             fn run_unit(&self, input: &StepInput) -> StepOutput {
@@ -8930,7 +8935,7 @@ mod tests {
                     run_id: input.run_id.clone(),
                     unit_ix: input.unit_ix,
                     attempt: input.attempt,
-                    output: "PASS\nchecked\nPASS".into(),
+                    output: self.answer.into(),
                     status: StepStatus::Ok,
                     usage: None,
                     files: Vec::new(),
@@ -8972,14 +8977,16 @@ mod tests {
             seat("pi", "pi -p {PROMPT}"),
         ];
         let noop: &DeltaSink = &|_: &str| {};
-        let run = |judge: Option<Vec<String>>, work: Option<Vec<String>>| {
+        let run_answer = |judge: Option<Vec<String>>, work: Option<Vec<String>>, answer| {
             let runner: Arc<dyn StepRunner> = Arc::new(Gatewayed {
                 providers: [("codex", work), ("pi", judge)].into_iter().collect(),
+                answer,
             });
             let (_o, v, e) =
                 run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
             (v, e.judge_skipped)
         };
+        let run = |judge, work| run_answer(judge, work, "PASS\nchecked\nPASS");
         let chatgpt = Some(vec!["chatgpt.com:443".to_string()]);
         // The attacker's roster: `pi` turns out to call codex's provider.
         let (v, skipped) = run(chatgpt.clone(), chatgpt.clone());
@@ -8992,6 +8999,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|w| w.contains("same provider")),
             "{skipped:?}"
+        );
+        // (codex review on P1, SILENT-OK) A REJECT from that judge is never turned into a skip
+        // that reduced assurance could pass: its denial stands.
+        let (v, _) = run_answer(chatgpt.clone(), chatgpt.clone(), "REJECT\nbroken\nREJECT");
+        assert!(
+            v.is_some_and(|v| !v.pass),
+            "a shared-provider denial still denies"
         );
         // Another provider stands.
         let (v, skipped) = run(Some(vec!["api.anthropic.com:443".into()]), chatgpt.clone());

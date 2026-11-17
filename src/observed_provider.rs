@@ -61,40 +61,65 @@ pub(crate) fn take_receipts() -> Vec<LaunchReceipt> {
     RECEIPTS.with(|r| std::mem::take(&mut *r.borrow_mut()))
 }
 
-/// Everything the launches of `seat` among `receipts` were observed calling; `None` when there was
-/// none, or any of them was unobserved (one unobserved turn hides what it called).
-pub(crate) fn observed_for(receipts: &[LaunchReceipt], seat: &str) -> Option<Vec<Provider>> {
-    let mut out: Vec<Provider> = Vec::new();
-    let mut any = false;
-    for r in receipts.iter().filter(|r| r.seat == seat) {
-        any = true;
-        for p in r.providers.as_ref()? {
-            if !out.contains(p) {
-                out.push(p.clone());
-            }
-        }
-    }
-    any.then_some(out)
+/// What the launches of one seat among a set of receipts were observed calling: every provider
+/// any of them was seen calling, and whether EVERY one of them was observed. A known shared
+/// provider is proven by `providers` alone; proving that two launches are independent also needs
+/// `complete` (one unobserved turn may have called anything).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub(crate) struct Observed {
+    pub(crate) providers: Vec<Provider>,
+    pub(crate) complete: bool,
 }
 
-/// Whether a judge's verdict stands against what the work was observed calling: a judge observed
-/// calling a provider the work was observed calling is not independent of it — its verdict is
-/// discarded and the reason returned. When either side is unobserved nothing is proven here
-/// (`None`); the caller's own rules decide, and nothing is re-admitted on an unobserved launch.
-pub(crate) fn same_provider(
-    judge: Option<&[Provider]>,
-    work: Option<&[Provider]>,
-) -> Option<String> {
-    let (judge, work) = (judge?, work?);
+impl Observed {
+    /// Fully observed, with at least one provider: what independence can be proven on (the
+    /// validator author's re-admission, crew#972 decision 2, builds on it).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn known(&self) -> Option<&[Provider]> {
+        (self.complete && !self.providers.is_empty()).then_some(self.providers.as_slice())
+    }
+}
+
+/// [`Observed`] for the launches of `seat` among `receipts`; never launched: nothing known, not
+/// complete.
+pub(crate) fn observed_for(receipts: &[LaunchReceipt], seat: &str) -> Observed {
+    let mut out = Observed::default();
+    let mut any = false;
+    let mut all = true;
+    for r in receipts.iter().filter(|r| r.seat == seat) {
+        any = true;
+        match &r.providers {
+            Some(ps) => {
+                for p in ps {
+                    if !out.providers.contains(p) {
+                        out.providers.push(p.clone());
+                    }
+                }
+            }
+            None => all = false,
+        }
+    }
+    out.providers.sort();
+    out.complete = any && all;
+    out
+}
+
+/// Whether a judge's verdict stands against what the work was observed calling: a judge seen
+/// calling a provider the work was seen calling is not independent of it, and the reason is
+/// returned. A KNOWN shared provider is proof even when other turns went unobserved; with no
+/// shared provider seen nothing is proven here (`None`) and the caller's own rules decide —
+/// nothing is ever re-admitted on an incomplete observation ([`Observed::known`]).
+pub(crate) fn same_provider(judge: &Observed, work: &Observed) -> Option<String> {
     let shared: Vec<&str> = judge
+        .providers
         .iter()
-        .filter(|p| work.contains(p))
+        .filter(|p| work.providers.contains(p))
         .map(String::as_str)
         .collect();
     (!shared.is_empty()).then(|| {
         format!(
             "the judge called the same provider as the work it judged ({}), as the seat gateway \
-             recorded both: its verdict is discarded",
+             recorded both: its approval is not independent and is discarded",
             shared.join(", ")
         )
     })
@@ -145,8 +170,8 @@ mod tests {
         assert_eq!(providers_of(&r), Some(vec!["gw1-stub:8080".to_string()]));
     }
 
-    /// Receipts: by seat, any unobserved turn makes the seat's launches unobserved; the verdict
-    /// check proves only what both sides show.
+    /// Receipts, by seat: what was seen is kept (proof of a shared provider) and an unobserved turn
+    /// makes the set incomplete (never proof of independence) — codex review on P1.
     #[test]
     fn receipts_and_the_shared_provider_rule() {
         take_receipts();
@@ -154,31 +179,43 @@ mod tests {
         record_receipt("claude", Some(vec!["api.anthropic.com:443".into()]));
         let r = take_receipts();
         assert!(take_receipts().is_empty(), "taken once");
+        let codex = observed_for(&r, "codex");
+        assert_eq!(codex.known(), Some(&["chatgpt.com:443".to_string()][..]));
         assert_eq!(
-            observed_for(&r, "codex"),
-            Some(vec!["chatgpt.com:443".to_string()])
+            observed_for(&r, "pi").known(),
+            None,
+            "never launched: unobserved"
         );
-        assert_eq!(observed_for(&r, "pi"), None, "never launched: unobserved");
         let mixed = vec![
-            LaunchReceipt {
-                seat: "codex".into(),
-                providers: Some(vec!["a".into()]),
-            },
             LaunchReceipt {
                 seat: "codex".into(),
                 providers: None,
             },
+            LaunchReceipt {
+                seat: "codex".into(),
+                providers: Some(vec!["a".into()]),
+            },
         ];
-        assert_eq!(
-            observed_for(&mixed, "codex"),
-            None,
-            "one unobserved turn hides the rest"
+        let m = observed_for(&mixed, "codex");
+        assert_eq!(m.providers, vec!["a".to_string()]);
+        assert!(!m.complete && m.known().is_none());
+        let seen = |p: &[&str], complete: bool| Observed {
+            providers: p.iter().map(|s| s.to_string()).collect(),
+            complete,
+        };
+        assert!(same_provider(&seen(&["a"], true), &seen(&["a"], true))
+            .is_some_and(|w| w.contains("same provider")));
+        assert!(
+            same_provider(&seen(&["a"], true), &m).is_some(),
+            "proof despite a gap"
         );
-        let a = vec!["api.anthropic.com:443".to_string()];
-        let c = vec!["chatgpt.com:443".to_string()];
-        assert!(same_provider(Some(&a), Some(&a)).is_some_and(|w| w.contains("same provider")));
-        assert_eq!(same_provider(Some(&a), Some(&c)), None);
-        assert_eq!(same_provider(None, Some(&c)), None);
-        assert_eq!(same_provider(Some(&a), None), None);
+        assert_eq!(
+            same_provider(&seen(&["a"], true), &seen(&["c"], true)),
+            None
+        );
+        assert_eq!(
+            same_provider(&Observed::default(), &seen(&["c"], true)),
+            None
+        );
     }
 }
