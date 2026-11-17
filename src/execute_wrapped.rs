@@ -4929,8 +4929,13 @@ impl WrappedCliStepRunner {
             drop(prompt_guard.take());
             // Revoke the seat's gateway key and keep what the gateway recorded for it (each
             // model request's status, model, tool calls, text and usage) as the unit's evidence.
+            // (core#1543) …and the launch's receipt: the providers it was observed calling, under
+            // the seat it was launched as. No lease (the host floor, an unseated launch):
+            // unobserved.
+            let mut observed: Option<Vec<crate::observed_provider::Provider>> = None;
             if let Some(lease) = gateway_lease.take() {
                 let records = lease.release();
+                observed = crate::observed_provider::providers_of(&records);
                 let phase = gov_env
                     .as_ref()
                     .map(|g| g.phase.clone())
@@ -4941,6 +4946,7 @@ impl WrappedCliStepRunner {
                     &records,
                 );
             }
+            crate::observed_provider::record_receipt(&cli_key, observed);
             let mut bounded = bounded;
             fail_closed_on_unrecorded_refusal(&mut bounded, unrecorded_refusal);
             // The process's own exit code, before any settle below rewrites it.

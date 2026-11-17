@@ -2102,6 +2102,11 @@ pub(crate) struct GatewayRecord {
     pub(crate) status: u16,
     pub(crate) unit: String,
     pub(crate) run: String,
+    /// (core#1543) The upstream the gateway sent the request to (`endpoint`, from the gateway's
+    /// own route config: `api.anthropic.com:443`, `chatgpt.com:443`…), never anything the seat
+    /// sent. Absent on a request the gateway answered itself (readiness) or refused.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) endpoint: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) tools: Vec<String>,
     pub(crate) input_tokens: Option<u64>,
@@ -2153,6 +2158,7 @@ pub(crate) fn parse_records(log: &str, unit_key_name_or_unit: &str) -> Vec<Gatew
                 status: u16::try_from(v["http.status"].as_u64()?).ok()?,
                 unit: unit.into(),
                 run: v["wicked_run"].as_str().unwrap_or("none").into(),
+                endpoint: v["endpoint"].as_str().map(str::to_string),
                 model: v["llm_model"]
                     .as_str()
                     .or_else(|| v["gen_ai.request.model"].as_str())
@@ -3788,6 +3794,7 @@ mod tests {
                 status: 200,
                 unit: "1".into(),
                 run: "run-a".into(),
+                endpoint: Some("gw1-stub:8080".into()),
                 model: Some("claude-proof".into()),
                 tools: vec!["Bash".into()],
                 input_tokens: Some(14),
@@ -3848,6 +3855,7 @@ mod tests {
                 status: 200,
                 unit: "1".into(),
                 run: "none".into(),
+                endpoint: None,
                 model: Some("model".into()),
                 tools: vec!["Read".into()],
                 input_tokens: Some(0),

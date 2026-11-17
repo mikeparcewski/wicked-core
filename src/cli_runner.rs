@@ -4458,6 +4458,13 @@ fn fallback_judge(
                 return FallbackJudge::Answered(av);
             }
             Err(e) => {
+                // (core#1543, coord codex-check 2 on #1547) The same search as the rotation's: a
+                // seat that approved while calling the work's provider is not independent, and the
+                // ladder moves on to its next seat — never ends on it.
+                if let Some(ni) = e.downcast_ref::<crate::validator::NoIndependentJudge>() {
+                    failures.push(format!("{ni} — fallback judge"));
+                    continue;
+                }
                 if let Some(nv) = e.downcast_ref::<crate::validator::JudgeNoVerdict>() {
                     // An answer without a verdict escalates, labelled — never a re-ask.
                     let fb = disclosure(&nv.seat);
@@ -4527,17 +4534,31 @@ fn judge_error_or_fallback(
     note_refusals: &RefusalSink<'_>,
     emit_delta: &DeltaSink,
 ) -> crate::validator::AgentVerdict {
+    // (core#1543) The rotation ran out of INDEPENDENT judges: the ladder continues the same search
+    // over the fallback seats; only when it runs out too does the gate hold.
+    let independent = e
+        .downcast_ref::<crate::validator::NoIndependentJudge>()
+        .cloned();
     let Some(refusals) = e
         .downcast_ref::<crate::validator::JudgeUnavailable>()
         .map(|u| u.refusals.clone())
+        .or_else(|| independent.as_ref().map(|ni| ni.refusals.clone()))
     else {
         return crate::validator::AgentVerdict::from_judge_error(who, e);
     };
     let held = crate::validator::AgentVerdict::from_judge_error(who, e);
+    // A seat that wrote a verdict and exited non-zero ends the search with the hold, as before —
+    // also beside same-provider approvals (codex confirmation on #1547).
     if !only_seat_refusals(&refusals, refused) {
         return held;
     }
-    let (preferred, reason) = unavailable_preferred(&refusals);
+    let (preferred, reason) = match &independent {
+        Some(ni) => (
+            ni.seats.clone(),
+            "no judge independent of the work's provider".to_string(),
+        ),
+        None => unavailable_preferred(&refusals),
+    };
     let tried = crate::validator::distinct_judge_keys(excluded, walked);
     let Some(candidates) = extra_ids.and_then(|ids| {
         fallback_candidates(
@@ -5114,6 +5135,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .requested_rejudge
         .as_ref()
         .filter(|j| !j.consumed && floor_rerun.is_none());
+    // (core#1543) The receipts of THIS unit's own launch, read back below.
+    crate::observed_provider::take_receipts();
     let output = match floor_rerun {
         Some(r) => {
             engine_note(
@@ -5189,6 +5212,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // failed (a nonzero exit after the answer, a stderr line) but whose answer carries its verdict
     // completed its work. It folds as a completed turn, so a FAIL is judged as a FAIL — the gate, or
     // a send-back — and is never failed over to another seat that might say PASS.
+    // (core#1543) The providers the unit's own launch was observed calling.
+    let work_observed = crate::observed_provider::observed_for(
+        &crate::observed_provider::take_receipts(),
+        input.unit.assigned_cli.as_deref().unwrap_or("claude"),
+    );
     let output = verdict_completes_the_turn(&input.unit, output, emit_delta);
     // DES-002 §8.8: the PA's review of a member's step has no judge and no floor (below), so
     // none of the floor's inputs below is computed for it.
@@ -5674,6 +5702,10 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
+    // (core#1543) The judge's search knows what the work called: an approval on that provider is
+    // never independent (`validator::NoIndependentJudge`, the fallback ladder continues it).
+    crate::observed_provider::take_receipts();
+    let _judging = crate::observed_provider::JudgingWork::of(&work_observed);
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
         // early without a closure (closures cannot mutate `judge_skipped`).
@@ -8875,6 +8907,372 @@ mod tests {
     /// the pinned validator's author, a benched seat and an unusable one are each named missing
     /// with why, and the seat the rotation would ask is eligible. With every other seat out, no
     /// seat is eligible.
+    /// (core#1543, KEY + SILENT-OK) Verify what each launch called: whatever the judge's seat is
+    /// called, a judge the seat gateway saw calling the provider the work's launch called is not
+    /// independent of it — its verdict is discarded and the gate says why (a required judge then
+    /// holds it). A judge seen calling another provider stands; anything unobserved changes nothing.
+    #[test]
+    fn core_1543_a_judge_seen_calling_the_works_provider_is_discarded() {
+        struct Gatewayed {
+            providers: std::collections::HashMap<&'static str, Option<Vec<String>>>,
+            answer: &'static str,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                // What the carrier records when it releases the launch's gateway lease.
+                crate::observed_provider::record_receipt(
+                    &seat,
+                    self.providers.get(seat.as_str()).cloned().flatten(),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: self.answer.into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1543-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("codex".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        // `pi` is the only judge distinct by key from codex (the work) and claude (the
+        // validator's author).
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let noop: &DeltaSink = &|_: &str| {};
+        let run_answer = |judge: Option<Vec<String>>, work: Option<Vec<String>>, answer| {
+            let runner: Arc<dyn StepRunner> = Arc::new(Gatewayed {
+                providers: [("codex", work), ("pi", judge)].into_iter().collect(),
+                answer,
+            });
+            let (_o, v, e) =
+                run_unit_and_judge_with_roster(&runner, &input, None, noop, &roster, &[], &[]);
+            (v, e.judge_skipped)
+        };
+        let run = |judge, work| run_answer(judge, work, "PASS\nchecked\nPASS");
+        let chatgpt = Some(vec!["chatgpt.com:443".to_string()]);
+        // The attacker's roster: `pi` turns out to call codex's provider.
+        let (v, _) = run(chatgpt.clone(), chatgpt.clone());
+        let v = v.expect("a hold");
+        assert!(
+            !v.pass,
+            "a shared provider is never an independent approval"
+        );
+        assert!(
+            v.seat_failure
+                .as_deref()
+                .is_some_and(|w| w.contains("no judge independent")),
+            "{v:?}"
+        );
+        // (codex review on P1, SILENT-OK) A REJECT from that judge is never turned into a skip
+        // that reduced assurance could pass: its denial stands.
+        let (v, _) = run_answer(chatgpt.clone(), chatgpt.clone(), "REJECT\nbroken\nREJECT");
+        assert!(
+            v.is_some_and(|v| !v.pass && v.judge_cli.as_deref() == Some("pi")),
+            "a shared-provider denial still denies, as the judge's own verdict"
+        );
+        // Another provider stands.
+        let (v, skipped) = run(Some(vec!["api.anthropic.com:443".into()]), chatgpt.clone());
+        assert_eq!(
+            v.and_then(|v| v.judge_cli).as_deref(),
+            Some("pi"),
+            "{skipped:?}"
+        );
+        // Unobserved (either side): nothing proven here, today's rules stand.
+        assert!(run(None, chatgpt.clone()).0.is_some());
+        assert!(run(chatgpt, None).0.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (coord codex-check on #1547) A same-provider approval never holds a gate while an
+    /// independent seat is there: Claude's work, Pi on Claude's provider, Codex on another — in
+    /// either roster order, Codex judges and its approval stands. With no seat on another provider
+    /// the approval is discarded and the gate holds.
+    #[test]
+    fn core_1543_an_independent_seat_later_in_the_roster_judges_before_any_hold() {
+        struct Gatewayed {
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let provider = if seat == "codex" {
+                    "chatgpt.com:443"
+                } else {
+                    "api.anthropic.com:443"
+                };
+                crate::observed_provider::record_receipt(&seat, Some(vec![provider.into()]));
+                if input.unit.session_id == "validator" {
+                    self.asked.lock().unwrap().push(seat.clone());
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1547-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("claude".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        let run = |order: &[&str]| {
+            let roster: Vec<crate::AgenticCli> = order
+                .iter()
+                .map(|k| seat(k, &format!("{k} -p {{PROMPT}}")))
+                .collect();
+            let runner = Arc::new(Gatewayed {
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let r: Arc<dyn StepRunner> = runner.clone();
+            let (_o, v, e) =
+                run_unit_and_judge_with_roster(&r, &input, None, noop, &roster, &[], &[]);
+            let asked = runner.asked.lock().unwrap().clone();
+            (v, e.judge_skipped, asked)
+        };
+        for order in [["claude", "pi", "codex"], ["pi", "claude", "codex"]] {
+            let (v, skipped, asked) = run(&order);
+            let v = v.unwrap_or_else(|| panic!("{order:?}: held: {skipped:?} (asked {asked:?})"));
+            assert_eq!(
+                v.judge_cli.as_deref(),
+                Some("codex"),
+                "{order:?}: {asked:?}"
+            );
+            assert!(v.pass, "{order:?}");
+            assert!(skipped.is_none(), "{order:?}: {skipped:?}");
+        }
+        // No seat on another provider: the search runs out and the gate holds (a seat failure,
+        // never the same-provider approval).
+        let (v, _, _) = run(&["claude", "pi"]);
+        let v = v.expect("a hold");
+        assert!(!v.pass && v.judge_cli.is_none());
+        assert!(
+            v.seat_failure
+                .as_deref()
+                .is_some_and(|w| w.contains("no judge independent")),
+            "{v:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (coord codex-check 2 on #1547) ONE search for an independent judge, run by the rotation and
+    /// the fallback ladder alike: Pi's work observed on Anthropic, codex and copilot benched, the
+    /// ladder's seats claude (Anthropic) then agy. Claude's approval is not independent and never
+    /// ends the search: agy judges. And the rotation running out hands the search to the ladder
+    /// (`judge_error_or_fallback`), never to a hold while a ladder seat is independent.
+    #[test]
+    fn core_1543_the_fallback_ladder_continues_the_same_independent_search() {
+        struct Gw;
+        impl StepRunner for Gw {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let provider = match seat.as_str() {
+                    "agy" => "generativelanguage.googleapis.com:443",
+                    "codex" | "copilot" => "chatgpt.com:443",
+                    _ => "api.anthropic.com:443",
+                };
+                crate::observed_provider::record_receipt(&seat, Some(vec![provider.into()]));
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let work = crate::observed_provider::Observed {
+            providers: vec!["api.anthropic.com:443".into()],
+            complete: true,
+        };
+        let _judging = crate::observed_provider::JudgingWork::of(&work);
+        crate::observed_provider::take_receipts();
+        let candidates = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("agy", "agy -p {PROMPT}"),
+        ];
+        let noop_refusals = |_: &[(String, String)]| {};
+        let noop: &DeltaSink = &|_: &str| {};
+        match fallback_judge(
+            "agent validator",
+            "the work is correct",
+            "work",
+            &["pi"],
+            &candidates,
+            vec!["codex".into(), "copilot".into()],
+            "codex and copilot benched (quota)".into(),
+            &Gw,
+            &noop_refusals,
+            noop,
+        ) {
+            FallbackJudge::Answered(av) => {
+                assert_eq!(av.judge_cli.as_deref(), Some("agy"), "{av:?}");
+                assert!(av.pass);
+            }
+            FallbackJudge::NoCandidate => panic!("no candidate"),
+            FallbackJudge::Failed(f) => panic!("held: {f:?}"),
+        }
+        // With agy also on the work's provider, the ladder runs out: a hold (seat failure).
+        let only_same = vec![seat("claude", "claude -p {PROMPT}")];
+        assert!(matches!(
+            fallback_judge(
+                "agent validator",
+                "c",
+                "w",
+                &["pi"],
+                &only_same,
+                vec![],
+                String::new(),
+                &Gw,
+                &noop_refusals,
+                noop,
+            ),
+            FallbackJudge::Failed(_)
+        ));
+    }
+
+    /// (codex confirmation on #1547, mixed exhaustion) A seat that wrote a verdict and exited
+    /// non-zero ends the search with the hold even beside a same-provider approval: the ladder is
+    /// never asked, so a fallback approval cannot paper over that REJECT.
+    #[test]
+    fn core_1543_a_verdict_bearing_failure_holds_beside_a_same_provider_approval() {
+        struct Asked(std::sync::Mutex<Vec<String>>);
+        impl StepRunner for Asked {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                self.0.lock().unwrap().push(seat.clone());
+                crate::observed_provider::record_receipt(
+                    &seat,
+                    Some(vec!["generativelanguage.googleapis.com:443".into()]),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let work = crate::observed_provider::Observed {
+            providers: vec!["api.anthropic.com:443".into()],
+            complete: true,
+        };
+        let _judging = crate::observed_provider::JudgingWork::of(&work);
+        crate::observed_provider::take_receipts();
+        let mut agy = seat("agy", "agy -p {PROMPT}");
+        agy.binary = "agy".into();
+        let pool = vec![agy];
+        let registry = vec![seat("pi", "pi -p {PROMPT}"), pool[0].clone()];
+        let runner = Asked(std::sync::Mutex::new(Vec::new()));
+        let e: anyhow::Error = crate::validator::NoIndependentJudge {
+            seats: vec!["claude".into()],
+            refusals: vec!["codex: exited 1".into()],
+        }
+        .into();
+        let refused = vec![("codex".to_string(), "REJECT\nbroken\nREJECT".to_string())];
+        let noop_refusals = |_: &[(String, String)]| {};
+        let noop: &DeltaSink = &|_: &str| {};
+        let v = judge_error_or_fallback(
+            "agent validator",
+            e,
+            &refused,
+            "the work is correct",
+            "work",
+            &["pi"],
+            Some(vec![]),
+            &[],
+            &[],
+            JudgeFallbackCtx {
+                pool: &pool,
+                registry: &registry,
+                bench: &[],
+                work_authors: &[],
+                author_binaries: Some(&[]),
+                reprobe: false,
+                rule_council: None,
+            },
+            &runner,
+            &noop_refusals,
+            noop,
+        );
+        assert!(!v.pass && v.judge_cli.is_none(), "{v:?}");
+        assert!(
+            v.seat_failure
+                .as_deref()
+                .is_some_and(|w| w.contains("no judge independent")),
+            "{v:?}"
+        );
+        assert!(runner.0.lock().unwrap().is_empty(), "the ladder was asked");
+    }
+
     #[test]
     fn rejudge_seats_name_the_eligible_judge_and_why_the_rest_cannot() {
         let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
