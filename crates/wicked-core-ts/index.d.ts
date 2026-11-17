@@ -561,7 +561,8 @@ export declare class Core {
    * `GateActions` object `{ord, gateKind, planRev?, actions: [{action, intent, note,
    * noteIntent?, seats?, rules?, needsPlanRev?}]}`, or `null` when the run is not awaiting a
    * human. Each listed answer is one `confirmGate` (or, for `reassign`, `reassignUnit` then
-   * approve) accepts; nothing else is. Read-only.
+   * approve) accepts; nothing else is. Writes nothing to the store (wicked-core#1522: the
+   * rejudge probe's seat-directory preparation).
    */
   gateActions(runId: string): Promise<string>
   /** List every registered repository, as a JSON array of `RepoEntry` objects. */

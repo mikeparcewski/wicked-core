@@ -1265,7 +1265,8 @@ impl Core {
     /// does at this gate, whether it needs a note, and a reassign's seats — computed by running
     /// each candidate through the decision path's own pre-checks, so the list is exactly what
     /// [`Core::confirm_gate`] (and a parked reassign) accepts. `None` when the run is not awaiting
-    /// a human. Read-only.
+    /// a human. Writes nothing to the store (the rejudge probe's seat-directory preparation is
+    /// wicked-core#1522).
     pub fn gate_actions(&self, run_id: &str) -> anyhow::Result<Option<GateActions>> {
         let (reply, rx) = channel();
         self.tx

@@ -9,7 +9,9 @@
 //! skin renders exactly this list, so a card can no longer offer an answer the engine refuses, hide
 //! one it takes, or label one as something it does not do.
 //!
-//! READ-ONLY: nothing here writes the store or resolves a row.
+//! It writes nothing to the store and resolves no row. One inherited exception: the `rejudge` probe
+//! on a `judge_unavailable` gate reads `registry_roster`, whose sign-in fill prepares seat config
+//! directories (wicked-core#1522).
 
 use serde::{Deserialize, Serialize};
 use wicked_apps_core::GraphStore;
@@ -43,7 +45,9 @@ pub struct GateAction {
     /// `amend_intent`, `consent:<id>`, a loop's choice) | `reassign` (`POST /runs/:id/reassign`).
     pub action: String,
     /// What it does AT THIS GATE — the label a skin draws comes from here, never from the prompt:
-    /// `continue`, `retry`, `land_with_carried_items`, `operator_judgment`, `deliver`, `complete`,
+    /// `continue`, `retry`, `land_with_carried_items`, `operator_judgment`, `accept_work` (a team
+    /// dispute's approve: the disputed work counts), `continue_team` (a team transport pause's
+    /// approve: the missing team fact is published), `deliver`, `complete`,
     /// `approve_plan`, `send_back`, `stop`, `reseat_and_retry`, or the action token itself.
     pub intent: String,
     pub note: NoteRule,
@@ -443,6 +447,8 @@ fn answer_actions(
     // REASSIGN: re-seat the gated unit, then approve it (crew's `POST /runs/:id/reassign`) — so
     // only where the plain approve RE-RUNS or RUNS the unit (never where it lands, judges or
     // delivers the work), on a seat step, on the seats the re-seat takes.
+    // (studio#1170 codex-check) Only where that approve RE-RUNS or RUNS the step itself: never at a team pause, whose
+    // approve answers the team (a dispute's counts the disputed work).
     if matches!(approve_intent, "retry" | "continue") && takes(&plain) {
         if let Some(unit) = cursor.filter(|u| u.tool_cmd.is_none()) {
             let current = unit.assigned_cli.as_deref().unwrap_or("claude");
@@ -487,6 +493,14 @@ fn approve_intent(
 ) -> &'static str {
     if adjudication_open {
         return "land_with_carried_items";
+    }
+    // A team dispute's approve COUNTS the disputed work (`answer_dispute_gate`: `DisputeApproved`); a team transport
+    // pause's approve publishes the missing team fact and the run goes on. Neither re-runs the step.
+    if super::team_gate::dispute_gate_open(session) {
+        return "accept_work";
+    }
+    if super::team_gate::transport_gate_open(session) {
+        return "continue_team";
     }
     if cursor
         .is_some_and(|u| u.member_step.is_none() && super::approve_is_operator_judgment(session, u))

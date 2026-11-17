@@ -30252,10 +30252,29 @@ mod request_changes_tests {
             .unwrap()
             .expect("a gate is open");
         let mut accepted = std::collections::BTreeSet::new();
+        let cursor_ord = {
+            let s = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            crate::domain::session_units(&store, &run_id).unwrap()[s.unit_ix].ord
+        };
         for (label, d) in candidate_answers(&store, &run_id) {
             let mut fresh = open_store(Some(":memory:")).unwrap();
             seed(&mut fresh, &run_id);
             if answer(&mut fresh, &run_id, d).0.is_ok() {
+                // (codex-check on #1512) THE INTENT IS WHAT THE ENGINE DOES: the plain approve's
+                // published intent is checked against what that approve scheduled.
+                if label == "approve" {
+                    let intent = action(&listed, "approve").map(|a| a.intent.clone());
+                    assert_intent_effect(
+                        name,
+                        intent.as_deref(),
+                        &fresh,
+                        &run_id,
+                        cursor_ord,
+                        None,
+                    );
+                }
                 accepted.insert(label);
             }
         }
@@ -30293,6 +30312,15 @@ mod request_changes_tests {
                     approved.is_ok(),
                     "{name}: re-seat on {cli}, then approve: {approved:?}"
                 );
+                // `reseat_and_retry`: the step runs again, on that seat — never counted as it stood.
+                assert_intent_effect(
+                    name,
+                    Some("reseat_and_retry"),
+                    &fresh,
+                    &run_id,
+                    unit.ord,
+                    Some(cli),
+                );
                 expected.push(cli.clone());
             }
         }
@@ -30301,6 +30329,45 @@ mod request_changes_tests {
             .unwrap_or_default();
         assert_eq!(seats, expected, "{name}: reassign seats");
         listed
+    }
+
+    /// (codex-check on #1512) What an answer's published INTENT promises, checked against the run
+    /// after the engine took it: an intent that re-runs or runs the step leaves it NOT counted (and a
+    /// re-seat leaves it on the new seat); an intent that accepts the work counts it.
+    fn assert_intent_effect(
+        name: &str,
+        intent: Option<&str>,
+        store: &dyn GraphStore,
+        run_id: &str,
+        ord: u32,
+        seat: Option<&str>,
+    ) {
+        let Some(intent) = intent else { return };
+        let unit = crate::domain::session_units(store, run_id)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.ord == ord)
+            .expect("the gated unit");
+        let counted = unit.status == UnitStatus::Done;
+        match intent {
+            "retry" | "continue" | "deliver" | "reseat_and_retry" => {
+                assert!(
+                    !counted,
+                    "{name}: `{intent}` counted unit {ord} instead of running it"
+                );
+            }
+            "land_with_carried_items" | "operator_judgment" | "accept_work" => {
+                assert!(counted, "{name}: `{intent}` did not count unit {ord}");
+            }
+            _ => {}
+        }
+        if let Some(seat) = seat {
+            assert_eq!(
+                unit.assigned_cli.as_deref(),
+                Some(seat),
+                "{name}: re-seated on {seat}"
+            );
+        }
     }
 
     /// (studio#1170) THE ENGINE'S SIDE OF THE CROSS-REPO CONTRACT: every shape's list is pinned in
@@ -30678,6 +30745,47 @@ mod request_changes_tests {
             Some("send_back"),
             "{listed:#?}"
         );
+        // Its plain approve COUNTS the disputed work (`DisputeApproved`): said so, never a retry.
+        assert_eq!(approve.intent, "accept_work");
+    }
+
+    /// (codex-check on #1512, W20) A MEMBER-STEP team dispute: a reassign there would re-seat, then
+    /// approve — and the approve counts the disputed member output without its review re-running.
+    /// So no reassign is published at any team pause, and the approve says it accepts the work.
+    #[test]
+    fn gate_actions_member_step_dispute_offers_no_reassign_and_says_approve_accepts() {
+        let run_id = format!("ga-dispute-member-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut s = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        s.unit_ix = 2;
+        s.clis = vec!["claude".into(), "codex".into(), "pi".into()];
+        s.team = Some(crate::domain::RunTeamState {
+            dispute: Some(crate::domain::DisputeGate {
+                gate_id: "g-2".into(),
+                ord: 3,
+                attempt: 0,
+                kind: crate::domain::DisputeKind::MemberStep,
+                finding_ids: Vec::new(),
+            }),
+            ..Default::default()
+        });
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        units[2].status = UnitStatus::Pending;
+        units[2].member_step = Some(crate::domain::MemberStepState {
+            member: "codex".into(),
+            ..Default::default()
+        });
+        put_node(&mut store, units[2].to_node()).unwrap();
+        open_row(&mut store, &run_id, 3, team_gate::TEAM_DISPUTE_GATE);
+        let listed = gate_actions::gate_actions(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert!(action(&listed, "reassign").is_none(), "{listed:#?}");
+        assert_eq!(action(&listed, "approve").unwrap().intent, "accept_work");
     }
 
     /// (core#782) A read-only phase's floor gate: an approve with a note is a FLOOR FIX.
