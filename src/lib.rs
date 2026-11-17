@@ -237,6 +237,7 @@ pub(crate) mod test_env {
 }
 
 pub use acp_runner::AcpStepRunner;
+pub use actor::gate_actions::{GateAction, GateActions, NoteRule};
 pub use actor::{NoEligibleSeat, RunBusy, RunExists, CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 pub use actor_stats::{ActorStatsView, CommandTiming, RunningCommand, SlowCommand};
 pub use applications::{
@@ -587,17 +588,27 @@ pub fn qe_reviewers_admitted(seats: &[(String, Option<String>)]) -> Vec<bool> {
         .collect()
 }
 
-/// Resolve the council roster from the registry (built-ins merged with the user's
-/// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
-/// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
-/// what a consumer passes as [`LaunchSpec::clis`] for a real run.
-pub fn registry_roster() -> Vec<AgenticCli> {
+/// (studio#1170) The registry's seat records as [`registry_roster`] filters them — usable for
+/// council or work — WITHOUT filling the sign-in / sign-out commands (resolving those prepares the
+/// seats' config directories). What a READ-ONLY path (a gate's published actions) consults for a
+/// seat's eligibility; anything that shows or runs a sign-in reads [`registry_roster`].
+pub fn registry_records() -> Vec<AgenticCli> {
     let user = std::env::var_os("HOME")
         .map(|h| std::path::PathBuf::from(h).join(".config/wicked-council/clis.toml"));
     wicked_council::registry::load(user.as_deref())
         .unwrap_or_default()
         .into_iter()
         .filter(|c| c.enabled_for_council || c.seat_eligible_for_work)
+        .collect()
+}
+
+/// Resolve the council roster from the registry (built-ins merged with the user's
+/// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
+/// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
+/// what a consumer passes as [`LaunchSpec::clis`] for a real run.
+pub fn registry_roster() -> Vec<AgenticCli> {
+    registry_records()
+        .into_iter()
         .map(|mut c| {
             // Fill the seat's sign-in command from the built-in table when the registry entry
             // does not override it — consumers (the studio's sign-in terminal) read it off the
@@ -1242,6 +1253,26 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::RejudgeReadiness {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (studio#1170, crew#1512) Every answer the run's open gate takes NOW — its token, what it
+    /// does at this gate, whether it needs a note, and a reassign's seats — computed by running
+    /// each candidate through the decision path's own pre-checks, so the list is exactly what
+    /// [`Core::confirm_gate`] (and a parked reassign) accepts — except at an Apps publish's consent
+    /// gate, judged on the QE record's tree (a tree changed since the QE PASS is refused on answer,
+    /// wicked-core#1534). `None` when the run is not awaiting
+    /// a human. Writes nothing to the store (the rejudge probe's seat-directory preparation is
+    /// wicked-core#1522).
+    pub fn gate_actions(&self, run_id: &str) -> anyhow::Result<Option<GateActions>> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::GateActions {
                 run_id: run_id.to_string(),
                 reply,
             })

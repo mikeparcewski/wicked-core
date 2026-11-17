@@ -118,6 +118,12 @@ pub(crate) enum Command {
         run_id: String,
         reply: Sender<anyhow::Result<crate::domain::RejudgeReadiness>>,
     },
+    /// (studio#1170, crew#1512) Every answer the run's open gate takes now — read-only
+    /// ([`crate::GateActions`]); `None` when the run is not awaiting a human.
+    GateActions {
+        run_id: String,
+        reply: Sender<anyhow::Result<Option<crate::GateActions>>>,
+    },
     /// Cancel a run — mark it terminally `Cancelled` and stop dispatching. (Real subprocess kill of an
     /// in-flight worker lands with the wrapped-CLI backend in P4a; for now the cursor stops advancing
     /// and any late worker result is ignored by the idempotency guard.)
@@ -681,6 +687,7 @@ impl Command {
             Command::ConfirmGate { .. } => "ConfirmGate",
             Command::PlanSendBackReady { .. } => "PlanSendBackReady",
             Command::RejudgeReadiness { .. } => "RejudgeReadiness",
+            Command::GateActions { .. } => "GateActions",
             Command::CancelRun { .. } => "CancelRun",
             Command::RegisterRepo { .. } => "RegisterRepo",
             Command::ListRepos { .. } => "ListRepos",

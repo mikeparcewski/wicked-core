@@ -3427,6 +3427,28 @@ pub(super) fn revision_fails_the_run(e: &anyhow::Error) -> bool {
     e.downcast_ref::<RevisionFailsTheRun>().is_some()
 }
 
+/// Whether [`apply_held_revision`] would apply a held revision to the run now: an accepted plan
+/// with a held edit, line or rescore, and a cursor that has not run (or is past the last unit).
+/// READ-ONLY, shared with the gate's published actions (an approve at a terminal gate with a held
+/// revision runs the added step, never completes).
+pub(super) fn held_revision_applies(
+    session: &AgentSession,
+    units: &[crate::domain::WorkUnit],
+) -> bool {
+    let held = session
+        .team_plan
+        .as_ref()
+        .filter(|t| t.accepted_rev > 0 && t.pending.is_none() && t.scope.is_none())
+        .is_some_and(|t| t.rescored.is_some() || !t.plan_lines.is_empty() || !t.edits.is_empty());
+    let cursor = session.unit_ix.min(units.len());
+    held && !units.get(cursor).is_some_and(|u| {
+        !matches!(
+            u.status,
+            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
+        )
+    })
+}
+
 /// (T4, §8.7 "Applying a revision") THE hook: every advance of a run goes through
 /// `advance_or_pause`, which calls this first — the fold's, a dispute answer's, a member step's
 /// acceptance, a gate's. It applies what is held (the human's edits, then a diff re-score that
@@ -3445,24 +3467,14 @@ pub(super) fn apply_held_revision(
     let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
         return Ok(());
     };
-    let Some(prior) = session
-        .team_plan
-        .clone()
-        .filter(|t| t.accepted_rev > 0 && t.pending.is_none() && t.scope.is_none())
-        .filter(|t| t.rescored.is_some() || !t.plan_lines.is_empty() || !t.edits.is_empty())
-    else {
-        return Ok(());
-    };
     let units = crate::domain::session_units(&*store, run_id)?;
-    let cursor = session.unit_ix.min(units.len());
-    if units.get(cursor).is_some_and(|u| {
-        !matches!(
-            u.status,
-            crate::domain::UnitStatus::Pending | crate::domain::UnitStatus::Distributed
-        )
-    }) {
+    if !held_revision_applies(&session, &units) {
         return Ok(());
     }
+    let Some(prior) = session.team_plan.clone() else {
+        return Ok(());
+    };
+    let cursor = session.unit_ix.min(units.len());
     let done: Vec<String> = units[..cursor]
         .iter()
         .map(|u| u.phase_id().unwrap_or_default().to_string())
