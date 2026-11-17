@@ -3657,16 +3657,28 @@ pub(crate) fn rejudge_seats(
     // the pinned validator's author is re-admitted first, when it is a party for that alone.
     let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
     let is_v = |k: &str| k == v || seat_key(k) == v;
+    // (codex on #1525) The SAME guard the rotation applies (`readmit_validator_author` and its
+    // `validator_never`): no author, launch exclusion, work author or recorded binary is the
+    // validator seat, by key or by the identity it launches; every author binary is known; and the
+    // validator seat is not a team monitor of this step (that exclusion would stay).
+    let v_id = crate::validator::excluded_identity(v, roster);
+    let is_v_any = |k: &str| {
+        is_v(k)
+            || crate::validator::normalize_identity(k) == v_id
+            || crate::validator::excluded_identity(k, roster) == v_id
+    };
     let validator_only = pinned
-        && !is_v(&work_author)
+        && !is_v_any(&work_author)
         && !unit
             .authored_by
             .iter()
             .chain(&unit.exclude_seats)
-            .any(|a| is_v(a))
-        && !(evaluator && work_authors.iter().any(|a| is_v(a)))
-        && !unit.authored_binaries.iter().any(|a| is_v(a))
-        && author_binaries.is_some_and(|b| !b.iter().any(|a| is_v(a)));
+            .chain(work_authors)
+            .chain(&unit.authored_binaries)
+            .any(|a| is_v_any(a))
+        && crate::pipeline::author_binaries_known(unit)
+        && author_binaries.is_some_and(|b| !b.iter().any(|a| is_v_any(a)))
+        && !unit_team_monitors(unit).iter().any(|m| is_v_any(m));
     if preferred.is_empty() && validator_only {
         let without: Vec<(String, &'static str)> = parties
             .iter()
@@ -5770,6 +5782,19 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     .then(|| crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string()),
                 )
                 .collect();
+            // (codex on #1525) …by the validator seat's own invocation identity too: a recorded
+            // author binary (or author) that IS what the validator seat launches built the work.
+            let mut validator_never = validator_never;
+            let v_id = crate::validator::excluded_identity(
+                crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
+                roster,
+            );
+            if validator_never.iter().any(|k| {
+                crate::validator::normalize_identity(k) == v_id
+                    || crate::validator::excluded_identity(k, roster) == v_id
+            }) {
+                validator_never.push(crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string());
+            }
             validator_fallback = readmit_validator_author(
                 &mut excluded,
                 work_author,
@@ -9039,10 +9064,74 @@ mod tests {
             rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &roster, &roster);
         assert_eq!(eligible, vec!["claude".to_string()], "{eligible:?}");
         // …but not when the launch excluded it.
-        unit.exclude_seats = vec!["claude".into()];
+        let mut excl = unit.clone();
+        excl.exclude_seats = vec!["claude".into()];
         let (eligible, _) =
-            rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &roster, &roster);
+            rejudge_seats(&excl, &roster, &run, &[], &[], Some(&[]), &roster, &roster);
         assert!(eligible.is_empty(), "{eligible:?}");
+        // (codex on #1525) …nor when an author's recorded binary IS what the validator seat
+        // launches (a wrapper invocation), nor when an author's binaries are unknown, nor when it
+        // monitored the step — the rotation keeps it out in each case, so readiness does too.
+        let wrapped = vec![
+            seat("claude", "claude-wrapper -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let mut ran = unit.clone();
+        ran.authored_by = vec!["codex".into()];
+        ran.authored_binaries = vec!["claude-wrapper".into(), "codex".into()];
+        let (eligible, _) = rejudge_seats(
+            &ran,
+            &wrapped,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &wrapped,
+            &wrapped,
+        );
+        assert!(
+            eligible.is_empty(),
+            "an author ran the validator seat's binary: {eligible:?}"
+        );
+        let mut unknown = unit.clone();
+        unknown.authored_by = vec!["codex".into()];
+        let (eligible, _) = rejudge_seats(
+            &unknown,
+            &roster,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &roster,
+            &roster,
+        );
+        assert!(
+            eligible.is_empty(),
+            "an author's binary is unknown: {eligible:?}"
+        );
+        let mut monitored = unit.clone();
+        monitored.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: String::new(),
+            attempt: 1,
+            seats: Vec::new(),
+            monitors: vec!["claude".into()],
+            consumed: false,
+            at: 0,
+        });
+        let (eligible, _) = rejudge_seats(
+            &monitored,
+            &roster,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &roster,
+            &roster,
+        );
+        assert!(
+            eligible.is_empty(),
+            "claude monitored the step: {eligible:?}"
+        );
     }
 
     #[test]
