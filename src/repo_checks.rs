@@ -3524,6 +3524,10 @@ pub(crate) struct CheckScratch {
     /// only under an exclusive lock, so it never deletes the scratch a floor is building into.
     /// `Option` only so [`Drop`] can release it before retiring an orphaned leaf.
     lease: Option<std::fs::File>,
+    /// (core#1482) The leaf, held since before any check ran there ([`HeldDir`]): the base build
+    /// output is removed through it, so a check that swapped a directory for a link since can
+    /// never redirect the removal ([`drop_base_output`]).
+    held: Option<HeldDir>,
     /// (DES-FLOOR-V2) The run's log store ([`crate::floor_log::run_dir`]) — outside every write
     /// root the boundary arms.
     pub(crate) logs: PathBuf,
@@ -3532,6 +3536,8 @@ pub(crate) struct CheckScratch {
     /// (DES-FLOOR-CONTAINER) Set when this floor's checks run in a fresh Linux container: every
     /// check is spawned there ([`run_one_with`]) instead of under the host's OS sandbox.
     pub(crate) container: Option<std::sync::Arc<crate::checks_container::ChecksFloor>>,
+    /// (core#1482) The run this floor belongs to: a cancel of it ends the floor's checks.
+    run_id: Option<String>,
 }
 
 impl Drop for CheckScratch {
@@ -3545,6 +3551,56 @@ impl Drop for CheckScratch {
         if orphan_path(&self.root).exists() {
             drop(self.lease.take());
             retire_leaf(&self.root);
+            return;
+        }
+        // (core#1482) The floor's base build output goes when the run's LAST floor on this leaf
+        // ends ([`drop_base_output`]); the head target stays for incremental re-floors.
+        drop(self.lease.take());
+        if let Some(held) = self.held.take() {
+            drop_base_output(&held, &self.root);
+        }
+    }
+}
+
+/// (core#1482) Remove `<leaf>/cargo-target/base` — about half a floor's peak disk; its results are
+/// in the run's log store — once no floor of the run holds the leaf, through the leaf `held` since
+/// before any check ran: every step walks from that fd and never follows a link, so a check that
+/// swapped `cargo-target` (or `base`) for a link to an outside directory, even after this looked,
+/// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
+/// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
+/// the lock is released before the slow removal, so the run's next floor never waits on it.
+/// Returns whether the base output is gone.
+fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
+    let aside = format!(".base-drop-{}", random_tmp_name());
+    let target = {
+        let Ok(Some(_exclusive)) = lock_leaf(leaf, true) else {
+            return false;
+        };
+        let target = match held.subdir("cargo-target", false) {
+            Ok(t) => t,
+            // Missing, or not a plain directory (a link a check left): unlinked, never entered.
+            Err(_) => return held.remove_tree("cargo-target").is_ok(),
+        };
+        match target.rename_child("base", &aside) {
+            Ok(true) => target,
+            Ok(false) => return true,
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not set the floor's base build output aside under {}: {e}",
+                    leaf.display()
+                );
+                return false;
+            }
+        }
+    };
+    match target.remove_tree(&aside) {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not drop the floor's base build output under {}: {e}",
+                leaf.display()
+            );
+            false
         }
     }
 }
@@ -3886,9 +3942,11 @@ impl CheckScratch {
             root,
             tmp,
             lease: Some(lease),
+            held: Some(held),
             logs,
             log_cap: log_cap(),
             container: None,
+            run_id: run_id.map(str::to_string),
         })
     }
 
@@ -4958,6 +5016,90 @@ pub fn run_floor_journaled(
 /// [`run_floor_journaled`] with the probe a guarded checkout gives
 /// ([`FloorCheckout::run_floor_journaled`]): a check is journaled only while the checkout still
 /// holds the journal's tree.
+/// (core#1482) Runs whose floor must stop: a cancel marks the run here, every running check of it
+/// is killed at its next poll (its process group), and no floor of it starts. A resume clears it.
+static CANCELLED_FLOORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// How many ended runs [`CANCELLED_FLOORS`] remembers.
+const CANCELLED_FLOORS_KEPT: usize = 512;
+
+/// (core#1482) Mark run `run_id` cancelled for its floor (called with the run's worker cancel).
+pub(crate) fn cancel_floor(run_id: &str) {
+    let mut g = CANCELLED_FLOORS.lock().unwrap_or_else(|p| p.into_inner());
+    if !g.iter().any(|r| r == run_id) {
+        g.push(run_id.to_string());
+    }
+    // Bounded: every ended run (and engine one-shot) passes here; the newest are the ones a
+    // still-running floor can belong to.
+    let excess = g.len().saturating_sub(CANCELLED_FLOORS_KEPT);
+    g.drain(..excess);
+}
+
+/// (core#1482) A resumed run's floor may run again.
+pub(crate) fn clear_floor_cancel(run_id: &str) {
+    CANCELLED_FLOORS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|r| r != run_id);
+}
+
+/// (core#1482) Whether run `run_id`'s floor was cancelled.
+pub(crate) fn floor_cancelled(run_id: Option<&str>) -> bool {
+    run_id.is_some_and(|id| {
+        CANCELLED_FLOORS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|r| r == id)
+    })
+}
+
+/// (core#1482) The free space a floor needs on the check cache's volume before it starts, in GiB:
+/// `WICKED_FLOOR_MIN_FREE_GB`, else 15 (an estate floor peaks near 41 GB; two at once filled a
+/// 90 GB host). `0` turns the guard off.
+pub(crate) fn floor_min_free_gib() -> u64 {
+    std::env::var("WICKED_FLOOR_MIN_FREE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(15)
+}
+
+/// The bytes free on the volume holding `path` (the cache cap's own reading, `volume_space`);
+/// `None` when unreadable. Test builds read [`test_free_bytes`] instead, so a nearly full CI
+/// runner never decides a fixture's outcome (the cache cap's `DiskProbe::Off` rule).
+#[cfg(not(test))]
+pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
+    volume_space(path).map(|s| s.free)
+}
+
+#[cfg(test)]
+pub(crate) fn free_bytes(_path: &Path) -> Option<u64> {
+    let v = TEST_FREE_BYTES.with(std::cell::Cell::get);
+    (v != u64::MAX - 1).then_some(v)
+}
+
+// (core#1482) Test seam: the free space the floor's disk guard reads in test builds, per test
+// thread (plenty by default; `u64::MAX - 1` = unreadable).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+/// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
+/// failure), or `None`: `free` bytes against `min_gib`. Unknown free space never refuses.
+pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
+    let free = free?;
+    let min = min_gib.saturating_mul(1 << 30);
+    (min > 0 && free < min).then(|| {
+        format!(
+            "environment: the host has {:.1} GiB free on the check cache's volume, under the \
+             floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
+             space, then retry the step — this is not a failure of the change",
+            free as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
 fn run_floor_inner(
     worktree: &Path,
     ctx: &FloorContext,
@@ -4965,6 +5107,37 @@ fn run_floor_inner(
     journal: Option<&FloorJournal>,
     untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
+    let report = run_floor_body(worktree, ctx, rerun, journal, untouched);
+    stopped_by_cancel(report, ctx.run_id.as_deref())
+}
+
+/// (core#1482, codex confirmation on #1530) A floor whose run was cancelled while it ran is that
+/// cancellation, never a failed or a passed floor: the environment refusal a floor refused at
+/// entry gives (`not_run`), its checks kept for display.
+fn stopped_by_cancel(mut report: RepoChecksReport, run_id: Option<&str>) -> RepoChecksReport {
+    if floor_cancelled(run_id) && report.sandbox_error.is_none() {
+        report.sandbox_error = Some("the run was cancelled: its floor was stopped".into());
+        report.passed = false;
+    }
+    report
+}
+
+fn run_floor_body(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
+) -> RepoChecksReport {
+    // (core#1482) A cancelled run starts no floor; a host short of disk refuses one as an
+    // environment failure (the checks would only fill the disk and fail the link step).
+    if floor_cancelled(ctx.run_id.as_deref()) {
+        return runner_refused(
+            worktree,
+            ctx,
+            "the run was cancelled: its floor does not start".into(),
+        );
+    }
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -4976,6 +5149,15 @@ fn run_floor_inner(
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
+    // (core#1482) The disk guard, measured AFTER the scratch's preparation: that runs the cache
+    // cap's lease-protected eviction (which frees stale leaves when the volume is short), and it
+    // creates the cache root, so its volume can be read on a fresh home.
+    if let Some(why) = check_cache_root()
+        .ok()
+        .and_then(|root| disk_guard(free_bytes(&root), floor_min_free_gib()))
+    {
+        return runner_refused(worktree, ctx, why);
+    }
     // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
     if let Some(root) = scratch.logs.parent() {
         crate::floor_log::gc(
@@ -8501,6 +8683,12 @@ pub(crate) struct HeldDir {
     path: PathBuf,
 }
 
+impl std::fmt::Debug for HeldDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldDir")
+    }
+}
+
 /// `rel`'s components: plain names only (no root, `..`, or empty name; `.` skipped).
 fn rel_names(rel: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
@@ -8738,6 +8926,31 @@ impl HeldDir {
             Ok(st) => Ok(Some(entry_kind(st.st_mode))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// (core#1482) Rename this directory's entry `from` to `to` (plain names), relative to the
+    /// held fd — whatever `from` is, it is moved, never followed. `false`: nothing at `from`.
+    pub(crate) fn rename_child(&self, from: &str, to: &str) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        let (f, t) = (cstr(from.as_bytes())?, cstr(to.as_bytes())?);
+        // SAFETY: `self.fd` is an open directory fd; both names are NUL-terminated.
+        let rc = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                f.as_ptr(),
+                self.fd.as_raw_fd(),
+                t.as_ptr(),
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(format!("`{from}`: {e}"))
         }
     }
 
@@ -9071,6 +9284,14 @@ impl HeldDir {
             Ok(_) => Ok(Some(EntryKind::Other)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    pub(crate) fn rename_child(&self, from: &str, to: &str) -> Result<bool, String> {
+        match std::fs::rename(self.leaf_path(from)?, self.leaf_path(to)?) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("`{from}`: {e}")),
         }
     }
 
@@ -10609,6 +10830,13 @@ pub(crate) fn run_one_with(
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
                 result.timed_out = true;
+                break None;
+            }
+            // (core#1482) The run was cancelled: the check's whole process group ends now.
+            Ok(false) if floor_cancelled(scratch.run_id.as_deref()) => {
+                crate::validator::kill_child_tree(&mut child);
+                crate::validator::reap_bounded(&mut child);
+                result.spawn_error = Some("the run was cancelled".into());
                 break None;
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
@@ -13154,6 +13382,63 @@ exit 1
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// (core#1482) Each floor's base build output goes when the run's last floor on the leaf ends;
+    /// the head target stays. Adversarial (SILENT-OK / data loss): a second floor still building
+    /// keeps it, and a check that turned `base` or `cargo-target` into a symlink never gets the
+    /// removal followed out of the scratch.
+    #[test]
+    fn core_1482_the_last_floor_out_drops_its_base_output_and_follows_no_link() {
+        let base = scratch("cache-drop-base");
+        let cache = base.join("cache");
+        let wt = base.join("repo").join("wicked-worktrees").join("r1");
+        std::fs::create_dir_all(&wt).unwrap();
+        let fill = |leaf: &Path| {
+            std::fs::write(leaf.join("cargo-target/head/h.bin"), "h").unwrap();
+            std::fs::write(leaf.join("cargo-target/base/b.bin"), "b").unwrap();
+        };
+        // Two floors of one run share the leaf: the first out leaves the other's base alone.
+        let a = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+        let leaf = a.root().to_path_buf();
+        let b = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+        fill(&leaf);
+        drop(a);
+        assert!(
+            leaf.join("cargo-target/base/b.bin").is_file(),
+            "b still builds"
+        );
+        drop(b);
+        assert!(
+            !leaf.join("cargo-target/base").exists(),
+            "the last out drops base"
+        );
+        let aside: Vec<_> = std::fs::read_dir(leaf.join("cargo-target"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".base-drop-"))
+            .collect();
+        assert!(aside.is_empty(), "set aside, then removed");
+        assert!(leaf.join("cargo-target/head/h.bin").is_file(), "head stays");
+        // A link a check left: unlinked, its target untouched.
+        #[cfg(unix)]
+        {
+            let outside = base.join("outside");
+            std::fs::create_dir_all(&outside).unwrap();
+            std::fs::write(outside.join("keep"), "k").unwrap();
+            let c = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+            let _ = std::fs::remove_dir_all(leaf.join("cargo-target/base"));
+            std::os::unix::fs::symlink(&outside, leaf.join("cargo-target/base")).unwrap();
+            drop(c);
+            assert!(outside.join("keep").is_file(), "never followed");
+            assert!(std::fs::symlink_metadata(leaf.join("cargo-target/base")).is_err());
+            let d = CheckScratch::prepare_in(&cache, &wt, Some("r1"), u64::MAX).unwrap();
+            std::fs::remove_dir_all(leaf.join("cargo-target")).unwrap();
+            std::os::unix::fs::symlink(&outside, leaf.join("cargo-target")).unwrap();
+            drop(d);
+            assert!(outside.join("keep").is_file(), "never followed");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// (core#1050) Two runs whose ids sanitize to ONE worktree path never share a check-scratch
     /// leaf: the first run's leaf, held by its floor when its worktree is removed, is marked
     /// orphaned rather than left reusable, the second run starts on its own empty leaf, and the
@@ -15542,7 +15827,7 @@ exit 1
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let e = held.write("link/x", "x").unwrap_err();
         assert!(e.contains("passes through a symlink"), "{e}");
-        let e = held.subdir("link", false).err().expect("refused");
+        let e = held.subdir("link", false).expect_err("refused");
         assert!(e.contains("passes through a symlink"), "{e}");
         assert!(held.create_fresh_dir("link/fresh").is_err());
         assert!(held.write_bytes("sub/../link/y", b"y", false).is_err());
