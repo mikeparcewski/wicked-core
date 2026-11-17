@@ -5681,8 +5681,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
-    // (core#1543) Only the judge's own launches are read back after the verdict.
+    // (core#1543) Only the judge's own launches are read back after the verdict, and the judge
+    // rotation knows what the work called (coord codex-check on #1547: an independent seat later
+    // in the roster is tried before any gate holds).
     crate::observed_provider::take_receipts();
+    let _judging = crate::observed_provider::JudgingWork::of(&work_observed);
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
         // early without a closure (closures cannot mutate `judge_skipped`).
@@ -9017,6 +9020,103 @@ mod tests {
         // Unobserved (either side): nothing proven here, today's rules stand.
         assert!(run(None, chatgpt.clone()).0.is_some());
         assert!(run(chatgpt, None).0.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (coord codex-check on #1547) A same-provider approval never holds a gate while an
+    /// independent seat is there: Claude's work, Pi on Claude's provider, Codex on another — in
+    /// either roster order, Codex judges and its approval stands. With no seat on another provider
+    /// the approval is discarded and the gate holds.
+    #[test]
+    fn core_1543_an_independent_seat_later_in_the_roster_judges_before_any_hold() {
+        struct Gatewayed {
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let provider = if seat == "codex" {
+                    "chatgpt.com:443"
+                } else {
+                    "api.anthropic.com:443"
+                };
+                crate::observed_provider::record_receipt(&seat, Some(vec![provider.into()]));
+                if input.unit.session_id == "validator" {
+                    self.asked.lock().unwrap().push(seat.clone());
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1547-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("claude".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        let run = |order: &[&str]| {
+            let roster: Vec<crate::AgenticCli> = order
+                .iter()
+                .map(|k| seat(k, &format!("{k} -p {{PROMPT}}")))
+                .collect();
+            let runner = Arc::new(Gatewayed {
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let r: Arc<dyn StepRunner> = runner.clone();
+            let (_o, v, e) =
+                run_unit_and_judge_with_roster(&r, &input, None, noop, &roster, &[], &[]);
+            let asked = runner.asked.lock().unwrap().clone();
+            (v, e.judge_skipped, asked)
+        };
+        for order in [["claude", "pi", "codex"], ["pi", "claude", "codex"]] {
+            let (v, skipped, asked) = run(&order);
+            let v = v.unwrap_or_else(|| panic!("{order:?}: held: {skipped:?} (asked {asked:?})"));
+            assert_eq!(
+                v.judge_cli.as_deref(),
+                Some("codex"),
+                "{order:?}: {asked:?}"
+            );
+            assert!(v.pass, "{order:?}");
+            assert!(skipped.is_none(), "{order:?}: {skipped:?}");
+        }
+        // No seat on another provider: the same-provider approval is discarded and the gate holds.
+        let (v, skipped, _) = run(&["claude", "pi"]);
+        assert!(v.is_none());
+        assert!(
+            skipped
+                .as_deref()
+                .is_some_and(|w| w.contains("same provider")),
+            "{skipped:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

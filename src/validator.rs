@@ -2556,7 +2556,15 @@ fn agent_validate_in(
     // moves on. The rule against verdict-shopping stands: a seat that said ANYTHING of its own
     // ends the rotation.
     let mut refusals: Vec<String> = Vec::new();
-    for seat in eligible_agent_seats(excluded_seats, roster) {
+    // (core#1543, coord codex-check on #1547) The seats not known to call the judged work's
+    // provider go first (a stable re-order: roster order otherwise), and an APPROVAL from a seat
+    // seen calling it is not independent: the rotation moves on to the next seat. Only when every
+    // seat that answered approved on the work's own provider is that approval returned — the
+    // caller then discards it and the gate holds.
+    let mut not_independent: Option<AgentVerdict> = None;
+    let mut seats: Vec<&AgenticCli> = eligible_agent_seats(excluded_seats, roster);
+    seats.sort_by_key(|c| crate::observed_provider::known_to_share(&c.key));
+    for seat in seats {
         let mut unit = base_unit.clone();
         unit.assigned_cli = Some(seat.key.clone());
         unit.assigned_invocation = Some(seat.headless_invocation.clone());
@@ -2580,7 +2588,17 @@ fn agent_validate_in(
                 if !names_a_verdict(&out.output) {
                     return Err(no_verdict_error(&seat.key, &out.output));
                 }
-                return Ok(parse_agent_verdict(&out.output).judged_by(&seat.key, true));
+                let verdict = parse_agent_verdict(&out.output).judged_by(&seat.key, true);
+                if verdict.pass && !crate::observed_provider::approval_is_independent(&seat.key) {
+                    eprintln!(
+                        "wicked-core: judge seat '{}' approved, but was seen calling the work's own \
+                         provider: not independent — trying the next seat (core#1543)",
+                        seat.key
+                    );
+                    not_independent.get_or_insert(verdict);
+                    continue;
+                }
+                return Ok(verdict);
             }
             // An operator stopped this run, or the seat burned its whole turn ceiling.
             // Rotating would defy the stop (and re-burn the ceiling on the next seat).
@@ -2613,6 +2631,11 @@ fn agent_validate_in(
                 refusals.push(format!("{} (elicitation failed)", seat.key));
             }
         }
+    }
+    // (core#1543) Every seat that answered approved on the work's own provider: that approval goes
+    // back to the caller, which discards it and holds the gate (no independent judge was left).
+    if let Some(v) = not_independent {
+        return Ok(v);
     }
     // Every eligible seat refused to run. Fail CLOSED, naming each one — the operator needs to know
     // this was an environment problem, not a rejected verdict. Typed (core#772) so the caller

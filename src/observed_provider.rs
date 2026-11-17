@@ -46,8 +46,69 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+thread_local! {
+    /// (coord codex-check on #1547) The providers the work being judged on this thread was seen
+    /// calling, while its judge rotation runs ([`judging_work_that_called`]).
+    static AVOID: std::cell::RefCell<Vec<Provider>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The providers each seat's latest observed launch called, process-wide: the judge rotation
+/// tries first the seats not known to share the work's provider.
+static LAST_SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, Vec<Provider>>>> =
+    std::sync::Mutex::new(None);
+
+/// While held, the judge rotations on this thread judge work known to have called `work`'s
+/// providers: they try first the seats not known to share them, and pass over an APPROVAL from a
+/// seat seen calling one of them to the next seat ([`approval_is_independent`]). Restored on drop.
+pub(crate) struct JudgingWork(Vec<Provider>);
+
+impl JudgingWork {
+    pub(crate) fn of(work: &Observed) -> Self {
+        Self(AVOID.with(|a| std::mem::replace(&mut *a.borrow_mut(), work.providers.clone())))
+    }
+}
+
+impl Drop for JudgingWork {
+    fn drop(&mut self) {
+        let prev = std::mem::take(&mut self.0);
+        AVOID.with(|a| *a.borrow_mut() = prev);
+    }
+}
+
+/// Whether `seat` is KNOWN (by its latest observed launch anywhere in this process) to call a
+/// provider the work being judged on this thread called: tried last, never skipped on a guess.
+pub(crate) fn known_to_share(seat: &str) -> bool {
+    let avoid = AVOID.with(|a| a.borrow().clone());
+    if avoid.is_empty() {
+        return false;
+    }
+    let seen = LAST_SEEN.lock().unwrap_or_else(|p| p.into_inner());
+    seen.as_ref()
+        .and_then(|m| m.get(seat))
+        .is_some_and(|ps| ps.iter().any(|p| avoid.contains(p)))
+}
+
+/// Whether an approval `seat` just gave on this thread stands as independent of the work being
+/// judged: `false` when this thread's receipts show its launch calling one of the work's providers.
+/// Unobserved: `true` (nothing proven; the caller's own rules stand).
+pub(crate) fn approval_is_independent(seat: &str) -> bool {
+    let avoid = AVOID.with(|a| a.borrow().clone());
+    if avoid.is_empty() {
+        return true;
+    }
+    let mine = RECEIPTS.with(|r| observed_for(&r.borrow(), seat));
+    !mine.providers.iter().any(|p| avoid.contains(p))
+}
+
 /// The carrier's half: record what a launch it ran on this thread was observed calling.
 pub(crate) fn record_receipt(seat: &str, providers: Option<Vec<Provider>>) {
+    if let Some(ps) = providers.as_ref().filter(|p| !p.is_empty()) {
+        LAST_SEEN
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(seat.to_string(), ps.clone());
+    }
     RECEIPTS.with(|r| {
         r.borrow_mut().push(LaunchReceipt {
             seat: seat.to_string(),
