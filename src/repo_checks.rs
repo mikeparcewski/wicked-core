@@ -3544,10 +3544,6 @@ impl Drop for CheckScratch {
         // (DES-FLOOR-CONTAINER) The container floor first: its containers and volume leases go
         // before the leaf can be retired, so the leaf's target volumes go with it.
         drop(self.container.take());
-        // (core#1482) The base side's build output goes after each floor: its results are cached
-        // in the log store (`BaseSide`), and it is half of a floor's peak disk (~20 GB of an
-        // estate floor's 41 GB). The head's target stays for the next floor's incremental build.
-        let _ = std::fs::remove_dir_all(self.root.join("cargo-target").join("base"));
         if orphan_path(&self.root).exists() {
             drop(self.lease.take());
             retire_leaf(&self.root);
