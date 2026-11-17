@@ -3515,6 +3515,9 @@ pub(crate) fn unit_team_monitors(unit: &crate::domain::WorkUnit) -> Vec<String> 
 /// The judge pool's reason for a seat recorded as having built the work.
 const BUILT_THIS_WORK: &str = "built this work";
 
+/// Why the pinned validator's author is a party to a re-judge (the rotation re-admits it last).
+const VALIDATOR_AUTHOR_PARTY: &str = "authors the pinned validator, so it never judges against it";
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn rejudge_seats(
     unit: &crate::domain::WorkUnit,
@@ -3554,7 +3557,7 @@ pub(crate) fn rejudge_seats(
         party(
             &mut parties,
             crate::validator::DETERMINISTIC_VALIDATOR_SEAT,
-            "authors the pinned validator, so it never judges against it",
+            VALIDATOR_AUTHOR_PARTY,
         );
     }
     // (core#1143) The unit's OWN seat never judges its own output — but it built the work only
@@ -3589,7 +3592,7 @@ pub(crate) fn rejudge_seats(
     for a in &unit.exclude_seats {
         party(&mut parties, a, "excluded from judging this step at launch");
     }
-    let monitors_from = parties.len();
+    let mut monitors_from = parties.len();
     for a in &unit_team_monitors(unit) {
         party(
             &mut parties,
@@ -3604,6 +3607,15 @@ pub(crate) fn rejudge_seats(
     if evaluator {
         for a in work_authors {
             party(&mut parties, a, "created the work this review reads");
+        }
+        // A creator that also monitored is named for what it did first: it created the work.
+        for (k, why) in parties.iter_mut() {
+            if work_authors
+                .iter()
+                .any(|a| a == k || seat_key(a) == k.as_str())
+            {
+                *why = "created the work this review reads";
+            }
         }
     }
     let creator_bins: Vec<String> = if evaluator && parties.len() > base_len {
@@ -3641,6 +3653,35 @@ pub(crate) fn rejudge_seats(
         (preferred, lost, ids)
     };
     let (mut preferred, mut lost, mut ids) = preferred_for(&parties, &creator_bins);
+    // (crew#972, two seats) As the rotation does ([`readmit_validator_author`]): with no judge left,
+    // the pinned validator's author is re-admitted first, when it is a party for that alone.
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    let is_v = |k: &str| k == v || seat_key(k) == v;
+    let validator_only = pinned
+        && !is_v(&work_author)
+        && !unit
+            .authored_by
+            .iter()
+            .chain(&unit.exclude_seats)
+            .any(|a| is_v(a))
+        && !(evaluator && work_authors.iter().any(|a| is_v(a)))
+        && !unit.authored_binaries.iter().any(|a| is_v(a))
+        && author_binaries.is_some_and(|b| !b.iter().any(|a| is_v(a)));
+    if preferred.is_empty() && validator_only {
+        let without: Vec<(String, &'static str)> = parties
+            .iter()
+            .filter(|(p, _)| p != v && seat_key(p) != v)
+            .cloned()
+            .collect();
+        let shift = parties.len() - without.len();
+        let (p2, l2, i2) = preferred_for(&without, &creator_bins);
+        if !p2.is_empty() {
+            parties = without;
+            monitors_from -= shift.min(monitors_from);
+            base_len -= shift.min(base_len);
+            (preferred, lost, ids) = (p2, l2, i2);
+        }
+    }
     // (crew#972) As the rotation does ([`exclude_monitors`]): with no judge distinct from the
     // monitors and the creators, the monitors are re-admitted first.
     if preferred.is_empty() && base_len > monitors_from {
@@ -3859,6 +3900,92 @@ fn exclude_creators<'a>(
         "no eligible judge seat distinct from the work's creators [{}]",
         creators.join(", ")
     ))
+}
+
+/// (crew#972, two seats) GAP B keeps the agent judge distinct from the pinned validator's author
+/// (`DETERMINISTIC_VALIDATOR_SEAT`) "when the roster allows". With only Claude Code and Codex signed
+/// in and codex the work's author, it never allowed: claude authored the validator, so no judge was
+/// left and every such gate held for the person. When no judge distinct from `excluded` remains,
+/// the validator author is dropped from `excluded` (if that leaves a judge) and the reason returned:
+/// it then judges, disclosed ([`disclose_validator_author_judge`]). It is never re-admitted when it
+/// is the work's author, one of its `creators`, or in `also_excluded` (a recorded author of the
+/// unit, or the launch's own judge exclusion): that would be a self-grade, or override the launch.
+fn readmit_validator_author(
+    excluded: &mut Vec<&str>,
+    work_author: &str,
+    creators: &[String],
+    also_excluded: &[String],
+    monitors: &[String],
+    has_judge: &impl Fn(&[&str]) -> bool,
+) -> Option<String> {
+    use crate::team::runner::seat_key;
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    let built = std::iter::once(work_author)
+        .chain(creators.iter().map(String::as_str))
+        .chain(also_excluded.iter().map(String::as_str))
+        .any(|k| k == v || seat_key(k) == v);
+    if built || !excluded.contains(&v) {
+        return None;
+    }
+    // Asked of the FULL preferred exclusion (the monitors and the creators too, which the rotation
+    // widens with next): the validator author yields before either of them does.
+    let parties: Vec<&str> = monitors
+        .iter()
+        .chain(creators)
+        .map(String::as_str)
+        .collect();
+    let full_judge = |base: &[&str]| {
+        let mut all: Vec<&str> = base.to_vec();
+        all.extend(parties.iter().copied().filter(|k| !base.contains(k)));
+        has_judge(&all)
+    };
+    if full_judge(excluded) {
+        return None;
+    }
+    let without: Vec<&str> = excluded.iter().copied().filter(|k| *k != v).collect();
+    if !full_judge(&without) {
+        return None;
+    }
+    *excluded = without;
+    Some(format!(
+        "no eligible judge seat distinct from the work's author '{work_author}' and the pinned \
+         validator's author '{v}'"
+    ))
+}
+
+/// (crew#972, two seats) A verdict the pinned validator's author rendered because
+/// [`readmit_validator_author`] re-admitted it: labelled on the gate, its receipt and the delivery
+/// receipt as a [`crate::assurance::JudgeFallback`], and named in the run's live output. It built
+/// nothing of the work, so `judgeDistinct` stands as the rotation set it. Any other verdict, or one
+/// a fallback already labels, passes through.
+fn disclose_validator_author_judge(
+    mut av: crate::validator::AgentVerdict,
+    validator_fallback: Option<&str>,
+    roster: &[crate::AgenticCli],
+    emit_delta: &DeltaSink,
+) -> crate::validator::AgentVerdict {
+    let (Some(why), Some(seat), None) =
+        (validator_fallback, av.judge_cli.clone(), &av.judge_fallback)
+    else {
+        return av;
+    };
+    let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+    if crate::team::runner::seat_key(&seat) != v
+        && crate::validator::excluded_identity(&seat, roster)
+            != crate::validator::excluded_identity(v, roster)
+    {
+        return av;
+    }
+    let fb = crate::assurance::JudgeFallback {
+        label: format!("judge: {seat} (also the pinned validator's author; {why})"),
+        seat,
+        preferred: Vec::new(),
+        reason: why.to_string(),
+    };
+    engine_note(emit_delta, &fb.label);
+    eprintln!("wicked-core: {} (crew#972)", fb.label);
+    av.judge_fallback = Some(fb);
+    av
 }
 
 /// (crew#972) Widen a judge's exclusion with the TEAM MONITORS that raised a finding on this step
@@ -5566,6 +5693,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let mut judge_skipped: Option<String> = None;
     // (crew#972) Set by the judge path that re-admitted the team monitors; read once the verdict is in.
     let mut monitor_fallback: Option<String> = None;
+    // (crew#972, two seats) Set when the pinned validator's author judges because no other seat
+    // distinct from the work's author was left ([`readmit_validator_author`]).
+    let mut validator_fallback: Option<String> = None;
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
         // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
         // early without a closure (closures cannot mutate `judge_skipped`).
@@ -5622,6 +5752,41 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 let configured = without_author_binaries(&eligible_configured, ex, &ids);
                 crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
             };
+            // (crew#972, two seats) The validator author's exclusion is the weakest one (it never
+            // built the work), so it yields before a monitor's or a creator's does. Never when it
+            // authored any of the work (by key or by a binary an author ran) or the launch
+            // excluded it.
+            let validator_never: Vec<String> = team_excluded
+                .iter()
+                .chain(fallback.work_authors)
+                .chain(creator_bins.iter())
+                .chain(&input.unit.authored_binaries)
+                .chain(fallback.author_binaries.unwrap_or_default())
+                .cloned()
+                // An author whose binaries are unknown may have run it: never re-admitted then.
+                .chain(
+                    (fallback.author_binaries.is_none()
+                        || !crate::pipeline::author_binaries_known(&input.unit))
+                    .then(|| crate::validator::DETERMINISTIC_VALIDATOR_SEAT.to_string()),
+                )
+                .collect();
+            validator_fallback = readmit_validator_author(
+                &mut excluded,
+                work_author,
+                &creators,
+                &validator_never,
+                &team_monitors,
+                &has_judge,
+            );
+            if let Some(why) = &validator_fallback {
+                engine_note(
+                    emit_delta,
+                    &format!(
+                        "agent validator: {why} — the pinned validator's author may judge it, \
+                         disclosed"
+                    ),
+                );
+            }
             // (crew#972) The monitors first, so a monitor is re-admitted before a creator is.
             monitor_fallback =
                 exclude_monitors(&mut excluded, &team_monitors, &creators, has_judge);
@@ -6047,13 +6212,14 @@ fn run_unit_and_judge_in<'scope, 'env>(
         None
     };
     let agent_verdict = agent_verdict.map(|av| {
-        disclose_monitor_judge(
+        let av = disclose_monitor_judge(
             av,
             monitor_fallback.as_deref(),
             &team_monitors,
             roster,
             emit_delta,
-        )
+        );
+        disclose_validator_author_judge(av, validator_fallback.as_deref(), roster, emit_delta)
     });
     // F-039 REPO CHECKS FLOOR ([`FloorPlan`]). A floor on a clean checkout started right after the
     // seat's turn (`early_floor`) and is joined here; a floor in the live worktree runs here, LAST
@@ -7842,8 +8008,11 @@ mod tests {
         // A launch-excluded seat is skipped, by cli key or by an instance of it.
         assert_eq!(judge_with(&["pi"]).0.as_deref(), Some("codex"));
         assert_eq!(judge_with(&["pi#2"]).0.as_deref(), Some("codex"));
+        // (crew#972) This roster records no author binaries, so the validator author (claude) is
+        // never re-admitted here (an author may have run it): with pi and codex out, no judge.
+        assert_eq!(judge_with(&["pi", "codex"]).0, None);
         // It only narrows: excluding every other seat leaves NO judge — never the author.
-        let (judge, ran) = judge_with(&["pi", "codex"]);
+        let (judge, ran) = judge_with(&["pi", "codex", "claude"]);
         assert_eq!(
             judge, None,
             "no distinct judge remains, so none is convened"
@@ -8136,37 +8305,55 @@ mod tests {
         );
         drop(seen);
 
-        // 2-seat roster [claude, agy]: both identities excluded ⇒ (#539) judge is SKIPPED, not
-        // dispatched as a self-grade via the single-runner fallback. The runner is called once for
-        // the work unit only; evidence.judge_skipped carries the eligibility reason.
+        // (crew#972, two seats) 2-seat roster [claude, agy] with agy the author: claude, the pinned
+        // validator's author, is the only seat that built nothing — it judges, disclosed. Never agy.
         let rec2 = Arc::new(RecordingRunner::default());
         let runner2: Arc<dyn StepRunner> = rec2.clone();
         let roster2 = vec![
             seat("claude", "claude -p {PROMPT}"),
             seat("agy", "agy run {PROMPT}"),
         ];
-        let (_out2, verdict2, evidence2) =
-            run_unit_and_judge_with_roster(&runner2, &input, None, noop, &roster2, &[], &[]);
+        // The authors' binaries are known (none ran claude), as the actor records them.
+        let (_out2, verdict2, _evidence2) = run_unit_and_judge_with_launches(
+            &runner2,
+            &input,
+            noop,
+            &roster2,
+            &[],
+            &[],
+            &roster2,
+            &[],
+            Some(&[]),
+        );
         let seen2 = rec2.seen.lock().unwrap();
-        assert_eq!(
-            seen2.len(),
-            1,
-            "only the work unit must be dispatched — no fallback judge call (#539)"
-        );
-        assert_eq!(
-            seen2.last().cloned().flatten().as_deref(),
-            Some("agy"),
-            "the single dispatch is the work unit (assigned_cli = agy)"
-        );
+        assert_eq!(seen2.last().cloned().flatten().as_deref(), Some("claude"));
         drop(seen2);
+        let fb = verdict2
+            .expect("the validator author judges")
+            .judge_fallback
+            .expect("disclosed");
         assert!(
-            verdict2.is_none(),
-            "no distinct seat ⇒ no agent verdict (#539 — judge skipped, not self-graded)"
+            fb.label.contains("pinned validator's author"),
+            "{}",
+            fb.label
         );
+
+        // …and with claude excluded at launch too, no distinct seat remains: (#539) the judge is
+        // SKIPPED, not dispatched as a self-grade. Only the work unit runs.
+        let mut excluded = input.clone();
+        excluded.unit.exclude_seats = vec!["claude".into()];
+        let rec3 = Arc::new(RecordingRunner::default());
+        let runner3: Arc<dyn StepRunner> = rec3.clone();
+        let (_out3, verdict3, evidence3) =
+            run_unit_and_judge_with_roster(&runner3, &excluded, None, noop, &roster2, &[], &[]);
+        let seen3 = rec3.seen.lock().unwrap();
+        assert_eq!(seen3.len(), 1, "only the work unit is dispatched (#539)");
+        drop(seen3);
         assert!(
-            evidence2.judge_skipped.is_some(),
-            "evidence.judge_skipped must name the reason when the judge is skipped (#539)"
+            verdict3.is_none(),
+            "no distinct seat ⇒ no agent verdict (#539)"
         );
+        assert!(evidence3.judge_skipped.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -8297,6 +8484,31 @@ mod tests {
             seen: Mutex::new(Vec::new()),
         });
         let runner: Arc<dyn StepRunner> = judge.clone();
+        // (crew#972, two seats) The pinned validator's author yields before a monitor: with claude
+        // available it judges, disclosed; the monitor case below excludes claude at launch.
+        let (_, first, _) = run_unit_and_judge_with_launches(
+            &runner,
+            &monitored,
+            noop,
+            &roster,
+            &[],
+            &[],
+            &roster,
+            &[],
+            Some(&[]),
+        );
+        let first = first.expect("ruled");
+        assert_eq!(first.judge_cli.as_deref(), Some("claude"));
+        assert!(first
+            .judge_fallback
+            .is_some_and(|fb| fb.label.contains("pinned validator's author")));
+        let mut monitored = monitored.clone();
+        monitored.unit.exclude_seats = vec!["claude".into()];
+        let judge = Arc::new(Judge {
+            answer: "PASS\nok\nPASS",
+            seen: Mutex::new(Vec::new()),
+        });
+        let runner: Arc<dyn StepRunner> = judge.clone();
         let (_, verdict, evidence) =
             run_unit_and_judge_with_roster(&runner, &monitored, None, noop, &roster, &[], &[]);
         assert_eq!(judge.seen.lock().unwrap().clone().len(), 1);
@@ -8320,6 +8532,7 @@ mod tests {
         // exclusion does: `watcher` monitored and invokes pi, `pi` is the only other judge left.
         let mut aliased = input.clone();
         aliased.unit.requested_rejudge.as_mut().unwrap().monitors = vec!["watcher".into()];
+        aliased.unit.exclude_seats = vec!["claude".into()];
         let alias_roster = vec![
             seat("claude", "claude -p {PROMPT}"),
             seat("agy", "agy run {PROMPT}"),
@@ -8766,6 +8979,72 @@ mod tests {
     /// the pinned validator's author, a benched seat and an unusable one are each named missing
     /// with why, and the seat the rotation would ask is eligible. With every other seat out, no
     /// seat is eligible.
+    /// (crew#972, two seats) With only Claude Code and Codex and codex the work's author, the pinned
+    /// validator's author (claude) is the only seat that built nothing: it is re-admitted (and the
+    /// re-judge readiness says so), never when it built the work or the launch excluded it, and
+    /// never while another distinct judge remains.
+    #[test]
+    fn two_seats_the_validator_author_judges_when_no_other_distinct_seat_is_left() {
+        let roster = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex exec {PROMPT}"),
+        ];
+        let has =
+            |keys: &'static [&'static str]| move |ex: &[&str]| keys.iter().any(|k| !ex.contains(k));
+        let v = crate::validator::DETERMINISTIC_VALIDATOR_SEAT;
+        let mut ex = vec![v, "codex"];
+        let why =
+            readmit_validator_author(&mut ex, "codex", &[], &[], &[], &has(&["claude", "codex"]));
+        assert!(why.is_some_and(|w| w.contains("pinned validator's author")));
+        assert_eq!(ex, vec!["codex"]);
+        // Another distinct judge remains (pi): the exclusion stands.
+        let mut ex = vec![v, "codex"];
+        assert!(readmit_validator_author(
+            &mut ex,
+            "codex",
+            &[],
+            &[],
+            &[],
+            &has(&["claude", "codex", "pi"])
+        )
+        .is_none());
+        assert_eq!(ex, vec![v, "codex"]);
+        // It built the work, or the launch excluded it, or a creator is it: never re-admitted.
+        for (author, creators, also) in [
+            ("claude", vec![], vec![]),
+            ("codex", vec!["claude".to_string()], vec![]),
+            ("codex", vec![], vec!["claude".to_string()]),
+        ] {
+            let mut ex = vec![v, "codex"];
+            assert!(readmit_validator_author(
+                &mut ex,
+                author,
+                &creators,
+                &also,
+                &[],
+                &has(&["claude", "codex"])
+            )
+            .is_none());
+        }
+        // The re-judge readiness mirrors it: claude is the eligible judge of codex's pinned gate.
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "w");
+        unit.assigned_cli = Some("codex".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        let run: Vec<String> = vec!["claude".into(), "codex".into()];
+        let (eligible, _) =
+            rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &roster, &roster);
+        assert_eq!(eligible, vec!["claude".to_string()], "{eligible:?}");
+        // …but not when the launch excluded it.
+        unit.exclude_seats = vec!["claude".into()];
+        let (eligible, _) =
+            rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &roster, &roster);
+        assert!(eligible.is_empty(), "{eligible:?}");
+    }
+
     #[test]
     fn rejudge_seats_name_the_eligible_judge_and_why_the_rest_cannot() {
         let mut unit = crate::domain::WorkUnit::pending("r:u4", "r", 4, "fix the retry");
@@ -8832,7 +9111,9 @@ mod tests {
             &[],
             &roster,
         );
-        assert!(none.is_empty(), "{none:?}");
+        // (crew#972, two seats) Two seats, agy the author: claude, the pinned validator's author,
+        // is the eligible judge (it built nothing).
+        assert_eq!(none, ["claude"], "{none:?}");
 
         // (core#954) An evaluator's creators are excluded unless that leaves no preferred seat —
         // then the rotation re-admits them, before any fallback judge.
@@ -8979,7 +9260,9 @@ mod tests {
             &[],
             &roster,
         );
-        assert_eq!(seats, ["agy"], "never the creator: {missing:?}");
+        // (crew#972, two seats) The pinned validator's author yields before a monitor does: it
+        // built nothing and raised no finding here. Never the creator.
+        assert_eq!(seats, ["claude"], "never the creator: {missing:?}");
         assert!(
             missing
                 .iter()
@@ -9114,6 +9397,9 @@ mod tests {
 
         let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
         unit.assigned_cli = Some("pi".into());
+        // (crew#972) claude is excluded at launch here, so no distinct judge remains: the
+        // validator author is not re-admitted and the judge is skipped, as this test needs.
+        unit.exclude_seats = vec!["claude".into()];
         unit.validator = Some(crate::validator::DeterministicValidator {
             criterion: "the work is correct".into(),
             script: "test -f x".into(),
@@ -9199,6 +9485,9 @@ mod tests {
 
         let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
         unit.assigned_cli = Some("pi".into());
+        // (crew#972) claude is excluded at launch here, so no distinct judge remains: the
+        // validator author is not re-admitted and the judge is skipped, as this test needs.
+        unit.exclude_seats = vec!["claude".into()];
         unit.validator = Some(crate::validator::DeterministicValidator {
             criterion: "correct".into(),
             script: "true".into(),
@@ -11359,6 +11648,9 @@ mod judge_routing_tests {
         // The built-in Evaluator phases' floor: the approved evidence-floor validator.
         let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "review the work");
         unit.assigned_cli = Some("pi".into());
+        // (crew#972) The launch excludes claude too, so no seat is distinct: the validator
+        // author is re-admitted only when nothing excludes it but its authorship.
+        unit.exclude_seats = vec!["claude".into()];
         unit.validator = Some(crate::validator::DeterministicValidator {
             criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
             script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
@@ -11438,6 +11730,9 @@ mod judge_routing_tests {
 
         let mut unit = crate::domain::WorkUnit::pending("ua:u1", "ua", 1, "review the work");
         unit.assigned_cli = Some("pi".into());
+        // (crew#972) The launch excludes claude too, so no seat is distinct: the validator
+        // author is re-admitted only when nothing excludes it but its authorship.
+        unit.exclude_seats = vec!["claude".into()];
         unit.validator = Some(crate::validator::DeterministicValidator {
             criterion: crate::builtin_floors::EVIDENCE_CRITERION.into(),
             script: crate::builtin_floors::EVIDENCE_SCRIPT.into(),
@@ -12407,6 +12702,9 @@ mod judge_fallback_tests {
         let dir = tmp("creator");
         let mut input = check_unit(&dir);
         input.unit.authored_by = Vec::new();
+        // (crew#972) claude, the pinned validator's author, is excluded at launch here, so the
+        // fallback is the only way a judge could sit (it would otherwise judge, disclosed).
+        input.unit.exclude_seats = vec!["claude".into()];
         let seats = Seats::new(vec![]);
         let runner: Arc<dyn StepRunner> = seats.clone();
         // The work's author is agy (a launch that made it work-eligible); pi evaluates.
