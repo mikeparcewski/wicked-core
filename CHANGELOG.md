@@ -64,6 +64,20 @@ Two release tracks share this file, newest entry first regardless of track:
   read as a deletion, and the step's output names each path. Build output a seat COMMITS still
   lands through its commits, as before. Seats already get a default CARGO_TARGET_DIR outside the
   worktree (`seat-build/<cli>/target`).
+- **Power-mode notes reach every turn, and "no change" is a structured field (core#1486, core#1495).**
+  A build attempt's retry or send-back notes (the operator's `amend` note of the latest round, the
+  review findings it was sent back with) ride turn 1 as their own block and every later turn ahead of
+  the task as authored, whose tail the continuation clips (the note `amend_unit` appends there was
+  lost); a later retry with no new note restates none. The
+  code-evidence floor's `NO CHANGE NEEDED` phrase search (19 negation cues) is replaced by a
+  structured line, `NO-CHANGE: <why>`, like `VERDICT:` and `HANDOFF:`; the engine's own prompts and
+  the orchestrator brief now ask for it. A power build keeps a `NO-CHANGE:` line any turn wrote
+  through the fold that saves only the final turn's text (a later invalid field withdraws it), and a
+  minimal declaration on an unchanged tree is not refused as too-short prose. Fenced examples, `>`
+  quotes and unfilled `<placeholders>` never declare. The engine still compares the tree itself.
+- **A steer queued for one unit is never delivered to another (ledger 2026-11-16 10:48Z).** An
+  operator message queued while a unit executes belongs to that unit: its next turn or dispatch hears
+  it; a unit dispatched after it does not (a QE steer reached the builder).
 - **Invalid seat egress settings fail closed.** A non-Unicode `WICKED_SEAT_EGRESS_HOSTS` value
   now disables CONNECT egress and emits a warning naming the variable, instead of silently
   selecting open egress. Only an unset value selects the open default. Gemini telemetry and

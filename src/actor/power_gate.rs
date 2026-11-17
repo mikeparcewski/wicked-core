@@ -615,7 +615,10 @@ pub(super) fn answer_pause(
         PauseDecision::Continue | PauseDecision::Stop => {}
     }
     if let Some(n) = note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
-        crate::power::queue_operator_message(run_id, "all", n);
+        // The paused orchestrator's own note: its next turn hears it (core#1486).
+        let ord = crate::domain::get_session(&*store, run_id)?
+            .and_then(|s| s.power.and_then(|p| p.orchestrator.ord));
+        crate::power::queue_operator_message(run_id, "all", n, ord);
     }
     let mut session = crate::domain::get_session(&*store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("not_found: run {run_id}"))?;

@@ -1101,14 +1101,17 @@ pub fn orchestrator_brief(
          Run the tests that cover your change; do not run the repository's whole suite here, \
          because the hand-off runs the repository's own checks itself. When the change is \
          complete, committed and the tests that cover it pass, end with exactly one line \
-         `{HANDOFF_PREFIX} <one-line summary>`. Never push or open a pull request: delivery is \
+         `{HANDOFF_PREFIX} <one-line summary>`. If the change needs no edit (it is already in \
+         the tree), leave the tree as it is and write the line `{no_change} <why>` before that \
+         line. Never push or open a pull request: delivery is \
          the engine's. Keep the run's working document current: before your first edit, write \
          your plan as one line `{APPROACH_PREFIX} <how you will make this change>`, and write it \
          again whenever the plan changes. For each choice a reviewer would ask about, write one \
          line `{DECISION_PREFIX} <what you chose> {WHY_MARK} <why>`. These lines are recorded as \
          yours, labelled with your seat; they never steer the run. {MEMORY_DIRECTIVE} \
          {rigor_line}{rework}{voice}",
-        voice = voice_section(voice)
+        voice = voice_section(voice),
+        no_change = crate::actor::NO_CHANGE_FIELD
     )
 }
 
@@ -1272,6 +1275,7 @@ pub fn notes_event(
 /// The prompt of a continuation turn (turn > 1): what the checkpoint found and what the operator
 /// said. The task is restated in brief so a turn whose session could not be resumed still knows
 /// the job.
+#[allow(clippy::too_many_arguments)]
 pub fn continuation_prompt(
     task: &str,
     turn: u32,
@@ -1280,6 +1284,7 @@ pub fn continuation_prompt(
     last_summary: &str,
     restarted: bool,
     voice: Option<&str>,
+    notes: &[String],
 ) -> String {
     let mut out = format!(
         "[power mode] Turn {turn} of at most {max_turns} of the same change. Continue from where \
@@ -1303,6 +1308,15 @@ pub fn continuation_prompt(
             out.push_str(&format!("- {}\n", m.trim()));
         }
     }
+    // (core#1486) The attempt's notes ride every turn, ahead of the task (clipped below).
+    out.push_str(&notes_block(notes));
+    // (codex r1) A restarted session never read the first brief: the no-change field rides every
+    // later turn too.
+    out.push_str(&format!(
+        "\n\nIf the change needs no edit, leave the tree as it is and write the line `{} <why>` \
+         before your `{HANDOFF_PREFIX}` line.",
+        crate::actor::NO_CHANGE_FIELD
+    ));
     if turn >= max_turns {
         out.push_str(&format!(
             "\n\nThis is your LAST turn: finish, commit, and end with `{HANDOFF_PREFIX} …`."
@@ -1324,6 +1338,36 @@ pub fn continuation_prompt(
     // fresh even in the container floor), and the block is short.
     out.push_str(&voice_section(voice));
     out
+}
+
+/// (core#1486, core#1495) A power build's saved output: the final turn's text under a header naming
+/// every earlier turn's checkpoint. When an earlier turn declared no change (`NO-CHANGE: <why>`)
+/// and the final turn wrote no such line, the header carries that declaration as its own line, so
+/// the code-evidence floor reads it from the attempt whatever turn wrote it. Whether the tree is
+/// unchanged is still the engine's own reading (`tree_changed`), never this line's.
+pub fn folded_output(
+    summaries: &[String],
+    text: &str,
+    no_change: Option<&(u32, String)>,
+) -> String {
+    if summaries.is_empty() {
+        return text.to_string();
+    }
+    let carried = no_change
+        .filter(|(turn, _)| *turn as usize <= summaries.len())
+        .filter(|_| crate::actor::no_change_line(text).is_none())
+        .map(|(turn, why)| {
+            format!(
+                "\n{} {why} (written in turn {turn})",
+                crate::actor::NO_CHANGE_FIELD
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        "[power mode: {} turn(s) of one orchestrator session]\n{}{carried}\n\n{text}",
+        summaries.len() + 1,
+        summaries.join("\n")
+    )
 }
 
 /// What the actor answers a checkpoint with.
@@ -1444,6 +1488,11 @@ pub struct QueuedMessage {
     /// `all` or a cli key.
     pub target: String,
     pub message: String,
+    /// (core#1486, ledger 2026-11-16 10:48Z) The unit that was EXECUTING when the message was
+    /// queued: it is that unit's, heard by its next turn or its next dispatch, never by another
+    /// unit's (a steer sent to a QE step was delivered to the builder after it). `None` = queued
+    /// between units: the next unit hears it.
+    pub for_ord: Option<u32>,
 }
 
 fn queue() -> &'static Mutex<HashMap<String, Vec<QueuedMessage>>> {
@@ -1454,7 +1503,7 @@ fn queue() -> &'static Mutex<HashMap<String, Vec<QueuedMessage>>> {
 /// Queue an operator message for the run's next turn or unit (the headless carrier has no live
 /// process to write into: C5 removed the ACP inject queue, and before this the engine dropped a
 /// broadcast with a log line while answering the inject OK).
-pub fn queue_operator_message(run_id: &str, target: &str, message: &str) {
+pub fn queue_operator_message(run_id: &str, target: &str, message: &str, for_ord: Option<u32>) {
     queue()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1463,18 +1512,20 @@ pub fn queue_operator_message(run_id: &str, target: &str, message: &str) {
         .push(QueuedMessage {
             target: target.to_string(),
             message: message.to_string(),
+            for_ord,
         });
 }
 
-/// Take every message queued for `run_id` that `cli` should hear (`all`, or its own key).
-pub fn take_operator_messages(run_id: &str, cli: &str) -> Vec<QueuedMessage> {
+/// Take every message queued for `run_id` that `cli`, running unit `ord`, should hear: addressed
+/// to `all` or its own key, and queued for this unit or between units ([`QueuedMessage::for_ord`]).
+pub fn take_operator_messages(run_id: &str, cli: &str, ord: u32) -> Vec<QueuedMessage> {
     let mut g = queue().lock().unwrap_or_else(|p| p.into_inner());
     let Some(list) = g.get_mut(run_id) else {
         return Vec::new();
     };
-    let (take, keep): (Vec<_>, Vec<_>) = list
-        .drain(..)
-        .partition(|m| m.target == "all" || m.target == cli);
+    let (take, keep): (Vec<_>, Vec<_>) = list.drain(..).partition(|m| {
+        (m.target == "all" || m.target == cli) && m.for_ord.is_none_or(|o| o == ord)
+    });
     *list = keep;
     if list.is_empty() {
         g.remove(run_id);
@@ -1572,6 +1623,77 @@ pub struct BuildArm {
     pub base: Option<String>,
     /// The person's voice block (core#1216), restated on every later turn.
     pub voice: Option<String>,
+    /// (core#1486) The notes this attempt was sent with — the operator's retry or send-back note
+    /// and the review findings it came back with ([`attempt_notes`]): restated on every turn, ahead
+    /// of the task (whose tail the continuation clips), so no later turn of the session loses them.
+    pub notes: Vec<String>,
+}
+
+/// The longest note a turn restates.
+const NOTE_MAX: usize = 20_000;
+
+/// (core#1486) The notes a build attempt was sent with: the latest round's operator notes (`amend`
+/// rulings of the unit's last attempt, oldest first) and, on a send-back, the findings it carries
+/// (`rework_amendment`). Empty for a first attempt.
+pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if unit.rework_of.is_some() {
+        if let Some(a) = unit
+            .rework_amendment
+            .as_deref()
+            .filter(|a| !a.trim().is_empty())
+        {
+            out.push(format!(
+                "Sent back to you with: {}",
+                clip(a.trim(), NOTE_MAX)
+            ));
+        }
+    }
+    // (codex r1) The notes for THIS dispatch: amendments recorded against the attempt it re-runs,
+    // or, for a first dispatch, a pre-dispatch (plan-gate) amendment. A later retry with no new
+    // note restates none.
+    // (codex r2) The dispatch stamps `last_attempt` with the attempt it mints before the build is
+    // armed, so the attempt this one re-runs is the one before it.
+    let this_round = |r: &crate::domain::OperatorRuling| match unit.last_attempt {
+        Some(a) if a > 0 => r.attempt == a - 1,
+        _ => r.attempt == 0,
+    };
+    for r in unit
+        .operator_rulings
+        .iter()
+        .filter(|r| r.action == "amend" && this_round(r))
+    {
+        let note = format!("The operator's note: {}", clip(r.text.trim(), NOTE_MAX));
+        if !out.contains(&note) {
+            out.push(note);
+        }
+    }
+    out
+}
+
+/// (core#1486, codex r1) The unit's task without the operator-amendment segments `amend_unit`
+/// appended to it (` (operator amendment: <text>)`, exact text from its rulings): the continuation
+/// restates the task as authored plus this attempt's [`attempt_notes`], never older rounds' notes.
+pub fn authored_task(unit: &crate::domain::WorkUnit) -> String {
+    let mut task = unit.description.clone();
+    for r in unit.operator_rulings.iter().filter(|r| r.action == "amend") {
+        task = task.replace(&format!(" (operator amendment: {})", r.text), "");
+    }
+    task
+}
+
+/// (core#1486) The block every turn of the attempt carries for its [`attempt_notes`].
+pub fn notes_block(notes: &[String]) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from(
+        "\n\nNotes for this attempt (act on them; where they differ from the task, they win):\n",
+    );
+    for n in notes {
+        out.push_str(&format!("- {}\n", n.replace('\n', " ")));
+    }
+    out
 }
 
 /// Armed builds by `(run, ord, attempt)`.
@@ -1972,6 +2094,7 @@ pub fn orchestrate(
     let mut tools: Vec<String> = Vec::new();
     let mut usage: Option<crate::workflow::Usage> = None;
     let mut governed = false;
+    let mut no_change: Option<(u32, String)> = None;
     let cli = arm.cli.clone();
     loop {
         turn_event(
@@ -2067,19 +2190,16 @@ pub fn orchestrate(
                 (a, b) => a.or(b),
             };
         }
+        // (core#1486, core#1495) A `NO-CHANGE:` line an earlier turn wrote survives the fold; a
+        // later turn's field (valid or not) replaces it, so an invalid one withdraws it (codex r2).
+        if let Some(field) = crate::actor::no_change_field(&out.output) {
+            no_change = field.map(|why| (turn, why));
+        }
         let finish = |status: StepStatus, text: &str, summaries: &[String]| StepOutput {
             run_id: input.run_id.clone(),
             unit_ix: input.unit_ix,
             attempt: input.attempt,
-            output: if summaries.is_empty() {
-                text.to_string()
-            } else {
-                format!(
-                    "[power mode: {} turn(s) of one orchestrator session]\n{}\n\n{text}",
-                    summaries.len() + 1,
-                    summaries.join("\n")
-                )
-            },
+            output: folded_output(summaries, text, no_change.as_ref()),
             status,
             usage: usage.clone(),
             files: files.clone(),
@@ -2166,7 +2286,7 @@ pub fn orchestrate(
             // Switched off: the rest of the run is phased; this build hands off as it stands.
             return finish(StepStatus::Ok, &out.output, &summaries);
         }
-        let taken = take_operator_messages(&input.run_id, &cli);
+        let taken = take_operator_messages(&input.run_id, &cli, input.unit.ord);
         for m in &taken {
             let _ = tx.send(crate::command::Command::EmitEvent(
                 crate::event::CoreEvent::WorkerMessageInjected {
@@ -2196,6 +2316,7 @@ pub fn orchestrate(
             &summary,
             !resumable,
             arm.voice.as_deref(),
+            &arm.notes,
         );
     }
 }
@@ -2203,6 +2324,113 @@ pub fn orchestrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// (core#1486) The attempt's retry and send-back notes ride every later turn AHEAD of the task,
+    /// which the continuation clips at 4,000 characters: a note appended to a long description's
+    /// tail (where `amend_unit` puts it) is never lost to the clip (crew#1547's revise: three
+    /// retries whose notes never reached the seat).
+    #[test]
+    fn the_attempts_notes_ride_every_later_turn_ahead_of_the_clipped_task() {
+        let mut u = crate::domain::WorkUnit::pending("r:fix", "r", 2, "fix");
+        let long = format!(
+            "{} (operator amendment: CITE src/lib.rs:42)",
+            "x".repeat(5000)
+        );
+        u.description = long.clone();
+        u.rework_of = Some(4);
+        u.rework_amendment = Some("ITEM 2 FAIL: the guard is missing (src/lib.rs:42)".into());
+        u.operator_rulings.push(crate::domain::OperatorRuling {
+            action: "amend".into(),
+            text: "an older round's note".into(),
+            attempt: 0,
+            at: 1,
+        });
+        u.operator_rulings.push(crate::domain::OperatorRuling {
+            action: "amend".into(),
+            text: "CITE src/lib.rs:42 and end with the NO-CHANGE line".into(),
+            attempt: 1,
+            at: 2,
+        });
+        // At arm time the dispatch has stamped the attempt it mints (2): it re-runs attempt 1.
+        u.last_attempt = Some(2);
+        let notes = attempt_notes(&u);
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].contains("ITEM 2 FAIL") && notes[1].contains("CITE src/lib.rs:42"));
+        assert!(
+            !notes.iter().any(|n| n.contains("older round")),
+            "the latest round only"
+        );
+        let a = CheckpointAnswer::default();
+        let p = continuation_prompt(&long, 2, 5, &a, "checked", false, None, &notes);
+        let at = p.find("Notes for this attempt").expect("the notes block");
+        assert!(
+            at < p.find("The change, for reference").unwrap(),
+            "ahead of the task"
+        );
+        assert!(
+            p.contains("CITE src/lib.rs:42 and end with the NO-CHANGE line"),
+            "{p}"
+        );
+        let none = continuation_prompt(&long, 2, 5, &a, "checked", false, None, &[]);
+        assert!(
+            !none.contains("CITE src/lib.rs:42 and end"),
+            "the clip drops the tail without it"
+        );
+        assert!(notes_block(&[]).is_empty());
+        // (codex r1) A later retry with no new note restates no older one, and the restated task
+        // drops every amendment segment (the notes block carries this round's).
+        let mut later = u.clone();
+        later.last_attempt = Some(3);
+        later.rework_of = None;
+        assert!(attempt_notes(&later).is_empty());
+        let mut amended = crate::domain::WorkUnit::pending("r:fix", "r", 2, "do the fix");
+        amended.description = "do the fix (operator amendment: old note)".into();
+        amended
+            .operator_rulings
+            .push(crate::domain::OperatorRuling {
+                action: "amend".into(),
+                text: "old note".into(),
+                attempt: 0,
+                at: 1,
+            });
+        assert_eq!(authored_task(&amended), "do the fix");
+        assert!(
+            p.contains("write the line `NO-CHANGE: <why>` before your"),
+            "{p}"
+        );
+    }
+
+    /// (core#1486, core#1495) A `NO-CHANGE:` line an earlier turn wrote survives the fold that keeps
+    /// only the final turn's text, so the code-evidence floor reads it; a final turn that wrote its
+    /// own keeps its own, and a single-turn build is its turn's text.
+    #[test]
+    fn an_earlier_turns_no_change_line_survives_the_fold() {
+        let summaries = vec!["turn 1: (no checkpoint line)".to_string()];
+        let out = folded_output(
+            &summaries,
+            "HANDOFF: verified the existing fix",
+            Some(&(1, "the fix is already on main".to_string())),
+        );
+        assert_eq!(
+            crate::actor::no_change_line(&out).as_deref(),
+            Some("the fix is already on main (written in turn 1)")
+        );
+        let own = folded_output(
+            &summaries,
+            "NO-CHANGE: still nothing to do\nHANDOFF: done",
+            Some(&(1, "earlier".to_string())),
+        );
+        assert_eq!(
+            crate::actor::no_change_line(&own).as_deref(),
+            Some("still nothing to do")
+        );
+        assert_eq!(folded_output(&[], "only turn", None), "only turn");
+        let b = orchestrator_brief(Some(Rigor::Standard), None, 1, None);
+        assert!(
+            b.contains("write the line `NO-CHANGE: <why>` before that line"),
+            "{b}"
+        );
+    }
 
     /// (power-speed) The orchestrator is told the hand-off runs the repository's checks itself, so
     /// it runs the tests covering its change and not the whole suite (rig run b6f7968b spent its
@@ -2258,14 +2486,14 @@ mod tests {
         );
         let a = CheckpointAnswer::default();
         for restarted in [false, true] {
-            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, None);
+            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, None, &[]);
             assert!(p.contains(MEMORY_DIRECTIVE), "{p}");
             assert!(
                 p.find(CHECKPOINT_PREFIX).unwrap() < p.find(MEMORY_DIRECTIVE).unwrap(),
                 "{p}"
             );
         }
-        let last = continuation_prompt("fix it", 5, 5, &a, "did x", false, None);
+        let last = continuation_prompt("fix it", 5, 5, &a, "did x", false, None, &[]);
         assert!(
             last.contains("LAST turn") && last.contains(MEMORY_DIRECTIVE),
             "{last}"
@@ -2322,11 +2550,11 @@ mod tests {
     fn every_later_turn_restates_the_voice_resumed_or_restarted() {
         let a = CheckpointAnswer::default();
         for restarted in [true, false] {
-            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, Some(VOICE));
+            let p = continuation_prompt("fix it", 2, 5, &a, "did x", restarted, Some(VOICE), &[]);
             assert!(p.contains(VOICE_GOVERNANCE), "{p}");
             assert!(p.trim_end().ends_with("- Keep it short."), "{p}");
         }
-        let none = continuation_prompt("fix it", 2, 5, &a, "did x", true, None);
+        let none = continuation_prompt("fix it", 2, 5, &a, "did x", true, None, &[]);
         assert!(!none.contains(VOICE_GOVERNANCE), "{none}");
     }
 
@@ -2874,16 +3102,36 @@ mod tests {
     #[test]
     fn the_operator_queue_delivers_by_target_once() {
         let run = "power-queue-test-run";
-        queue_operator_message(run, "all", "a");
-        queue_operator_message(run, "codex", "b");
-        queue_operator_message(run, "claude", "c");
-        let got: Vec<String> = take_operator_messages(run, "claude")
+        queue_operator_message(run, "all", "a", None);
+        queue_operator_message(run, "codex", "b", None);
+        queue_operator_message(run, "claude", "c", None);
+        let got: Vec<String> = take_operator_messages(run, "claude", 2)
             .into_iter()
             .map(|m| m.message)
             .collect();
         assert_eq!(got, vec!["a".to_string(), "c".to_string()]);
-        assert!(take_operator_messages(run, "claude").is_empty());
-        assert_eq!(take_operator_messages(run, "codex").len(), 1);
+        assert!(take_operator_messages(run, "claude", 2).is_empty());
+        assert_eq!(take_operator_messages(run, "codex", 2).len(), 1);
+        forget_run(run);
+    }
+
+    /// (core#1486, ledger 2026-11-16 10:48Z) A steer queued while the QE step (ord 5) executed is
+    /// that step's: the builder (ord 2) dispatched next never hears it; the QE step's next run does.
+    #[test]
+    fn a_message_queued_for_one_unit_is_never_delivered_to_another() {
+        let run = "power-queue-scoped-run";
+        queue_operator_message(run, "all", "QE: build one crate only", Some(5));
+        queue_operator_message(run, "all", "between units", None);
+        let builder: Vec<String> = take_operator_messages(run, "pi", 2)
+            .into_iter()
+            .map(|m| m.message)
+            .collect();
+        assert_eq!(builder, vec!["between units".to_string()]);
+        let qe: Vec<String> = take_operator_messages(run, "claude", 5)
+            .into_iter()
+            .map(|m| m.message)
+            .collect();
+        assert_eq!(qe, vec!["QE: build one crate only".to_string()]);
         forget_run(run);
     }
 

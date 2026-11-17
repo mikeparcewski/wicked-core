@@ -3207,15 +3207,14 @@ pub(crate) fn author_binaries_known(u: &crate::domain::WorkUnit) -> bool {
             .any(|b| b == crate::domain::UNKNOWN_AUTHOR_BINARY)
 }
 
-/// (rig run ea73afc0) The lead of a floor denial whose attempt said NO CHANGE NEEDED but changed
+/// (rig run ea73afc0) The lead of a floor denial whose attempt declared no change but changed
 /// the tree anyway: the engine read it as a change (the floor ran on the new tree), and the gate
 /// says so, so the operator sees why the floor ran again. Empty otherwise.
 pub(crate) fn no_change_contradicted_note(
     output: &str,
     evidence: &crate::workflow::UnitEvidence,
 ) -> &'static str {
-    if evidence.tree_changed == Some(true) && crate::actor::no_change_mention(output) == Some(true)
-    {
+    if evidence.tree_changed == Some(true) && crate::actor::no_change_line(output).is_some() {
         NO_CHANGE_CONTRADICTED
     } else {
         ""
@@ -5625,7 +5624,7 @@ mod judge_bench_tests {
         let outcome = apply_and_finish_unit(
             &mut store,
             unit,
-            "the step's output, unchanged tree: NO CHANGE NEEDED, the failures are load-bound",
+            "the step's output, unchanged tree:\nNO-CHANGE: the failures are load-bound",
             &workflow_id,
             EntityMode::Shared,
             sid,
@@ -5774,18 +5773,18 @@ mod judge_bench_tests {
         units[0].denial_reason.clone()
     }
 
-    /// (rig run ea73afc0) An automatic retry turn that said NO CHANGE NEEDED but changed the tree
+    /// (rig run ea73afc0) An automatic retry turn that declared no change but changed the tree
     /// (it applied a team member's unrelated advice) is a change: its floor ran on the new tree,
     /// and the floor's denial says so first. Without the declaration, or on an unchanged tree,
     /// the denial reads as before.
     #[test]
     fn a_no_change_answer_that_changed_the_tree_is_read_as_a_change() {
-        let said = "NO CHANGE NEEDED: the failures are load-bound. Also tried PATHEXT on Windows.";
+        let said = "Also tried PATHEXT on Windows.\nNO-CHANGE: the failures are load-bound.";
         let reason = fold_retry_answer("nochange-contradicted", said, Some(true)).expect("denied");
         assert!(reason.starts_with(NO_CHANGE_CONTRADICTED), "{reason}");
         assert!(reason.contains("repo checks floor failed"), "{reason}");
         assert!(
-            crate::actor::no_change_mention(&reason) != Some(true),
+            crate::actor::no_change_line(&reason).is_none(),
             "the disclosure is not itself a declaration a later fold could read"
         );
         let plain =
