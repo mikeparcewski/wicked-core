@@ -2166,17 +2166,18 @@ pub(crate) enum Ending {
 /// pod not confirmed gone, a write-back refused): could-not-run, never a pass.
 #[cfg(test)]
 pub(crate) fn settle(seat: &Seat, ending: Ending) -> Result<i32, String> {
-    settle_unless(seat, ending, &|| false)
+    settle_unless(seat, ending, &|| false).map(|(code, _)| code)
 }
 
 /// [`settle`], with `cancelled` asked again once the pod is gone, right before the write-back
 /// (codex b2-gw #4): a unit cancelled or reassigned while its rc was read or its pod deleted
-/// brings nothing back.
+/// brings nothing back. (core#1498) With the exit code, what the write-back left out, as step
+/// warnings ([`write_back`]).
 pub(crate) fn settle_unless(
     seat: &Seat,
     ending: Ending,
     cancelled: &dyn Fn() -> bool,
-) -> Result<i32, String> {
+) -> Result<(i32, Vec<String>), String> {
     let mut settled = seat.settled.lock().unwrap_or_else(|p| p.into_inner());
     if *settled {
         return Err("the seat was already reaped".into());
@@ -2228,12 +2229,12 @@ pub(crate) fn settle_unless(
     let back = if code.is_ok() && ending != Ending::Cancelled && !cancelled() {
         write_back(seat, cancelled)
     } else {
-        Ok(())
+        Ok(Vec::new())
     };
     drop_scratch(seat);
     let code = code?;
-    back?;
-    Ok(code)
+    let warnings = back?;
+    Ok((code, warnings))
 }
 
 /// Select the roots returned by a unit; cargo homes and scratch must never be among them.
@@ -2246,10 +2247,14 @@ pub(crate) fn write_back_roots(roots: &[PlanRoot]) -> Vec<&PlanRoot> {
 /// masked or `.git` path, all BEFORE any host file changes (review r1); then only what the seat
 /// changed against the copy-in baseline is applied with the no-follow walk, a file the host also
 /// changed meanwhile is a conflict (refused, never overwritten), and the host HEAD moves last.
-pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<(), String> {
+///
+/// (core#1498) What the pod LEFT OUT (build output in a tagged cache dir, a file past the stream's
+/// limit) is never written and never a deletion: it stays as the host has it, and each is returned
+/// as a warning for the step, so a large build in a written-back root never fails the unit.
+pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Vec<String>, String> {
     let back = write_back_roots(&seat.roots);
     if back.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let mut refs: Vec<(String, &PlanRoot)> = Vec::new();
     for r in &back {
@@ -2269,7 +2274,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
             r.err_text()
         ));
     }
-    let roots = sync::decode(&mut r.stdout.as_slice(), STREAM_LIMIT)
+    let mut roots = sync::decode(&mut r.stdout.as_slice(), STREAM_LIMIT)
         .map_err(|e| format!("the write-back was refused: {e}"))?;
     if roots.len() != back.len() {
         return Err("the write-back's roots do not match the unit's".into());
@@ -2282,11 +2287,17 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
     // Every root checked before anything is fetched or applied; diffed against the host only
     // after the commits are in (below), so the conflict check reads the host as it is when the
     // write-back lands, not minutes earlier (codex b2-seat #4).
-    let mut checked: Vec<(&PlanRoot, Vec<Entry>)> = Vec::new();
-    for ((replica, want), got) in refs.iter().zip(&roots) {
+    let mut checked: Vec<(&PlanRoot, Vec<Entry>, Vec<sync::Skipped>)> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
+    for ((replica, want), got) in refs.iter().zip(roots.iter_mut()) {
         if &got.replica != replica {
             return Err("the write-back's roots are out of order".into());
         }
+        let left_out = sync::take_skipped(got)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        sync::refuse_unsafe_skips(&want.host, want.mode, &left_out)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        warnings.extend(left_out.iter().map(|s| s.describe(&want.host)));
         let empty = HashMap::new();
         let mut entries = sync::check_entries_against(
             got,
@@ -2294,13 +2305,14 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
             baseline.get(&want.host).unwrap_or(&empty),
         )
         .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+        entries.retain(|e| !left_out.iter().any(|s| s.covers(&e.path)));
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             entries.retain(|e| !in_node_modules(&e.path));
         }
-        checked.push((want, entries));
+        checked.push((want, entries, left_out));
     }
     let tree_back = back
         .iter()
@@ -2351,10 +2363,15 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         }
     }
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
-    for (want, entries) in checked {
+    for (want, entries, left_out) in checked {
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
-        let retained = retained_links(&entries, &base);
-        let (writes, mut deletes) = delta(&want.host, &base, entries)?;
+        let mut retained = retained_links(&entries, &base);
+        retained.extend(
+            left_out_links(&want.host, &left_out).map_err(|e| {
+                format!("the write-back of {} was refused: {e}", want.host.display())
+            })?,
+        );
+        let (writes, mut deletes) = delta_keeping(&want.host, &base, entries, &left_out)?;
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             deletes.retain(|d| !in_node_modules(d));
         }
@@ -2425,7 +2442,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<()
         }
         let _ = git(&["update-ref", "-d", &refname]);
     }
-    Ok(())
+    Ok(warnings)
 }
 
 /// A new owner-only directory under the temp dir, removed with everything in it when dropped.
@@ -2669,6 +2686,77 @@ pub(crate) fn apply_roots(plans: &[RootPlan<'_>]) -> Result<(), String> {
             .map_err(|e| format!("the write-back of {} failed: {e}", want.host.display()))?;
     }
     Ok(())
+}
+
+/// (core#1498) [`delta`], with every path the pod left out kept as the host has it: never written
+/// (the pod sent none of it) and never a deletion.
+pub(crate) fn delta_keeping(
+    host: &Path,
+    base: &HashMap<String, [u8; 32]>,
+    entries: Vec<Entry>,
+    left_out: &[sync::Skipped],
+) -> Result<(Vec<Entry>, Vec<String>), String> {
+    // (codex r1) Left out BEFORE the deletion check: a path the host changed meanwhile under a
+    // skip is no conflict, because nothing of it is written or deleted.
+    // (core#1518 codex confirm #5) Nor a host path the pod sent nothing for that a skip may alias
+    // on a folding host (`src/file.rs` under a skipped `SRC/file.rs`): kept, never deleted.
+    let sent: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    let kept: HashMap<String, [u8; 32]> = base
+        .iter()
+        .filter(|(p, _)| {
+            !left_out
+                .iter()
+                .any(|s| s.covers(p) || (!sent.contains(p.as_str()) && s.may_alias(p)))
+        })
+        .map(|(p, d)| (p.clone(), *d))
+        .collect();
+    delta(host, &kept, entries)
+}
+
+/// (codex r1, r2) The host's links a skip keeps as they are: every link the host holds NOW under a
+/// left-out path (a cache dir, or a file left out for the limit), whether or not it changed since
+/// the copy-in. They join the retained-link check, so what the unit changes around them can never
+/// make one resolve outside its root. Only link targets are read, never a regular file's content
+/// (a host file grown past the stream limit under a skip is no refusal).
+pub(crate) fn left_out_links(
+    host: &Path,
+    left_out: &[sync::Skipped],
+) -> Result<Vec<Entry>, String> {
+    let mut out = Vec::new();
+    let mut push_link = |rel: String| -> Result<(), String> {
+        let at = host.join(&rel);
+        match std::fs::symlink_metadata(&at) {
+            Ok(m) if m.file_type().is_symlink() => {
+                let target = std::fs::read_link(&at)
+                    .map_err(|e| format!("`{rel}` could not be read: {e}"))?;
+                let data = target
+                    .to_str()
+                    .ok_or_else(|| format!("`{rel}` points at a non-UTF-8 path"))?
+                    .as_bytes()
+                    .to_vec();
+                out.push(Entry {
+                    kind: sync::Kind::Link,
+                    path: rel,
+                    data,
+                });
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("`{rel}` could not be read: {e}")),
+        }
+    };
+    for s in left_out {
+        push_link(s.path.clone())?;
+        if s.why == "cache"
+            && std::fs::symlink_metadata(host.join(&s.path)).is_ok_and(|m| m.is_dir())
+        {
+            for rel in sync::host_plain_listing(&host.join(&s.path), &[])? {
+                push_link(format!("{}/{rel}", s.path))?;
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// What the seat changed in one root against its copy-in `base` (pure over the host's current
