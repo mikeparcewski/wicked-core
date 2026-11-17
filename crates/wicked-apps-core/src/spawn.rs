@@ -3330,14 +3330,17 @@ rebase.autosquash\0";
     }
 
     /// Restores the process variables a fixture changes, also when an assertion unwinds.
+    #[cfg(unix)]
     struct EnvRestore(Vec<(&'static str, Option<std::ffi::OsString>)>);
 
+    #[cfg(unix)]
     impl EnvRestore {
         fn take(keys: &[&'static str]) -> Self {
             Self(keys.iter().map(|k| (*k, std::env::var_os(k))).collect())
         }
     }
 
+    #[cfg(unix)]
     impl Drop for EnvRestore {
         fn drop(&mut self) {
             for (k, v) in &self.0 {
@@ -3353,7 +3356,10 @@ rebase.autosquash\0";
     /// four wicked-studio#1151 commits did) still commits as the identity the operator's own git
     /// resolves in that worktree, author and committer: the global identity, a repository's own
     /// identity, and an `includeIf "gitdir:…"` identity. With no operator identity the fence
-    /// forges none: the seat's own wins, and an identity the daemon inherited stays.
+    /// forges none: the seat's own wins, and an identity the daemon inherited stays. Unix only: the
+    /// `includeIf "gitdir:"` case needs a path git matches as written (Windows canonical paths carry
+    /// a `\\?\` prefix); the identity rule itself is platform-free and its unit test runs everywhere.
+    #[cfg(unix)]
     #[test]
     fn a_fenced_seats_commits_carry_the_operators_resolved_identity_whatever_the_seat_configures() {
         let _env = lock_env();
