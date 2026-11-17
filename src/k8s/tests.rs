@@ -1073,3 +1073,20 @@ fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
     std::thread::spawn(move || tx.send(super::run_epoch(&r)).unwrap());
     assert_eq!(rx.recv_timeout(std::time::Duration::from_secs(5)), Ok(1));
 }
+
+/// (core#1491) A run that ended arms no seat until it is resumed (under the lifecycle lock, so an
+/// arm retry racing the end cannot re-create the namespace), and a late cleanup of an earlier
+/// epoch never lowers the recorded end.
+#[test]
+fn an_ended_run_arms_no_seat_until_it_is_resumed() {
+    let run = format!("ended-run-{}", std::process::id());
+    assert!(super::arming_live(&run));
+    let e = super::run_epoch(&run);
+    super::release_run(&run, e + 5);
+    super::release_run(&run, e);
+    assert!(super::run_ended_since(&run, e + 4), "the newer end stands");
+    assert!(!super::arming_live(&run), "an ended run arms nothing");
+    assert_eq!(super::run_epoch(&run), e, "and its epoch is untouched");
+    super::forget_ended(&run);
+    assert!(super::arming_live(&run), "a resumed run arms again");
+}

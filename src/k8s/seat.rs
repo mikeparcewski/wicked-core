@@ -1730,7 +1730,12 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
-    super::arming(s.run_id);
+    if !super::arming_live(s.run_id) {
+        return Err((
+            FloorUnarmed::PodNotReady,
+            "the run ended before its seat could arm".into(),
+        ));
+    }
     cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
         .map_err(|e| (classify_apply(&e), e))?;
     super::clock::mark("namespace");

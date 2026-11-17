@@ -347,6 +347,31 @@ pub(crate) fn run_epoch(run_id: &str) -> u64 {
     life(run_id).1.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// (core#1491) A seat arms only for a run that has not ended since it was last resumed: under the
+/// run's lifecycle lock (the same one `release_run` holds), so an arm retry racing the run's end
+/// can never re-create its namespace. `false`: the run ended; nothing was armed.
+pub(crate) fn arming_live(run_id: &str) -> bool {
+    let l = life(run_id);
+    let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    let ended = ENDED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .is_some_and(|m| m.contains_key(run_id));
+    if ended {
+        return false;
+    }
+    l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    true
+}
+
+/// (core#1491) A resumed run may arm again.
+pub(crate) fn forget_ended(run_id: &str) {
+    if let Some(m) = ENDED.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        m.remove(run_id);
+    }
+}
+
 /// The run arms (a seat or a floor is about to use its namespace): waits out a release in
 /// flight, then voids every release scheduled before now.
 pub(crate) fn arming(run_id: &str) {
@@ -362,11 +387,15 @@ pub(crate) fn arming(run_id: &str) {
 pub(crate) fn release_run(run_id: &str, epoch: u64) {
     // (core#1491) Recorded first: an arm retry in backoff stops instead of re-creating the
     // namespace of a run that ended after it armed.
-    ENDED
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get_or_insert_with(std::collections::HashMap::new)
-        .insert(run_id.to_string(), epoch);
+    {
+        // Monotonic: a late cleanup of an earlier epoch never lowers a newer end.
+        let mut g = ENDED.lock().unwrap_or_else(|p| p.into_inner());
+        let e = g
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(run_id.to_string())
+            .or_insert(epoch);
+        *e = (*e).max(epoch);
+    }
     let l = life(run_id);
     let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {
