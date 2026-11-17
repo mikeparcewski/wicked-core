@@ -3524,6 +3524,10 @@ pub(crate) struct CheckScratch {
     /// only under an exclusive lock, so it never deletes the scratch a floor is building into.
     /// `Option` only so [`Drop`] can release it before retiring an orphaned leaf.
     lease: Option<std::fs::File>,
+    /// (core#1482) The leaf, held since before any check ran there ([`HeldDir`]): the base build
+    /// output is removed through it, so a check that swapped a directory for a link since can
+    /// never redirect the removal ([`drop_base_output`]).
+    held: Option<HeldDir>,
     /// (DES-FLOOR-V2) The run's log store ([`crate::floor_log::run_dir`]) — outside every write
     /// root the boundary arms.
     pub(crate) logs: PathBuf,
@@ -3552,28 +3556,45 @@ impl Drop for CheckScratch {
         // (core#1482) The floor's base build output goes when the run's LAST floor on this leaf
         // ends ([`drop_base_output`]); the head target stays for incremental re-floors.
         drop(self.lease.take());
-        drop_base_output(&self.root);
+        if let Some(held) = self.held.take() {
+            drop_base_output(&held, &self.root);
+        }
     }
 }
 
 /// (core#1482) Remove `<leaf>/cargo-target/base` — about half a floor's peak disk; its results are
-/// in the run's log store — once no floor of the run holds the leaf: only under the leaf's
-/// EXCLUSIVE lock (non-blocking: a floor still building keeps it, review r1 on #1530), and never
-/// through a symlink a check left (`cargo-target` or `base` made a link is unlinked, not followed;
-/// `remove_dir_all` does not follow links inside). Returns whether the base output is gone.
-fn drop_base_output(leaf: &Path) -> bool {
-    let Ok(Some(_held)) = lock_leaf(leaf, true) else {
-        return false;
+/// in the run's log store — once no floor of the run holds the leaf, through the leaf `held` since
+/// before any check ran: every step walks from that fd and never follows a link, so a check that
+/// swapped `cargo-target` (or `base`) for a link to an outside directory, even after this looked,
+/// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
+/// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
+/// the lock is released before the slow removal, so the run's next floor never waits on it.
+/// Returns whether the base output is gone.
+fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
+    let aside = format!(".base-drop-{}", random_tmp_name());
+    let target = {
+        let Ok(Some(_exclusive)) = lock_leaf(leaf, true) else {
+            return false;
+        };
+        let target = match held.subdir("cargo-target", false) {
+            Ok(t) => t,
+            // Missing, or not a plain directory (a link a check left): unlinked, never entered.
+            Err(_) => return held.remove_tree("cargo-target").is_ok(),
+        };
+        match target.rename_child("base", &aside) {
+            Ok(true) => target,
+            Ok(false) => return true,
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: could not set the floor's base build output aside under {}: {e}",
+                    leaf.display()
+                );
+                return false;
+            }
+        }
     };
-    let target = leaf.join("cargo-target");
-    match std::fs::symlink_metadata(&target) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
-        Ok(m) if !m.is_dir() => return std::fs::remove_file(&target).is_ok(),
-        Ok(_) => {}
-    }
-    match remove_leaf_dir(&target.join("base")) {
-        Ok(()) => true,
+    match target.remove_tree(&aside) {
+        Ok(_) => true,
         Err(e) => {
             eprintln!(
                 "wicked-core: could not drop the floor's base build output under {}: {e}",
@@ -3921,6 +3942,7 @@ impl CheckScratch {
             root,
             tmp,
             lease: Some(lease),
+            held: Some(held),
             logs,
             log_cap: log_cap(),
             container: None,
@@ -5079,6 +5101,28 @@ pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
 }
 
 fn run_floor_inner(
+    worktree: &Path,
+    ctx: &FloorContext,
+    rerun: Option<&FloorRerun>,
+    journal: Option<&FloorJournal>,
+    untouched: Option<&dyn Fn() -> bool>,
+) -> RepoChecksReport {
+    let report = run_floor_body(worktree, ctx, rerun, journal, untouched);
+    stopped_by_cancel(report, ctx.run_id.as_deref())
+}
+
+/// (core#1482, codex confirmation on #1530) A floor whose run was cancelled while it ran is that
+/// cancellation, never a failed or a passed floor: the environment refusal a floor refused at
+/// entry gives (`not_run`), its checks kept for display.
+fn stopped_by_cancel(mut report: RepoChecksReport, run_id: Option<&str>) -> RepoChecksReport {
+    if floor_cancelled(run_id) && report.sandbox_error.is_none() {
+        report.sandbox_error = Some("the run was cancelled: its floor was stopped".into());
+        report.passed = false;
+    }
+    report
+}
+
+fn run_floor_body(
     worktree: &Path,
     ctx: &FloorContext,
     rerun: Option<&FloorRerun>,
@@ -8639,6 +8683,12 @@ pub(crate) struct HeldDir {
     path: PathBuf,
 }
 
+impl std::fmt::Debug for HeldDir {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("HeldDir")
+    }
+}
+
 /// `rel`'s components: plain names only (no root, `..`, or empty name; `.` skipped).
 fn rel_names(rel: &str) -> Result<Vec<String>, String> {
     let mut out = Vec::new();
@@ -8876,6 +8926,31 @@ impl HeldDir {
             Ok(st) => Ok(Some(entry_kind(st.st_mode))),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    /// (core#1482) Rename this directory's entry `from` to `to` (plain names), relative to the
+    /// held fd — whatever `from` is, it is moved, never followed. `false`: nothing at `from`.
+    pub(crate) fn rename_child(&self, from: &str, to: &str) -> Result<bool, String> {
+        use std::os::fd::AsRawFd;
+        let (f, t) = (cstr(from.as_bytes())?, cstr(to.as_bytes())?);
+        // SAFETY: `self.fd` is an open directory fd; both names are NUL-terminated.
+        let rc = unsafe {
+            libc::renameat(
+                self.fd.as_raw_fd(),
+                f.as_ptr(),
+                self.fd.as_raw_fd(),
+                t.as_ptr(),
+            )
+        };
+        if rc == 0 {
+            return Ok(true);
+        }
+        let e = std::io::Error::last_os_error();
+        if e.kind() == std::io::ErrorKind::NotFound {
+            Ok(false)
+        } else {
+            Err(format!("`{from}`: {e}"))
         }
     }
 
@@ -9209,6 +9284,14 @@ impl HeldDir {
             Ok(_) => Ok(Some(EntryKind::Other)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+        }
+    }
+
+    pub(crate) fn rename_child(&self, from: &str, to: &str) -> Result<bool, String> {
+        match std::fs::rename(self.leaf_path(from)?, self.leaf_path(to)?) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(format!("`{from}`: {e}")),
         }
     }
 
@@ -13328,6 +13411,12 @@ exit 1
             !leaf.join("cargo-target/base").exists(),
             "the last out drops base"
         );
+        let aside: Vec<_> = std::fs::read_dir(leaf.join("cargo-target"))
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".base-drop-"))
+            .collect();
+        assert!(aside.is_empty(), "set aside, then removed");
         assert!(leaf.join("cargo-target/head/h.bin").is_file(), "head stays");
         // A link a check left: unlinked, its target untouched.
         #[cfg(unix)]
@@ -15738,7 +15827,7 @@ exit 1
         std::os::unix::fs::symlink(&outside, root.join("link")).unwrap();
         let e = held.write("link/x", "x").unwrap_err();
         assert!(e.contains("passes through a symlink"), "{e}");
-        let e = held.subdir("link", false).err().expect("refused");
+        let e = held.subdir("link", false).expect_err("refused");
         assert!(e.contains("passes through a symlink"), "{e}");
         assert!(held.create_fresh_dir("link/fresh").is_err());
         assert!(held.write_bytes("sub/../link/y", b"y", false).is_err());

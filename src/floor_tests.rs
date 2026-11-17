@@ -5641,8 +5641,22 @@ fn core_1482_a_cancelled_runs_check_is_killed() {
         "{r:?}"
     );
     assert!(floor_cancelled(Some(&run)));
+    // (codex confirmation on #1530, SILENT-OK) The floor it ran in is the run's cancellation,
+    // `not_run`, never a failed or a passed floor.
+    let passing = guarded_report_stub(&wt);
+    assert_eq!(passing.outcome(), "passed");
+    let r = stopped_by_cancel(passing, Some(&run));
+    assert_eq!(r.outcome(), "not_run", "{r:?}");
+    assert!(r
+        .sandbox_error
+        .as_deref()
+        .is_some_and(|e| e.contains("cancelled")));
     clear_floor_cancel(&run);
     assert!(!floor_cancelled(Some(&run)));
+    assert_eq!(
+        stopped_by_cancel(guarded_report_stub(&wt), Some(&run)).outcome(),
+        "passed"
+    );
     drop(checks);
     let _ = std::fs::remove_dir_all(&wt);
 }
