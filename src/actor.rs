@@ -3621,6 +3621,17 @@ pub(crate) fn run(
                     )));
                     continue;
                 }
+                // (core#1581) A run held at a power checkpoint pause runs nothing until the
+                // operator answers it: a reassign (which would dispatch a replacement for a full
+                // turn) is refused, the run untouched, before anything is cancelled.
+                if let Some(p) = power_gate::held_pause(&session) {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "conflict: run {run_id} is held at power checkpoint {}; answer the pause \
+                         (POST /runs/{run_id}/power/pause) before reassigning its unit",
+                        p.checkpoint
+                    )));
+                    continue;
+                }
                 // (T3 round 10) The dispatch guard, judged BEFORE anything is reaped or bumped: a
                 // reassign is refused — the run untouched — while no unit may dispatch.
                 if let Some(why) = team_gate::dispatch_blocked(&session) {
@@ -4588,14 +4599,36 @@ pub(crate) fn run(
                 reason,
                 reply,
             } => {
-                let _ = reply.send(power_gate::set_power(
+                // (core#1581) The switch to phased answers a held checkpoint pause: with no
+                // worker left waiting on it, the run is released as an answer releases it.
+                let held = !on
+                    && crate::domain::get_session(&store, &run_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| power_gate::held_pause(&s).is_some());
+                let res = power_gate::set_power(
                     &mut store,
                     &mut subscribers,
                     &run_id,
                     on,
                     &actor,
                     reason,
-                ));
+                );
+                if held && res.is_ok() {
+                    release_answered_pause(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &mut in_flight,
+                        &run_id,
+                        &lifecycle_maps,
+                        &actor_maps,
+                        process_gen,
+                        is_acp,
+                    );
+                }
+                let _ = reply.send(res);
             }
             Command::RaiseRigor {
                 run_id,
@@ -4639,6 +4672,20 @@ pub(crate) fn run(
                     ) {
                         eprintln!("wicked-core: run {run_id}: stop at the pause failed ({e:#})");
                     }
+                }
+                if res.is_ok() && decision != crate::power::PauseDecision::Stop {
+                    release_answered_pause(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &mut in_flight,
+                        &run_id,
+                        &lifecycle_maps,
+                        &actor_maps,
+                        process_gen,
+                        is_acp,
+                    );
                 }
                 // A stop cancelled the run: answer with the state as the cancel left it.
                 let res = match res {
@@ -5754,6 +5801,13 @@ pub(crate) fn resume_run_inner(
     if session.status == SessionStatus::AwaitingHuman && repeat_gate::ask_open(&*store, run_id)? {
         return Ok(SessionStatus::AwaitingHuman);
     }
+    // (core#1581) Likewise a run held at a power checkpoint pause: its answer releases it, a
+    // resume never re-dispatches past it. A stale pause (on a run switched to phased) is cleared.
+    let mut session = session;
+    power_gate::drop_stale_pause(store, &mut session)?;
+    if power_gate::held_pause(&session).is_some() {
+        return Ok(session.status);
+    }
     // (J4) An orphan: persisted `executing` with no worker in this process (the in-flight check
     // above), its cursor unit dispatched (`last_attempt`) and never folded (still `distributed`).
     // Its advance below re-dispatches that unit; it is not a step boundary.
@@ -5937,6 +5991,46 @@ pub(crate) fn resume_run_inner(
     }
 }
 
+/// (core#1581) A checkpoint pause was just answered (or switched off). A worker waiting on it in
+/// this process wakes on its own (`crate::power::answer_pause`); with none (a restart ended it,
+/// so the run is not in flight), the answer releases the held run: it is redriven from its cursor
+/// under a fresh attempt, as a resume would.
+#[allow(clippy::too_many_arguments)]
+fn release_answered_pause(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) {
+    let executing = crate::domain::get_session(&*store, run_id)
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.status == SessionStatus::Executing);
+    if !executing || in_flight.contains(run_id) {
+        return;
+    }
+    if let Err(e) = resume_run_inner(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        run_id,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    ) {
+        emit_run_error(subscribers, run_id, e);
+    }
+}
+
 /// RESTART RECOVERY (seam finding #1) — run ONCE on actor bootstrap when exec-mediation is armed. Any
 /// session persisted `Executing` had a unit dispatched that never reached a terminal apply before the
 /// process died (the `task.dispatched` was lost, or its `task.completed` was consumed but the apply
@@ -5971,6 +6065,18 @@ fn report_orphaned_executing_sessions(
     };
     for s in sessions {
         if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+            continue;
+        }
+        // (core#1581) A run held at a power checkpoint pause waits on the operator, not on a
+        // worker: it is re-opened as it was (the persisted pause is its card), never announced as
+        // an orphan whose remedy is a resume.
+        if let Some(p) = power_gate::held_pause(&s) {
+            eprintln!(
+                "wicked-core: run {} is held at power checkpoint {} (persisted pause re-opened \
+                 after a restart); it waits for the operator's answer \
+                 (POST /api/v1/runs/{}/power/pause)",
+                s.id, p.checkpoint, s.id
+            );
             continue;
         }
         // `ord` is 1-based. Falling back to 0 would emit an ordinal no unit can have, so a reader
@@ -6028,6 +6134,28 @@ fn redrive_executing_sessions(
     };
     for s in sessions {
         if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+            continue;
+        }
+        let mut s = s;
+        // (core#1581) A stale pause (a run an older engine switched to phased mid-turn kept it)
+        // holds nothing: it is cleared, and the run redrives as before with no pause card.
+        if let Err(e) = power_gate::drop_stale_pause(store, &mut s) {
+            emit_run_error(subscribers, &s.id, e);
+            continue;
+        }
+        // (core#1581) A run held at a power checkpoint pause stays held: nothing is redriven past
+        // the operator's answer, which releases it (`Command::AnswerPowerPause`). The orphan
+        // report below re-opens it. The attempt the restart interrupted is superseded as a
+        // redrive would supersede it, so its late or synthetic result (the cli-runner's
+        // predecessor path posts one for a dead process's task) applies as stale, never to the
+        // held run.
+        if power_gate::held_pause(&s).is_some() {
+            let units = crate::domain::session_units(store, &s.id).unwrap_or_default();
+            let mut held = s;
+            held.attempt = redrive_attempt(false, held.attempt, units.get(held.unit_ix));
+            if let Err(e) = put_node(store, held.to_node()) {
+                emit_run_error(subscribers, &held.id, e);
+            }
             continue;
         }
         let run_id = s.id.clone();
@@ -10942,6 +11070,14 @@ fn advance_or_pause_with(
     is_acp: bool,
     mid_unit: bool,
 ) -> anyhow::Result<Progress> {
+    // (core#1581) A run held at a power checkpoint pause advances nowhere until the operator
+    // answers it: every advance (a gate's or a team recovery's answer, a resume, a fold) stops
+    // here, the run left with its pause and no worker. The answer releases it.
+    if crate::domain::get_session(&*store, run_id)?
+        .is_some_and(|s| power_gate::held_pause(&s).is_some())
+    {
+        return Ok(Progress::Paused);
+    }
     // (X1) The scope step's boundary: the launch plan is scored from the PA's answer and decided
     // as the initial plan (accepted, or held for its plan_approval gate) before any creator step
     // dispatches. A plan that cannot be decided or planned fails the run: it never runs on with
@@ -21669,6 +21805,46 @@ mod terminal_gate_tests {
         );
         let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
         assert_eq!(session.status, SessionStatus::AwaitingHuman);
+    }
+
+    /// (core#1581) Every advance stops at a held power checkpoint pause: the run neither
+    /// dispatches nor finalizes (here: the `Auto` terminal gate below would finalize) until the
+    /// pause is answered, whatever path advances it (a team transport gate's answer included).
+    #[test]
+    fn an_advance_stops_at_a_held_power_pause() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        s.status = SessionStatus::Executing;
+        let mut p = crate::power::PowerState::launched(true, 0);
+        p.pause = Some(crate::power::PowerPause {
+            at: 1,
+            checkpoint: 1,
+            reasons: vec!["a destructive change appeared".into()],
+            recommended: "continue_high".into(),
+        });
+        s.power = Some(p);
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(progress, Progress::Paused), "held, not finalized");
+        let after = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(after.status, SessionStatus::Executing);
+        assert!(after.power.unwrap().pause.is_some());
     }
 
     /// Control: an `Auto` terminal gate finalizes (no spurious pause) — the fix is scoped to the
@@ -35450,6 +35626,32 @@ mod worker_code_graph_tests {
             "the reporter emitted nothing even with an empty in-flight set — the exclusion test \
              above proves nothing"
         );
+    }
+
+    /// (core#1581) A run held at a power checkpoint pause waits on the operator, not a worker: a
+    /// restart re-opens its persisted pause and never announces it as an orphan to resume.
+    #[test]
+    fn a_run_held_at_a_power_pause_is_not_announced_as_an_orphan() {
+        let dir = scratch("orphan_held_pause");
+        let mut store = open_store(Some(dir.join("o.db").to_str().unwrap())).unwrap();
+        let mut s = session_at("held-run", SessionStatus::Executing);
+        let mut p = crate::power::PowerState::launched(true, 0);
+        p.pause = Some(crate::power::PowerPause {
+            at: 1,
+            checkpoint: 1,
+            reasons: vec!["a destructive change appeared".into()],
+            recommended: "continue_high".into(),
+        });
+        s.power = Some(p);
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        assert!(
+            emitted(&store).is_empty(),
+            "a run held at its pause was announced as an orphan"
+        );
+        // Answered (the pause cleared) with no worker, it is an orphan again.
+        s.power.as_mut().unwrap().pause = None;
+        crate::domain::put_node(&mut store, s.to_node()).unwrap();
+        assert!(!emitted(&store).is_empty());
     }
 
     /// `ord` is 1-based, so 0 is an ordinal no unit can hold. A run whose units cannot be read must

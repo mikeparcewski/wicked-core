@@ -529,6 +529,353 @@ fn a_dispatched_but_uncompleted_task_re_runs_after_a_restart() {
     released.store(true, Ordering::SeqCst); // free the leaked process-1 worker thread
 }
 
+// ── core#1581: a daemon restart never releases a held power-run pause ────────────────────────────
+
+/// The pause a checkpoint persists (`power_gate::on_checkpoint`) for the given triggers, keyed as
+/// it keys them: `(destructive, spread, sensitive new dependency, struggle)`.
+fn checkpoint_pause(
+    destructive: bool,
+    spread: bool,
+    dependency: bool,
+    struggle: bool,
+) -> (wicked_core::power::PowerPause, Vec<String>) {
+    let struggled = if struggle {
+        vec!["3 failed test runs".to_string()]
+    } else {
+        Vec::new()
+    };
+    let rows = wicked_core::power::sudden_complexity(destructive, spread, dependency, &struggled);
+    let keys = rows
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .filter(|k| k != "spread")
+        .collect();
+    let recommended = if spread { "split" } else { "continue_high" };
+    let pause = wicked_core::power::PowerPause {
+        at: 1_700_000_000_000,
+        checkpoint: 3,
+        reasons: rows.into_iter().map(|(_, r)| r).collect(),
+        recommended: recommended.into(),
+    };
+    (pause, keys)
+}
+
+/// The unit a held run is held on: the second, so the first one's completed task has moved the
+/// dispatch consumer's durable cursor and a restart replays the second one's task through the
+/// cli-runner's predecessor path (a synthetic failure at the interrupted attempt).
+const HELD_IX: u64 = 1;
+
+/// Every `task.dispatched` attempt for the held unit, in bus order.
+fn dispatched_held(bus_db: &str) -> Vec<u64> {
+    let bus = BusDb::open(bus_db).unwrap();
+    bus.poll(TASK_DISPATCHED, 0, 200)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.payload["unit_ix"].as_u64() == Some(HELD_IX))
+        .filter_map(|e| e.payload["attempt"].as_u64())
+        .collect()
+}
+
+/// A runner that completes every unit at once except the held unit, which it counts on entry and
+/// then parks until `open` (or a 30 s cap): a worker mid-unit when the daemon dies, or (after a
+/// restart) a released worker held still so the test can count dispatches exactly.
+struct HoldRunner {
+    open: Arc<AtomicBool>,
+    held_runs: Arc<AtomicUsize>,
+}
+impl StepRunner for HoldRunner {
+    fn run_unit(&self, input: &StepInput) -> StepOutput {
+        if input.unit_ix as u64 == HELD_IX {
+            self.held_runs.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !self.open.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        StepOutput {
+            run_id: input.run_id.clone(),
+            unit_ix: input.unit_ix,
+            attempt: input.attempt,
+            output: format!("done: {}", input.unit.description),
+            status: StepStatus::Ok,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: false,
+        }
+    }
+}
+
+fn view_of(core: &Core, run_id: &str) -> wicked_core::SessionView {
+    core.sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run_id)
+        .unwrap_or_else(|| panic!("run {run_id} not on the store"))
+}
+
+fn power_of(core: &Core, run_id: &str) -> wicked_core::power::PowerState {
+    view_of(core, run_id).session.power.expect("a power run")
+}
+
+/// Process 2 of a restart, and what the test holds of it.
+struct Restarted {
+    core: Core,
+    /// Entries into the held unit after the restart.
+    held_runs: Arc<AtomicUsize>,
+    /// The held unit's attempts dispatched before the restart (process 1's one).
+    before: Vec<u64>,
+    bus_db: String,
+    /// Releases both processes' parked workers (on drop too, so a failed assert never leaves one).
+    open: Arc<AtomicBool>,
+}
+impl Drop for Restarted {
+    fn drop(&mut self) {
+        self.open.store(true, Ordering::SeqCst);
+    }
+}
+
+/// A power run whose orchestrator is mid-unit when the daemon dies. Process 1 runs unit 0 and
+/// parks on the held unit; the store then holds the power record a checkpoint pause leaves
+/// (`pause = None`: a run that was not paused); process 2 is a fresh Core over the same dbs.
+fn restarted_power_run(
+    name: &str,
+    run_id: &str,
+    pause: Option<(wicked_core::power::PowerPause, Vec<String>)>,
+    on: bool,
+) -> Restarted {
+    use wicked_apps_core::ToNode;
+    let dir = tmp_dir(name);
+    let estate_db = dir.join("estate.db").to_str().unwrap().to_string();
+    let bus_db = dir.join("bus.db").to_str().unwrap().to_string();
+    let open = Arc::new(AtomicBool::new(false));
+    let before = {
+        let core1 = Core::spawn_with_engine_exec(
+            estate_db.clone(),
+            Arc::new(StubDispatcher),
+            Arc::new(HoldRunner {
+                open: open.clone(),
+                held_runs: Arc::new(AtomicUsize::new(0)),
+            }),
+            bus_db.clone(),
+        );
+        launch(&core1, run_id).expect("launch");
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && dispatched_held(&bus_db).is_empty() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let before = dispatched_held(&bus_db);
+        assert_eq!(before.len(), 1, "the held unit dispatched once: {before:?}");
+        let v = view_of(&core1, run_id);
+        assert_eq!(v.session.status, SessionStatus::Executing);
+        assert_eq!(v.session.unit_ix as u64, HELD_IX);
+        drop(core1);
+        before
+    };
+    {
+        // What the store holds when the daemon dies: the run's power record, with the pause the
+        // checkpoint persisted (and the triggers that answering it acknowledges).
+        let mut store = open_store(Some(&estate_db)).unwrap();
+        let mut s = wicked_core::get_session(&store, run_id).unwrap().unwrap();
+        let mut p = wicked_core::power::PowerState::launched(on, 1_700_000_000_000);
+        p.checkpoints = 3;
+        if let Some((pause, keys)) = pause {
+            p.pause = Some(pause);
+            p.acknowledged = keys;
+        }
+        s.power = Some(p);
+        wicked_core::put_node(&mut store, s.to_node()).unwrap();
+    }
+    let held_runs = Arc::new(AtomicUsize::new(0));
+    let core = Core::spawn_with_engine_exec(
+        estate_db,
+        Arc::new(StubDispatcher),
+        Arc::new(HoldRunner {
+            open: open.clone(),
+            held_runs: held_runs.clone(),
+        }),
+        bus_db.clone(),
+    );
+    // The actor answers a read only after its boot (redrive and orphan report) is done.
+    let _ = view_of(&core, run_id);
+    Restarted {
+        core,
+        held_runs,
+        before,
+        bus_db,
+        open,
+    }
+}
+
+impl Restarted {
+    /// Held: nothing dispatched or run, the run still executing with the same pause (the same
+    /// card) on the record, its interrupted attempt superseded (the replayed task's synthetic
+    /// failure applied as stale, never failing the run); a resume and a reassign do not get past
+    /// it either.
+    fn assert_held(&self, run_id: &str, want: &wicked_core::power::PowerPause) {
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(
+            dispatched_held(&self.bus_db),
+            self.before,
+            "the restart dispatched the unit of a run held at its pause"
+        );
+        assert_eq!(self.held_runs.load(Ordering::SeqCst), 0, "no worker ran");
+        let v = view_of(&self.core, run_id);
+        assert_eq!(v.session.status, SessionStatus::Executing);
+        assert!(
+            u64::from(v.session.attempt) > self.before[0],
+            "the attempt the restart interrupted is superseded"
+        );
+        let power = v.session.power.expect("a power run");
+        assert_eq!(
+            power.pause.as_ref(),
+            Some(want),
+            "the same pause, re-opened"
+        );
+        assert_eq!(
+            self.core.resume_run(run_id).expect("resume"),
+            SessionStatus::Executing
+        );
+        let err = self
+            .core
+            .reassign_unit(run_id, HELD_IX as u32 + 1, Some("fake-b".into()))
+            .expect_err("a reassign of a held run is refused");
+        assert!(
+            err.to_string().contains("held at power checkpoint"),
+            "{err}"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            dispatched_held(&self.bus_db),
+            self.before,
+            "a resume or a reassign dispatched past the held pause"
+        );
+        assert_eq!(power_of(&self.core, run_id).pause.as_ref(), Some(want));
+    }
+
+    /// Released: the held unit is dispatched exactly once more, under a fresh attempt, and its
+    /// worker entered once (it is parked there, so nothing else can re-dispatch it meanwhile).
+    fn assert_released_once(&self) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while Instant::now() < deadline && self.held_runs.load(Ordering::SeqCst) == 0 {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let attempts = dispatched_held(&self.bus_db);
+        assert_eq!(
+            attempts.len(),
+            self.before.len() + 1,
+            "exactly one re-dispatch: {attempts:?}"
+        );
+        assert!(attempts[1] > attempts[0], "a fresh attempt: {attempts:?}");
+        assert_eq!(
+            self.held_runs.load(Ordering::SeqCst),
+            1,
+            "the unit ran once"
+        );
+    }
+
+    /// Answering the re-opened pause records the answer and releases the run exactly once.
+    fn answer(
+        &self,
+        run_id: &str,
+        decision: wicked_core::power::PauseDecision,
+    ) -> wicked_core::power::PowerState {
+        let st = self
+            .core
+            .answer_power_pause(run_id, decision, None, "operator:test")
+            .expect("answer the re-opened pause");
+        assert!(st.pause.is_none(), "the answer closed the pause");
+        assert_eq!(st.operator_gates, 1, "the answer is recorded");
+        self.assert_released_once();
+        let power = power_of(&self.core, run_id);
+        assert!(power.pause.is_none());
+        assert_eq!(power.operator_gates, 1);
+        power
+    }
+}
+
+/// core#1581: a power run paused at a checkpoint (struggle and a new dependency in a sensitive
+/// area) stays paused across a restart; answering "continue at high rigor" resumes it.
+#[test]
+fn a_restart_keeps_a_power_pause_held_until_it_is_answered() {
+    let run = "pause-restart";
+    let (pause, keys) = checkpoint_pause(false, false, true, true);
+    let r = restarted_power_run("pause_restart", run, Some((pause.clone(), keys)), true);
+    r.assert_held(run, &pause);
+    let power = r.answer(run, wicked_core::power::PauseDecision::ContinueHigh);
+    assert!(
+        power.history.iter().any(|c| c.by == "operator:test"),
+        "the operator's raise is on the rigor history"
+    );
+}
+
+/// core#1581: the same for a destructive-step pause, answered "continue".
+#[test]
+fn a_restart_keeps_a_destructive_step_pause_held_until_it_is_answered() {
+    let run = "pause-destructive";
+    let (pause, keys) = checkpoint_pause(true, false, false, false);
+    assert!(pause.reasons.iter().any(|r| r.contains("destructive")));
+    let r = restarted_power_run("pause_destructive", run, Some((pause.clone(), keys)), true);
+    r.assert_held(run, &pause);
+    r.answer(run, wicked_core::power::PauseDecision::Continue);
+}
+
+/// core#1581: a spread pause too, answered "switch to phased" (the switch is on the record).
+#[test]
+fn a_restart_keeps_a_spread_pause_held_until_it_is_answered() {
+    let run = "pause-spread";
+    let (pause, keys) = checkpoint_pause(false, true, false, false);
+    let r = restarted_power_run("pause_spread", run, Some((pause.clone(), keys)), true);
+    r.assert_held(run, &pause);
+    let power = r.answer(run, wicked_core::power::PauseDecision::SwitchPhased);
+    assert!(!power.on, "switched to phased");
+    assert!(power
+        .toggles
+        .iter()
+        .any(|t| !t.on && t.by == "operator:test"));
+}
+
+/// core#1581: the power switch turned off on a held run answers its pause: after a restart, with no
+/// worker waiting, the switch releases the run (never leaving it executing with nothing behind it).
+#[test]
+fn a_restart_then_the_switch_to_phased_releases_a_held_pause() {
+    let run = "pause-switch";
+    let (pause, keys) = checkpoint_pause(false, false, true, false);
+    let r = restarted_power_run("pause_switch", run, Some((pause.clone(), keys)), true);
+    r.assert_held(run, &pause);
+    let st = r
+        .core
+        .set_power_mode(run, false, "operator:test", Some("phased from here".into()))
+        .expect("switch to phased");
+    assert!(
+        !st.on && st.pause.is_none(),
+        "the switch answered the pause"
+    );
+    r.assert_released_once();
+}
+
+/// core#1581, upgrade: an older engine persisted a pause on a run switched to phased mid-turn
+/// (`power.on = false` WITH a pause). That pause holds nothing: on restart it is cleared, the run
+/// redrives exactly once as before, and no pause card shows.
+#[test]
+fn an_upgrade_redrives_a_switched_off_run_with_a_stale_pause() {
+    let run = "pause-stale-off";
+    let (pause, keys) = checkpoint_pause(true, false, false, false);
+    let r = restarted_power_run("pause_stale_off", run, Some((pause, keys)), false);
+    r.assert_released_once();
+    let power = power_of(&r.core, run);
+    assert!(!power.on);
+    assert!(power.pause.is_none(), "the stale pause card is cleared");
+}
+
+/// core#1581: a power run with no pause still redrives on restart as before, exactly once.
+#[test]
+fn a_restart_still_redrives_a_power_run_that_was_not_paused() {
+    let r = restarted_power_run("pause_none", "pause-none", None, true);
+    r.assert_released_once();
+}
+
 /// Seam finding #2/#3 (WEDGE-ON-RE-DISPATCH): a conditional-gate Approve under exec-mediation must
 /// RE-RUN the cursor unit (bumped attempt → fresh idempotency key), not wedge on a deduped dispatch.
 #[test]

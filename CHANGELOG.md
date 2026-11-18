@@ -38,13 +38,26 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
+  worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
+  next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's
+  source of truth for every kind (destructive step, sensitive new dependency, struggle, spread). A held run is never
+  redriven, resumed or reassigned past it (a reassign is refused with a conflict until the pause is answered) and is
+  not reported as an orphan, so after a restart it stays executing with the same pause card; the attempt the restart
+  interrupted is superseded, so the replayed task's synthetic failure applies as stale (except for a run that boot
+  reconciliation moves to `awaiting_human`, which keeps its attempt unfenced: #1585). Only a run in power mode is
+  held: a pause an older engine kept on a run switched to phased mid-turn is cleared on redrive or resume, and that
+  run redrives as before with no pause card. No checkpoint clears a held
+  pause (a turn end waits on it), every advance stops at one (a team transport gate's answer included), a superseded
+  attempt's checkpoint is stale (it stops that worker and opens nothing), and a run switched to phased opens no new
+  pause. Answering it (`POST /runs/:id/power/pause`), or switching the run to phased,
+  records the answer and, with no worker left waiting, resumes the run once from its cursor under a fresh attempt.
 - **Every container seat kind gets the project graph's read mount, not only Claude (core#1571).** The READ-only
   mount of a bound project graph's directory (`project-graphs/<id>/`) came only through the Claude gate-hook
   environment, so a Codex or pi container seat got none and its project chat could not read the graph. The mount
   is now derived from the unit's governance for every seat (`seat_read_roots`). A repo graph's key dir is
   unchanged: every governed seat already gets it as a write root (core#1554 makes it read-only after estate
   0.35.7). The project-graph grant's doc no longer calls it "read AND write".
-
 - **The redactor cuts the secret shapes it missed, and every deny print that quotes a reason or a cause is
   redacted (core#1577).** These survived the one tool-activity redactor and reached the decisions log through the
   fence recorders:
