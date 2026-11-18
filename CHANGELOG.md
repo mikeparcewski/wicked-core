@@ -38,6 +38,13 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Every container seat kind gets the project graph's read mount, not only Claude (core#1571).** The READ-only
+  mount of a bound project graph's directory (`project-graphs/<id>/`) came only through the Claude gate-hook
+  environment, so a Codex or pi container seat got none and its project chat could not read the graph. The mount
+  is now derived from the unit's governance for every seat (`seat_read_roots`). A repo graph's key dir is
+  unchanged: every governed seat already gets it as a write root (core#1554 makes it read-only after estate
+  0.35.7). The project-graph grant's doc no longer calls it "read AND write".
+
 - **The redactor cuts the secret shapes it missed, and every deny print that quotes a reason or a cause is
   redacted (core#1577).** These survived the one tool-activity redactor and reached the decisions log through the
   fence recorders:
