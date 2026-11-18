@@ -38,6 +38,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A chat or run bound to a project graph can read it (crew#1497).** The grant recognised only the repo-graph
+  shape. `<state home>/project-graphs/<id>/code-graph.db` is the store the engine vouches for and hands over as
+  `WICKED_ESTATE_DB`, but it got no read root and no seat-container mount. The seat got no answers from it, and
+  project chats fell back to grep. That directory is now granted READ only: exactly the bound project's directory,
+  real directories and file only (no link on the grant), under this daemon's state home only. It never gets a
+  write root, so a seat can change nothing there (no link swap, no forged crew manifest, no planted temp file).
+  Reading it needs wicked-estate 0.35.7, whose `--readonly` server opens the graph read-only, and crew leaving the
+  graph in DELETE journal mode. The repo-graph grant is unchanged.
 - **A seat's commit keeps a git name that ends in a Unicode space (core#1565).** The identity read from `git var`
   trimmed every trailing Unicode space, so `Operator` followed by a no-break space became `Operator`, unlike the
   operator's own `git commit`. Only the one ASCII space `git var` prints before `<` is removed now.

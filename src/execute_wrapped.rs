@@ -4858,9 +4858,11 @@ impl WrappedCliStepRunner {
                     if repo_read_root(Some(db), self.operational_home.as_deref()).is_none() {
                         eprintln!(
                             "wicked-core: code_graph_db {db:?} is not an absolute code-graph \
-                             path under this daemon's repo-graph root \
-                             (<state home>/repo-graphs/<key>/estate.db; a graph is never inside \
-                             the checkout — core#406); not widening the read boundary for unit {}",
+                             path under this daemon's repo-graph root (<root>/<key>/estate.db) or \
+                             its state home's project graphs \
+                             (<state home>/project-graphs/<id>/code-graph.db, no link); a graph \
+                             is never inside the checkout (core#406); not widening the read \
+                             boundary for unit {}",
                             input.unit.id
                         );
                     }
@@ -5962,6 +5964,19 @@ fn repo_read_root(
         code_graph_db,
         crate::code_graph::repo_graph_root_for(state_home).as_deref(),
     )
+    .or_else(|| project_graph_dir(code_graph_db, state_home).map(PathBuf::into_os_string))
+}
+
+/// crew#1497: the second graph shape the READ grant recognises — the project graph the actor vouched
+/// for (`actor::project_code_graph_db`), `<state home>/project-graphs/<id>/code-graph.db` → EXACTLY
+/// the bound project's directory ([`crate::code_graph::classify_project_graph_db_at`]: no link,
+/// this state home only). Tried only after the repo shape, which keeps its exact behaviour. It never
+/// joins a write list: [`graph_write_dir`] does not call it.
+fn project_graph_dir(code_graph_db: Option<&str>, state_home: Option<&Path>) -> Option<PathBuf> {
+    crate::code_graph::classify_project_graph_db_at(
+        std::path::Path::new(code_graph_db?),
+        crate::code_graph::project_graph_root_for(state_home).as_deref(),
+    )
 }
 
 /// [`repo_read_root`] with the repo-graph root injected — pure, so the grant tests never read env.
@@ -5987,6 +6002,10 @@ pub(crate) fn graph_write_dir(
         code_graph_db,
         crate::code_graph::repo_graph_root_for(state_home).as_deref(),
     )
+    // crew#1497: never a project graph. Its directory is granted READ only ([`repo_read_root`]):
+    // crew leaves the graph in DELETE journal mode and the seat's estate opens it read-only
+    // (wicked-estate 0.35.7), so a seat needs no write there and can change nothing in it (no link
+    // swap, no forged crew manifest, no planted temp file).
 }
 
 /// [`graph_write_dir`] with the repo-graph root injected — pure, so the grant tests never read env.
@@ -9066,6 +9085,241 @@ mod tests {
             None,
             "the write grant fails closed on the same shapes"
         );
+    }
+
+    /// crew#1497 — a scratch state home holding `project-graphs/<id>/code-graph.db` for each id,
+    /// canonical (macOS temp is reached through `/var` → `/private/var`).
+    fn project_graph_home(name: &str, ids: &[&str]) -> (PathBuf, PathBuf) {
+        let base = std::env::temp_dir().join(format!("wc-pg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let sh = base.join("state");
+        for id in ids {
+            let dir = sh.join("project-graphs").join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("code-graph.db"), b"").unwrap();
+        }
+        (base, sh)
+    }
+
+    /// crew#1497 (KEY) — a unit bound to project A's graph is granted EXACTLY A's directory, READ
+    /// only, through the wrapper and the shared read assembly; never a write on it (no write root, so
+    /// no link swap, forged manifest or planted temp file), and never project B's directory, the
+    /// `project-graphs` root or the state home. Fails on main: the project shape classified as
+    /// nothing, so the chat's graph was never granted.
+    #[test]
+    fn a_project_graph_grants_exactly_its_own_project_dir_and_never_a_sibling() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (base, sh) = project_graph_home("grant", &["proj-a", "proj-b"]);
+        let root = sh.join("project-graphs");
+        let (dir_a, dir_b) = (root.join("proj-a"), root.join("proj-b"));
+        let db_a = dir_a.join("code-graph.db");
+
+        assert_eq!(
+            repo_read_root(db_a.to_str(), Some(&sh)).map(PathBuf::from),
+            Some(dir_a.clone()),
+            "the read grant is project A's own directory"
+        );
+        assert_eq!(
+            graph_write_dir(db_a.to_str(), Some(&sh)),
+            None,
+            "a project graph is never a write grant: a seat can change nothing in its directory"
+        );
+        let cwd = base.join("worktree");
+        assert!(
+            !armed_write_root_paths(
+                &cwd,
+                &[],
+                graph_write_dir(db_a.to_str(), Some(&sh)).as_deref()
+            )
+            .iter()
+            .any(|w| w.starts_with(&root) || root.starts_with(w)),
+            "no write root reaches the project graphs"
+        );
+        let reads = assemble_read_roots(db_a.to_str(), Some(&sh), &[], None);
+        assert_eq!(
+            reads.iter().filter(|r| **r == dir_a).count(),
+            1,
+            "{reads:?}"
+        );
+        for granted in &reads {
+            for unreachable in [&dir_b, &root, &sh] {
+                assert!(
+                    !unreachable.starts_with(granted),
+                    "a unit bound to project A reaches {unreachable:?} through {granted:?}"
+                );
+            }
+        }
+        // Another daemon's state home does not recognise this daemon's project graph.
+        let other = base.join("other-state");
+        std::fs::create_dir_all(other.join("project-graphs")).unwrap();
+        assert_eq!(repo_read_root(db_a.to_str(), Some(&other)), None);
+        assert_eq!(graph_write_dir(db_a.to_str(), Some(&other)), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// crew#1497 (KEY) — every other shape under (or near) `project-graphs` grants nothing: the
+    /// launcher mints this path, so the recogniser is strict.
+    #[test]
+    fn a_misshaped_project_graph_path_grants_nothing() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (base, sh) = project_graph_home("shape", &["p1"]);
+        let root = sh.join("project-graphs");
+        // Shapes that exist on disk, so only the shape rule can refuse them.
+        std::fs::write(root.join("p1").join("estate.db"), b"").unwrap();
+        std::fs::write(root.join("p1").join("x.db"), b"").unwrap();
+        std::fs::write(root.join("code-graph.db"), b"").unwrap();
+        std::fs::create_dir_all(root.join("p1").join("nested")).unwrap();
+        std::fs::write(root.join("p1").join("nested").join("code-graph.db"), b"").unwrap();
+        std::fs::create_dir_all(root.join("-dash")).unwrap();
+        std::fs::write(root.join("-dash").join("code-graph.db"), b"").unwrap();
+        let long = "k".repeat(65);
+        std::fs::create_dir_all(root.join(&long)).unwrap();
+        std::fs::write(root.join(&long).join("code-graph.db"), b"").unwrap();
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        let cases: Vec<(&str, PathBuf)> = vec![
+            ("relative", PathBuf::from("project-graphs/p1/code-graph.db")),
+            (
+                "the repo-graph file name",
+                root.join("p1").join("estate.db"),
+            ),
+            ("another file name", root.join("p1").join("x.db")),
+            ("directly under the root", root.join("code-graph.db")),
+            (
+                "nested below a project dir",
+                root.join("p1").join("nested").join("code-graph.db"),
+            ),
+            (
+                "a traversal segment",
+                root.join("p1").join("..").join("code-graph.db"),
+            ),
+            ("a dot segment", root.join(".").join("code-graph.db")),
+            (
+                "a leading dash key",
+                root.join("-dash").join("code-graph.db"),
+            ),
+            (
+                "a key over 64 chars",
+                root.join(&long).join("code-graph.db"),
+            ),
+            (
+                "no db in the project dir",
+                root.join("empty").join("code-graph.db"),
+            ),
+            (
+                "a project dir that does not exist",
+                root.join("ghost").join("code-graph.db"),
+            ),
+            (
+                "project-graphs under another dir",
+                base.join("project-graphs").join("p1").join("code-graph.db"),
+            ),
+        ];
+        for (why, db) in cases {
+            assert_eq!(
+                repo_read_root(db.to_str(), Some(&sh)),
+                None,
+                "{why}: {db:?}"
+            );
+            assert_eq!(
+                graph_write_dir(db.to_str(), Some(&sh)),
+                None,
+                "{why}: {db:?}"
+            );
+        }
+        assert_eq!(repo_read_root(None, Some(&sh)), None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// crew#1497 (KEY) — no link anywhere on the grant: a symlinked project id (pointing at another
+    /// project, or anywhere), a symlinked db, or a symlinked `project-graphs` root grants nothing.
+    /// A state home reached through a link the operator configured still grants, at the real path.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_project_id_db_or_root_grants_nothing() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (base, sh) = project_graph_home("links", &["victim"]);
+        let root = sh.join("project-graphs");
+        let link = |src: &Path, dst: &Path| std::os::unix::fs::symlink(src, dst).unwrap();
+        // A project id that is a link to another project's directory.
+        link(&root.join("victim"), &root.join("attacker"));
+        // A project id that is a link to an arbitrary directory holding a db.
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("code-graph.db"), b"").unwrap();
+        link(&outside, &root.join("escape"));
+        // A real project dir whose db is a link.
+        std::fs::create_dir_all(root.join("dblink")).unwrap();
+        link(
+            &outside.join("code-graph.db"),
+            &root.join("dblink").join("code-graph.db"),
+        );
+        for id in ["attacker", "escape", "dblink"] {
+            let db = root.join(id).join("code-graph.db");
+            assert_eq!(repo_read_root(db.to_str(), Some(&sh)), None, "{id}");
+            assert_eq!(graph_write_dir(db.to_str(), Some(&sh)), None, "{id}");
+        }
+        // A `project-graphs` root that is itself a link.
+        let sh2 = base.join("state2");
+        std::fs::create_dir_all(&sh2).unwrap();
+        link(&root, &sh2.join("project-graphs"));
+        let via = sh2
+            .join("project-graphs")
+            .join("victim")
+            .join("code-graph.db");
+        assert_eq!(repo_read_root(via.to_str(), Some(&sh2)), None);
+        assert_eq!(graph_write_dir(via.to_str(), Some(&sh2)), None);
+        // A state home reached through a configured link: granted, at the real directory.
+        let sh_link = base.join("state-link");
+        link(&sh, &sh_link);
+        let db = sh_link
+            .join("project-graphs")
+            .join("victim")
+            .join("code-graph.db");
+        assert_eq!(
+            repo_read_root(db.to_str(), Some(&sh_link)).map(PathBuf::from),
+            Some(root.join("victim")),
+            "the read grant is the real project dir"
+        );
+        assert_eq!(
+            graph_write_dir(db.to_str(), Some(&sh_link)),
+            None,
+            "never a write grant"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// crew#1497 — the repo-graph grant is unchanged beside a project graph in the same state home:
+    /// the wrapper answers exactly what the repo-shape classifier answers.
+    #[test]
+    fn a_repo_graph_grant_is_unchanged_beside_project_graphs() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        if std::env::var_os(crate::code_graph::REPO_GRAPH_ROOT_ENV).is_some_and(|v| !v.is_empty()) {
+            eprintln!("skipping: WICKED_ESTATE_REPO_GRAPH_ROOT is set in this process");
+            return;
+        }
+        let (base, sh) = project_graph_home("repo", &["p1"]);
+        let repo_root = sh.join("repo-graphs");
+        let db = crate::code_graph::repo_graph_db_at(&repo_root, &base.join("some-repo"));
+        let expected = repo_read_root_at(db.to_str(), Some(&repo_root));
+        assert!(expected.is_some(), "precondition: the repo shape grants");
+        assert_eq!(repo_read_root(db.to_str(), Some(&sh)), expected);
+        assert_eq!(
+            graph_write_dir(db.to_str(), Some(&sh)),
+            graph_write_dir_at(db.to_str(), Some(&repo_root))
+        );
+        // Lexical, as before: the repo key dir need not exist on disk to be granted.
+        assert!(!db.parent().unwrap().exists());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// core#294 — the LAUNCH-declared extra READ roots ride the ONE shared assembly, appended to
