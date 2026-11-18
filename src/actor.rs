@@ -9348,29 +9348,12 @@ fn identity_missing_at(worktree: Option<&std::path::Path>) -> Vec<String> {
         return Vec::new();
     };
     let (author, committer) = wicked_apps_core::spawn::operator_git_idents(Some(worktree));
-    missing_identity_roles(author.as_ref(), committer.as_ref())
+    wicked_apps_core::spawn::missing_git_ident_roles(author.as_ref(), committer.as_ref())
 }
 
-/// The roles a seat spawn would refuse, by the seat's own rule
-/// (`wicked_apps_core::spawn::usable_git_ident`): not resolved, a blank name, a control character.
-fn missing_identity_roles(
-    author: Option<&wicked_apps_core::spawn::GitIdent>,
-    committer: Option<&wicked_apps_core::spawn::GitIdent>,
-) -> Vec<String> {
-    [("author", author), ("committer", committer)]
-        .into_iter()
-        .filter(|(_, i)| wicked_apps_core::spawn::usable_git_ident(*i).is_none())
-        .map(|(role, _)| role.to_string())
-        .collect()
-}
-
-/// (wicked-core#1566) The identity roles each run's launch found missing, kept for its gates (in
-/// memory: after a daemon restart the run's `gitIdentityMissing` event still says it).
-static IDENTITY_MISSING: std::sync::Mutex<std::collections::BTreeMap<String, Vec<String>>> =
-    std::sync::Mutex::new(std::collections::BTreeMap::new());
-
-/// Emit `gitIdentityMissing` for `run_id` and keep the roles for its gates; nothing when none is
-/// missing.
+/// (wicked-core#1566) Emit `gitIdentityMissing` for `run_id` when its launch's identity read
+/// found roles missing; nothing when none is. (The gates read the latest read's record,
+/// `wicked_apps_core::spawn::latest_git_ident_missing`, never this.)
 fn report_identity_missing(
     subscribers: &mut crate::event_log::EventSink,
     run_id: &str,
@@ -9383,24 +9366,20 @@ fn report_identity_missing(
         subscribers,
         CoreEvent::GitIdentityMissing {
             session: run_id.to_string(),
-            roles: missing.clone(),
+            roles: missing,
             remedy: GIT_IDENTITY_REMEDY.to_string(),
         },
     );
-    IDENTITY_MISSING
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(run_id.to_string(), missing);
 }
 
-/// The roles `run_id`'s launch found missing (empty when none, or not recorded in this process).
-fn recorded_identity_missing(run_id: &str) -> Vec<String> {
-    IDENTITY_MISSING
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(run_id)
-        .cloned()
-        .unwrap_or_default()
+/// (wicked-core#1566) The gate sentence for a run's worktree, from its LATEST identity read;
+/// empty for a repo-less run or when that read resolved both roles.
+fn workdir_identity_gate_note(workdir: Option<&str>) -> String {
+    git_identity_gate_note(
+        &workdir
+            .map(|w| wicked_apps_core::spawn::latest_git_ident_missing(std::path::Path::new(w)))
+            .unwrap_or_default(),
+    )
 }
 
 /// (wicked-core#1566) The gate sentence for missing identity roles; empty when none is missing.
@@ -9435,12 +9414,12 @@ fn escalate_denied_unit(
     def_gate: bool,
     note: &str,
 ) -> anyhow::Result<()> {
-    // (wicked-core#1566) A gate on a run whose worktree resolved no git identity at launch says so:
-    // the seats' commits there are refused until one is configured. Read from what the launch
-    // recorded, never a git call on the actor.
+    // (wicked-core#1566) A gate on a run whose worktree's LATEST identity read (the launch's or a
+    // seat spawn's) resolved no git identity says so: the seats' commits there are refused until
+    // one is configured. Read from that record, never a git call on the actor.
     let note = &format!(
         "{note}{}",
-        git_identity_gate_note(&recorded_identity_missing(&session.id))
+        workdir_identity_gate_note(session.workdir.as_deref())
     );
     let ord = unit.ord;
     let denial = unit.denial.as_ref();
@@ -40305,15 +40284,35 @@ mod carried_skip_tests {
 #[cfg(test)]
 mod git_identity_missing_tests {
     use super::{
-        git_identity_gate_note, identity_missing_in, missing_identity_roles,
-        recorded_identity_missing, report_identity_missing, GIT_IDENTITY_REMEDY,
+        git_identity_gate_note, identity_missing_in, report_identity_missing,
+        workdir_identity_gate_note, GIT_IDENTITY_REMEDY,
     };
-    use wicked_apps_core::spawn::{GitIdent, HardenedCommand};
+    use wicked_apps_core::spawn::{
+        missing_git_ident_roles, operator_git_idents, record_git_ident_read, GitIdent,
+        HardenedCommand,
+    };
 
     fn ident(name: &str) -> GitIdent {
         GitIdent {
             name: name.into(),
             email: "op@example.invalid".into(),
+        }
+    }
+
+    fn repo_with_identity(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Repo Person"],
+            &["config", "user.email", "repo@example.invalid"],
+        ] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .expect("git runs");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
         }
     }
 
@@ -40323,29 +40322,29 @@ mod git_identity_missing_tests {
     #[test]
     fn the_missing_roles_are_the_ones_a_seat_refuses() {
         let ok = ident("Operator");
-        assert!(missing_identity_roles(Some(&ok), Some(&ok)).is_empty());
+        assert!(missing_git_ident_roles(Some(&ok), Some(&ok)).is_empty());
         assert_eq!(
-            missing_identity_roles(None, None),
+            missing_git_ident_roles(None, None),
             vec!["author", "committer"]
         );
-        assert_eq!(missing_identity_roles(None, Some(&ok)), vec!["author"]);
+        assert_eq!(missing_git_ident_roles(None, Some(&ok)), vec!["author"]);
         let blank = ident("\u{a0}");
         assert_eq!(
-            missing_identity_roles(Some(&ok), Some(&blank)),
+            missing_git_ident_roles(Some(&ok), Some(&blank)),
             vec!["committer"]
         );
         let ctl = ident("Op\rerator");
         assert_eq!(
-            missing_identity_roles(Some(&ctl), Some(&ok)),
+            missing_git_ident_roles(Some(&ctl), Some(&ok)),
             vec!["author"]
         );
     }
 
     /// The gate sentence names the roles, says the seats' commits are refused and what to run; with
-    /// nothing missing it is empty. Reported once at launch, it is what the run's gates read (no git
-    /// call at the gate), and the event carries the roles and the remedy, never a name or email.
+    /// nothing missing it is empty. The launch's run event carries the roles and the remedy, never a
+    /// name or an email, and nothing when no role is missing.
     #[test]
-    fn a_missing_identity_is_a_run_event_and_every_gate_of_the_run_says_it() {
+    fn a_missing_identity_is_a_run_event_and_the_gate_sentence_names_the_remedy() {
         let missing = vec!["author".to_string(), "committer".to_string()];
         let note = git_identity_gate_note(&missing);
         assert!(
@@ -40356,46 +40355,63 @@ mod git_identity_missing_tests {
         assert!(note.contains(GIT_IDENTITY_REMEDY), "{note}");
         assert_eq!(git_identity_gate_note(&[]), "");
 
-        let run = format!("core1566-{}", std::process::id());
         let mut subs = crate::event_log::EventSink::default();
         let (tx, rx) = std::sync::mpsc::channel();
         subs.push(tx);
-        report_identity_missing(&mut subs, &run, Vec::new());
-        assert!(recorded_identity_missing(&run).is_empty());
+        report_identity_missing(&mut subs, "r1566", Vec::new());
         assert!(rx.try_recv().is_err(), "nothing missing: no event");
-        report_identity_missing(&mut subs, &run, missing.clone());
-        assert_eq!(recorded_identity_missing(&run), missing);
-        let ev = rx.try_recv().expect("the run event");
-        let wire = ev.to_json();
+        report_identity_missing(&mut subs, "r1566", missing);
+        let wire = rx.try_recv().expect("the run event").to_json();
         assert_eq!(wire["type"], "gitIdentityMissing");
-        assert_eq!(wire["session"], run.as_str());
+        assert_eq!(wire["session"], "r1566");
         assert_eq!(wire["roles"][1], "committer");
         assert!(wire["remedy"]
             .as_str()
             .is_some_and(|r| r.contains("user.email")));
-        assert!(recorded_identity_missing("another-run").is_empty());
     }
 
-    /// A repository-local identity resolves both roles (no process environment is changed: the
-    /// unresolved side is the seat fixture's in wicked-apps-core).
+    /// Merge check (W12): the gate sentence is a fact about the LATEST identity read, not the
+    /// session. A refused attempt (no identity) makes the run's gates say it; the operator
+    /// configures an identity and retries, the retry's seat spawn reads it (the real
+    /// `operator_git_idents`), and a later, unrelated gate carries no identity sentence. A seat in a
+    /// subdirectory of the worktree counts; another run's worktree does not.
+    #[test]
+    fn after_the_identity_is_configured_and_a_retry_reads_it_later_gates_say_nothing() {
+        let base = std::env::temp_dir().join(format!("core1566-latest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let other = base.join("other");
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let w = wt.to_str().unwrap();
+
+        // The refused attempt: the read found no identity (a seat in a subdirectory).
+        record_git_ident_read(&wt.join("sub"), None, None);
+        record_git_ident_read(&other, Some(&ident("Op")), Some(&ident("Op")));
+        let refused = workdir_identity_gate_note(Some(w));
+        assert!(
+            refused.contains("No git author or committer identity is configured"),
+            "{refused}"
+        );
+        assert_eq!(workdir_identity_gate_note(other.to_str()), "");
+        assert_eq!(workdir_identity_gate_note(None), "", "a repo-less run");
+
+        // Configure, retry: the retry's seat spawn read resolves both roles.
+        repo_with_identity(&wt);
+        let (author, committer) = operator_git_idents(Some(&wt));
+        assert!(author.is_some() && committer.is_some());
+        let later = workdir_identity_gate_note(Some(w));
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(later, "", "an unrelated gate after the retry says nothing");
+    }
+
+    /// The launch read on a repository-local identity resolves both roles (no process environment
+    /// is changed: the unresolved side is the seat fixture's in wicked-apps-core).
     #[test]
     fn a_repository_identity_resolves_both_roles() {
         let repo = std::env::temp_dir().join(format!("core1566-repo-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&repo);
-        std::fs::create_dir_all(&repo).unwrap();
-        for args in [
-            &["init", "-q"][..],
-            &["config", "user.name", "Repo Person"],
-            &["config", "user.email", "repo@example.invalid"],
-        ] {
-            let out = std::process::Command::new("git")
-                .hardened()
-                .args(args)
-                .current_dir(&repo)
-                .output()
-                .expect("git runs");
-            assert!(out.status.success(), "git {args:?}: {out:?}");
-        }
+        repo_with_identity(&repo);
         let resolved = identity_missing_in(&repo);
         let _ = std::fs::remove_dir_all(&repo);
         assert!(resolved.is_empty(), "{resolved:?}");

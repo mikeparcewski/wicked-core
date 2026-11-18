@@ -737,7 +737,63 @@ pub fn operator_git_idents(cwd: Option<&std::path::Path>) -> (Option<GitIdent>, 
         let out = git.output().ok().filter(|o| o.status.success())?;
         parse_git_ident(std::str::from_utf8(&out.stdout).ok()?)
     };
-    (var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT"))
+    let idents = (var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT"));
+    if let Some(dir) = cwd {
+        record_git_ident_read(dir, idents.0.as_ref(), idents.1.as_ref());
+    }
+    idents
+}
+
+/// (wicked-core#1566) The roles a seat would refuse ([`usable_git_ident`]): `"author"`,
+/// `"committer"`, in that order; empty when both are usable.
+pub fn missing_git_ident_roles(
+    author: Option<&GitIdent>,
+    committer: Option<&GitIdent>,
+) -> Vec<String> {
+    [("author", author), ("committer", committer)]
+        .into_iter()
+        .filter(|(_, i)| usable_git_ident(*i).is_none())
+        .map(|(role, _)| role.to_string())
+        .collect()
+}
+
+/// (wicked-core#1566) The LATEST identity read per directory: every [`operator_git_idents`] with a
+/// cwd (the launch's read beside a minted worktree, and each seat spawn's read) replaces the entry
+/// for that directory, so the record is a fact about the latest attempt, never a session-long
+/// cache: configure an identity and retry, and the retry's seat spawn clears it. In memory only.
+static GIT_IDENT_READS: std::sync::Mutex<
+    std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<String>)>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static GIT_IDENT_READ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Record one identity read from `dir` (see [`GIT_IDENT_READS`]).
+pub fn record_git_ident_read(
+    dir: &std::path::Path,
+    author: Option<&GitIdent>,
+    committer: Option<&GitIdent>,
+) {
+    let seq = GIT_IDENT_READ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    GIT_IDENT_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            dir.to_path_buf(),
+            (seq, missing_git_ident_roles(author, committer)),
+        );
+}
+
+/// The roles the LATEST identity read from `dir` or a directory under it found missing (a seat
+/// may run in a subdirectory of its worktree); empty when that read resolved both, or none was
+/// made in this process. No git call and no filesystem access: safe on the engine's actor.
+pub fn latest_git_ident_missing(dir: &std::path::Path) -> Vec<String> {
+    GIT_IDENT_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(k, _)| k.starts_with(dir))
+        .max_by_key(|(_, (seq, _))| *seq)
+        .map(|(_, (_, missing))| missing.clone())
+        .unwrap_or_default()
 }
 
 /// (wicked-core#1566) The identity a seat may carry: resolved, a non-blank name, no control

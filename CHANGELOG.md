@@ -44,10 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
 - **A run whose repository has no git identity says so on the run and at its gates (core#1566).** With no identity
   configured, a seat's commits are refused (core#1485), but the reason reached only the daemon's stderr. The launch now
   reads the identity beside the minted worktree: off the actor on the interactive path, and beside the worktree add on
-  the campaign path. It uses the seat's own rule (`usable_git_ident`). A missing author or committer emits
-  `gitIdentityMissing {session, roles, remedy}` (additive event), and every denial gate of that run adds a sentence
-  from what the launch recorded (no git call at the gate): the seats' commits are refused until one is configured,
-  with the `git config` commands to run.
+  the campaign path. It uses the seat's own rule (`usable_git_ident`). A missing author or committer emits a new
+  `CoreEvent::GitIdentityMissing`, JSON `{type: "gitIdentityMissing", session, roles, remedy}` (camelCase like every
+  CoreEvent type; additive, so a consumer that skips unknown types is unaffected). Every denial gate of that run adds a
+  sentence (the seats' commits are refused until one is configured, with the `git config` commands to run) from the
+  LATEST identity read of its worktree: every read (the launch's and each seat spawn's) replaces the record, so once
+  an identity is configured and a retry's seat reads it, later gates say nothing. No git call at the gate.
 - **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
   (core#1552).** npm got every core-ts version, but nothing made a GitHub Release, so the Releases page's Latest
   stayed a hand-made 0.7.29. A new `registry` job waits until npm serves all six packages at the tag's version (the
