@@ -6743,21 +6743,28 @@ pub(crate) fn is_blocked_estate_write(claim: &ConformanceClaim) -> bool {
         && claim.policy_ids.iter().any(|p| p == ESTATE_FENCE_RULE_ID)
 }
 
-/// (core#1562) The most of a refused command the gate record keeps, in characters.
+/// (core#1562) The most of a refused command the gate record keeps, in UTF-8 bytes (the `…` included).
 pub(crate) const REFUSED_COMMAND_MAX: usize = 2048;
 
 /// (core#1562) A refused command (or the fence's reason, which names it) as the gate record keeps it, read in full
 /// off the decisions log
 /// (the wire's tool-activity target is clipped to [`crate::tool_activity::TARGET_MAX`]): secrets cut
-/// by the tool-activity redactor, then at most [`REFUSED_COMMAND_MAX`] characters (`…` marks a cut).
+/// by the tool-activity redactor, then at most [`REFUSED_COMMAND_MAX`] BYTES (`…` marks a cut), cut at a character
+/// boundary and never inside a redaction marker (`***`: a partial one is dropped).
 pub(crate) fn refused_command_record(command: &str) -> String {
     let redacted = crate::tool_activity::redact(command);
-    if redacted.chars().count() <= REFUSED_COMMAND_MAX {
+    if redacted.len() <= REFUSED_COMMAND_MAX {
         return redacted;
     }
-    let mut cut: String = redacted.chars().take(REFUSED_COMMAND_MAX - 1).collect();
-    cut.push('…');
-    cut
+    let mut end = REFUSED_COMMAND_MAX - '…'.len_utf8();
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut head = &redacted[..end];
+    if redacted[end..].starts_with('*') {
+        head = head.trim_end_matches('*');
+    }
+    format!("{head}…")
 }
 
 /// (core#1562) A call the engine refused BEFORE it ran: a blocked filesystem-boundary write or a
@@ -10827,9 +10834,32 @@ mod tests {
             cmd.starts_with("GH_TOKEN=*** wicked-estate index xxx"),
             "{cmd}"
         );
-        assert!(cmd.chars().count() <= REFUSED_COMMAND_MAX && cmd.ends_with('…'));
+        assert!(cmd.len() <= REFUSED_COMMAND_MAX && cmd.ends_with('…'));
         assert!(cmd.chars().count() > crate::tool_activity::TARGET_MAX);
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// core#1562 (coord merge check W8): the refused command's cap is BYTES, cut at a character boundary, and never
+    /// inside a redaction marker.
+    #[test]
+    fn a_refused_command_is_capped_in_bytes_at_a_char_boundary_never_inside_a_redaction_marker() {
+        // 2,048 three-byte characters would be 6 KB under a character cap.
+        let wide = refused_command_record(&"€".repeat(2_048));
+        assert!(wide.len() <= REFUSED_COMMAND_MAX, "{}", wide.len());
+        assert!(wide.ends_with('…'));
+        assert!(wide.trim_end_matches('…').chars().all(|c| c == '€'));
+        // A redaction marker (`GH_TOKEN=***`) straddling the cut is dropped whole, never left as `*` or `**`.
+        let pad = format!("{} ", "x".repeat(2_034));
+        let cmd = format!("{pad}GH_TOKEN=ghp_secretvalue123 {}", "z".repeat(500));
+        let rec = refused_command_record(&cmd);
+        assert!(!rec.contains("ghp_secretvalue123"), "{rec}");
+        assert!(rec.len() <= REFUSED_COMMAND_MAX, "{}", rec.len());
+        assert!(rec.ends_with("GH_TOKEN=…"), "{}", &rec[rec.len() - 20..]);
+        // Short commands are kept whole.
+        assert_eq!(
+            refused_command_record("git push origin main"),
+            "git push origin main"
+        );
     }
 
     /// core#716 — a blocked filesystem-boundary WRITE on a unit whose deterministic floor PASSED is

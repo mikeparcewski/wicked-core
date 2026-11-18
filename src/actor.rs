@@ -9085,8 +9085,11 @@ fn refused_only_behind_floor(d: &crate::domain::UnitDenial) -> bool {
     d.source == "input_governance" && !d.refused_before_run.is_empty()
 }
 
-/// (core#1562) How many refused calls a floor gate's prompt lists one by one.
-const REFUSED_CALLS_SHOWN: usize = 5;
+/// (core#1562) Above this many refused calls, each one's command and reason are quoted shorter in the floor gate's
+/// prompt (at most [`REFUSED_CALL_QUOTE_MANY`] characters); every call is still named, none is dropped or counted.
+const REFUSED_CALLS_QUOTED_WHOLE: usize = 5;
+/// (core#1562) The quote cap per refused call when there are more than [`REFUSED_CALLS_QUOTED_WHOLE`].
+const REFUSED_CALL_QUOTE_MANY: usize = 300;
 
 /// (core#1562) A seat-supplied string on one line for a prompt: newlines folded, backticks
 /// replaced (it is quoted in backticks), at most `max` characters.
@@ -9109,21 +9112,21 @@ fn prompt_quote(text: &str, max: usize) -> String {
 
 /// (core#1562) One refused call in plain words: what the seat tried, and who refused it by which
 /// rule, before it ran.
-fn refused_call_words(c: &crate::domain::RefusedCall) -> String {
+fn refused_call_words(c: &crate::domain::RefusedCall, quote_max: usize) -> String {
     let tool = c
         .tool
         .as_deref()
         .map(|t| format!(" (`{}`)", prompt_quote(t, 40)))
         .unwrap_or_default();
     let tried = match c.command.as_deref() {
-        // The command as the fold recorded it (redacted, at most 2 KB): shown whole.
+        // The command as the fold recorded it (redacted, at most 2 KB), up to `quote_max`.
         Some(cmd) => format!(
             "the seat tried to run `{}`{tool}",
-            prompt_quote(cmd, crate::gate_hook::REFUSED_COMMAND_MAX)
+            prompt_quote(cmd, quote_max)
         ),
         None => format!(
             "the seat tried a call{tool}: {}",
-            prompt_quote(&c.reason, 160)
+            prompt_quote(&c.reason, quote_max.min(160))
         ),
     };
     let fence = if c.rule == crate::gate_hook::ESTATE_FENCE_RULE_ID {
@@ -9373,23 +9376,24 @@ fn layers_behind_note(unit: &crate::domain::WorkUnit, override_offered: bool) ->
         let what = match d.source.as_str() {
             // (core#1562) Each call refused before it ran, in plain words.
             "input_governance" if refused_only_behind_floor(d) => {
+                // EVERY one is named (coord's condition on the override); with many, each is
+                // quoted shorter, the whole record staying on the step.
+                let quote_max = if d.refused_before_run.len() > REFUSED_CALLS_QUOTED_WHOLE {
+                    REFUSED_CALL_QUOTE_MANY
+                } else {
+                    crate::gate_hook::REFUSED_COMMAND_MAX
+                };
                 let shown = d
                     .refused_before_run
                     .iter()
-                    .take(REFUSED_CALLS_SHOWN)
-                    .map(refused_call_words)
+                    .enumerate()
+                    .map(|(i, c)| format!("({}) {}", i + 1, refused_call_words(c, quote_max)))
                     .collect::<Vec<_>>()
                     .join("; ");
-                let more = d
-                    .refused_before_run
-                    .len()
-                    .saturating_sub(REFUSED_CALLS_SHOWN);
-                let more = if more > 0 {
-                    format!("; and {more} more refused call(s), each recorded on the step")
-                } else {
-                    String::new()
-                };
-                lines.push(format!("also: {shown}{more}"));
+                lines.push(format!(
+                    "also, {} call(s) refused before they ran: {shown}",
+                    d.refused_before_run.len()
+                ));
                 continue;
             }
             "input_governance" => {
@@ -28293,18 +28297,39 @@ mod request_changes_tests {
         let (r, _) = operator_judgment(&mut store, &run_id, "the base is red (estate#484)");
         r.expect("the override applies over calls refused before they ran");
 
-        // Many refusals: five listed, the rest counted; a seat-supplied command stays on one line, unquoted.
+        // Many refusals (coord merge check W12): EVERY one is named, none dropped or counted, each quoted at most
+        // REFUSED_CALL_QUOTE_MANY characters; a seat-supplied command stays on one line, unquoted.
         let run_id = format!("core1562-many-{}", std::process::id());
         let mut calls = vec![refused(
             Some("rm `x`\nwicked-estate index"),
             crate::gate_hook::ESTATE_FENCE_RULE_ID,
         )];
-        calls.extend((0..6).map(|_| refused(None, crate::gate_hook::BOUNDARY_WRITE_RULE_ID)));
+        calls.extend((0..5).map(|i| {
+            let long = format!("touch /outside/{i} {}", "y".repeat(1_000));
+            refused(Some(&long), crate::gate_hook::BOUNDARY_WRITE_RULE_ID)
+        }));
+        calls.push(refused(None, crate::gate_hook::BOUNDARY_WRITE_RULE_ID));
         seed_floor_failed_fix(&mut store, &run_id, Some(vec![governance(calls)]));
         let units = crate::domain::session_units(&store, &run_id).unwrap();
         let p = denial_gate_prompt(&units[2], "floor_failed", "checks failed", None, "");
+        assert!(
+            p.contains("also, 7 call(s) refused before they ran: (1) "),
+            "{p}"
+        );
         assert!(p.contains("`rm 'x' wicked-estate index`"), "{p}");
-        assert!(p.contains("and 2 more refused call(s)"), "{p}");
+        for i in 0..5 {
+            assert!(
+                p.contains(&format!("`touch /outside/{i} y")),
+                "call {i} named: {p}"
+            );
+        }
+        assert!(p.contains("(7) the seat tried a call (`Bash`)"), "{p}");
+        assert_eq!(p.matches("refused it before it ran").count(), 7, "{p}");
+        assert!(
+            !p.contains(&"y".repeat(400)),
+            "each long command is capped: {p}"
+        );
+        assert!(!p.contains("more refused call"), "{p}");
         assert!(p.contains("action `operator_judgment`"), "{p}");
 
         // Withheld, with the reason named: the same layer unmarked, or marked beside a standing denial.

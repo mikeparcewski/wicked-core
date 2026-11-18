@@ -57,8 +57,9 @@ Two release tracks share this file, newest entry first regardless of track:
   step's decisions log a second time with those refusals discounted. Only when that pass is clean (no policy deny,
   no corrupted line, the hook-fired proof present, no write the write-root witness caught) does it mark the denial
   `refused_before_run`, listing each refused call: evaluator, rule, tool and the command, which is redacted and
-  capped at 2 KB. It is still a denial (retries, floor re-runs and the carry are unchanged); the operator's judgment
-  is offered over it, and the prompt names what the seat tried. When the judgment is withheld, the prompt now says
+  capped at 2,048 bytes (cut at a character boundary, never inside a redaction marker). It is still a denial
+  (retries, floor re-runs and the carry are unchanged); the operator's judgment is offered over it, and the prompt
+  names every refused call and what the seat tried (with more than five, each quote is capped at 300 characters). When the judgment is withheld, the prompt now says
   so and names each layer that withholds it. A reviewer turn's standing denial is never masked by the executor's
   refused-only one.
 - **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
