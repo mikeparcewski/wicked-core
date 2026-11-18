@@ -1063,6 +1063,22 @@ impl Core {
         serde_json::to_string(&wicked_core::worktree_benched(&clis, bound)).map_err(err)
     }
 
+    /// (crew#972) Whether the seats in `clisJson` (the engine-shaped roster, as `launchRun`'s) can
+    /// cover an author plus an independent judge of its work, by the default gate's own pool and
+    /// rotation (`wicked_core::judge_coverage`): JSON `{covered, singleIdentity, authors: [{seat,
+    /// judges: [{seat, seenSharing?}], notJudges: [{seat, reason, detail?}]}], benched}`. Judges are
+    /// in the gate's order; `seenSharing` names a provider the seat was seen calling that the author
+    /// also called (the gate tries it last and discards its approval if it calls it again), and
+    /// `covered` counts only unflagged judges. Not predicted: pinned gates, monitors and the fallback
+    /// ladder. `bound`: the run is bound to a repository. Reads the process's observed providers and
+    /// the floor env at call time. An addon without this static predates it; crew keys on its presence.
+    #[napi]
+    pub fn judge_coverage(clis_json: String, bound: bool) -> napi::Result<String> {
+        let clis: Vec<AgenticCli> = serde_json::from_str(&clis_json)
+            .map_err(|e| err(format!("clisJson is not a valid AgenticCli array: {e}")))?;
+        serde_json::to_string(&wicked_core::judge_coverage(&clis, bound)).map_err(err)
+    }
+
     /// (crew Agents page A4) Whether this host's skill routing admits the seat `key` (run with its
     /// roster `invocation` template, when given) to the engine's isolated QE reviewer turn
     /// (wicked-core#917) — the reviewer runs the QE skill, and a skills root that makes it
