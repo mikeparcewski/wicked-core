@@ -2816,8 +2816,11 @@ mod tests {
         // Names git quotes (non-ASCII, a double quote) are scratch too, and a quoted non-scratch
         // name is read as its real path.
         std::fs::write(wd.join("tmp/\u{e9}.output"), "x\n").unwrap();
-        std::fs::create_dir_all(wd.join("scratch")).unwrap();
-        std::fs::write(wd.join("scratch/a\"b.output"), "x\n").unwrap();
+        if cfg!(unix) {
+            // Windows refuses a `"` in a filename; the non-ASCII name covers quoting there.
+            std::fs::create_dir_all(wd.join("scratch")).unwrap();
+            std::fs::write(wd.join("scratch/a\"b.output"), "x\n").unwrap();
+        }
         std::fs::write(wd.join("caf\u{e9}.rs"), "fn c() {}\n").unwrap();
         let r = measure(wd, Some(&base), "turn", 2, 0, "s");
         assert!(
