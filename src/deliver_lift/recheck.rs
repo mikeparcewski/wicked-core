@@ -198,9 +198,11 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    // spawn-audit: test-only — git fixtures building the layout under test.
+    // Hardened like every spawn site (spawn_audit): the fixtures need nothing of the engine's env.
     fn git(cwd: &Path, args: &[&str]) -> String {
+        use wicked_apps_core::spawn::HardenedCommand;
         let out = std::process::Command::new("git")
+            .hardened()
             .args(args)
             .current_dir(cwd)
             .output()
