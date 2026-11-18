@@ -41,11 +41,12 @@ Two release tracks share this file, newest entry first regardless of track:
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
   worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
   next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's
-  source of truth for every kind (destructive step, sensitive new dependency, struggle, spread): a held run is never
-  redriven or resumed past it and is not reported as an orphan, so after a restart it stays executing with the same
-  pause card; no checkpoint clears a held pause (a turn end waits on it); answering it (`POST /runs/:id/power/pause`)
-  records the answer and, with no worker left waiting, resumes the run from its cursor under a fresh attempt. The
-  switch to phased, which answers a pause, now clears it too.
+  source of truth for every kind (destructive step, sensitive new dependency, struggle, spread). A held run is never
+  redriven, resumed or reassigned past it (a reassign is refused with a conflict until the pause is answered) and is
+  not reported as an orphan, so after a restart it stays executing with the same pause card; the attempt the restart
+  interrupted is superseded, so the replayed task's synthetic failure applies as stale. No checkpoint clears a held
+  pause (a turn end waits on it). Answering it (`POST /runs/:id/power/pause`), or switching the run to phased,
+  records the answer and, with no worker left waiting, resumes the run once from its cursor under a fresh attempt.
 - **The redactor cuts the secret shapes it missed, and every deny print that quotes a reason or a cause is
   redacted (core#1577).** These survived the one tool-activity redactor and reached the decisions log through the
   fence recorders:

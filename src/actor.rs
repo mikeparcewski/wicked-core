@@ -3621,6 +3621,17 @@ pub(crate) fn run(
                     )));
                     continue;
                 }
+                // (core#1581) A run held at a power checkpoint pause runs nothing until the
+                // operator answers it: a reassign (which would dispatch a replacement for a full
+                // turn) is refused, the run untouched, before anything is cancelled.
+                if let Some(p) = power_gate::held_pause(&session) {
+                    let _ = reply.send(Err(anyhow::anyhow!(
+                        "conflict: run {run_id} is held at power checkpoint {}; answer the pause \
+                         (POST /runs/{run_id}/power/pause) before reassigning its unit",
+                        p.checkpoint
+                    )));
+                    continue;
+                }
                 // (T3 round 10) The dispatch guard, judged BEFORE anything is reaped or bumped: a
                 // reassign is refused — the run untouched — while no unit may dispatch.
                 if let Some(why) = team_gate::dispatch_blocked(&session) {
@@ -4588,14 +4599,36 @@ pub(crate) fn run(
                 reason,
                 reply,
             } => {
-                let _ = reply.send(power_gate::set_power(
+                // (core#1581) The switch to phased answers a held checkpoint pause: with no
+                // worker left waiting on it, the run is released as an answer releases it.
+                let held = !on
+                    && crate::domain::get_session(&store, &run_id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|s| power_gate::held_pause(&s).is_some());
+                let res = power_gate::set_power(
                     &mut store,
                     &mut subscribers,
                     &run_id,
                     on,
                     &actor,
                     reason,
-                ));
+                );
+                if held && res.is_ok() {
+                    release_answered_pause(
+                        &mut store,
+                        &mut subscribers,
+                        &runner,
+                        &self_tx,
+                        &mut in_flight,
+                        &run_id,
+                        &lifecycle_maps,
+                        &actor_maps,
+                        process_gen,
+                        is_acp,
+                    );
+                }
+                let _ = reply.send(res);
             }
             Command::RaiseRigor {
                 run_id,
@@ -4640,17 +4673,8 @@ pub(crate) fn run(
                         eprintln!("wicked-core: run {run_id}: stop at the pause failed ({e:#})");
                     }
                 }
-                // (core#1581) No worker waits on this pause (a restart ended it): the answer
-                // releases the held run, which is redriven from its cursor as a resume would.
-                if res.is_ok()
-                    && decision != crate::power::PauseDecision::Stop
-                    && !in_flight.contains(&run_id)
-                    && crate::domain::get_session(&store, &run_id)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|s| s.status == SessionStatus::Executing)
-                {
-                    if let Err(e) = resume_run_inner(
+                if res.is_ok() && decision != crate::power::PauseDecision::Stop {
+                    release_answered_pause(
                         &mut store,
                         &mut subscribers,
                         &runner,
@@ -4661,9 +4685,7 @@ pub(crate) fn run(
                         &actor_maps,
                         process_gen,
                         is_acp,
-                    ) {
-                        emit_run_error(&mut subscribers, &run_id, e);
-                    }
+                    );
                 }
                 // A stop cancelled the run: answer with the state as the cancel left it.
                 let res = match res {
@@ -5967,6 +5989,46 @@ pub(crate) fn resume_run_inner(
     }
 }
 
+/// (core#1581) A checkpoint pause was just answered (or switched off). A worker waiting on it in
+/// this process wakes on its own (`crate::power::answer_pause`); with none (a restart ended it,
+/// so the run is not in flight), the answer releases the held run: it is redriven from its cursor
+/// under a fresh attempt, as a resume would.
+#[allow(clippy::too_many_arguments)]
+fn release_answered_pause(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    runner: &Arc<dyn StepRunner>,
+    self_tx: &Sender<Command>,
+    in_flight: &mut HashSet<String>,
+    run_id: &str,
+    lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    process_gen: uuid::Uuid,
+    is_acp: bool,
+) {
+    let executing = crate::domain::get_session(&*store, run_id)
+        .ok()
+        .flatten()
+        .is_some_and(|s| s.status == SessionStatus::Executing);
+    if !executing || in_flight.contains(run_id) {
+        return;
+    }
+    if let Err(e) = resume_run_inner(
+        store,
+        subscribers,
+        runner,
+        self_tx,
+        in_flight,
+        run_id,
+        lifecycle_maps,
+        actor_maps,
+        process_gen,
+        is_acp,
+    ) {
+        emit_run_error(subscribers, run_id, e);
+    }
+}
+
 /// RESTART RECOVERY (seam finding #1) — run ONCE on actor bootstrap when exec-mediation is armed. Any
 /// session persisted `Executing` had a unit dispatched that never reached a terminal apply before the
 /// process died (the `task.dispatched` was lost, or its `task.completed` was consumed but the apply
@@ -6074,8 +6136,17 @@ fn redrive_executing_sessions(
         }
         // (core#1581) A run held at a power checkpoint pause stays held: nothing is redriven past
         // the operator's answer, which releases it (`Command::AnswerPowerPause`). The orphan
-        // report below re-opens it.
+        // report below re-opens it. The attempt the restart interrupted is superseded as a
+        // redrive would supersede it, so its late or synthetic result (the cli-runner's
+        // predecessor path posts one for a dead process's task) applies as stale, never to the
+        // held run.
         if power_gate::held_pause(&s).is_some() {
+            let units = crate::domain::session_units(store, &s.id).unwrap_or_default();
+            let mut held = s;
+            held.attempt = redrive_attempt(false, held.attempt, units.get(held.unit_ix));
+            if let Err(e) = put_node(store, held.to_node()) {
+                emit_run_error(subscribers, &held.id, e);
+            }
             continue;
         }
         let run_id = s.id.clone();
