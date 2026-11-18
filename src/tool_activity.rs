@@ -902,7 +902,14 @@ fn redact_config_pairs(cmd: &str) -> String {
             }
             for pair in plain.chunks(2) {
                 if let [k, v] = pair {
-                    if secret(words[*k]) {
+                    // A flag's own secret-named value (`--profile prod-auth KEY VALUE`) is no key:
+                    // the scan above reads that shape.
+                    let flag_value = *k > 0
+                        && flag(words[*k - 1])
+                        && !words[*k - 1].contains('=')
+                        && secret(words[*v])
+                        && words.get(*v + 1).is_some_and(|w| !w.starts_with('-'));
+                    if secret(words[*k]) && !flag_value {
                         cut.push(spans[*v]);
                     }
                 }
