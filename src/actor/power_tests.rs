@@ -674,7 +674,31 @@ fn a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_
         }
     });
     let mut e = power_engine("pw6", w.clone(), "ph");
-    let revised = settled(&e, "ph", tev::PLAN_REVISED, 1);
+    let mut waited = 0;
+    while payloads(&e, "ph", tev::PLAN_REVISED).is_empty() {
+        std::thread::sleep(Duration::from_millis(250));
+        waited += 1;
+        if waited > 160 {
+            let v = view(&e, "ph");
+            let tp = v.session.team_plan.clone();
+            panic!(
+                "no plan.revised: status {:?} unit_ix {} units {:?} rescored {:?} rev {:?} accepted_rev {:?} \
+                 max {:?} pending {:?} calls {:?} power {:?} bus {:?}",
+                v.session.status,
+                v.session.unit_ix,
+                v.units.iter().map(|u| (u.id.clone(), format!("{:?}", u.status))).collect::<Vec<_>>(),
+                tp.as_ref().map(|t| t.rescored.clone()),
+                tp.as_ref().map(|t| t.rev),
+                tp.as_ref().map(|t| t.accepted_rev),
+                tp.as_ref().map(|t| t.max_score),
+                tp.as_ref().map(|t| t.pending.is_some()),
+                e.worker.calls(),
+                v.session.power.as_ref().map(|p| p.history.iter().map(|h| h.trigger.clone()).collect::<Vec<_>>()),
+                rows(&e, "ph").iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            );
+        }
+    }
+    let revised = payloads(&e, "ph", tev::PLAN_REVISED);
     assert_eq!(revised[0]["reason"], "floor_raised");
     assert_eq!(revised[0]["to_band"], "70-100");
     assert_eq!(revised[0]["high_risk"], true);
