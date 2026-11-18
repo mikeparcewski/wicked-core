@@ -473,10 +473,30 @@ fn impact_score_table() {
 fn a_cross_crate_change_in_one_repository_raises_rigor_but_is_not_a_spread() {
     let store = graph(
         &[
-            node("guard", NodeKind::Function, "crates/extract/src/lib.rs", (10, 20)),
-            node("index", NodeKind::Function, "crates/cli/src/lib.rs", (10, 20)),
-            node("link", NodeKind::Function, "crates/cli/src/link.rs", (10, 20)),
-            node("serve", NodeKind::Function, "crates/serve/src/main.rs", (10, 20)),
+            node(
+                "guard",
+                NodeKind::Function,
+                "crates/extract/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "index",
+                NodeKind::Function,
+                "crates/cli/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "link",
+                NodeKind::Function,
+                "crates/cli/src/link.rs",
+                (10, 20),
+            ),
+            node(
+                "serve",
+                NodeKind::Function,
+                "crates/serve/src/main.rs",
+                (10, 20),
+            ),
         ],
         &[],
     );
@@ -490,10 +510,25 @@ fn a_cross_crate_change_in_one_repository_raises_rigor_but_is_not_a_spread() {
     ));
     let a = assess(&diff, ready(&store), None);
     let s = a.signals.as_ref().expect("graph was read");
-    assert_eq!((s.changed_symbols, s.products, s.repositories), (4, 3, 1), "{s:?}");
-    assert!(a.reasons.iter().any(|r| r == "span +20: 3 products"), "{:?}", a.reasons);
-    assert_eq!(a.score, 50, "reach 20 + span 20 + complexity 10: {:?}", a.reasons);
-    assert!(a.score > THRESHOLDS.qe_waiver_max_score, "QE stays required");
+    assert_eq!(
+        (s.changed_symbols, s.products, s.repositories),
+        (4, 3, 1),
+        "{s:?}"
+    );
+    assert!(
+        a.reasons.iter().any(|r| r == "span +20: 3 products"),
+        "{:?}",
+        a.reasons
+    );
+    assert_eq!(
+        a.score, 50,
+        "reach 20 + span 20 + complexity 10: {:?}",
+        a.reasons
+    );
+    assert!(
+        a.score > THRESHOLDS.qe_waiver_max_score,
+        "QE stays required"
+    );
     let fresh = crate::power::PowerState::launched(true, 0);
     let spread = crate::power::spread_grew(&fresh, s.repositories);
     assert!(!spread, "one repository is no spread");

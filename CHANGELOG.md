@@ -53,12 +53,14 @@ Two release tracks share this file, newest entry first regardless of track:
   another product" (rig runs 97ee72d4 and 40f41c9c). Two concerns now have two numbers. Rigor keeps `products`
   exactly as before: review depth, QE and phase minimums still escalate for a cross-crate change. The spread is
   `repositories` (one for a run's own repository), so only a change that adds a repository pauses. Rigor growth inside
-  the repository, even two bands at once, no longer pauses at all: the checkpoint raises rigor, the plan gains the
-  phases the band requires, and the run goes on unattended (the escalation is its `rigorRescored` row). The intake no
+  the repository, even two bands at once, is no longer a power pause: the checkpoint raises rigor and the plan gains
+  the phases the band requires (the escalation is its `rigorRescored` row); a rise into the high-risk band is still the
+  plan gate's approval, as before. The intake no
   longer seeds the spread baseline from `products`, and the turn-start rigor the two-band check read is gone.
   The checkpoint also skips untracked scratch, as delivery does: an untracked file under `tmp/`, `.cache/`,
   `test-results/` and the other delivery scratch and tool-output directories, at any depth, is not part of the change
-  it scores (core#1573; run 40f41c9c's extra "product" was a CLI's task output under `tmp/`).
+  it scores, names git would quote included (core#1573; run 40f41c9c's extra "product" was a CLI's task output
+  under `tmp/`).
 - **A chat or run bound to a project graph can read it (crew#1497).** The grant recognised only the repo-graph
   shape. `<state home>/project-graphs/<id>/code-graph.db` is the store the engine vouches for and hands over as
   `WICKED_ESTATE_DB`, but it got no read root and no seat-container mount. The seat got no answers from it, and

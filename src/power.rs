@@ -1413,9 +1413,10 @@ pub fn struggle_score(s: &Struggle) -> (u8, Vec<String>) {
 
 /// "Suddenly complex" (DES §5.4): the reasons to pause, empty when none holds. Rigor growth inside
 /// the run's repository is NOT one: the checkpoint raises rigor and the plan gains the phases the
-/// new band requires, unattended (the escalation is a `rigorRescored` row, not a pause). Only a
-/// spread into another repository, a destructive change, a sensitive new dependency or struggle
-/// pauses.
+/// new band requires (the escalation is a `rigorRescored` row, not a power pause). A rise INTO
+/// the high-risk band is still the plan gate's to approve (`plan_gate::approval`,
+/// `IntoHighRisk`), not this pause. Only a spread into another repository, a destructive change,
+/// a sensitive new dependency or struggle pauses here.
 pub fn sudden_complexity(
     destructive_new: bool,
     spread_new: bool,
@@ -1859,9 +1860,11 @@ pub fn measure(
             }
         }
     }
-    if let Some(untracked) = git(wd, &["ls-files", "--others", "--exclude-standard"]) {
+    // `-z`: raw NUL-delimited names, so a quoted one (`"tmp/\303\251.output"` under the default
+    // `core.quotePath`) is read as its real path and the scratch check sees `tmp`.
+    if let Some(untracked) = git(wd, &["ls-files", "-z", "--others", "--exclude-standard"]) {
         for p in untracked
-            .lines()
+            .split('\0')
             .filter(|p| !p.is_empty() && !untracked_scratch(p))
         {
             if !paths.iter().any(|x| x == p) {
@@ -2810,6 +2813,12 @@ mod tests {
         std::fs::create_dir_all(wd.join("crates/x/test-results")).unwrap();
         std::fs::write(wd.join("crates/x/test-results/r.json"), "{}\n").unwrap();
         std::fs::write(wd.join("tmp.rs"), "fn t() {}\n").unwrap();
+        // Names git quotes (non-ASCII, a double quote) are scratch too, and a quoted non-scratch
+        // name is read as its real path.
+        std::fs::write(wd.join("tmp/\u{e9}.output"), "x\n").unwrap();
+        std::fs::create_dir_all(wd.join("scratch")).unwrap();
+        std::fs::write(wd.join("scratch/a\"b.output"), "x\n").unwrap();
+        std::fs::write(wd.join("caf\u{e9}.rs"), "fn c() {}\n").unwrap();
         let r = measure(wd, Some(&base), "turn", 2, 0, "s");
         assert!(
             !r.paths
@@ -2818,7 +2827,19 @@ mod tests {
             "untracked scratch is not the change: {:?}",
             r.paths
         );
+        assert!(
+            !r.paths
+                .iter()
+                .any(|p| p.contains("scratch") || p.contains(".output")),
+            "{:?}",
+            r.paths
+        );
         assert!(r.paths.contains(&"tmp.rs".to_string()), "{:?}", r.paths);
+        assert!(
+            r.paths.contains(&"caf\u{e9}.rs".to_string()),
+            "{:?}",
+            r.paths
+        );
         assert_eq!(r.trigger, "turn");
         assert_eq!(r.turn, 2);
         assert!(r.paths.contains(&"a.rs".to_string()), "{:?}", r.paths);
