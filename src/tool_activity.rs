@@ -829,13 +829,18 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
 /// `` `npm config …` ``); one shell word after it (quoted fragments whole, so a quoted `&` or `;`
 /// never ends the command, and an unquoted `|`, `;`, `&` or backtick does); and a word naming a
 /// secret.
-fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
-    static R: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
+fn config_rules() -> &'static ([regex::Regex; 2], regex::Regex, regex::Regex) {
+    static R: std::sync::OnceLock<([regex::Regex; 2], regex::Regex, regex::Regex)> =
         std::sync::OnceLock::new();
     R.get_or_init(|| {
         let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
         (
-            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
+            // Both heads scan, their cuts united: the plain one (flags only) and, (core#1580), one that
+            // also skips each flag's value, so neither can hide a head the other finds.
+            [
+                re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
+                re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+(?:\s+(?:[^\s'"-]\S*|'[^']*'|"(?:[^"\\]|\\.)*"))?)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
+            ],
             re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])+"#),
             re(SECRET_WORD),
         )
@@ -849,49 +854,70 @@ fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
 /// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
 /// aws_secret_access_key …`), so the next word is the key.
 fn redact_config_pairs(cmd: &str) -> String {
-    let (head, word, secret_word) = config_rules();
+    let (heads, word, secret_word) = config_rules();
     let flag = |w: &str| w.starts_with('-');
     let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
     let mut cut: Vec<(usize, usize)> = Vec::new();
-    let mut from = 0;
-    while from < cmd.len() {
-        let Some(m) = head.find_at(cmd, from) else {
-            break;
-        };
-        let mut words: Vec<&str> = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        let mut pos = m.end();
-        loop {
-            let rest = &cmd[pos..];
-            let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
-            match word.find(&cmd[start..]) {
-                Some(w) if start > pos || spans.is_empty() => {
-                    words.push(w.as_str());
-                    spans.push((start, start + w.end()));
-                    pos = start + w.end();
+    for head in heads {
+        let mut from = 0;
+        while from < cmd.len() {
+            let Some(m) = head.find_at(cmd, from) else {
+                break;
+            };
+            let mut words: Vec<&str> = Vec::new();
+            let mut spans: Vec<(usize, usize)> = Vec::new();
+            let mut pos = m.end();
+            loop {
+                let rest = &cmd[pos..];
+                let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
+                match word.find(&cmd[start..]) {
+                    Some(w) if start > pos || spans.is_empty() => {
+                        words.push(w.as_str());
+                        spans.push((start, start + w.end()));
+                        pos = start + w.end();
+                    }
+                    _ => break,
                 }
-                _ => break,
             }
-        }
-        let mut i = 0;
-        while i + 1 < words.len() {
-            let flag_value = i > 0
-                && flag(words[i - 1])
-                && !words[i - 1].contains('=')
-                && secret(words[i + 1])
-                && words.get(i + 2).is_some_and(|w| !w.starts_with('-'));
-            if secret(words[i]) && !flag_value {
-                cut.push(spans[i + 1]);
-                i += 2;
-            } else {
-                i += 1;
+            let mut i = 0;
+            while i + 1 < words.len() {
+                let flag_value = i > 0
+                    && flag(words[i - 1])
+                    && !words[i - 1].contains('=')
+                    && secret(words[i + 1])
+                    && words.get(i + 2).is_some_and(|w| !w.starts_with('-'));
+                if secret(words[i]) && !flag_value {
+                    cut.push(spans[i + 1]);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
             }
+            // (core#1580) And the strict reading, KEY VALUE pairs of the non-flag words: a value that
+            // merely names a secret word (`registry https://auth.example/ //h/:_authToken V`) is not a
+            // key, so the next pair is judged on its own. Only ever ADDS cuts to the scan above.
+            let mut plain: Vec<usize> = (0..words.len()).filter(|&j| !flag(words[j])).collect();
+            if plain.first().is_some_and(|&j| words[j] == "set") {
+                plain.remove(0);
+            }
+            for pair in plain.chunks(2) {
+                if let [k, v] = pair {
+                    if secret(words[*k]) {
+                        cut.push(spans[*v]);
+                    }
+                }
+            }
+            from = pos;
         }
-        from = pos;
     }
+    cut.sort_unstable();
+    cut.dedup();
     let mut out = String::with_capacity(cmd.len());
     let mut last = 0;
     for (a, b) in cut {
+        if a < last {
+            continue;
+        }
         out.push_str(&cmd[last..a]);
         out.push_str("***");
         last = b;
@@ -1302,6 +1328,21 @@ mod tests {
                 format!("curl -H 'Authorization: Bearer \\\r\n{}' https://h", v("s")),
                 v("s"),
             ),
+            // core#1580
+            (
+                format!(
+                    "aws --profile ci configure set aws_secret_access_key {}",
+                    v("t")
+                ),
+                v("t"),
+            ),
+            (
+                format!(
+                    "npm config set registry https://auth.example.test/ //h/:_authToken {}",
+                    v("u")
+                ),
+                v("u"),
+            ),
         ];
         for (cmd, secret) in &cases {
             let t = bash(cmd);
@@ -1380,6 +1421,20 @@ mod tests {
             (
                 "npm config set //one/:_authToken {s} //two/:_authToken {s}",
                 "npm config set //one/:_authToken *** //two/:_authToken ***",
+            ),
+            // core#1580: a valued global flag before the subcommand (quoted too), and a second pair
+            // after a pair whose value merely names a secret word (its key is over-cut: safe).
+            (
+                "aws --profile ci configure set aws_secret_access_key {s}",
+                "aws --profile ci configure set aws_secret_access_key ***",
+            ),
+            (
+                "aws --region eu-west-1 --profile \"ci account\" configure set aws_secret_access_key {s}",
+                "aws --region eu-west-1 --profile \"ci account\" configure set aws_secret_access_key ***",
+            ),
+            (
+                "npm config set registry https://auth.example.test/ //h/:_authToken {s}",
+                "npm config set registry https://auth.example.test/ *** ***",
             ),
             (
                 "npm config set //h/:_authToken 'prefix'{s}",

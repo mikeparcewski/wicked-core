@@ -44,9 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
   - a bare token as a URL's userinfo, `https://TOKEN@host/…` (a user name alone is cut too; an `@` after `/`,
     `?` or `#` is not userinfo and stays);
   - a config CLI's secret values (`npm config …`, `npm c …`, `aws configure …`, `git config …` and the like):
-    every `<key naming a secret> <value>` pair up to the end of the command (an unquoted `|`, `;` or `&`; a quoted
-    one does not end it), wherever the flags sit, a flag's own secret-named value (`--profile prod-auth`) not
-    taken for the key; a bare `config` word (`rg config …`) is not a config CLI;
+    each `<key naming a secret> <value>` pair, judged both as a scan for secret-named words and as strict key-then-value pairs of the non-flag words, up to the end of the command
+    (an unquoted `|`, `;` or `&`; a quoted one does not end it); a flag's own secret-named value
+    (`--profile prod-auth`) not taken for the key, and a valued global flag before the subcommand
+    (`aws --profile ci configure set …`) skipped; a value that merely names a secret word
+    (`registry https://auth.example/`) never hides the next pair (core#1580; its key may be over-cut); a bare `config` word
+    (`rg config …`) is not a config CLI;
   - a spaced or quoted-key `name = value` line (an AWS credentials or `.npmrc` line);
   - `--user=…` and the attached `-uuser:password`;
   - a value spelled as several abutting fragments (`'a'b`, `"a\"b"`, `a\ b`), now read as one shell word (a
