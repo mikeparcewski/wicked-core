@@ -5262,7 +5262,7 @@ pub fn run_gate_hook(
     // consumes the log. So there is no in-run audit hole (Copilot).
     RECORD_FAILED.store(false, std::sync::atomic::Ordering::SeqCst);
     if let Some(reason) = store_unavailable(db) {
-        eprintln!("wicked-governance: DENY ({reason})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         return relayed_exit(2, true);
     }
     let mut raw = String::new();
@@ -5378,7 +5378,7 @@ pub(crate) fn evaluate_tool_call(
     // configured it). `fold_input_denial` checks for this sentinel; its absence alongside real claim
     // lines means the hook was bypassed (hook process suppressed while tool calls still ran) → DENY.
     if let Err(why) = write_hook_fired_sentinel(decisions_path, phase) {
-        eprintln!("wicked-governance: DENY ({why})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&why));
         return 2;
     }
 
@@ -5415,7 +5415,7 @@ pub(crate) fn evaluate_tool_call(
     if crate::mcp_isolation::has_mcp_prefix(tool) {
         let reason = crate::mcp_isolation::denial_reason(tool);
         append_mcp_deny(decisions_path, scope, phase, tool, &reason);
-        eprintln!("wicked-governance: DENY ({reason})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         return 2;
     }
 
@@ -5498,7 +5498,7 @@ pub(crate) fn evaluate_tool_call(
         } else {
             append_boundary_deny(decisions_path, scope, phase, tool, &reason, fatal);
         }
-        eprintln!("wicked-governance: DENY ({reason})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         if !shell_read_denied {
             return 2;
         }
@@ -5579,7 +5579,7 @@ pub(crate) fn evaluate_tool_call(
                         changed.join(", ")
                     );
                     append_witness_deny(decisions_path, scope, phase, tool, &changed);
-                    eprintln!("wicked-governance: DENY ({reason})");
+                    eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
                     return 2;
                 }
             }
@@ -5603,7 +5603,7 @@ pub(crate) fn evaluate_tool_call(
             &reason,
             context.get("command").and_then(serde_json::Value::as_str),
         );
-        eprintln!("wicked-governance: DENY ({reason})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         return 2;
     }
 
@@ -6266,6 +6266,8 @@ pub(crate) fn append_infra_deny_checked(
     tool: &str,
     reason: &str,
 ) -> std::io::Result<()> {
+    // (core#1569) An infra reason can carry a relayed refusal's text (`hook_relay`): redacted here.
+    let reason = &seat_text(reason);
     let claim = ConformanceClaim {
         // Keyed on `phase` only — NOT the scope, which embeds `/` (`wicked-agent/<sess>/unit/<id>`) and
         // would make an unsafe/unbounded claim symbol (Copilot). One infra-deny node per phase is enough
@@ -6404,6 +6406,10 @@ fn append_phase_scope_deny(
     reason: &str,
     command: Option<&str>,
 ) {
+    // (core#1569) Redacted once, here: every reader of the record sees only this copy.
+    let reason = &seat_text(reason);
+    let command = command.map(seat_text);
+    let command = command.as_deref();
     let claim = ConformanceClaim {
         // Keyed on `phase` only, for the same reason `append_infra_deny` is: `scope` embeds `/`
         // and would make an unbounded claim symbol.
@@ -6531,6 +6537,8 @@ fn append_remote_write_deny(
     reason: &str,
     command: &str,
 ) {
+    // (core#1569) Redacted once, here: every reader of the record sees only this copy.
+    let (reason, command) = (&seat_text(reason), &seat_text(command));
     let claim = ConformanceClaim {
         claim_id: format!("{REMOTE_WRITE_DENY_PREFIX}{phase}"),
         scope: scope.to_string(),
@@ -6571,6 +6579,8 @@ fn append_estate_deny(
     command: &str,
     fatal: bool,
 ) {
+    // (core#1569) Redacted once, here: every reader of the record sees only this copy.
+    let (reason, command) = (&seat_text(reason), &seat_text(command));
     let (prefix, criteria) = if fatal {
         (
             BOUNDARY_WRITE_DENY_PREFIX,
@@ -6625,6 +6635,15 @@ fn append_estate_deny(
     }
 }
 
+/// (core#1569) Seat-supplied text in a refusal record (the refused command, or a reason that quotes
+/// it or the path it named), as the record STORES it: secrets cut by the tool-activity redactor
+/// ([`crate::tool_activity::redact`]: auth headers, secret-named assignments and flags, `-u` / `-p`
+/// / `--user` values, credentials in a URL), once, at capture. The decisions log, the fold, the
+/// events and the gate prompts all read this copy; nothing downstream sees the raw text.
+pub(crate) fn seat_text(text: &str) -> String {
+    crate::tool_activity::redact(text)
+}
+
 fn append_boundary_deny(
     decisions_path: &str,
     scope: &str,
@@ -6633,6 +6652,8 @@ fn append_boundary_deny(
     reason: &str,
     fatal: bool,
 ) {
+    // (core#1569) Redacted once, here: every reader of the record sees only this copy.
+    let reason = &seat_text(reason);
     let (prefix, rule, criteria) = if fatal {
         (
             BOUNDARY_WRITE_DENY_PREFIX,
@@ -7534,7 +7555,7 @@ pub fn run_output_gate_hook(
     db: Option<&str>,
 ) -> i32 {
     if let Some(reason) = store_unavailable(db) {
-        eprintln!("wicked-governance: DENY ({reason})");
+        eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         return 2;
     }
     let mut raw = String::new();
@@ -16116,7 +16137,8 @@ mod phase_scope_tests {
             .iter()
             .find_map(|r| r.remote_write_refusal())
             .expect("the fold sees the refusal");
-        assert_eq!(rec_command, command);
+        // (core#1569) Stored as the redactor's copy: the wire's redactor cuts a `-u` value.
+        assert_eq!(rec_command, "cd /wt && git push -u *** wicked/run");
         assert!(rec_reason.contains("`git push`"), "{rec_reason}");
         assert!(recs[0].claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX));
         // The claim itself is ADVISORY by the allowlist — prevention, not a violation.
@@ -16127,9 +16149,78 @@ mod phase_scope_tests {
             .next()
             .expect("one conformance claim recorded");
         assert!(is_advisory_deny(&claim), "{claim:?}");
-        assert_eq!(claim.obligations.get(1).map(String::as_str), Some(command));
+        assert_eq!(
+            claim.obligations.get(1).map(String::as_str),
+            Some(crate::tool_activity::redact(command).as_str())
+        );
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
         let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// core#1569 — a refused command is redacted ONCE, at capture: every fence recorder that stores
+    /// seat-supplied text (the estate fence on both arms, the filesystem boundary on both arms, the
+    /// remote-write fence, the phase scope, the infra recorder the hook relay falls back to) writes
+    /// only the redacted copy to the decisions log, so
+    /// the fold, the events and the prompts never see the secret. Token-shaped strings in an
+    /// assignment, a header and a URL; the raw log is searched, not a reader's view of it.
+    #[test]
+    fn a_refused_command_is_stored_redacted_by_every_fence_recorder() {
+        let run_id = format!("core1569-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let p = decisions_path_for(&run_id, 0);
+        write_armed_marker(&p, "unit-1").unwrap();
+        let log = p.to_str().unwrap();
+        let tok = "ghp_core1569SECRETvalue0123456789";
+        let cmd = format!(
+            "GH_TOKEN={tok} wicked-estate index . && curl -H 'Authorization: Bearer {tok}' \
+             https://bot:{tok}@github.com/o/r.git"
+        );
+        let reason = format!("estate-deny fence: `{cmd}` is a write subcommand");
+        append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, &cmd, false);
+        append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, &cmd, true);
+        let boundary = format!("path outside the worktree (write): `{cmd}`");
+        append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, true);
+        append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, false);
+        let remote = format!("{REMOTE_WRITE_REASON_PREFIX} `{cmd}`");
+        append_remote_write_deny(log, "wf/unit-1", "unit-1", &remote, &cmd);
+        append_phase_scope_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, Some(&cmd));
+        // The relay's infra record of an unrecorded refusal carries the same text.
+        append_infra_deny(log, "wf/unit-1", "unit-1", "Bash", &remote);
+
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let claims: Vec<ConformanceClaim> = raw
+            .lines()
+            .filter_map(|l| serde_json::from_str::<ConformanceClaim>(l).ok())
+            .collect();
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        assert_eq!(claims.len(), 7, "{raw}");
+        assert!(
+            !raw.contains(tok),
+            "a secret reached the decisions log: {raw}"
+        );
+        assert!(!raw.contains("core1569SECRET"), "{raw}");
+        for c in &claims {
+            let text = format!("{} {}", c.criteria, c.obligations.join(" "));
+            assert!(text.contains("GH_TOKEN=***"), "{text}");
+            assert!(text.contains("https://***@github.com/o/r.git"), "{text}");
+        }
+        // The command slot still names what the seat tried, redacted.
+        let estate = &claims[0].obligations[1];
+        assert!(
+            estate.starts_with("GH_TOKEN=*** wicked-estate index ."),
+            "{estate}"
+        );
+    }
+
+    /// core#1569 — every deny diagnostic that quotes a refusal's reason is printed through
+    /// `seat_text` (the hook relay forwards it and records it on an unrecorded deny). A source
+    /// scan, as `spawn_audit` does for spawns: a new raw print fails here.
+    #[test]
+    fn no_deny_diagnostic_prints_a_raw_reason() {
+        let src = include_str!("gate_hook.rs");
+        for raw in [concat!("DENY ({", "reason})"), concat!("DENY ({", "why})")] {
+            assert!(!src.contains(raw), "a raw deny diagnostic: {raw}");
+        }
     }
 
     /// Review of #449 (FN-1/FN-2): every bypass spelling the review reproduced is refused by the

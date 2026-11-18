@@ -985,7 +985,11 @@ pub fn record_mcp_boundary_escape(
     reason: &str,
 ) -> Result<String, McpCallError> {
     let unit = resolve(token).ok_or(McpCallError::InvalidToken)?;
-    let (subject, reason) = (subject.trim(), reason.trim());
+    // (core#1569) Caller-supplied text is stored redacted, once, here.
+    let (subject, reason) = (
+        &crate::gate_hook::seat_text(subject.trim()),
+        &crate::gate_hook::seat_text(reason.trim()),
+    );
     if subject.is_empty() || reason.is_empty() {
         return Err(McpCallError::BadRequest(
             "a boundary escape names its subject and its reason".to_string(),
@@ -2076,6 +2080,17 @@ mod tests {
             }),
             "the escape fails the unit: {denial:?}"
         );
+        // (core#1569) A caller-supplied reason is stored redacted: a credential in a URL never
+        // reaches the decisions log.
+        record_mcp_boundary_escape(
+            &token.value,
+            "mcp:jira/get_issue",
+            "redirected to https://bot:ghp_core1569MCPsecret@evil.example/x",
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&dpath).unwrap();
+        assert!(!raw.contains("ghp_core1569MCPsecret"), "{raw}");
+        assert!(raw.contains("https://***@evil.example/x"), "{raw}");
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 
