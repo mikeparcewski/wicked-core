@@ -16601,6 +16601,37 @@ mod phase_scope_tests {
                 format!("printf 'aws_session_token = {}' >> creds", v("ini")),
                 v("ini"),
             ),
+            // core#1580: a valued global flag before the subcommand, several npm pairs with a
+            // secret-named value, a flag with a value after the subcommand, and a command quoted
+            // inside another's flag value.
+            (
+                format!(
+                    "aws --profile ci configure set aws_secret_access_key {}",
+                    v("awsg")
+                ),
+                v("awsg"),
+            ),
+            (
+                format!(
+                    "npm config set registry https://auth.example.test/ //h/:_authToken {}",
+                    v("npm2")
+                ),
+                v("npm2"),
+            ),
+            (
+                format!(
+                    "npm config set --userconfig ci.npmrc registry https://auth.example.test/ //h/:_authToken {}",
+                    v("rc")
+                ),
+                v("rc"),
+            ),
+            (
+                format!(
+                    "npm --prefix . config set --location user init-author-name \"npm config token X\" registry https://auth.example.test/ //h/:_authToken \"{}\"",
+                    v("ovl")
+                ),
+                v("ovl"),
+            ),
             (
                 format!("curl --user \\\n  bot:{} https://example.test", v("cont")),
                 v("cont"),

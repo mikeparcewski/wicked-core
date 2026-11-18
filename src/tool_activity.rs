@@ -824,107 +824,82 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
     })
 }
 
-/// (core#1577) A config CLI's command head (`npm config`, `npm c`, `aws configure`, `git config`,
-/// flags between allowed, also right after a quote or backtick: a reason quotes the command as
-/// `` `npm config …` ``); one shell word after it (quoted fragments whole, so a quoted `&` or `;`
-/// never ends the command, and an unquoted `|`, `;`, `&` or backtick does); and a word naming a
-/// secret.
-fn config_rules() -> &'static ([regex::Regex; 2], regex::Regex, regex::Regex) {
-    static R: std::sync::OnceLock<([regex::Regex; 2], regex::Regex, regex::Regex)> =
+/// (core#1577, core#1580) A config CLI's command head (`npm config`, `npm c`, `aws configure`,
+/// `git config`, ...): the tool, any flags and their values in between (`aws --profile ci
+/// configure`, `npm --prefix . config`: the earliest subcommand word wins), then the subcommand.
+/// Also right after a quote or backtick: a reason quotes the command as `` `npm config …` ``. And
+/// one shell word (quoted fragments whole, so a quoted `&` or `;` never ends the command, and an
+/// unquoted `|`, `;`, `&` or backtick does), and a word naming a secret.
+fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
+    static R: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
         std::sync::OnceLock::new();
     R.get_or_init(|| {
         let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
         (
-            // Both heads scan, their cuts united: the plain one (flags only) and, (core#1580), one that
-            // also skips each flag's value, so neither can hide a head the other finds.
-            [
-                re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
-                re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+(?:\s+(?:[^\s'"-]\S*|'[^']*'|"(?:[^"\\]|\\.)*"))?)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
-            ],
+            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+(?:\s+(?:[^\s'"-]\S*|'[^']*'|"(?:[^"\\]|\\.)*"))??)*?\s+(?:config(?:ure)?|c)(?:\s|$)"#),
             re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])+"#),
             re(SECRET_WORD),
         )
     })
 }
 
-/// (core#1577) In every config CLI command, the value of each `<key naming a secret> <value>` pair:
-/// `npm config set //host/:_authToken …` (npm takes several pairs, its keys carry `/` and `:`),
-/// `aws configure set --profile ci aws_secret_access_key …`. A key with `=` in it was already
-/// judged as an assignment. A secret-named word right after a valued flag, followed by another
-/// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
-/// aws_secret_access_key …`), so the next word is the key.
+/// (core#1577, core#1580) In every config CLI command that names a secret anywhere after its
+/// subcommand, EVERY argument after it is masked, a leading `set` aside: its flags stay, their
+/// values, keys and values do not. No pairing and no flag-arity guess (npm takes several pairs and
+/// flags with values, `--userconfig ci.npmrc`), so no shape can shift one. The keys are masked too
+/// (the core#1575 class of over-redaction). A word an earlier pass already cut stays as it is.
+/// Cuts from every head are UNITED (overlaps merged), and each head is searched again from just
+/// after its own start, so a command quoted inside another's flag value is judged as well.
 fn redact_config_pairs(cmd: &str) -> String {
-    let (heads, word, secret_word) = config_rules();
-    let flag = |w: &str| w.starts_with('-');
-    let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
+    let (head, word, secret_word) = config_rules();
     let mut cut: Vec<(usize, usize)> = Vec::new();
-    for head in heads {
-        let mut from = 0;
-        while from < cmd.len() {
-            let Some(m) = head.find_at(cmd, from) else {
-                break;
-            };
-            let mut words: Vec<&str> = Vec::new();
-            let mut spans: Vec<(usize, usize)> = Vec::new();
-            let mut pos = m.end();
-            loop {
-                let rest = &cmd[pos..];
-                let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
-                match word.find(&cmd[start..]) {
-                    Some(w) if start > pos || spans.is_empty() => {
-                        words.push(w.as_str());
-                        spans.push((start, start + w.end()));
-                        pos = start + w.end();
-                    }
-                    _ => break,
+    let mut from = 0;
+    while from < cmd.len() {
+        let Some(m) = head.find_at(cmd, from) else {
+            break;
+        };
+        from = m.start() + 1;
+        let mut words: Vec<&str> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut pos = m.end();
+        loop {
+            let rest = &cmd[pos..];
+            let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
+            match word.find(&cmd[start..]) {
+                Some(w) if start > pos || spans.is_empty() => {
+                    words.push(w.as_str());
+                    spans.push((start, start + w.end()));
+                    pos = start + w.end();
                 }
+                _ => break,
             }
-            let mut i = 0;
-            while i + 1 < words.len() {
-                let flag_value = i > 0
-                    && flag(words[i - 1])
-                    && !words[i - 1].contains('=')
-                    && secret(words[i + 1])
-                    && words.get(i + 2).is_some_and(|w| !w.starts_with('-'));
-                if secret(words[i]) && !flag_value {
-                    cut.push(spans[i + 1]);
-                    i += 2;
-                } else {
-                    i += 1;
-                }
+        }
+        if !words.iter().any(|w| secret_word.is_match(w)) {
+            continue;
+        }
+        let mut verb_open = true;
+        for (n, w) in words.iter().enumerate() {
+            if w.starts_with('-') {
+                continue;
             }
-            // (core#1580) And the strict reading, KEY VALUE pairs of the non-flag words: a value that
-            // merely names a secret word (`registry https://auth.example/ //h/:_authToken V`) is not a
-            // key, so the next pair is judged on its own. Only ever ADDS cuts to the scan above.
-            let mut plain: Vec<usize> = (0..words.len()).filter(|&j| !flag(words[j])).collect();
-            if plain.first().is_some_and(|&j| words[j] == "set") {
-                plain.remove(0);
+            // The first plain word, when it is `set`, is the verb.
+            let verb = std::mem::take(&mut verb_open) && *w == "set";
+            if !verb && !w.contains("***") {
+                cut.push(spans[n]);
             }
-            for pair in plain.chunks(2) {
-                if let [k, v] = pair {
-                    // A flag's own secret-named value (`--profile prod-auth KEY VALUE`) is no key:
-                    // the scan above reads that shape.
-                    let flag_value = *k > 0
-                        && flag(words[*k - 1])
-                        && !words[*k - 1].contains('=')
-                        && secret(words[*v])
-                        && words.get(*v + 1).is_some_and(|w| !w.starts_with('-'));
-                    if secret(words[*k]) && !flag_value {
-                        cut.push(spans[*v]);
-                    }
-                }
-            }
-            from = pos;
         }
     }
     cut.sort_unstable();
-    cut.dedup();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (a, b) in cut {
+        match merged.last_mut() {
+            Some(last) if a <= last.1 => last.1 = last.1.max(b),
+            _ => merged.push((a, b)),
+        }
+    }
     let mut out = String::with_capacity(cmd.len());
     let mut last = 0;
-    for (a, b) in cut {
-        if a < last {
-            continue;
-        }
+    for (a, b) in merged {
         out.push_str(&cmd[last..a]);
         out.push_str("***");
         last = b;
@@ -1350,6 +1325,20 @@ mod tests {
                 ),
                 v("u"),
             ),
+            (
+                format!(
+                    "npm config set --userconfig ci.npmrc registry https://auth.example.test/ //h/:_authToken {}",
+                    v("w")
+                ),
+                v("w"),
+            ),
+            (
+                format!(
+                    "npm --prefix . config set --location user init-author-name \"npm config token X\" registry https://auth.example.test/ //h/:_authToken \"{}\"",
+                    v("x")
+                ),
+                v("x"),
+            ),
         ];
         for (cmd, secret) in &cases {
             let t = bash(cmd);
@@ -1389,67 +1378,77 @@ mod tests {
         let cut: &[(&str, &str)] = &[
             (
                 "npm config set --global //h/:_authToken token{s} --location=user",
-                "npm config set --global //h/:_authToken *** --location=user",
+                "npm config set --global *** *** --location=user",
             ),
             (
                 "npm config --global set //h/:_authToken {s}",
-                "npm config --global set //h/:_authToken ***",
+                "npm config --global set *** ***",
             ),
             (
                 "aws configure set --profile \"ci account\" aws_secret_access_key {s}",
-                "aws configure set --profile \"ci account\" aws_secret_access_key ***",
+                "aws configure set --profile *** *** ***",
             ),
             (
                 "npm c set //h/:_authToken {s}",
-                "npm c set //h/:_authToken ***",
+                "npm c set *** ***",
             ),
             // A refusal reason quotes the command in backticks; a shell may run it quoted.
             (
                 "refused: `npm config set //h/:_authToken {s}`",
-                "refused: `npm config set //h/:_authToken ***`",
+                "refused: `npm config set *** ***`",
             ),
             (
                 "sh -c 'npm config set //h/:_authToken {s}'",
-                "sh -c 'npm config set //h/:_authToken ***'",
+                "sh -c 'npm config set *** ***'",
             ),
             // codex r2: a flag's value naming a secret is not the key; a quoted `&` is not the end.
             (
                 "aws configure set --profile prod-auth aws_secret_access_key {s}",
-                "aws configure set --profile prod-auth aws_secret_access_key ***",
+                "aws configure set --profile *** *** ***",
             ),
             (
                 "aws configure set --profile \"R&D\" aws_secret_access_key {s}",
-                "aws configure set --profile \"R&D\" aws_secret_access_key ***",
+                "aws configure set --profile *** *** ***",
             ),
             (
                 "npm config set registry https://r.example.test //h/:_authToken {s}",
-                "npm config set registry https://r.example.test //h/:_authToken ***",
+                "npm config set *** *** *** ***",
             ),
             (
                 "npm config set //one/:_authToken {s} //two/:_authToken {s}",
-                "npm config set //one/:_authToken *** //two/:_authToken ***",
+                "npm config set *** *** *** ***",
             ),
             // core#1580: a valued global flag before the subcommand (quoted too), and a second pair
             // after a pair whose value merely names a secret word (its key is over-cut: safe).
             (
                 "aws --profile ci configure set aws_secret_access_key {s}",
-                "aws --profile ci configure set aws_secret_access_key ***",
+                "aws --profile ci configure set *** ***",
             ),
             (
                 "aws --region eu-west-1 --profile \"ci account\" configure set aws_secret_access_key {s}",
-                "aws --region eu-west-1 --profile \"ci account\" configure set aws_secret_access_key ***",
+                "aws --region eu-west-1 --profile \"ci account\" configure set *** ***",
             ),
             (
                 "npm config set registry https://auth.example.test/ //h/:_authToken {s}",
-                "npm config set registry https://auth.example.test/ *** ***",
+                "npm config set *** *** *** ***",
+            ),
+            // core#1580 (codex check): a flag with a value after the subcommand, and a command
+            // quoted inside a value after the head (every argument is masked; the nested head's cut and the outer one are united).
+            (
+                "npm config set --userconfig ci.npmrc registry https://auth.example.test/ //h/:_authToken {s}",
+                "npm config set --userconfig *** *** *** *** ***",
+            ),
+            (
+                "npm --prefix . config set --location user init-author-name \"npm config token X\" registry https://auth.example.test/ //h/:_authToken \"{s}\"",
+                "npm --prefix . config set --location *** *** ***",
             ),
             (
                 "npm config set //h/:_authToken 'prefix'{s}",
-                "npm config set //h/:_authToken ***",
+                "npm config set *** ***",
             ),
             (
                 "aws configure set aws_secret_access_key \"prefix\\\"{s}\"",
-                "aws configure set aws_secret_access_key ***",
+                "aws configure set *** ***",
             ),
             ("tool --password {s}\\ tail run", "tool --password *** run"),
             (
