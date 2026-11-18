@@ -704,7 +704,12 @@ pub fn parse_git_ident(line: &str) -> Option<GitIdent> {
     let close = line.rfind('>')?;
     let open = line[..close].rfind('<')?;
     Some(GitIdent {
-        name: line[..open].trim_end().to_string(),
+        // Only the one ASCII space `git var` puts before `<` (wicked-core#1565): a name that ends in a
+        // no-break or other Unicode space keeps it, exactly as the operator's own `git commit` records it.
+        name: line[..open]
+            .strip_suffix(' ')
+            .unwrap_or(&line[..open])
+            .to_string(),
         email: line[open + 1..close].to_string(),
     })
 }
@@ -3399,6 +3404,15 @@ rebase.autosquash\0";
             parse_git_ident("Ada <> 1 +0000").map(|i| i.email),
             Some(String::new())
         );
+        // wicked-core#1565: Unicode spaces at either end of the name are the name's, not separators.
+        assert_eq!(
+            parse_git_ident("Operator\u{a0} <op@example.invalid> 1 +0000\n").map(|i| i.name),
+            Some("Operator\u{a0}".to_string())
+        );
+        assert_eq!(
+            parse_git_ident("\u{2003}Op\u{2003} <op@example.invalid> 1 +0000").map(|i| i.name),
+            Some("\u{2003}Op\u{2003}".to_string())
+        );
         assert_eq!(parse_git_ident("no identity here"), None);
         assert_eq!(parse_git_ident(""), None);
     }
@@ -3547,6 +3561,20 @@ rebase.autosquash\0";
             case("global", user, &[]),
             Ok(format!("{op}|{op}")),
             "the global identity, not the seat's own"
+        );
+        // wicked-core#1565: a trailing no-break space is part of the name; the seat's commit keeps it, as the
+        // operator's own `git commit` does.
+        assert_eq!(
+            case(
+                "nbsp",
+                "[user]\n\tname = Operator\u{a0}\n\temail = op@example.invalid\n",
+                &[]
+            ),
+            Ok(
+                "Operator\u{a0} <op@example.invalid>|Operator\u{a0} <op@example.invalid>"
+                    .to_string()
+            ),
+            "a Unicode space at the end of the name is kept"
         );
         let repo_id = "Repo Identity <repo@example.invalid>";
         assert_eq!(
