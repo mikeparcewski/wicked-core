@@ -9106,7 +9106,14 @@ fn prompt_quote(text: &str, max: usize) -> String {
     if flat.chars().count() <= max {
         flat.to_string()
     } else {
-        format!("{}…", flat.chars().take(max).collect::<String>())
+        let head: String = flat.chars().take(max).collect();
+        // Never cut inside a redaction marker (`***`): a partial one is dropped.
+        let head = if flat.chars().nth(max) == Some('*') {
+            head.trim_end_matches('*').to_string()
+        } else {
+            head
+        };
+        format!("{head}…")
     }
 }
 
@@ -28330,6 +28337,9 @@ mod request_changes_tests {
             "each long command is capped: {p}"
         );
         assert!(!p.contains("more refused call"), "{p}");
+        // A prompt quote never cuts inside a redaction marker either (codex r2 W8).
+        let q = prompt_quote(&format!("{} GH_TOKEN=*** rest", "x".repeat(289)), 300);
+        assert!(q.ends_with("GH_TOKEN=…"), "{q}");
         assert!(p.contains("action `operator_judgment`"), "{p}");
 
         // Withheld, with the reason named: the same layer unmarked, or marked beside a standing denial.
