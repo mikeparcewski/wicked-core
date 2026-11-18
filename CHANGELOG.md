@@ -50,6 +50,17 @@ Two release tracks share this file, newest entry first regardless of track:
   sentence (the seats' commits are refused until one is configured, with the `git config` commands to run) from the
   LATEST identity read of its worktree: every read (the launch's and each seat spawn's) replaces the record, so once
   an identity is configured and a retry's seat reads it, later gates say nothing. No git call at the gate.
+- **A tool call the engine refused before it ran no longer withholds the operator's judgment over a failed floor
+  (core#1562).** At a repo-checks floor gate (a known-red base among them) any other denial withheld "Approve as your
+  own judgment", including the estate command fence's refusal of a graph write that never ran (run 5cfb1a2d: a
+  manual `wicked-estate index`). Every remaining answer re-ran the same failing floor. The gate fold now folds the
+  step's decisions log a second time with those refusals discounted. Only when that pass is clean (no policy deny,
+  no corrupted line, the hook-fired proof present, no write the write-root witness caught) does it mark the denial
+  `refused_before_run`, listing each refused call: evaluator, rule, tool and the command, which is redacted and
+  capped at 2 KB. It is still a denial (retries, floor re-runs and the carry are unchanged); the operator's judgment
+  is offered over it, and the prompt names what the seat tried. When the judgment is withheld, the prompt now says
+  so and names each layer that withholds it. A reviewer turn's standing denial is never masked by the executor's
+  refused-only one.
 - **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
   (core#1552).** npm got every core-ts version, but nothing made a GitHub Release, so the Releases page's Latest
   stayed a hand-made 0.7.29. A new `registry` job waits until npm serves all six packages at the tag's version (the

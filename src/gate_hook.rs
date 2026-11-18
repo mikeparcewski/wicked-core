@@ -6731,6 +6731,40 @@ pub(crate) fn is_blocked_boundary_write(claim: &ConformanceClaim) -> bool {
         && claim.policy_ids.iter().any(|p| p == BOUNDARY_WRITE_RULE_ID)
 }
 
+/// (core#1562) Whether a Deny claim is the estate command fence's FATAL refusal — a write path on
+/// the shared graph from a code-executing unit, refused before it ran ([`append_estate_deny`] with
+/// `fatal`). Keyed like [`is_blocked_boundary_write`]: the evaluator identity, the fatal claim-id
+/// prefix AND the fence's rule id, so a policy deny, a boundary write or an advisory estate deny never
+/// matches.
+pub(crate) fn is_blocked_estate_write(claim: &ConformanceClaim) -> bool {
+    claim.decision == Decision::Deny
+        && claim.evaluator_identity == BOUNDARY_EVALUATOR
+        && claim.claim_id.starts_with(BOUNDARY_WRITE_DENY_PREFIX)
+        && claim.policy_ids.iter().any(|p| p == ESTATE_FENCE_RULE_ID)
+}
+
+/// (core#1562) The most of a refused command the gate record keeps, in characters.
+pub(crate) const REFUSED_COMMAND_MAX: usize = 2048;
+
+/// (core#1562) A refused command as the gate record keeps it, read in full off the decisions log
+/// (the wire's tool-activity target is clipped to [`crate::tool_activity::TARGET_MAX`]): secrets cut
+/// by the tool-activity redactor, then at most [`REFUSED_COMMAND_MAX`] characters (`…` marks a cut).
+pub(crate) fn refused_command_record(command: &str) -> String {
+    let redacted = crate::tool_activity::redact(command);
+    if redacted.chars().count() <= REFUSED_COMMAND_MAX {
+        return redacted;
+    }
+    let mut cut: String = redacted.chars().take(REFUSED_COMMAND_MAX - 1).collect();
+    cut.push('…');
+    cut
+}
+
+/// (core#1562) A call the engine refused BEFORE it ran: a blocked filesystem-boundary write or a
+/// blocked estate-fence graph write. Never a policy deny, an infra deny or a fail-closed arm.
+pub(crate) fn is_refused_before_run(claim: &ConformanceClaim) -> bool {
+    is_blocked_boundary_write(claim) || is_blocked_estate_write(claim)
+}
+
 /// If `v` is an armed-marker object, the phase it marks; else `None`. Checks the ROOT key
 /// (`v.get(ARMED_MARKER_KEY)`), NOT a substring — a substring match would let a crafted claim whose
 /// `criteria`/`obligations` merely CONTAIN the marker string be silently skipped by the fold, bypassing
@@ -7100,6 +7134,15 @@ pub(crate) fn fold_input_denial_after_floor(
 
 /// [`fold_input_denial_after_floor`] over one decisions log `path` — the attempt's, or one
 /// engine-run QE reviewer turn's own ([`qe_review_decisions_path`]).
+///
+/// (core#1562) A denial this fold returns is marked [`crate::domain::UnitDenial::refused_before_run`]
+/// when the SAME log folds clean with every [`is_refused_before_run`] claim discounted: the two
+/// passes differ in nothing else, so a clean second pass proves the only standing causes were calls
+/// the engine refused before they ran. Every other arm counts in the second pass — a policy or infra
+/// deny, a corrupted line, a missing armed marker, no hook-fired proof, the no-hook arm and the
+/// post-hoc write-root witness (which the first pass skips once a refusal has denied). The denial
+/// is returned either way; the mark only stops it withholding the operator's judgment over a failed
+/// floor (`actor::tolerated_behind_floor`).
 pub(crate) fn fold_input_denial_in(
     store: &mut dyn GraphStore,
     path: &std::path::Path,
@@ -7107,6 +7150,50 @@ pub(crate) fn fold_input_denial_in(
     governed: bool,
     tool_activity: bool,
     floor_passed: bool,
+) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
+    let mut ignored = Vec::new();
+    let Some(mut denial) = fold_input_denial_pass(
+        store,
+        path,
+        phase,
+        governed,
+        tool_activity,
+        floor_passed,
+        false,
+        &mut ignored,
+    )?
+    else {
+        return Ok(None);
+    };
+    let mut refused = Vec::new();
+    let second = fold_input_denial_pass(
+        store,
+        path,
+        phase,
+        governed,
+        tool_activity,
+        floor_passed,
+        true,
+        &mut refused,
+    )?;
+    if second.is_none() && !refused.is_empty() {
+        denial.refused_before_run = refused;
+    }
+    Ok(Some(denial))
+}
+
+/// One pass of [`fold_input_denial_in`]. `discount_refusals` (the second pass only) discloses
+/// every [`is_refused_before_run`] claim instead of denying on it, and lists each in `refused`.
+#[allow(clippy::too_many_arguments)]
+fn fold_input_denial_pass(
+    store: &mut dyn GraphStore,
+    path: &std::path::Path,
+    phase: &str,
+    governed: bool,
+    tool_activity: bool,
+    floor_passed: bool,
+    discount_refusals: bool,
+    refused: &mut Vec<crate::domain::RefusedCall>,
 ) -> anyhow::Result<Option<crate::domain::UnitDenial>> {
     // Every denial this fold produces is an input-governance deny for `phase`.
     let fail_closed = |reason: String| {
@@ -7229,7 +7316,27 @@ pub(crate) fn fold_input_denial_in(
         // was blocked, nothing landed or leaked, and the worker adapts. Whether the blocked call
         // MATTERED is judged by the unit's OUTPUT gate and its required deliverables, not by this
         // containment event.
-        let disclosed_after_floor = floor_passed && is_blocked_boundary_write(&claim);
+        let disclosed_after_floor = ((floor_passed || discount_refusals)
+            && is_blocked_boundary_write(&claim))
+            || (discount_refusals && is_refused_before_run(&claim));
+        if discount_refusals && is_refused_before_run(&claim) {
+            refused.push(crate::domain::RefusedCall {
+                evaluator: claim.evaluator_identity.clone(),
+                rule: claim
+                    .policy_ids
+                    .iter()
+                    .find(|p| *p == BOUNDARY_WRITE_RULE_ID || *p == ESTATE_FENCE_RULE_ID)
+                    .cloned()
+                    .unwrap_or_default(),
+                tool: tool_for_claim.clone(),
+                command: claim
+                    .obligations
+                    .get(1)
+                    .filter(|c| !c.trim().is_empty())
+                    .map(|c| refused_command_record(c)),
+                reason: claim.obligations.first().cloned().unwrap_or_default(),
+            });
+        }
         if denial.is_none()
             && claim.decision == Decision::Deny
             && !is_advisory_deny(&claim)
@@ -7246,6 +7353,7 @@ pub(crate) fn fold_input_denial_in(
                 denied_tool: tool_for_claim,
                 phase: Some(phase.to_string()),
                 findings_trimmed: false,
+                refused_before_run: Vec::new(),
             });
         }
     }
@@ -10500,6 +10608,208 @@ mod tests {
                 .is_some(),
             "a Deny whose criteria contains the marker string is NOT skipped (no substring bypass)"
         );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// core#1562 — an input-governance denial whose ONLY causes are calls the engine refused before they ran (an
+    /// estate-fence graph write, a boundary write) is marked, each refusal named in log order with its evaluator,
+    /// rule, tool and command; it is still a denial. Any standing cause beside them — a policy deny before or after,
+    /// a corrupted line, no hook-fired proof, a write the witness caught (the refused action done another way) — or a
+    /// claim shaped like a refusal but not recorded by the fence leaves it unmarked.
+    #[test]
+    fn a_denial_of_calls_refused_before_they_ran_is_marked_and_any_standing_cause_unmarks_it() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core1562-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let fold = |store: &mut dyn GraphStore, attempt: u32| {
+            fold_input_denial_after_floor(store, &run_id, attempt, "unit-2", true, true, false)
+                .unwrap()
+        };
+        let arm = |attempt: u32| {
+            let p = decisions_path_for(&run_id, attempt);
+            write_armed_marker(&p, "unit-2").unwrap();
+            write_hook_fired(&p, "unit-2");
+            p
+        };
+        let estate = |p: &std::path::Path, cmd: &str| {
+            append_estate_deny(
+                p.to_str().unwrap(),
+                "wf/unit-2",
+                "unit-2",
+                "Bash",
+                "estate-deny fence: a write subcommand on the shared graph",
+                cmd,
+                true,
+            )
+        };
+        let write = |p: &std::path::Path| {
+            append_boundary_deny(
+                p.to_str().unwrap(),
+                "wf/unit-2",
+                "unit-2",
+                "Bash",
+                "path outside this unit's boundary: /srv/elsewhere/x (write)",
+                true,
+            )
+        };
+        let deny = |p: &std::path::Path, id: &str, evaluator: &str, rules: &[&str]| {
+            let mut c = allow_claim(id, "unit-2");
+            c.decision = Decision::Deny;
+            c.evaluator_identity = evaluator.to_string();
+            c.policy_ids = rules.iter().map(|r| r.to_string()).collect();
+            append_decision(p, &c).unwrap();
+        };
+
+        // One estate refusal: marked, named.
+        let p = arm(0);
+        estate(&p, "wicked-estate index --db /srv/g.db");
+        let d = fold(&mut store, 0).expect("still a denial");
+        assert_eq!(d.claim_id.as_deref(), Some("boundary-deny:unit-2"));
+        assert_eq!(
+            d.refused_before_run,
+            vec![crate::domain::RefusedCall {
+                evaluator: BOUNDARY_EVALUATOR.into(),
+                rule: ESTATE_FENCE_RULE_ID.into(),
+                tool: Some("Bash".into()),
+                command: Some("wicked-estate index --db /srv/g.db".into()),
+                reason: "estate-deny fence: a write subcommand on the shared graph".into(),
+            }]
+        );
+
+        // Many refusals of escalating kinds, every one refused before it ran: marked, all listed in order.
+        let p = arm(1);
+        write(&p);
+        estate(&p, "wicked-estate index");
+        estate(&p, "wicked-estate-mcp --db /srv/g.db");
+        write(&p);
+        let d = fold(&mut store, 1).unwrap();
+        let rules: Vec<&str> = d
+            .refused_before_run
+            .iter()
+            .map(|r| r.rule.as_str())
+            .collect();
+        assert_eq!(
+            rules,
+            vec![
+                BOUNDARY_WRITE_RULE_ID,
+                ESTATE_FENCE_RULE_ID,
+                ESTATE_FENCE_RULE_ID,
+                BOUNDARY_WRITE_RULE_ID
+            ]
+        );
+        assert_eq!(
+            d.refused_before_run[0].command, None,
+            "the boundary recorder files no command"
+        );
+
+        // Refusals escalating into a policy deny (after them): unmarked.
+        let p = arm(2);
+        write(&p);
+        estate(&p, "wicked-estate index");
+        deny(
+            &p,
+            "policy-no-graph",
+            "wicked-governance",
+            &["policy:no-graph"],
+        );
+        assert!(fold(&mut store, 2).unwrap().refused_before_run.is_empty());
+
+        // A policy deny BEFORE the refusal: unmarked, and it is the recorded denial.
+        let p = arm(3);
+        deny(
+            &p,
+            "policy-no-graph",
+            "wicked-governance",
+            &["policy:no-graph"],
+        );
+        estate(&p, "wicked-estate index");
+        let d = fold(&mut store, 3).unwrap();
+        assert!(d.refused_before_run.is_empty());
+        assert_eq!(d.claim_id.as_deref(), Some("policy-no-graph"));
+
+        // A corrupted line beside the refusal: unmarked.
+        let p = arm(4);
+        estate(&p, "wicked-estate index");
+        {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+            f.write_all(b"{not json\n").unwrap();
+        }
+        assert!(fold(&mut store, 4).unwrap().refused_before_run.is_empty());
+
+        // No hook-fired proof beside the refusal: unmarked.
+        let p = decisions_path_for(&run_id, 5);
+        write_armed_marker(&p, "unit-2").unwrap();
+        estate(&p, "wicked-estate index");
+        assert!(fold(&mut store, 5).unwrap().refused_before_run.is_empty());
+
+        // The refused action then done another way: the write-root witness caught a write after the last
+        // allowed call. The first pass never runs the witness once the refusal denied; the second does.
+        let wt = std::env::temp_dir().join(format!("core1562-wt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&wt);
+        std::fs::create_dir_all(&wt).unwrap();
+        let p = arm(6);
+        estate(&p, "wicked-estate index");
+        write_write_root_witness(
+            &write_root_witness_path(&p.to_string_lossy(), "unit-2"),
+            &WitnessSnapshot {
+                roots: vec![wt.clone()],
+                collector: CollectorKind::RawWalk,
+                entries: vec![],
+            },
+        );
+        std::fs::write(wt.join("graph-written-another-way.db"), "x").unwrap();
+        let d = fold(&mut store, 6).unwrap();
+        assert!(d.refused_before_run.is_empty(), "{d:?}");
+        let _ = std::fs::remove_dir_all(&wt);
+
+        // Shaped like a refusal, not the fence's: the estate rule on another evaluator, a `boundary-deny:` claim
+        // with a policy rule. Each still denies, unmarked.
+        let p = arm(7);
+        deny(
+            &p,
+            "boundary-deny:unit-2",
+            "wicked-governance",
+            &[ESTATE_FENCE_RULE_ID],
+        );
+        assert!(fold(&mut store, 7).unwrap().refused_before_run.is_empty());
+        let p = arm(8);
+        deny(
+            &p,
+            "boundary-deny:unit-2",
+            BOUNDARY_EVALUATOR,
+            &["policy:no-graph"],
+        );
+        assert!(fold(&mut store, 8).unwrap().refused_before_run.is_empty());
+        // The estate fence's ADVISORY arm never denies at all.
+        let p = arm(9);
+        append_estate_deny(
+            p.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            "estate-deny fence: a write subcommand",
+            "wicked-estate index",
+            false,
+        );
+        assert_eq!(fold(&mut store, 9), None);
+
+        // The refused command is recorded past the wire's clip, secrets cut, at most 2 KB.
+        let long = format!(
+            "GH_TOKEN=ghp_secretvalue123 wicked-estate index {}",
+            "x".repeat(3000)
+        );
+        let p = arm(10);
+        estate(&p, &long);
+        let d = fold(&mut store, 10).unwrap();
+        let cmd = d.refused_before_run[0].command.clone().unwrap();
+        assert!(!cmd.contains("ghp_secretvalue123"), "{cmd}");
+        assert!(
+            cmd.starts_with("GH_TOKEN=*** wicked-estate index xxx"),
+            "{cmd}"
+        );
+        assert!(cmd.chars().count() <= REFUSED_COMMAND_MAX && cmd.ends_with('…'));
+        assert!(cmd.chars().count() > crate::tool_activity::TARGET_MAX);
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 

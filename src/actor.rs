@@ -9068,10 +9068,79 @@ fn floor_override_record_allows(
 /// ran and its verdict could not be bound (none recorded, no VERDICT line, a stale record). That is
 /// no verdict on the work, so it does not withhold the judgment either; QE acceptance stays
 /// required at delivery, as for an INCONCLUSIVE record.
+/// (core#1562) So is an input-governance layer whose ONLY standing causes were tool calls the engine
+/// refused before they ran, with the step's every other governance record clean
+/// ([`refused_only_behind_floor`]): the prompt names each refusal, and it stays recorded on the step.
 fn tolerated_behind_floor(unit: &crate::domain::WorkUnit, d: &crate::domain::UnitDenial) -> bool {
     pipeline::judge_absent_behind_floor(d)
         || d.source == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE
         || qe_unbound_behind_floor(unit, d)
+        || refused_only_behind_floor(d)
+}
+
+/// (core#1562) Whether `d` is the input-governance layer the gate fold marked as refused calls
+/// only ([`crate::domain::UnitDenial::refused_before_run`], set by `gate_hook::fold_input_denial_in`
+/// when the same log folds clean with those refusals discounted).
+fn refused_only_behind_floor(d: &crate::domain::UnitDenial) -> bool {
+    d.source == "input_governance" && !d.refused_before_run.is_empty()
+}
+
+/// (core#1562) How many refused calls a floor gate's prompt lists one by one.
+const REFUSED_CALLS_SHOWN: usize = 5;
+
+/// (core#1562) A seat-supplied string on one line for a prompt: newlines folded, backticks
+/// replaced (it is quoted in backticks), at most `max` characters.
+fn prompt_quote(text: &str, max: usize) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| match c {
+            '`' => '\'',
+            c if c.is_control() => ' ',
+            c => c,
+        })
+        .collect();
+    let flat = flat.trim();
+    if flat.chars().count() <= max {
+        flat.to_string()
+    } else {
+        format!("{}…", flat.chars().take(max).collect::<String>())
+    }
+}
+
+/// (core#1562) One refused call in plain words: what the seat tried, and who refused it by which
+/// rule, before it ran.
+fn refused_call_words(c: &crate::domain::RefusedCall) -> String {
+    let tool = c
+        .tool
+        .as_deref()
+        .map(|t| format!(" (`{}`)", prompt_quote(t, 40)))
+        .unwrap_or_default();
+    let tried = match c.command.as_deref() {
+        // The command as the fold recorded it (redacted, at most 2 KB): shown whole.
+        Some(cmd) => format!(
+            "the seat tried to run `{}`{tool}",
+            prompt_quote(cmd, crate::gate_hook::REFUSED_COMMAND_MAX)
+        ),
+        None => format!(
+            "the seat tried a call{tool}: {}",
+            prompt_quote(&c.reason, 160)
+        ),
+    };
+    let fence = if c.rule == crate::gate_hook::ESTATE_FENCE_RULE_ID {
+        "the estate command fence"
+    } else {
+        "the filesystem boundary"
+    };
+    let why = if c.command.is_some() {
+        format!(" ({})", prompt_quote(&c.reason, 160))
+    } else {
+        String::new()
+    };
+    format!(
+        "{tried}; {fence} (rule `{}`, evaluator `{}`) refused it before it ran{why}",
+        prompt_quote(&c.rule, 60),
+        prompt_quote(&c.evaluator, 60)
+    )
 }
 
 /// (core#1153) Whether `d` is the QE layer of a unit whose last reviewer record bound no verdict
@@ -9092,18 +9161,24 @@ fn qe_unbound_behind_floor(unit: &crate::domain::WorkUnit, d: &crate::domain::Un
 /// the clause is byte-identical either way (studio's `offersFloorOverride` matches it verbatim),
 /// and [`floor_override_judge_note`] adds the judge's part after the options.
 fn floor_override_offer(unit: &crate::domain::WorkUnit, source: &str) -> &'static str {
-    let repo_floor = source == crate::repo_checks::DENIAL_SOURCE
-        || source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT;
-    if repo_floor
-        && unit.member_step.is_none()
-        && unit.tool_cmd.is_none()
-        && !crate::deliver_lift::is_deliver_unit(unit)
+    if floor_override_gate(unit, source)
         && floor_override_record_allows(unit, unit.denials_behind.as_deref())
     {
         FLOOR_OVERRIDE_OFFER
     } else {
         ""
     }
+}
+
+/// (core#1562) A gate where the operator's judgment applies bar the layers behind the floor: a
+/// repo-checks floor on an agent step that is not a team member's, a tool step or the deliver unit.
+fn floor_override_gate(unit: &crate::domain::WorkUnit, source: &str) -> bool {
+    let repo_floor = source == crate::repo_checks::DENIAL_SOURCE
+        || source == crate::repo_checks::DENIAL_SOURCE_TIMEOUT;
+    repo_floor
+        && unit.member_step.is_none()
+        && unit.tool_cmd.is_none()
+        && !crate::deliver_lift::is_deliver_unit(unit)
 }
 
 /// The operator-judgment offer clause, byte-identical wherever the engine offers it (studio's
@@ -9234,7 +9309,54 @@ fn floor_override_judge_note(unit: &crate::domain::WorkUnit, source: &str) -> St
         );
     }
     out.push_str(&layers_behind_note(unit, offered));
+    if offered && behind.iter().any(refused_only_behind_floor) {
+        out.push_str(
+            ". Your own judgment is still offered over those refused calls: the engine refused \
+             each before it ran, and no other governance record denies this step; they stay \
+             recorded on it, so weigh what the seat tried before you approve",
+        );
+    }
+    if !offered && floor_override_gate(unit, source) {
+        out.push_str(&floor_override_withheld_note(unit));
+    }
     out
+}
+
+/// (core#1562) Why the operator's judgment is NOT offered at a floor gate where it otherwise
+/// applies: each layer behind the floor that withholds it, or the missing record. A QE layer is
+/// named by [`layers_behind_note`]'s own `skip_qe` sentence, so only the others are listed here.
+fn floor_override_withheld_note(unit: &crate::domain::WorkUnit) -> String {
+    let Some(behind) = unit.denials_behind.as_deref() else {
+        return ". Your own judgment over the failed floor is not \
+                offered: this gate did not record whether any other layer denied the step; request \
+                changes (the step reworks and every layer runs again) and it can be offered on \
+                that floor"
+            .to_string();
+    };
+    let layers = behind
+        .iter()
+        .filter(|d| !tolerated_behind_floor(unit, d))
+        .filter(|d| !crate::qe_acceptance::review::is_qe_denial(d))
+        .map(|d| match d.source.as_str() {
+            "input_governance" => format!(
+                "input governance ({}{})",
+                d.rule_ids
+                    .first()
+                    .map(|r| format!("rule `{}`: ", prompt_quote(r, 60)))
+                    .unwrap_or_default(),
+                prompt_quote(&reason_head(&d.reason), 240)
+            ),
+            other => format!("`{other}` ({})", prompt_quote(&reason_head(&d.reason), 240)),
+        })
+        .collect::<Vec<_>>();
+    if layers.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". Your own judgment over the failed floor is not offered: \
+         {} also denied this step, and that judgment overrides the floor only (deny-dominates)",
+        layers.join("; ")
+    )
 }
 
 /// (j4-gates) Every layer recorded behind a failed floor that the operator's judgment does NOT
@@ -9249,6 +9371,27 @@ fn layers_behind_note(unit: &crate::domain::WorkUnit, override_offered: bool) ->
         .filter(|d| !pipeline::judge_absent_behind_floor(d))
     {
         let what = match d.source.as_str() {
+            // (core#1562) Each call refused before it ran, in plain words.
+            "input_governance" if refused_only_behind_floor(d) => {
+                let shown = d
+                    .refused_before_run
+                    .iter()
+                    .take(REFUSED_CALLS_SHOWN)
+                    .map(refused_call_words)
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                let more = d
+                    .refused_before_run
+                    .len()
+                    .saturating_sub(REFUSED_CALLS_SHOWN);
+                let more = if more > 0 {
+                    format!("; and {more} more refused call(s), each recorded on the step")
+                } else {
+                    String::new()
+                };
+                lines.push(format!("also: {shown}{more}"));
+                continue;
+            }
             "input_governance" => {
                 let tool = d
                     .denied_tool
@@ -28093,6 +28236,126 @@ mod request_changes_tests {
         assert_eq!(session.assurance.required, declared);
         assert_eq!(units[3].status, UnitStatus::Pending, "{:?}", units[3]);
         assert!(units[3].assurance.is_none());
+    }
+
+    /// core#1562 — refused-call denial on the floored step (run 5cfb1a2d's gate): when the fold marked the input-governance
+    /// layer as calls the engine refused before they ran, the operator's judgment is offered AND taken, and the prompt
+    /// names each refusal: evaluator, rule and what the seat tried. The same layer unmarked (a record from before the
+    /// mark, or a standing cause), or beside any other denial, is neither offered nor taken, and the prompt says why.
+    #[test]
+    fn a_floor_override_is_offered_over_calls_refused_before_they_ran_and_names_each() {
+        let refused = |cmd: Option<&str>, rule: &str| crate::domain::RefusedCall {
+            evaluator: "wicked-governance-boundary".into(),
+            rule: rule.into(),
+            tool: Some("Bash".into()),
+            command: cmd.map(str::to_string),
+            reason: "estate-deny fence: a write subcommand".into(),
+        };
+        let governance = |calls: Vec<crate::domain::RefusedCall>| UnitDenial {
+            claim_id: Some("boundary-deny:unit-2".into()),
+            rule_ids: vec![crate::gate_hook::ESTATE_FENCE_RULE_ID.into()],
+            denied_tool: Some("Bash".into()),
+            refused_before_run: calls,
+            ..UnitDenial::new(
+                "input_governance",
+                "input governance denied a tool-call in unit-2 (claim boundary-deny:unit-2)",
+            )
+        };
+        let mut store = open_store(Some(":memory:")).unwrap();
+
+        // Offered and taken; each refusal named in plain words.
+        let run_id = format!("core1562-offer-{}", std::process::id());
+        let marked = governance(vec![
+            refused(
+                Some("wicked-estate index --db /srv/g.db"),
+                crate::gate_hook::ESTATE_FENCE_RULE_ID,
+            ),
+            refused(None, crate::gate_hook::BOUNDARY_WRITE_RULE_ID),
+        ]);
+        seed_floor_failed_fix(&mut store, &run_id, Some(vec![marked]));
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let p = denial_gate_prompt(&units[2], "floor_failed", "checks failed", None, "");
+        assert!(p.contains("action `operator_judgment`"), "{p}");
+        assert!(
+            p.contains(
+                "the seat tried to run `wicked-estate index --db /srv/g.db` (`Bash`); the estate \
+                 command fence (rule `engine:estate-command-fence`, evaluator \
+                 `wicked-governance-boundary`) refused it before it ran"
+            ),
+            "{p}"
+        );
+        assert!(
+            p.contains("the filesystem boundary (rule `engine:filesystem-boundary-write`"),
+            "{p}"
+        );
+        assert!(p.contains("still offered over those refused calls"), "{p}");
+        assert!(!p.contains("is not offered"), "{p}");
+        let (r, _) = operator_judgment(&mut store, &run_id, "the base is red (estate#484)");
+        r.expect("the override applies over calls refused before they ran");
+
+        // Many refusals: five listed, the rest counted; a seat-supplied command stays on one line, unquoted.
+        let run_id = format!("core1562-many-{}", std::process::id());
+        let mut calls = vec![refused(
+            Some("rm `x`\nwicked-estate index"),
+            crate::gate_hook::ESTATE_FENCE_RULE_ID,
+        )];
+        calls.extend((0..6).map(|_| refused(None, crate::gate_hook::BOUNDARY_WRITE_RULE_ID)));
+        seed_floor_failed_fix(&mut store, &run_id, Some(vec![governance(calls)]));
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let p = denial_gate_prompt(&units[2], "floor_failed", "checks failed", None, "");
+        assert!(p.contains("`rm 'x' wicked-estate index`"), "{p}");
+        assert!(p.contains("and 2 more refused call(s)"), "{p}");
+        assert!(p.contains("action `operator_judgment`"), "{p}");
+
+        // Withheld, with the reason named: the same layer unmarked, or marked beside a standing denial.
+        let cases: Vec<(&str, Option<Vec<UnitDenial>>, &str)> = vec![
+            (
+                "unmarked",
+                Some(vec![governance(Vec::new())]),
+                "input governance (rule `engine:estate-command-fence`",
+            ),
+            (
+                "beside-policy",
+                Some(vec![
+                    governance(vec![refused(
+                        Some("wicked-estate index"),
+                        crate::gate_hook::ESTATE_FENCE_RULE_ID,
+                    )]),
+                    UnitDenial::new("governance", "policy denied"),
+                ]),
+                "`governance` (policy denied)",
+            ),
+            (
+                "beside-evaluator",
+                Some(vec![
+                    governance(vec![refused(
+                        Some("wicked-estate index"),
+                        crate::gate_hook::ESTATE_FENCE_RULE_ID,
+                    )]),
+                    UnitDenial::new("evaluator_verdict", "VERDICT: FAIL"),
+                ]),
+                "`evaluator_verdict` (VERDICT: FAIL)",
+            ),
+            (
+                "no-record",
+                None,
+                "did not record whether any other layer denied the step",
+            ),
+        ];
+        for (name, behind, why) in cases {
+            let run_id = format!("core1562-{name}-{}", std::process::id());
+            seed_floor_failed_fix(&mut store, &run_id, behind);
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            let p = denial_gate_prompt(&units[2], "floor_failed", "checks failed", None, "");
+            assert!(!p.contains("operator_judgment"), "{name}: offered: {p}");
+            assert!(
+                p.contains("Your own judgment over the failed floor is not offered"),
+                "{name}: {p}"
+            );
+            assert!(p.contains(why), "{name}: {p}");
+            let (r, _) = operator_judgment(&mut store, &run_id, "the base is red");
+            r.expect_err(name);
+        }
     }
 
     /// (operator ruling 2026-10-20) Deny-dominates for everything but the judge's no-verdict hold:

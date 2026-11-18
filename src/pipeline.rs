@@ -1774,7 +1774,7 @@ pub(crate) fn apply_and_finish_unit(
             t.tool_activity,
             floor_judged,
         )?;
-        qe_hook_denial = qe_hook_denial.or(denial);
+        qe_hook_denial = standing_first(qe_hook_denial, denial);
         // Disclosed under the reviewer's own seat, as the executor's record is under its own —
         // only for a turn of THIS attempt (a carried review was disclosed when it ran).
         if t.attempt == attempt {
@@ -1783,7 +1783,9 @@ pub(crate) fn apply_and_finish_unit(
             disclose_hook_record_in(&log, session_id, attempt, &seat, t.governed, emit);
         }
     }
-    let hook_denial = hook_denial.or(qe_hook_denial);
+    // (core#1562) A standing denial wins over one whose only causes were refused before they ran,
+    // so a reviewer turn's policy deny is never masked by the executor's discounted refusal.
+    let hook_denial = standing_first(hook_denial, qe_hook_denial);
     // Capture whether the hook denied NOW, before `hook_denial` is moved into the deny-dominance
     // fold below and its source identity is lost in `validator_denial`. The actor uses this flag to
     // block HumanConfirmIf routing on hook vetoes (a hook-sourced deny must hard-fail the run, not
@@ -2775,6 +2777,71 @@ fn fold_record(
     out
 }
 
+/// (core#1562) Of two input-governance denials, the first unless it was only refused calls
+/// ([`crate::domain::UnitDenial::refused_before_run`]) and the second is a standing one; with both
+/// only refusals, the first, carrying the second's refusals too, so the operator sees every one.
+fn standing_first(
+    a: Option<crate::domain::UnitDenial>,
+    b: Option<crate::domain::UnitDenial>,
+) -> Option<crate::domain::UnitDenial> {
+    match (a, b) {
+        (Some(a), Some(b))
+            if !a.refused_before_run.is_empty() && b.refused_before_run.is_empty() =>
+        {
+            Some(b)
+        }
+        (Some(mut a), Some(b)) if !a.refused_before_run.is_empty() => {
+            a.refused_before_run.extend(b.refused_before_run);
+            Some(a)
+        }
+        (a, b) => a.or(b),
+    }
+}
+
+#[cfg(test)]
+mod standing_first_tests {
+    use super::standing_first;
+    use crate::domain::{RefusedCall, UnitDenial};
+
+    fn refusal(cmd: &str) -> UnitDenial {
+        UnitDenial {
+            refused_before_run: vec![RefusedCall {
+                evaluator: "wicked-governance-boundary".into(),
+                rule: "engine:estate-command-fence".into(),
+                tool: Some("Bash".into()),
+                command: Some(cmd.into()),
+                reason: "estate-deny fence".into(),
+            }],
+            ..UnitDenial::new("input_governance", "refused")
+        }
+    }
+
+    /// core#1562 — the executor's refused-calls-only denial never masks a QE reviewer turn's standing one (or the
+    /// other way round), and two refused-only denials keep every refusal.
+    #[test]
+    fn a_standing_denial_wins_over_refused_calls_only() {
+        let standing = UnitDenial::new("input_governance", "policy denied");
+        assert_eq!(
+            standing_first(Some(refusal("a")), Some(standing.clone())),
+            Some(standing.clone())
+        );
+        assert_eq!(
+            standing_first(Some(standing.clone()), Some(refusal("a"))),
+            Some(standing.clone())
+        );
+        let both = standing_first(Some(refusal("a")), Some(refusal("b"))).unwrap();
+        let cmds: Vec<_> = both
+            .refused_before_run
+            .iter()
+            .filter_map(|r| r.command.as_deref())
+            .collect();
+        assert_eq!(cmds, vec!["a", "b"]);
+        assert_eq!(standing_first(None, Some(refusal("a"))), Some(refusal("a")));
+        assert_eq!(standing_first(Some(refusal("a")), None), Some(refusal("a")));
+        assert_eq!(standing_first(None, None), None);
+    }
+}
+
 /// (operator ruling 2026-10-20, core#1061 follow-on) Whether `d`, a denial a gate fold recorded
 /// behind a failed repo-checks floor ([`crate::domain::WorkUnit::denials_behind`]), is the judge
 /// layer's NO-VERDICT hold — the one other denial the operator's judgment over that floor also
@@ -2792,6 +2859,7 @@ pub(crate) fn judge_absent_behind_floor(d: &crate::domain::UnitDenial) -> bool {
         && d.denied_tool.is_none()
         && d.phase.is_none()
         && !d.findings_trimmed
+        && d.refused_before_run.is_empty()
 }
 
 /// (operator ruling 2026-10-21, xreview r1-r5) What a unit's previous gate fold recorded, read
@@ -2963,6 +3031,7 @@ fn evaluator_layer(
                 denied_tool: None,
                 phase: None, // filled in by apply_unit with the unit-phase token
                 findings_trimmed: false,
+                refused_before_run: Vec::new(),
             });
             (Some(e), None, denial)
         }
@@ -7004,6 +7073,7 @@ mod judge_absent_behind_floor_tests {
             },
             UnitDenial {
                 findings_trimmed: true,
+                refused_before_run: Vec::new(),
                 ..hold.clone()
             },
         ] {
