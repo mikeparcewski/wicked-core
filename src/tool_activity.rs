@@ -891,7 +891,8 @@ fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
         // sits in the command: a secret-named word before it (`registry https://auth.example.test/`)
         // cannot hide its value. Added to the loop above, which cuts what it always cut.
         for (k, w) in words.iter().enumerate() {
-            if k + 1 < words.len() && w.starts_with("//") && secret(w) && !flag(words[k + 1]) {
+            let key = w.trim_matches(['"', '\'']);
+            if k + 1 < words.len() && key.starts_with("//") && secret(key) && !flag(words[k + 1]) {
                 cut.push(spans[k + 1]);
             }
         }
@@ -1566,6 +1567,10 @@ mod tests {
             // (main cuts the key word there; the value is cut as well).
             (
                 "npm config set registry https://auth.example.test/ //h/:_authToken {s}",
+                "npm config set registry https://auth.example.test/ *** ***",
+            ),
+            (
+                "npm config set registry https://auth.example.test/ \"//h/:_authToken\" {s}",
                 "npm config set registry https://auth.example.test/ *** ***",
             ),
             (
