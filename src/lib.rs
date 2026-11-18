@@ -535,6 +535,21 @@ pub fn host_boundary() -> serde_json::Value {
     crate::worker_sandbox::host_boundary()
 }
 
+pub use deliver_lift::TreeRecheck;
+
+/// (crew#1493) The repository's own checks (the verify floor, as the deliver re-verify runs it) on
+/// the tree of `workdir`'s `HEAD`, for run `run_id`, measured against `base_commit` — so crew can
+/// re-deliver a finished run's pull request rebased onto its current base without pushing a tree
+/// no check ran on. See [`deliver_lift::check_run_tree`]. Blocks for the floor's duration.
+pub fn check_run_tree(
+    run_id: &str,
+    workdir: &std::path::Path,
+    repo_root: &std::path::Path,
+    base_commit: &str,
+) -> anyhow::Result<TreeRecheck> {
+    deliver_lift::check_run_tree(run_id, workdir, repo_root, base_commit)
+}
+
 /// (core#1122) What the repo-checks floor holds on disk — the build cache at
 /// `<worker home>/repo-checks` (by repository, largest first, with its caps) and the floor log
 /// store — for crew's diagnostics and the Nerve Center's disk row. Read-only; walks the cache.

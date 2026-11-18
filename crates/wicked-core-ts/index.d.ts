@@ -865,6 +865,25 @@ export declare class Core {
    */
   static floorCacheUsage(): Promise<string>
   /**
+   * (crew#1493) The repository's own checks on a finished run's REBASED tree, before crew
+   * re-delivers its pull request: the verify floor the deliver re-verify runs, on a clean checkout
+   * of exactly the tree `workdir`'s `HEAD` commit holds (a container floor checks that tree, never
+   * a re-snapshot), held to it afterwards, measured against `baseCommit` (the full id of a commit
+   * object, an ancestor of `HEAD`: the base the branch was rebased onto; a failure the floor can
+   * attribute to that base is excluded, an inseparable one still denies). It runs the repo's checks
+   * as the engine floor resolves them: a current base build guide takes precedence over detected
+   * tests in the directories it covers (a guide with only a lint check runs lint only); elsewhere
+   * the full test command runs where one exists, under the recheck's own floor id. Which checks
+   * ran, and where each came from, is `report.checks[].name` / `.source` (the build guide's or the
+   * detected one's): show that, not a bare pass. `workdir` is a worktree of the registered repository at
+   * `repoRoot`. Resolves to a JSON `{ head, tree, base, passed, checksRun, report }` (`head` is the
+   * commit id to push, `report` the floor's `RepoChecksReport`); rejects when the inputs do not name
+   * that shape. `passed` is false when the floor refuses (no OS write boundary, a checkout that
+   * could not be made, a short disk) or ran no check but provisioning. Runs for the floor's
+   * duration (minutes); writes nothing to the run's record.
+   */
+  static checkRunTree(runId: string, workdir: string, repoRoot: string, baseCommit: string): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

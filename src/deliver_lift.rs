@@ -649,7 +649,9 @@ fn merge_tree(
 }
 
 mod changelog;
+mod recheck;
 use changelog::is_changelog;
+pub use recheck::{check_run_tree, TreeRecheck};
 
 /// Write `content` into the object store as a blob, byte for byte (no filters); its id.
 fn write_blob(cwd: &Path, env: &[(&str, &Path)], content: &[u8]) -> anyhow::Result<String> {
