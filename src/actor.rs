@@ -11061,6 +11061,14 @@ fn advance_or_pause_with(
     is_acp: bool,
     mid_unit: bool,
 ) -> anyhow::Result<Progress> {
+    // (core#1581) A run held at a power checkpoint pause advances nowhere until the operator
+    // answers it: every advance (a gate's or a team recovery's answer, a resume, a fold) stops
+    // here, the run left with its pause and no worker. The answer releases it.
+    if crate::domain::get_session(&*store, run_id)?
+        .is_some_and(|s| power_gate::held_pause(&s).is_some())
+    {
+        return Ok(Progress::Paused);
+    }
     // (X1) The scope step's boundary: the launch plan is scored from the PA's answer and decided
     // as the initial plan (accepted, or held for its plan_approval gate) before any creator step
     // dispatches. A plan that cannot be decided or planned fails the run: it never runs on with
@@ -21788,6 +21796,46 @@ mod terminal_gate_tests {
         );
         let session = crate::domain::get_session(&store, "r").unwrap().unwrap();
         assert_eq!(session.status, SessionStatus::AwaitingHuman);
+    }
+
+    /// (core#1581) Every advance stops at a held power checkpoint pause: the run neither
+    /// dispatches nor finalizes (here: the `Auto` terminal gate below would finalize) until the
+    /// pause is answered, whatever path advances it (a team transport gate's answer included).
+    #[test]
+    fn an_advance_stops_at_a_held_power_pause() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, GateSpec::Auto);
+        let mut s = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        s.status = SessionStatus::Executing;
+        let mut p = crate::power::PowerState::launched(true, 0);
+        p.pause = Some(crate::power::PowerPause {
+            at: 1,
+            checkpoint: 1,
+            reasons: vec!["a destructive change appeared".into()],
+            recommended: "continue_high".into(),
+        });
+        s.power = Some(p);
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let progress = advance_or_pause(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "r",
+            1,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        assert!(matches!(progress, Progress::Paused), "held, not finalized");
+        let after = crate::domain::get_session(&store, "r").unwrap().unwrap();
+        assert_eq!(after.status, SessionStatus::Executing);
+        assert!(after.power.unwrap().pause.is_some());
     }
 
     /// Control: an `Auto` terminal gate finalizes (no spurious pause) — the fix is scoped to the

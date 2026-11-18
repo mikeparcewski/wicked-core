@@ -45,7 +45,9 @@ Two release tracks share this file, newest entry first regardless of track:
   redriven, resumed or reassigned past it (a reassign is refused with a conflict until the pause is answered) and is
   not reported as an orphan, so after a restart it stays executing with the same pause card; the attempt the restart
   interrupted is superseded, so the replayed task's synthetic failure applies as stale. No checkpoint clears a held
-  pause (a turn end waits on it). Answering it (`POST /runs/:id/power/pause`), or switching the run to phased,
+  pause (a turn end waits on it), every advance stops at one (a team transport gate's answer included), a superseded
+  attempt's checkpoint is stale (it stops that worker and opens nothing), and a run switched to phased opens no new
+  pause. Answering it (`POST /runs/:id/power/pause`), or switching the run to phased,
   records the answer and, with no worker left waiting, resumes the run once from its cursor under a fresh attempt.
 - **The redactor cuts the secret shapes it missed, and every deny print that quotes a reason or a cause is
   redacted (core#1577).** These survived the one tool-activity redactor and reached the decisions log through the

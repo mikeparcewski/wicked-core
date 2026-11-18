@@ -98,7 +98,10 @@ pub(super) fn on_checkpoint(
     let Some(power) = session.power.clone() else {
         return Ok(CheckpointAnswer::default());
     };
-    if !live(&session) {
+    // (core#1581) A superseded worker's checkpoint (an older attempt: a reassign or a redrive
+    // moved past it) is stale, like its result would be: it changes nothing, opens no pause, and
+    // stops that worker, so it can never hold a pause or take the live worker's answer.
+    if !live(&session) || attempt < session.attempt {
         return Ok(CheckpointAnswer {
             stop: true,
             ..Default::default()
@@ -256,19 +259,21 @@ pub(super) fn on_checkpoint(
                 .any(|f| f.by == "policy" && f.rigor == Rigor::Highest)
         });
     let spread_grew = crate::power::spread_grew(power, signals.spread);
-    let pause_reasons: Vec<(&'static str, String)> = if turn_end && power.pause.is_none() {
-        crate::power::sudden_complexity(
-            destructive_new,
-            spread_grew,
-            report.new_dependencies > 0 && !sensitive.is_empty(),
-            &struggle_reasons,
-        )
-        .into_iter()
-        .filter(|(k, _)| !power.acknowledged.iter().any(|a| a == k))
-        .collect()
-    } else {
-        Vec::new()
-    };
+    // A run switched to phased pauses no more: its build hands off at this turn (`stop` below).
+    let pause_reasons: Vec<(&'static str, String)> =
+        if turn_end && power.on && power.pause.is_none() {
+            crate::power::sudden_complexity(
+                destructive_new,
+                spread_grew,
+                report.new_dependencies > 0 && !sensitive.is_empty(),
+                &struggle_reasons,
+            )
+            .into_iter()
+            .filter(|(k, _)| !power.acknowledged.iter().any(|a| a == k))
+            .collect()
+        } else {
+            Vec::new()
+        };
     let pause_keys: Vec<String> = pause_reasons.iter().map(|(k, _)| k.to_string()).collect();
     let pause_reasons: Vec<String> = pause_reasons.into_iter().map(|(_, r)| r).collect();
     let paused_before = power.history.iter().filter(|r| r.paused).count();
@@ -1244,6 +1249,48 @@ mod held_pause_tests {
             None,
             "the switch to phased answers the pause"
         );
+        crate::power::forget_run(id);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A superseded worker's checkpoint is stale (it stops that worker and opens nothing), and a
+    /// run switched to phased pauses no more; a live power run's struggle still pauses.
+    #[test]
+    fn a_stale_or_switched_off_checkpoint_opens_no_pause() {
+        let dir = std::env::temp_dir().join(format!("wc-stale-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("s.db").to_str().unwrap())).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        let mut struggling = report("turn");
+        struggling.failed_runs = 3;
+        let fresh = |id: &str, on: bool, attempt: u32| {
+            let mut s = held(id, (false, false, false, false));
+            s.attempt = attempt;
+            let p = s.power.as_mut().unwrap();
+            p.pause = None;
+            p.on = on;
+            s
+        };
+        // Control: the live attempt of a power run that is on pauses on its struggle.
+        let id = "pw-live-struggle";
+        put_node(&mut store, fresh(id, true, 2).to_node()).unwrap();
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 2, &struggling).unwrap();
+        assert!(a.pause.is_some() && pause_of(&store, id).is_some());
+        crate::power::forget_run(id);
+        // A superseded attempt: stopped, nothing recorded.
+        let id = "pw-stale-struggle";
+        put_node(&mut store, fresh(id, true, 2).to_node()).unwrap();
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 1, &struggling).unwrap();
+        assert!(a.stop && a.pause.is_none());
+        let after = crate::domain::get_session(&store, id).unwrap().unwrap();
+        let p = after.power.unwrap();
+        assert!(p.pause.is_none() && p.checkpoints == 0 && p.history.is_empty());
+        // Switched to phased: the build hands off, no pause.
+        let id = "pw-off-struggle";
+        put_node(&mut store, fresh(id, false, 2).to_node()).unwrap();
+        let a = on_checkpoint(&mut store, &mut sink, id, 1, 2, &struggling).unwrap();
+        assert!(a.stop && a.pause.is_none() && pause_of(&store, id).is_none());
         crate::power::forget_run(id);
         let _ = std::fs::remove_dir_all(&dir);
     }
