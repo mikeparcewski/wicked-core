@@ -825,16 +825,18 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
 }
 
 /// (core#1577) A config CLI's command head (`npm config`, `npm c`, `aws configure`, `git config`,
-/// flags between allowed); one shell word after it (quoted fragments whole, so a quoted `&` or `;`
-/// never ends the command, and an unquoted `|`, `;` or `&` does); and a word naming a secret.
+/// flags between allowed, also right after a quote or backtick: a reason quotes the command as
+/// `` `npm config …` ``); one shell word after it (quoted fragments whole, so a quoted `&` or `;`
+/// never ends the command, and an unquoted `|`, `;`, `&` or backtick does); and a word naming a
+/// secret.
 fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
     static R: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
         std::sync::OnceLock::new();
     R.get_or_init(|| {
         let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
         (
-            re(r"(?:^|[\s;&|(])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"),
-            re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&])+"#),
+            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
+            re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])+"#),
             re(SECRET_WORD),
         )
     })
@@ -1352,6 +1354,15 @@ mod tests {
             (
                 "npm c set //h/:_authToken {s}",
                 "npm c set //h/:_authToken ***",
+            ),
+            // A refusal reason quotes the command in backticks; a shell may run it quoted.
+            (
+                "refused: `npm config set //h/:_authToken {s}`",
+                "refused: `npm config set //h/:_authToken ***`",
+            ),
+            (
+                "sh -c 'npm config set //h/:_authToken {s}'",
+                "sh -c 'npm config set //h/:_authToken ***'",
             ),
             // codex r2: a flag's value naming a secret is not the key; a quoted `&` is not the end.
             (
