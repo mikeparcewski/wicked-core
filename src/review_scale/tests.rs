@@ -465,8 +465,6 @@ fn impact_score_table() {
     }
 }
 
-/// core#692: the reach reason names WHY a traversal is incomplete. A hop horizon is not a node
-/// cap: within the horizon the count is exact, so it must not read "(capped)".
 /// (rig run 97ee72d4, a one-issue bug fix in wicked-estate) Crates of one repository are one
 /// product: a fix across three crates, whose dependent sits in a fourth, spans one product and
 /// earns no span points, so it cannot read as "spread into another product".
@@ -526,6 +524,8 @@ fn a_fix_across_three_crates_of_one_repository_is_one_product() {
     );
 }
 
+/// core#692: the reach reason names WHY a traversal is incomplete. A hop horizon is not a node
+/// cap: within the horizon the count is exact, so it must not read "(capped)".
 #[test]
 fn reach_reason_labels_truncation_by_cause() {
     let reason = |node_cap_reached, depth_horizon_reached| {
