@@ -773,10 +773,20 @@ fn paths_in(cmd: &str, root: &Path) -> String {
     out
 }
 
-/// A value as a shell word: single- or double-quoted (no escapes), or bare.
-const VALUE: &str = r#"(?:'[^']*'|"[^"]*"|[^\s'"]+)"#;
+/// A value as one whole shell word: a quoted fragment (single, or double with escapes) and the
+/// bare or escaped characters after it (`'a'b`, `"a\"b"`), or bare and escaped characters alone
+/// (`a\ b`; core#1577). A quote after a bare start is not taken in: in `echo 'TOKEN=v' && …` the
+/// value is `v`, and the closing quote never opens a fragment that swallows the next command.
+const VALUE: &str = r#"(?:(?:'[^']*'|"(?:[^"\\]|\\.)*")(?:\\.|[^\s'"\\])*|(?:\\.|[^\s'"\\])+)"#;
+/// The words that say a name holds a secret (one list, for both spellings below).
+macro_rules! secret_word {
+    () => {
+        r"(?i:token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|credential|auth)"
+    };
+}
+const SECRET_WORD: &str = secret_word!();
 /// A name that says it holds a secret.
-const SECRET_NAME: &str = r"[A-Za-z0-9_.-]*(?i:token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|credential|auth)[A-Za-z0-9_.-]*";
+const SECRET_NAME: &str = concat!(r"[A-Za-z0-9_.-]*", secret_word!(), r"[A-Za-z0-9_.-]*");
 
 fn redactors() -> &'static [(regex::Regex, &'static str)] {
     static R: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
@@ -795,24 +805,116 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
                 "${1}***",
             ),
             // `NAME=value` and `--name=value` / `--name value` / `-p value` where the name says secret.
-            (re(format!(r"(\b{SECRET_NAME}=){VALUE}")), "${1}***"),
+            // (core#1577) `name = value` too, and a quoted name: an ini / credentials-file line
+            // (`aws_secret_access_key = …`), an `.npmrc` `//host/:_authToken=…`.
+            (
+                re(format!(r#"(\b{SECRET_NAME}['"]?[ \t]*=[ \t]*){VALUE}"#)),
+                "${1}***",
+            ),
             (re(format!(r"((?:^|\s)--?{SECRET_NAME}\s+){VALUE}")), "${1}***"),
             (re(format!(r"((?:^|\s)-(?:u|p)\s+){VALUE}")), "${1}***"),
-            (re(format!(r"((?:^|\s)--user\s+){VALUE}")), "${1}***"),
-            // Credentials in a URL.
-            (re(r#"(://)[^/\s:@'"]+:[^/\s@'"]+@"#.into()), "${1}***@"),
+            (re(format!(r"((?:^|\s)--user(?:\s+|=)){VALUE}")), "${1}***"),
+            // (core#1577) `-uuser:password`, the attached spelling (a colon says it is a login).
+            (re(format!(r#"((?:^|\s)-u)[^\s:'"]+:{VALUE}"#)), "${1}***"),
+            // Credentials in a URL: `user:password@` and (core#1577) a bare token as the userinfo,
+            // `https://TOKEN@host/…` (a user name alone is cut too; it is often the token). The
+            // userinfo ends the authority's first part: an `@` after `/`, `?` or `#` is not one.
+            (re(r#"(://)[^/?#\s@'"]+@"#.into()), "${1}***@"),
         ]
     })
 }
 
+/// (core#1577) A config CLI's command head (`npm config`, `npm c`, `aws configure`, `git config`,
+/// flags between allowed); one shell word after it (quoted fragments whole, so a quoted `&` or `;`
+/// never ends the command, and an unquoted `|`, `;` or `&` does); and a word naming a secret.
+fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
+    static R: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
+        (
+            re(r"(?:^|[\s;&|(])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"),
+            re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&])+"#),
+            re(SECRET_WORD),
+        )
+    })
+}
+
+/// (core#1577) In every config CLI command, the value of each `<key naming a secret> <value>` pair:
+/// `npm config set //host/:_authToken …` (npm takes several pairs, its keys carry `/` and `:`),
+/// `aws configure set --profile ci aws_secret_access_key …`. A key with `=` in it was already
+/// judged as an assignment. A secret-named word right after a valued flag, followed by another
+/// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
+/// aws_secret_access_key …`), so the next word is the key.
+fn redact_config_pairs(cmd: &str) -> String {
+    let (head, word, secret_word) = config_rules();
+    let flag = |w: &str| w.starts_with('-');
+    let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    let mut from = 0;
+    while from < cmd.len() {
+        let Some(m) = head.find_at(cmd, from) else {
+            break;
+        };
+        let mut words: Vec<&str> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut pos = m.end();
+        loop {
+            let rest = &cmd[pos..];
+            let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
+            match word.find(&cmd[start..]) {
+                Some(w) if start > pos || spans.is_empty() => {
+                    words.push(w.as_str());
+                    spans.push((start, start + w.end()));
+                    pos = start + w.end();
+                }
+                _ => break,
+            }
+        }
+        let mut i = 0;
+        while i + 1 < words.len() {
+            let flag_value = i > 0
+                && flag(words[i - 1])
+                && !words[i - 1].contains('=')
+                && secret(words[i + 1])
+                && words.get(i + 2).is_some_and(|w| !w.starts_with('-'));
+            if secret(words[i]) && !flag_value {
+                cut.push(spans[i + 1]);
+                i += 2;
+            } else {
+                i += 1;
+            }
+        }
+        from = pos;
+    }
+    let mut out = String::with_capacity(cmd.len());
+    let mut last = 0;
+    for (a, b) in cut {
+        out.push_str(&cmd[last..a]);
+        out.push_str("***");
+        last = b;
+    }
+    out.push_str(&cmd[last..]);
+    out
+}
+
+/// A shell line continuation: a backslash, any trailing blanks, and the newline.
+fn continuation() -> &'static regex::Regex {
+    static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| regex::Regex::new(r"\\[ \t]*\r?\n").expect("continuation pattern"))
+}
+
 /// A command with secrets cut, quoted or not: auth header values, secret-named assignments, headers
-/// and flags, `-u` / `-p` / `--user` values, and credentials in a URL.
+/// and flags, config CLIs' secret keys, `-u` / `-p` / `--user` values, and credentials in a URL.
+/// A shell line continuation is joined first, as the shell joins it, so a value on the next line
+/// is cut like one on the same line (core#1577; also inside quotes, where the record then shows
+/// the two lines joined).
 pub fn redact(cmd: &str) -> String {
-    let mut out = cmd.to_string();
+    let mut out = continuation().replace_all(cmd, "").into_owned();
     for (re, with) in redactors() {
         out = re.replace_all(&out, *with).into_owned();
     }
-    out
+    redact_config_pairs(&out)
 }
 
 fn clip(s: &str) -> String {
@@ -1158,6 +1260,46 @@ mod tests {
                 v("j"),
             ),
             (format!("curl -H 'X-Api-Key: {}' https://h", v("k")), v("k")),
+            // core#1577: a bare token as a URL's userinfo, npm and AWS config values, and a value
+            // after a shell line continuation.
+            (
+                format!("git push https://{}@example.test/o/r.git", v("l")),
+                v("l"),
+            ),
+            (
+                format!(
+                    "npm config set //registry.example.test/:_authToken {}",
+                    v("m")
+                ),
+                v("m"),
+            ),
+            (
+                format!(
+                    "echo '//registry.example.test/:_authToken={}' >> .npmrc",
+                    v("n")
+                ),
+                v("n"),
+            ),
+            (
+                format!(
+                    "aws configure set --profile ci aws_secret_access_key {}",
+                    v("o")
+                ),
+                v("o"),
+            ),
+            (
+                format!("printf 'aws_session_token = {}' >> creds", v("p")),
+                v("p"),
+            ),
+            (
+                format!("curl --user \\\n  alice:{} https://h", v("q")),
+                v("q"),
+            ),
+            (format!("tool --password \\\n {} run", v("r")), v("r")),
+            (
+                format!("curl -H 'Authorization: Bearer \\\r\n{}' https://h", v("s")),
+                v("s"),
+            ),
         ];
         for (cmd, secret) in &cases {
             let t = bash(cmd);
@@ -1169,6 +1311,13 @@ mod tests {
             "git status --short",
             "nothing secret, nothing cut"
         );
+        for kept in [
+            "git clone https://example.test/o/r.git",
+            "npm config set registry https://registry.example.test/",
+            "aws configure set region eu-west-1",
+        ] {
+            assert_eq!(bash(kept), kept, "nothing secret, nothing cut");
+        }
         // Paths in a command: the worktree's are relative, the home directory is `~`.
         assert_eq!(bash("cat /w/repo/src/a.rs"), "cat src/a.rs");
         if let Some(h) = home() {
@@ -1180,6 +1329,121 @@ mod tests {
         assert_eq!(t.chars().count(), TARGET_MAX);
         assert!(t.ends_with('…'));
         assert_eq!(target_of("Bash", &json!({}), root), None);
+    }
+
+    /// core#1577 (codex r1 on the fix): each shape the redactor missed, with what it must record. The
+    /// secret is built at run time (secret scanners read test files too); `{s}` marks it.
+    #[test]
+    fn the_redactor_cuts_every_reported_shape_and_keeps_ordinary_commands() {
+        let secret = format!("core1577{}", "Q7".repeat(5));
+        let cut: &[(&str, &str)] = &[
+            (
+                "npm config set --global //h/:_authToken token{s} --location=user",
+                "npm config set --global //h/:_authToken *** --location=user",
+            ),
+            (
+                "npm config --global set //h/:_authToken {s}",
+                "npm config --global set //h/:_authToken ***",
+            ),
+            (
+                "aws configure set --profile \"ci account\" aws_secret_access_key {s}",
+                "aws configure set --profile \"ci account\" aws_secret_access_key ***",
+            ),
+            (
+                "npm c set //h/:_authToken {s}",
+                "npm c set //h/:_authToken ***",
+            ),
+            // codex r2: a flag's value naming a secret is not the key; a quoted `&` is not the end.
+            (
+                "aws configure set --profile prod-auth aws_secret_access_key {s}",
+                "aws configure set --profile prod-auth aws_secret_access_key ***",
+            ),
+            (
+                "aws configure set --profile \"R&D\" aws_secret_access_key {s}",
+                "aws configure set --profile \"R&D\" aws_secret_access_key ***",
+            ),
+            (
+                "npm config set registry https://r.example.test //h/:_authToken {s}",
+                "npm config set registry https://r.example.test //h/:_authToken ***",
+            ),
+            (
+                "npm config set //one/:_authToken {s} //two/:_authToken {s}",
+                "npm config set //one/:_authToken *** //two/:_authToken ***",
+            ),
+            (
+                "npm config set //h/:_authToken 'prefix'{s}",
+                "npm config set //h/:_authToken ***",
+            ),
+            (
+                "aws configure set aws_secret_access_key \"prefix\\\"{s}\"",
+                "aws configure set aws_secret_access_key ***",
+            ),
+            ("tool --password {s}\\ tail run", "tool --password *** run"),
+            (
+                "npm config set '//h/:_authToken'={s}",
+                "npm config set '//h/:_authToken'=***",
+            ),
+            ("curl --user=bot:{s} https://h", "curl --user=*** https://h"),
+            ("curl -ubot:{s} https://h", "curl -u*** https://h"),
+            (
+                "curl --user \\  \n bot:{s} https://h",
+                "curl --user  *** https://h",
+            ),
+            (
+                "git push https://{s}@example.test/o/r.git",
+                "git push https://***@example.test/o/r.git",
+            ),
+            (
+                "printf 'aws_session_token = {s}' >> creds",
+                "printf 'aws_session_token = ***' >> creds",
+            ),
+        ];
+        for (raw, want) in cut {
+            let cmd = raw.replace("{s}", &secret);
+            assert_eq!(redact(&cmd), *want, "{cmd:?}");
+        }
+        let kept: &[(&str, &str)] = &[
+            // An `@` after `?` or `#` is not userinfo: the destination is recorded as it was.
+            (
+                "curl 'https://example.test?email=alice@example.org'",
+                "curl 'https://example.test?email=alice@example.org'",
+            ),
+            (
+                "curl https://example.test/#a@b",
+                "curl https://example.test/#a@b",
+            ),
+            // A key already cut as an assignment never takes the next word for its value.
+            (
+                "npm config set //h/:_authToken=v --location=user",
+                "npm config set //h/:_authToken=*** --location=user",
+            ),
+            (
+                "git config --global user.name 'Jane Doe'",
+                "git config --global user.name 'Jane Doe'",
+            ),
+            (
+                "vim config/a.json src/auth.ts other",
+                "vim config/a.json src/auth.ts other",
+            ),
+            ("cp -pR a b", "cp -pR a b"),
+            // codex r2: `config` as a search word is not a config CLI, and a quoted assignment's
+            // closing quote never swallows the next command.
+            (
+                "rg config src/auth.rs src/lib.rs",
+                "rg config src/auth.rs src/lib.rs",
+            ),
+            (
+                "echo 'TOKEN=v' && echo 'done'",
+                "echo 'TOKEN=***' && echo 'done'",
+            ),
+            (
+                "cargo test config_auth -- --nocapture",
+                "cargo test config_auth -- --nocapture",
+            ),
+        ];
+        for (raw, want) in kept {
+            assert_eq!(redact(raw), *want, "{raw:?}");
+        }
     }
 
     #[test]

@@ -38,12 +38,40 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **The redactor cuts the secret shapes it missed, and every deny print that quotes a reason or a cause is
+  redacted (core#1577).** These survived the one tool-activity redactor and reached the decisions log through the
+  fence recorders:
+  - a bare token as a URL's userinfo, `https://TOKEN@host/…` (a user name alone is cut too; an `@` after `/`,
+    `?` or `#` is not userinfo and stays);
+  - a config CLI's secret values (`npm config …`, `npm c …`, `aws configure …`, `git config …` and the like):
+    every `<key naming a secret> <value>` pair up to the end of the command (an unquoted `|`, `;` or `&`; a quoted
+    one does not end it), wherever the flags sit, a flag's own secret-named value (`--profile prod-auth`) not
+    taken for the key; a bare `config` word (`rg config …`) is not a config CLI;
+  - a spaced or quoted-key `name = value` line (an AWS credentials or `.npmrc` line);
+  - `--user=…` and the attached `-uuser:password`;
+  - a value spelled as several abutting fragments (`'a'b`, `"a\"b"`, `a\ b`), now read as one shell word (a
+    quote after a bare start is not taken in, so `echo 'TOKEN=v' && …` keeps the rest of the command);
+  - a value after a shell line continuation (a backslash, optional blanks, then a newline), joined first as the
+    shell joins it.
+  The same redactor now cuts them, for the wire and the log alike. The infrastructure-cause
+  `wicked-governance: DENY (…)` prints (a store open, a policy select, a rule recall failure) now go through
+  `seat_text` too. A source scan, judged with whitespace removed, fails any positional deny print whose argument is
+  not exactly one `seat_text(…)` call, and any named one that interpolates more than a constant. Known limits:
+  - a spelling built to dodge a literal scan (a quoted option name such as `'--user'`, or a URL whose userinfo
+    alone is quoted) is not cut;
+  - an attached `-pVALUE` is not cut, because it cannot be told from a flag cluster (`-pR`, `-pv`);
+  - a config key whose name merely contains a secret word has its value cut (`init-author-name`,
+    `credential.helper`);
+  - a continuation inside single quotes is shown joined.
+  The accepted `-u` / `-p` over-redaction (core#1575) is unchanged. Diagnostics that print an I/O error inline
+  (`could not read tool call: …`) are not reasons and are unchanged.
 - **A refused command is redacted once, when it is recorded (core#1569).** The fence recorders wrote a refused
   tool call's command (and the reason that quotes it) to the decisions log raw, so an inline token or a password in
   a URL reached storage even where a reader later showed a redacted copy. The estate fence (both arms), the
   filesystem boundary (both arms), the remote-write fence, the phase scope, the infra recorder (the hook relay's
   fallback) and the MCP REST-boundary recorder now pass that text through the tool-activity redactor before the
-  record is written (`seat_text`), and so does every `wicked-governance: DENY (…)` diagnostic the relay forwards.
+  record is written (`seat_text`), and so does every `wicked-governance: DENY (…)` diagnostic that quotes a
+  refusal's reason (the infrastructure-cause prints went through `seat_text` only with core#1577).
   The fold, the events and the gate prompts read only that copy. The redactor is the same one the wire uses, so a
   `-u` / `-p` value is cut in the stored command too (`git push -u ***`, `mkdir -p ***`; the boundary reason still
   names the resolved path).

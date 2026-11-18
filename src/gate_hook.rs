@@ -5622,7 +5622,7 @@ pub(crate) fn evaluate_tool_call(
             );
             eprintln!(
                 "wicked-governance: DENY ({})",
-                crate::diagnostic::with_cause("open store failed", &e)
+                seat_text(&crate::diagnostic::with_cause("open store failed", &e))
             );
             return 2;
         }
@@ -5648,7 +5648,7 @@ pub(crate) fn evaluate_tool_call(
             );
             eprintln!(
                 "wicked-governance: DENY ({})",
-                crate::diagnostic::with_cause("policy select failed", &e)
+                seat_text(&crate::diagnostic::with_cause("policy select failed", &e))
             );
             return 2;
         }
@@ -7703,7 +7703,7 @@ pub fn run_output_gate_hook(
         Err(e) => {
             eprintln!(
                 "wicked-governance: DENY ({})",
-                crate::diagnostic::with_cause("open store failed", &e)
+                seat_text(&crate::diagnostic::with_cause("open store failed", &e))
             );
             return 2;
         }
@@ -7714,7 +7714,7 @@ pub fn run_output_gate_hook(
         Err(e) => {
             eprintln!(
                 "wicked-governance: DENY ({})",
-                crate::diagnostic::with_cause("policy select failed", &e)
+                seat_text(&crate::diagnostic::with_cause("policy select failed", &e))
             );
             return 2;
         }
@@ -7727,7 +7727,10 @@ pub fn run_output_gate_hook(
     if let Err(e) = attach_recalled_rules(&store, &output_rule_query(), &mut claim) {
         eprintln!(
             "wicked-governance: DENY ({})",
-            crate::diagnostic::with_cause("conformance-rule recall failed", &e)
+            seat_text(&crate::diagnostic::with_cause(
+                "conformance-rule recall failed",
+                &e
+            ))
         );
         return 2;
     }
@@ -16571,6 +16574,68 @@ mod phase_scope_tests {
         );
     }
 
+    /// core#1577 — the shapes the one redactor used to miss, each through every fence recorder into
+    /// the raw decisions log: a bare token as a URL's userinfo, npm and AWS config values, and a
+    /// value after a shell line continuation (the MCP REST-boundary recorder: `mcp_gate`'s test).
+    /// The values are built at run time (secret scanners read test files too).
+    #[test]
+    fn the_redactor_gaps_never_reach_the_decisions_log() {
+        let v = |tag: &str| format!("core1577{tag}{}", "Z9".repeat(6));
+        let shapes = [
+            (
+                format!("git push https://{}@example.test/o/r.git main", v("url")),
+                v("url"),
+            ),
+            (
+                format!(
+                    "npm config set //registry.example.test/:_authToken {}",
+                    v("npm")
+                ),
+                v("npm"),
+            ),
+            (
+                format!("aws configure set aws_secret_access_key {}", v("aws")),
+                v("aws"),
+            ),
+            (
+                format!("printf 'aws_session_token = {}' >> creds", v("ini")),
+                v("ini"),
+            ),
+            (
+                format!("curl --user \\\n  bot:{} https://example.test", v("cont")),
+                v("cont"),
+            ),
+        ];
+        for (n, (cmd, secret)) in shapes.iter().enumerate() {
+            let run_id = format!("core1577-{n}-{}", std::process::id());
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let p = decisions_path_for(&run_id, 0);
+            write_armed_marker(&p, "unit-1").unwrap();
+            let log = p.to_str().unwrap();
+            let reason = format!("refused: `{cmd}`");
+            append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, cmd, false);
+            append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, cmd, true);
+            append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, true);
+            append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, false);
+            let remote = format!("{REMOTE_WRITE_REASON_PREFIX} `{cmd}`");
+            append_remote_write_deny(log, "wf/unit-1", "unit-1", &remote, cmd);
+            append_phase_scope_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, Some(cmd));
+            append_infra_deny(log, "wf/unit-1", "unit-1", "Bash", &remote);
+            let raw = std::fs::read_to_string(&p).unwrap();
+            let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+            let claims = raw
+                .lines()
+                .filter(|l| serde_json::from_str::<ConformanceClaim>(l).is_ok())
+                .count();
+            assert_eq!(claims, 7, "{raw}");
+            assert!(
+                !raw.contains(secret.as_str()),
+                "{cmd:?} reached the log: {raw}"
+            );
+            assert!(raw.contains("***"), "{raw}");
+        }
+    }
+
     /// core#1569 — every deny diagnostic that quotes a refusal's reason is printed through
     /// `seat_text` (the hook relay forwards it and records it on an unrecorded deny). A source
     /// scan, as `spawn_audit` does for spawns: a new raw print fails here.
@@ -16579,6 +16644,61 @@ mod phase_scope_tests {
         let src = include_str!("gate_hook.rs");
         for raw in [concat!("DENY ({", "reason})"), concat!("DENY ({", "why})")] {
             assert!(!src.contains(raw), "a raw deny diagnostic: {raw}");
+        }
+        // (core#1577) …and every `DENY (…)` print that interpolates is judged on the source with
+        // the whitespace removed (so `"…DENY ({})" , x` is the same print): a positional one's
+        // ONLY argument is one `seat_text(…)` call, and a named one names a constant, never a cause.
+        let flat: String = src.split_whitespace().collect();
+        let marker = concat!("wicked-governance:DENY({", "})\",");
+        let mut seen = 0;
+        for (at, _) in flat.match_indices(marker) {
+            let rest = &flat[at + marker.len()..];
+            let open = "seat_text(";
+            assert!(
+                rest.starts_with(open),
+                "a deny diagnostic printed raw: {}",
+                &rest[..rest.len().min(80)]
+            );
+            // The `seat_text(` call's own closing paren, then the print's: nothing in between.
+            let mut depth = 1usize;
+            let mut end = None;
+            for (i, ch) in rest[open.len()..].char_indices() {
+                match ch {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            end = Some(open.len() + i + 1);
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let end = end.expect("the seat_text call closes");
+            assert!(
+                rest[end..].starts_with(");"),
+                "a deny diagnostic prints more than its redacted text: {}",
+                &rest[..(end + 40).min(rest.len())]
+            );
+            seen += 1;
+        }
+        assert_eq!(
+            seen,
+            flat.matches(concat!("wicked-governance:DENY({", "})"))
+                .count(),
+            "every positional deny print is one of the judged spellings"
+        );
+        assert!(seen >= 12, "the scan found {seen} positional deny prints");
+        for (at, _) in flat.match_indices(concat!("wicked-governance:DENY({", "")) {
+            let name: String = flat[at + "wicked-governance:DENY({".len()..]
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            assert!(
+                name.is_empty() || name.chars().all(|c| c.is_ascii_uppercase() || c == '_'),
+                "a deny diagnostic interpolates `{name}` raw"
+            );
         }
     }
 
