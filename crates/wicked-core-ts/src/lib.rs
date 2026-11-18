@@ -5184,6 +5184,16 @@ mod tests {
                 "reason", "remedy",
             ],
         );
+        // wicked-core#1566: no git identity resolves in the run's worktree.
+        check(
+            CoreEvent::GitIdentityMissing {
+                session: s(),
+                roles: vec!["author".to_string()],
+                remedy: s(),
+            },
+            "gitIdentityMissing",
+            &["type", "session", "roles", "remedy"],
+        );
         // Review of #456 (F4/F6): the seat's write containment at distribution; a kept worktree.
         check(
             CoreEvent::SandboxPosture {

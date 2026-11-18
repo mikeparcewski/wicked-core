@@ -1909,6 +1909,7 @@ pub(crate) fn run(
                                     Command::WorktreeReady {
                                         spec,
                                         repo_ref: Some(ref_id),
+                                        identity_missing: identity_missing_in(&wt),
                                         workdir: Some(wt.to_string_lossy().to_string()),
                                         base_commit,
                                     }
@@ -1929,6 +1930,7 @@ pub(crate) fn run(
                             repo_ref: None,
                             workdir: None,
                             base_commit: None,
+                            identity_missing: Vec::new(),
                         });
                     }
                     Ok(run_id)
@@ -2034,6 +2036,7 @@ pub(crate) fn run(
                 repo_ref,
                 workdir,
                 base_commit,
+                identity_missing,
             } => {
                 // (ASK-K1a) The roster is re-ordered with the PA pick first, below.
                 let mut spec = spec;
@@ -2083,6 +2086,18 @@ pub(crate) fn run(
                         });
                     }
                     continue; // Stay in the actor loop — do NOT return/kill the actor.
+                }
+                // (wicked-core#1566) No git identity resolves in the worktree: a seat's commits are
+                // refused there (wicked-core#1485). Said on the run, not only on the daemon's stderr.
+                if !identity_missing.is_empty() {
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::GitIdentityMissing {
+                            session: run_id.clone(),
+                            roles: identity_missing.clone(),
+                            remedy: GIT_IDENTITY_REMEDY.to_string(),
+                        },
+                    );
                 }
                 if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                     s.workdir = workdir.clone();
@@ -9321,6 +9336,45 @@ fn denial_gate_note(human_confirm: crate::domain::HumanConfirm) -> &'static str 
     }
 }
 
+/// (wicked-core#1566) What to do when no git identity resolves for a run's worktree.
+const GIT_IDENTITY_REMEDY: &str = "configure a git identity: git config --global user.name \"Your \
+     Name\" and git config --global user.email you@example.com (or this repository's own user.name \
+     and user.email)";
+
+/// (wicked-core#1566) The identity roles (`author`, `committer`) the operator's git does not
+/// resolve in `worktree` (`wicked_apps_core::spawn::operator_git_idents`, the read every seat spawn
+/// makes); empty when both resolve.
+fn identity_missing_in(worktree: &std::path::Path) -> Vec<String> {
+    identity_missing_at(Some(worktree))
+}
+
+fn identity_missing_at(worktree: Option<&std::path::Path>) -> Vec<String> {
+    let Some(worktree) = worktree else {
+        return Vec::new();
+    };
+    let (author, committer) = wicked_apps_core::spawn::operator_git_idents(Some(worktree));
+    let mut missing = Vec::new();
+    if author.is_none() {
+        missing.push("author".to_string());
+    }
+    if committer.is_none() {
+        missing.push("committer".to_string());
+    }
+    missing
+}
+
+/// (wicked-core#1566) The gate sentence for missing identity roles; empty when none is missing.
+fn git_identity_gate_note(missing: &[String]) -> String {
+    if missing.is_empty() {
+        return String::new();
+    }
+    format!(
+        ". No git {} identity is configured for this run's repository, so the seats' commits are \
+         refused until one is: {GIT_IDENTITY_REMEDY}",
+        missing.join(" or ")
+    )
+}
+
 /// (core#464) Open the `escalation` gate on a DENIED unit: emit `GateEscalated` naming the denial
 /// class and the guard's restore outcome, then pause the run ON the unit (cursor unchanged, so
 /// Approve re-dispatches it and Reject cancels). The one route every denial takes — the
@@ -9341,6 +9395,14 @@ fn escalate_denied_unit(
     def_gate: bool,
     note: &str,
 ) -> anyhow::Result<()> {
+    // (wicked-core#1566) A gate on a run whose worktree resolves no git identity says so: the
+    // seats' commits there are refused until one is configured.
+    let note = &format!(
+        "{note}{}",
+        git_identity_gate_note(&identity_missing_at(
+            session.workdir.as_deref().map(std::path::Path::new)
+        ))
+    );
     let ord = unit.ord;
     let denial = unit.denial.as_ref();
     let class = denial_class(denial, hook_denied);
@@ -40198,5 +40260,94 @@ mod carried_skip_tests {
         let mut legacy = units.clone();
         legacy[0].rule_skips[0].rulings_rev = None;
         assert!(carried_skips(problem, &[], &legacy, 5).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod git_identity_missing_tests {
+    use super::{git_identity_gate_note, identity_missing_in, GIT_IDENTITY_REMEDY};
+    use wicked_apps_core::spawn::HardenedCommand;
+
+    fn git(cwd: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .expect("git runs");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// wicked-core#1566 — with no git identity anywhere, both roles are named missing, and the gate
+    /// sentence says the seats' commits are refused and what to run; a repository-local identity
+    /// resolves both, and the sentence is empty.
+    #[test]
+    fn a_worktree_without_a_git_identity_is_named_on_the_run_and_its_gates() {
+        let _guard = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let keys = [
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_AUTHOR_NAME",
+            "GIT_AUTHOR_EMAIL",
+            "GIT_COMMITTER_NAME",
+            "GIT_COMMITTER_EMAIL",
+            "EMAIL",
+        ];
+        let saved: Vec<_> = keys.iter().map(|k| (*k, std::env::var_os(k))).collect();
+        let base = std::env::temp_dir().join(format!("core1566-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let empty = base.join("empty-gitconfig");
+        std::fs::write(&empty, "").unwrap();
+        std::env::set_var("GIT_CONFIG_GLOBAL", &empty);
+        std::env::set_var("GIT_CONFIG_NOSYSTEM", "1");
+        for k in &keys[2..] {
+            std::env::remove_var(k);
+        }
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q"]);
+        let missing = identity_missing_in(&repo);
+        git(&repo, &["config", "user.name", "Repo Person"]);
+        git(&repo, &["config", "user.email", "repo@example.invalid"]);
+        let resolved = identity_missing_in(&repo);
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(missing, vec!["author".to_string(), "committer".to_string()]);
+        let note = git_identity_gate_note(&missing);
+        assert!(
+            note.contains("No git author or committer identity is configured"),
+            "{note}"
+        );
+        assert!(note.contains("the seats' commits are refused"), "{note}");
+        assert!(note.contains(GIT_IDENTITY_REMEDY), "{note}");
+        assert!(note.contains("git config --global user.name"), "{note}");
+        assert!(resolved.is_empty(), "{resolved:?}");
+        assert_eq!(git_identity_gate_note(&resolved), "");
+    }
+
+    /// The run event's wire shape.
+    #[test]
+    fn the_missing_identity_event_names_the_roles_and_the_remedy() {
+        let ev = crate::CoreEvent::GitIdentityMissing {
+            session: "r1".into(),
+            roles: vec!["committer".into()],
+            remedy: GIT_IDENTITY_REMEDY.into(),
+        };
+        let wire = ev.to_json();
+        assert_eq!(wire["type"], "gitIdentityMissing");
+        assert_eq!(wire["session"], "r1");
+        assert_eq!(wire["roles"][0], "committer");
+        assert!(wire["remedy"]
+            .as_str()
+            .is_some_and(|r| r.contains("user.email")));
     }
 }
