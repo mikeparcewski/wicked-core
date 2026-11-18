@@ -737,7 +737,81 @@ pub fn operator_git_idents(cwd: Option<&std::path::Path>) -> (Option<GitIdent>, 
         let out = git.output().ok().filter(|o| o.status.success())?;
         parse_git_ident(std::str::from_utf8(&out.stdout).ok()?)
     };
-    (var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT"))
+    let idents = (var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT"));
+    if let Some(dir) = cwd {
+        record_git_ident_read(dir, idents.0.as_ref(), idents.1.as_ref());
+    }
+    idents
+}
+
+/// (wicked-core#1566) The roles a seat would refuse ([`usable_git_ident`]): `"author"`,
+/// `"committer"`, in that order; empty when both are usable.
+pub fn missing_git_ident_roles(
+    author: Option<&GitIdent>,
+    committer: Option<&GitIdent>,
+) -> Vec<String> {
+    [("author", author), ("committer", committer)]
+        .into_iter()
+        .filter(|(_, i)| usable_git_ident(*i).is_none())
+        .map(|(role, _)| role.to_string())
+        .collect()
+}
+
+/// (wicked-core#1566) The LATEST identity read per directory: every [`operator_git_idents`] with a
+/// cwd (the launch's read beside a minted worktree, and each seat spawn's read) replaces the entry
+/// for that directory, so the record is a fact about the latest attempt, never a session-long
+/// cache: configure an identity and retry, and the retry's seat spawn clears it. In memory only.
+static GIT_IDENT_READS: std::sync::Mutex<GitIdentReads> = std::sync::Mutex::new(GitIdentReads {
+    seq: 0,
+    by_dir: std::collections::BTreeMap::new(),
+});
+
+/// The record behind [`GIT_IDENT_READS`]: per directory, the read's sequence number (taken under
+/// the lock, so a later publication always carries a larger one) and the roles it found missing.
+struct GitIdentReads {
+    seq: u64,
+    by_dir: std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<String>)>,
+}
+
+/// Record one identity read from `dir` (see [`GIT_IDENT_READS`]).
+pub fn record_git_ident_read(
+    dir: &std::path::Path,
+    author: Option<&GitIdent>,
+    committer: Option<&GitIdent>,
+) {
+    let missing = missing_git_ident_roles(author, committer);
+    let mut reads = GIT_IDENT_READS.lock().unwrap_or_else(|p| p.into_inner());
+    reads.seq += 1;
+    let seq = reads.seq;
+    reads.by_dir.insert(dir.to_path_buf(), (seq, missing));
+}
+
+/// The roles the LATEST identity read from `dir` or a directory under it found missing (a seat
+/// may run in a subdirectory of its worktree); empty when that read resolved both, or none was
+/// made in this process. No git call and no filesystem access: safe on the engine's actor.
+pub fn latest_git_ident_missing(dir: &std::path::Path) -> Vec<String> {
+    // `dir` and the paths under it sort together (`Path` orders by component), so only that range
+    // is visited.
+    GIT_IDENT_READS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .by_dir
+        .range(dir.to_path_buf()..)
+        .take_while(|(k, _)| k.starts_with(dir))
+        .max_by_key(|(_, (seq, _))| *seq)
+        .map(|(_, (_, missing))| missing.clone())
+        .unwrap_or_default()
+}
+
+/// (wicked-core#1566) The identity a seat may carry: resolved, a non-blank name, no control
+/// character in the name or the email. The one rule for the seat's environment
+/// ([`seat_git_identity_env`]) and the engine's report of a missing identity.
+pub fn usable_git_ident(i: Option<&GitIdent>) -> Option<&GitIdent> {
+    i.filter(|i| {
+        !i.name.trim().is_empty()
+            && !i.name.chars().any(char::is_control)
+            && !i.email.chars().any(char::is_control)
+    })
 }
 
 /// The operator's author and committer ([`operator_git_idents`]) as git's identity ENVIRONMENT
@@ -758,16 +832,9 @@ pub fn seat_git_identity_env(
     author: Option<&GitIdent>,
     committer: Option<&GitIdent>,
 ) -> Vec<(String, String)> {
-    fn usable(i: Option<&GitIdent>) -> Option<&GitIdent> {
-        i.filter(|i| {
-            !i.name.trim().is_empty()
-                && !i.name.chars().any(char::is_control)
-                && !i.email.chars().any(char::is_control)
-        })
-    }
     let mut env = Vec::new();
     for (role, ident) in [("AUTHOR", author), ("COMMITTER", committer)] {
-        match usable(ident) {
+        match usable_git_ident(ident) {
             Some(i) => {
                 env.push((format!("GIT_{role}_NAME"), i.name.clone()));
                 env.push((format!("GIT_{role}_EMAIL"), i.email.clone()));

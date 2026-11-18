@@ -1047,6 +1047,14 @@ pub enum CoreEvent {
         reason: String,
         remedy: String,
     },
+    /// (wicked-core#1566; additive) No git identity resolves in the run's worktree, so a seat's
+    /// commits there are refused (wicked-core#1485): which roles are missing (`author`,
+    /// `committer`) and what to run. Emitted once, when the worktree is ready.
+    GitIdentityMissing {
+        session: String,
+        roles: Vec<String>,
+        remedy: String,
+    },
     /// (F-E2E-029 review F4; additive) The WRITE CONTAINMENT the seat assigned to an agent unit
     /// actually runs under, disclosed at distribution so an operator is never left believing a
     /// fence is hermetic: `os` — (core#993) the unit runs on the container seat floor
@@ -3146,6 +3154,16 @@ impl CoreEvent {
                 "tool": tool,
                 "command": command,
                 "reason": reason,
+                "remedy": remedy,
+            }),
+            CoreEvent::GitIdentityMissing {
+                session,
+                roles,
+                remedy,
+            } => json!({
+                "type": "gitIdentityMissing",
+                "session": session,
+                "roles": roles,
                 "remedy": remedy,
             }),
             CoreEvent::SandboxPosture {

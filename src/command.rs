@@ -74,6 +74,10 @@ pub(crate) enum Command {
         /// (F-7R2-013) The commit the worktree was minted FROM (`RunBase::commit`), recorded on
         /// the session as `base_commit`; `None` for a repo-less run or a reused worktree.
         base_commit: Option<String>,
+        /// (wicked-core#1566) The git identity roles (`author`, `committer`) the operator's git does
+        /// NOT resolve in the minted worktree, read off-thread beside it: a seat's commits there are
+        /// refused (wicked-core#1485). Empty for a repo-less run, or when both resolve.
+        identity_missing: Vec<String>,
     },
     /// Internal: worktree creation failed off-thread; actor marks the run Failed.
     /// Posted by the worktree-creation worker spawned by `LaunchRun` on error.
