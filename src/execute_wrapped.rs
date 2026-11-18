@@ -9284,9 +9284,14 @@ mod tests {
             .join("victim")
             .join("code-graph.db");
         assert_eq!(
-            graph_write_dir(db.to_str(), Some(&sh_link)),
+            repo_read_root(db.to_str(), Some(&sh_link)).map(PathBuf::from),
             Some(root.join("victim")),
-            "the grant is the real project dir"
+            "the read grant is the real project dir"
+        );
+        assert_eq!(
+            graph_write_dir(db.to_str(), Some(&sh_link)),
+            None,
+            "never a write grant"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
