@@ -761,10 +761,17 @@ pub fn missing_git_ident_roles(
 /// cwd (the launch's read beside a minted worktree, and each seat spawn's read) replaces the entry
 /// for that directory, so the record is a fact about the latest attempt, never a session-long
 /// cache: configure an identity and retry, and the retry's seat spawn clears it. In memory only.
-static GIT_IDENT_READS: std::sync::Mutex<
-    std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<String>)>,
-> = std::sync::Mutex::new(std::collections::BTreeMap::new());
-static GIT_IDENT_READ_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GIT_IDENT_READS: std::sync::Mutex<GitIdentReads> = std::sync::Mutex::new(GitIdentReads {
+    seq: 0,
+    by_dir: std::collections::BTreeMap::new(),
+});
+
+/// The record behind [`GIT_IDENT_READS`]: per directory, the read's sequence number (taken under
+/// the lock, so a later publication always carries a larger one) and the roles it found missing.
+struct GitIdentReads {
+    seq: u64,
+    by_dir: std::collections::BTreeMap<std::path::PathBuf, (u64, Vec<String>)>,
+}
 
 /// Record one identity read from `dir` (see [`GIT_IDENT_READS`]).
 pub fn record_git_ident_read(
@@ -772,25 +779,25 @@ pub fn record_git_ident_read(
     author: Option<&GitIdent>,
     committer: Option<&GitIdent>,
 ) {
-    let seq = GIT_IDENT_READ_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    GIT_IDENT_READS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(
-            dir.to_path_buf(),
-            (seq, missing_git_ident_roles(author, committer)),
-        );
+    let missing = missing_git_ident_roles(author, committer);
+    let mut reads = GIT_IDENT_READS.lock().unwrap_or_else(|p| p.into_inner());
+    reads.seq += 1;
+    let seq = reads.seq;
+    reads.by_dir.insert(dir.to_path_buf(), (seq, missing));
 }
 
 /// The roles the LATEST identity read from `dir` or a directory under it found missing (a seat
 /// may run in a subdirectory of its worktree); empty when that read resolved both, or none was
 /// made in this process. No git call and no filesystem access: safe on the engine's actor.
 pub fn latest_git_ident_missing(dir: &std::path::Path) -> Vec<String> {
+    // `dir` and the paths under it sort together (`Path` orders by component), so only that range
+    // is visited.
     GIT_IDENT_READS
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .filter(|(k, _)| k.starts_with(dir))
+        .by_dir
+        .range(dir.to_path_buf()..)
+        .take_while(|(k, _)| k.starts_with(dir))
         .max_by_key(|(_, (seq, _))| *seq)
         .map(|(_, (_, missing))| missing.clone())
         .unwrap_or_default()
