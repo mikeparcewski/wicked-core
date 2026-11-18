@@ -740,6 +740,17 @@ pub fn operator_git_idents(cwd: Option<&std::path::Path>) -> (Option<GitIdent>, 
     (var("GIT_AUTHOR_IDENT"), var("GIT_COMMITTER_IDENT"))
 }
 
+/// (wicked-core#1566) The identity a seat may carry: resolved, a non-blank name, no control
+/// character in the name or the email. The one rule for the seat's environment
+/// ([`seat_git_identity_env`]) and the engine's report of a missing identity.
+pub fn usable_git_ident(i: Option<&GitIdent>) -> Option<&GitIdent> {
+    i.filter(|i| {
+        !i.name.trim().is_empty()
+            && !i.name.chars().any(char::is_control)
+            && !i.email.chars().any(char::is_control)
+    })
+}
+
 /// The operator's author and committer ([`operator_git_idents`]) as git's identity ENVIRONMENT
 /// (wicked-core#1485): `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` from the author and
 /// `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL` from the committer, each exactly as git resolved it.
@@ -758,16 +769,9 @@ pub fn seat_git_identity_env(
     author: Option<&GitIdent>,
     committer: Option<&GitIdent>,
 ) -> Vec<(String, String)> {
-    fn usable(i: Option<&GitIdent>) -> Option<&GitIdent> {
-        i.filter(|i| {
-            !i.name.trim().is_empty()
-                && !i.name.chars().any(char::is_control)
-                && !i.email.chars().any(char::is_control)
-        })
-    }
     let mut env = Vec::new();
     for (role, ident) in [("AUTHOR", author), ("COMMITTER", committer)] {
-        match usable(ident) {
+        match usable_git_ident(ident) {
             Some(i) => {
                 env.push((format!("GIT_{role}_NAME"), i.name.clone()));
                 env.push((format!("GIT_{role}_EMAIL"), i.email.clone()));

@@ -42,10 +42,12 @@ Two release tracks share this file, newest entry first regardless of track:
   trimmed every trailing Unicode space, so `Operator` followed by a no-break space became `Operator`, unlike the
   operator's own `git commit`. Only the one ASCII space `git var` prints before `<` is removed now.
 - **A run whose repository has no git identity says so on the run and at its gates (core#1566).** With no identity
-  configured, a seat's commits are refused (core#1485), but the reason reached only the daemon's stderr. The worktree
-  worker now reads the identity beside the minted worktree. A missing author or committer emits `gitIdentityMissing
-  {session, roles, remedy}` (additive event), and every denial gate of that run adds a sentence: the seats' commits are
-  refused until one is configured, with the `git config` commands to run.
+  configured, a seat's commits are refused (core#1485), but the reason reached only the daemon's stderr. The launch now
+  reads the identity beside the minted worktree: off the actor on the interactive path, and beside the worktree add on
+  the campaign path. It uses the seat's own rule (`usable_git_ident`). A missing author or committer emits
+  `gitIdentityMissing {session, roles, remedy}` (additive event), and every denial gate of that run adds a sentence
+  from what the launch recorded (no git call at the gate): the seats' commits are refused until one is configured,
+  with the `git config` commands to run.
 - **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
   (core#1552).** npm got every core-ts version, but nothing made a GitHub Release, so the Releases page's Latest
   stayed a hand-made 0.7.29. A new `registry` job waits until npm serves all six packages at the tag's version (the
