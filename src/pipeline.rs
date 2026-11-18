@@ -2798,50 +2798,6 @@ fn standing_first(
     }
 }
 
-#[cfg(test)]
-mod standing_first_tests {
-    use super::standing_first;
-    use crate::domain::{RefusedCall, UnitDenial};
-
-    fn refusal(cmd: &str) -> UnitDenial {
-        UnitDenial {
-            refused_before_run: vec![RefusedCall {
-                evaluator: "wicked-governance-boundary".into(),
-                rule: "engine:estate-command-fence".into(),
-                tool: Some("Bash".into()),
-                command: Some(cmd.into()),
-                reason: "estate-deny fence".into(),
-            }],
-            ..UnitDenial::new("input_governance", "refused")
-        }
-    }
-
-    /// core#1562 — the executor's refused-calls-only denial never masks a QE reviewer turn's standing one (or the
-    /// other way round), and two refused-only denials keep every refusal.
-    #[test]
-    fn a_standing_denial_wins_over_refused_calls_only() {
-        let standing = UnitDenial::new("input_governance", "policy denied");
-        assert_eq!(
-            standing_first(Some(refusal("a")), Some(standing.clone())),
-            Some(standing.clone())
-        );
-        assert_eq!(
-            standing_first(Some(standing.clone()), Some(refusal("a"))),
-            Some(standing.clone())
-        );
-        let both = standing_first(Some(refusal("a")), Some(refusal("b"))).unwrap();
-        let cmds: Vec<_> = both
-            .refused_before_run
-            .iter()
-            .filter_map(|r| r.command.as_deref())
-            .collect();
-        assert_eq!(cmds, vec!["a", "b"]);
-        assert_eq!(standing_first(None, Some(refusal("a"))), Some(refusal("a")));
-        assert_eq!(standing_first(Some(refusal("a")), None), Some(refusal("a")));
-        assert_eq!(standing_first(None, None), None);
-    }
-}
-
 /// (operator ruling 2026-10-20, core#1061 follow-on) Whether `d`, a denial a gate fold recorded
 /// behind a failed repo-checks floor ([`crate::domain::WorkUnit::denials_behind`]), is the judge
 /// layer's NO-VERDICT hold — the one other denial the operator's judgment over that floor also
@@ -7119,5 +7075,49 @@ mod operator_waiver_tests {
             operator_waiver(&r).as_deref(),
             Some("checks waived by the operator (`accept_partial`): test, lint")
         );
+    }
+}
+
+#[cfg(test)]
+mod standing_first_tests {
+    use super::standing_first;
+    use crate::domain::{RefusedCall, UnitDenial};
+
+    fn refusal(cmd: &str) -> UnitDenial {
+        UnitDenial {
+            refused_before_run: vec![RefusedCall {
+                evaluator: "wicked-governance-boundary".into(),
+                rule: "engine:estate-command-fence".into(),
+                tool: Some("Bash".into()),
+                command: Some(cmd.into()),
+                reason: "estate-deny fence".into(),
+            }],
+            ..UnitDenial::new("input_governance", "refused")
+        }
+    }
+
+    /// core#1562 — the executor's refused-calls-only denial never masks a QE reviewer turn's standing one (or the
+    /// other way round), and two refused-only denials keep every refusal.
+    #[test]
+    fn a_standing_denial_wins_over_refused_calls_only() {
+        let standing = UnitDenial::new("input_governance", "policy denied");
+        assert_eq!(
+            standing_first(Some(refusal("a")), Some(standing.clone())),
+            Some(standing.clone())
+        );
+        assert_eq!(
+            standing_first(Some(standing.clone()), Some(refusal("a"))),
+            Some(standing.clone())
+        );
+        let both = standing_first(Some(refusal("a")), Some(refusal("b"))).unwrap();
+        let cmds: Vec<_> = both
+            .refused_before_run
+            .iter()
+            .filter_map(|r| r.command.as_deref())
+            .collect();
+        assert_eq!(cmds, vec!["a", "b"]);
+        assert_eq!(standing_first(None, Some(refusal("a"))), Some(refusal("a")));
+        assert_eq!(standing_first(Some(refusal("a")), None), Some(refusal("a")));
+        assert_eq!(standing_first(None, None), None);
     }
 }

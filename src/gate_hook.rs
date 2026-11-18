@@ -6746,7 +6746,8 @@ pub(crate) fn is_blocked_estate_write(claim: &ConformanceClaim) -> bool {
 /// (core#1562) The most of a refused command the gate record keeps, in characters.
 pub(crate) const REFUSED_COMMAND_MAX: usize = 2048;
 
-/// (core#1562) A refused command as the gate record keeps it, read in full off the decisions log
+/// (core#1562) A refused command (or the fence's reason, which names it) as the gate record keeps it, read in full
+/// off the decisions log
 /// (the wire's tool-activity target is clipped to [`crate::tool_activity::TARGET_MAX`]): secrets cut
 /// by the tool-activity redactor, then at most [`REFUSED_COMMAND_MAX`] characters (`…` marks a cut).
 pub(crate) fn refused_command_record(command: &str) -> String {
@@ -7334,7 +7335,14 @@ fn fold_input_denial_pass(
                     .get(1)
                     .filter(|c| !c.trim().is_empty())
                     .map(|c| refused_command_record(c)),
-                reason: claim.obligations.first().cloned().unwrap_or_default(),
+                // The fence's reason names the command segment too: redacted and capped the same way.
+                reason: refused_command_record(
+                    claim
+                        .obligations
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                ),
             });
         }
         if denial.is_none()
@@ -10800,8 +10808,19 @@ mod tests {
             "x".repeat(3000)
         );
         let p = arm(10);
-        estate(&p, &long);
+        append_estate_deny(
+            p.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            "estate-deny fence: `GH_TOKEN=ghp_secretvalue123 wicked-estate index` is a write subcommand",
+            &long,
+            true,
+        );
         let d = fold(&mut store, 10).unwrap();
+        let reason = &d.refused_before_run[0].reason;
+        assert!(!reason.contains("ghp_secretvalue123"), "{reason}");
+        assert!(reason.contains("GH_TOKEN=***"), "{reason}");
         let cmd = d.refused_before_run[0].command.clone().unwrap();
         assert!(!cmd.contains("ghp_secretvalue123"), "{cmd}");
         assert!(
