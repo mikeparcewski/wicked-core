@@ -5802,7 +5802,9 @@ pub(crate) fn resume_run_inner(
         return Ok(SessionStatus::AwaitingHuman);
     }
     // (core#1581) Likewise a run held at a power checkpoint pause: its answer releases it, a
-    // resume never re-dispatches past it.
+    // resume never re-dispatches past it. A stale pause (on a run switched to phased) is cleared.
+    let mut session = session;
+    power_gate::drop_stale_pause(store, &mut session)?;
     if power_gate::held_pause(&session).is_some() {
         return Ok(session.status);
     }
@@ -6132,6 +6134,13 @@ fn redrive_executing_sessions(
     };
     for s in sessions {
         if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+            continue;
+        }
+        let mut s = s;
+        // (core#1581) A stale pause (a run an older engine switched to phased mid-turn kept it)
+        // holds nothing: it is cleared, and the run redrives as before with no pause card.
+        if let Err(e) = power_gate::drop_stale_pause(store, &mut s) {
+            emit_run_error(subscribers, &s.id, e);
             continue;
         }
         // (core#1581) A run held at a power checkpoint pause stays held: nothing is redriven past

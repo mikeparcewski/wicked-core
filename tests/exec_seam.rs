@@ -642,6 +642,7 @@ fn restarted_power_run(
     name: &str,
     run_id: &str,
     pause: Option<(wicked_core::power::PowerPause, Vec<String>)>,
+    on: bool,
 ) -> Restarted {
     use wicked_apps_core::ToNode;
     let dir = tmp_dir(name);
@@ -676,7 +677,7 @@ fn restarted_power_run(
         // checkpoint persisted (and the triggers that answering it acknowledges).
         let mut store = open_store(Some(&estate_db)).unwrap();
         let mut s = wicked_core::get_session(&store, run_id).unwrap().unwrap();
-        let mut p = wicked_core::power::PowerState::launched(true, 1_700_000_000_000);
+        let mut p = wicked_core::power::PowerState::launched(on, 1_700_000_000_000);
         p.checkpoints = 3;
         if let Some((pause, keys)) = pause {
             p.pause = Some(pause);
@@ -800,7 +801,7 @@ impl Restarted {
 fn a_restart_keeps_a_power_pause_held_until_it_is_answered() {
     let run = "pause-restart";
     let (pause, keys) = checkpoint_pause(false, false, true, true);
-    let r = restarted_power_run("pause_restart", run, Some((pause.clone(), keys)));
+    let r = restarted_power_run("pause_restart", run, Some((pause.clone(), keys)), true);
     r.assert_held(run, &pause);
     let power = r.answer(run, wicked_core::power::PauseDecision::ContinueHigh);
     assert!(
@@ -815,7 +816,7 @@ fn a_restart_keeps_a_destructive_step_pause_held_until_it_is_answered() {
     let run = "pause-destructive";
     let (pause, keys) = checkpoint_pause(true, false, false, false);
     assert!(pause.reasons.iter().any(|r| r.contains("destructive")));
-    let r = restarted_power_run("pause_destructive", run, Some((pause.clone(), keys)));
+    let r = restarted_power_run("pause_destructive", run, Some((pause.clone(), keys)), true);
     r.assert_held(run, &pause);
     r.answer(run, wicked_core::power::PauseDecision::Continue);
 }
@@ -825,7 +826,7 @@ fn a_restart_keeps_a_destructive_step_pause_held_until_it_is_answered() {
 fn a_restart_keeps_a_spread_pause_held_until_it_is_answered() {
     let run = "pause-spread";
     let (pause, keys) = checkpoint_pause(false, true, false, false);
-    let r = restarted_power_run("pause_spread", run, Some((pause.clone(), keys)));
+    let r = restarted_power_run("pause_spread", run, Some((pause.clone(), keys)), true);
     r.assert_held(run, &pause);
     let power = r.answer(run, wicked_core::power::PauseDecision::SwitchPhased);
     assert!(!power.on, "switched to phased");
@@ -841,7 +842,7 @@ fn a_restart_keeps_a_spread_pause_held_until_it_is_answered() {
 fn a_restart_then_the_switch_to_phased_releases_a_held_pause() {
     let run = "pause-switch";
     let (pause, keys) = checkpoint_pause(false, false, true, false);
-    let r = restarted_power_run("pause_switch", run, Some((pause.clone(), keys)));
+    let r = restarted_power_run("pause_switch", run, Some((pause.clone(), keys)), true);
     r.assert_held(run, &pause);
     let st = r
         .core
@@ -854,10 +855,24 @@ fn a_restart_then_the_switch_to_phased_releases_a_held_pause() {
     r.assert_released_once();
 }
 
+/// core#1581, upgrade: an older engine persisted a pause on a run switched to phased mid-turn
+/// (`power.on = false` WITH a pause). That pause holds nothing: on restart it is cleared, the run
+/// redrives exactly once as before, and no pause card shows.
+#[test]
+fn an_upgrade_redrives_a_switched_off_run_with_a_stale_pause() {
+    let run = "pause-stale-off";
+    let (pause, keys) = checkpoint_pause(true, false, false, false);
+    let r = restarted_power_run("pause_stale_off", run, Some((pause, keys)), false);
+    r.assert_released_once();
+    let power = power_of(&r.core, run);
+    assert!(!power.on);
+    assert!(power.pause.is_none(), "the stale pause card is cleared");
+}
+
 /// core#1581: a power run with no pause still redrives on restart as before, exactly once.
 #[test]
 fn a_restart_still_redrives_a_power_run_that_was_not_paused() {
-    let r = restarted_power_run("pause_none", "pause-none", None);
+    let r = restarted_power_run("pause_none", "pause-none", None, true);
     r.assert_released_once();
 }
 

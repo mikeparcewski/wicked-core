@@ -33,16 +33,38 @@ fn live(session: &AgentSession) -> bool {
     )
 }
 
-/// (core#1581) The checkpoint pause a live run is held at: its persisted `power.pause`. That record
-/// is the pause's one source of truth. The in-process wait ([`crate::power::open_pause`]) only
-/// wakes a worker still waiting on it, and a restart ends that worker, so nothing may dispatch
-/// a held run's unit (the boot redrive, a resume) and no checkpoint may clear it; only the
-/// operator's answer ([`answer_pause`]) or the switch to phased releases it.
+/// (core#1581) The checkpoint pause a live power-mode run is held at: its persisted `power.pause`.
+/// That record is the pause's one source of truth. The in-process wait
+/// ([`crate::power::open_pause`]) only wakes a worker still waiting on it, and a restart ends that
+/// worker, so nothing may dispatch a held run's unit (the boot redrive, a resume) and no
+/// checkpoint may clear it; only the operator's answer ([`answer_pause`]) or the switch to phased
+/// releases it. A pause on a run no longer in power mode holds nothing: it is stale (an older
+/// engine kept the pause of a run switched off mid-turn) and [`drop_stale_pause`] clears it.
 pub(super) fn held_pause(session: &AgentSession) -> Option<&crate::power::PowerPause> {
     if !live(session) {
         return None;
     }
-    session.power.as_ref()?.pause.as_ref()
+    let power = session.power.as_ref().filter(|p| p.on)?;
+    power.pause.as_ref()
+}
+
+/// (core#1581) Clear a stale pause (one on a run switched to phased, which [`held_pause`] does not
+/// hold), so the run redrives as it did before and shows no pause card. `true` when one was
+/// cleared (the caller's copy is updated and persisted).
+pub(super) fn drop_stale_pause(
+    store: &mut dyn GraphStore,
+    session: &mut AgentSession,
+) -> anyhow::Result<bool> {
+    let Some(power) = session
+        .power
+        .as_mut()
+        .filter(|p| !p.on && p.pause.is_some())
+    else {
+        return Ok(false);
+    };
+    power.pause = None;
+    put_node(store, session.to_node())?;
+    Ok(true)
 }
 
 fn absorbs_design_of(absorbs: &[String]) -> bool {
@@ -1211,6 +1233,30 @@ mod held_pause_tests {
         let mut none = held("pw-none", (true, false, false, false));
         none.power.as_mut().unwrap().pause = None;
         assert!(held_pause(&none).is_none());
+        // A pause on a run switched to phased (an older engine kept it) holds nothing.
+        let mut off = held("pw-off", (true, false, false, false));
+        off.power.as_mut().unwrap().on = false;
+        assert!(held_pause(&off).is_none());
+    }
+
+    /// A stale pause (on a run switched to phased) is cleared and persisted; a held one is not.
+    #[test]
+    fn a_stale_pause_is_dropped_and_a_held_one_is_kept() {
+        let dir = std::env::temp_dir().join(format!("wc-stale-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("s.db").to_str().unwrap())).unwrap();
+        let mut off = held("pw-drop-off", (true, false, false, false));
+        off.power.as_mut().unwrap().on = false;
+        put_node(&mut store, off.to_node()).unwrap();
+        assert!(drop_stale_pause(&mut store, &mut off).unwrap());
+        assert!(off.power.as_ref().unwrap().pause.is_none());
+        assert!(pause_of(&store, "pw-drop-off").is_none());
+        let mut on = held("pw-drop-on", (true, false, false, false));
+        put_node(&mut store, on.to_node()).unwrap();
+        assert!(!drop_stale_pause(&mut store, &mut on).unwrap());
+        assert!(pause_of(&store, "pw-drop-on").is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// No checkpoint clears a held pause (the restart bug's last step: a redriven worker's

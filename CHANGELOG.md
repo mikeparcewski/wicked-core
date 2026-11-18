@@ -44,7 +44,10 @@ Two release tracks share this file, newest entry first regardless of track:
   source of truth for every kind (destructive step, sensitive new dependency, struggle, spread). A held run is never
   redriven, resumed or reassigned past it (a reassign is refused with a conflict until the pause is answered) and is
   not reported as an orphan, so after a restart it stays executing with the same pause card; the attempt the restart
-  interrupted is superseded, so the replayed task's synthetic failure applies as stale. No checkpoint clears a held
+  interrupted is superseded, so the replayed task's synthetic failure applies as stale (except for a run that boot
+  reconciliation moves to `awaiting_human`, which keeps its attempt unfenced: #1585). Only a run in power mode is
+  held: a pause an older engine kept on a run switched to phased mid-turn is cleared on redrive or resume, and that
+  run redrives as before with no pause card. No checkpoint clears a held
   pause (a turn end waits on it), every advance stops at one (a team transport gate's answer included), a superseded
   attempt's checkpoint is stale (it stops that worker and opens nothing), and a run switched to phased opens no new
   pause. Answering it (`POST /runs/:id/power/pause`), or switching the run to phased,
