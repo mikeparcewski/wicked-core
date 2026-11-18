@@ -38,6 +38,9 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A seat's commit keeps a git name that ends in a Unicode space (core#1565).** The identity read from `git var`
+  trimmed every trailing Unicode space, so `Operator` followed by a no-break space became `Operator`, unlike the
+  operator's own `git commit`. Only the one ASCII space `git var` prints before `<` is removed now.
 - **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
   (core#1552).** npm got every core-ts version, but nothing made a GitHub Release, so the Releases page's Latest
   stayed a hand-made 0.7.29. A new `registry` job waits until npm serves all six packages at the tag's version (the
