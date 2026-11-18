@@ -394,12 +394,12 @@ How much review a change summons is read from **what depends on what it touched*
 |---|---|
 | **C** changed symbols | `signals_from_diff` reads each file's paths from its `---`/`+++` headers (git-unquoted; `/dev/null` = new or deleted) and from `rename from`/`rename to` for hunk-less renames — the `diff --git` line only delimits files — and keeps, per non-docs file, the base-side lines each hunk touches (removed lines, and both neighbours of an insertion). A graph node whose span contains a touched line is in C; when none does (a pure rename/move, a mode change, lines outside every symbol) the file's node is the changed symbol, so its importers count. Only a touched file the graph does not know (a new file) counts as one changed symbol nothing reaches. |
 | **R** dependents | `store.traverse(c, TraversalSpec::blast_radius(3))` per seed: callers, importers, and injected-edge consumers (`EdgeKind::Other`) within 3 hops, union over C, minus C. |
-| **span** | distinct products the change spans, where a product is a **repository** (never a crate or package inside one). The graph read is the run repository's own, so a run's change is one product today; the +10 per product row applies to a reading across repositories |
+| **span** | distinct products (`crates/<x>`, `packages/<x>`, else the root) C and R land in |
 | **contract change** | a touched path matches `contract_path_markers` (`api-types`, `/event.rs`, `schema`, `/mcp`, `.d.ts`, …) or a changed **type** matches `contract_symbol_markers` (`event`, `schema`, `tool`, `api`, `request`, `response`, `dto`, `payload`) |
 | **G** test gap | the share of C that no test symbol (test path, or `test`-prefixed name) reaches within 3 hops |
 | **destructive**, **critical** | the diff-only line and path markers. Destructive stays diff-only so it works with no graph. |
 
-**Deterministic score 0–100:** reach 0 with no changed symbols; else 20 for 0–5 dependents (a behavioural change nothing depends on yet still gets one monitor), 40 for 6–20, 60 for 21–100, 80 above; +10 per product (repository) beyond the first (max +20); +20 contract change; +20 × G only when R is non-empty; +20 critical; destructive ⇒ `max(score, 70)`; cap 100. Docs-only scores 0 (no symbols). Every contribution is a line in `Assessment.reasons`.
+**Deterministic score 0–100:** reach 0 with no changed symbols; else 20 for 0–5 dependents (a behavioural change nothing depends on yet still gets one monitor), 40 for 6–20, 60 for 21–100, 80 above; +10 per product beyond the first (max +20); +20 contract change; +20 × G only when R is non-empty; +20 critical; destructive ⇒ `max(score, 70)`; cap 100. Docs-only scores 0 (no symbols). Every contribution is a line in `Assessment.reasons`.
 
 **Bands → plan:** 0–19 → 0 monitors / none / no post-hoc; 20–39 → 1 / standard / no; 40–69 → 2 / deep / post-hoc; 70–100 → 3 / deep / post-hoc **on a different CLI than the worker** (`post_hoc_other_cli`).
 

@@ -178,7 +178,7 @@ pub(super) fn on_checkpoint(
         files: u32::try_from(report.paths.len()).unwrap_or(u32::MAX),
         lines: report.lines,
         dependents: signals_in.as_ref().map(|s| s.dependents),
-        spread: signals_in.as_ref().map_or(0, |s| s.products),
+        spread: signals_in.as_ref().map_or(0, |s| s.repositories),
         new_dependencies: report.new_dependencies,
         sensitive: sensitive.clone(),
         struggle,
@@ -233,9 +233,9 @@ pub(super) fn on_checkpoint(
             }
         }
     }
-    // Sudden complexity pauses only at a turn end (the worker can wait there). The jump is read
-    // against the rigor the TURN started at, so a mid-turn checkpoint's raise never hides it; a
-    // trigger the operator already answered is never raised again by the cumulative diff.
+    // Sudden complexity pauses only at a turn end (the worker can wait there); a trigger the
+    // operator already answered is never raised again by the cumulative diff. Rigor growth is not
+    // a trigger: `to` above is the raise, and the run goes on at it.
     let turn_end = matches!(report.trigger.as_str(), "turn" | "pre_handoff");
     let destructive_new = destructive
         && !power.plan.as_ref().is_some_and(|p| {
@@ -243,12 +243,9 @@ pub(super) fn on_checkpoint(
                 .iter()
                 .any(|f| f.by == "policy" && f.rigor == Rigor::Highest)
         });
-    let turn_from = power.turn_start_rigor.unwrap_or(current).min(current);
     let spread_grew = crate::power::spread_grew(power, signals.spread);
     let pause_reasons: Vec<(&'static str, String)> = if turn_end && power.pause.is_none() {
         crate::power::sudden_complexity(
-            turn_from,
-            to,
             destructive_new,
             spread_grew,
             report.new_dependencies > 0 && !sensitive.is_empty(),
@@ -292,12 +289,9 @@ pub(super) fn on_checkpoint(
     row.turn = Some(report.turn);
     row.paused = pause.is_some();
     power.rigor = Some(to);
-    if turn_end {
-        power.turn_start_rigor = Some(to);
-    }
     if pause.is_some() {
         // Answering this pause acknowledges its triggers — except spread, whose baseline moves to
-        // the spread the operator now accepts, so a further product pauses again.
+        // the spread the operator now accepts, so a further repository pauses again.
         if pause_keys.iter().any(|k| k == "spread") {
             power.baseline_spread = Some(signals_spread);
         }

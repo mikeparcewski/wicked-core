@@ -47,6 +47,18 @@ Two release tracks share this file, newest entry first regardless of track:
   The fold, the events and the gate prompts read only that copy. The redactor is the same one the wire uses, so a
   `-u` / `-p` value is cut in the stored command too (`git push -u ***`, `mkdir -p ***`; the boundary reason still
   names the resolved path).
+- **A power run no longer pauses because its change spans crates of one repository (core#1572).** The power
+  checkpoint read the review-scale `products` signal (each `crates/<x>` / `packages/<x>`, else the root) as its
+  spread, so a one-issue fix across crates rescored higher and paused at `pre_handoff` with "the change spread into
+  another product" (rig runs 97ee72d4 and 40f41c9c). Two concerns now have two numbers. Rigor keeps `products`
+  exactly as before: review depth, QE and phase minimums still escalate for a cross-crate change. The spread is
+  `repositories` (one for a run's own repository), so only a change that adds a repository pauses. Rigor growth inside
+  the repository, even two bands at once, no longer pauses at all: the checkpoint raises rigor, the plan gains the
+  phases the band requires, and the run goes on unattended (the escalation is its `rigorRescored` row). The intake no
+  longer seeds the spread baseline from `products`, and the turn-start rigor the two-band check read is gone.
+  The checkpoint also skips untracked scratch, as delivery does: an untracked file under `tmp/`, `.cache/`,
+  `test-results/` and the other delivery scratch and tool-output directories, at any depth, is not part of the change
+  it scores (core#1573; run 40f41c9c's extra "product" was a CLI's task output under `tmp/`).
 - **A chat or run bound to a project graph can read it (crew#1497).** The grant recognised only the repo-graph
   shape. `<state home>/project-graphs/<id>/code-graph.db` is the store the engine vouches for and hands over as
   `WICKED_ESTATE_DB`, but it got no read root and no seat-container mount. The seat got no answers from it, and
@@ -55,12 +67,6 @@ Two release tracks share this file, newest entry first regardless of track:
   write root, so a seat can change nothing there (no link swap, no forged crew manifest, no planted temp file).
   Reading it needs wicked-estate 0.35.7, whose `--readonly` server opens the graph read-only, and crew leaving the
   graph in DELETE journal mode. The repo-graph grant is unchanged.
-- **A fix across several crates of one repository no longer pauses a power run as "the change spread into another
-  product".** The review-scale span signal counted each `crates/<x>` and `packages/<x>` as a product, so a one-issue
-  bug fix in a Rust workspace or monorepo read as a three-product spread, rescored high to highest and paused at
-  `pre_handoff` for the operator (rig run 97ee72d4, wicked-estate). A product is now a repository: the graph the score
-  reads is the run repository's own, so a change in it spans one product and earns no span points. A reading across
-  two repositories still scores and pauses as before.
 - **A seat's commit keeps a git name that ends in a Unicode space (core#1565).** The identity read from `git var`
   trimmed every trailing Unicode space, so `Operator` followed by a no-break space became `Operator`, unlike the
   operator's own `git commit`. Only the one ASCII space `git var` prints before `<` is removed now.

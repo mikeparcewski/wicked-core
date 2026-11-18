@@ -16,8 +16,8 @@
 //!    commit the diff's old side is taken from? Anything else is [`GraphAge::Stale`] or
 //!    [`GraphAge::Missing`], and [`assess`] applies this itself.
 //! 3. [`impact_signals`] (graph reads): C = the changed symbols, R = their dependents within
-//!    `hops` (callers, importers, injected-edge consumers), the products (repositories) the change
-//!    spans, whether a published surface changed, and the test gap.
+//!    `hops` (callers, importers, injected-edge consumers), the products R lands in, whether a
+//!    published surface changed, and the test gap.
 //! 4. [`impact_score`] (pure): a deterministic 0-100 from the table.
 //! 5. An optional [`ModelAssessment`] hook may ADD 0, 10 or 20 with a recorded rationale. It can
 //!    never subtract, and it is consulted only once the deterministic score is at least
@@ -129,10 +129,13 @@ pub(crate) struct ImpactSignals {
     pub changed_symbols: u32,
     /// |R|: distinct dependents of C within [`Thresholds::hops`], outside C.
     pub dependents: u32,
-    /// Products the change spans. A product is a repository, never a crate or package inside one.
-    /// The graph read is the run repository's own (`code_graph::existing_code_graph`), so every
-    /// touched path and every dependent is in that one repository: 1 for a behavioural change.
+    /// Products (`crates/<x>`, `packages/<x>`, else the root) that C and R land in: a RIGOR signal
+    /// (review depth, QE, phase minimums), so a cross-crate change is reviewed as one (#600).
     pub products: u32,
+    /// Repositories the change spans: the power checkpoint's spread, never `products`. The graph
+    /// read is the run repository's own (`code_graph::existing_code_graph`), so a behavioural
+    /// change is in exactly one.
+    pub repositories: u32,
     /// The diff touches a published surface (a path or a wire-type symbol marker).
     pub contract_change: bool,
     /// G: the share of the INDEXED part of C that no test symbol reaches, 0..=1. An unindexed
@@ -238,7 +241,7 @@ pub(crate) struct Thresholds {
     /// `(min dependents, reach points)`, ascending. The first tier starts at 0: a behavioural
     /// change nothing depends on yet (a new leaf file) is still a change, and gets one monitor.
     pub reach_tiers: &'static [(u32, u32)],
-    /// Points per product (repository) beyond the first, and the most such steps that count.
+    /// Points per product beyond the first, and the most such steps that count.
     pub product_step: u32,
     pub product_max_steps: u32,
     pub contract_points: u32,
@@ -608,9 +611,11 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
     }
     let mut seeds: Vec<SymbolId> = Vec::new();
     let mut seed_ids: BTreeSet<&str> = BTreeSet::new();
+    let mut products: BTreeSet<String> = BTreeSet::new();
     // Touched files with no indexed symbol: each is one changed symbol nothing reaches.
     let mut unindexed = 0u32;
     for f in &diff.touched {
+        products.insert(product(&f.path));
         s.contract_change |= has_marker(&f.path, t.contract_path_markers)
             || has_marker(&f.old_path, t.contract_path_markers);
         let in_file: &[&Node] = by_file
@@ -667,13 +672,14 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
                 continue;
             }
             tested |= is_test_symbol(n);
+            products.insert(product(&n.location.file));
             reached.insert(n.symbol.0.clone());
         }
         untested += u32::from(!tested);
     }
     s.dependents = reached.len() as u32;
-    // One repository's graph: the change spans its one product (crates in it are not products).
-    s.products = u32::from(!diff.touched.is_empty());
+    s.products = products.len() as u32;
+    s.repositories = u32::from(!diff.touched.is_empty());
     s.test_gap = if seeds.is_empty() {
         0.0
     } else {
@@ -1723,6 +1729,15 @@ fn classify(path: &str) -> Kind {
         Kind::Config
     } else {
         Kind::Code
+    }
+}
+
+/// `crates/<name>` and `packages/<name>` are products; everything else is the root product.
+fn product(path: &str) -> String {
+    let c: Vec<&str> = path.split('/').collect();
+    match c.as_slice() {
+        [root @ ("crates" | "packages"), name, _, ..] => format!("{root}/{name}"),
+        _ => ".".to_string(),
     }
 }
 
