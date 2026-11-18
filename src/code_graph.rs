@@ -516,7 +516,8 @@ fn project_graph_root_from(
 ///     key dir directly under the root — never nested, never the root itself);
 ///   - NO link anywhere on the grant: the `project-graphs` root, the key dir and the db must each be
 ///     real (lstat) — a symlinked project id could point a unit at another project's graph, or at
-///     any directory, and the grant is read AND write;
+///     any directory (the grant is READ only since crew#1497, and it still must not land on
+///     another project's graph);
 ///   - the root resolved through its ancestors (the state home may be reached through a link the
 ///     operator configured, `/var` → `/private/var`) must still hold the key dir directly, so the
 ///     grant can never land outside THIS state home's `project-graphs`.

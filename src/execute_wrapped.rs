@@ -4141,23 +4141,16 @@ impl WrappedCliStepRunner {
                     self.operational_home.as_deref(),
                     handed.map(|s| s.root.as_path()),
                 );
-                let read_roots: Vec<PathBuf> = input
-                    .governance
-                    .iter()
-                    .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
-                    .chain(handed.map(|s| s.root.clone()))
-                    .chain(
-                        gov_env
-                            .iter()
-                            .flat_map(|g| g.read_roots(self.operational_home.as_deref())),
-                    )
-                    .chain(
-                        input
-                            .governance
-                            .iter()
-                            .flat_map(|g| promoted_write_roots(&g.extra_write_roots, &homes)),
-                    )
-                    .collect();
+                let read_roots = seat_read_roots(
+                    input.governance.as_ref(),
+                    handed.map(|s| s.root.clone()),
+                    gov_env
+                        .iter()
+                        .flat_map(|g| g.read_roots(self.operational_home.as_deref()))
+                        .collect(),
+                    &homes,
+                    self.operational_home.as_deref(),
+                );
                 // A claude unit's gate hook runs on the host, reached through the gateway's hook
                 // route; without the relay (or a gateway to route it) its tool calls would run
                 // unjudged. An offline seat has no gateway at all (agy gw-r1 F-02): refused up
@@ -6048,6 +6041,43 @@ impl GovLaunch {
         }
         roots
     }
+}
+
+/// What a container seat may read beyond its tree, for EVERY seat kind: the launch's read roots,
+/// its skills delivery, a governed claude unit's gate-hook roots (`gov_roots`, empty for any other
+/// CLI), the run's declared write roots promoted to reads and the graph directory the unit's
+/// `code_graph_db` names ([`repo_read_root`]: a repo graph's key dir or the bound project's graph
+/// dir). core#1571: the graph directory used to arrive only through `gov_roots`, which is claude-only,
+/// so a codex or pi container seat got no project-graph mount at all. Duplicates are harmless (the
+/// mount builder skips a covered path) but dropped here so the list reads as the set it is.
+pub(crate) fn seat_read_roots(
+    governance: Option<&crate::workflow::GovernanceContext>,
+    handed_root: Option<PathBuf>,
+    gov_roots: Vec<PathBuf>,
+    homes: &[PathBuf],
+    operational_home: Option<&Path>,
+) -> Vec<PathBuf> {
+    let graph_dir = governance
+        .and_then(|g| repo_read_root(g.code_graph_db.as_deref(), operational_home))
+        .map(PathBuf::from);
+    let mut out: Vec<PathBuf> = Vec::new();
+    for r in governance
+        .iter()
+        .flat_map(|g| g.extra_read_roots.iter().map(PathBuf::from))
+        .chain(handed_root)
+        .chain(gov_roots)
+        .chain(
+            governance
+                .iter()
+                .flat_map(|g| promoted_write_roots(&g.extra_write_roots, homes)),
+        )
+        .chain(graph_dir)
+    {
+        if !out.contains(&r) {
+            out.push(r);
+        }
+    }
+    out
 }
 
 /// The run's declared write roots as READ roots of every unit, each pinned
@@ -9163,6 +9193,49 @@ mod tests {
 
     /// crew#1497 (KEY) — every other shape under (or near) `project-graphs` grants nothing: the
     /// launcher mints this path, so the recogniser is strict.
+    /// core#1571 (KEY) — every container seat kind gets the bound project's graph directory as a
+    /// read mount, not only a claude one. A codex or pi unit has no gate-hook env (`gov_roots`
+    /// empty); before, that left it with no project-graph mount, so its chat could not read the
+    /// graph. Fails on main: the directory came only through the claude-only `GovLaunch`.
+    #[test]
+    fn every_seat_kind_gets_the_project_graph_dir_as_a_read_root() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let (base, sh) = project_graph_home("allseats", &["proj-a", "proj-b"]);
+        let dir_a = sh.join("project-graphs").join("proj-a");
+        let gov = crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: "/abs/estate.db".to_string(),
+            code_graph_db: Some(dir_a.join("code-graph.db").to_string_lossy().into_owned()),
+            extra_write_roots: Vec::new(),
+            extra_read_roots: vec!["/abs/extra".to_string()],
+            project_id: Some("proj-a".to_string()),
+            repo_id: None,
+            apps: None,
+        };
+        // A non-claude seat: no gate-hook roots.
+        let codex = seat_read_roots(Some(&gov), None, Vec::new(), &[], Some(&sh));
+        assert!(codex.contains(&dir_a), "{codex:?}");
+        assert!(
+            !codex
+                .iter()
+                .any(|r| r.ends_with("proj-b") || *r == sh.join("project-graphs")),
+            "never a sibling project or the root: {codex:?}"
+        );
+        assert!(codex.contains(&PathBuf::from("/abs/extra")));
+        // A claude seat whose gate-hook roots already carry the directory: listed once.
+        let claude = seat_read_roots(Some(&gov), None, vec![dir_a.clone()], &[], Some(&sh));
+        assert_eq!(
+            claude.iter().filter(|r| **r == dir_a).count(),
+            1,
+            "{claude:?}"
+        );
+        // No governance, no graph: nothing.
+        assert!(seat_read_roots(None, None, Vec::new(), &[], Some(&sh)).is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_misshaped_project_graph_path_grants_nothing() {
         let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
