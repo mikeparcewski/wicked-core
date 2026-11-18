@@ -465,6 +465,76 @@ fn impact_score_table() {
     }
 }
 
+/// (rig runs 97ee72d4, 40f41c9c) Two concerns, two numbers. Crates of one repository are RIGOR:
+/// a three-crate change keeps its span points, so its score stays above the QE waiver and QE stays
+/// required (#600). They are not a SPREAD: the change is in one repository, so the power
+/// checkpoint raises rigor and does not pause.
+#[test]
+fn a_cross_crate_change_in_one_repository_raises_rigor_but_is_not_a_spread() {
+    let store = graph(
+        &[
+            node(
+                "guard",
+                NodeKind::Function,
+                "crates/extract/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "index",
+                NodeKind::Function,
+                "crates/cli/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "link",
+                NodeKind::Function,
+                "crates/cli/src/link.rs",
+                (10, 20),
+            ),
+            node(
+                "serve",
+                NodeKind::Function,
+                "crates/serve/src/main.rs",
+                (10, 20),
+            ),
+        ],
+        &[],
+    );
+    let hunk = "@@ -12,1 +12,1 @@\n-    old();\n+    new();\n";
+    let diff = signals_from_diff(&format!(
+        "{}{}{}{}",
+        file_diff("crates/extract/src/lib.rs", hunk),
+        file_diff("crates/cli/src/lib.rs", hunk),
+        file_diff("crates/cli/src/link.rs", hunk),
+        file_diff("crates/serve/src/main.rs", hunk),
+    ));
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(
+        (s.changed_symbols, s.products, s.repositories),
+        (4, 3, 1),
+        "{s:?}"
+    );
+    assert!(
+        a.reasons.iter().any(|r| r == "span +20: 3 products"),
+        "{:?}",
+        a.reasons
+    );
+    assert_eq!(
+        a.score, 50,
+        "reach 20 + span 20 + complexity 10: {:?}",
+        a.reasons
+    );
+    assert!(
+        a.score > THRESHOLDS.qe_waiver_max_score,
+        "QE stays required"
+    );
+    let fresh = crate::power::PowerState::launched(true, 0);
+    let spread = crate::power::spread_grew(&fresh, s.repositories);
+    assert!(!spread, "one repository is no spread");
+    assert!(crate::power::sudden_complexity(false, spread, false, &[]).is_empty());
+}
+
 /// core#692: the reach reason names WHY a traversal is incomplete. A hop horizon is not a node
 /// cap: within the horizon the count is exact, so it must not read "(capped)".
 #[test]

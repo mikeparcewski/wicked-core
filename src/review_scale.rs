@@ -129,8 +129,13 @@ pub(crate) struct ImpactSignals {
     pub changed_symbols: u32,
     /// |R|: distinct dependents of C within [`Thresholds::hops`], outside C.
     pub dependents: u32,
-    /// Products (`crates/<x>`, `packages/<x>`, else the root) that C and R land in.
+    /// Products (`crates/<x>`, `packages/<x>`, else the root) that C and R land in: a RIGOR signal
+    /// (review depth, QE, phase minimums), so a cross-crate change is reviewed as one (#600).
     pub products: u32,
+    /// Repositories the change spans: the power checkpoint's spread, never `products`. The graph
+    /// read is the run repository's own (`code_graph::existing_code_graph`), so a behavioural
+    /// change is in exactly one.
+    pub repositories: u32,
     /// The diff touches a published surface (a path or a wire-type symbol marker).
     pub contract_change: bool,
     /// G: the share of the INDEXED part of C that no test symbol reaches, 0..=1. An unindexed
@@ -674,6 +679,7 @@ pub(crate) fn impact_signals<S: GraphRead + ?Sized>(
     }
     s.dependents = reached.len() as u32;
     s.products = products.len() as u32;
+    s.repositories = u32::from(!diff.touched.is_empty());
     s.test_gap = if seeds.is_empty() {
         0.0
     } else {

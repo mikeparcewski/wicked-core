@@ -3170,18 +3170,8 @@ pub(super) fn apply_scope(
                     stay_phased: Vec::new(),
                 });
             }
-            // The intake's own scope spread (products) is the baseline a later spread is read against.
-            power.baseline_spread = decided
-                .events
-                .iter()
-                .filter(|e| e.event_type() == crate::team::events::PATH_SCORED)
-                .filter_map(|e| e.to_payload().ok())
-                .find_map(|p| {
-                    p.get("signals")
-                        .and_then(|s| s.get("products"))
-                        .and_then(|n| n.as_u64())
-                        .and_then(|n| u32::try_from(n).ok())
-                });
+            // No spread baseline from the intake: its `products` are crates (a rigor signal), and
+            // the run's change is in its one repository, which is the unset baseline.
             power.rigor = Some(plan.rigor);
             let row = crate::power::change(
                 "intake",

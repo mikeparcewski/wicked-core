@@ -229,6 +229,8 @@ pub struct RigorSignals {
     pub files: u32,
     pub lines: u32,
     pub dependents: Option<u32>,
+    /// Repositories the change spans (`ImpactSignals::repositories`). Crates and packages inside
+    /// one repository raise rigor, never the spread.
     pub spread: u32,
     pub new_dependencies: u32,
     pub sensitive: Vec<String>,
@@ -376,11 +378,7 @@ pub struct PowerState {
     /// planned anything; [`PowerState::floor`] reads them with the intake plan's.
     #[serde(default)]
     pub floors: Vec<RigorFloor>,
-    /// The rigor when the current turn started: a turn end compares against it, so a mid-turn
-    /// checkpoint's raise never hides a two-band jump. Engine-internal.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub turn_start_rigor: Option<Rigor>,
-    /// Pause triggers the operator already answered (`jump`, `destructive`, `spread`,
+    /// Pause triggers the operator already answered (`destructive`, `spread`,
     /// `sensitive_dependency`, `struggle`): the cumulative diff never re-raises them. Engine-internal.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acknowledged: Vec<String>,
@@ -388,9 +386,9 @@ pub struct PowerState {
     /// Engine-internal.
     #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub turn_ms: u64,
-    /// How many products (top-level areas) the change spanned when rigor was first measured — the
-    /// intake's own scope, else the first checkpoint's diff. "Spread into another product" means
-    /// more than this, never a scope the intake already planned. Engine-internal.
+    /// How many repositories the operator has accepted the change spanning: unset is the run's
+    /// own one; answering a spread pause moves it to the spread accepted. "Spread into another
+    /// product" means more repositories than this. Engine-internal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub baseline_spread: Option<u32>,
     /// When the build started (unix millis), for elapsed-against-estimate. Engine-internal.
@@ -442,7 +440,6 @@ impl PowerState {
             pause: None,
             outcome: None,
             floors: Vec::new(),
-            turn_start_rigor: None,
             acknowledged: Vec::new(),
             turn_ms: 0,
             baseline_spread: None,
@@ -503,10 +500,10 @@ pub fn orchestrator_minutes(state: &PowerState, now: i64) -> u32 {
     u32::try_from((state.turn_ms + running) / 60_000).unwrap_or(u32::MAX)
 }
 
-/// Whether the change spread past the products it was planned (or last accepted) to span: at
-/// least two products and more than the baseline — the intake's own product count, or one when
-/// intake gave none (a zero reading counts as one). Answering a spread pause moves the baseline to
-/// the spread the operator accepted, so further growth pauses again.
+/// Whether the change spread past the repositories it was planned (or last accepted) to span: at
+/// least two repositories and more than the baseline (one when unset; a zero reading counts as
+/// one). Answering a spread pause moves the baseline to the spread the operator accepted, so
+/// further growth pauses again. Crates or packages inside one repository are never a spread.
 pub fn spread_grew(state: &PowerState, spread: u32) -> bool {
     let base = state.baseline_spread.unwrap_or(1).max(1);
     spread >= 2 && spread > base
@@ -520,7 +517,6 @@ pub fn turn_started(state: &mut PowerState, turn: u32, attempt: u32, cli: &str, 
         open.outcome = Some("interrupted".into());
     }
     state.orchestrator.turns = state.orchestrator.turns.max(turn);
-    state.turn_start_rigor = state.rigor;
     state.turn_log.push(PowerTurnRecord {
         turn,
         attempt,
@@ -1415,26 +1411,19 @@ pub fn struggle_score(s: &Struggle) -> (u8, Vec<String>) {
     (u8::try_from(score.min(100)).unwrap_or(100), reasons)
 }
 
-/// "Suddenly complex" (DES §5.4): the reasons to pause, empty when none holds.
+/// "Suddenly complex" (DES §5.4): the reasons to pause, empty when none holds. Rigor growth inside
+/// the run's repository is NOT one: the checkpoint raises rigor and the plan gains the phases the
+/// new band requires (the escalation is a `rigorRescored` row, not a power pause). A rise INTO
+/// the high-risk band is still the plan gate's to approve (`plan_gate::approval`,
+/// `IntoHighRisk`), not this pause. Only a spread into another repository, a destructive change,
+/// a sensitive new dependency or struggle pauses here.
 pub fn sudden_complexity(
-    from: Rigor,
-    to: Rigor,
     destructive_new: bool,
     spread_new: bool,
     sensitive_new_dependency: bool,
     struggle_reasons: &[String],
 ) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
-    if to.rank() - from.rank() >= 2 {
-        out.push((
-            "jump",
-            format!(
-                "rigor jumped two bands at once ({} -> {})",
-                from.as_str(),
-                to.as_str()
-            ),
-        ));
-    }
     if destructive_new {
         out.push(("destructive", "a destructive change appeared".into()));
     }
@@ -1816,8 +1805,36 @@ fn git(wd: &std::path::Path, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// Directories whose UNTRACKED files are never a run's product, at any depth: a seat's or tool's
+/// scratch (core#1573: a CLI's task output under `tmp/`). The same names as delivery's own
+/// classifier (crew `packages/crew/src/core/deliver-exclusions.ts`: `SCRATCH_DIRS` then
+/// `TOOL_ARTIFACT_DIRS`), so the checkpoint scores what delivery would ship.
+pub const UNTRACKED_SCRATCH_DIRS: [&str; 12] = [
+    "tmp",
+    ".tmp",
+    "scratch",
+    ".cache",
+    "coverage",
+    ".vitest",
+    "playwright-report",
+    "test-results",
+    "node_modules",
+    ".nyc_output",
+    "__pycache__",
+    ".pytest_cache",
+];
+
+/// An untracked path under one of [`UNTRACKED_SCRATCH_DIRS`] (any directory component).
+fn untracked_scratch(path: &str) -> bool {
+    let dirs: Vec<&str> = path.split('/').collect();
+    dirs[..dirs.len().saturating_sub(1)]
+        .iter()
+        .any(|d| UNTRACKED_SCRATCH_DIRS.contains(d))
+}
+
 /// Measure the build's diff since `start` (the HEAD its first turn started from): committed and
-/// uncommitted changes, new untracked files, reverts among the build's commits.
+/// uncommitted changes, new untracked files (not scratch: [`UNTRACKED_SCRATCH_DIRS`]), reverts
+/// among the build's commits.
 pub fn measure(
     wd: &std::path::Path,
     start: Option<&str>,
@@ -1843,8 +1860,13 @@ pub fn measure(
             }
         }
     }
-    if let Some(untracked) = git(wd, &["ls-files", "--others", "--exclude-standard"]) {
-        for p in untracked.lines().filter(|p| !p.is_empty()) {
+    // `-z`: raw NUL-delimited names, so a quoted one (`"tmp/\303\251.output"` under the default
+    // `core.quotePath`) is read as its real path and the scratch check sees `tmp`.
+    if let Some(untracked) = git(wd, &["ls-files", "-z", "--others", "--exclude-standard"]) {
+        for p in untracked
+            .split('\0')
+            .filter(|p| !p.is_empty() && !untracked_scratch(p))
+        {
             if !paths.iter().any(|x| x == p) {
                 paths.push(p.to_string());
             }
@@ -2783,7 +2805,44 @@ mod tests {
         run(&["revert", "--no-edit", "HEAD"]);
         std::fs::write(wd.join("a.rs"), "fn a() { c() }\n").unwrap();
         std::fs::write(wd.join("Cargo.toml"), "[package]\n").unwrap();
+        // (core#1573, rig run 40f41c9c) A CLI's untracked task output under `tmp/` is scratch,
+        // at any depth, and so is a tool's output dir; a file merely NAMED like one is not.
+        let task = wd.join("tmp/claude-1000/slug/sess/tasks");
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::write(task.join("b1.output"), "x\n").unwrap();
+        std::fs::create_dir_all(wd.join("crates/x/test-results")).unwrap();
+        std::fs::write(wd.join("crates/x/test-results/r.json"), "{}\n").unwrap();
+        std::fs::write(wd.join("tmp.rs"), "fn t() {}\n").unwrap();
+        // Names git quotes (non-ASCII, a double quote) are scratch too, and a quoted non-scratch
+        // name is read as its real path.
+        std::fs::write(wd.join("tmp/\u{e9}.output"), "x\n").unwrap();
+        if cfg!(unix) {
+            // Windows refuses a `"` in a filename; the non-ASCII name covers quoting there.
+            std::fs::create_dir_all(wd.join("scratch")).unwrap();
+            std::fs::write(wd.join("scratch/a\"b.output"), "x\n").unwrap();
+        }
+        std::fs::write(wd.join("caf\u{e9}.rs"), "fn c() {}\n").unwrap();
         let r = measure(wd, Some(&base), "turn", 2, 0, "s");
+        assert!(
+            !r.paths
+                .iter()
+                .any(|p| p.starts_with("tmp/") || p.contains("test-results")),
+            "untracked scratch is not the change: {:?}",
+            r.paths
+        );
+        assert!(
+            !r.paths
+                .iter()
+                .any(|p| p.contains("scratch") || p.contains(".output")),
+            "{:?}",
+            r.paths
+        );
+        assert!(r.paths.contains(&"tmp.rs".to_string()), "{:?}", r.paths);
+        assert!(
+            r.paths.contains(&"caf\u{e9}.rs".to_string()),
+            "{:?}",
+            r.paths
+        );
         assert_eq!(r.trigger, "turn");
         assert_eq!(r.turn, 2);
         assert!(r.paths.contains(&"a.rs".to_string()), "{:?}", r.paths);
@@ -3017,14 +3076,17 @@ mod tests {
     #[test]
     fn spread_means_past_the_first_measured_scope() {
         let mut st = PowerState::launched(true, 0);
-        // An intake scope over two products (crew and its api-types) is the baseline, not growth.
+        // An accepted spread over two repositories is the baseline, not growth.
         st.baseline_spread = Some(2);
         assert!(!spread_grew(&st, 2));
-        assert!(spread_grew(&st, 3), "a third product is growth");
-        // No intake reading: a single product never pauses; a second one does.
+        assert!(spread_grew(&st, 3), "a third repository is growth");
+        // Unset: the run's one repository never pauses; a second one does, as a spread. (No
+        // production producer reads two repositories yet: a run's diff is one worktree.)
         let fresh = PowerState::launched(true, 0);
         assert!(!spread_grew(&fresh, 1));
         assert!(spread_grew(&fresh, 2));
+        let why = sudden_complexity(false, spread_grew(&fresh, 2), false, &[]);
+        assert_eq!(why.iter().map(|(k, _)| *k).collect::<Vec<_>>(), ["spread"]);
         // A zero reading is no baseline below one product.
         let mut zero = PowerState::launched(true, 0);
         zero.baseline_spread = Some(0);
@@ -3076,26 +3138,15 @@ mod tests {
     }
 
     #[test]
-    fn a_two_band_jump_or_struggle_is_sudden_complexity() {
-        assert!(
-            sudden_complexity(Rigor::Light, Rigor::Standard, false, false, false, &[]).is_empty()
-        );
+    fn rigor_growth_alone_is_not_sudden_complexity() {
+        // (rig runs 97ee72d4, 40f41c9c) A change across crates of one repository raises rigor, even
+        // two bands, and goes on unattended: nothing here is a reason to pause.
+        let one_repo = spread_grew(&PowerState::launched(true, 0), 1);
+        assert!(sudden_complexity(false, one_repo, false, &[]).is_empty());
         assert_eq!(
-            sudden_complexity(Rigor::Light, Rigor::High, false, false, false, &[]).len(),
-            1
-        );
-        assert_eq!(
-            sudden_complexity(
-                Rigor::High,
-                Rigor::High,
-                true,
-                true,
-                true,
-                &["3 failed test runs".into()]
-            )
-            .len(),
+            sudden_complexity(true, true, true, &["3 failed test runs".into()]).len(),
             4,
-            "jump excluded; destructive, spread, dependency, struggle"
+            "destructive, spread, dependency, struggle"
         );
     }
 
