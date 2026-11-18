@@ -848,8 +848,8 @@ fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
 /// judged as an assignment. A secret-named word right after a valued flag, followed by another
 /// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
 /// aws_secret_access_key …`), so the next word is the key.
-fn redact_config_pairs(cmd: &str) -> String {
-    let (head, word, secret_word) = config_rules();
+fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
+    let (_, word, secret_word) = config_rules();
     let flag = |w: &str| w.starts_with('-');
     let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
     let mut cut: Vec<(usize, usize)> = Vec::new();
@@ -889,9 +889,37 @@ fn redact_config_pairs(cmd: &str) -> String {
         }
         from = pos;
     }
+    cut
+}
+
+/// (core#1580) The same command head with VALUED global flags allowed before the subcommand
+/// (`npm --userconfig ci.npmrc config set …`, `aws --profile p configure set …`). It is ADDED to
+/// main's head (`config_rules().0`, unchanged), never substituted for it: both heads cut, and
+/// the cuts are merged, so everything main masks stays masked. A flag takes one value word that
+/// does not start with `-` (quoted fragments whole); it never crosses an unquoted `|`, `;`, `&`
+/// or backtick, nor a newline.
+fn valued_flag_head() -> &'static regex::Regex {
+    static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    R.get_or_init(|| {
+        regex::Regex::new(
+            r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:[ \t]+-[^\s|;&`]+(?:[ \t]+(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`-])(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])*)?)+[ \t]+(?:config(?:ure)?|c)(?:\s|$)"#,
+        )
+        .expect("redaction pattern")
+    })
+}
+
+/// Main's head and the valued-flag head, each cutting, the cuts merged (core#1580).
+fn redact_config_pairs(cmd: &str) -> String {
+    let mut cut = config_cuts(cmd, &config_rules().0);
+    cut.extend(config_cuts(cmd, valued_flag_head()));
+    cut.sort_unstable();
     let mut out = String::with_capacity(cmd.len());
     let mut last = 0;
     for (a, b) in cut {
+        if a < last {
+            last = last.max(b); // both heads cut this word: once is enough
+            continue;
+        }
         out.push_str(&cmd[last..a]);
         out.push_str("***");
         last = b;
@@ -1454,6 +1482,104 @@ mod tests {
         ];
         for (raw, want) in kept {
             assert_eq!(redact(raw), *want, "{raw:?}");
+        }
+    }
+
+    /// core#1580: the two shapes #1579 left, ADDITIVELY. A valued global flag before the config
+    /// subcommand is skipped as well as main's valueless ones; main's matcher and its whole table
+    /// above stay as they were. Every wrapper below (command substitution, a newline, `;` / `&&`,
+    /// a `VAR=` assignment) is checked against what ends the command and what must survive it.
+    #[test]
+    fn a_valued_global_flag_before_the_config_subcommand_does_not_hide_the_secret() {
+        let secret = format!("core1580{}", "Z9".repeat(5));
+        let cut: &[(&str, &str)] = &[
+            (
+                "npm --userconfig ci.npmrc config set //registry/:_authToken {s}",
+                "npm --userconfig ci.npmrc config set //registry/:_authToken ***",
+            ),
+            (
+                "aws --profile p configure set aws_secret_access_key {s}",
+                "aws --profile p configure set aws_secret_access_key ***",
+            ),
+            (
+                "aws --profile \"ci account\" --region eu-west-1 configure set aws_secret_access_key {s}",
+                "aws --profile \"ci account\" --region eu-west-1 configure set aws_secret_access_key ***",
+            ),
+            (
+                "aws --profile=p --no-cli-pager configure set aws_secret_access_key {s}",
+                "aws --profile=p --no-cli-pager configure set aws_secret_access_key ***",
+            ),
+            // Command substitution: as main treats the unflagged form, the `)` rides with the value.
+            (
+                "out=$(aws --profile p configure set aws_secret_access_key {s})",
+                "out=$(aws --profile p configure set aws_secret_access_key ***",
+            ),
+            (
+                "out=$(aws configure set aws_secret_access_key {s})",
+                "out=$(aws configure set aws_secret_access_key ***",
+            ),
+            (
+                "echo `npm --userconfig cfg.npmrc config set //h/:_authToken {s}`",
+                "echo `npm --userconfig cfg.npmrc config set //h/:_authToken ***`",
+            ),
+            // A newline ends the command; the next one is recorded as it was.
+            (
+                "aws --profile p configure set aws_secret_access_key {s}\necho READY",
+                "aws --profile p configure set aws_secret_access_key ***\necho READY",
+            ),
+            // `;`, `&&`, `||`, `|` end it too.
+            (
+                "cd x; npm --userconfig cfg.npmrc config set //h/:_authToken {s}; echo ok",
+                "cd x; npm --userconfig cfg.npmrc config set //h/:_authToken ***; echo ok",
+            ),
+            (
+                "aws --profile p configure set aws_secret_access_key {s} && echo done",
+                "aws --profile p configure set aws_secret_access_key *** && echo done",
+            ),
+            (
+                "true || aws --profile p configure set aws_secret_access_key {s} | cat",
+                "true || aws --profile p configure set aws_secret_access_key *** | cat",
+            ),
+            // Assignments before the tool.
+            (
+                "AWS_PAGER= aws --profile p configure set aws_secret_access_key {s}",
+                "AWS_PAGER= aws --profile p configure set aws_secret_access_key ***",
+            ),
+            (
+                "FOO=1 BAR=2 npm --userconfig cfg.npmrc config set //h/:_authToken {s} --location=user",
+                "FOO=1 BAR=2 npm --userconfig cfg.npmrc config set //h/:_authToken *** --location=user",
+            ),
+            (
+                "sh -c 'aws --profile p configure set aws_secret_access_key {s}'",
+                "sh -c 'aws --profile p configure set aws_secret_access_key ***'",
+            ),
+            // A later pair on the same command, and main's own head, are cut once, not twice.
+            (
+                "npm --userconfig cfg.npmrc config set //one/:_authToken {s} //two/:_authToken {s}",
+                "npm --userconfig cfg.npmrc config set //one/:_authToken *** //two/:_authToken ***",
+            ),
+            (
+                "npm config set //h/:_authToken {s}",
+                "npm config set //h/:_authToken ***",
+            ),
+        ];
+        for (raw, want) in cut {
+            let cmd = raw.replace("{s}", &secret);
+            assert_eq!(redact(&cmd), *want, "{cmd:?}");
+            assert!(!redact(&cmd).contains(&secret), "{cmd:?}");
+        }
+        let kept: &[&str] = &[
+            "npm --userconfig ci.npmrc config set registry https://registry.example.test/",
+            "aws --profile p configure set region eu-west-1",
+            "git -C repo config user.name Example",
+            "git --git-dir x config user.name Example\necho READY",
+            "git config user.name Example\necho READY",
+            "out=$(git -C repo config user.name Example)",
+            "git -C repo log --oneline -n 3",
+            "npm --prefix app install left-pad",
+        ];
+        for raw in kept {
+            assert_eq!(redact(raw), *raw, "{raw:?}");
         }
     }
 
