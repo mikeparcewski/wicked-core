@@ -33,6 +33,18 @@ fn live(session: &AgentSession) -> bool {
     )
 }
 
+/// (core#1581) The checkpoint pause a live run is held at: its persisted `power.pause`. That record
+/// is the pause's one source of truth. The in-process wait ([`crate::power::open_pause`]) only
+/// wakes a worker still waiting on it, and a restart ends that worker, so nothing may dispatch
+/// a held run's unit (the boot redrive, a resume) and no checkpoint may clear it; only the
+/// operator's answer ([`answer_pause`]) or the switch to phased releases it.
+pub(super) fn held_pause(session: &AgentSession) -> Option<&crate::power::PowerPause> {
+    if !live(session) {
+        return None;
+    }
+    session.power.as_ref()?.pause.as_ref()
+}
+
 fn absorbs_design_of(absorbs: &[String]) -> bool {
     absorbs.iter().any(|a| a == "design")
 }
@@ -302,7 +314,12 @@ pub(super) fn on_checkpoint(
     if let Some(p) = power.plan.as_mut() {
         retarget_handoff(&mut p.handoff, to, absorbs_design);
     }
-    power.pause = pause.clone();
+    // (core#1581) A held pause is never cleared here: only the operator's answer releases it.
+    if pause.is_some() {
+        power.pause = pause.clone();
+    }
+    // What the worker waits on at this turn end: the pause opened now, or one already held.
+    let waits_on = if turn_end { power.pause.clone() } else { None };
     if is_final {
         let handoff = power.handoff.get_or_insert_with(|| crate::power::Handoff {
             round: 1,
@@ -341,7 +358,7 @@ pub(super) fn on_checkpoint(
             at: now,
         },
     );
-    if pause.is_some() {
+    if waits_on.is_some() {
         // The worker waits at this turn end for `POST /runs/:id/power/pause`; the run stays
         // executing (no engine gate opens under an in-flight unit) and the pause is on the
         // power record and on this checkpoint's frames.
@@ -351,7 +368,7 @@ pub(super) fn on_checkpoint(
         rigor: Some(to),
         note,
         messages: Vec::new(),
-        pause,
+        pause: waits_on,
         stop: !on,
     })
 }
@@ -403,6 +420,11 @@ pub(super) fn set_power(
         Vec::new()
     };
     power.on = on;
+    if !on {
+        // The switch answers a held checkpoint pause (its waiting worker hears `SwitchPhased`
+        // below), so the persisted pause goes with it (core#1581).
+        power.pause = None;
+    }
     let toggle = crate::power::PowerToggle {
         at: now,
         on,
@@ -1113,5 +1135,116 @@ mod qe_binding_tests {
         // An inconclusive record keeps the operator's gate (unchanged): not a binding miss.
         let inc = qe_unit(r::OUTCOME_INCONCLUSIVE, Some("FAIL"));
         assert!(!qe_binding_miss(&inc));
+    }
+}
+
+/// (core#1581) The persisted `power.pause` is the pause's one source of truth.
+#[cfg(test)]
+mod held_pause_tests {
+    use super::*;
+    use wicked_apps_core::open_store;
+
+    fn held(id: &str, kinds: (bool, bool, bool, bool)) -> AgentSession {
+        let mut s = crate::actor::sessions_detail_fold_tests::session(id);
+        s.status = SessionStatus::Executing;
+        let mut p = crate::power::PowerState::launched(true, 0);
+        let struggle = if kinds.3 {
+            vec!["3 failed runs".to_string()]
+        } else {
+            Vec::new()
+        };
+        let reasons = crate::power::sudden_complexity(kinds.0, kinds.1, kinds.2, &struggle);
+        p.pause = Some(crate::power::PowerPause {
+            at: 1,
+            checkpoint: 2,
+            reasons: reasons.into_iter().map(|(_, r)| r).collect(),
+            recommended: "continue_high".into(),
+        });
+        s.power = Some(p);
+        s
+    }
+
+    fn report(trigger: &str) -> crate::power::CheckpointReport {
+        crate::power::CheckpointReport {
+            trigger: trigger.into(),
+            turn: 2,
+            head: None,
+            tree: None,
+            paths: Vec::new(),
+            lines: 0,
+            new_dependencies: 0,
+            reverts: 0,
+            failed_runs: 0,
+            summary: String::new(),
+        }
+    }
+
+    fn pause_of(store: &dyn GraphStore, id: &str) -> Option<crate::power::PowerPause> {
+        crate::domain::get_session(store, id)
+            .unwrap()
+            .unwrap()
+            .power
+            .unwrap()
+            .pause
+    }
+
+    /// Every pause kind holds a live run; an ended run holds nothing.
+    #[test]
+    fn every_pause_kind_holds_a_live_run() {
+        for kinds in [
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+            (false, false, false, true),
+        ] {
+            let s = held("pw-kind", kinds);
+            assert!(held_pause(&s).is_some(), "{kinds:?}");
+            let mut ended = s.clone();
+            ended.status = SessionStatus::Cancelled;
+            assert!(held_pause(&ended).is_none(), "{kinds:?}");
+        }
+        let mut none = held("pw-none", (true, false, false, false));
+        none.power.as_mut().unwrap().pause = None;
+        assert!(held_pause(&none).is_none());
+    }
+
+    /// No checkpoint clears a held pause (the restart bug's last step: a redriven worker's
+    /// `pre_handoff` checkpoint wrote `pause = None`); a turn end waits on it; the switch to
+    /// phased, which answers it, clears it.
+    #[test]
+    fn a_checkpoint_never_clears_a_held_pause_and_a_turn_end_waits_on_it() {
+        let dir = std::env::temp_dir().join(format!("wc-held-pause-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut store = open_store(Some(dir.join("s.db").to_str().unwrap())).unwrap();
+        let id = "pw-held-ck";
+        let s = held(id, (true, false, false, false));
+        let want = s.power.as_ref().unwrap().pause.clone();
+        put_node(&mut store, s.to_node()).unwrap();
+        let mut sink = crate::event_log::EventSink::default();
+        for trigger in ["timer", "commit"] {
+            let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &report(trigger)).unwrap();
+            assert!(
+                a.pause.is_none(),
+                "a mid-turn {trigger} checkpoint never waits"
+            );
+            assert_eq!(pause_of(&store, id), want, "{trigger} kept the held pause");
+        }
+        for trigger in ["turn", "pre_handoff"] {
+            let a = on_checkpoint(&mut store, &mut sink, id, 1, 0, &report(trigger)).unwrap();
+            assert_eq!(
+                a.pause, want,
+                "a {trigger} checkpoint waits on the held pause"
+            );
+            assert_eq!(pause_of(&store, id), want, "{trigger} kept the held pause");
+        }
+        set_power(&mut store, &mut sink, id, false, "operator:test", None).unwrap();
+        assert_eq!(
+            pause_of(&store, id),
+            None,
+            "the switch to phased answers the pause"
+        );
+        crate::power::forget_run(id);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

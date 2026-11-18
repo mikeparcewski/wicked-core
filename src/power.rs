@@ -1738,7 +1738,9 @@ fn pauses() -> &'static Mutex<HashMap<String, Option<PauseDecision>>> {
     P.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// The actor opened a pause on `run_id`: the worker waits for its answer.
+/// The actor opened a pause on `run_id`: the worker waits for its answer. This map is only the
+/// wake-up for a worker that is waiting in THIS process; the pause itself is the run's persisted
+/// `power.pause`, which outlives a restart and holds the run until it is answered (core#1581).
 pub fn open_pause(run_id: &str) {
     pauses()
         .lock()
@@ -1746,7 +1748,8 @@ pub fn open_pause(run_id: &str) {
         .insert(run_id.to_string(), None);
 }
 
-/// Answer an open pause (no-op when none is open).
+/// Wake the worker waiting on an open pause (no-op when none waits: after a restart, the actor
+/// releases the held run itself).
 pub fn answer_pause(run_id: &str, decision: PauseDecision) {
     if let Some(slot) = pauses()
         .lock()
