@@ -858,8 +858,12 @@ export declare class Core {
    * of exactly the tree `workdir`'s `HEAD` commit holds (a container floor checks that tree, never
    * a re-snapshot), held to it afterwards, measured against `baseCommit` (the full id of a commit
    * object, an ancestor of `HEAD`: the base the branch was rebased onto; a failure the floor can
-   * attribute to that base is excluded, an inseparable one still denies). The full test command
-   * runs where the repository has one, under the recheck's own floor id. `workdir` is a worktree of the registered repository at
+   * attribute to that base is excluded, an inseparable one still denies). It runs the repo's checks
+   * as the engine floor resolves them: a current base build guide takes precedence over detected
+   * tests in the directories it covers (a guide with only a lint check runs lint only); elsewhere
+   * the full test command runs where one exists, under the recheck's own floor id. Which checks
+   * ran, and where each came from, is `report.checks[].name` / `.source` (the build guide's or the
+   * detected one's): show that, not a bare pass. `workdir` is a worktree of the registered repository at
    * `repoRoot`. Resolves to a JSON `{ head, tree, base, passed, checksRun, report }` (`head` is the
    * commit id to push, `report` the floor's `RepoChecksReport`); rejects when the inputs do not name
    * that shape. `passed` is false when the floor refuses (no OS write boundary, a checkout that

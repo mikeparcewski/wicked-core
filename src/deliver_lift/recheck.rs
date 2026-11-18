@@ -17,9 +17,13 @@
 //! - The floor runs under its own id (`<run>-recheck-<n>`), not the run's: a finished run's id is
 //!   in the floor-cancel set (its completion cancels its workers), which would refuse every
 //!   recheck; and a cancel of the run never reaches a recheck it does not own.
-//! - The full test command runs where the repository has one (the power full-suite rule set for
-//!   that id; a repository whose only test is its targeted command keeps it): a finished run's own
-//!   policy is gone with it (`power::forget_run`), and a re-delivery is a delivery checkpoint.
+//! - The checks are the engine floor's own resolution, not a second resolver: a current base build
+//!   guide takes precedence over the detected tests in the directories it covers (a guide with only
+//!   a lint check runs lint only); elsewhere the full test command runs where the repository has one
+//!   (the power full-suite rule set for that id; a repository whose only test is its targeted
+//!   command keeps it), since a finished run's own policy is gone with it (`power::forget_run`) and
+//!   a re-delivery is a delivery checkpoint. Which checks ran, and from where, is
+//!   `report.checks[].name` / `.source`.
 //! - A floor that ran no check (only provisioning, or none detected) does not pass: a re-delivery
 //!   is never unverified (coord's ruling on crew#1493).
 
@@ -219,6 +223,8 @@ mod tests {
         checks: Option<serde_json::Value>,
         base_files: &'a [&'a str],
         head_removes: &'a [&'a str],
+        /// The base's `.wicked/build-guide.json`; `None` = no guide.
+        guide: Option<serde_json::Value>,
     }
 
     /// A registered repository whose base carries `base_files` (and the checks config), and a
@@ -248,6 +254,9 @@ mod tests {
                 checks.to_string(),
             )
             .unwrap();
+        }
+        if let Some(guide) = &f.guide {
+            std::fs::write(repo.join(crate::floor_guide::GUIDE_PATH), guide.to_string()).unwrap();
         }
         std::fs::write(repo.join("README"), "fixture\n").unwrap();
         for name in f.base_files {
@@ -287,6 +296,7 @@ mod tests {
             ),
             base_files: &["ok"],
             head_removes: if head_keeps_ok { &[] } else { &["ok"] },
+            guide: None,
         })
     }
 
@@ -392,6 +402,7 @@ mod tests {
             })),
             base_files: &["full"],
             head_removes: &["full"],
+            guide: None,
         });
         let r = check_run_tree("run-full", &wt, &repo, &base).unwrap();
         if unboxed(&r) {
@@ -414,6 +425,7 @@ mod tests {
             checks: None,
             base_files: &[],
             head_removes: &[],
+            guide: None,
         });
         let r = check_run_tree("run-empty", &wt, &repo, &base).unwrap();
         if unboxed(&r) {
@@ -445,5 +457,42 @@ mod tests {
         // A worktree of another repository.
         let (other, _, _) = simple("refuse-other", true);
         assert!(check_run_tree("r", &wt, &other, &base).is_err());
+    }
+
+    /// The checks run as the engine floor resolves them: a current base build guide takes precedence over the
+    /// detected tests in the directories it covers. A guide that has only a lint check runs lint only, and the
+    /// report names it and its source (`report.checks[].source` = the guide), so a consumer can show "checked:
+    /// lint only (from the build guide)" instead of a bare pass (codex merge check, crew#1493).
+    #[test]
+    fn a_base_build_guide_with_only_lint_runs_lint_and_says_the_guide_chose_it() {
+        let (repo, wt, base) = layout(Fixture {
+            tag: "guide",
+            // The detected test would fail; the guide replaces it in `.`, so it never runs.
+            checks: Some(serde_json::json!({ "test": ["sh", "-c", "exit 1"], "timeout_s": 60 })),
+            base_files: &[],
+            head_removes: &[],
+            guide: Some(serde_json::json!({
+                "version": 1,
+                "checks": [{ "name": "lint", "run": ["sh", "-c", "true"] }]
+            })),
+        });
+        let r = check_run_tree("run-guide", &wt, &repo, &base).unwrap();
+        if unboxed(&r) {
+            return;
+        }
+        let ran: Vec<(&str, &str)> = r
+            .report
+            .checks
+            .iter()
+            .map(|c| (c.name.as_str(), c.source.as_str()))
+            .collect();
+        assert_eq!(
+            ran,
+            vec![("lint", crate::repo_checks::GUIDE_SOURCE)],
+            "{:?}",
+            r.report
+        );
+        assert!(r.passed, "{:?}", r.report);
+        assert_eq!(r.checks_run, 1);
     }
 }
