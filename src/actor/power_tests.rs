@@ -665,10 +665,14 @@ fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
 #[cfg(not(windows))]
 #[test]
 fn a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it() {
-    if crate::validator::skip_in_container_floor("a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it") {
+    if crate::validator::skip_in_container_floor(
+        "a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it",
+    ) {
         return;
     }
-    if crate::validator::skip_when_nested("a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it") {
+    if crate::validator::skip_when_nested(
+        "a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it",
+    ) {
         return;
     }
     let w = Worker::scripted(move |i, _| {
