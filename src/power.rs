@@ -1414,8 +1414,9 @@ pub fn struggle_score(s: &Struggle) -> (u8, Vec<String>) {
 /// "Suddenly complex" (DES §5.4): the reasons to pause, empty when none holds. Rigor growth inside
 /// the run's repository is NOT one: the checkpoint raises rigor and the plan gains the phases the
 /// new band requires (the escalation is a `rigorRescored` row, not a power pause). A rise INTO
-/// the high-risk band is still the plan gate's to approve (`plan_gate::approval`,
-/// `IntoHighRisk`), not this pause. Only a spread into another repository, a destructive change,
+/// the high-risk band is the plan gate's, not this pause: a standard run waits for a person at
+/// `IntoHighRisk`, and a power run's rigor-only rise is accepted by the engine and named
+/// (`high_risk_accepted`; a destructive step, a new obligation or a second repository still waits). Only a spread into another repository, a destructive change,
 /// a sensitive new dependency or struggle pauses here.
 pub fn sudden_complexity(
     destructive_new: bool,

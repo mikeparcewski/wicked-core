@@ -582,6 +582,9 @@ pub(super) fn record_auto_high_risk(
     };
     let rigor = power.rigor.unwrap_or(Rigor::Light);
     let planned = power.planned_score();
+    // The row is a notice, not a measurement: it carries the latest measured score forward, so the
+    // run's outcome (`history.last().actual`) still reads what was measured.
+    let actual = power.history.last().map_or(planned, |r| r.actual);
     let added_text = if added.is_empty() {
         "the plan already had every phase the new score requires".to_string()
     } else {
@@ -592,7 +595,7 @@ pub(super) fn record_auto_high_risk(
         rigor,
         rigor,
         planned,
-        planned,
+        actual,
         vec![format!(
             "The change rose into high risk (band {band}) and the run continued without asking: \
              a rigor-only rise (no destructive step, no override, no new obligation, no new \

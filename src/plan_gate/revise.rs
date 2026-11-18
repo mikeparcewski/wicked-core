@@ -233,14 +233,19 @@ pub(crate) struct Revised {
 /// (operator ruling 2026-11-18) A POWER run's rise into high risk is only a change of rigor when
 /// the re-score carries no destructive step, the plan no floor override, the diff no newly fired
 /// obligation and no repository beyond the run's own. Such a rise is accepted by the engine; any
-/// other still waits for a person. A standard run never reaches this: its matrix row is unchanged.
-fn rigor_only_rise(power: bool, r: &DiffRescore, destructive: bool, has_override: bool) -> bool {
+/// other still waits for a person. A revision that is not a re-score only adds steps (its own
+/// destructive signal is judged the same way), so in a power run it too proceeds where the engine
+/// already accepted the run's high risk. A standard run never reaches this: its matrix is unchanged.
+fn rigor_only_rise(
+    power: bool,
+    rescore: Option<&DiffRescore>,
+    destructive: bool,
+    has_override: bool,
+) -> bool {
     power
         && !destructive
         && !has_override
-        && !r.destructive
-        && r.obligations.is_empty()
-        && r.repositories <= 1
+        && rescore.is_none_or(|r| !r.destructive && r.obligations.is_empty() && r.repositories <= 1)
 }
 
 fn catalog_pos(catalog: &str) -> Option<usize> {
@@ -683,12 +688,16 @@ pub(crate) fn revise(
             // (operator ruling 2026-11-18) A power run takes a rigor-only rise into high risk
             // itself; the caller records it as a named event. Standard runs and every other
             // rise keep their gate.
-            Ok(Some(ApprovalReason::IntoHighRisk | ApprovalReason::HighRisk))
-                if floor_rescore.as_ref().is_some_and(|r| {
-                    rigor_only_rise(prior.power, r, destructive, filled.floor_override.is_some())
-                }) =>
+            Ok(Some(reason @ (ApprovalReason::IntoHighRisk | ApprovalReason::HighRisk)))
+                if rigor_only_rise(
+                    prior.power,
+                    floor_rescore.as_ref(),
+                    destructive,
+                    filled.floor_override.is_some(),
+                ) =>
             {
-                auto_high_risk = true;
+                auto_high_risk =
+                    floor_rescore.is_some() && matches!(reason, ApprovalReason::IntoHighRisk);
                 None
             }
             Ok(n) => n.map(|r| r.as_str().to_string()),

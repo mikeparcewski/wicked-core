@@ -3605,6 +3605,13 @@ pub(super) fn apply_held_revision(
         publish_plan_facts(&session, facts);
         return Ok(());
     };
+    // A later change of the same boundary may have held the plan: the escalation is named only
+    // when nothing is waiting for a person.
+    let named = if state.pending.is_none() {
+        std::mem::take(&mut auto_high_risk)
+    } else {
+        Vec::new()
+    };
     let mut next = session.clone();
     next.team_plan = Some(state);
     if let Err(e) = revise_units(store, subscribers, &next, def) {
@@ -3621,7 +3628,7 @@ pub(super) fn apply_held_revision(
     let session = crate::domain::get_session(&*store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     publish_plan_facts(&session, facts);
-    for (band, added) in &auto_high_risk {
+    for (band, added) in &named {
         super::power_gate::record_auto_high_risk(store, subscribers, run_id, band, added)?;
     }
     Ok(())

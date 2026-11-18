@@ -662,14 +662,28 @@ fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
 /// highest band at the hand-off takes the rise itself: no plan gate opens, `plan.revised` adds the
 /// new score's phases, and the run's rigor history carries a `high_risk_accepted` row that names
 /// it. (A standard run's same rise still pauses: `x1_e_the_diff_rescore_still_ratchets_...`.)
+#[cfg(not(windows))]
 #[test]
 fn a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it() {
+    if crate::validator::skip_in_container_floor("a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it") {
+        return;
+    }
+    if crate::validator::skip_when_nested("a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it") {
+        return;
+    }
     let w = Worker::scripted(move |i, _| {
         let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
         match phase.as_str() {
             "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
-            // The settled diff touches `src/` (no graph: scored at the fail-closed 100).
-            "fix" => turn("edited the code\nHANDOFF: done", Some(&["src/lib.rs"])),
+            // A real edit under `src/` (no graph: scored at the fail-closed 100); the settled
+            // diff the supervisor reports is the same path.
+            "fix" => {
+                let wd = i.workdir.as_ref().expect("a worktree");
+                std::fs::create_dir_all(wd.join("src")).unwrap();
+                std::fs::write(wd.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+                turn("edited the code\nHANDOFF: done", Some(&["src/lib.rs"]))
+            }
+            "validator-agent" => turn("PASS", None),
             _ => hold(),
         }
     });
