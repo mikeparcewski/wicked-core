@@ -36,7 +36,20 @@ Two release tracks share this file, newest entry first regardless of track:
   `## [core-ts X.Y.Z]` heading (also the combined `## [0.4.0] / [core-ts 0.4.1]`), drops link refs and scrubs home
   paths; exit 1 (no block) drafts a generic note, any other failure fails the job. Its tests run on CI's Linux leg.
   Earlier versions are not backfilled. A full re-run after a publish still fails at npm (core#1556).
-
+- **A seat's commits carry the operator's git identity, whatever the seat configures (core#1485).** Every seat
+  spawn now also sets `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL` to the author and `GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`
+  to the committer the operator's own `git commit` in the seat's worktree would record, each asked of git
+  (`git var GIT_AUTHOR_IDENT` / `GIT_COMMITTER_IDENT` in the daemon's environment from that worktree), so git's own
+  precedence applies: inherited `GIT_AUTHOR_*`/`GIT_COMMITTER_*`, then `author.*`/`committer.*`, then `user.*`, across
+  system, global and repository config with their includes (an `includeIf "gitdir:…"` or a repository's own identity
+  applies). git ranks this environment above every config source, so a seat that names itself with `git -c
+  user.name=…` or in its replica's `.git/config`, or a pod whose copied config did not arrive, no longer authors
+  commits as itself (wicked-studio#1151 was delivered with four `pi <pi@local>` commits). What git itself keeps
+  possible stays: `--author` sets the author (the committer stays the operator's), and `commit --amend`/`rebase`/
+  `cherry-pick` keep an existing commit's author. It reaches Kubernetes seat pods through the existing unit-env
+  hand-off. A role with no configured identity (git's host-name guess does not count: `user.useConfigOnly`) gets an
+  empty name, so the seat's commit is refused with git's "empty ident name" rather than landing as the seat's own
+  identity, and the daemon logs which role is missing.
 - **The engine owns the QE evidence dir, and a QE binding miss re-runs QE (core#1484, crew#1554).**
   Before the QE executor turn the engine creates the attempt's QE run in the run's ledger (complete
   project, scenario and run rows, `config.json` when absent, the `evidence/<uuid>` dir) and the
