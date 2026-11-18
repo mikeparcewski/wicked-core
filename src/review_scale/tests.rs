@@ -467,6 +467,65 @@ fn impact_score_table() {
 
 /// core#692: the reach reason names WHY a traversal is incomplete. A hop horizon is not a node
 /// cap: within the horizon the count is exact, so it must not read "(capped)".
+/// (rig run 97ee72d4, a one-issue bug fix in wicked-estate) Crates of one repository are one
+/// product: a fix across three crates, whose dependent sits in a fourth, spans one product and
+/// earns no span points, so it cannot read as "spread into another product".
+#[test]
+fn a_fix_across_three_crates_of_one_repository_is_one_product() {
+    let store = graph(
+        &[
+            node(
+                "guard",
+                NodeKind::Function,
+                "crates/extract/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "index",
+                NodeKind::Function,
+                "crates/cli/src/lib.rs",
+                (10, 20),
+            ),
+            node(
+                "link",
+                NodeKind::Function,
+                "crates/cli/src/link.rs",
+                (10, 20),
+            ),
+            node(
+                "caller",
+                NodeKind::Function,
+                "crates/mcp/src/main.rs",
+                (1, 5),
+            ),
+        ],
+        &[edge("caller", "guard", EdgeKind::Calls)],
+    );
+    let hunk = "@@ -12,1 +12,1 @@\n-    old();\n+    new();\n";
+    let diff = signals_from_diff(&format!(
+        "{}{}{}{}",
+        file_diff("crates/extract/src/lib.rs", hunk),
+        file_diff("crates/cli/src/lib.rs", hunk),
+        file_diff("crates/cli/src/link.rs", hunk),
+        file_diff(
+            "crates/tests/tests/new_test.rs",
+            "@@ -0,0 +1 @@\n+fn t() {}\n"
+        ),
+    ));
+    let a = assess(&diff, ready(&store), None);
+    let s = a.signals.as_ref().expect("graph was read");
+    assert_eq!(
+        (s.changed_symbols, s.dependents, s.products),
+        (4, 1, 1),
+        "{s:?}"
+    );
+    assert!(
+        !a.reasons.iter().any(|r| r.starts_with("span")),
+        "{:?}",
+        a.reasons
+    );
+}
+
 #[test]
 fn reach_reason_labels_truncation_by_cause() {
     let reason = |node_cap_reached, depth_horizon_reached| {

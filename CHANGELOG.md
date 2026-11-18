@@ -55,6 +55,12 @@ Two release tracks share this file, newest entry first regardless of track:
   write root, so a seat can change nothing there (no link swap, no forged crew manifest, no planted temp file).
   Reading it needs wicked-estate 0.35.7, whose `--readonly` server opens the graph read-only, and crew leaving the
   graph in DELETE journal mode. The repo-graph grant is unchanged.
+- **A fix across several crates of one repository no longer pauses a power run as "the change spread into another
+  product".** The review-scale span signal counted each `crates/<x>` and `packages/<x>` as a product, so a one-issue
+  bug fix in a Rust workspace or monorepo read as a three-product spread, rescored high to highest and paused at
+  `pre_handoff` for the operator (rig run 97ee72d4, wicked-estate). A product is now a repository: the graph the score
+  reads is the run repository's own, so a change in it spans one product and earns no span points. A reading across
+  two repositories still scores and pauses as before.
 - **A seat's commit keeps a git name that ends in a Unicode space (core#1565).** The identity read from `git var`
   trimmed every trailing Unicode space, so `Operator` followed by a no-break space became `Operator`, unlike the
   operator's own `git commit`. Only the one ASCII space `git var` prints before `<` is removed now.
