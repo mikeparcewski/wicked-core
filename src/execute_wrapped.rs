@@ -4026,6 +4026,8 @@ impl WrappedCliStepRunner {
             let mut opencode_password: Option<String> = None;
             let mut seat_cleanup: Option<crate::container_floor::ReapOnDrop> = None;
             let mut scratch_guard: Option<crate::container_floor::RemoveOnDrop> = None;
+            // A container seat's temp dir outside its tree (core#1573), a READ root of its gate.
+            let mut seat_tmp_read_root: Option<PathBuf> = None;
             // A long prompt's file (core#1228): kept until the seat has run.
             let mut prompt_guard: Option<crate::container_floor::CarriedPrompt> = None;
             // A1: a requested kernel floor that cannot arm DISCLOSES AND CONTINUES rather than
@@ -4063,18 +4065,23 @@ impl WrappedCliStepRunner {
                 // posture), git state, its seat home, secrets masked — rendered as a hardened
                 // seat container. Not armed = refused (fail closed), never run on the host.
                 let fenced = write_posture.fences_writes();
-                let scratch: Option<PathBuf> = match (&codex_checks, fenced) {
-                    (Some(ctx), _) => Some(ctx.check_scratch.clone()),
+                // Every container unit has a scratch outside its tree (core#1573): a fenced
+                // unit's temp and build output go there, and under every posture claude's own temp
+                // (`CLAUDE_CODE_TMPDIR`), whose task-output dirs would otherwise land in the tree.
+                let scratch: Option<PathBuf> = match &codex_checks {
+                    Some(ctx) => Some(ctx.check_scratch.clone()),
                     // A fresh scratch for this unit alone: removed however the unit ends.
-                    (None, true) => match codex_check_scratch(input) {
+                    None => match codex_check_scratch(input) {
                         Ok(dir) => {
                             scratch_guard = Some(crate::container_floor::RemoveOnDrop(dir.clone()));
                             Some(dir)
                         }
-                        Err(why) => return posture_refusal(input, &why),
+                        Err(why) if fenced => return posture_refusal(input, &why),
+                        Err(why) => return isolation_refusal(input, &why),
                     },
-                    _ => None,
                 };
+                // The claude gate reads where its seat's temp is (a background task's output).
+                seat_tmp_read_root = scratch.as_ref().map(|s| s.join("tmp"));
                 let floor_roots: Vec<PathBuf> = if fenced {
                     let mut r = crate::write_posture::unit_admitted_roots(
                         write_posture,
@@ -4157,6 +4164,9 @@ impl WrappedCliStepRunner {
                             .iter()
                             .flat_map(|g| promoted_write_roots(&g.extra_write_roots, &homes)),
                     )
+                    // (core#1573) The seat's own temp: the mount set and, below, the fence
+                    // narrowing see the same root the gate hook env is handed.
+                    .chain(seat_tmp_read_root.iter().cloned())
                     .collect();
                 // A claude unit's gate hook runs on the host, reached through the gateway's hook
                 // route; without the relay (or a gateway to route it) its tool calls would run
@@ -4208,6 +4218,10 @@ impl WrappedCliStepRunner {
                     .iter()
                     .flat_map(|g| g.extra_write_roots.iter().chain(g.extra_read_roots.iter()))
                     .map(PathBuf::from)
+                    // (core#1573) Its task output must stay readable when the worker home nests
+                    // under a fenced state-home directory: only this dir is opened, every other
+                    // mounted entry beside it keeps its deny by name.
+                    .chain(seat_tmp_read_root.iter().cloned())
                     .collect();
                 // (core#1461) The settings file is narrowed BEFORE the arm copies it into the
                 // seat's replica: the pod mounts it by subPath, bound to the inode the copy-in
@@ -4849,11 +4863,25 @@ impl WrappedCliStepRunner {
                 // `assemble_read_roots`. A mis-shaped `code_graph_db` — an in-tree
                 // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
                 // widened (the helper's shape check), reported here so the operator sees why.
-                let read_roots: Vec<std::ffi::OsString> = g
+                let mut read_roots: Vec<std::ffi::OsString> = g
                     .read_roots(self.operational_home.as_deref())
                     .into_iter()
                     .map(PathBuf::into_os_string)
                     .collect();
+                // (core#1573) …plus the container seat's own temp, outside its tree: claude tells
+                // the seat where a background task's output is, and the seat reads it there. Only
+                // when it can be joined: a worker home spelled with the path separator must cost
+                // the seat that one read root, never every other one (codex r1).
+                if let Some(tmp) = &seat_tmp_read_root {
+                    if !push_joinable_read_root(&mut read_roots, tmp) {
+                        eprintln!(
+                            "wicked-core: the seat temp {} cannot be joined into READ_ROOTS; \
+                             unit {} reads its background task output only through its tools",
+                            tmp.display(),
+                            input.unit.id
+                        );
+                    }
+                }
                 if let Some(db) = g.code_graph_db.as_deref() {
                     if repo_read_root(Some(db), self.operational_home.as_deref()).is_none() {
                         eprintln!(
@@ -5118,6 +5146,18 @@ impl WrappedCliStepRunner {
             governed: gov_env.is_some() || floor_governed,
         }
     }
+}
+
+/// (core#1573) Add `root` to a read-root list only while the list still joins into one env value:
+/// `false` (and the list unchanged) when `root` carries the platform's path separator, so one
+/// unrepresentable root never costs the unit every other read root.
+pub(crate) fn push_joinable_read_root(roots: &mut Vec<std::ffi::OsString>, root: &Path) -> bool {
+    roots.push(root.as_os_str().to_os_string());
+    if std::env::join_paths(roots.iter()).is_ok() {
+        return true;
+    }
+    roots.pop();
+    false
 }
 
 /// The `WICKED_WRITE_ROOTS` value for a governed unit (core#259): the unit cwd FIRST, widened by
@@ -17446,6 +17486,93 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (core#1573, coord W12) The full posture with a worker home NESTED under the fenced `.wicked`
+    /// (`WICKED_WORKER_HOME=$HOME/.wicked/worker`): the seat's own temp (claude's task output) is
+    /// a mounted entry there, and the fence narrowing denies every mounted entry that is no working
+    /// root BY NAME, so the seat could not Read its own task output. The temp is one of the read
+    /// roots the narrowing consumes (the launch's `read_roots`, the same `seat_tmp_read_root` the
+    /// gate hook env is handed): its dir is open, every sibling in the worker home stays denied.
+    #[cfg(unix)]
+    #[test]
+    fn a_nested_worker_home_seat_reads_its_own_task_output_and_nothing_beside_it() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir()
+            .canonicalize()
+            .unwrap()
+            .join(format!("wicked-core1573-{}", uuid::Uuid::new_v4().simple()));
+        let wicked = home.join(".wicked");
+        let clone = wicked.join("repos").join("x");
+        let tree = clone.join("wicked-worktrees").join("r");
+        let worker = wicked.join("worker");
+        let tmp = worker.join("scratch").join("u1").join("tmp");
+        let sibling = worker.join("claude");
+        for d in [&tree, &tmp, &sibling] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let _home = HomeGuard::pin(&home);
+        let _cfg = VarGuard::unset("CLAUDE_CONFIG_DIR");
+        let spec = crate::worker_sandbox::SeatFloor {
+            profile: "governed".into(),
+            tree: tree.clone(),
+            writable: vec![tree.clone(), tmp.clone(), sibling.clone()],
+            protected: vec![clone.clone()],
+            readmitted: vec![tree.clone()],
+            readmitted_files: vec![],
+            masks: crate::worker_sandbox::floor_mask_dirs_under(Some(&home)),
+            pinned: vec![],
+            net: vec![],
+        };
+        let mounts = crate::container_floor::mount_plan(&spec).unwrap();
+        let task_output = tmp
+            .join("claude-501")
+            .join("t")
+            .join("tasks")
+            .join("a.output");
+        let secret = sibling.join("settings.json");
+        let rules_for = |working: &[PathBuf]| {
+            let view = crate::container_floor::mount_view(&mounts, working);
+            super::container_fence_rules(
+                &super::deny_rules(None, None).unwrap(),
+                None,
+                None,
+                &[],
+                &view,
+            )
+            .unwrap()
+        };
+        let denied = |rules: &[String], p: &Path| {
+            rules
+                .iter()
+                .any(|r| rule_denies(r, "Read", p.to_str().unwrap()))
+        };
+        // Without the temp among the read roots (main's early inputs): the seat is denied it.
+        let without = rules_for(&[tree.clone(), clone.clone()]);
+        assert!(
+            denied(&without, &task_output),
+            "the premise: the nested temp is denied by name: {without:?}"
+        );
+        // With it (the fix): readable; the rest of the worker home stays denied.
+        let with = rules_for(&[tree.clone(), clone.clone(), tmp.clone()]);
+        assert!(!denied(&with, &task_output), "task output denied: {with:?}");
+        assert!(denied(&with, &secret), "a sibling was opened: {with:?}");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// (core#1573) Source guard: the launch's ONE read-root list and the fence narrowing's declared
+    /// roots both carry the seat temp, so no input to the narrowing misses it.
+    #[test]
+    fn the_seat_temp_rides_the_mount_read_roots_and_the_fence_declared_roots() {
+        let src = include_str!("execute_wrapped.rs");
+        let launch = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let chained = launch
+            .matches(".chain(seat_tmp_read_root.iter().cloned())")
+            .count();
+        assert_eq!(
+            chained, 2,
+            "read_roots and declared must both chain the seat temp"
+        );
     }
 
     /// core#396 × the Read deny fence (FINDING-067), design v3.1 §1: the snapshot lives under

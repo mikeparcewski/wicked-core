@@ -38,6 +38,19 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A container seat's claude temp no longer lands in the run's worktree (core#1573).** Under the full write
+  posture `CLAUDE_CODE_TMPDIR` was `<cwd>/tmp`, so claude's `claude-<uid>/<slug of the cwd>/<session>/tasks/<id>.output`
+  (a home-derived slug) was an untracked change the run's change readers and plan gaps saw. Every container unit
+  now gets the per-unit scratch the fenced posture already had (outside the tree, a writable seat mount, removed
+  after the seat exits), claude's temp is `<scratch>/tmp` under every posture, and the claude gate admits READS
+  there so a seat can still read a background task's output. Known limit: the full posture's `TMPDIR` stays
+  `<cwd>/tmp` on purpose; moving it needs a new write carve-out in four fences (the write roots and their witness,
+  the host kernel profile, the os-sandbox marker, the container roots), reversing core#264 and crew#427, for a
+  dir that git, delivery and (core#1570) the scorer already exclude. Known limit: a worker home set under a
+  fenced home dir (`WICKED_WORKER_HOME=~/.wicked/worker`) keeps claude's own Read deny over its temp, as it
+  already did for a fenced unit's scratch; the default `~/.wicked-worker` is not fenced, and the seat still reads
+  a task's output through its own task tools.
+
 - **A refused command is redacted once, when it is recorded (core#1569).** The fence recorders wrote a refused
   tool call's command (and the reason that quotes it) to the decisions log raw, so an inline token or a password in
   a URL reached storage even where a reader later showed a redacted copy. The estate fence (both arms), the

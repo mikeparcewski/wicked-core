@@ -16055,7 +16055,7 @@ mod boundary_tests {
             launcher.contains(
                 "assemble_read_roots(self.code_graph_db.as_deref(),operational_home,&self.extra_read_roots,self.skills_root.as_deref()"
             ) && launcher.contains(
-                "letread_roots:Vec<std::ffi::OsString>=g.read_roots(self.operational_home.as_deref())"
+                "letmutread_roots:Vec<std::ffi::OsString>=g.read_roots(self.operational_home.as_deref())"
             ),
             "the wrapped launcher no longer joins the launch-declared extra_read_roots (and the \
              skills snapshot) into WICKED_READ_ROOTS (core#294, core#396)"

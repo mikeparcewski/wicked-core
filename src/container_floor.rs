@@ -5198,6 +5198,137 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// (core#1573) A full-posture claude seat's own temp (`CLAUDE_CODE_TMPDIR`, where claude writes
+    /// `claude-<uid>/<slug of the cwd>/<session>/tasks/<id>.output`) is the unit's scratch, outside
+    /// the tree and bind-mounted writable; it was `<cwd>/tmp`, so the home-derived slug landed in
+    /// the worktree as an untracked change. `TMPDIR` is not redirected under the full posture (it
+    /// stays the carrier's in-boundary `<cwd>/tmp`) and the build target stays the seat's own.
+    #[test]
+    fn a_full_posture_claude_seats_own_temp_is_its_scratch_never_the_tree() {
+        use wicked_apps_core::spawn::{SeatCli, SeatConfig, WORKER_HOME_ENV};
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = tmp("claude-seat-tmp");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        let scratch = worker.join("checks").join("run-1").join("unit");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let prior = std::env::var_os(WORKER_HOME_ENV);
+        std::env::set_var(WORKER_HOME_ENV, &worker);
+        let config = SeatConfig::Isolated {
+            cli: SeatCli::Claude,
+            root: None,
+            set: Vec::new(),
+            strip: Vec::new(),
+        };
+        let plan = crate::worker_sandbox::plan_seat_floor(
+            crate::worker_sandbox::SeatLaunch {
+                cwd: &tree,
+                cli: SeatCli::Claude,
+                config: &config,
+                read_only: false,
+                scratch: Some(&scratch),
+                gov_log_dir: None,
+                own_ports: &[],
+            },
+            vec![tree.clone()],
+        );
+        match prior {
+            Some(v) => std::env::set_var(WORKER_HOME_ENV, v),
+            None => std::env::remove_var(WORKER_HOME_ENV),
+        }
+        let get = |k: &str| -> Vec<PathBuf> {
+            plan.env
+                .iter()
+                .filter(|(n, _)| *n == k)
+                .map(|(_, v)| v.clone())
+                .collect()
+        };
+        let claude_tmp = get("CLAUDE_CODE_TMPDIR");
+        assert_eq!(claude_tmp, vec![scratch.join("tmp")], "{:?}", plan.env);
+        assert!(
+            !claude_tmp[0].starts_with(&tree),
+            "claude's temp is in the tree"
+        );
+        assert!(claude_tmp[0].is_dir(), "the dir exists before the bind");
+        for k in ["TMPDIR", "TMP", "TEMP"] {
+            assert!(
+                get(k).is_empty(),
+                "{k} is redirected under the full posture"
+            );
+        }
+        assert_eq!(
+            get("CARGO_TARGET_DIR"),
+            vec![worker.join("seat-build").join("claude").join("target")]
+        );
+        assert!(plan.inputs.seat_dirs.contains(&scratch));
+        let spec = crate::worker_sandbox::resolve_seat_floor(&plan.inputs).unwrap();
+        let mounts = mount_plan(&spec).unwrap();
+        assert!(
+            mounts.contains(&Mount::Bind {
+                path: scratch.clone(),
+                rw: true,
+            }),
+            "{mounts:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// (core#1573) The carrier hands EVERY container unit a scratch, not only a fenced one: without
+    /// it a full-posture claude seat's own temp falls back to `<cwd>/tmp` in the tree.
+    #[test]
+    fn the_carrier_hands_every_container_unit_a_scratch() {
+        let carrier = include_str!("execute_wrapped.rs");
+        let at = carrier
+            .find("let scratch: Option<PathBuf> = match &codex_checks {")
+            .expect("the container branch picks the unit's scratch");
+        let end = carrier[at..]
+            .find("let floor_roots")
+            .expect("the scratch arm ends before the floor roots");
+        let arm = &carrier[at..at + end];
+        assert!(
+            arm.contains("None => match codex_check_scratch(input) {"),
+            "{arm}"
+        );
+        assert!(
+            !arm.contains("(None, true)"),
+            "the scratch is fenced-only again: {arm}"
+        );
+        assert!(
+            carrier.contains("push_joinable_read_root(&mut read_roots, tmp)"),
+            "the claude gate no longer reads its seat's temp"
+        );
+    }
+
+    /// (core#1573, codex r1) A seat temp whose path carries the path separator is left out of
+    /// the gate's read roots alone; the roots already there still join and still arm.
+    #[cfg(unix)]
+    #[test]
+    fn an_unjoinable_seat_temp_costs_only_its_own_read_root() {
+        use crate::execute_wrapped::push_joinable_read_root;
+        let mut roots: Vec<std::ffi::OsString> = vec!["/skills".into(), "/graph/key".into()];
+        assert!(push_joinable_read_root(
+            &mut roots,
+            Path::new("/worker/checks/run/u/tmp")
+        ));
+        assert_eq!(roots.len(), 3);
+        assert!(!push_joinable_read_root(
+            &mut roots,
+            Path::new("/worker:1573/checks/run/u/tmp")
+        ));
+        assert_eq!(
+            roots,
+            vec![
+                std::ffi::OsString::from("/skills"),
+                "/graph/key".into(),
+                "/worker/checks/run/u/tmp".into()
+            ]
+        );
+        assert!(std::env::join_paths(&roots).is_ok());
+    }
+
     /// The [`crate::worker_sandbox::SEAT_TOOLCHAIN_BUILD_ENV`] variables removed from this process's
     /// environment while it lives (the plan reads an operator's value from there), restored on drop
     /// (a panic included). The caller holds the env lock.

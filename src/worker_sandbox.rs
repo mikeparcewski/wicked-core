@@ -1402,8 +1402,9 @@ pub(crate) struct SeatLaunch<'a> {
     pub(crate) config: &'a wicked_apps_core::spawn::SeatConfig,
     /// A fenced posture (read-only / deliverable-roots): the read-only profile.
     pub(crate) read_only: bool,
-    /// Where a fenced unit's temp, build output and caches go instead of the tree (its check
-    /// scratch); `None` under the full posture, whose temp is `<cwd>/tmp`.
+    /// The unit's scratch outside the tree (a seat dir the floor admits). A fenced unit's temp,
+    /// build output and caches go there instead of the tree; under the full posture only claude's
+    /// own temp does (core#1573), and `TMPDIR` stays `<cwd>/tmp`.
     pub(crate) scratch: Option<&'a Path>,
     /// The dir the unit's gate hook writes its decisions log in (the wrapped claude carrier); the
     /// in-process ACP gate writes from the daemon, outside the floor, so it passes `None`.
@@ -1440,24 +1441,31 @@ pub(crate) fn plan_seat_floor(launch: SeatLaunch<'_>, write_roots: Vec<PathBuf>)
         env.push(("CARGO_HOME", build.join("cargo-home")));
         env.push(("CARGO_TARGET_DIR", build.join("target")));
     }
-    let tmp = match (launch.read_only, launch.scratch) {
-        (true, Some(scratch)) => {
-            let tmp = scratch.join("tmp");
-            let _ = std::fs::create_dir_all(&tmp);
-            for k in ["TMPDIR", "TMP", "TEMP"] {
-                env.push((k, tmp.clone()));
-            }
-            // The fenced posture's target stays in its scratch (last value wins).
-            env.retain(|(k, _)| *k != "CARGO_TARGET_DIR");
-            env.push(("CARGO_TARGET_DIR", scratch.join("target")));
-            tmp
+    // The unit's own temp, outside the tree, in a dir the floor admits (its scratch).
+    let scratch_tmp = launch.scratch.map(|scratch| {
+        let tmp = scratch.join("tmp");
+        let _ = std::fs::create_dir_all(&tmp);
+        tmp
+    });
+    if let (true, Some(scratch), Some(tmp)) = (launch.read_only, launch.scratch, &scratch_tmp) {
+        for k in ["TMPDIR", "TMP", "TEMP"] {
+            env.push((k, tmp.clone()));
         }
-        _ => launch.cwd.join("tmp"),
-    };
-    // claude ignores `TMPDIR` for its Bash tool's temp dir (`/private/tmp/claude-<uid>`), which
+        // The fenced posture's target stays in its scratch (last value wins).
+        env.retain(|(k, _)| *k != "CARGO_TARGET_DIR");
+        env.push(("CARGO_TARGET_DIR", scratch.join("target")));
+    }
+    // claude ignores `TMPDIR` for its Bash tool's temp dir (claude-<uid>), which
     // the floor denies: every Bash call failed EPERM without this (DES-PROC-GOVERNANCE §3.1).
+    // (core#1573) It is the scratch under EVERY posture, never the tree: claude names its dir
+    // `claude-<uid>/<slug of the cwd>/<session>/tasks/<id>.output`, and under `<cwd>/tmp` that
+    // home-derived slug was an untracked change the run's change readers saw. `<cwd>/tmp` is
+    // left only for a launch with no scratch (the floor's unit tests; the carrier passes one).
     if launch.cli == SeatCli::Claude {
-        env.push(("CLAUDE_CODE_TMPDIR", tmp));
+        env.push((
+            "CLAUDE_CODE_TMPDIR",
+            scratch_tmp.unwrap_or_else(|| launch.cwd.join("tmp")),
+        ));
     }
     // A seat container's only route out is the gateway; the floor records just the loopback
     // ports the seat serves itself (opencode's pinned server).
