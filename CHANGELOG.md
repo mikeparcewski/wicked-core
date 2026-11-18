@@ -38,6 +38,15 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A refused command is redacted once, when it is recorded (core#1569).** The fence recorders wrote a refused
+  tool call's command (and the reason that quotes it) to the decisions log raw, so an inline token or a password in
+  a URL reached storage even where a reader later showed a redacted copy. The estate fence (both arms), the
+  filesystem boundary (both arms), the remote-write fence, the phase scope, the infra recorder (the hook relay's
+  fallback) and the MCP REST-boundary recorder now pass that text through the tool-activity redactor before the
+  record is written (`seat_text`), and so does every `wicked-governance: DENY (…)` diagnostic the relay forwards.
+  The fold, the events and the gate prompts read only that copy. The redactor is the same one the wire uses, so a
+  `-u` / `-p` value is cut in the stored command too (`git push -u ***`, `mkdir -p ***`; the boundary reason still
+  names the resolved path).
 - **A chat or run bound to a project graph can read it (crew#1497).** The grant recognised only the repo-graph
   shape. `<state home>/project-graphs/<id>/code-graph.db` is the store the engine vouches for and hands over as
   `WICKED_ESTATE_DB`, but it got no read root and no seat-container mount. The seat got no answers from it, and
