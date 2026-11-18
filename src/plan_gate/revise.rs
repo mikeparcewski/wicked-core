@@ -43,6 +43,10 @@ pub struct DiffRescore {
     pub rescore_seq: u32,
     pub score: u8,
     pub destructive: bool,
+    /// Repositories the settled diff spans (`ImpactSignals::repositories`; 0 when unmeasured, an
+    /// operator's raise). More than one is a new repository, which a power run never absorbs.
+    #[serde(default)]
+    pub repositories: u32,
     /// Its `path.scored{basis:"diff"}`, published first at the boundary.
     pub fact: QueuedFact,
     /// (WT-C3) The obligations of held testing rules the settled diff newly fired (the context
@@ -85,6 +89,7 @@ pub(crate) fn hold_rescore(
     let mut held = if band_rises { fresh.clone() } else { w.clone() };
     held.score = w.score.max(fresh.score);
     held.destructive = w.destructive || fresh.destructive;
+    held.repositories = w.repositories.max(fresh.repositories);
     held.obligations = super::union(&w.obligations, &fresh.obligations);
     held.recalled = super::union(&w.recalled, &fresh.recalled);
     held
@@ -220,6 +225,22 @@ pub(crate) struct Revised {
     pub state: TeamPlanState,
     pub events: Vec<TeamEvent>,
     pub outcome: Outcome,
+    /// A POWER run's rigor-only rise into high risk was accepted without a human (operator
+    /// ruling 2026-11-18): the caller records it as a named event on the run.
+    pub auto_accepted_high_risk: bool,
+}
+
+/// (operator ruling 2026-11-18) A POWER run's rise into high risk is only a change of rigor when
+/// the re-score carries no destructive step, the plan no floor override, the diff no newly fired
+/// obligation and no repository beyond the run's own. Such a rise is accepted by the engine; any
+/// other still waits for a person. A standard run never reaches this: its matrix row is unchanged.
+fn rigor_only_rise(power: bool, r: &DiffRescore, destructive: bool, has_override: bool) -> bool {
+    power
+        && !destructive
+        && !has_override
+        && !r.destructive
+        && r.obligations.is_empty()
+        && r.repositories <= 1
 }
 
 fn catalog_pos(catalog: &str) -> Option<usize> {
@@ -395,6 +416,11 @@ pub(crate) fn revise(
     let mut events = Vec::new();
     let mut obligations = prior.obligations.clone();
     let mut recalled = prior.recalled.clone();
+    // The re-score this revision applies, kept for the power run's rigor-only rise below.
+    let floor_rescore = match &change {
+        Change::Floor(r) => Some(r.clone()),
+        Change::Steps { .. } => None,
+    };
     let (additions, proposal_id, reason, score, destructive, by_human, pa_touch, first_creator) =
         match change {
             Change::Floor(r) => {
@@ -489,6 +515,7 @@ pub(crate) fn revise(
                             now,
                         )?);
                         return Ok(Revised {
+                            auto_accepted_high_risk: false,
                             state: prior.clone(),
                             events,
                             outcome: Outcome::Refused {
@@ -521,6 +548,7 @@ pub(crate) fn revise(
             anyhow::bail!("the floor raise could not be composed: {reason}");
         }
         Ok(Revised {
+            auto_accepted_high_risk: false,
             state: prior.clone(),
             events,
             outcome: Outcome::Refused { reason },
@@ -628,6 +656,7 @@ pub(crate) fn revise(
         Err(r) => return refuse(events, refusal_text(&r)),
     };
     def.id = per_run_def_id(run_id, rev);
+    let mut auto_high_risk = false;
     let needs = if by_human {
         None
     } else if let Some(p) = &prior.pending {
@@ -651,6 +680,17 @@ pub(crate) fn revise(
                 first_creator,
             },
         ) {
+            // (operator ruling 2026-11-18) A power run takes a rigor-only rise into high risk
+            // itself; the caller records it as a named event. Standard runs and every other
+            // rise keep their gate.
+            Ok(Some(ApprovalReason::IntoHighRisk | ApprovalReason::HighRisk))
+                if floor_rescore.as_ref().is_some_and(|r| {
+                    rigor_only_rise(prior.power, r, destructive, filled.floor_override.is_some())
+                }) =>
+            {
+                auto_high_risk = true;
+                None
+            }
             Ok(n) => n.map(|r| r.as_str().to_string()),
             Err(why) => return refuse(events, why.to_string()),
         }
@@ -710,6 +750,7 @@ pub(crate) fn revise(
             state.approved_high_risk |= by_human && filled.high_risk;
             state.pending = None;
             Ok(Revised {
+                auto_accepted_high_risk: auto_high_risk,
                 state,
                 events,
                 outcome: Outcome::Accepted { def },
@@ -744,6 +785,7 @@ pub(crate) fn revise(
                 done: done.to_vec(),
             });
             Ok(Revised {
+                auto_accepted_high_risk: false,
                 state,
                 events,
                 outcome: Outcome::Held { def },
@@ -1086,6 +1128,7 @@ pub(crate) fn send_back(
     let refuse = |mut events: Vec<TeamEvent>, reason: String| -> anyhow::Result<Revised> {
         events.push(plan_refused(run_id, &pid, base_rev, &reason, now)?);
         Ok(Revised {
+            auto_accepted_high_risk: false,
             state: prior.clone(),
             events,
             outcome: Outcome::Refused { reason },
@@ -1172,6 +1215,7 @@ pub(crate) fn send_back(
         done: held.done.clone(),
     });
     Ok(Revised {
+        auto_accepted_high_risk: false,
         state,
         events,
         outcome: Outcome::Held { def },

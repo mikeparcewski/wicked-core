@@ -2939,6 +2939,11 @@ pub(super) fn on_rescored(
             rescore_seq,
             score,
             destructive: scored.destructive,
+            repositories: scored
+                .assessment
+                .signals
+                .as_ref()
+                .map_or(0, |s| s.repositories),
             fact: crate::plan_gate::queued_facts(&[fact])?
                 .pop()
                 .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
@@ -3530,6 +3535,9 @@ pub(super) fn apply_held_revision(
     let mut state = cleared.clone();
     let mut facts = Vec::new();
     let mut def = None;
+    // (operator ruling 2026-11-18) Each rigor-only rise a power run took into high risk: the band
+    // and the phases it added, recorded as a named event once the revision stands.
+    let mut auto_high_risk: Vec<(String, Vec<String>)> = Vec::new();
     for change in changes {
         let floor = matches!(change, crate::plan_gate::Change::Floor(_));
         let r = match crate::plan_gate::revise(
@@ -3561,6 +3569,29 @@ pub(super) fn apply_held_revision(
         match r.outcome {
             crate::plan_gate::Outcome::Accepted { def: d }
             | crate::plan_gate::Outcome::Held { def: d } => {
+                if r.auto_accepted_high_risk {
+                    let band = r
+                        .state
+                        .accepted
+                        .as_ref()
+                        .map(|a| a.band.clone())
+                        .unwrap_or_default();
+                    let before: Vec<&str> = state
+                        .accepted
+                        .iter()
+                        .flat_map(|a| a.steps.steps.iter().map(|s| s.id.as_str()))
+                        .collect();
+                    auto_high_risk.push((
+                        band,
+                        r.state
+                            .accepted
+                            .iter()
+                            .flat_map(|a| a.steps.steps.iter())
+                            .filter(|s| !before.contains(&s.id.as_str()))
+                            .map(|s| s.catalog.clone())
+                            .collect(),
+                    ));
+                }
                 state = r.state;
                 def = Some(d);
             }
@@ -3590,6 +3621,9 @@ pub(super) fn apply_held_revision(
     let session = crate::domain::get_session(&*store, run_id)?
         .ok_or_else(|| anyhow::anyhow!("run not found: {run_id}"))?;
     publish_plan_facts(&session, facts);
+    for (band, added) in &auto_high_risk {
+        super::power_gate::record_auto_high_risk(store, subscribers, run_id, band, added)?;
+    }
     Ok(())
 }
 

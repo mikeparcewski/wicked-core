@@ -720,9 +720,12 @@ Rules:
 | Initial plan (`plan.proposed`, rev 1) | **approval** | proceeds | **approval** |
 | Revision that crosses **into** high risk (previous accepted rev not high risk) | **approval** | — | **approval** |
 | (Rev 15; built by ASK-K2b) Revision that crosses **into work** (a `kind:"change"` adding the first creator step to an accepted plan that had none; `reason:"first_creator"`) | **approval** | **approval** | **approval** |
+| (Rev 16; operator ruling 2026-11-18) **Power run**: a floor raise (diff re-score or rigor raise) into, or within, high risk that is **rigor-only** — no destructive step, no newly fired obligation, no repository beyond the run's own, and no override (auto mode refuses one) | — | — | proceeds: the engine accepts the rev (`plan.revised` adds the new score's phases), and the run's rigor history records a `high_risk_accepted` row |
 | Revision that stays high risk (an earlier rev was already approved as high risk) | **approval** | — | proceeds |
 | Any other revision (PA addition, accepted member request, floor raise below high risk) | **approval** | proceeds | — |
 | A plan carrying a floor `override` (manual only, §8.5) | **approval** | refused | refused |
+
+**Power-run rigor rise (rev 16, operator ruling 2026-11-18).** In a power run a rise into high risk that changes only the run's rigor is accepted by the engine, not held for a person; the row above the matrix's "into high risk" row is overridden for that case only (`src/plan_gate/revise.rs` `rigor_only_rise`). Rigor-only means the floor raise carries no destructive signal, no newly fired testing-rule obligation, spans no more than the run's one repository (`DiffRescore.repositories`), and the plan carries no override. The revision floor-fills at the new score as any other (QE required, security and architecture minimums), and the actor records a `high_risk_accepted` row on the run's rigor history (`RigorRescored`), so the narrator and Details name the escalation. Anything else, and every standard run, keeps the matrix as written. One mechanism: the matrix call is unchanged; `revise` takes the one exception.
 
 **The gate is a real gate.** When approval is required, at the step boundary the actor:
 1. advances the cursor past the finished unit (the `advance_or_pause` bookkeeping, `src/actor.rs:6071`), then
