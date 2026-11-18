@@ -972,6 +972,35 @@ pub struct UnitDenial {
     /// other denial source and when no trimming occurred.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub findings_trimmed: bool,
+    /// (core#1562) Set on an `input_governance` denial whose ONLY standing causes are tool calls the
+    /// engine refused BEFORE they ran — filesystem-boundary writes or estate-fence graph writes
+    /// (`gate_hook::is_refused_before_run`) — and whose step's governance evidence folds clean with
+    /// those refusals discounted (no policy deny, no write-root witness escape, no fail-closed arm):
+    /// each refusal, in log order, so the operator sees what the seat tried. Set only by the gate
+    /// fold. The denial still denies (retries, floor re-runs and the carry are unchanged); a
+    /// non-empty list only stops it withholding the operator's judgment over a failed floor. Empty
+    /// on every other denial and on records from before it existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refused_before_run: Vec<RefusedCall>,
+}
+
+/// (core#1562) One tool call the engine refused before it ran, as the gate fold read it off the
+/// unit's decisions log: who refused it, by which rule, and what the seat tried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedCall {
+    /// The recording evaluator (`wicked-governance-boundary`).
+    pub evaluator: String,
+    /// The rule that refused it (`engine:filesystem-boundary-write` | `engine:estate-command-fence`).
+    pub rule: String,
+    /// The tool the seat called (`Bash`, `Write`, …), when the log annotated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// The attempted command, when the recorder files it (the estate fence does; the boundary
+    /// recorder names the path in `reason`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// The fence's own reason (the path, or the segment and why).
+    pub reason: String,
 }
 
 impl UnitDenial {
@@ -986,6 +1015,7 @@ impl UnitDenial {
             denied_tool: None,
             phase: None,
             findings_trimmed: false,
+            refused_before_run: Vec::new(),
         }
     }
 }

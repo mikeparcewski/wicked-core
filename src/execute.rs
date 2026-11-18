@@ -236,6 +236,7 @@ pub(crate) fn apply_unit(
             denied_tool: None,
             phase: Some(phase_name.clone()),
             findings_trimmed: false,
+            refused_before_run: Vec::new(),
         })
     } else {
         // A dual-validator / evaluator / input-hook deny (deny-dominates over a governance ALLOW).
@@ -796,6 +797,7 @@ mod tests {
             denied_tool: Some("Edit".to_string()),
             phase: Some("unit-3".to_string()),
             findings_trimmed: false,
+            refused_before_run: Vec::new(),
         };
         let outcome = apply_unit(
             &mut store,
