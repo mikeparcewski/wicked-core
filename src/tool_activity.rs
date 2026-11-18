@@ -887,6 +887,14 @@ fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
                 i += 1;
             }
         }
+        // (core#1580) An .npmrc scoped key (`//host/:_authToken`) takes the next word wherever it
+        // sits in the command: a secret-named word before it (`registry https://auth.example.test/`)
+        // cannot hide its value. Added to the loop above, which cuts what it always cut.
+        for (k, w) in words.iter().enumerate() {
+            if k + 1 < words.len() && w.starts_with("//") && secret(w) && !flag(words[k + 1]) {
+                cut.push(spans[k + 1]);
+            }
+        }
         from = pos;
     }
     cut
@@ -897,12 +905,13 @@ fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
 /// main's head (`config_rules().0`, unchanged), never substituted for it: both heads cut, and
 /// the cuts are merged, so everything main masks stays masked. A flag takes one value word that
 /// does not start with `-` (quoted fragments whole); it never crosses an unquoted `|`, `;`, `&`
-/// or backtick, nor a newline.
+/// or backtick, and the subcommand must be followed by a blank or the end, so a newline after it
+/// ends the command (the next line is a command of its own).
 fn valued_flag_head() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
         regex::Regex::new(
-            r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:[ \t]+-[^\s|;&`]+(?:[ \t]+(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`-])(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])*)?)+[ \t]+(?:config(?:ure)?|c)(?:\s|$)"#,
+            r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:[ \t]+-[^\s|;&`]+(?:[ \t]+(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`-])(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])*)?)+[ \t]+(?:config(?:ure)?|c)(?:[ \t]|$)"#,
         )
         .expect("redaction pattern")
     })
@@ -1553,6 +1562,16 @@ mod tests {
                 "sh -c 'aws --profile p configure set aws_secret_access_key {s}'",
                 "sh -c 'aws --profile p configure set aws_secret_access_key ***'",
             ),
+            // The issue's other shape: a secret-named word ahead of the key does not hide its value
+            // (main cuts the key word there; the value is cut as well).
+            (
+                "npm config set registry https://auth.example.test/ //h/:_authToken {s}",
+                "npm config set registry https://auth.example.test/ *** ***",
+            ),
+            (
+                "npm --userconfig cfg.npmrc config set registry https://auth.example.test/ //h/:_authToken {s} --location=user",
+                "npm --userconfig cfg.npmrc config set registry https://auth.example.test/ *** *** --location=user",
+            ),
             // A later pair on the same command, and main's own head, are cut once, not twice.
             (
                 "npm --userconfig cfg.npmrc config set //one/:_authToken {s} //two/:_authToken {s}",
@@ -1575,6 +1594,7 @@ mod tests {
             "git --git-dir x config user.name Example\necho READY",
             "git config user.name Example\necho READY",
             "out=$(git -C repo config user.name Example)",
+            "aws --profile p configure\necho token READY",
             "git -C repo log --oneline -n 3",
             "npm --prefix app install left-pad",
         ];

@@ -38,12 +38,16 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **A valued global flag before a config CLI's subcommand no longer hides the secret value (core#1580).** The tool-activity
-  redactor now also masks `npm --userconfig ci.npmrc config set //registry/:_authToken V` and `aws --profile p configure
-  set aws_secret_access_key V`: a second command head, which allows flags that take a value before `config` /
-  `configure`, is added to the unchanged one, and both heads' cuts are merged, so nothing masked before is unmasked.
-  The earlier entry's "wherever the flags sit" covered valueless flags only. Known limit: a flag whose value starts
-  with `-`, or a value split from its flag by a newline, is not skipped.
+- **A valued global flag before a config CLI's subcommand, and an .npmrc key after a secret-named word, no longer hide
+  the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
+  //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
+  allows flags that take a value before `config` / `configure`, is added to the unchanged one, and both heads' cuts
+  are merged, so nothing masked before is unmasked. A newline after the subcommand ends the command (the next line
+  is its own command). A scoped `.npmrc` key (`//host/:_authToken`) now also takes the next word when a secret-named
+  word precedes it (`npm config set registry https://auth.example.test/ //h/:_authToken V`; the key word is cut as
+  before, and now the value too). The earlier entry's "wherever the flags sit" covered valueless flags only.
+  Known limits: a flag whose value starts with `-` is not skipped; a pair whose key is not an `.npmrc` scoped key
+  (`//…`) after a secret-named word earlier in the same command is still read as before.
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
   worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
   next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's
