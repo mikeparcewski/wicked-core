@@ -784,7 +784,6 @@ macro_rules! secret_word {
         r"(?i:token|secret|passw(?:or)?d|api[_-]?key|private[_-]?key|access[_-]?key|credential|auth)"
     };
 }
-const SECRET_WORD: &str = secret_word!();
 /// A name that says it holds a secret.
 const SECRET_NAME: &str = concat!(r"[A-Za-z0-9_.-]*", secret_word!(), r"[A-Za-z0-9_.-]*");
 
@@ -824,71 +823,134 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
     })
 }
 
-/// (core#1577, core#1580) A config CLI's command head (`npm config`, `npm c`, `aws configure`,
-/// `git config`, ...): the tool, any flags and their values in between (`aws --profile ci
-/// configure`, `npm --prefix . config`: the earliest subcommand word wins), then the subcommand.
-/// Also right after a quote or backtick: a reason quotes the command as `` `npm config …` ``. And
-/// one shell word (quoted fragments whole, so a quoted `&` or `;` never ends the command, and an
-/// unquoted `|`, `;`, `&` or backtick does), and a word naming a secret.
-fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
-    static R: std::sync::OnceLock<(regex::Regex, regex::Regex, regex::Regex)> =
-        std::sync::OnceLock::new();
-    R.get_or_init(|| {
-        let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
-        (
-            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+(?:\s+(?:[^\s'"-]\S*|'[^']*'|"(?:[^"\\]|\\.)*"))??)*?\s+(?:config(?:ure)?|c)(?:\s|$)"#),
-            re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])+"#),
-            re(SECRET_WORD),
-        )
-    })
-}
+/// The CLIs whose `config` / `configure` subcommand writes settings (and so credentials).
+const CONFIG_TOOLS: &[&str] = &[
+    "npm", "pnpm", "yarn", "aws", "git", "gh", "gcloud", "az", "docker", "kubectl", "helm",
+    "composer", "pip", "poetry", "bundle", "conda",
+];
 
-/// (core#1577, core#1580) In every config CLI command that names a secret anywhere after its
-/// subcommand, EVERY argument after it is masked, a leading `set` aside: its flags stay, their
-/// values, keys and values do not. No pairing and no flag-arity guess (npm takes several pairs and
-/// flags with values, `--userconfig ci.npmrc`), so no shape can shift one. The keys are masked too
-/// (the core#1575 class of over-redaction). A word an earlier pass already cut stays as it is.
-/// Cuts from every head are UNITED (overlaps merged), and each head is searched again from just
-/// after its own start, so a command quoted inside another's flag value is judged as well.
-fn redact_config_pairs(cmd: &str) -> String {
-    let (head, word, secret_word) = config_rules();
-    let mut cut: Vec<(usize, usize)> = Vec::new();
-    let mut from = 0;
-    while from < cmd.len() {
-        let Some(m) = head.find_at(cmd, from) else {
-            break;
-        };
-        from = m.start() + 1;
-        let mut words: Vec<&str> = Vec::new();
-        let mut spans: Vec<(usize, usize)> = Vec::new();
-        let mut pos = m.end();
-        loop {
-            let rest = &cmd[pos..];
-            let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
-            match word.find(&cmd[start..]) {
-                Some(w) if start > pos || spans.is_empty() => {
-                    words.push(w.as_str());
-                    spans.push((start, start + w.end()));
-                    pos = start + w.end();
+/// Shell words of `text` in one pass, as byte spans, one list per command segment (an unquoted
+/// `|`, `;`, `&` or backtick ends a segment). A quoted fragment (`'…'`, `"…"` with backslash
+/// escapes) is part of its word, so a quoted `;` ends nothing; an unterminated quote runs to the
+/// end (more is masked, never less).
+fn shell_segments(text: &str) -> Vec<Vec<(usize, usize)>> {
+    let b = text.as_bytes();
+    let n = b.len();
+    let mut segments: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut cur: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < n {
+        match b[i] {
+            b' ' | b'\t' | b'\n' | b'\r' => i += 1,
+            b'|' | b';' | b'&' | b'`' => {
+                if !cur.is_empty() {
+                    segments.push(std::mem::take(&mut cur));
                 }
-                _ => break,
+                i += 1;
             }
-        }
-        if !words.iter().any(|w| secret_word.is_match(w)) {
-            continue;
-        }
-        let mut verb_open = true;
-        for (n, w) in words.iter().enumerate() {
-            if w.starts_with('-') {
-                continue;
-            }
-            // The first plain word, when it is `set`, is the verb.
-            let verb = std::mem::take(&mut verb_open) && *w == "set";
-            if !verb && !w.contains("***") {
-                cut.push(spans[n]);
+            _ => {
+                let start = i;
+                while i < n {
+                    match b[i] {
+                        b' ' | b'\t' | b'\n' | b'\r' | b'|' | b';' | b'&' | b'`' => break,
+                        b'\\' => i += 2,
+                        b'\'' => {
+                            i += 1;
+                            while i < n && b[i] != b'\'' {
+                                i += 1;
+                            }
+                            i += 1;
+                        }
+                        b'"' => {
+                            i += 1;
+                            while i < n && b[i] != b'"' {
+                                i += if b[i] == b'\\' { 2 } else { 1 };
+                            }
+                            i += 1;
+                        }
+                        _ => i += 1,
+                    }
+                }
+                cur.push((start, i.min(n)));
             }
         }
     }
+    if !cur.is_empty() {
+        segments.push(cur);
+    }
+    segments
+}
+
+/// The flags and values a config CLI's subcommand may sit behind (`aws --profile ci configure`).
+const HEAD_WALK: usize = 64;
+
+/// (core#1577, core#1580) Cut spans of every config CLI command in `text` (one pass over its
+/// words; a quoted word is scanned once more as a command of its own, a few levels deep). The head
+/// is a tool (`npm`, `aws`, `git`, …), flags and their values, then `config` / `configure` / `c`
+/// (the earliest such word wins). EVERY argument after it is cut, whatever it is named, a leading
+/// `set` and the flags aside: no key/value pairing, no flag-arity guess, no secret-word test (npm
+/// keys carry `/` and `:`, git's are `imap.pass`, az's `storage.connection_string`, and a git
+/// credential helper is a script). After `--` every word is an argument. An argument an earlier
+/// pass already cut in part is cut whole.
+fn config_cuts(text: &str, base: usize, depth: u8, cuts: &mut Vec<(usize, usize)>) {
+    for words in shell_segments(text) {
+        if depth < 4 {
+            for &(a, b) in &words {
+                let w = &text[a..b];
+                if w.len() > 2 && (w.starts_with('\'') || w.starts_with('"')) {
+                    let inner_end = if w.ends_with(&w[..1]) { b - 1 } else { b };
+                    config_cuts(&text[a + 1..inner_end], base + a + 1, depth + 1, cuts);
+                }
+            }
+        }
+        for t in 0..words.len() {
+            let tool = text[words[t].0..words[t].1].trim_start_matches('(');
+            if !CONFIG_TOOLS.contains(&tool) {
+                continue;
+            }
+            let mut j = t + 1;
+            let mut after_flag = false;
+            let mut found = None;
+            while j < words.len() && j <= t + HEAD_WALK {
+                let w = &text[words[j].0..words[j].1];
+                if matches!(w, "config" | "configure" | "c") {
+                    found = Some(j);
+                    break;
+                }
+                if w.starts_with('-') {
+                    after_flag = true;
+                } else if after_flag {
+                    after_flag = false;
+                } else {
+                    break;
+                }
+                j += 1;
+            }
+            let Some(head) = found else { continue };
+            let (mut verb_open, mut positional) = (true, false);
+            for &(a, b) in &words[head + 1..] {
+                let w = &text[a..b];
+                if w == "--" && !positional {
+                    positional = true;
+                    continue;
+                }
+                if !positional && w.starts_with('-') {
+                    continue;
+                }
+                if std::mem::take(&mut verb_open) && w == "set" {
+                    continue;
+                }
+                cuts.push((base + a, base + b));
+            }
+            // Every later head in this segment lies inside what was just cut.
+            break;
+        }
+    }
+}
+
+fn redact_config_pairs(cmd: &str) -> String {
+    let mut cut: Vec<(usize, usize)> = Vec::new();
+    config_cuts(cmd, 0, 0, &mut cut);
     cut.sort_unstable();
     let mut merged: Vec<(usize, usize)> = Vec::new();
     for (a, b) in cut {
@@ -1339,6 +1401,18 @@ mod tests {
                 ),
                 v("x"),
             ),
+            (
+                format!(
+                    "git config credential.helper '!f() {{ printf \"username=%s\\npassword=%s\\n\" bot {}; }}; f'",
+                    v("y")
+                ),
+                v("y"),
+            ),
+            (format!("git config imap.pass {}", v("z")), v("z")),
+            (
+                format!("az config set storage.connection_string {}", v("za")),
+                v("za"),
+            ),
         ];
         for (cmd, secret) in &cases {
             let t = bash(cmd);
@@ -1350,13 +1424,16 @@ mod tests {
             "git status --short",
             "nothing secret, nothing cut"
         );
-        for kept in [
+        assert_eq!(
+            bash("git clone https://example.test/o/r.git"),
             "git clone https://example.test/o/r.git",
-            "npm config set registry https://registry.example.test/",
-            "aws configure set region eu-west-1",
-        ] {
-            assert_eq!(bash(kept), kept, "nothing secret, nothing cut");
-        }
+            "nothing secret, nothing cut"
+        );
+        // A config write is masked whole, secret or not (over-redaction, the core#1575 class).
+        assert_eq!(
+            bash("aws configure set region eu-west-1"),
+            "aws configure set *** ***"
+        );
         // Paths in a command: the worktree's are relative, the home directory is `~`.
         assert_eq!(bash("cat /w/repo/src/a.rs"), "cat src/a.rs");
         if let Some(h) = home() {
@@ -1440,8 +1517,26 @@ mod tests {
             ),
             (
                 "npm --prefix . config set --location user init-author-name \"npm config token X\" registry https://auth.example.test/ //h/:_authToken \"{s}\"",
-                "npm --prefix . config set --location *** *** ***",
+                "npm --prefix . config set --location *** *** *** *** *** *** ***",
             ),
+            // core#1580 (merge check r2): a git credential helper script (an earlier pass masks its
+            // placeholder, the argument is still masked whole), and keys no word list names.
+            (
+                "git config credential.helper '!f() { printf \"username=%s\\npassword=%s\\n\" bot {s}; }; f'",
+                "git config *** ***",
+            ),
+            ("git config imap.pass {s}", "git config *** ***"),
+            ("git config sendemail.smtpPass {s}", "git config *** ***"),
+            ("az config set storage.key {s}", "az config set *** ***"),
+            (
+                "az config set storage.connection_string {s}",
+                "az config set *** ***",
+            ),
+            (
+                "gcloud config set auth/access_token_file {s}",
+                "gcloud config set *** ***",
+            ),
+            ("git config -- user.name -{s}", "git config -- *** ***"),
             (
                 "npm config set //h/:_authToken 'prefix'{s}",
                 "npm config set *** ***",
@@ -1453,7 +1548,7 @@ mod tests {
             ("tool --password {s}\\ tail run", "tool --password *** run"),
             (
                 "npm config set '//h/:_authToken'={s}",
-                "npm config set '//h/:_authToken'=***",
+                "npm config set ***",
             ),
             ("curl --user=bot:{s} https://h", "curl --user=*** https://h"),
             ("curl -ubot:{s} https://h", "curl -u*** https://h"),
@@ -1487,11 +1582,12 @@ mod tests {
             // A key already cut as an assignment never takes the next word for its value.
             (
                 "npm config set //h/:_authToken=v --location=user",
-                "npm config set //h/:_authToken=*** --location=user",
+                "npm config set *** --location=user",
             ),
+            // Over-redaction, accepted (the core#1575 class): a plain config write is masked whole.
             (
                 "git config --global user.name 'Jane Doe'",
-                "git config --global user.name 'Jane Doe'",
+                "git config --global *** ***",
             ),
             (
                 "vim config/a.json src/auth.ts other",
@@ -1515,6 +1611,36 @@ mod tests {
         ];
         for (raw, want) in kept {
             assert_eq!(redact(raw), *want, "{raw:?}");
+        }
+    }
+
+    /// (core#1580) The head scan is one pass: 100 KB of repeated heads, flags and quoted words
+    /// redacts in about the time of text with no config command in it.
+    #[test]
+    fn the_redactor_is_linear_in_repeated_config_heads() {
+        use std::time::Instant;
+        let size = 100 * 1024;
+        let baseline_input = "echo ok ".repeat(size / 8);
+        let t = Instant::now();
+        let _ = redact(&baseline_input);
+        let baseline = t.elapsed();
+        for unit in [
+            "npm config ",
+            "npm -x ",
+            "npm -x config ",
+            "'npm config ' ",
+            "git config a ",
+        ] {
+            let input = unit.repeat(size / unit.len());
+            let t = Instant::now();
+            let out = redact(&input);
+            let took = t.elapsed();
+            assert!(!out.is_empty());
+            assert!(
+                took <= baseline * 5 + std::time::Duration::from_millis(250),
+                "{unit:?} x{} took {took:?}, baseline {baseline:?}",
+                size / unit.len()
+            );
         }
     }
 

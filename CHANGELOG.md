@@ -43,13 +43,16 @@ Two release tracks share this file, newest entry first regardless of track:
   fence recorders:
   - a bare token as a URL's userinfo, `https://TOKEN@host/…` (a user name alone is cut too; an `@` after `/`,
     `?` or `#` is not userinfo and stays);
-  - a config CLI's secret values (`npm config …`, `npm c …`, `aws configure …`, `git config …` and the like):
-    once the command's head is a config subcommand (flags and their values may sit before it,
-    `aws --profile ci configure set …`) and any argument after it names a secret, EVERY argument after the
-    subcommand is masked, a leading `set` and the flags aside (no key/value pairing, no flag-arity guess, so
-    `--userconfig ci.npmrc` and several pairs per `set` cannot shift anything); the keys are masked too (the
-    core#1575 class of over-redaction); a command quoted inside another's flag value is judged as well, and
-    the cuts are united (core#1580); a bare `config` word (`rg config …`) is not a config CLI;
+  - a config CLI's values (`npm config …`, `npm c …`, `aws configure …`, `git config …`, `gcloud config …`,
+    `az config …` and the like): after the config subcommand (flags and their values may sit before it,
+    `aws --profile ci configure set …`) EVERY non-flag argument is masked, whatever it is named (a leading `set`
+    stays; after `--` every word is an argument; an argument an earlier pass cut in part is masked whole). There
+    is no key/value pairing, no flag-arity guess and no secret-word test, so `--userconfig ci.npmrc`, several
+    pairs per `set`, `git config imap.pass …`, `az config set storage.connection_string …` and a git credential
+    helper script cannot slip through. A quoted word is scanned as a command too, the cuts are united (core#1580),
+    and the scan is one pass (100 KB of repeated heads costs about what plain text does). The accepted
+    over-redaction (the core#1575 class): `git config user.name 'Jane Doe'` records as `git config ***
+    ***`. A bare `config` word (`rg config …`) is not a config CLI;
   - a spaced or quoted-key `name = value` line (an AWS credentials or `.npmrc` line);
   - `--user=…` and the attached `-uuser:password`;
   - a value spelled as several abutting fragments (`'a'b`, `"a\"b"`, `a\ b`), now read as one shell word (a

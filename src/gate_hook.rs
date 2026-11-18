@@ -16633,6 +16633,23 @@ mod phase_scope_tests {
                 v("ovl"),
             ),
             (
+                format!(
+                    "git config credential.helper '!f() {{ printf \"username=%s\\npassword=%s\\n\" bot {}; }}; f'",
+                    v("helper")
+                ),
+                v("helper"),
+            ),
+            (format!("git config imap.pass {}", v("imap")), v("imap")),
+            (
+                format!("git config sendemail.smtpPass {}", v("smtp")),
+                v("smtp"),
+            ),
+            (format!("az config set storage.key {}", v("azkey")), v("azkey")),
+            (
+                format!("az config set storage.connection_string {}", v("azcs")),
+                v("azcs"),
+            ),
+            (
                 format!("curl --user \\\n  bot:{} https://example.test", v("cont")),
                 v("cont"),
             ),
