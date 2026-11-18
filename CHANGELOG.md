@@ -25,6 +25,18 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **napi-release drafts the GitHub Release for each core-ts tag; the operator publishes it after certification
+  (core#1552).** npm got every core-ts version, but nothing made a GitHub Release, so the Releases page's Latest
+  stayed a hand-made 0.7.29. A new `registry` job waits until npm serves all six packages at the tag's version (the
+  wait the lockfile job had, moved so both follow-ups share it; `lockfile` now `needs: registry`). After it, a
+  `github-release` job (`contents: write` on that job only) creates the tag's Release as a DRAFT with the version's
+  CHANGELOG block as notes. CI never publishes the draft and never sets Latest: the operator/coord publishes it and
+  sets Latest after JOURNEY CERTIFIED. An existing Release for the tag, draft or published, is left alone, so a re-run
+  never errors. `scripts/changelog-section.py` reads both the `- **core-ts X.Y.Z**` bullet and the older
+  `## [core-ts X.Y.Z]` heading (also the combined `## [0.4.0] / [core-ts 0.4.1]`), drops link refs and scrubs home
+  paths; exit 1 (no block) drafts a generic note, any other failure fails the job. Its tests run on CI's Linux leg.
+  Earlier versions are not backfilled. A full re-run after a publish still fails at npm (core#1556).
+
 - **The engine owns the QE evidence dir, and a QE binding miss re-runs QE (core#1484, crew#1554).**
   Before the QE executor turn the engine creates the attempt's QE run in the run's ledger (complete
   project, scenario and run rows, `config.json` when absent, the `evidence/<uuid>` dir) and the
