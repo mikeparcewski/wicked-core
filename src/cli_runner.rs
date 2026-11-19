@@ -3731,24 +3731,14 @@ pub(crate) fn rejudge_seats(
         .collect();
     // The preferred judges (the run's own seats, bench applied), the distinct seats the bench took
     // out, and the authors' identities — as the rotation computes them.
-    // (core#1592) A seat whose latest observed launch called a provider the judged work called is
-    // no judge to offer: its approval would be refused, so a re-judge on it only fails again.
-    let shared = |k: &str| crate::observed_provider::shared_with(k, &unit.observed_providers);
     let preferred_for = |parties: &[(String, &'static str)], bins: &[String]| {
         let excluded: Vec<&str> = parties.iter().map(|(p, _)| p.as_str()).collect();
         let mut ids = author_identities(&excluded, roster);
         ids.extend(bins.iter().cloned());
-        let distinct = crate::validator::distinct_judge_keys(
+        let preferred = crate::validator::distinct_judge_keys(
             &excluded,
             &without_author_binaries(&eligible_pool, &excluded, &ids),
         );
-        // The seats filtered out here stay in `lost`: a distinct seat existed, so the fallback
-        // seats may still stand in for it.
-        let preferred: Vec<String> = distinct
-            .iter()
-            .filter(|k| shared(k).is_none())
-            .cloned()
-            .collect();
         let lost: Vec<String> = crate::validator::distinct_judge_keys(
             &excluded,
             &without_author_binaries(&unbenched, &excluded, &ids),
@@ -3802,7 +3792,7 @@ pub(crate) fn rejudge_seats(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|c| c.key)
-                .filter(|k| !preferred.contains(k) && shared(k).is_none())
+                .filter(|k| !preferred.contains(k))
                 .collect()
         }
         _ => Vec::new(),
@@ -3834,8 +3824,6 @@ pub(crate) fn rejudge_seats(
                 )
             } else if !roster.iter().any(|c| c.key == *k || c.key == seat_key(k)) {
                 "not a judge seat on this computer (no registry record)".to_string()
-            } else if let Some(p) = shared(k) {
-                format!("was observed calling {p}, the provider the work called, so it is not independent of it")
             } else {
                 "runs the same CLI as a party to this work".to_string()
             };
@@ -9324,93 +9312,6 @@ mod tests {
             "{why}"
         );
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// (core#1592) A re-judge is not offered a seat seen calling the provider the work called: it
-    /// would fail the same way. The seat is named with why; the monitor is re-admitted instead.
-    #[test]
-    fn core_1592_rejudge_drops_a_seat_known_to_share_the_works_provider() {
-        let mut unit = crate::domain::WorkUnit::pending("r:u2", "r", 2, "fix it");
-        unit.assigned_cli = Some("claude".into());
-        unit.observed_providers = vec!["api.anthropic.com:443".into()];
-        unit.validator = Some(crate::validator::DeterministicValidator {
-            criterion: "c".into(),
-            script: "true".into(),
-            approved: true,
-        });
-        unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
-            output: String::new(),
-            attempt: 1,
-            seats: Vec::new(),
-            monitors: vec!["codex-j1592r".into()],
-            consumed: true,
-            at: 0,
-        });
-        let roster = vec![
-            seat("claude", "claude -p {PROMPT}"),
-            seat("codex-j1592r", "codex exec {PROMPT}"),
-            seat("pi-j1592r", "pi -p {PROMPT}"),
-        ];
-        let run: Vec<String> = ["claude", "codex-j1592r", "pi-j1592r"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        // Before pi is seen anywhere, it is offered (nothing is known).
-        let (before, _) = rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &[], &roster);
-        assert_eq!(before, ["pi-j1592r"]);
-        crate::observed_provider::record_receipt(
-            "pi-j1592r",
-            Some(vec!["api.anthropic.com:443".into()]),
-        );
-        crate::observed_provider::take_receipts();
-        let (seats, missing) =
-            rejudge_seats(&unit, &roster, &run, &[], &[], Some(&[]), &[], &roster);
-        assert_eq!(seats, ["codex-j1592r"], "{missing:?}");
-        let pi = missing.iter().find(|m| m.seat == "pi-j1592r");
-        assert!(
-            pi.is_some_and(|m| m.reason.contains("api.anthropic.com:443")),
-            "{missing:?}"
-        );
-        // With no other seat in the run, the fallback judge (outside the run) is still offered
-        // when the only distinct seat shares the work's provider — and not when it shares it too.
-        let mut agy = seat("agy#1592", "agy -p {PROMPT}");
-        agy.binary = "agy".into();
-        let pool = vec![agy.clone()];
-        let mut registry = roster.clone();
-        registry.push(agy);
-        let run_two: Vec<String> = ["claude", "pi-j1592r"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        let mut plain = unit.clone();
-        plain.requested_rejudge = None;
-        let (seats, missing) = rejudge_seats(
-            &plain,
-            &roster,
-            &run_two,
-            &[],
-            &[],
-            Some(&[]),
-            &pool,
-            &registry,
-        );
-        assert_eq!(seats, ["agy#1592"], "{missing:?}");
-        crate::observed_provider::record_receipt(
-            "agy#1592",
-            Some(vec!["api.anthropic.com:443".into()]),
-        );
-        crate::observed_provider::take_receipts();
-        let (seats, missing) = rejudge_seats(
-            &plain,
-            &roster,
-            &run_two,
-            &[],
-            &[],
-            Some(&[]),
-            &pool,
-            &registry,
-        );
-        assert!(seats.is_empty(), "{seats:?} {missing:?}");
     }
 
     /// (codex review on the re-land, KEY + SILENT-OK) The re-admission is never a route around
