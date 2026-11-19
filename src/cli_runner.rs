@@ -3742,6 +3742,8 @@ pub(crate) fn rejudge_seats(
             &excluded,
             &without_author_binaries(&eligible_pool, &excluded, &ids),
         );
+        // The seats filtered out here stay in `lost`: a distinct seat existed, so the fallback
+        // seats may still stand in for it.
         let preferred: Vec<String> = distinct
             .iter()
             .filter(|k| shared(k).is_none())
@@ -3752,7 +3754,7 @@ pub(crate) fn rejudge_seats(
             &without_author_binaries(&unbenched, &excluded, &ids),
         )
         .into_iter()
-        .filter(|k| !distinct.contains(k))
+        .filter(|k| !preferred.contains(k))
         .collect();
         (preferred, lost, ids)
     };
@@ -3800,7 +3802,7 @@ pub(crate) fn rejudge_seats(
                 .unwrap_or_default()
                 .into_iter()
                 .map(|c| c.key)
-                .filter(|k| !preferred.contains(k))
+                .filter(|k| !preferred.contains(k) && shared(k).is_none())
                 .collect()
         }
         _ => Vec::new(),
@@ -9369,6 +9371,46 @@ mod tests {
             pi.is_some_and(|m| m.reason.contains("api.anthropic.com:443")),
             "{missing:?}"
         );
+        // With no other seat in the run, the fallback judge (outside the run) is still offered
+        // when the only distinct seat shares the work's provider — and not when it shares it too.
+        let mut agy = seat("agy#1592", "agy -p {PROMPT}");
+        agy.binary = "agy".into();
+        let pool = vec![agy.clone()];
+        let mut registry = roster.clone();
+        registry.push(agy);
+        let run_two: Vec<String> = ["claude", "pi-j1592r"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut plain = unit.clone();
+        plain.requested_rejudge = None;
+        let (seats, missing) = rejudge_seats(
+            &plain,
+            &roster,
+            &run_two,
+            &[],
+            &[],
+            Some(&[]),
+            &pool,
+            &registry,
+        );
+        assert_eq!(seats, ["agy#1592"], "{missing:?}");
+        crate::observed_provider::record_receipt(
+            "agy#1592",
+            Some(vec!["api.anthropic.com:443".into()]),
+        );
+        crate::observed_provider::take_receipts();
+        let (seats, missing) = rejudge_seats(
+            &plain,
+            &roster,
+            &run_two,
+            &[],
+            &[],
+            Some(&[]),
+            &pool,
+            &registry,
+        );
+        assert!(seats.is_empty(), "{seats:?} {missing:?}");
     }
 
     /// (codex review on the re-land, KEY + SILENT-OK) The re-admission is never a route around
