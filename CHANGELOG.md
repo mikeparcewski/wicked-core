@@ -38,19 +38,21 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **A valued global flag before a config CLI's subcommand, and an .npmrc key after a secret-named word, no longer hide
-  the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
+- **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
+  hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
   allows flags that take a value before `config` / `configure`, is added to the unchanged one, and both heads' cuts
-  are merged, so nothing masked before is unmasked. A newline after the subcommand ends the command for the added head (the next line
-  is its own command). A scoped `.npmrc` key (`//host/:_authToken`) now also takes the next word when a secret-named
-  word precedes it (`npm config set registry https://auth.example.test/ //h/:_authToken V`; the key word is cut as
-  before, and now the value too). The earlier entry's "wherever the flags sit" covered valueless flags only.
-  Known limits (each also in a `post-mvp` issue): a flag whose value starts with `-` is not skipped; a pair whose
-  key is not an `.npmrc` scoped key (`//…`) after a secret-named word earlier in the same command is still read as
-  before; the word scan (as on main) runs across a `)`, so `$(aws … set aws_secret_access_key V) echo token READY`
-  also masks `READY`; and a bare `aws configure` / `git config` with no flag before it, followed by a newline,
-  masks the next line's words as it did on main (the newline rule above is for the added head only).
+  are merged, so nothing masked before is unmasked. For the added head only, a newline after the subcommand and a `)`
+  end the command (the next line, or the words after `$(…)`, are commands of their own). A scoped `.npmrc` AUTH key
+  (`//host/:_authToken`, `:_auth`, `:_password`, quoted or not) now also takes the next word when a secret-named word
+  precedes it (`npm config set registry https://auth.example.test/ //h/:_authToken V`; the key word is cut as before,
+  and now the value too); `:certfile` and `:keyfile` hold paths, so their values are kept. The earlier entry's
+  "wherever the flags sit" covered valueless flags only.
+  Known limits (each in core#1589): on main's head, unchanged, the word scan runs across a `)` and a newline, so
+  `$(aws configure set aws_secret_access_key V) echo token READY` masks `READY` and `aws configure` + newline masks
+  the next line's words (W8, as on main); a flag whose value starts with `-` is not skipped by the added head (W6);
+  a pair whose key is not an `.npmrc` auth key after a secret-named word earlier in the same command is read as
+  before (W6).
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
   worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
   next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's

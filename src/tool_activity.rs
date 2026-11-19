@@ -848,7 +848,7 @@ fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
 /// judged as an assignment. A secret-named word right after a valued flag, followed by another
 /// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
 /// aws_secret_access_key …`), so the next word is the key.
-fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
+fn config_cuts(cmd: &str, head: &regex::Regex, stop_at_paren: bool) -> Vec<(usize, usize)> {
     let (_, word, secret_word) = config_rules();
     let flag = |w: &str| w.starts_with('-');
     let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
@@ -873,6 +873,14 @@ fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
                 _ => break,
             }
         }
+        // (core#1580) The added head's command ends at the first word with a `)`: `$(aws … V) echo …`
+        // must not read the words after the substitution as part of it. Main's head keeps its scan.
+        if stop_at_paren {
+            if let Some(p) = words.iter().position(|w| w.contains(')')) {
+                words.truncate(p + 1);
+                spans.truncate(p + 1);
+            }
+        }
         let mut i = 0;
         while i + 1 < words.len() {
             let flag_value = i > 0
@@ -887,12 +895,16 @@ fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
                 i += 1;
             }
         }
-        // (core#1580) An .npmrc scoped key (`//host/:_authToken`) takes the next word wherever it
+        // (core#1580) An .npmrc scoped AUTH key (`//host/:_authToken`, `:_auth`, `:_password`; not `:certfile` or
+        // `:keyfile`, which hold paths) takes the next word wherever it
         // sits in the command: a secret-named word before it (`registry https://auth.example.test/`)
         // cannot hide its value. Added to the loop above, which cuts what it always cut.
         for (k, w) in words.iter().enumerate() {
             let key = w.trim_matches(['"', '\'']);
-            if k + 1 < words.len() && key.starts_with("//") && secret(key) && !flag(words[k + 1]) {
+            let auth_key = [":_authToken", ":_auth", ":_password"]
+                .iter()
+                .any(|k| key.ends_with(k));
+            if k + 1 < words.len() && key.starts_with("//") && auth_key && !flag(words[k + 1]) {
                 cut.push(spans[k + 1]);
             }
         }
@@ -920,8 +932,8 @@ fn valued_flag_head() -> &'static regex::Regex {
 
 /// Main's head and the valued-flag head, each cutting, the cuts merged (core#1580).
 fn redact_config_pairs(cmd: &str) -> String {
-    let mut cut = config_cuts(cmd, &config_rules().0);
-    cut.extend(config_cuts(cmd, valued_flag_head()));
+    let mut cut = config_cuts(cmd, &config_rules().0, false);
+    cut.extend(config_cuts(cmd, valued_flag_head(), true));
     cut.sort_unstable();
     let mut out = String::with_capacity(cmd.len());
     let mut last = 0;
@@ -1563,6 +1575,11 @@ mod tests {
                 "sh -c 'aws --profile p configure set aws_secret_access_key {s}'",
                 "sh -c 'aws --profile p configure set aws_secret_access_key ***'",
             ),
+            // `)` ends the added head's command; a following word is its own command.
+            (
+                "out=$(aws --profile p configure set aws_secret_access_key {s}) echo token READY",
+                "out=$(aws --profile p configure set aws_secret_access_key *** echo token READY",
+            ),
             // The issue's other shape: a secret-named word ahead of the key does not hide its value
             // (main cuts the key word there; the value is cut as well).
             (
@@ -1605,6 +1622,20 @@ mod tests {
         ];
         for raw in kept {
             assert_eq!(redact(raw), *raw, "{raw:?}");
+        }
+        // Scoped npm config that is not an auth key holds a path, not a secret: the value after
+        // it is kept (the key word is cut by main's own rule, as it always was).
+        for (raw, want) in [
+            (
+                "npm config set registry https://auth.example.test/ //auth.example.test/:certfile cert.pem",
+                "npm config set registry https://auth.example.test/ *** cert.pem",
+            ),
+            (
+                "npm config set registry https://auth.example.test/ //h/:keyfile key.pem",
+                "npm config set registry https://auth.example.test/ *** key.pem",
+            ),
+        ] {
+            assert_eq!(redact(raw), want, "{raw:?}");
         }
     }
 
