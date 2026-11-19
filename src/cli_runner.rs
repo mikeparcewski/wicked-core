@@ -5881,7 +5881,12 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 ids.extend(creator_bins.iter().cloned());
                 let all = without_author_binaries(&eligible, ex, &ids);
                 let configured = without_author_binaries(&eligible_configured, ex, &ids);
-                crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
+                // (core#1592) A judge the search would refuse as sharing the work's provider is
+                // no judge here: the monitor and creator exclusions must not rely on it.
+                crate::validator::independent_judge_available(
+                    ex,
+                    judge_roster(ex, &configured, &all),
+                )
             };
             // (crew#972 decision 2, core#1543) The validator author's exclusion is the weakest:
             // with no other judge left it is re-admitted — only when this unit's own launch was
@@ -6158,7 +6163,8 @@ fn run_unit_and_judge_in<'scope, 'env>(
             let has_judge = |ex: &[&str]| {
                 let mut ids = author_identities(ex, roster);
                 ids.extend(creator_bins.iter().cloned());
-                crate::validator::distinct_judge_available(
+                // (core#1592) As on the pinned path: only a judge independent of the work counts.
+                crate::validator::independent_judge_available(
                     ex,
                     &without_author_binaries(&eligible_run, ex, &ids),
                 )
@@ -9174,6 +9180,140 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// (core#1592, KEY) The monitor exclusion must not lean on a judge the search will refuse. Claude
+    /// built the work, codex monitored the step and raised a finding, and the second seat was seen
+    /// calling claude's provider: codex judges, disclosed. A second seat on another provider judges
+    /// as before (codex stays out). With no other seat the gate holds and names the providers.
+    /// Seat keys are unique to this test: the last-seen record is process-wide.
+    #[test]
+    fn core_1592_a_monitor_judges_when_the_only_other_seat_shares_the_works_provider() {
+        const ANTHROPIC: &str = "api.anthropic.com:443";
+        struct Gatewayed {
+            providers: std::collections::HashMap<&'static str, Vec<String>>,
+            seen_before: Vec<(&'static str, Vec<String>)>,
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                self.asked.lock().unwrap().push(seat.clone());
+                if seat == "claude" {
+                    // What the run's earlier launches left in the process-wide record.
+                    for (k, p) in &self.seen_before {
+                        crate::observed_provider::record_receipt(k, Some(p.clone()));
+                    }
+                }
+                crate::observed_provider::record_receipt(
+                    &seat,
+                    self.providers.get(seat.as_str()).cloned(),
+                );
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("wcore-1592-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+        unit.assigned_cli = Some("claude".into());
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the work is correct".into(),
+            script: "test -f x".into(),
+            approved: true,
+        });
+        // codex monitored this step and raised a finding (the basis a re-judge keeps).
+        unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: String::new(),
+            attempt: 1,
+            seats: Vec::new(),
+            monitors: vec!["codex-j1592".into()],
+            consumed: true,
+            at: 0,
+        });
+        let input = StepInput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 2,
+            unit,
+            workflow_id: "wf-r".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(dir.clone()),
+            governance: None,
+            prior_outputs: vec![],
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let noop: &DeltaSink = &|_: &str| {};
+        let judge = |roster: &[crate::AgenticCli], pi_calls: &str| {
+            let runner = Arc::new(Gatewayed {
+                providers: [
+                    ("claude", vec![ANTHROPIC.to_string()]),
+                    ("codex-j1592", vec!["chatgpt.com:443".to_string()]),
+                    ("pi-j1592", vec![pi_calls.to_string()]),
+                ]
+                .into_iter()
+                .collect(),
+                seen_before: vec![("pi-j1592", vec![pi_calls.to_string()])],
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let dynr: Arc<dyn StepRunner> = runner.clone();
+            let (_o, v, _) =
+                run_unit_and_judge_with_roster(&dynr, &input, None, noop, roster, &[], &[]);
+            let asked = runner.asked.lock().unwrap().clone();
+            (v.expect("a verdict"), asked)
+        };
+        let three = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex-j1592", "codex exec {PROMPT}"),
+            seat("pi-j1592", "pi -p {PROMPT}"),
+        ];
+        // pi was seen on claude's provider: codex, the monitor, judges, disclosed.
+        let (v, asked) = judge(&three, ANTHROPIC);
+        assert!(v.pass, "{v:?} asked {asked:?}");
+        assert_eq!(v.judge_cli.as_deref(), Some("codex-j1592"), "{asked:?}");
+        assert!(
+            v.judge_fallback
+                .as_ref()
+                .is_some_and(|f| f.label.contains("team-monitor fallback")),
+            "{v:?}"
+        );
+        // pi on another provider judges as before: the monitor stays out, nothing is disclosed.
+        let (v, asked) = judge(&three, "generativelanguage.googleapis.com:443");
+        assert!(v.pass, "{v:?} asked {asked:?}");
+        assert_eq!(v.judge_cli.as_deref(), Some("pi-j1592"), "{asked:?}");
+        assert!(v.judge_fallback.is_none(), "{v:?}");
+        assert!(!asked.iter().any(|a| a == "codex-j1592"), "{asked:?}");
+        // No other seat at all: the hold names what the work and the approver called.
+        let two = vec![
+            seat("claude", "claude -p {PROMPT}"),
+            seat("pi-j1592", "pi -p {PROMPT}"),
+        ];
+        let (v, _) = judge(&two, ANTHROPIC);
+        assert!(!v.pass && v.judge_cli.is_none(), "{v:?}");
+        let why = v.seat_failure.as_deref().unwrap_or_default();
+        assert!(why.contains("no judge independent"), "{why}");
+        assert!(
+            why.contains("the work called api.anthropic.com:443"),
+            "{why}"
+        );
+        assert!(
+            why.contains("pi-j1592 called api.anthropic.com:443"),
+            "{why}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// (codex review on the re-land, KEY + SILENT-OK) The re-admission is never a route around
     /// observation: (1) a seat that runs claude under another key, picked once claude's exclusion
     /// lifted, has its UNOBSERVED approval discarded too; (2) a unit whose own history holds
@@ -9964,6 +10104,7 @@ mod tests {
         let e: anyhow::Error = crate::validator::NoIndependentJudge {
             seats: vec!["claude".into()],
             refusals: vec!["codex: exited 1".into()],
+            ..Default::default()
         }
         .into();
         let refused = vec![("codex".to_string(), "REJECT\nbroken\nREJECT".to_string())];
