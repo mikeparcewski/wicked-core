@@ -42,6 +42,25 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
+  hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
+  //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
+  allows flags that take a value before `config` / `configure`, is added to the unchanged one, and both heads' cuts
+  are merged, so nothing masked before is unmasked. For the added head only, a newline after the subcommand and a `)`
+  end the command (the next line, or the words after `$(…)`, are commands of their own). A scoped `.npmrc` AUTH key
+  (`//host/:_authToken`, `:_auth`, `:_password`, quoted or not) now also takes the next word when a secret-named word
+  precedes it (`npm config set registry https://auth.example.test/ //h/:_authToken V`; the key word is cut as before,
+  and now the value too); `:certfile` and `:keyfile` hold paths, so their values are kept. The earlier entry's
+  "wherever the flags sit" covered valueless flags only.
+  Known limits (each in core#1589, all present on main's matcher, which this change leaves as it was): a quoted `)`
+  in a value ends the added head's scan (`… registry 'https://example.test/(v1)' //h/:_authToken V` keeps `V`), a
+  second command after a `$(…)` is not read as a config command (`out=$(aws … get region) aws … set
+  aws_secret_access_key V` keeps `V`), and a pair whose key is not an `.npmrc` auth key after a secret-named word
+  earlier in the same command is read as before (each W10); on main's head the word scan runs across a `)` and a
+  newline, so `$(aws configure set aws_secret_access_key V) echo token READY` masks `READY` and `aws configure` plus
+  a newline masks the next line's words (W8); a flag whose value starts with `-` is not skipped by the added head
+  (W6).
+
 - **A review-FAIL send-back no longer strands the judge when the only other seat shares the creator's provider (core#1592).** The monitor and creator exclusions counted a seat as a judge by name, so codex (a team monitor that raised a finding) was kept out for the sake of a seat the engine had already seen calling the creator's provider, whose approval the independent-judge search then refused: no judge, a `judge_unavailable` gate. A seat known to share the work's provider no longer counts as a judge there, so the monitor is re-admitted, disclosed. The refusal names the work's providers and what each refused approver was seen calling.
 
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
