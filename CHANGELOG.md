@@ -48,11 +48,14 @@ Two release tracks share this file, newest entry first regardless of track:
   precedes it (`npm config set registry https://auth.example.test/ //h/:_authToken V`; the key word is cut as before,
   and now the value too); `:certfile` and `:keyfile` hold paths, so their values are kept. The earlier entry's
   "wherever the flags sit" covered valueless flags only.
-  Known limits (each in core#1589): on main's head, unchanged, the word scan runs across a `)` and a newline, so
-  `$(aws configure set aws_secret_access_key V) echo token READY` masks `READY` and `aws configure` + newline masks
-  the next line's words (W8, as on main); a flag whose value starts with `-` is not skipped by the added head (W6);
-  a pair whose key is not an `.npmrc` auth key after a secret-named word earlier in the same command is read as
-  before (W6).
+  Known limits (each in core#1589, all present on main's matcher, which this change leaves as it was): a quoted `)`
+  in a value ends the added head's scan (`… registry 'https://example.test/(v1)' //h/:_authToken V` keeps `V`), a
+  second command after a `$(…)` is not read as a config command (`out=$(aws … get region) aws … set
+  aws_secret_access_key V` keeps `V`), and a pair whose key is not an `.npmrc` auth key after a secret-named word
+  earlier in the same command is read as before (each W10); on main's head the word scan runs across a `)` and a
+  newline, so `$(aws configure set aws_secret_access_key V) echo token READY` masks `READY` and `aws configure` plus
+  a newline masks the next line's words (W8); a flag whose value starts with `-` is not skipped by the added head
+  (W6).
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
   worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
   next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's
