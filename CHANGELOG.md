@@ -3217,6 +3217,39 @@ Two release tracks share this file, newest entry first regardless of track:
   of a governed `timed_out` attempt replays its `Edit` under attempt 1; two governed turns on one
   cached ACP session (attempt 0, then the `rework_of` attempt 1) each record the gate's `Write`
   answer in their own decisions log behind the ACP armed marker and each report the handoff.
+- **core-ts 0.15.46** — 2026-11-19 — patch release on main e4c9616, carrying 16 PRs since 0.15.45: #1553, #1555, #1557,
+  #1558, #1559, #1563, #1564, #1567, #1568, #1570, #1574, #1579, #1584, #1586, #1591 and #1595.
+  - **A delivered pull request's red required check goes back to Build in a power run (#1591, crew#1623).** When the
+    deliver script's trusted verdict is `checks_failed`, the deliver-refusal gate is answered by the same hand-off
+    send-back as a review's NOT-PASS, carrying the failing job's findings (log redacted at capture), and it spends the
+    same hand-off round budget. With the rounds spent, an unknown check state, or a phased run, the run stays parked at
+    the gate for the operator. crew 0.18.18 waits for the PR's required checks before it calls a run done.
+  - **A seat seen on the work's provider is no judge, for the monitor and creator exclusions too (#1595, core#1592).**
+    The exclusion no longer counts a seat by name: a seat known to share the work's provider does not count, and the
+    disclosed monitor re-admission then applies, so Codex judges work Pi and Claude share a provider for. A fix retry no
+    longer parks at "no eligible judge seat remained".
+  - **Judge coverage can be asked before a launch (#1558, crew#972).** `Core.judgeCoverage` answers whether the chosen
+    seats cover an author plus an independent judge, by the gate's own rule. Additive; no run behaviour changes.
+  - **A run's checks can be re-run on a rebased tree (#1559, crew#1493)** (`Core.checkRunTree`), so crew can re-deliver a
+    conflicting pull request without pushing an unchecked tree.
+  - **Git identity:** a seat's commits carry the operator's git identity whatever the seat configures (#1555, #1485); a
+    name ending in a Unicode space keeps it (#1567, core#1565); a repository with no git identity says so on the run and
+    at its gates, with the `git config` commands to run (#1568, core#1566).
+  - **Project graphs for every seat kind:** a unit or project chat bound to a project graph reads it, read-only, for
+    Claude, Codex and pi alike (#1563 and #1586; crew#1497, core#1571). Reading needs wicked-estate 0.35.7.
+  - **Power runs:** a held checkpoint pause stays held across a daemon restart until someone answers it (#1584,
+    core#1581); a change that spans several crates of one repository no longer pauses a run, only a second repository does
+    (#1570, core#1572).
+  - **Gates and redaction:** a tool call the engine refused before it ran no longer hides "Approve as your own
+    judgment" at a failed-floor gate (#1564, core#1562); secrets in a refused command are redacted once, at capture
+    (#1574, core#1569), and the redactor cuts URL userinfo, config-command secrets, continued lines and `--user=` forms,
+    with every deny print redacted (#1579, core#1577).
+  - **Release plumbing:** GitHub Releases for core-ts tags are drafted by CI after npm serves the packages, and the
+    operator publishes them after certification (#1557, core#1552); #1553 pinned the published 0.15.45 platform lock entries.
+  - **Known limits.** Quoted option names built to dodge the redactor are not cut, and an attached `-pVALUE` is not cut;
+    the reconciled `awaiting_human` attempt stays unfenced (core#1585); the other limits named in the entries above
+    stand. **Upgrade notes.** No `LaunchSpec` field change, gate protocol unchanged, no image rebuild; new binding methods
+    `checkRunTree` and `judgeCoverage`.
 - **core-ts 0.15.45** — 2026-11-17 — patch release on main 7a4a048, carrying 17 PRs since 0.15.44: #1487, #1490,
   #1510, #1511, #1512, #1514, #1515, #1516, #1518, #1519, #1521, #1526, #1527, #1530, #1539, #1547 and #1548.
   - **Judge independence is what the seat gateway observed (#1547, core#1543 P1).** A seat's identity for judging is the
