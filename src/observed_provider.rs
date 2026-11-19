@@ -120,6 +120,16 @@ pub(crate) fn shared_with(seat: &str, avoid: &[Provider]) -> Option<Provider> {
     last_seen(seat)?.into_iter().find(|p| avoid.contains(p))
 }
 
+/// The providers of the work being judged on this thread ([`JudgingWork`]); empty when none is held.
+pub(crate) fn work_providers() -> Vec<Provider> {
+    AVOID.with(|a| a.borrow().avoid.clone())
+}
+
+/// What `seat`'s launches on this thread were observed calling (empty: nothing observed).
+pub(crate) fn observed_this_thread(seat: &str) -> Vec<Provider> {
+    RECEIPTS.with(|r| observed_for(&r.borrow(), seat).providers)
+}
+
 /// Whether an approval `seat` just gave on this thread stands as independent of the work being
 /// judged: `false` when this thread's receipts show its launch calling one of the work's providers.
 /// Unobserved: `true` (nothing proven; the caller's own rules stand) — unless the search

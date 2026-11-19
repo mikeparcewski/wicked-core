@@ -42,6 +42,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A review-FAIL send-back no longer strands the judge when the only other seat shares the creator's provider (core#1592).** The monitor and creator exclusions counted a seat as a judge by name, so codex (a team monitor that raised a finding) was kept out for the sake of a seat the engine had already seen calling the creator's provider, whose approval the independent-judge search then refused: no judge, a `judge_unavailable` gate. A seat known to share the work's provider no longer counts as a judge there, so the monitor is re-admitted, disclosed. The refusal names the work's providers and what each refused approver was seen calling.
+
 - **A daemon restart no longer releases a held power-run pause (core#1581).** The pause wait lived only in the
   worker's memory: the boot redrive (`redrive_executing_sessions`) re-dispatched a paused run's build unit, and its
   next checkpoint wrote `power.pause = None`, with no operator answer. The persisted `power.pause` is now the pause's

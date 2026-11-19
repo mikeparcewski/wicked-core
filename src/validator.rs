@@ -2035,10 +2035,14 @@ impl AgentVerdict {
 /// and every other seat refused as a seat (`refusals`). No independent verdict exists — the caller
 /// tries the fallback seats the search did not walk ([`crate::cli_runner`]'s ladder), then holds
 /// as a seat failure, never as a REJECT and never on a same-provider approval.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct NoIndependentJudge {
     pub(crate) seats: Vec<String>,
     pub(crate) refusals: Vec<String>,
+    /// (core#1592) The providers the judged work was observed calling.
+    pub(crate) work: Vec<String>,
+    /// (core#1592) What each refused approver was observed calling, as `"<seat> called <providers>"`.
+    pub(crate) seen: Vec<String>,
 }
 
 impl NoIndependentJudge {
@@ -2048,6 +2052,18 @@ impl NoIndependentJudge {
              another provider than the work's",
             self.seats.join(", ")
         );
+        // (core#1592) Say which providers: the work's and what each approver was seen calling.
+        if !self.work.is_empty() || !self.seen.is_empty() {
+            s.push_str(&format!(
+                " (the work called {}; {})",
+                if self.work.is_empty() {
+                    "no observed provider".to_string()
+                } else {
+                    self.work.join(", ")
+                },
+                self.seen.join("; ")
+            ));
+        }
         if !self.refusals.is_empty() {
             s.push_str(&format!("; {}", self.refusals.join("; ")));
         }
@@ -2378,6 +2394,17 @@ pub(crate) fn distinct_judge_available(excluded_keys: &[&str], roster: &[Agentic
     !eligible_agent_seats(excluded_keys, roster).is_empty()
 }
 
+/// (core#1592) [`distinct_judge_available`] for a judge that must also be INDEPENDENT of the work:
+/// a seat already known (its latest observed launch in this process) to call a provider the work
+/// being judged on this thread called ([`crate::observed_provider::known_to_share`]) is no judge
+/// here, since its approval would be refused. The monitor and creator exclusions ask this, so a
+/// seat is never kept out for the benefit of a judge the search will then refuse.
+pub(crate) fn independent_judge_available(excluded_keys: &[&str], roster: &[AgenticCli]) -> bool {
+    eligible_agent_seats(excluded_keys, roster)
+        .iter()
+        .any(|c| !crate::observed_provider::known_to_share(&c.key))
+}
+
 /// (core#772) The keys of the identity-distinct, usable judge seats in `roster`, in rotation
 /// order — the seats [`agent_validate`] would walk for a work author in `excluded_keys`.
 pub(crate) fn distinct_judge_keys(excluded_keys: &[&str], roster: &[AgenticCli]) -> Vec<String> {
@@ -2605,6 +2632,7 @@ fn agent_validate_in(
     // on to the next seat and never ends on it. When it runs out it says so
     // ([`NoIndependentJudge`]); the fallback ladder runs this same search over its own seats.
     let mut not_independent: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
     let mut seats: Vec<&AgenticCli> = eligible_agent_seats(excluded_seats, roster);
     seats.sort_by_key(|c| crate::observed_provider::known_to_share(&c.key));
     for seat in seats {
@@ -2640,6 +2668,16 @@ fn agent_validate_in(
                         seat.key
                     );
                     not_independent.push(seat.key.clone());
+                    let calls = crate::observed_provider::observed_this_thread(&seat.key);
+                    seen.push(format!(
+                        "{} called {}",
+                        seat.key,
+                        if calls.is_empty() {
+                            "no observed provider".to_string()
+                        } else {
+                            calls.join(", ")
+                        }
+                    ));
                     continue;
                 }
                 return Ok(verdict);
@@ -2682,6 +2720,8 @@ fn agent_validate_in(
         return Err(NoIndependentJudge {
             seats: not_independent,
             refusals,
+            work: crate::observed_provider::work_providers(),
+            seen,
         }
         .into());
     }
