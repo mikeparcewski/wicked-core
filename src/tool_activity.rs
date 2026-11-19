@@ -804,6 +804,14 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
                 re(format!(r#"(?i)(\b(?:{SECRET_NAME}|cookie|x-api-key):\s*)[^\s'"]+"#)),
                 "${1}***",
             ),
+            // (crew#1623) A JSON member whose key names a secret (a CI log prints API bodies and
+            // config dumps): `"password": "v"`, `'api_key':'v'`. The value is the one quoted string.
+            (
+                re(format!(
+                    r#"(["']{SECRET_NAME}["']\s*:\s*)(?:"(?:[^"\\]|\\.)*"|'[^']*')"#
+                )),
+                "${1}***",
+            ),
             // `NAME=value` and `--name=value` / `--name value` / `-p value` where the name says secret.
             // (core#1577) `name = value` too, and a quoted name: an ini / credentials-file line
             // (`aws_secret_access_key = …`), an `.npmrc` `//host/:_authToken=…`.
@@ -1407,6 +1415,16 @@ mod tests {
             (
                 "printf 'aws_session_token = {s}' >> creds",
                 "printf 'aws_session_token = ***' >> creds",
+            ),
+            // (crew#1623) A CI log's bare lines: spaced `key = value`, quoted passwords.
+            ("aws_secret_access_key = {s}", "aws_secret_access_key = ***"),
+            ("api_key = {s}", "api_key = ***"),
+            ("password=\"{s}\"", "password=***"),
+            ("password='{s}'", "password=***"),
+            ("export API_KEY=\"{s}\"", "export API_KEY=***"),
+            (
+                "{\"password\":\"{s}\",\"api_key\": '{s}'}",
+                "{\"password\":***,\"api_key\": ***}",
             ),
         ];
         for (raw, want) in cut {

@@ -6701,6 +6701,16 @@ fn apply_step_result(
     let unit = units
         .get_mut(output.unit_ix)
         .ok_or_else(|| anyhow::anyhow!("unit ix {} out of range for {run_id}", output.unit_ix))?;
+    // (crew#1623) A PR-checks deliver refusal carries a CI job's log. It is redacted HERE, in place,
+    // at the one point every deliver output passes before ANY sink: the attempt record, the
+    // transcript, the gate prompt, the unit's denial, the findings and the send-back note all read
+    // `output.output` after this line. (The verdict is read from the trusted sentinel, which the
+    // redaction leaves whole.)
+    if let Some(redacted) =
+        crate::deliver_lift::redacted_checks_output(unit.tool_cmd.as_deref(), &output.output)
+    {
+        output.output = redacted;
+    }
     // NO-OP TRIPWIRE (core#126), scoped to SKILL-DRIVEN units: an Ok step whose entire output
     // is the CLI refusing the invocation ("Unknown command: …") is not completed work — it is a
     // silent no-op that must take the failure path (ladder/triage/gate), never fold as Ok.
@@ -7517,6 +7527,15 @@ fn apply_step_result(
             put_node(store, unit.to_node())?;
             // The FULL refusal transcript survives the rejection (usability review #1).
             persist_rejected_transcript(store, &session, unit, &output.output);
+            // (crew#1623) The PR is open and a required check on it is red: on a power run with
+            // hand-off rounds left the gate below is answered by a send-back to the build (the
+            // same path and budget as a review's NOT-PASS); otherwise it waits for the operator.
+            let pr_checks_send_back = power_gate::pr_checks_failed_send_back(
+                subscribers,
+                &mut session,
+                unit,
+                &output.output,
+            );
             // `detail` is the bare bounded excerpt — no framing — so seat health and the studio
             // read the script's own words (crew `deliver-triage.ts` classifies them).
             emit(
@@ -7551,6 +7570,16 @@ fn apply_step_result(
                 "escalation",
                 prompt,
             )?;
+            if let Some(note) = pr_checks_send_back {
+                let (reply, _rx) = std::sync::mpsc::channel();
+                let _ = self_tx.send(Command::ConfirmGate {
+                    run_id: run_id.clone(),
+                    decision: crate::workflow::HumanDecision::RequestChanges { note: Some(note) },
+                    actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
+                    expect: None,
+                    reply,
+                });
+            }
             return Ok(StepApplied::Paused);
         }
         // (N4, ship re-proof) A deliver unit that reaches this point carries the LIFT-CONFLICT
@@ -13842,6 +13871,13 @@ fn dispatch_unit_with(
                     (refused.output, refused.status)
                 }
             };
+            // (crew#1623) A PR-checks deliver refusal carries a CI job's log: redacted HERE, where the
+            // tool's output is captured, before the live delta below and the result both carry it.
+            // (The fold redacts again at its top: the same function, idempotent, for any other
+            // producer of a deliver result.)
+            let output_str =
+                crate::deliver_lift::redacted_checks_output(Some(cmd.as_slice()), &output_str)
+                    .unwrap_or(output_str);
             // core#500: say what was stopped BEFORE the result posts — one channel, so this frame
             // lands after whatever the actor emitted when it flipped the identity (`runCancelled`
             // on a cancel; `unitReassigned` → `toolExecutorDispatched` on a supersede). Nothing
@@ -20466,7 +20502,10 @@ fn rewind_to_creator_scoped(
         // target, as core#803 says.
         Some(d) => {
             matches!(d.source.as_str(), "worker_failure" | "turn_timeout")
-                || d.source == crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL
+                // (crew#1623) …except a delivery whose PR's required checks are red: the command
+                // worked, the work is what failed, so it goes back to the creator.
+                || (d.source == crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL
+                    && !crate::deliver_lift::refusal_is_pr_checks_failed(cursor))
                 // (DES-DEMO-RECORD-001) The host could not record: retry the Tool.
                 || d.source == crate::demo_record::DENIAL_REFUSED
                 // (DES-EDITOR-CONFORMANCE-HOST) The cases could not run here: retry the Tool.
@@ -22271,6 +22310,61 @@ retry the deliver phase";
         let (applied, session, unit) = fail(&mut store, &mut subs, &run_id, IDENTITY_REFUSAL);
         let evs = drain(&erx);
         assert_parked_on_the_refusal(&store, &run_id, applied, &session, &unit, &evs);
+    }
+
+    /// (crew#1623) A PR-checks refusal carries a CI job's log. Redaction happens where the output is
+    /// captured, before ANY sink: the stored attempt record, the unit's transcript, the denial, the
+    /// emitted frames and the gate prompt all lack the secret and the home path.
+    #[test]
+    fn a_pr_checks_refusal_is_redacted_before_any_sink() {
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let secret = ["wJalr", "XUtnFEMI7MDENG"].concat();
+        let pw = ["pw0", "rd-value"].concat();
+        let jk = ["json", "-key-value"].concat();
+        let home = ["/Us", "ers/alice"].concat();
+        let run_id = format!("deliver-checks-redact-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, &run_id, "deliver", false);
+        let mut u = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        u.tool_cmd = Some(vec![format!("DELIVER_NONCE='{nonce}'; exit 1")]);
+        put_node(&mut store, u.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let output = format!(
+            "deliver: PR CHECKS DETAIL\n--- CI / semver (fail)\naws_secret_access_key = {secret}\n\
+             password=\"{pw}\"\n{{\"api_key\":\"{jk}\"}}\ncwd {home}/work\n\
+             deliver: PR CHECKS FAILING - url\ndeliver: OUTCOME {nonce} checks_failed"
+        );
+        let (applied, _session, unit) = fail(&mut store, &mut subs, &run_id, &output);
+        assert!(matches!(applied, StepApplied::Paused));
+        let mut seen = String::new();
+        for ev in drain(&erx) {
+            seen.push_str(&ev.to_json().to_string());
+        }
+        seen.push_str(unit.denial_reason.as_deref().unwrap_or_default());
+        for attempt in [None, Some(0)] {
+            let t = crate::domain::get_unit_transcript_at(&store, &unit.id, attempt)
+                .expect("a transcript record");
+            seen.push_str(t.output.as_deref().unwrap_or_default());
+        }
+        let record = crate::domain::get_unit_transcript_at(&store, &unit.id, Some(0)).unwrap();
+        assert!(
+            record
+                .output
+                .as_deref()
+                .is_some_and(|o| o.contains("PR CHECKS DETAIL")),
+            "the attempt record keeps the (redacted) log"
+        );
+        for leaked in [secret.as_str(), pw.as_str(), jk.as_str(), home.as_str()] {
+            assert!(!seen.contains(leaked), "{leaked} reached a sink: {seen}");
+        }
+        assert!(
+            seen.contains(&format!("deliver: OUTCOME {nonce} checks_failed")),
+            "the trusted verdict survives the redaction"
+        );
     }
 
     /// (wicked-crew 0.9.4 release smoke, F-SMOKE-004) A judge seat that refused while a unit's
@@ -26276,6 +26370,49 @@ mod request_changes_tests {
             })
             .collect();
         assert_eq!(amended, vec![5], "a refused deliver retries itself");
+
+        // (crew#1623) …but a deliver whose PR's required checks are red (the trusted
+        // `checks_failed` verdict) is a verdict on the work: the send-back reaches the creator.
+        let nonce = "0123456789abcdef0123456789abcdef";
+        let run_id = format!("rc-deliver-checks-red-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_bug_with_deliver(&mut store, &run_id);
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        let tool = units.iter_mut().find(|u| u.ord == 5).unwrap();
+        tool.tool_cmd = Some(vec![format!("DELIVER_NONCE='{nonce}'; deliver.sh")]);
+        tool.status = UnitStatus::Rejected;
+        tool.last_attempt = Some(0);
+        let why = format!(
+            "deliver refused on unit 5: deliver: PR CHECKS FAILING - url\ndeliver: OUTCOME {nonce} checks_failed"
+        );
+        tool.denial_reason = Some(why.clone());
+        tool.denial = Some(crate::domain::UnitDenial::new(
+            crate::deliver_lift::DENIAL_SOURCE_DELIVER_REFUSAL,
+            why,
+        ));
+        put_node(&mut store, tool.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::RequestChanges { note: None },
+        )
+        .unwrap();
+        let amended: Vec<u32> = drain(&erx)
+            .iter()
+            .filter_map(|e| match e {
+                CoreEvent::UnitReworkAmended { ord, .. } => Some(*ord),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(amended.len(), 1, "{amended:?}");
+        assert_ne!(
+            amended[0], 5,
+            "red PR checks go back to the creator, not to deliver"
+        );
     }
 
     /// DES §7 (11): at the intake gate (cursor on triage, no creator before it) the arm is refused

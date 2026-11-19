@@ -16,6 +16,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Added
 
+- **A power run sends a delivered PR's red required check back to Build (crew#1623).** When the deliver script's trusted verdict is
+  `checks_failed` (the PR is open and a required check is red), the deliver-refusal gate is answered by the same hand-off send-back as a
+  review's NOT-PASS (`engine:power-handoff`), carrying the failing job's findings, and it spends the same `MAX_HANDOFF_ROUNDS` budget. With
+  the rounds spent, `checks_unknown`, or a phased run, the run stays parked at the gate for the operator. A send-back an operator answers on that gate (red checks) also reaches the creator instead of re-running deliver.
 - **The engine runs a run's repository checks on a rebased tree on request (crew#1493).** `check_run_tree` /
   napi static `Core.checkRunTree(runId, workdir, repoRoot, baseCommit)`: the verify floor the deliver re-verify runs,
   on a guarded checkout of exactly the tree `workdir`'s `HEAD` commit holds (a container floor checks that tree), held

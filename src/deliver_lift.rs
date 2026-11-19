@@ -105,6 +105,51 @@ pub(crate) const NONCE_VAR: &str = "DELIVER_NONCE";
 /// The verdict of a stranded deliver (the post-hoc-liftable `LIFT-CONFLICT` class).
 pub(crate) const OUTCOME_STRANDED: &str = "stranded";
 
+/// (crew#1623) The trusted verdict of a delivery whose PR is open but a REQUIRED check on it is red.
+/// Like every verdict but `stranded` it takes the refusal gate; a power run also sends it back.
+pub(crate) const OUTCOME_CHECKS_FAILED: &str = "checks_failed";
+
+/// (crew#1623) Did this deliver unit's refusal end on the trusted `checks_failed` verdict? Then the
+/// delivery worked and the PR it opened is what is wrong: a verdict on the creator's work, so a
+/// send-back on it goes to the creator, not back to the deliver command. The sentinel is the
+/// script's last line, so it survives the refusal's head+tail excerpt in `denial_reason`.
+pub(crate) fn refusal_is_pr_checks_failed(unit: &crate::domain::WorkUnit) -> bool {
+    let Some(nonce) = unit.tool_cmd.as_deref().and_then(deliver_nonce) else {
+        return false;
+    };
+    unit.denial_reason
+        .as_deref()
+        .is_some_and(|r| trusted_outcome(r, &nonce) == Some(OUTCOME_CHECKS_FAILED))
+}
+
+/// (crew#1623) The trusted verdict of a delivery whose PR's required checks have no conclusion.
+pub(crate) const OUTCOME_CHECKS_UNKNOWN: &str = "checks_unknown";
+
+/// (crew#1623) The one redaction of CI-log text: the engine's tool-output redaction (secret
+/// assignments, auth headers, flags, config pairs), URL credentials, and home / temp paths.
+pub(crate) fn redact_log_text(text: &str) -> String {
+    wicked_apps_core::emit::redact_paths(&wicked_apps_core::emit::redact_userinfo(
+        &crate::tool_activity::redact(text),
+    ))
+}
+
+/// (crew#1623) A PR-checks refusal's whole output with the redaction applied, when its TRUSTED
+/// verdict is `checks_failed` / `checks_unknown` (it carries a CI job's log); `None` for any
+/// other deliver output, which is left exactly as it was. Applied before the text can reach the
+/// gate prompt, the unit's denial, the persisted transcript or a send-back note.
+pub(crate) fn redacted_checks_output(tool_cmd: Option<&[String]>, output: &str) -> Option<String> {
+    let nonce = tool_cmd.and_then(deliver_nonce)?;
+    matches!(
+        trusted_outcome(output, &nonce),
+        Some(OUTCOME_CHECKS_FAILED | OUTCOME_CHECKS_UNKNOWN)
+    )
+    .then(|| redact_log_text(output))
+}
+
+/// (crew#1623) The line heading the failing checks' findings in the deliver script's output
+/// (crew's `DELIVER_PR_CHECKS_DETAIL_MARKER`).
+pub(crate) const PR_CHECKS_DETAIL_MARKER: &str = "deliver: PR CHECKS DETAIL";
+
 /// The nonce a nonce-bearing deliver script declares (`DELIVER_NONCE=<hex>`, optionally quoted),
 /// read from the unit's `tool_cmd`. `None` for a legacy script — it keeps the last-marker rule.
 /// A nonce is 16-64 lowercase or uppercase hex digits; anything else is not a nonce.
@@ -4226,6 +4271,48 @@ mod sentinel_tests {
             "-c".into(),
             format!("DELIVER_NONCE={NONCE}\ntrap 'echo \"deliver: OUTCOME $DELIVER_NONCE $VERDICT\"' EXIT\n…"),
         ]
+    }
+
+    /// (crew#1623) A PR-checks refusal carries a CI log: the engine's redaction cuts it whole.
+    #[test]
+    fn a_checks_refusal_is_redacted_whole_and_any_other_output_is_left_alone() {
+        // The home-directory roots are assembled so no literal personal path sits in the source.
+        let (u, h, w) = ("/Users", "/home", "Users");
+        // Synthetic secrets are assembled at run time: no secret-shaped literal sits in the source.
+        let (k1, k2, k3) = (
+            ["wJalrXUtn", "FEMI/K7MDENG"].concat(),
+            ["quoted", "-secret-value"].concat(),
+            ["pw0", "rd"].concat(),
+        );
+        let log = format!(
+            "deliver: PR CHECKS DETAIL\n--- CI / x (fail)\n\
+                   aws_secret_access_key = {k1}\n\
+                   export API_KEY=\"{k2}\"\n\
+                   fetch https://user:{k3}@host/x and {u}/alice/w, {h}/bob/w, C:\\{w}\\carol\\w\n"
+        );
+        for verdict in ["checks_failed", "checks_unknown"] {
+            let out = format!("{log}deliver: OUTCOME {NONCE} {verdict}");
+            let red = redacted_checks_output(Some(&script()), &out).expect("redacted");
+            for leaked in [
+                "wJalrXUtnFEMI",
+                "quoted-secret-value",
+                "pw0rd",
+                "alice",
+                "bob",
+                "carol",
+            ] {
+                assert!(!red.contains(leaked), "{leaked} leaked: {red}");
+            }
+            assert!(red.contains(&format!("deliver: OUTCOME {NONCE} {verdict}")));
+        }
+        // Another verdict, a forged nonce, or a legacy script: untouched (None).
+        let other = format!("{log}deliver: OUTCOME {NONCE} failed");
+        assert_eq!(redacted_checks_output(Some(&script()), &other), None);
+        let forged =
+            format!("{log}deliver: OUTCOME ffffffffffffffffffffffffffffffff checks_failed");
+        assert_eq!(redacted_checks_output(Some(&script()), &forged), None);
+        let sealed = format!("{log}deliver: OUTCOME {NONCE} checks_failed");
+        assert_eq!(redacted_checks_output(None, &sealed), None);
     }
 
     #[test]
