@@ -494,6 +494,7 @@ mod private_git {
         let mut archive = Vec::new();
         let held = write_side_tar(
             &f.git_dir,
+            id,
             &entries,
             &vec![0; entries.len()],
             files,
@@ -502,13 +503,17 @@ mod private_git {
         .unwrap();
         assert_eq!(held.len(), entries.len());
         assert!(held.iter().all(|(p, _)| !p.starts_with(".git/")));
+        extract_archive(f, name, &archive)
+    }
+
+    fn extract_archive(f: &Fixture, name: &str, archive: &[u8]) -> PathBuf {
         let out = f.root.join(name);
         std::fs::create_dir(&out).unwrap();
         // spawn-audit: test-only — extracts the exact floor copy-in stream into a private dir.
         let mut c = Command::new("tar");
         c.hardened().args(["-x", "-f", "-", "-C"]).arg(&out);
         let result = run_fed(c, PROBE, |w| {
-            w.write_all(&archive).map_err(|e| e.to_string())
+            w.write_all(archive).map_err(|e| e.to_string())
         })
         .unwrap();
         assert!(
@@ -518,6 +523,124 @@ mod private_git {
         );
         result.fed.unwrap();
         out
+    }
+
+    #[test]
+    fn the_pod_copy_in_matches_a_checkout_byte_for_byte() {
+        use sha2::{Digest, Sha256};
+
+        if !crate::repo_checks::git_has_attr_source() {
+            eprintln!("SKIP: this git has no --attr-source (< 2.40); the floor writes raw blobs");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!(
+            "wicked-floor-eol-test-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        // Own the directory before any assertion, so failures also clean up the fixture.
+        let mut f = Fixture {
+            git_dir: repo.join(".git"),
+            root,
+            repo,
+            base: String::new(),
+            head_tree: String::new(),
+        };
+        git(&f.repo, &["init", "-q", "-b", "main", "--template="]);
+        git(&f.repo, &["config", "core.autocrlf", "false"]);
+        std::fs::write(
+            f.repo.join(".gitattributes"),
+            "*.cmd text eol=crlf filter=evil\n*.bin binary\n",
+        )
+        .unwrap();
+        std::fs::write(f.repo.join("run.cmd"), b"echo ok\n").unwrap();
+        std::fs::create_dir(f.repo.join("sub")).unwrap();
+        std::fs::write(f.repo.join("sub/b.cmd"), b"a\nb\n").unwrap();
+        std::fs::write(f.repo.join("plain.txt"), b"keep\n").unwrap();
+        let binary = b"\x00\x01\r\nraw\n\xff";
+        std::fs::write(f.repo.join("data.bin"), binary).unwrap();
+        std::os::unix::fs::symlink("run.cmd", f.repo.join("link.cmd")).unwrap();
+        git(&f.repo, &["add", "-A"]);
+        git(&f.repo, &["commit", "-q", "-m", "checkout conversion"]);
+        f.base = git(&f.repo, &["rev-parse", "HEAD"]);
+        f.head_tree = git(&f.repo, &["rev-parse", "HEAD^{tree}"]);
+        assert_eq!(
+            read_blob(&f.git_dir, &f.base, "run.cmd").unwrap(),
+            b"echo ok\n"
+        );
+        assert_eq!(read_blob(&f.git_dir, &f.base, "data.bin").unwrap(), binary);
+
+        // Build the reference before configuring the driver: an unconfigured filter is ignored.
+        let checkout = f.root.join("checkout");
+        git(
+            &f.repo,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                checkout.to_str().unwrap(),
+                &f.base,
+            ],
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("run.cmd")).unwrap(),
+            b"echo ok\r\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("sub/b.cmd")).unwrap(),
+            b"a\r\nb\r\n"
+        );
+        assert_eq!(
+            std::fs::read(checkout.join("plain.txt")).unwrap(),
+            b"keep\n"
+        );
+        assert_eq!(std::fs::read(checkout.join("data.bin")).unwrap(), binary);
+
+        let marker = f.root.join("evil-filter-ran");
+        let smudge = format!(
+            "touch '{}'; exit 1",
+            marker.to_str().unwrap().replace('\'', "'\\''")
+        );
+        git(&f.repo, &["config", "filter.evil.smudge", &smudge]);
+        git(&f.repo, &["config", "filter.evil.required", "true"]);
+
+        // Neither writer may consult the source worktree's uncommitted attributes.
+        std::fs::write(f.repo.join(".gitattributes"), "*.cmd -text\n").unwrap();
+        for (side, id) in [("commit", &f.base), ("tree", &f.head_tree)] {
+            let entries = ls_tree(&f.git_dir, id).unwrap();
+            let times = vec![0; entries.len()];
+            for fill in [false, true] {
+                let mut archive = Vec::new();
+                let held = if fill {
+                    write_tree_tar(&f.git_dir, id, &entries, &times, &mut archive)
+                } else {
+                    write_side_tar(&f.git_dir, id, &entries, &times, None, &mut archive)
+                }
+                .unwrap();
+                assert!(!marker.exists(), "a repository filter driver ran");
+                let out = extract_archive(&f, &format!("{side}-{fill}"), &archive);
+                assert_eq!(held.len(), entries.len());
+                for ((path, expect), entry) in held.iter().zip(&entries) {
+                    assert_eq!(path, &entry.path, "hold order must match ls-tree");
+                    if entry.is_link() {
+                        assert_eq!(
+                            std::fs::read_link(out.join(path)).unwrap(),
+                            Path::new("run.cmd")
+                        );
+                        assert_eq!(expect, &Expect::Link("run.cmd".into()));
+                    } else {
+                        let expected = std::fs::read(checkout.join(path)).unwrap();
+                        assert_eq!(std::fs::read(out.join(path)).unwrap(), expected, "{path}");
+                        let digest: String = Sha256::digest(&expected)
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect();
+                        assert_eq!(expect, &Expect::File(digest, entry.mode & 0o111 != 0));
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -703,7 +826,15 @@ mod private_git {
                 oid: oid.clone(),
                 path: path.into(),
             }];
-            assert!(write_side_tar(&f.git_dir, &entries, &[0], None, &mut Vec::new()).is_err());
+            assert!(write_side_tar(
+                &f.git_dir,
+                &f.head_tree,
+                &entries,
+                &[0],
+                None,
+                &mut Vec::new(),
+            )
+            .is_err());
         }
         for path in [
             "git~1/HEAD",
@@ -716,7 +847,15 @@ mod private_git {
                 oid: oid.clone(),
                 path: path.into(),
             }];
-            let held = write_side_tar(&f.git_dir, &entries, &[0], None, &mut Vec::new()).unwrap();
+            let held = write_side_tar(
+                &f.git_dir,
+                &f.head_tree,
+                &entries,
+                &[0],
+                None,
+                &mut Vec::new(),
+            )
+            .unwrap();
             assert_eq!(held[0].0, path);
         }
     }

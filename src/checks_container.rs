@@ -2,7 +2,11 @@
 //!
 //! Each floor side runs in a fresh pod in the run's namespace. The engine streams a verified
 //! copy of the pinned tree into it, executes checks through `kubectl exec`, and verifies the
-//! tree after each check. The pod's rc file must agree with the command's exit status.
+//! tree after each check. Copies are converted as a checkout of that tree converts: its own
+//! `.gitattributes` text/eol rules and the source repository's `core.autocrlf`/`eol`, with no
+//! filter driver, hook, or host configuration. Conversion needs git >= 2.40 (`--attr-source`);
+//! older git writes raw blobs, as the host floor export does. The pod's rc file must agree with
+//! the command's exit status.
 //! Each side carries a private `.git`: HEAD names its copied snapshot, `origin/<default>` names
 //! the run base, and no other history is exported. If rebuilding `.git` fails, the tree still
 //! runs and the engine logs the failed step. Host hooks and repository configuration are never
@@ -19,7 +23,7 @@
 //! [`RUNNER_ENV`] selects `auto|container|sandbox`: auto tries pods on macOS, with the host
 //! sandbox as fallback; Linux auto keeps bwrap. Explicit container mode fails closed.
 
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -437,7 +441,10 @@ pub(crate) fn npm_ci(check: &RepoCheck) -> Option<&[String]> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The tree copy: a tar the engine writes from git's object store.
+// The tree copy: converted as a checkout under the tree's .gitattributes text/eol rules and
+// the source core.autocrlf/eol, with no filter driver, hook, or host configuration.
+// Conversion needs git >= 2.40 (--attr-source); older git writes raw blobs, as the host floor
+// export does.
 // ---------------------------------------------------------------------------------------------
 
 /// One entry of a tree to copy in.
@@ -905,99 +912,107 @@ pub(crate) enum Expect {
     Link(String),
 }
 
-/// Write `entries` (with `mtimes`) as a tar to `out`, reading each blob through one
-/// `git cat-file --batch` (raw object bytes: no filter, no eol conversion, no hook). Returns what
-/// each copied path holds, for the after-check comparison.
+/// Write `entries` of `tree` (with `mtimes`) as a tar to `out`. Regular files are converted
+/// exactly as a checkout of `tree` converts: its own `.gitattributes` text/eol rules and the
+/// source repository's `core.autocrlf`/`eol`, with no filter driver, hook, or host configuration.
+/// Conversion needs git >= 2.40 (`--attr-source`); older git writes raw blobs, as the host floor
+/// export does.
+/// Symlink targets stay raw. Returns what each copied path holds for the after-check comparison.
 pub(crate) fn write_tree_tar(
     git_dir: &Path,
+    tree: &str,
     entries: &[Entry],
     mtimes: &[u64],
     out: &mut dyn Write,
 ) -> Result<Vec<(String, Expect)>, String> {
-    write_side_tar(git_dir, entries, mtimes, None, out)
+    write_side_tar(git_dir, tree, entries, mtimes, None, out)
 }
 
-/// The exact copy-in archive: git metadata is deliberately outside the verified tree's `held`.
+/// The exact copy-in archive, converted as a checkout of `tree` under its own `.gitattributes`
+/// text/eol rules and the source repository's `core.autocrlf`/`eol`, with no filter driver, hook,
+/// or host configuration. Git metadata is outside the verified tree's `held`; link targets stay
+/// raw. Tar members group files before links, but `held` retains the input order for verification.
+/// Conversion needs git >= 2.40 (`--attr-source`); older git writes raw blobs, as the host floor
+/// export does.
 fn write_side_tar(
     git_dir: &Path,
+    tree: &str,
     entries: &[Entry],
     mtimes: &[u64],
     git: Option<&GitFiles>,
-    out: &mut dyn Write,
+    mut out: &mut dyn Write,
 ) -> Result<Vec<(String, Expect)>, String> {
     use sha2::{Digest, Sha256};
-    let mut c = git_cmd(git_dir, &["cat-file", "--batch"]);
-    c.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = c
-        .spawn()
-        .map_err(|e| format!("`git cat-file --batch`: {e}"))?;
-    let mut tx = child.stdin.take().ok_or("no stdin")?;
-    let mut rx = BufReader::new(child.stdout.take().ok_or("no stdout")?);
+    // Refuse metadata paths before reading any object or writing any part of the archive.
+    for e in entries {
+        if e.path.split('/').any(|c| c == ".git") {
+            return Err(format!("the tree holds a git metadata path {:?}", e.path));
+        }
+    }
     let mut held = Vec::with_capacity(entries.len());
-    let result = (|| -> Result<(), String> {
-        let mut line = String::new();
-        let mut out = out;
-        for (e, t) in entries.iter().zip(mtimes) {
-            if e.path.split('/').any(|c| c == ".git") {
-                return Err(format!("the tree holds a git metadata path {:?}", e.path));
-            }
-            writeln!(tx, "{}", e.oid).map_err(|e| e.to_string())?;
-            tx.flush().map_err(|e| e.to_string())?;
-            line.clear();
-            rx.read_line(&mut line).map_err(|e| e.to_string())?;
-            let mut f = line.trim_end().split(' ');
-            let (Some(_), Some(kind), Some(size)) = (f.next(), f.next(), f.next()) else {
-                return Err(format!("`{}`: {}", e.path, line.trim_end()));
-            };
-            if kind != "blob" {
-                return Err(format!("`{}` is not a blob ({kind})", e.path));
-            }
-            let size: usize = size.parse().map_err(|_| "a bad blob size".to_string())?;
-            let mut body = vec![0u8; size];
-            rx.read_exact(&mut body).map_err(|e| e.to_string())?;
-            let mut nl = [0u8; 1];
-            rx.read_exact(&mut nl).map_err(|e| e.to_string())?;
-            tar_member(&mut out, &e.path, e.mode, *t, &body)
-                .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
-            let expect = if e.is_link() {
-                Expect::Link(String::from_utf8_lossy(&body).into_owned())
-            } else {
-                Expect::File(
-                    Sha256::digest(&body)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect(),
-                    e.mode & 0o111 != 0,
-                )
-            };
-            held.push((e.path.clone(), expect));
+    let files: Vec<_> = entries
+        .iter()
+        .zip(mtimes)
+        .enumerate()
+        .filter(|(_, (e, _))| !e.is_link())
+        .collect();
+    let blobs = files
+        .iter()
+        .map(|(_, (e, _))| (e.oid.clone(), e.path.clone()))
+        .collect();
+    crate::repo_checks::checkout_bytes(git_dir, tree, blobs, true, |i, body| {
+        let (index, (e, t)) = files[i];
+        tar_member(&mut out, &e.path, e.mode, *t, &body)
+            .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
+        let expect = Expect::File(
+            Sha256::digest(&body)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect(),
+            e.mode & 0o111 != 0,
+        );
+        held.push((index, (e.path.clone(), expect)));
+        Ok(())
+    })?;
+    let links: Vec<_> = entries
+        .iter()
+        .zip(mtimes)
+        .enumerate()
+        .filter(|(_, (e, _))| e.is_link())
+        .collect();
+    let blobs = links
+        .iter()
+        .map(|(_, (e, _))| (e.oid.clone(), e.path.clone()))
+        .collect();
+    crate::repo_checks::checkout_bytes(git_dir, tree, blobs, false, |i, body| {
+        let (index, (e, t)) = links[i];
+        tar_member(&mut out, &e.path, e.mode, *t, &body)
+            .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
+        let expect = Expect::Link(String::from_utf8_lossy(&body).into_owned());
+        held.push((index, (e.path.clone(), expect)));
+        Ok(())
+    })?;
+    if let Some(files) = git {
+        for dir in [
+            ".git",
+            ".git/refs",
+            ".git/refs/heads",
+            ".git/refs/tags",
+            ".git/objects",
+            ".git/objects/info",
+            ".git/objects/pack",
+        ] {
+            tar_member(&mut out, dir, 0o040755, 0, &[]).map_err(|e| e.to_string())?;
         }
-        if let Some(files) = git {
-            for dir in [
-                ".git",
-                ".git/refs",
-                ".git/refs/heads",
-                ".git/refs/tags",
-                ".git/objects",
-                ".git/objects/info",
-                ".git/objects/pack",
-            ] {
-                tar_member(&mut out, dir, 0o040755, 0, &[]).map_err(|e| e.to_string())?;
-            }
-            for (rel, mode, bytes) in files {
-                tar_member(&mut out, &format!(".git/{rel}"), *mode, 0, bytes)
-                    .map_err(|e| e.to_string())?;
-            }
+        for (rel, mode, bytes) in files {
+            tar_member(&mut out, &format!(".git/{rel}"), *mode, 0, bytes)
+                .map_err(|e| e.to_string())?;
         }
-        out.write_all(&[0u8; 1024]).map_err(|e| e.to_string())?;
-        out.flush().map_err(|e| e.to_string())
-    })();
-    drop(tx);
-    let _ = child.kill();
-    let _ = child.wait();
-    result.map(|()| held)
+    }
+    out.write_all(&[0u8; 1024]).map_err(|e| e.to_string())?;
+    out.flush().map_err(|e| e.to_string())?;
+    held.sort_by_key(|(i, _)| *i);
+    Ok(held.into_iter().map(|(_, entry)| entry).collect())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1178,6 +1193,7 @@ struct NmMount {
 /// What one side's container is made from.
 #[derive(Debug, Clone)]
 struct SidePlan {
+    tree: String,
     entries: Vec<Entry>,
     git: Option<Arc<GitFiles>>,
     nm: Vec<NmMount>,
@@ -1557,7 +1573,7 @@ impl ChecksFloor {
                     &native,
                 );
                 let t = Instant::now();
-                let filled = self.fill_nm(&entries, dir, &volume, &native)?;
+                let filled = self.fill_nm(&id, &entries, dir, &volume, &native)?;
                 caches.push(CacheUse {
                     kind: "node_modules".into(),
                     volume: volume.clone(),
@@ -1595,7 +1611,7 @@ impl ChecksFloor {
                     &cargo_inputs(&entries, &id),
                 ]);
                 let t = Instant::now();
-                let filled = self.fill_cargo(&entries, dir, &marker)?;
+                let filled = self.fill_cargo(&id, &entries, dir, &marker)?;
                 let ms = (!matches!(filled, Fill::Hit)).then(|| t.elapsed().as_millis() as u64);
                 // One registry entry per side: the worst state of its workspaces' fetches.
                 match caches
@@ -1633,6 +1649,7 @@ impl ChecksFloor {
         }
         let git = optional_floor_git(&self.git_dir, &id, tree, self.base_commit.as_deref());
         Ok(SidePlan {
+            tree: id,
             entries,
             git,
             nm,
@@ -1870,7 +1887,14 @@ impl ChecksFloor {
         c.args(["sh", "-c", &script]);
         let mut held = Vec::new();
         let fed = run_fed(c, COPY, |w| {
-            held = write_side_tar(&self.git_dir, &entries, &times, plan.git.as_deref(), w)?;
+            held = write_side_tar(
+                &self.git_dir,
+                &plan.tree,
+                &entries,
+                &times,
+                plan.git.as_deref(),
+                w,
+            )?;
             Ok(())
         })
         .map_err(|e| format!("the tree copy-in: {e}"))?;
@@ -2274,16 +2298,23 @@ print(json.dumps({'n':len(bad),'paths':bad[:20]}))
 
     fn fill_nm(
         &self,
+        tree: &str,
         entries: &[Entry],
         dir: &str,
         volume: &str,
         native: &[&str],
     ) -> Result<Fill, String> {
-        self.filler().fill_nm(entries, dir, volume, native)
+        self.filler().fill_nm(tree, entries, dir, volume, native)
     }
 
-    fn fill_cargo(&self, entries: &[Entry], dir: &str, marker: &str) -> Result<Fill, String> {
-        self.filler().fill_cargo(entries, dir, marker)
+    fn fill_cargo(
+        &self,
+        tree: &str,
+        entries: &[Entry],
+        dir: &str,
+        marker: &str,
+    ) -> Result<Fill, String> {
+        self.filler().fill_cargo(tree, entries, dir, marker)
     }
 }
 
@@ -2302,6 +2333,7 @@ impl Filler<'_> {
     /// key and run, in a fill pod: B14).
     fn fill_nm(
         &self,
+        tree: &str,
         entries: &[Entry],
         dir: &str,
         volume: &str,
@@ -2363,6 +2395,7 @@ impl Filler<'_> {
              {mark}"
         );
         let got = self.run_install(
+            tree,
             entries,
             volume,
             &[
@@ -2388,7 +2421,13 @@ impl Filler<'_> {
     /// The copy leaves out every `.cargo` directory and `rust-toolchain` file, and every compiler
     /// wrapper is overridden, so cargo runs no repository-configured program while it has the
     /// network.
-    fn fill_cargo(&self, entries: &[Entry], dir: &str, marker: &str) -> Result<Fill, String> {
+    fn fill_cargo(
+        &self,
+        tree: &str,
+        entries: &[Entry],
+        dir: &str,
+        marker: &str,
+    ) -> Result<Fill, String> {
         let key = format!("{}/{CARGO_HOME_VOLUME}/{marker}", self.place.ns);
         let _lock = lock_volume(&format!("{}-{CARGO_HOME_VOLUME}", self.place.ns))?;
         if filled(&key) {
@@ -2413,6 +2452,7 @@ impl Filler<'_> {
         );
         let filtered = cargo_fill_entries(entries);
         let got = self.run_install(
+            tree,
             &filtered,
             CARGO_HOME_VOLUME,
             &[("CARGO_HOME", FILL_DIR)],
@@ -2431,8 +2471,10 @@ impl Filler<'_> {
     /// on success, `Failed(log)` when the install itself failed (the script's exit 3, after its
     /// `WICKED-FILL-START` line) and `reach` answers from the pod, `Err` for anything else (the
     /// cluster, the copy, the deadline, an unreachable registry). The pod goes on every path.
+    #[allow(clippy::too_many_arguments)]
     fn run_install(
         &self,
+        tree: &str,
         entries: &[Entry],
         claim: &str,
         env: &[(&str, &str)],
@@ -2499,7 +2541,7 @@ impl Filler<'_> {
         let mut c = self.place.exec(&name, true);
         c.args(["sh", "-c", &wrapped]);
         let fed = run_fed(c, FILL, |w| {
-            write_tree_tar(self.git_dir, entries, &times, w).map(drop)
+            write_tree_tar(self.git_dir, tree, entries, &times, w).map(drop)
         })
         .map_err(|e| format!("the install pod: {e}"))?;
         let out = String::from_utf8_lossy(&fed.out).into_owned();
@@ -2686,17 +2728,19 @@ pub(crate) fn seat_node_modules(
         memory: &memory,
         git_dir,
     };
-    Ok(match filler.fill_nm(&entries, "", &volume, &[])? {
-        Fill::Hit => SeatNm::Claim {
-            claim: volume,
-            hit: true,
+    Ok(
+        match filler.fill_nm(&snap.tree, &entries, "", &volume, &[])? {
+            Fill::Hit => SeatNm::Claim {
+                claim: volume,
+                hit: true,
+            },
+            Fill::Filled => SeatNm::Claim {
+                claim: volume,
+                hit: false,
+            },
+            Fill::Failed(log) => SeatNm::Failed(log),
         },
-        Fill::Filled => SeatNm::Claim {
-            claim: volume,
-            hit: false,
-        },
-        Fill::Failed(log) => SeatNm::Failed(log),
-    })
+    )
 }
 
 /// [`seat_node_modules`] as the seats' dependency provisioning ([`crate::seat_deps`]'s result
