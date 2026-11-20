@@ -482,6 +482,60 @@ fn a_carried_dispute_keeps_its_original_reviewer_out_whatever_the_seat_now_runs(
     );
 }
 
+#[test]
+fn a_carried_disputes_judge_cannot_arbitrate_after_another_seat_authors_with_its_binary() {
+    fn timeout(_: &DecisionRequest, _: &[crate::AgenticCli]) -> DisputeOutcome {
+        DisputeOutcome::TimedOut
+    }
+    let mut input = reviewed("carried-author-bin");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let pair: Vec<crate::AgenticCli> = ["claude", "codex", "pi"].into_iter().map(seat).collect();
+    let first_council = FakeCouncil::new("carried-author-bin", timeout);
+    let first = settle_with(&input, &judge, REVIEWER_KEPT, &first_council, &pair);
+    assert_eq!(first_council.seats(0), vec!["pi".to_string()]);
+    assert_eq!(row(&first, "R1").status, RuleStatus::Disputed);
+    input.unit.rule_check = Some(first);
+    // A later attempt's codex seat authored with pi; the original judge is now an author too.
+    input.unit.authored_by = vec!["codex".into()];
+    input.unit.authored_binaries = vec!["pi".into()];
+    let again = FakeCouncil::new("carried-author-bin-2", kept_1);
+    let r = settle_with(&input, &judge, "VERDICT: PASS", &again, &pair);
+    assert_eq!(
+        again.convened(),
+        0,
+        "an author binary equal to the judge is excluded"
+    );
+    assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
+    assert!(r.hold().is_some());
+}
+
+#[test]
+fn a_carried_disputes_arbiter_excludes_a_benched_creators_registered_binary() {
+    fn timeout(_: &DecisionRequest, _: &[crate::AgenticCli]) -> DisputeOutcome {
+        DisputeOutcome::TimedOut
+    }
+    let mut input = reviewed("carried-benched-creator");
+    let judge = Judging::says("BROKEN — src/a.rs:2 add() is untyped");
+    let mut reg: Vec<crate::AgenticCli> = ["claude", "codex", "pi"].into_iter().map(seat).collect();
+    let first_council = FakeCouncil::new("carried-benched-creator", timeout);
+    let first = settle_with(&input, &judge, REVIEWER_KEPT, &first_council, &reg);
+    assert_eq!(first_council.seats(0), vec!["pi".to_string()]);
+    assert_eq!(row(&first, "R1").status, RuleStatus::Disputed);
+    input.unit.rule_check = Some(first);
+    // The creator is benched, but its registry record now launches the original judge's binary.
+    reg[0].headless_invocation = "pi -p {PROMPT}".into();
+    let live: Vec<crate::AgenticCli> = ["codex", "pi"].into_iter().map(seat).collect();
+    let again = FakeCouncil::new("carried-benched-creator-2", kept_1);
+    let r = settle_in(&input, &judge, "VERDICT: PASS", &again, &reg, &live);
+    assert_eq!(
+        again.convened(),
+        0,
+        "benching a creator does not erase its identity"
+    );
+    assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
+    assert!(r.hold().is_some());
+}
+
 /// (codex r2) A special file planted at the slot's path (a FIFO) is refused at once: never a
 /// blocking open on the unit's worker thread.
 #[cfg(unix)]
@@ -1037,4 +1091,11 @@ fn a_run_of_two_seats_gets_its_arbiter_even_when_the_registry_has_more() {
             .is_some_and(|a| a.starts_with("pi (it judged the rule")),
         "{c:?}"
     );
+    // Resolving exclusions against the full registry must not re-admit a benched judge.
+    let live: Vec<crate::AgenticCli> = ["claude", "codex"].into_iter().map(seat).collect();
+    let benched = FakeCouncil::new("two-seat-run-benched", kept_1);
+    let r = settle_in(&input, &judge, REVIEWER_KEPT, &benched, &registry(), &live);
+    assert_eq!(benched.convened(), 0);
+    assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
+    assert!(r.hold().is_some());
 }

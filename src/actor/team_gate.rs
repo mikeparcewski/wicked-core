@@ -3716,6 +3716,7 @@ pub(super) fn revise_units(
                 // (core#850) …and the receipt of its last gate (codex r1).
                 k.assurance = o.assurance.clone();
                 k.worker_failed_clis = o.worker_failed_clis.clone();
+                k.content_refused_clis = o.content_refused_clis.clone();
                 k.team_run = o.team_run;
                 k.team = o.team.clone();
                 k.member_step = o.member_step.clone();

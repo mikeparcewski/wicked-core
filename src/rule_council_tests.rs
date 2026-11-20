@@ -332,6 +332,30 @@ fn a_kept_ruling_resting_on_the_instruction_is_waived_and_holds() {
 }
 
 #[test]
+fn a_rejected_arbiter_ballot_reports_the_single_seated_voter() {
+    let row = judged("R1", RuleStatus::Broken, "src/add.rs:1 untyped");
+    let v = DecisionVerdict {
+        seated: 1,
+        seats: vec!["pi".into()],
+        eligible: vec!["pi".into()],
+        no_ruling_reason: Some("council no seat returned a vote — pi: ballot rejected".into()),
+        ..verdict(&[])
+    };
+    let out = settle(
+        &row,
+        positions_for(&row, RuleStatus::Kept),
+        &v,
+        &VoteBars {
+            arbiter: true,
+            ..bars(false, None)
+        },
+    );
+    assert_eq!(out.status, RuleStatus::Disputed);
+    assert!(out.reason.contains("0 of 1 answered"), "{}", out.reason);
+    assert!(report(vec![out]).hold().is_some());
+}
+
+#[test]
 fn a_council_with_no_ruling_is_disputed_and_holds() {
     // A.7.2: 1 of 3 answered; a timeout; an error — each a disputed row that holds.
     let row = judged("R1", RuleStatus::Kept, "src/add.rs fine");

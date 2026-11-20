@@ -1320,6 +1320,11 @@ pub struct WorkUnit {
     /// resume/restart. `#[serde(default)]` for back-compat with units persisted before this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_failed_clis: Vec<String>,
+    /// (core#1492) The subset of [`Self::worker_failed_clis`] that REFUSED this unit's content (a
+    /// provider content-policy refusal). Disclosed on the gate so a reader knows another provider
+    /// refused the work a compliant seat now rules on. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_refused_clis: Vec<String>,
     /// (crew#972) EVERY seat this Build/Recon unit was dispatched on — its first seat and each seat
     /// a reassign, failover or bench reseat moved it to. Stamped at dispatch and kept, except for a
     /// worker failure that changed nothing ([`Self::author_probe`]): a seat that built any attempt
@@ -1349,6 +1354,10 @@ pub struct WorkUnit {
     /// dispatch, that launch's providers are unknown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observation_pending: bool,
+    /// (core#1549) A repeat-page reset left known-empty provider history while retaining
+    /// `last_attempt` for unique dispatch keys. Consumed by the next dispatch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observation_reset: bool,
     /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
     /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
     /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
@@ -1945,11 +1954,13 @@ impl WorkUnit {
             capture_report: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            content_refused_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
             observed_providers: Vec::new(),
             providers_unobserved: false,
             observation_pending: false,
+            observation_reset: false,
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,

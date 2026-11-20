@@ -198,6 +198,7 @@ pub(super) fn after_pass(
                 u.rework_of = None;
                 u.rework_amendment = None;
                 u.worker_failed_clis.clear();
+                u.content_refused_clis.clear();
                 // Who wrote the previous page is not who writes this one: the page's reviewer is
                 // excluded only by this pass's authors (codex r5 on #1226: a seat switch between
                 // pages left both seats authors and no reviewer could be seated). Earlier passes'
@@ -210,6 +211,7 @@ pub(super) fn after_pass(
                 // A launch whose observation never folded still leaves this page incomplete.
                 u.observed_providers.clear();
                 u.providers_unobserved = u.observation_pending;
+                u.observation_reset = true;
                 u.review_rounds.clear();
                 u.operator_rulings.clear();
                 u.floor_auto_retries = 0;
@@ -563,6 +565,71 @@ mod tests {
             ["ITEM 2: DEFERRED — confirm first-page CI"]
         );
         assert!(critique.review_rounds.is_empty());
+    }
+
+    #[test]
+    fn core_1549_a_repeat_page_dispatch_has_known_empty_provider_history() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ix = seed(&mut store, "observed-page", Vec::new(), |_| {});
+        let mut page = unit(&store, "observed-page", 1);
+        page.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "the page is correct".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        page.observed_providers = vec!["api.anthropic.com:443".into()];
+        put_node(&mut store, page.to_node()).unwrap();
+        let (result, _) = run(&mut store, "observed-page", ix, CONTINUE);
+        assert!(result.is_some());
+        let page = unit(&store, "observed-page", 1);
+        assert_eq!(page.last_attempt, Some(1), "attempt keys stay fresh");
+        assert!(page.observed_providers.is_empty());
+        assert!(
+            page.observation_pending,
+            "the new launch awaits its own receipt"
+        );
+        assert!(
+            !page.providers_unobserved,
+            "the observed previous page is not an unobserved launch: {page:?}"
+        );
+        assert!(
+            !page.to_node().metadata.contains_key("observation_reset"),
+            "the dispatch consumes the reset marker"
+        );
+    }
+
+    #[test]
+    fn core_1549_a_legacy_dispatch_without_a_reset_still_has_unknown_providers() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, "legacy-page", Vec::new(), |_| {});
+        let mut page = unit(&store, "legacy-page", 1);
+        page.status = UnitStatus::Distributed;
+        let mut node = page.to_node();
+        node.metadata.remove("observation_reset");
+        put_node(&mut store, node).unwrap();
+        let mut s = session("legacy-page", 0);
+        s.attempt = 1;
+        put_node(&mut store, s.to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let mut subs = crate::event_log::EventSink::default();
+        let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
+        assert!(dispatch_unit(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            "legacy-page",
+            0,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap());
+        let page = unit(&store, "legacy-page", 1);
+        assert!(page.providers_unobserved, "legacy history remains unknown");
+        assert!(page.observation_pending);
+        assert_eq!(page.last_attempt, Some(1));
     }
 
     /// codex r1/r2 on #1226: a new pass carries nothing of the last pass's reviews, send-back or
