@@ -2123,6 +2123,54 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
     Ok(units)
 }
 
+/// Read the unit at a session's cursor without dropping undecodable nodes from its ordering.
+/// Raw session identity and ordinals locate the node; only the selected node is decoded.
+/// An unreadable ordinal on any node in this session prevents locating the cursor safely.
+pub fn session_unit_at(
+    store: &dyn GraphRead,
+    session_id: &str,
+    unit_ix: usize,
+) -> anyhow::Result<Option<WorkUnit>> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(WORK_UNIT.to_string())],
+        ..Default::default()
+    };
+    let prefix = format!("{session_id}:");
+    let mut nodes = Vec::new();
+    for node in store.find_symbols(&query)? {
+        let belongs = match node.metadata.get("session_id").and_then(|v| v.as_str()) {
+            Some(id) => id == session_id,
+            None => node.name.starts_with(&prefix),
+        };
+        if !belongs {
+            continue;
+        }
+        let ord = node
+            .metadata
+            .get("ord")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "run {session_id}: cannot locate unit position {unit_ix}: \
+                     node {} has an unreadable ord",
+                    node.name
+                )
+            })?;
+        nodes.push((ord, node));
+    }
+    nodes.sort_by_key(|(ord, _)| *ord);
+    nodes
+        .get(unit_ix)
+        .map(|(_, node)| {
+            WorkUnit::from_node(node).map_err(|e| {
+                anyhow::anyhow!(
+                    "run {session_id}: unit position {unit_ix} could not be decoded: {e}"
+                )
+            })
+        })
+        .transpose()
+}
+
 /// Every [`WorkUnit`] on the store grouped by its session, each group ordered by `ord` — ONE scan
 /// of the unit nodes. A whole-store read (the sessions-detail fold behind every run read) builds
 /// on this, never on [`session_units`] per session: that re-reads and re-parses EVERY unit for
@@ -2839,6 +2887,63 @@ mod tests {
         assert_eq!(
             WorkUnit::from_node(&u.to_node()).unwrap().stage,
             StageKind::Review
+        );
+    }
+
+    /// core#1520 W6: a corrupt unit keeps its cursor position; other runs cannot poison it.
+    #[test]
+    fn session_unit_at_preserves_raw_positions_and_ignores_other_sessions() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let first = WorkUnit::pending("s:u1", "s", 1, "step one");
+        let second = WorkUnit::pending("s:u2", "s", 2, "step two");
+        let mut other = WorkUnit::pending("s:other", "other", 1, "unrelated").to_node();
+        other
+            .metadata
+            .insert("ord".into(), serde_json::json!("bad"));
+        other
+            .metadata
+            .insert("description".into(), serde_json::json!(false));
+        put_nodes(&mut store, &[second.to_node(), other, first.to_node()]).unwrap();
+
+        assert_eq!(
+            session_unit_at(&store, "s", 0).unwrap(),
+            Some(first.clone())
+        );
+        assert_eq!(
+            session_unit_at(&store, "s", 1).unwrap(),
+            Some(second.clone())
+        );
+        assert_eq!(session_unit_at(&store, "s", 2).unwrap(), None);
+
+        let mut corrupt = first.to_node();
+        corrupt
+            .metadata
+            .insert("description".into(), serde_json::json!(false));
+        put_node(&mut store, corrupt.clone()).unwrap();
+        let err = session_unit_at(&store, "s", 0).unwrap_err().to_string();
+        assert!(
+            err.contains("run s") && err.contains("unit position 0"),
+            "{err}"
+        );
+        assert_eq!(session_unit_at(&store, "s", 1).unwrap(), Some(second));
+
+        // Without a string session_id, the raw name still identifies this run's node.
+        corrupt
+            .metadata
+            .insert("session_id".into(), serde_json::json!(false));
+        put_node(&mut store, corrupt).unwrap();
+        assert!(session_unit_at(&store, "s", 0).is_err());
+
+        // An unreadable ordinal prevents locating the cursor safely, even past the last node.
+        let mut bad_ord = first.to_node();
+        bad_ord
+            .metadata
+            .insert("ord".into(), serde_json::json!("bad"));
+        put_node(&mut store, bad_ord).unwrap();
+        let err = session_unit_at(&store, "s", 2).unwrap_err().to_string();
+        assert!(
+            err.contains("run s") && err.contains("unit position 2"),
+            "{err}"
         );
     }
 
