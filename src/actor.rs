@@ -853,6 +853,7 @@ pub(crate) fn run(
         }
     };
 
+    crate::gate_hook::gov_root_for_state_home(operational_home.as_deref());
     if let Err(why) = crate::gate_hook::gov_root_ready() {
         eprintln!("wicked-core: {why}; every governed unit will be refused");
     }
