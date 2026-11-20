@@ -29,8 +29,10 @@
 //! on a phase; in the standalone P0 path it opens the phase if absent purely so the veto is
 //! observable, but the execute backend remains the phase opener of record.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use wicked_apps_core::{
     open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, HardenedCommand, NodeKind,
@@ -5825,6 +5827,45 @@ pub(crate) fn gov_root() -> std::path::PathBuf {
         )
     })
     .clone()
+}
+
+pub(crate) const GOV_DIR_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Best-effort startup sweep of old governance directories whose runs are no longer live.
+pub(crate) fn sweep_stale_gov_dirs(
+    root: &Path,
+    live_dir_names: &HashSet<String>,
+    max_age: Duration,
+    now: SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| live_dir_names.contains(name))
+        {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= max_age && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// The per-run governance directory (outside any worktree). Cleared on a FRESH (re-)launch of a run id
@@ -11887,6 +11928,52 @@ mod boundary_tests {
         assert_eq!(gov_root_for(&usable, &temp), root);
         assert_eq!(gov_root_for(&[None, Some("rel".into())], &temp), fallback);
         assert_eq!(gov_root_for(&[], &temp), fallback);
+    }
+
+    #[test]
+    fn sweep_stale_gov_dirs_removes_only_old_non_live_directories() {
+        use std::collections::HashSet;
+        use std::time::{Duration, SystemTime};
+
+        let root = std::env::temp_dir().join(format!("wicked-gov-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, live) = (root.join("old"), root.join("live"));
+        for dir in [&old, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let file = root.join("loose-file");
+        std::fs::write(&file, "keep").unwrap();
+        let max_age = Duration::from_secs(14 * 24 * 60 * 60);
+        let live_names = HashSet::from(["live".to_string()]);
+
+        // Everything is fresh: nothing goes, whatever its run's state.
+        let now = SystemTime::now();
+        assert_eq!(sweep_stale_gov_dirs(&root, &live_names, max_age, now), 0);
+        assert!(old.is_dir());
+
+        // Fifteen days later (no mtime games: portable): the non-live dir goes, nothing else.
+        let later = now + max_age + Duration::from_secs(86_400);
+        assert_eq!(sweep_stale_gov_dirs(&root, &live_names, max_age, later), 1);
+        assert!(!old.exists(), "old non-live directory must be removed");
+        assert!(live.is_dir(), "old live directory must be kept");
+        assert!(file.is_file(), "even an old loose file must be kept");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sweep_stale_gov_dirs_missing_root_returns_zero() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-gov-sweep-missing-{}", std::process::id()));
+        assert!(!root.exists());
+        assert_eq!(
+            sweep_stale_gov_dirs(
+                &root,
+                &std::collections::HashSet::new(),
+                std::time::Duration::from_secs(14 * 24 * 60 * 60),
+                std::time::SystemTime::now(),
+            ),
+            0
+        );
     }
 
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {

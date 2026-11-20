@@ -1130,11 +1130,25 @@ pub(crate) fn run(
     }
     // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
     // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
-    // skips it (liveness unknown).
+    // skips it (liveness unknown). The same live set protects governance directories during the
+    // one-time retention sweep below.
     match crate::domain::all_sessions(&store) {
-        Ok(sessions) => crate::k8s::boot_sweep(partition_sessions_for_reap(&sessions).0),
+        Ok(sessions) => {
+            let (live, _) = partition_sessions_for_reap(&sessions);
+            let live_dir_names = live
+                .iter()
+                .map(|id| crate::gate_hook::run_dir_name(id))
+                .collect();
+            crate::gate_hook::sweep_stale_gov_dirs(
+                &crate::gate_hook::gov_root(),
+                &live_dir_names,
+                crate::gate_hook::GOV_DIR_RETENTION,
+                std::time::SystemTime::now(),
+            );
+            crate::k8s::boot_sweep(live);
+        }
         Err(e) => {
-            eprintln!("wicked-core: skipping the cluster boot sweep: cannot read sessions ({e})")
+            eprintln!("wicked-core: skipping the cluster and governance boot sweeps: cannot read sessions ({e})")
         }
     }
     // (DES-TEAMING-002 §8.8) A member turn's read-only view is removed when the turn ends; one an
