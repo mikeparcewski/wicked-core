@@ -5791,28 +5791,37 @@ fn encode_run_id(run_id: &str) -> String {
         .collect()
 }
 
-/// Pure resolution of the governance root: `<home>/.wicked/core-gov`, else the legacy temp root.
-/// Outside the state home on purpose, so granting a seat access to a run's files does not unmask
-/// the state home's core.db (core#1430); `~/.wicked` is already a worker-denied home subdir.
+/// Pure resolution of the governance root: `<home>/.wicked/core-gov` for the first candidate home
+/// that is non-empty and absolute, else the legacy temp root. Outside the state home on purpose, so
+/// granting a seat access to a run's files does not unmask the state home's core.db (core#1430);
+/// `~/.wicked` is already a worker-denied home subdir.
 pub(crate) fn gov_root_for(
-    home: Option<std::ffi::OsString>,
+    homes: &[Option<std::ffi::OsString>],
     temp: &std::path::Path,
 ) -> std::path::PathBuf {
-    match home.filter(|h| !h.is_empty()) {
-        Some(h) => std::path::PathBuf::from(h).join(".wicked").join("core-gov"),
-        // Embedders/tests without a resolvable home keep the legacy temp root.
-        None => temp.join("wicked-core-gov"),
-    }
+    homes
+        .iter()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .find(|h| h.is_absolute())
+        .map(|h| h.join(".wicked").join("core-gov"))
+        // Embedders without a usable home keep the temp root.
+        .unwrap_or_else(|| temp.join("wicked-core-gov"))
 }
 
 /// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
-/// directory for a run, so a later change to `HOME` (a test pinning it, a child env) cannot move it.
+/// directory for a run, so a later change to `HOME` (a child env) cannot move it. Unit tests keep
+/// the temp root: they pin `HOME` per test, which a process-wide root must not latch.
 pub(crate) fn gov_root() -> std::path::PathBuf {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        if cfg!(test) {
+            return temp.join("wicked-core-gov");
+        }
         gov_root_for(
-            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-            &std::env::temp_dir(),
+            &[std::env::var_os("HOME"), std::env::var_os("USERPROFILE")],
+            &temp,
         )
     })
     .clone()
@@ -5820,30 +5829,10 @@ pub(crate) fn gov_root() -> std::path::PathBuf {
 
 /// The per-run governance directory (outside any worktree). Cleared on a FRESH (re-)launch of a run id
 /// so a prior terminal run's stale decisions can't fail a new run — see the launcher; resume/redrive
-/// deliberately do NOT clear it (they continue the same run's log).
+/// deliberately do NOT clear it (they continue the same run's log). A run in flight across the
+/// upgrade that moved the root re-arms on its next attempt (the old temp dir is not read).
 pub fn gov_run_dir(run_id: &str) -> std::path::PathBuf {
-    gov_run_dir_in(
-        &gov_root(),
-        &std::env::temp_dir().join("wicked-core-gov"),
-        run_id,
-    )
-}
-
-/// [`gov_run_dir`] over explicit roots. Adopts an in-flight run's directory from the legacy temp
-/// root once across an upgrade; a failed move (including across filesystems) is best effort, and
-/// only the new location is used afterwards.
-fn gov_run_dir_in(
-    root: &std::path::Path,
-    legacy_root: &std::path::Path,
-    run_id: &str,
-) -> std::path::PathBuf {
-    let dir = root.join(run_dir_name(run_id));
-    let legacy = legacy_root.join(run_dir_name(run_id));
-    if dir != legacy && !dir.exists() && legacy.exists() {
-        let _ = create_dir_all_private(root);
-        let _ = std::fs::rename(&legacy, &dir);
-    }
-    dir
+    gov_root().join(run_dir_name(run_id))
 }
 
 /// The per-run DIRECTORY NAME every engine-owned per-run scratch tree keys on — the governance
@@ -11883,44 +11872,15 @@ mod boundary_tests {
     #[test]
     fn gov_root_is_under_home_not_the_temp_dir() {
         let temp = std::path::Path::new("/var/folders/xx/T");
-        let root = gov_root_for(Some("/home/op".into()), temp);
+        let fallback = temp.join("wicked-core-gov");
+        let root = gov_root_for(&[Some("/home/op".into())], temp);
         assert_eq!(root, std::path::PathBuf::from("/home/op/.wicked/core-gov"));
         assert!(!root.starts_with(temp));
-        // No resolvable home: the legacy temp root, the only case that may live under temp.
-        assert_eq!(gov_root_for(None, temp), temp.join("wicked-core-gov"));
-        assert_eq!(
-            gov_root_for(Some("".into()), temp),
-            temp.join("wicked-core-gov")
-        );
-    }
-
-    #[test]
-    fn gov_run_dir_adopts_a_legacy_temp_dir_once() {
-        let base =
-            std::env::temp_dir().join(format!("core-1430-{}", uuid::Uuid::new_v4().simple()));
-        let (root, legacy_root) = (base.join("new"), base.join("legacy"));
-        let log = "attempt-0/decisions.ndjson";
-        let legacy = legacy_root.join(run_dir_name("r1"));
-        std::fs::create_dir_all(legacy.join("attempt-0")).unwrap();
-        std::fs::write(legacy.join(log), "existing decisions\n").unwrap();
-
-        let dir = gov_run_dir_in(&root, &legacy_root, "r1");
-        assert_eq!(dir, root.join(run_dir_name("r1")));
-        assert_eq!(
-            std::fs::read_to_string(dir.join(log)).unwrap(),
-            "existing decisions\n"
-        );
-        assert!(!legacy.exists());
-
-        // Once adopted, a new legacy tree must not replace the active run's evidence.
-        std::fs::create_dir_all(legacy.join("attempt-0")).unwrap();
-        std::fs::write(legacy.join(log), "stale decisions\n").unwrap();
-        assert_eq!(gov_run_dir_in(&root, &legacy_root, "r1"), dir);
-        assert_eq!(
-            std::fs::read_to_string(dir.join(log)).unwrap(),
-            "existing decisions\n"
-        );
-        std::fs::remove_dir_all(base).unwrap();
+        // Empty or relative candidates fall through to the next one, then to the temp root.
+        let usable = [Some("".into()), Some(".".into()), Some("/home/op".into())];
+        assert_eq!(gov_root_for(&usable, temp), root);
+        assert_eq!(gov_root_for(&[None, Some("rel".into())], temp), fallback);
+        assert_eq!(gov_root_for(&[], temp), fallback);
     }
 
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {

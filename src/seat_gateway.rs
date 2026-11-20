@@ -2197,7 +2197,7 @@ pub(crate) fn write_records(path: &Path, records: &[GatewayRecord]) {
     }
     let written = path
         .parent()
-        .map_or(Ok(()), fs::create_dir_all)
+        .map_or(Ok(()), crate::gate_hook::create_dir_all_private)
         .and_then(|()| fs::OpenOptions::new().create(true).append(true).open(path))
         .and_then(|mut f| f.write_all(body.as_bytes()));
     if let Err(e) = written {

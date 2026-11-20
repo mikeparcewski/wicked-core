@@ -50,8 +50,9 @@ Two release tracks share this file, newest entry first regardless of track:
 
 - **Per-run governance files survive macOS temp purges (core#1430).** Decisions logs, settings,
   policy databases and gateway records now live under `~/.wicked/core-gov/<run>` (HOME, else
-  USERPROFILE), with a temp fallback only when no home is resolvable. Existing temp directories
-  are adopted once on a best-effort basis, and gateway record writes recreate missing parents.
+  USERPROFILE; empty or relative values are skipped), with a temp fallback only when no usable home
+  exists. A run in flight across the upgrade re-arms on its next attempt (the old temp dir is not
+  read). Gateway record writes recreate a vanished parent directory, privately.
 
 - **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
   process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
