@@ -2296,12 +2296,9 @@ pub(crate) fn normalize_identity(tok: &str) -> String {
 /// identity, so a same-binary seat is never a valid "distinct" judge. NOT the `binary` registry field
 /// (which the ad-hoc/test seats leave unset) — the invocation is the ground truth of what runs.
 pub(crate) fn seat_identity(c: &AgenticCli) -> String {
-    let argv0 = c
-        .headless_invocation
-        .split_whitespace()
-        .next()
-        .unwrap_or("");
-    normalize_identity(argv0)
+    normalize_identity(&crate::execute_wrapped::template_binary(
+        &c.headless_invocation,
+    ))
 }
 
 /// The normalized identity to EXCLUDE for an author key: if the key names a roster seat, its invocation
@@ -5981,6 +5978,25 @@ mod tests {
             select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT, "agy"], &two).is_none(),
             "both roster identities excluded ⇒ fall back rather than pick a colliding seat"
         );
+    }
+
+    #[test]
+    fn core_1528_quoted_wrapper_seat_and_exclusion_share_the_launch_identity() {
+        let roster = vec![seat(
+            "claude",
+            "\"/opt/Seat Tools/claude-wrapper\" -p {PROMPT}",
+        )];
+        assert_eq!(seat_identity(&roster[0]), "claude-wrapper");
+        assert_eq!(excluded_identity("claude", &roster), "claude-wrapper");
+    }
+
+    #[test]
+    fn core_1528_quoted_validator_wrapper_excludes_the_same_binary() {
+        let roster = vec![
+            seat("claude", "\"/opt/Seat Tools/claude-wrapper\" -p {PROMPT}"),
+            seat("alias", "claude-wrapper -p {PROMPT}"),
+        ];
+        assert!(select_agent_seat(&[DETERMINISTIC_VALIDATOR_SEAT], &roster).is_none());
     }
 
     #[test]

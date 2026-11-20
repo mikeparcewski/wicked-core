@@ -4121,13 +4121,14 @@ fn is_validator_author(seat: &str) -> bool {
 /// (creators of reviewed work counted as eligible — they are the core#954 fallback's to decide),
 /// the validator author is dropped from `excluded` if that leaves one, and the reason returned.
 /// Never when it is this unit's own author by key (its seat, a recorded author, a launch
-/// exclusion), and never when this unit's own launch was not OBSERVED (`work_observed`): the
-/// verdict is then verified against the provider each launch was observed calling
+/// exclusion) or launch identity, and never when this unit's own launch was not OBSERVED
+/// (`work_observed`): the verdict is then verified against the provider each launch was observed calling
 /// ([`crate::observed_provider`]), never against what a name predicts.
 fn readmit_validator_author(
     excluded: &mut Vec<&str>,
     unit: &crate::domain::WorkUnit,
     work_author: &str,
+    roster: &[crate::AgenticCli],
     work_observed: Option<&[crate::observed_provider::Provider]>,
     has_judge: &impl Fn(&[&str]) -> bool,
 ) -> Option<String> {
@@ -4140,6 +4141,8 @@ fn readmit_validator_author(
     let own = |k: &str| k == work_author || seat_key(k) == seat_key(work_author);
     let own_binaries =
         crate::cli_runner::launched_identities(work_author, unit.assigned_invocation.clone());
+    let mut validator_binaries = launched_identities(v, None);
+    validator_binaries.push(crate::validator::excluded_identity(v, roster));
     let history_is_this_launch = !unit.providers_unobserved
         && unit.authored_by.iter().all(|k| own(k))
         && unit
@@ -4149,6 +4152,7 @@ fn readmit_validator_author(
     if !excluded.contains(&v)
         || !history_is_this_launch
         || is_validator_author(work_author)
+        || own_binaries.iter().any(|b| validator_binaries.contains(b))
         || unit
             .authored_by
             .iter()
@@ -5922,6 +5926,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 &mut excluded,
                 &input.unit,
                 work_author,
+                roster,
                 work_observed.known(),
                 &has_any_judge,
             );
@@ -9825,6 +9830,41 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn core_1528_readmission_checks_the_frozen_launch_against_the_validator() {
+        let cases = [
+            ("claude -p {PROMPT}", "claude -p {PROMPT}"),
+            (
+                "\"/opt/Seat Tools/claude-wrapper\" -p {PROMPT}",
+                "claude-wrapper -p {PROMPT}",
+            ),
+            ("claude -p {PROMPT}", "codex exec {PROMPT}"),
+        ];
+        let admitted: Vec<bool> = cases
+            .iter()
+            .map(|(validator_invocation, work_invocation)| {
+                let roster = vec![
+                    seat("claude", validator_invocation),
+                    seat("codex", "codex exec {PROMPT}"),
+                ];
+                let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "work");
+                unit.assigned_cli = Some("codex".into());
+                unit.assigned_invocation = Some((*work_invocation).into());
+                let mut excluded = vec![crate::validator::DETERMINISTIC_VALIDATOR_SEAT, "codex"];
+                readmit_validator_author(
+                    &mut excluded,
+                    &unit,
+                    "codex",
+                    &roster,
+                    Some(&["chatgpt.com:443".to_string()]),
+                    &|ex| crate::validator::distinct_judge_available(ex, &roster),
+                )
+                .is_some()
+            })
+            .collect();
+        assert_eq!(admitted, vec![false, false, true]);
+    }
+
     /// (codex review on the re-land, KEY + SILENT-OK) The re-admission is never a route around
     /// observation: (1) a seat that runs claude under another key, picked once claude's exclusion
     /// lifted, has its UNOBSERVED approval discarded too; (2) a unit whose own history holds
@@ -9922,6 +9962,7 @@ mod tests {
             &mut ex,
             &history,
             "codex",
+            &roster,
             Some(&["chatgpt.com:443".to_string()]),
             &judge_without_claude,
         )
@@ -9934,6 +9975,7 @@ mod tests {
             &mut ex,
             &gap,
             "codex",
+            &roster,
             Some(&["chatgpt.com:443".to_string()]),
             &judge_without_claude,
         )
@@ -9963,6 +10005,7 @@ mod tests {
             &mut ex,
             &input.unit,
             "codex",
+            &two,
             Some(&["chatgpt.com:443".to_string()]),
             &judge_without_claude,
         )
