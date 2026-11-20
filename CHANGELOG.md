@@ -44,6 +44,11 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Provider content refusals fail the unit over to the next eligible seat (core#1492).** Recognized
+  Codex and Claude refusals with a nonzero wrapped CLI exit skip failure triage and use the existing
+  failover ladder, preserving the refused transcript without benching the seat. With no eligible
+  seat left, an attended run parks at the dead-seat gate for reassignment.
+
 - **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
   process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
   on both the first attempt and every retry. The FAIL reaches the gate instead of being replaced

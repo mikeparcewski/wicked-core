@@ -1483,6 +1483,23 @@ pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
         || o.contains("acp timeout") // acp_runner's rpc/turn deadline
 }
 
+/// Whether a wrapped CLI refused this unit's content (core#1492). Require the runner's own
+/// nonzero-exit marker and a narrow provider signature in the last 2 KiB: earlier output may
+/// discuss refusals as subject matter. This is unit-specific, not a reason to bench the seat.
+pub(crate) fn is_content_refusal(output: &str) -> bool {
+    if !crate::execute_wrapped::wrapped_exit_code(output).is_some_and(|code| code != 0) {
+        return false;
+    }
+    let mut start = output.len().saturating_sub(2048);
+    while !output.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = output[start..].to_ascii_lowercase();
+    tail.contains("flagged for possible cybersecurity risk")
+        || (tail.contains("appears to violate our usage policy")
+            && tail.contains("unable to respond to this request"))
+}
+
 // ── ACP input governance ──────────────────────────────────────────────────────
 
 // ── ACP input governance (removed) ────────────────────────────────────────────
