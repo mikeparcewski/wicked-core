@@ -4014,8 +4014,11 @@ impl WrappedCliStepRunner {
                 )
             }) {
                 let db = PathBuf::from(key_dir).join(crate::code_graph::CODE_GRAPH_DB_FILE);
-                if let Err(error) = crate::code_graph::settle_graph_journal(&db) {
-                    tracing::warn!(db = %db.display(), %error, "could not settle repo graph journal at seat launch");
+                // A repo never indexed has no graph file yet: nothing to settle, no warning.
+                if db.exists() {
+                    if let Err(error) = crate::code_graph::settle_graph_journal(&db) {
+                        tracing::warn!(db = %db.display(), %error, "could not settle repo graph journal at seat launch");
+                    }
                 }
             }
             // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP

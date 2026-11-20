@@ -229,7 +229,17 @@ pub(crate) const CODE_GRAPH_DB_FILE: &str = "estate.db";
 pub(crate) fn settle_graph_journal(db: &Path) -> rusqlite::Result<String> {
     let conn =
         rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
-    conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+    // A concurrent engine writer or a seat's open read holds the db for moments: wait for it
+    // rather than launch a seat on a graph still in WAL mode.
+    conn.busy_timeout(std::time::Duration::from_secs(5))?;
+    let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+    if !mode.eq_ignore_ascii_case("delete") {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+            Some(format!("the graph stayed in {mode} journal mode")),
+        ));
+    }
+    Ok(mode)
 }
 
 /// Env var overriding the repo-graph root wholesale — precedence 1 in [`repo_graph_root`] and the
@@ -2231,6 +2241,25 @@ mod tests {
         drop(reader);
         assert!(!wal.exists(), "a read-only seat must need no WAL");
         assert!(!shm.exists(), "a read-only seat must need no shared memory");
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn settling_a_graph_a_writer_still_holds_fails_instead_of_claiming_delete_mode() {
+        let base = scratch("settle-busy");
+        let db = base.join(CODE_GRAPH_DB_FILE);
+        // The writer stays open with rows in the WAL: the switch cannot complete.
+        let writer = sqlite_with_rows(&db, 3);
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        assert!(settle_graph_journal(&db).is_err());
+        assert!(started.elapsed() >= std::time::Duration::from_secs(4));
+        drop(writer);
+        // An absent graph is an error too, and creates nothing.
+        let absent = base.join("absent").join(CODE_GRAPH_DB_FILE);
+        std::fs::create_dir_all(absent.parent().unwrap()).unwrap();
+        assert!(settle_graph_journal(&absent).is_err());
+        assert!(!absent.exists());
         std::fs::remove_dir_all(base).unwrap();
     }
 
