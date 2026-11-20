@@ -7273,19 +7273,30 @@ fn apply_step_result(
             || crate::runtime_wait::is_floor_runtime_refusal(&output.output)
             // (core#1356) The runtime answers but could not make the seat's network (its address
             // pools ran out): the host's fault too, named as what it is.
-            || crate::runtime_wait::is_floor_network_refusal(&output.output))
+            || crate::runtime_wait::is_floor_network_refusal(&output.output)
+            || crate::runtime_wait::is_floor_repository_refusal(&output.output))
     {
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         let cli = unit
             .assigned_cli
             .clone()
             .unwrap_or_else(|| "claude".to_string());
+        let repository = crate::runtime_wait::is_floor_repository_refusal(&output.output);
         let network = crate::runtime_wait::is_floor_network_refusal(&output.output);
         let pools = network
             && output
                 .output
                 .contains(crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted.as_str());
-        let why = if network {
+        let why = if repository {
+            let cause = crate::runtime_wait::floor_network_cause(&output.output)
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            format!(
+                "Unit {ord} ({cli}) did not run: the repository is a partial clone whose recent \
+                 history was never fetched{cause} — the repository's state, not seat '{cli}''s \
+                 (the seat is not benched)"
+            )
+        } else if network {
             // The runtime's own error (the network's name and cause) rides after the kind's words.
             let cause = crate::runtime_wait::floor_network_cause(&output.output)
                 .map(|c| format!(" ({c})"))
@@ -7322,7 +7333,11 @@ fn apply_step_result(
         put_node(store, unit.to_node())?;
         persist_rejected_transcript(store, &session, unit, &output.output);
         if human_present {
-            let fix = if pools {
+            let fix = if repository {
+                "Fetch the missing objects in the repository (`git config --unset \
+                 remote.<name>.partialclonefilter`, then `git fetch --refetch <name>`), or clone \
+                 it again without --filter"
+            } else if pools {
                 "Free the runtime's address pools: list its networks (`docker network ls`) and \
                  remove the unused ones (`docker network rm <name>`)"
             } else if network {
@@ -7331,10 +7346,14 @@ fn apply_step_result(
                 "Start the container runtime (Rancher Desktop, Docker Desktop, `podman machine \
                  start`, `colima start`)"
             };
+            let shared = if repository {
+                "Every seat copies the same repository, so reassigning does not fix it."
+            } else {
+                "Every seat runs in the same runtime, so reassigning does not fix it."
+            };
             let prompt = format!(
                 "{why}. {fix}, then approve to retry on the same seat (optionally amend), or \
-                 reject to stop the run. Every seat runs in the same runtime, so reassigning does \
-                 not fix it."
+                 reject to stop the run. {shared}"
             );
             pause_for_human(
                 store,

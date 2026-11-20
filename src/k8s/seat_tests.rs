@@ -4961,3 +4961,89 @@ fn a_failed_read_after_a_runtime_error_keeps_that_error() {
         "nothing seen, nothing added"
     );
 }
+
+// (core#1541) Every failed arm contributes evidence, with the final attempt first.
+#[test]
+fn a_not_ready_arm_keeps_each_attempts_diagnosis() {
+    let mut tries = 0;
+    let result: Result<(), _> =
+        seat::retry_arm(&seat::ARM_RETRY_BACKOFF, &|_| {}, &|| false, || {
+            tries += 1;
+            Err((FloorUnarmed::PodNotReady, format!("diagnosis {tries}")))
+        });
+    assert_eq!(
+        result.unwrap_err().1,
+        "diagnosis 3 (after 3 arm attempts; earlier: attempt 1: diagnosis 1 | \
+         attempt 2: diagnosis 2)"
+    );
+}
+
+#[test]
+fn earlier_arm_diagnoses_are_clipped_at_a_character_boundary() {
+    let mut tries = 0;
+    let result: Result<(), _> = seat::retry_arm(&[Duration::ZERO], &|_| {}, &|| false, || {
+        tries += 1;
+        let msg = if tries == 1 {
+            format!("{}omitted", "é".repeat(1001))
+        } else {
+            "last diagnosis".into()
+        };
+        Err((FloorUnarmed::PodNotReady, msg))
+    });
+    assert_eq!(
+        result.unwrap_err().1,
+        format!(
+            "last diagnosis (after 2 arm attempts; earlier: attempt 1: {})",
+            "é".repeat(1000)
+        )
+    );
+}
+
+#[test]
+fn ending_during_arm_backoff_keeps_earlier_attempts() {
+    use std::cell::Cell;
+
+    let ended = Cell::new(false);
+    let tries = Cell::new(0);
+    let result: Result<(), _> = seat::retry_arm(
+        &seat::ARM_RETRY_BACKOFF,
+        &|_| ended.set(tries.get() == 2),
+        &|| ended.get(),
+        || {
+            tries.set(tries.get() + 1);
+            Err((
+                FloorUnarmed::PodNotReady,
+                format!("diagnosis {}", tries.get()),
+            ))
+        },
+    );
+    let msg = result.unwrap_err().1;
+    assert_eq!(tries.get(), 2);
+    assert!(msg.starts_with("diagnosis 2"), "{msg}");
+    assert!(
+        msg.contains("the run ended during the arm's backoff"),
+        "{msg}"
+    );
+    assert!(
+        msg.contains("after 2 arm attempts; earlier: attempt 1: diagnosis 1"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn an_api_error_keeps_the_last_pod_diagnosis_and_wait_history() {
+    let last = json!({"status": {"phase": "Pending", "conditions": [
+        {"type": "Ready", "status": "False", "reason": "ContainersNotReady"}
+    ]}});
+    let diagnosis = seat::pod_diagnosis(Some(&last), None, 5);
+    let seen =
+        vec!["container seat waiting CreateContainerError context deadline exceeded".to_string()];
+    let msg = seat::api_error_message("Unable to connect to the server", &diagnosis, &seen);
+    assert!(msg.starts_with("Unable to connect to the server"), "{msg}");
+    assert!(msg.contains("phase Pending"), "{msg}");
+    assert!(msg.contains("Ready ContainersNotReady"), "{msg}");
+    assert!(
+        msg.contains("seen during the wait: container seat waiting CreateContainerError"),
+        "{msg}"
+    );
+}

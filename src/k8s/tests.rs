@@ -1055,7 +1055,7 @@ fn k8s_a_commit_into_the_runs_node_modules_is_refused_for_a_deps_seat() {
 fn k8s_a_release_scheduled_before_a_rearm_is_void() {
     let run = format!("epoch-{}", uuid::Uuid::new_v4().simple());
     let before = super::run_epoch(&run);
-    super::arming(&run);
+    super::arming_with(&run, || ());
     assert_eq!(super::run_epoch(&run), before + 1);
     // Scheduled at the old epoch: returns at once, touching nothing (no cluster is configured
     // in a unit test, and none is asked).
@@ -1089,7 +1089,7 @@ fn k8s_install_refuses_a_linked_credential_dir() {
 #[test]
 fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
     let run = format!("epoch-nb-{}", uuid::Uuid::new_v4().simple());
-    super::arming(&run);
+    super::arming_with(&run, || ());
     let l = super::life(&run);
     let _held = l.0.lock().unwrap(); // a release in flight
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1104,7 +1104,7 @@ fn k8s_reading_a_runs_epoch_never_waits_on_its_release() {
 #[test]
 fn an_ended_run_arms_no_seat_until_it_is_resumed() {
     let run = format!("ended-run-{}", std::process::id());
-    assert!(super::arming_live(&run, super::lifecycle(&run)));
+    assert!(super::admit_arm(&run, super::lifecycle(&run), || ()).is_some());
     let before = super::run_epoch(&run) - 1;
     // The end is recorded on the actor thread at the transition, before any cleanup runs.
     let e = super::end_run(&run);
@@ -1113,7 +1113,7 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
         "an attempt from before stops"
     );
     assert!(
-        !super::arming_live(&run, super::lifecycle(&run)),
+        super::admit_arm(&run, super::lifecycle(&run), || ()).is_none(),
         "an ended run arms nothing"
     );
     assert_eq!(super::run_epoch(&run), e, "and its epoch is untouched");
@@ -1125,7 +1125,7 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
         "an attempt of the ended lifecycle sees the resume and stops"
     );
     assert!(
-        super::arming_live(&run, super::lifecycle(&run)),
+        super::admit_arm(&run, super::lifecycle(&run), || ()).is_some(),
         "a resumed run arms again"
     );
 }
@@ -1136,16 +1136,16 @@ fn an_ended_run_arms_no_seat_until_it_is_resumed() {
 #[test]
 fn an_obsolete_cleanup_never_fences_a_resumed_run() {
     let run = format!("obsolete-{}", uuid::Uuid::new_v4().simple());
-    assert!(super::arming_live(&run, super::lifecycle(&run)));
+    assert!(super::admit_arm(&run, super::lifecycle(&run), || ()).is_some());
     let e = super::end_run(&run);
     super::forget_ended(&run);
     assert!(
-        super::arming_live(&run, super::lifecycle(&run)),
+        super::admit_arm(&run, super::lifecycle(&run), || ()).is_some(),
         "resumed: arms (E+1)"
     );
     super::release_run(&run, e);
     assert!(
-        super::arming_live(&run, super::lifecycle(&run)),
+        super::admit_arm(&run, super::lifecycle(&run), || ()).is_some(),
         "the late cleanup of E fenced nothing"
     );
 }
@@ -1158,15 +1158,51 @@ fn an_obsolete_cleanup_never_fences_a_resumed_run() {
 fn a_stale_retry_is_never_admitted_into_a_resumed_lifecycle() {
     let run = format!("stale-retry-{}", uuid::Uuid::new_v4().simple());
     let generation = super::lifecycle(&run);
-    assert!(super::arming_live(&run, generation), "first attempt arms");
+    assert!(
+        super::admit_arm(&run, generation, || ()).is_some(),
+        "first attempt arms"
+    );
     super::end_run(&run);
     super::forget_ended(&run);
     assert!(
-        !super::arming_live(&run, generation),
+        super::admit_arm(&run, generation, || ()).is_none(),
         "the old lifecycle's retry is refused"
     );
     assert!(
-        super::arming_live(&run, super::lifecycle(&run)),
+        super::admit_arm(&run, super::lifecycle(&run), || ()).is_some(),
         "the resumed one arms"
+    );
+}
+
+// (core#1541) Namespace creation holds the same lifecycle lock as release.
+#[test]
+fn arm_admission_holds_the_lifecycle_lock_through_creation() {
+    let run = format!("admit-lock-{}", uuid::Uuid::new_v4().simple());
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (worker, blocked) = super::admit_arm(&run, super::lifecycle(&run), || {
+        let r = run.clone();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            super::arming_with(&r, || ());
+            done_tx.send(()).unwrap();
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let blocked = matches!(
+            done_rx.recv_timeout(std::time::Duration::from_millis(300)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        );
+        (worker, blocked)
+    })
+    .expect("a live run is admitted");
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    worker.join().unwrap();
+    assert!(
+        blocked,
+        "creation must hold the lifecycle lock until admission returns"
     );
 }
