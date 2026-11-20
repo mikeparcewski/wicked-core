@@ -10257,7 +10257,8 @@ mod tests {
                 benched: &[],
                 ballot_only: &[],
                 authors: &["a", "b"],
-                covered: Some(false),
+                // (core#1528) Read quote-aware, as the launcher reads it: claude and codex.
+                covered: Some(true),
             },
             Case {
                 tag: "alias",
