@@ -1437,7 +1437,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d8_a_stale_repo_graph_is_reindexed_at_the_run_base() {
-        use std::os::unix::fs::PermissionsExt;
         const OLD: &str = "3071a7632882ade840e3c73772eaf44288c6b4c3";
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-base-index");
@@ -1446,8 +1445,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let script = |name: &str, body: &str| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_env::install_stub(&p, &format!("#!/bin/sh\n{body}\n"));
             p.to_string_lossy().into_owned()
         };
         let never = dir.join("never-run").to_string_lossy().into_owned();
@@ -1534,7 +1532,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_checkout_reindex_runs_the_onboarding_command_under_the_launch_lock() {
-        use std::os::unix::fs::PermissionsExt;
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("checkout-index");
         let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
@@ -1542,8 +1539,7 @@ mod tests {
         std::fs::create_dir_all(&wt).unwrap();
         let script = |name: &str, body: &str| {
             let p = dir.join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            crate::test_env::install_stub(&p, &format!("#!/bin/sh\n{body}\n"));
             p.to_string_lossy().into_owned()
         };
         let patient = Some(crate::test_env::PATIENT);
@@ -1639,7 +1635,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_base_index_that_did_not_finish_leaves_a_graph_no_run_trusts() {
-        use std::os::unix::fs::PermissionsExt;
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-partial");
         let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
@@ -1651,12 +1646,10 @@ mod tests {
         graph_at(&partial, BASE);
         let p = dir.join("indexer");
         // The stand-in writes the base provenance (as estate does first), then dies.
-        std::fs::write(
+        crate::test_env::install_stub(
             &p,
-            format!("#!/bin/sh\ncp '{}' \"$4\"\nexit 9\n", partial.display()),
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            &format!("#!/bin/sh\ncp '{}' \"$4\"\nexit 9\n", partial.display()),
+        );
         let out = index_at_base_with(
             &p.to_string_lossy(),
             &repo,
@@ -1679,7 +1672,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d8_reindexes_a_graph_indexed_from_a_dirty_checkout_at_the_base() {
-        use std::os::unix::fs::PermissionsExt;
         use wicked_apps_core::GraphWrite;
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-dirty");
@@ -1706,16 +1698,14 @@ mod tests {
         let clean = dir.join("clean.db");
         graph_at(&clean, BASE);
         let p = dir.join("indexer");
-        std::fs::write(
+        crate::test_env::install_stub(
             &p,
-            format!(
+            &format!(
                 "#!/bin/sh\ntouch '{}'\ncp '{}' \"$4\"\n",
                 ran.display(),
                 clean.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let out = index_at_base_with(
             &p.to_string_lossy(),
             &repo,
