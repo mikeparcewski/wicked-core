@@ -639,6 +639,7 @@ pub(crate) fn expected_files(a: &Approved) -> Vec<String> {
         "demo-video/chapters.md",
         "demo-video/timings.json",
         "demo-video/record.json",
+        "review/survey.png",
         "review/chapters.png",
         "review/joins.png",
         "review/end.png",
@@ -1015,6 +1016,12 @@ mod tests {
             chapter_keys: keys.iter().map(|s| s.to_string()).collect(),
             intro: false,
         }
+    }
+
+    #[test]
+    fn expected_files_requires_the_survey_sheet() {
+        let a = approved(&["01-a", "02-b"]);
+        assert!(expected_files(&a).contains(&"review/survey.png".to_string()));
     }
 
     fn passing(a: &Approved) -> DemoTake {

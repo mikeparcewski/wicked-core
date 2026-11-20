@@ -55,7 +55,7 @@ fn arm() {
          if [ \"$mode\" = NONE ]; then exit 0; fi\n\
          mkdir -p \"$R/demo-video/segments/01-a\" \"$R/demo-video/segments/02-b\" \"$R/review\"\n\
          for f in demo.mp4 chapters.md timings.json segments/01-a/segment.mp4 segments/02-b/segment.mp4; do echo x > \"$R/demo-video/$f\"; done\n\
-         for f in chapters.png joins.png end.png ffprobe.json; do echo x > \"$R/review/$f\"; done\n\
+         for f in survey.png chapters.png joins.png end.png ffprobe.json; do echo x > \"$R/review/$f\"; done\n\
          case \"$mode\" in\n\
            SHORT) rm \"$R/demo-video/segments/02-b/segment.mp4\"; v=PASS; c=null;;\n\
            FAIL) v=FAIL; c='\"left_app\"';;\n\

@@ -954,13 +954,15 @@ control, never press one that saves, launches, approves or deletes. Write nothin
 
 /// The `review` step's instructions (an evaluator: it reads and judges, it writes nothing).
 pub const DEMO_REVIEW_INSTRUCTIONS: &str = "Run the wicked-garden-demo skill's `review` action \
-on the recording in the demo root the task names: look at `review/chapters.png`, \
+on the recording in the demo root the task names: look at `review/survey.png`, `review/chapters.png`, \
 `review/joins.png` and `review/end.png`, and read `review/ffprobe.json` for the chapters, size \
-and codec (the engine probed `demo-video/demo.mp4` for you). You judge work the engine recorded \
+and codec (the engine probed `demo-video/demo.mp4` for you). If a required sheet is missing, or a \
+sheet tool (`contact_sheet.py`) answers COULD-NOT-RUN, report COULD-NOT-RUN as the verdict word, \
+never PASS or accept. You judge work the engine recorded \
 from another seat's plan; change no file. Check every caption against its picture, the joins, the \
 held closing card, and that synthetic data is labelled. Report every finding as `timestamp · \
 chapter · what's wrong · verdict` (verdict: re-encode, re-record, or fix-app), then end with one \
-fenced ```json block: {\"verdict\": \"accept\" or \"changes\", \"findings\": [{\"at\": \
+fenced ```json block: {\"verdict\": \"accept\" or \"changes\" or \"COULD-NOT-RUN\", \"findings\": [{\"at\": \
 \"m:ss\", \"chapter\": \"<key>\", \"issue\": \"..\", \"verdict\": \
 \"re-encode|re-record|fix-app\"}]}.";
 
@@ -2444,7 +2446,11 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             DEMO_PLAN_INSTRUCTIONS.contains("storyline.json")
                 && !DEMO_PLAN_INSTRUCTIONS.contains("storyline.mjs")
         );
-        assert!(DEMO_REVIEW_INSTRUCTIONS.contains("ffprobe.json"));
+        assert!(
+            DEMO_REVIEW_INSTRUCTIONS.contains("ffprobe.json")
+                && DEMO_REVIEW_INSTRUCTIONS.contains("review/survey.png")
+                && DEMO_REVIEW_INSTRUCTIONS.contains("COULD-NOT-RUN")
+        );
     }
 
     /// (DES-CATALOG-002 §3.1) The read-only verbs: every Investigate, Analyze and Judge preset —
