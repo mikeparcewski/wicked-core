@@ -3748,6 +3748,7 @@ pub(super) fn revise_units(
                 k.observed_providers = o.observed_providers.clone();
                 k.providers_unobserved = o.providers_unobserved;
                 k.observation_pending = o.observation_pending;
+                k.observation_reset = o.observation_reset;
                 kept.push(k);
             }
             None => {
