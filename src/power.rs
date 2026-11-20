@@ -60,6 +60,9 @@ pub const PAUSE_GATE_KIND: &str = "power_pause";
 /// The actor id the engine answers a hand-off send-back as.
 pub const HANDOFF_ACTOR: &str = "engine:power-handoff";
 
+/// The actor id the engine approves a dead-seat gate as after a bench re-probe.
+pub const BENCH_REPROBE_ACTOR: &str = "engine:bench-reprobe";
+
 /// The catalog types power mode satisfies without a phased step, unless a rule or the QE plan
 /// keeps them (operator ruling 2026-10-29): the intake QE plan is `test_plan`, and the
 /// distinct-seat review of the orchestrator's approach at hand-off is `design`.
