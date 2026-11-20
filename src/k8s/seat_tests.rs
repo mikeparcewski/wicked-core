@@ -4301,6 +4301,151 @@ fn a_not_ready_pods_diagnosis_names_phase_conditions_and_last_events() {
     assert_eq!(seat::pod_diagnosis(None, None, 5), "no pod was created");
 }
 
+#[test]
+fn an_unreadable_events_response_is_said_in_the_pod_diagnosis() {
+    let p = json!({"status": {"phase": "Pending"}});
+    for (code, stderr, expected) in [
+        (
+            Some(1),
+            "Forbidden: events is forbidden",
+            "Forbidden: events is forbidden",
+        ),
+        (Some(1), "", "kubectl exited 1"),
+        (None, "", "kubectl timed out"),
+    ] {
+        let result = super::Called {
+            code,
+            stdout: br#"{"items":[]}"#.to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            seat::pod_diagnosis_with_events(Some(&p), &result, 5, &[]),
+            format!("phase Pending; events unavailable: {expected}")
+        );
+    }
+    let mut result = super::Called {
+        code: Some(0),
+        stdout: b"not JSON".to_vec(),
+        stderr: Vec::new(),
+    };
+    let parse_error = serde_json::from_slice::<serde_json::Value>(&result.stdout).unwrap_err();
+    assert_eq!(
+        seat::pod_diagnosis_with_events(Some(&p), &result, 5, &[]),
+        format!("phase Pending; events unavailable: {parse_error}")
+    );
+    result.stdout = br#"{"items":[{"reason":"Failed","message":"operation timeout"}]}"#.to_vec();
+    assert_eq!(
+        seat::pod_diagnosis_with_events(Some(&p), &result, 5, &[]),
+        "phase Pending; last events: Failed: operation timeout"
+    );
+}
+
+#[test]
+fn plain_create_timeouts_wait_but_denials_and_config_errors_still_refuse() {
+    for message in [
+        "operation timeout",
+        "operation timed out",
+        "timed out",
+        "deadline exceeded",
+    ] {
+        assert!(seat::transient_create_error(message), "{message}");
+        let denied = format!("permission denied: {message}");
+        assert!(!seat::transient_create_error(&denied), "{denied}");
+        for reason in [
+            "CreateContainerError",
+            "RunContainerError",
+            "CreateContainerConfigError",
+        ] {
+            let mut p = pod("seat-1-abc", "u1", "Pending", false);
+            p["status"]["containerStatuses"][0]["state"] =
+                json!({"waiting": {"reason": reason, "message": message}});
+            let expected = if reason == "CreateContainerConfigError" {
+                PodState::Failed(FloorUnarmed::PolicyRefused, message.into())
+            } else {
+                PodState::Waiting
+            };
+            assert_eq!(seat::pod_state(&p, "seat-1-abc", "u1"), expected);
+            p["status"]["containerStatuses"][0]["state"]["waiting"]["message"] = json!(denied);
+            assert_eq!(
+                seat::pod_state(&p, "seat-1-abc", "u1"),
+                PodState::Failed(FloorUnarmed::PolicyRefused, denied.clone())
+            );
+        }
+    }
+}
+
+#[test]
+fn pod_diagnosis_clips_each_long_message_at_a_character_boundary() {
+    let long = "界".repeat(300);
+    let p = json!({"status": {
+        "phase": "Pending",
+        "conditions": [{"type": "Ready", "status": "False", "reason": "Waiting", "message": long}],
+        "initContainerStatuses": [{"name": "sync", "state": {"terminated": {"reason": "Error", "message": long}}}],
+        "containerStatuses": [{"name": "seat", "state": {"waiting": {"reason": "CreateContainerError", "message": long}}}]
+    }});
+    let events = json!({"items": [{"reason": "Failed", "message": long}]});
+    let seen = vec![format!("container earlier waiting Error {long}")];
+    let d = seat::pod_diagnosis_seen(Some(&p), Some(&events), 5, &seen);
+    for part in d.split("; ").skip(1) {
+        let message = part
+            .strip_prefix("last events: Failed: ")
+            .or_else(|| part.strip_prefix("seen during the wait: "))
+            .unwrap_or(part);
+        assert_eq!(message.chars().count(), 200, "{part}");
+    }
+    assert!(d.contains("Ready Waiting "));
+    assert!(d.contains("init container sync terminated Error "));
+    assert!(d.contains("container seat waiting CreateContainerError "));
+    assert!(d.contains("seen during the wait: container earlier waiting Error "));
+    assert!(d.contains("last events: Failed: "));
+}
+
+#[test]
+fn a_bounded_pod_diagnosis_keeps_conditions_and_all_five_events_in_the_suffix() {
+    let long = "x".repeat(1000);
+    let p = json!({"status": {"phase": "Pending", "conditions": [
+        {"type": "PodScheduled", "status": "False", "message": long},
+        {"type": "Initialized", "status": "False", "message": long},
+        {"type": "ContainersReady", "status": "False", "message": long},
+        {"type": "Ready", "status": "False", "message": long}
+    ]}});
+    let events = json!({"items": (1..=5).map(|i| json!({
+        "reason": format!("Event{i}"), "message": long
+    })).collect::<Vec<_>>()});
+    let d = seat::pod_diagnosis(Some(&p), Some(&events), 5);
+    let suffix = crate::runtime_wait::diagnosis_suffix(&d);
+    assert!(suffix.len() < 4096, "{}", suffix.len());
+    for condition in ["PodScheduled", "Initialized", "ContainersReady", "Ready"] {
+        assert!(suffix.contains(condition), "{suffix}");
+    }
+    for i in 1..=5 {
+        assert!(suffix.contains(&format!("Event{i}: ")), "{suffix}");
+    }
+}
+
+#[test]
+fn event_recency_prefers_series_then_last_timestamp_then_event_time_then_creation() {
+    let events = json!({"items": [
+        {"reason": "Series", "message": "s", "series": {"lastObservedTime": "2026-11-17T05:00:00Z"},
+         "lastTimestamp": "2026-11-17T00:00:00Z", "eventTime": "2026-11-17T00:00:00Z"},
+        {"reason": "Last", "message": "l", "lastTimestamp": "2026-11-17T04:00:00Z",
+         "eventTime": "2026-11-17T00:00:00Z"},
+        {"reason": "Event", "message": "e", "series": {"lastObservedTime": ""},
+         "lastTimestamp": "", "eventTime": "2026-11-17T03:00:00Z", "metadata": {"creationTimestamp": "2026-11-17T09:00:00Z"}},
+        {"reason": "Created", "message": "c", "metadata": {"creationTimestamp": "2026-11-17T02:00:00Z"}}
+    ]});
+    let d = seat::pod_diagnosis(None, Some(&events), 4);
+    assert!(
+        d.ends_with("last events: Created: c | Event: e | Last: l | Series: s"),
+        "{d}"
+    );
+    let d = seat::pod_diagnosis(None, Some(&events), 1);
+    assert!(
+        d.ends_with("last events (3 earlier event(s) not shown): Series: s"),
+        "{d}"
+    );
+}
+
 /// (core#1491) An arm whose pod was not ready is retried after each backoff, then reports how many
 /// arms were tried; a refusal (policy, admission) is never retried, and a run that ended during a
 /// backoff gets no further arm.

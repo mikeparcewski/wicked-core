@@ -1473,7 +1473,9 @@ pub(crate) fn transient_create_error(msg: &str) -> bool {
         return false;
     }
     m.trim().is_empty()
-        || m.contains("context deadline exceeded")
+        || m.contains("operation timeout")
+        || m.contains("timed out")
+        || m.contains("deadline exceeded")
         || m.contains("code = deadlineexceeded")
         || m.contains("i/o timeout")
 }
@@ -1531,6 +1533,33 @@ pub(crate) fn with_history(err: String, seen: &[String]) -> String {
     }
 }
 
+/// Bound each condition, container state, history entry and event message without splitting a
+/// character. Long runtime messages must leave room for the rest of the pod's evidence.
+fn diagnosis_message(message: &str) -> String {
+    message.chars().take(200).collect()
+}
+
+/// The pod's evidence plus an explicit error when its events could not be read or parsed (pure).
+pub(crate) fn pod_diagnosis_with_events(
+    pod: Option<&Value>,
+    result: &super::Called,
+    n: usize,
+    seen: &[String],
+) -> String {
+    let events = if result.ok() {
+        serde_json::from_slice::<Value>(&result.stdout).map_err(|e| e.to_string())
+    } else {
+        Err(result.err_text())
+    };
+    match events {
+        Ok(events) => pod_diagnosis_seen(pod, Some(&events), n, seen),
+        Err(e) => format!(
+            "{}; events unavailable: {e}",
+            pod_diagnosis_seen(pod, None, n, seen)
+        ),
+    }
+}
+
 /// [`pod_diagnosis`] plus every state an earlier poll saw that the final snapshot no longer shows.
 pub(crate) fn pod_diagnosis_seen(
     pod: Option<&Value>,
@@ -1540,10 +1569,10 @@ pub(crate) fn pod_diagnosis_seen(
 ) -> String {
     let mut d = pod_diagnosis(pod, events, n);
     let now = pod.map(container_states).unwrap_or_default();
-    let earlier: Vec<&str> = seen
+    let earlier: Vec<String> = seen
         .iter()
         .filter(|s| !now.contains(s))
-        .map(String::as_str)
+        .map(|s| diagnosis_message(s))
         .collect();
     if !earlier.is_empty() {
         d.push_str(&format!("; seen during the wait: {}", earlier.join(" | ")));
@@ -1574,16 +1603,14 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
                 .filter(|c| c.get("status").and_then(Value::as_str) != Some("True"))
             {
                 let field = |k: &str| c.get(k).and_then(Value::as_str).unwrap_or("");
-                out.push(
-                    format!("{} {} {}", field("type"), field("reason"), field("message"))
-                        .trim()
-                        .to_string(),
-                );
+                out.push(diagnosis_message(
+                    format!("{} {} {}", field("type"), field("reason"), field("message")).trim(),
+                ));
             }
             // (codex confirmation on #1527, HIDE) Each container's own state that is not
             // running — the runtime's words, init containers first — so it outlives the pod even
             // when no event kept it.
-            out.extend(container_states(p));
+            out.extend(container_states(p).iter().map(|s| diagnosis_message(s)));
         }
     }
     let mut items: Vec<&Value> = events
@@ -1594,6 +1621,7 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
     // Newest LAST by when each event last occurred (RFC 3339 sorts as text), not by list order.
     let when = |e: &Value| {
         [
+            "/series/lastObservedTime",
             "/lastTimestamp",
             "/eventTime",
             "/metadata/creationTimestamp",
@@ -1617,10 +1645,12 @@ pub(crate) fn pod_diagnosis(pod: Option<&Value>, events: Option<&Value>, n: usiz
             format!(
                 "{}: {}",
                 e.get("reason").and_then(Value::as_str).unwrap_or("?"),
-                e.get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
+                diagnosis_message(
+                    e.get("message")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .trim()
+                )
             )
         })
         .collect();
@@ -1950,23 +1980,20 @@ pub(crate) fn arm(
         }
         // (core#1491) The pod's phase, conditions and last events, read before the reap.
         let diagnose = |pod: Option<&Value>| {
-            let events = kube
-                .call(
-                    Some(&ns),
-                    &[
-                        "get",
-                        "events",
-                        "--field-selector",
-                        &format!("involvedObject.name={sandbox}"),
-                        "-o",
-                        "json",
-                    ],
-                    None,
-                    Duration::from_secs(15),
-                )
-                .stdout;
-            let events: Option<Value> = serde_json::from_slice(&events).ok();
-            pod_diagnosis_seen(pod, events.as_ref(), 5, &seen)
+            let events = kube.call(
+                Some(&ns),
+                &[
+                    "get",
+                    "events",
+                    "--field-selector",
+                    &format!("involvedObject.name={sandbox}"),
+                    "-o",
+                    "json",
+                ],
+                None,
+                Duration::from_secs(15),
+            );
+            pod_diagnosis_with_events(pod, &events, 5, &seen)
         };
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,

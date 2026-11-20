@@ -467,6 +467,30 @@ fn k8s_the_engine_account_cannot_change_what_it_does_not_own() {
     assert!(!docs.iter().any(|d| d["kind"] == "Secret"));
 }
 
+#[test]
+fn k8s_the_engine_can_only_read_events() {
+    let docs = cluster::install_docs("o1");
+    let engine = docs
+        .iter()
+        .find(|d| d["kind"] == "ClusterRole" && d["metadata"]["name"] == "wicked-engine-o1")
+        .unwrap();
+    let rules: Vec<_> = engine["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| {
+            r["resources"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("events"))
+        })
+        .collect();
+    assert_eq!(rules.len(), 1, "the engine needs one read-only events rule");
+    assert_eq!(rules[0]["apiGroups"], json!([""]));
+    assert_eq!(rules[0]["resources"], json!(["events"]));
+    assert_eq!(rules[0]["verbs"], json!(["get", "list"]));
+}
+
 /// Review r1 P2: a delete is bound to the exact object the ownership check read.
 #[test]
 fn k8s_a_namespace_delete_is_bound_to_the_object_that_was_checked() {

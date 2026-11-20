@@ -4383,8 +4383,16 @@ impl WrappedCliStepRunner {
                             if out.output.ends_with(')') {
                                 out.output.pop();
                             }
-                            out.output
-                                .push_str(&crate::runtime_wait::network_cause_suffix(&detail));
+                            let suffix = match why {
+                                // The pod's conditions and events need their own budget so
+                                // long runtime messages do not push the events out.
+                                crate::worker_sandbox::FloorUnarmed::PodNotReady
+                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused => {
+                                    crate::runtime_wait::diagnosis_suffix(&detail)
+                                }
+                                _ => crate::runtime_wait::network_cause_suffix(&detail),
+                            };
+                            out.output.push_str(&suffix);
                         }
                         return out;
                     }
