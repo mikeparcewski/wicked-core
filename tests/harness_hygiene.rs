@@ -87,6 +87,52 @@ fn temp_fixtures_are_scoped_to_the_process() {
     );
 }
 
+/// Integration tests link the non-test library, so governance paths otherwise use the real HOME
+/// (core#1618). Pin the root before test threads start, or configure it on a probe subprocess.
+#[test]
+fn governance_path_users_isolate_the_governance_root() {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let mut users = 0usize;
+    let mut missing = Vec::new();
+    let mut entries: Vec<_> = fs::read_dir(&dir)
+        .expect("the tests directory is readable")
+        .map(|e| e.expect("a test directory entry is readable").path())
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        // This guard quotes the patterns it scans for.
+        .filter(|p| p.file_name().is_some_and(|n| n != "harness_hygiene.rs"))
+        .collect();
+    entries.sort();
+
+    for path in entries {
+        let src = fs::read_to_string(&path).expect("a test source is readable");
+        if !src.contains("decisions_path_for") && !src.contains("gov_run_dir") {
+            continue;
+        }
+        users += 1;
+        let ctor_pins_root = src.split("#[ctor::ctor(unsafe)]").skip(1).any(|ctor| {
+            // Ctors are top-level functions; stop at their closing brace so a setter in an
+            // ordinary test does not qualify just because the binary also has an emit ctor.
+            let body = ctor.split("\n}").next().unwrap_or_default();
+            body.contains("set_var(\"WICKED_GOV_ROOT\",") || body.contains("set_var(\"HOME\",")
+        });
+        let subprocess_pins_root = src.contains(".env(\"WICKED_GOV_ROOT\",");
+        if !ctor_pins_root && !subprocess_pins_root {
+            missing.push(path.file_name().unwrap().to_string_lossy().into_owned());
+        }
+    }
+
+    assert!(
+        users >= 2,
+        "the scan must find the governance integration suites"
+    );
+    assert!(
+        missing.is_empty(),
+        "these governance path users can write the real ~/.wicked/core-gov (core#1618): \
+         {missing:?}; set WICKED_GOV_ROOT before main (or on a probe subprocess), \
+         or pin HOME in a ctor"
+    );
+}
+
 /// Every test binary in this suite must arm the hermetic emit spool BEFORE main (core#311).
 ///
 /// Engine paths under test — gate transitions, conformance recording, rule lifecycle — fire

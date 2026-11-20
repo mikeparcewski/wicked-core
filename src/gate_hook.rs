@@ -5812,11 +5812,19 @@ pub(crate) fn gov_root_for(
 }
 
 /// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
-/// directory for a run, so a later change to `HOME` (a child env) cannot move it. Unit tests keep
-/// the temp root: they pin `HOME` per test, which a process-wide root must not latch.
+/// directory for a run, so a later change to `HOME` (a child env) cannot move it. `WICKED_GOV_ROOT`
+/// is the test seam: a non-empty, absolute override takes precedence, including in integration
+/// tests that link the non-test library. Otherwise unit tests keep the temp root: they pin `HOME`
+/// per test, which a process-wide root must not latch.
 pub(crate) fn gov_root() -> std::path::PathBuf {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
+        if let Some(root) = std::env::var_os("WICKED_GOV_ROOT") {
+            let root = std::path::PathBuf::from(root);
+            if !root.as_os_str().is_empty() && root.is_absolute() {
+                return root;
+            }
+        }
         let temp = std::env::temp_dir();
         if cfg!(test) {
             return temp.join("wicked-core-gov");
