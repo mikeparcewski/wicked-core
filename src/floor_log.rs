@@ -275,6 +275,7 @@ thread_local! {
 
 /// Fail the next capture's first write on this thread, including its reader thread.
 #[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) fn fail_next_write(error: std::io::Error) {
     NEXT_WRITE_ERROR.with(|e| *e.borrow_mut() = Some(error));
 }
