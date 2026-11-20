@@ -731,10 +731,9 @@ fn code_graph_path_for_write_at(key: &str, root: Option<&Path>) -> std::io::Resu
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "no repo-graph root resolves for {}: set {REPO_GRAPH_ROOT_ENV}, run under a daemon \
-                 (the root is <state home>/{REPO_GRAPHS_DIRNAME}), or set HOME (USERPROFILE on \
-                 Windows) — a graph is never minted inside the working tree",
-                repo.display()
+                "no repo-graph root resolves for graph key {key}: set {REPO_GRAPH_ROOT_ENV}, run \
+                 under a daemon (the root is <state home>/{REPO_GRAPHS_DIRNAME}), or set HOME \
+                 (USERPROFILE on Windows) — a graph is never minted inside the working tree"
             ),
         )
     })?;
