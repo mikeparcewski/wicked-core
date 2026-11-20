@@ -357,8 +357,8 @@ pub use repo::{
     FINDING_CODE_GRAPH_ROOT_UNRESOLVABLE, FINDING_IN_TREE_CODE_GRAPH_IGNORED,
 };
 pub use repo_checks::{
-    BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv, FloorStage, RepoCheck,
-    RepoChecksReport,
+    is_environment_refusal, BaseRun, CheckDecision, CheckRun, ClaimCheck, FloorContext, FloorEnv,
+    FloorStage, RepoCheck, RepoChecksReport, ENVIRONMENT_REFUSAL_PREFIX,
 };
 pub use repo_intel::{
     change_digest_since, commits_since, profile_repo, Commit, GraphStats, Hotspot, RepoProfile,

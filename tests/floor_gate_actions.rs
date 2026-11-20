@@ -30,8 +30,8 @@ use wicked_council::types::{Category, Confidence, Dispatcher, InputMode, Vote};
 use wicked_council::{AgenticCli, CouncilTask};
 
 use wicked_core::{
-    Core, CoreEvent, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec, SessionStatus, StepInput,
-    StepOutput, StepRunner, StepStatus,
+    is_environment_refusal, Core, CoreEvent, HumanConfirm, HumanDecision, LaunchSpec, RepoSpec,
+    SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 
 #[ctor::ctor(unsafe)]
@@ -380,7 +380,7 @@ fn fix_floor_denied(evs: &[CoreEvent], source: &str) -> bool {
     }
 }
 
-/// Did the fix unit's floor say it could not arm an OS write boundary (`sandbox_error`)? The one
+/// Did the fix unit's floor report a boundary refusal, excluding environment refusals? The one
 /// shape that excuses a test here. A Windows host has no boundary at all, and there a floor that
 /// never reported counts too; anywhere else a missing report is a failure, never a skip.
 fn no_boundary(evs: &[CoreEvent]) -> bool {
@@ -392,13 +392,47 @@ fn no_boundary(evs: &[CoreEvent]) -> bool {
             ..
         } = e
         {
-            if sandbox_error.is_some() {
+            if sandbox_error
+                .as_deref()
+                .is_some_and(|e| !is_environment_refusal(e))
+            {
                 return true;
             }
             reported = true;
         }
     }
     cfg!(windows) && !reported
+}
+
+/// core#1611: a disk-refused fix floor must fail these tests, never silently excuse them.
+#[test]
+fn a_disk_refused_fix_floor_is_not_excused_as_a_missing_boundary() {
+    let frame = |error: &str| CoreEvent::RepoChecksEvaluated {
+        session: "disk-refusal-classifier".into(),
+        ord: 3,
+        attempt: 0,
+        passed: false,
+        criterion: "repo checks".into(),
+        checks: vec![],
+        skipped: vec![],
+        sandbox_level: "best-effort".into(),
+        sandbox_error: Some(error.into()),
+        detect_error: None,
+        outcome: "not_run".into(),
+        floor: "creator".into(),
+        claim: None,
+        env: None,
+        changed: vec![],
+        changed_truncated: false,
+        reused_from: None,
+        floor_runner: None,
+    };
+    assert!(!no_boundary(&[frame(
+        "environment: the host has 1.0 GiB free, minimum 15 GiB. Free disk space, then retry",
+    )]));
+    assert!(no_boundary(&[frame(
+        "no OS write boundary could be armed for the checks"
+    )]));
 }
 
 fn no_session_failed(evs: &[CoreEvent]) {

@@ -61,7 +61,8 @@
 //! nested worktree — run once per run and cached by base sha + check name + argv, the export
 //! removed before the next head run) and the EXIT CODES of the processes the floor launches. The
 //! head's output text is evidence only: twenty-one review rounds of core#1060 each found a new way
-//! for a head's own text to excuse a failure, so no head text decides anything here.
+//! for a head's own text to excuse a failure, so head text alone never decides an outcome.
+//! ENOSPC is the only head-output-assisted classification and requires a corroborating volume reading.
 //!
 //! * The head check runs unchanged. Exit 0 is a `pass`; a signal, or (for a check of a usable
 //!   build guide) an exit outside its `failedExit`, is `could_not_run`.
@@ -618,6 +619,13 @@ impl CheckRun {
     /// Exit 0, within its bound, and it could be started.
     pub fn passed(&self) -> bool {
         self.exit_code == Some(0) && !self.timed_out && self.spawn_error.is_none()
+    }
+
+    /// Did the environment prevent the check from running to a verdict?
+    pub fn environment_failure(&self) -> bool {
+        self.spawn_error
+            .as_deref()
+            .is_some_and(|e| e.starts_with(ENVIRONMENT_REFUSAL_PREFIX))
     }
 
     /// The check's outcome on the wire: `passed` | `failed` | `timed_out` | `could_not_run`.
@@ -1212,15 +1220,16 @@ impl CreatorSeed {
     /// reused check leaves in the checkout. Not a timeout: a missing input fails, it does not
     /// hang, and a second hour-long bound would only repeat it.
     fn set_aside_by(&self, check: &RepoCheck, run: &CheckRun) -> Option<String> {
-        (run.denies() && !run.timed_out && !self.reused.is_empty()).then(|| {
-            format!(
-                "`{}` ran fresh after the reused {} and {} — it may need something a reused \
+        (run.denies() && !run.timed_out && !run.environment_failure() && !self.reused.is_empty())
+            .then(|| {
+                format!(
+                    "`{}` ran fresh after the reused {} and {} — it may need something a reused \
                  check leaves in the checkout",
-                check.name,
-                self.reused.join(", "),
-                run.outcome()
-            )
-        })
+                    check.name,
+                    self.reused.join(", "),
+                    run.outcome()
+                )
+            })
     }
 
     /// The floor log's line for one reused check.
@@ -1651,8 +1660,18 @@ impl RepoChecksReport {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// An environment refusal carries its own cause and advice, distinct from a missing boundary.
+    pub fn environment_refusal(&self) -> Option<&str> {
+        self.sandbox_error
+            .as_deref()
+            .filter(|e| is_environment_refusal(e))
+    }
+
     /// The operator-facing denial when `!passed`.
     pub fn denial_reason(&self) -> String {
+        if let Some(e) = self.environment_refusal() {
+            return format!("repo checks floor could not run: {e}");
+        }
         if let Some(e) = &self.sandbox_error {
             return format!(
                 "repo checks floor failed: {CRITERION}. The checks were NOT run: {e} — the floor \
@@ -5104,6 +5123,14 @@ thread_local! {
     pub(crate) static TEST_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
+/// The wire prefix for a floor's environment refusal, whose text carries its own advice.
+pub const ENVIRONMENT_REFUSAL_PREFIX: &str = "environment:";
+
+/// Whether a refusal describes the environment rather than a missing OS write boundary.
+pub fn is_environment_refusal(error: &str) -> bool {
+    error.starts_with(ENVIRONMENT_REFUSAL_PREFIX)
+}
+
 /// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
 /// failure), or `None`: `free` bytes against `min_gib`. Unknown free space never refuses.
 pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
@@ -5111,8 +5138,8 @@ pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
     let min = min_gib.saturating_mul(1 << 30);
     (min > 0 && free < min).then(|| {
         format!(
-            "environment: the host has {:.1} GiB free on the check cache's volume, under the \
-             floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
+            "{ENVIRONMENT_REFUSAL_PREFIX} the host has {:.1} GiB free on the check cache's volume, \
+             under the floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
              space, then retry the step — this is not a failure of the change",
             free as f64 / (1u64 << 30) as f64
         )
@@ -6045,7 +6072,7 @@ fn run_detected(
                     ..check.clone()
                 };
                 let r = run_held(worktree, held_head, &a, sandbox, scratch, Tree::Head);
-                if r.passed() {
+                if r.passed() || r.environment_failure() {
                     r
                 } else {
                     let mut full =
@@ -6123,6 +6150,9 @@ fn run_detected(
             let retried_whole = !retry_extra.is_empty();
             run.reruns.extend(retry_extra);
             let retry_passed = early_retry.as_ref().is_some_and(CheckRun::passed);
+            let retry_environment_failure = early_retry
+                .as_ref()
+                .is_some_and(CheckRun::environment_failure);
             // (core#1191) A fresh check that failed after reused ones sends the floor round again
             // with nothing reused (core#1152), and that pass classifies it. Classifying it HERE
             // too (the base run: a whole suite) would be paid twice — rig run b6f7968b spent
@@ -6130,10 +6160,23 @@ fn run_detected(
             // over. Only where nothing left could accept the failure: no exclusion can apply and
             // the identical retry (when due) has already failed. A retry that passed, or a base
             // a precise exclusion could still read, is decided below as before (xreview on #1192).
-            let set_aside_now = (compare && excluding.is_none() && !retry_passed)
-                .then(|| seed.as_ref().and_then(|s| s.set_aside_by(check, &run)))
-                .flatten();
-            if let Some(why) = set_aside_now {
+            let set_aside_now =
+                (compare && excluding.is_none() && !retry_passed && !retry_environment_failure)
+                    .then(|| seed.as_ref().and_then(|s| s.set_aside_by(check, &run)))
+                    .flatten();
+            if retry_environment_failure {
+                let mut r = early_retry.expect("environment failure on the retry");
+                decide_alone(&mut r);
+                run.spawn_error = r.spawn_error.clone();
+                run.retry = Some(RetrySummary {
+                    whole_because,
+                    ..RetrySummary::of(&r)
+                });
+                let mut decision = r.decision.clone().expect("decided above");
+                decision.log_refs.extend(run.logs.iter().cloned());
+                run.decision = Some(decision);
+                run.reruns.push(r);
+            } else if let Some(why) = set_aside_now {
                 if let Some(r) = early_retry {
                     run.retry = Some(RetrySummary {
                         whole_because: whole_because.clone(),
@@ -11021,6 +11064,31 @@ pub(crate) fn run_one_with(
         };
         if let Some(msg) = launcher {
             result.spawn_error = Some(msg);
+        }
+    }
+    // (core#1605) ENOSPC on a cache volume below the admission minimum is infrastructure,
+    // not a failed check to retry or compare with the base. Output alone is repo-controlled:
+    // require the volume reading too, and keep any earlier launcher/log/signal diagnosis.
+    if failed
+        && !result.timed_out
+        && result.spawn_error.is_none()
+        && [&stdout, &stderr]
+            .iter()
+            .any(|text| text.contains("No space left on device") || text.contains("os error 28"))
+    {
+        let min_gib = floor_min_free_gib();
+        if let Some(free) = check_cache_root()
+            .ok()
+            .and_then(|root| free_bytes(&root))
+            .filter(|free| disk_guard(Some(*free), min_gib).is_some())
+        {
+            result.spawn_error = Some(format!(
+                "{ENVIRONMENT_REFUSAL_PREFIX} the disk filled during `{}` ({:.1} GiB free, \
+                 minimum {min_gib} GiB; WICKED_FLOOR_MIN_FREE_GB). Free disk space, then retry; \
+                 not a failure of the change",
+                check.name,
+                free as f64 / (1u64 << 30) as f64
+            ));
         }
     }
     // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.
