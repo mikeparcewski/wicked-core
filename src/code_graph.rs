@@ -648,10 +648,20 @@ pub(crate) fn code_graph_rel() -> PathBuf {
     CODE_GRAPH_DB_REL.split('/').collect()
 }
 
-/// Refuse links at the repo graph's key directory or database. A missing database is allowed
-/// so the writer can index a fresh graph; metadata errors otherwise propagate.
+/// Refuse links at the repo graph's key directory, database, writer lock and SQLite sidecars
+/// so readers and writers cannot follow them into other files. Missing paths are allowed.
 fn refuse_linked_graph(db: &Path) -> std::io::Result<()> {
-    for path in db.parent().into_iter().chain(std::iter::once(db)) {
+    let siblings = [".writer.lock", "-wal", "-shm", "-journal"].map(|suffix| {
+        let mut path = db.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
+    });
+    for path in db
+        .parent()
+        .into_iter()
+        .chain(std::iter::once(db))
+        .chain(siblings.iter().map(PathBuf::as_path))
+    {
         match std::fs::symlink_metadata(path) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(std::io::Error::new(
@@ -660,7 +670,7 @@ fn refuse_linked_graph(db: &Path) -> std::io::Result<()> {
                 ));
             }
             Ok(_) => {}
-            Err(err) if path == db && err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err),
         }
     }
@@ -1083,7 +1093,8 @@ pub(crate) enum BaseIndex {
 /// repo's graph (incremental: only changed files are re-extracted) records exactly the base.
 /// Runs on the launch's worktree thread, off the actor, bounded by the worktree's index budget. `root` is
 /// the repo-graph root the actor resolved (the thread has no state-home binding). `Err` says why
-/// it did not happen; the run then scores as before (a stale graph fails closed).
+/// it did not happen, including a linked graph path; the run then scores as before (a stale graph
+/// fails closed).
 pub(crate) fn index_at_base(
     repo: &Path,
     worktree: &Path,
@@ -1102,6 +1113,9 @@ fn index_at_base_with(
     bound: IndexBound,
 ) -> Result<BaseIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(db) = resolved_code_graph_db_at(repo, root) {
+        refuse_linked_graph(&db).map_err(|e| e.to_string())?;
+    }
     let Some(db) = existing_code_graph_at(repo, root) else {
         return Ok(BaseIndex::NoGraph);
     };
@@ -1207,7 +1221,8 @@ pub enum CheckoutIndex {
 /// taken under [`BASE_INDEX_LOCK`] so it is never a second writer beside a launch's D8 (crew's repo
 /// watcher, wicked-core#1230). The graph it leaves is marked not-a-base ([`mark_not_a_base`]), so a
 /// run's later checks ([`crate::review_scale::graph_age`]) fail closed until a launch's D8 indexes
-/// its base again. A repo with no graph yet is left to onboarding (`NoGraph`).
+/// its base again. A repo with no graph yet is left to onboarding (`NoGraph`); linked graph paths
+/// return an error.
 pub fn index_checkout(
     repo: &Path,
     held_by: impl FnOnce() -> Result<Vec<String>, String>,
@@ -1229,6 +1244,9 @@ fn index_checkout_with(
     held_by: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<CheckoutIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(db) = resolved_code_graph_db_at(repo, root) {
+        refuse_linked_graph(&db).map_err(|e| e.to_string())?;
+    }
     let Some(db) = existing_code_graph_at(repo, root) else {
         return Ok(CheckoutIndex::NoGraph);
     };
@@ -2077,6 +2095,77 @@ mod tests {
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(err.to_string().contains(&db.display().to_string()), "{err}");
         }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_writer_lock_or_sidecar_is_refused_for_read_and_write() {
+        for suffix in [".writer.lock", "-wal", "-shm", "-journal"] {
+            let base = scratch(&format!("linked-repo-graph{suffix}"));
+            let repo = base.join("repo");
+            let root = base.join("repo-graphs");
+            std::fs::create_dir_all(&repo).unwrap();
+            let db = repo_graph_db_at(&root, &repo);
+            std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+            std::fs::write(&db, b"indexed").unwrap();
+            let mut sibling = db.as_os_str().to_os_string();
+            sibling.push(suffix);
+            let sibling = PathBuf::from(sibling);
+            let target = base.join("text-file");
+            std::fs::write(&target, b"not a database").unwrap();
+            std::os::unix::fs::symlink(&target, &sibling).unwrap();
+
+            assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+            let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(
+                err.to_string().contains(&sibling.display().to_string()),
+                "{err}"
+            );
+
+            std::fs::remove_file(&sibling).unwrap();
+            assert_eq!(existing_code_graph_at(&repo, Some(&root)), Some(db.clone()));
+            assert_eq!(
+                code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
+                db
+            );
+            let _ = std::fs::remove_dir_all(&base);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_writer_lock_link_is_a_named_reindex_refusal() {
+        let base = scratch("linked-writer-lock-reindex");
+        let repo = base.join("repo");
+        let worktree = base.join("worktree");
+        let root = base.join("repo-graphs");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&worktree).unwrap();
+        let db = repo_graph_db_at(&root, &repo);
+        graph_at(&db, "old-commit");
+        let mut lock = db.as_os_str().to_os_string();
+        lock.push(".writer.lock");
+        let lock = PathBuf::from(lock);
+        let target = base.join("text-file");
+        std::fs::write(&target, b"not a database").unwrap();
+        std::os::unix::fs::symlink(&target, &lock).unwrap();
+        let marker = base.join("indexer-ran");
+        let stub = base.join("indexer");
+        crate::test_env::install_stub(&stub, &format!("#!/bin/sh\ntouch '{}'\n", marker.display()));
+        let bin = stub.to_string_lossy();
+        let patient = Some(crate::test_env::PATIENT);
+
+        let checkout = index_checkout_with(&bin, &repo, Some(&root), patient, || Ok(vec![]));
+        let indexed = index_at_base_with(&bin, &repo, &worktree, "new-base", Some(&root), patient);
+        for result in [checkout.map(|_| ()), indexed.map(|_| ())] {
+            let err = result.unwrap_err();
+            assert!(err.contains("refusing symlinked repo graph path"), "{err}");
+            assert!(err.contains(&lock.display().to_string()), "{err}");
+        }
+        assert!(!marker.exists(), "the indexer ran despite the planted link");
 
         let _ = std::fs::remove_dir_all(&base);
     }
