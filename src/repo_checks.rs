@@ -10185,7 +10185,7 @@ fn decide(
     let early_retry = early_retry.filter(|_| !excluded_run);
     // (core#1198) A check that retries its own failures is not retried again.
     let retry = early_retry.or_else(|| {
-        (!crashed_out && !no_retry)
+        (!deciding.environment_failure() && !crashed_out && !no_retry)
             .then(|| {
                 retry_if_loaded(
                     worktree,
@@ -10206,6 +10206,11 @@ fn decide(
         decision.flaky = r.passed();
         twice = !r.passed() && !r.timed_out && r.spawn_error.is_none() && ran_loaded(&r);
         deciding = r;
+    }
+    // (core#1627) The deciding run may be nested in `reruns`: keep its environment cause on
+    // the head too, so a floor with reused checks terminates instead of starting over.
+    if deciding.environment_failure() {
+        head.spawn_error = deciding.spawn_error.clone();
     }
     // Head ids are an ANNOTATION: listed beside the outcome, never deciding it (the deciding
     // run's, when it was the excluded one).
@@ -10235,7 +10240,9 @@ fn decide(
     } else {
         base_unknown
     };
-    let (outcome, classification) = if deciding.passed() && excluded_run {
+    let (outcome, classification) = if deciding.environment_failure() {
+        (OUTCOME_COULD_NOT_RUN, None)
+    } else if deciding.passed() && excluded_run {
         (OUTCOME_PASS_EXCLUDED, Some(PRE_EXISTING_IN_SANDBOX))
     } else if deciding.passed() {
         (OUTCOME_PASS, Some(FLAKY_UNDER_LOAD))
@@ -11094,8 +11101,18 @@ pub(crate) fn run_one_with(
     result.stdout_tail = String::from_utf8_lossy(&out.tail).into_owned();
     result.stderr_tail = String::from_utf8_lossy(&err.tail).into_owned();
     // A stream the store could not keep is no record: the check could not be run as evidence.
-    if let Some(e) = out.error.or(err.error) {
-        result.spawn_error = Some(e);
+    if let Some(stream) = [&out, &err]
+        .into_iter()
+        .find(|s| s.no_space)
+        .or_else(|| [&out, &err].into_iter().find(|s| s.error.is_some()))
+    {
+        if let Some(e) = &stream.error {
+            result.spawn_error = Some(if stream.no_space {
+                format!("{}; {e}", disk_full_error(check, ""))
+            } else {
+                e.clone()
+            });
+        }
     }
     // Read back only for a failing run: nothing below reads a passing run's streams (agy r6).
     let failed = result.exit_code != Some(0);
@@ -11151,12 +11168,12 @@ pub(crate) fn run_one_with(
             .and_then(|root| free_bytes(&root))
             .filter(|free| disk_guard(Some(*free), min_gib).is_some())
         {
-            result.spawn_error = Some(format!(
-                "{ENVIRONMENT_REFUSAL_PREFIX} the disk filled during `{}` ({:.1} GiB free, \
-                 minimum {min_gib} GiB; WICKED_FLOOR_MIN_FREE_GB). Free disk space, then retry; \
-                 not a failure of the change",
-                check.name,
-                free as f64 / (1u64 << 30) as f64
+            result.spawn_error = Some(disk_full_error(
+                check,
+                &format!(
+                    " ({:.1} GiB free, minimum {min_gib} GiB; WICKED_FLOOR_MIN_FREE_GB)",
+                    free as f64 / (1u64 << 30) as f64
+                ),
             ));
         }
     }
@@ -11168,6 +11185,15 @@ pub(crate) fn run_one_with(
     }
     result.duration_ms = started.elapsed().as_millis() as u64;
     result
+}
+
+/// The same environment refusal for corroborated check output and the log store's own ENOSPC.
+fn disk_full_error(check: &RepoCheck, detail: &str) -> String {
+    format!(
+        "{ENVIRONMENT_REFUSAL_PREFIX} the disk filled during `{}`{detail}. Free disk space, then \
+         retry; not a failure of the change",
+        check.name
+    )
 }
 
 /// The per-stream log cap ([`crate::floor_log::MAX_STREAM_BYTES`]; a test may lower it).
@@ -11333,6 +11359,222 @@ pub(crate) mod tests {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
         crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
+    }
+
+    /// core#1627: deciding runs must stop a floor with reused checks, including when a red
+    /// base cannot be separated. Exclusion keeps these retries inside `decide`, not early.
+    #[cfg(unix)]
+    #[test]
+    fn core_1627_deciding_enospc_is_terminal_after_reuse() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let _load = test_seam::pin(8.0, 4);
+        let _exclude = test_seam::exclude(true);
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+                match &self.0 {
+                    Some(v) => std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", v),
+                    None => std::env::remove_var("WICKED_FLOOR_MIN_FREE_GB"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("WICKED_FLOOR_MIN_FREE_GB"));
+        std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", "15");
+        for (tag, precise, on_retry) in [
+            ("unseparated-retry", false, true),
+            ("excluded-retry", true, true),
+            ("excluded-head", true, false),
+        ] {
+            let wt = scratch(tag);
+            std::fs::write(
+                wt.join("check.sh"),
+                "case \"$*\" in *--list*)\n\
+                   echo 'new: test'; case \"$*\" in *--skip=old*) ;; *) echo 'old: test';; esac; exit 0;;\n\
+                 esac\n\
+                 echo run >> attempts\n\
+                 echo 'No space left on device (os error 28)' >&2\n\
+                 exit 101\n",
+            )
+            .unwrap();
+            let scratch = CheckScratch::prepare(&wt).unwrap();
+            let sandbox = WorkerSandbox {
+                wrapper: Vec::new(),
+                level: SandboxLevel::BestEffort,
+                downgrade_reason: None,
+            };
+            let check = RepoCheck {
+                name: "test".into(),
+                argv: s(&["sh", "check.sh"]),
+                source: "fixture".into(),
+                timeout_s: Some(30),
+                dir: String::new(),
+            };
+            TEST_FREE_BYTES.with(|c| c.set(40 << 30));
+            let mut head = run_one(&wt, &check, &sandbox, &scratch, Tree::Head);
+            assert!(head.spawn_error.is_none(), "{head:?}");
+            let old = TestId {
+                id: "old".into(),
+                q: String::new(),
+            };
+            let side = BaseSide {
+                base: BaseRun {
+                    head: "base".into(),
+                    cached: false,
+                    run: Some(head.clone()),
+                    error: None,
+                },
+                toc: Some(Toc {
+                    ids: vec![old.clone()],
+                    failing: vec![old.clone()],
+                    alone: vec![(old, true)],
+                    incomplete: (!precise).then(|| "the base list was incomplete".into()),
+                    ..Toc::default()
+                }),
+            };
+            let guide: GuideCheck = serde_json::from_value(serde_json::json!({
+                "name": "test", "run": check.argv, "failedExit": [101],
+                "results": {"kind": "text"},
+                "parser": {"failed": ["^FAIL (?P<id>.+)$"]},
+                "list": {"run": ["sh", "check.sh", "--list"],
+                         "item": "^(?P<id>.+): test$"},
+                "alone": {"run": ["sh", "check.sh", "{id}"]},
+                "deselect": {"append": ["--skip={id}"]}
+            }))
+            .unwrap();
+            let seed = CreatorSeed {
+                record: CreatorFloorRecord {
+                    floor_policy: FLOOR_POLICY_VERSION,
+                    tree: "tree".into(),
+                    base: "base".into(),
+                    ord: 1,
+                    attempt: 0,
+                    phase: Some("fix".into()),
+                    sandbox_level: "best_effort".into(),
+                    exclude: true,
+                    checks: Vec::new(),
+                },
+                reused: vec!["lint".into()],
+                fresh: Vec::new(),
+            };
+            assert!(seed.set_aside_by(&check, &head).is_some());
+            if precise && on_retry {
+                // The two head inventories and the excluded run see plenty; only its retry
+                // sees low space. Inventory probes also use the existing spawn seam.
+                test_seam::before_spawn(|| {
+                    test_seam::before_spawn(|| {
+                        test_seam::before_spawn(|| {
+                            test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)))
+                        })
+                    })
+                });
+            } else {
+                test_seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+            }
+            decide(
+                &wt,
+                None,
+                &check,
+                &mut head,
+                Some(side),
+                &Ok(&guide),
+                true,
+                &sandbox,
+                &scratch,
+                None,
+                false,
+            );
+            let deciding = head.reruns.last().expect("a deciding run ran");
+            assert!(deciding.environment_failure(), "{head:?}");
+            assert!(head.environment_failure(), "{head:?}");
+            assert_eq!(head.spawn_error, deciding.spawn_error, "{head:?}");
+            assert_eq!(head.outcome(), OUTCOME_COULD_NOT_RUN, "{head:?}");
+            let decision = head.decision.as_ref().unwrap();
+            assert_eq!(decision.outcome, OUTCOME_COULD_NOT_RUN, "{head:?}");
+            assert_eq!(head.classification, None, "{head:?}");
+            assert!(
+                seed.set_aside_by(&check, &head).is_none(),
+                "no restart: {head:?}"
+            );
+            assert_eq!(head.retry.is_some(), on_retry, "{head:?}");
+            assert_eq!(
+                head.reruns.len(),
+                usize::from(precise) + usize::from(on_retry)
+            );
+            for rerun in &head.reruns {
+                for log in &rerun.logs {
+                    assert!(decision.log_refs.contains(log), "{decision:?}");
+                }
+            }
+            assert_eq!(
+                std::fs::read_to_string(wt.join("attempts"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                1 + usize::from(precise) + usize::from(on_retry)
+            );
+            drop(scratch);
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+    }
+
+    /// core#1627: an ENOSPC from the engine's log writer is itself corroboration, even for
+    /// exit zero and with ample disk space. Preserve the original log error for diagnosis.
+    #[cfg(unix)]
+    #[test]
+    fn core_1627_log_write_enospc_is_an_environment_failure() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let wt = scratch("log-write-enospc");
+        let scratch = CheckScratch::prepare(&wt).unwrap();
+        let sandbox = WorkerSandbox {
+            wrapper: Vec::new(),
+            level: SandboxLevel::BestEffort,
+            downgrade_reason: None,
+        };
+        for exit in [0, 101] {
+            for (write_error, no_space) in [
+                (std::io::Error::from_raw_os_error(28), true),
+                (
+                    std::io::Error::new(
+                        std::io::ErrorKind::StorageFull,
+                        "injected full log device",
+                    ),
+                    true,
+                ),
+                (std::io::Error::other("No space left on device"), false),
+            ] {
+                let check = RepoCheck {
+                    name: "test".into(),
+                    argv: s(&["sh", "-c", &format!("echo ordinary-output; exit {exit}")]),
+                    source: "fixture".into(),
+                    timeout_s: Some(30),
+                    dir: String::new(),
+                };
+                let detail = write_error.to_string();
+                crate::floor_log::fail_next_write(write_error);
+                let mut run = run_one(&wt, &check, &sandbox, &scratch, Tree::Head);
+                assert_eq!(run.exit_code, Some(exit), "{run:?}");
+                assert_eq!(run.environment_failure(), no_space, "{run:?}");
+                let error = run.spawn_error.as_deref().unwrap();
+                if no_space {
+                    assert!(error.contains("the disk filled during `test`"), "{error}");
+                    assert!(error.contains("Free disk space, then retry"), "{error}");
+                }
+                assert!(
+                    error.ends_with(&format!("the floor log could not be written: {detail}")),
+                    "{error}"
+                );
+                assert!(run.logs[0].truncated, "{run:?}");
+                decide_alone(&mut run);
+                assert_eq!(run.decision.unwrap().outcome, OUTCOME_COULD_NOT_RUN);
+            }
+        }
+        drop(scratch);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     #[test]
