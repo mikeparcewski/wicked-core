@@ -4770,6 +4770,7 @@ impl WrappedCliStepRunner {
             // (DES-OUTGOV-003 §8).
             if let Some(g) = &gov_env {
                 cmd.env(crate::gate_hook::DECISIONS_PATH_ENV, &g.decisions_path);
+                arm_hook_gov_root(&mut cmd);
                 cmd.env(crate::gate_hook::GATE_DB_ENV, &g.db_path);
                 cmd.env(crate::gate_hook::GATE_SCOPE_ENV, &g.scope);
                 cmd.env(crate::gate_hook::GATE_PHASE_ENV, &g.phase);
@@ -5899,6 +5900,11 @@ struct GovLaunch {
     /// READ roots — a worker reads its skill's `SKILL.md`, refs and scripts there — and nothing
     /// else: the snapshot is immutable by contract, so it is never a write root.
     skills_root: Option<PathBuf>,
+}
+
+/// Keep host and relayed hooks on the same governance root as the daemon's decisions path.
+fn arm_hook_gov_root(cmd: &mut Command) {
+    cmd.env(crate::gate_hook::GOV_ROOT_ENV, crate::gate_hook::gov_root());
 }
 
 /// Point a GOVERNED worker's estate CLI channel at the repo's OWN graph via `$WICKED_ESTATE_DB`.
@@ -13773,6 +13779,20 @@ mod tests {
         );
         // The hook still arms — this is a scoping fix, not a governance downgrade.
         assert_eq!(json["hooks"]["PreToolUse"][0]["matcher"], "*");
+    }
+
+    #[test]
+    fn the_governed_seat_env_carries_the_resolved_gov_root() {
+        // spawn-audit: test-only — this Command is never spawned; inspect its explicit hook env.
+        let mut cmd = Command::new("true");
+        arm_hook_gov_root(&mut cmd);
+        let root = crate::gate_hook::gov_root();
+        let passed = cmd
+            .get_envs()
+            .find(|(k, _)| *k == std::ffi::OsStr::new(crate::gate_hook::GOV_ROOT_ENV))
+            .map(|(_, v)| v);
+        assert_eq!(passed, Some(Some(root.as_os_str())));
+        assert!(crate::gate_hook::decisions_path_for("hook-gov-root", 0).starts_with(&root));
     }
 
     /// The CLI-channel twin of `the_worker_mcp_never_receives_the_operational_store`. FINDING-069
