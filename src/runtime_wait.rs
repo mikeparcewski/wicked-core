@@ -77,8 +77,18 @@ const NETWORK_CAUSE_CAP: usize = 400;
 /// The refusal's closing suffix for the runtime's network error `detail`: labelled, on one line
 /// (whitespace runs, newlines included, become one space), bounded, and closed with `)`.
 pub(crate) fn network_cause_suffix(detail: &str) -> String {
+    cause_suffix(detail, NETWORK_CAUSE_CAP)
+}
+
+/// A pod diagnosis keeps its conditions and five events on the refusal's one line, with a
+/// separate 4096-byte budget for that evidence.
+pub(crate) fn diagnosis_suffix(detail: &str) -> String {
+    cause_suffix(detail, 4096)
+}
+
+fn cause_suffix(detail: &str, cap: usize) -> String {
     let flat = detail.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut end = flat.len().min(NETWORK_CAUSE_CAP);
+    let mut end = flat.len().min(cap);
     while !flat.is_char_boundary(end) {
         end -= 1;
     }
@@ -232,6 +242,30 @@ pub(crate) fn unavailable_output(last: &StepOutput, cli: &str, waited: Duration)
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    #[test]
+    fn pod_diagnosis_suffix_flattens_whitespace_and_has_its_own_byte_cap() {
+        assert_eq!(
+            diagnosis_suffix("phase Pending;\n  last events:\tFailed: operation timeout"),
+            " — runtime error: phase Pending; last events: Failed: operation timeout)"
+        );
+        let detail = "界".repeat(2000);
+        let suffix = diagnosis_suffix(&detail);
+        let body = suffix
+            .strip_prefix(NETWORK_CAUSE_LABEL)
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap();
+        assert_eq!(body, "界".repeat(4096 / 3));
+        assert!(body.len() <= 4096);
+        let network = network_cause_suffix(&detail);
+        let body = network
+            .strip_prefix(NETWORK_CAUSE_LABEL)
+            .unwrap()
+            .strip_suffix(')')
+            .unwrap();
+        assert_eq!(body, "界".repeat(400 / 3));
+    }
 
     fn out(status: StepStatus, text: &str) -> StepOutput {
         StepOutput {

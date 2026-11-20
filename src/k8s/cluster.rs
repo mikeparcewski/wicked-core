@@ -207,6 +207,7 @@ pub(crate) fn install_docs(owner: &str) -> Vec<Value> {
                        "limitranges", "configmaps"],
          "verbs": crud},
         {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get", "list"]},
+        {"apiGroups": [""], "resources": ["events"], "verbs": ["get", "list"]},
         {"apiGroups": ["networking.k8s.io"], "resources": ["networkpolicies"], "verbs": crud},
         {"apiGroups": ["apps"], "resources": ["deployments"], "verbs": crud},
         {"apiGroups": ["batch"], "resources": ["jobs"], "verbs": crud},
