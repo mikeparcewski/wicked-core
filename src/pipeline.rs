@@ -1385,215 +1385,213 @@ pub(crate) fn apply_and_finish_unit(
             .find(|u| u.ord == ord)
             .and_then(|u| u.phase_id().map(str::to_string))
     };
-    let checks_denial: Option<(&'static str, String)> =
-        match &evidence.repo_checks {
-            Some(report) => {
-                unit.repo_checks = Some(report.clone());
-                let verify_floor =
-                    unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
-                let (changed, changed_truncated) = if verify_floor {
-                    (Vec::new(), false)
+    let checks_denial: Option<(&'static str, String)> = match &evidence.repo_checks {
+        Some(report) => {
+            unit.repo_checks = Some(report.clone());
+            let verify_floor = unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
+            let (changed, changed_truncated) = if verify_floor {
+                (Vec::new(), false)
+            } else {
+                creator_changed_paths(unit, workdir.as_deref(), report)
+            };
+            emit(CoreEvent::RepoChecksEvaluated {
+                session: session_id.to_string(),
+                ord: unit.ord,
+                attempt,
+                passed: report.passed,
+                criterion: crate::repo_checks::CRITERION.to_string(),
+                checks: report.checks.clone(),
+                skipped: report.skipped.clone(),
+                sandbox_level: report.sandbox_level.clone(),
+                sandbox_error: report.sandbox_error.clone(),
+                detect_error: report.detect_error.clone(),
+                outcome: report.outcome().to_string(),
+                // (L1↔L2 contract, review-L2-505 / DES-L2 §4) The deliver TOOL unit runs the
+                // VERIFY floor over the tree it ships — its frame reads `verify`, never
+                // `creator`, exactly like a declared `repo_checks_floor` phase.
+                floor: if verify_floor {
+                    crate::repo_checks::FloorStage::Verify
                 } else {
-                    creator_changed_paths(unit, workdir.as_deref(), report)
-                };
-                emit(CoreEvent::RepoChecksEvaluated {
+                    crate::repo_checks::FloorStage::Creator
+                }
+                .as_wire()
+                .to_string(),
+                claim: report.claim.clone(),
+                env: report.env.clone(),
+                changed,
+                changed_truncated,
+                reused_from: report.reused_from.clone(),
+                floor_runner: report.runner.clone().map(Box::new),
+            });
+            // The re-run an operator retry armed, on the SAME tree the replaced result
+            // judged: said on the wire beside the fresh frame, so the gate history holds both
+            // results. The fresh report alone decides the gate below (deny-dominant).
+            if let Some((reason, previous_outcome, tree)) = recheck
+                .as_ref()
+                .filter(|(_, _, t)| t.is_some() && *t == report.tree)
+            {
+                emit(CoreEvent::FloorRecheck {
                     session: session_id.to_string(),
                     ord: unit.ord,
                     attempt,
-                    passed: report.passed,
-                    criterion: crate::repo_checks::CRITERION.to_string(),
-                    checks: report.checks.clone(),
-                    skipped: report.skipped.clone(),
-                    sandbox_level: report.sandbox_level.clone(),
-                    sandbox_error: report.sandbox_error.clone(),
-                    detect_error: report.detect_error.clone(),
+                    reason: reason.clone(),
+                    tree: tree.clone(),
+                    previous_outcome: previous_outcome.to_string(),
                     outcome: report.outcome().to_string(),
-                    // (L1↔L2 contract, review-L2-505 / DES-L2 §4) The deliver TOOL unit runs the
-                    // VERIFY floor over the tree it ships — its frame reads `verify`, never
-                    // `creator`, exactly like a declared `repo_checks_floor` phase.
-                    floor: if verify_floor {
-                        crate::repo_checks::FloorStage::Verify
-                    } else {
-                        crate::repo_checks::FloorStage::Creator
-                    }
-                    .as_wire()
-                    .to_string(),
-                    claim: report.claim.clone(),
-                    env: report.env.clone(),
-                    changed,
-                    changed_truncated,
-                    reused_from: report.reused_from.clone(),
-                    floor_runner: report.runner.clone().map(Box::new),
+                    passed: report.passed,
                 });
-                // The re-run an operator retry armed, on the SAME tree the replaced result
-                // judged: said on the wire beside the fresh frame, so the gate history holds both
-                // results. The fresh report alone decides the gate below (deny-dominant).
-                if let Some((reason, previous_outcome, tree)) = recheck
-                    .as_ref()
-                    .filter(|(_, _, t)| t.is_some() && *t == report.tree)
-                {
-                    emit(CoreEvent::FloorRecheck {
-                        session: session_id.to_string(),
-                        ord: unit.ord,
-                        attempt,
-                        reason: reason.clone(),
-                        tree: tree.clone(),
-                        previous_outcome: previous_outcome.to_string(),
-                        outcome: report.outcome().to_string(),
-                        passed: report.passed,
-                    });
-                }
-                // (J4) A floor that resumed one a daemon restart interrupted says what it reused.
-                if let Some(r) = &report.resumed {
-                    emit(CoreEvent::FloorResumed {
-                        session: session_id.to_string(),
-                        ord: unit.ord,
-                        attempt,
-                        from_attempt: r.from_attempt,
-                        tree: report.tree.clone(),
-                        reused: r.reused.clone(),
-                        restarted: r.restarted.clone(),
-                    });
-                }
-                if default_floor_refused_unsandboxed {
-                    eprintln!(
+            }
+            // (J4) A floor that resumed one a daemon restart interrupted says what it reused.
+            if let Some(r) = &report.resumed {
+                emit(CoreEvent::FloorResumed {
+                    session: session_id.to_string(),
+                    ord: unit.ord,
+                    attempt,
+                    from_attempt: r.from_attempt,
+                    tree: report.tree.clone(),
+                    reused: r.reused.clone(),
+                    restarted: r.restarted.clone(),
+                });
+            }
+            if default_floor_refused_unsandboxed {
+                eprintln!(
                     "wicked-core: unit {} changed the worktree tree but the default repo-checks \
                      floor could not run ({}); disclosed as UNGATED on the deterministic layer, \
                      not denied (F-7R2-005)",
                     unit.ord,
                     floor_refusal_advice(Some(report))
                 );
-                    None
-                } else if let Some(carry) = (!report.passed
+                None
+            } else if let Some(carry) = (!report.passed
                     && !crate::deliver_lift::is_deliver_unit(unit)
                     && unit.tool_cmd.is_none()
                     // An operator's explicit re-run asks for a fresh word on this tree.
                     && recheck.is_none())
+            .then(|| {
+                carried_floor_override(
+                    run_session.as_ref(),
+                    session_id,
+                    unit,
+                    attempt,
+                    report,
+                    false,
+                    &phase_of,
+                )
+            })
+            .flatten()
+            {
+                // (core#1168, core#1186) The operator already overrode this failure on this
+                // tree and base: the very result this verify floor reused, or a result whose
+                // failing tests include every one failing here. The override stands, labelled
+                // as carried; nothing is asked again.
+                eprintln!(
+                    "wicked-core: unit {} floor: {} — {}",
+                    unit.ord,
+                    carry
+                        .floor_override
+                        .as_ref()
+                        .map(|f| f.label.as_str())
+                        .unwrap_or_default(),
+                    report.summary()
+                );
+                carried_override = Some(carry);
+                None
+            } else {
+                (!report.passed).then(|| {
+                    (
+                        report.denial_source(),
+                        format!(
+                            "{}{}",
+                            no_change_contradicted_note(output, evidence),
+                            report.denial_reason()
+                        ),
+                    )
+                })
+            }
+        }
+        None if unit.repo_checks_floor
+            && unit.tool_cmd.is_none()
+            && workdir.is_some()
+            && guard_denial.is_none() =>
+        {
+            Some((
+                crate::repo_checks::DENIAL_SOURCE,
+                format!(
+                    "repo checks floor did not run for this verified_evidence phase: {} — \
+                         the result reached the gate without the engine's own check evidence \
+                         (fail-closed)",
+                    crate::repo_checks::CRITERION
+                ),
+            ))
+        }
+        None if carried.as_ref().is_some_and(|r| !r.passed) => {
+            floor_carried = true;
+            let r = carried.as_ref().expect("checked");
+            // (core#1186) The rework left the tree unchanged and the operator already
+            // overrode this failure on it: the override stands (carried, labelled) — only
+            // when nothing else denied behind that floor last time (the judge does not run
+            // again on an unchanged tree, so its last word must have been clear).
+            let carry = prior_denials_behind
+                .as_ref()
+                .is_some_and(|b| b.is_empty())
                 .then(|| {
                     carried_floor_override(
                         run_session.as_ref(),
                         session_id,
                         unit,
                         attempt,
-                        report,
-                        false,
+                        r,
+                        true,
                         &phase_of,
                     )
                 })
-                .flatten()
-                {
-                    // (core#1168, core#1186) The operator already overrode this failure on this
-                    // tree and base: the very result this verify floor reused, or a result whose
-                    // failing tests include every one failing here. The override stands, labelled
-                    // as carried; nothing is asked again.
-                    eprintln!(
-                        "wicked-core: unit {} floor: {} — {}",
-                        unit.ord,
-                        carry
-                            .floor_override
-                            .as_ref()
-                            .map(|f| f.label.as_str())
-                            .unwrap_or_default(),
-                        report.summary()
-                    );
-                    carried_override = Some(carry);
-                    None
-                } else {
-                    (!report.passed).then(|| {
-                        (
-                            report.denial_source(),
-                            format!(
-                                "{}{}",
-                                no_change_contradicted_note(output, evidence),
-                                report.denial_reason()
-                            ),
-                        )
-                    })
-                }
+                .flatten();
+            if let Some(carry) = carry {
+                eprintln!(
+                    "wicked-core: unit {} floor on the unchanged tree: {} — {}",
+                    unit.ord,
+                    carry
+                        .floor_override
+                        .as_ref()
+                        .map(|f| f.label.as_str())
+                        .unwrap_or_default(),
+                    r.summary()
+                );
+                carried_override = Some(carry);
             }
-            None if unit.repo_checks_floor
-                && unit.tool_cmd.is_none()
-                && workdir.is_some()
-                && guard_denial.is_none() =>
-            {
-                Some((
-                    crate::repo_checks::DENIAL_SOURCE,
+            carried_override.is_none().then(|| {
+                (
+                    r.denial_source(),
                     format!(
-                        "repo checks floor did not run for this verified_evidence phase: {} — \
-                         the result reached the gate without the engine's own check evidence \
-                         (fail-closed)",
-                        crate::repo_checks::CRITERION
-                    ),
-                ))
-            }
-            None if carried.as_ref().is_some_and(|r| !r.passed) => {
-                floor_carried = true;
-                let r = carried.as_ref().expect("checked");
-                // (core#1186) The rework left the tree unchanged and the operator already
-                // overrode this failure on it: the override stands (carried, labelled) — only
-                // when nothing else denied behind that floor last time (the judge does not run
-                // again on an unchanged tree, so its last word must have been clear).
-                let carry = prior_denials_behind
-                    .as_ref()
-                    .is_some_and(|b| b.is_empty())
-                    .then(|| {
-                        carried_floor_override(
-                            run_session.as_ref(),
-                            session_id,
-                            unit,
-                            attempt,
-                            r,
-                            true,
-                            &phase_of,
-                        )
-                    })
-                    .flatten();
-                if let Some(carry) = carry {
-                    eprintln!(
-                        "wicked-core: unit {} floor on the unchanged tree: {} — {}",
-                        unit.ord,
-                        carry
-                            .floor_override
-                            .as_ref()
-                            .map(|f| f.label.as_str())
-                            .unwrap_or_default(),
-                        r.summary()
-                    );
-                    carried_override = Some(carry);
-                }
-                carried_override.is_none().then(|| {
-                    (
-                        r.denial_source(),
-                        format!(
-                            "the rework left the tree unchanged; this unit's last floor result on \
+                        "the rework left the tree unchanged; this unit's last floor result on \
                          this tree stands ({}): {}",
-                            r.outcome(),
-                            r.denial_reason()
-                        ),
-                    )
-                })
-            }
-            // (F-7R2-005) The DEFAULT floor: an agent unit that CHANGED the tree it was handed owes
-            // the repository's own checks — a changed tree with no report is the same fail-closed
-            // shape as a declared floor whose report never arrived.
-            None if evidence.tree_changed == Some(true)
-                && unit.tool_cmd.is_none()
-                && workdir.is_some()
-                && guard_denial.is_none() =>
-            {
-                Some((
-                    crate::repo_checks::DENIAL_SOURCE,
-                    format!(
-                        "repo checks floor did not run although unit {} changed the worktree \
+                        r.outcome(),
+                        r.denial_reason()
+                    ),
+                )
+            })
+        }
+        // (F-7R2-005) The DEFAULT floor: an agent unit that CHANGED the tree it was handed owes
+        // the repository's own checks — a changed tree with no report is the same fail-closed
+        // shape as a declared floor whose report never arrived.
+        None if evidence.tree_changed == Some(true)
+            && unit.tool_cmd.is_none()
+            && workdir.is_some()
+            && guard_denial.is_none() =>
+        {
+            Some((
+                crate::repo_checks::DENIAL_SOURCE,
+                format!(
+                    "repo checks floor did not run although unit {} changed the worktree \
                          tree: {} — the result reached the gate without the engine's own check \
                          evidence (fail-closed, F-7R2-005)",
-                        unit.ord,
-                        crate::repo_checks::CRITERION
-                    ),
-                ))
-            }
-            None => None,
-        };
+                    unit.ord,
+                    crate::repo_checks::CRITERION
+                ),
+            ))
+        }
+        None => None,
+    };
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before the
     // denials are moved into the deny-dominance fold below, so `GateEvaluated` can carry the
     // depth. Both deterministic instruments count: the pinned validator and the repo checks.
