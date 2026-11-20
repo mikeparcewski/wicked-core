@@ -2632,7 +2632,7 @@ pub(crate) fn fence_check(root: &Path, operational_home: Option<&Path>) -> Resul
 /// engine's OWN operational home (codex round 8: the canonical parent of the database it was
 /// spawned on — crew's `stateHomeOfDb`; no environment variable states it, v3.4 §2 stands). A
 /// custom state home that is neither is known only through the snapshot handed from it.
-fn state_home_candidates(operational_home: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn state_home_candidates(operational_home: Option<&Path>) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(|h| PathBuf::from(h).join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME))
@@ -4418,13 +4418,14 @@ impl WrappedCliStepRunner {
                 }
             } else {
                 // core#548: with no strict per-seat profile, every worker in a run worktree
-                // still gets the repository boundary — its own tree writable, the clone and its
-                // sibling worktrees read-only at the OS (`worker_sandbox`). Not armed (not a run
+                // still gets the repository boundary plus engine stores — its own tree writable,
+                // protected roots read-only at the OS (`worker_sandbox`). Not armed (not a run
                 // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
                 match crate::worker_sandbox::default_worker_sandbox(
                     &cwd,
                     &worker_write_roots,
                     &cli_key,
+                    operational_home,
                 ) {
                     Ok(armed) => {
                         floor = Ok(armed.tool);
@@ -10453,6 +10454,9 @@ mod tests {
     #[test]
     fn a_governed_unit_on_a_floor_class_seat_in_a_worktree_is_governed_by_the_floor() {
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _graph_env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         // C5: the labelled interim host floor, chosen explicitly (products default to container).
         let _floor = VarGuard::set(
             crate::container_floor::SEAT_FLOOR_ENV,
@@ -10461,7 +10465,7 @@ mod tests {
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (base, _clone, own, _sibling) =
             crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
-        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy").is_err() {
+        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy", None).is_err() {
             eprintln!("execute_wrapped: no launcher can arm here — the IG1-core-2 proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;

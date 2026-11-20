@@ -12,12 +12,14 @@
 //! (the wrapped CLI spawn and the ACP bridge spawn):
 //!
 //! - **Read-only:** the clone root the worktree belongs to (its main working tree, its `.git`,
-//!   every sibling run worktree under `wicked-worktrees/`) and the worktree's parent directory.
+//!   every sibling run worktree under `wicked-worktrees/`), the worktree's parent directory,
+//!   the repo-graph root and existing registered state-home entries except `project-graphs`.
 //! - **Writable inside that:** the unit's own worktree, its own gitdir
 //!   (`.git/worktrees/<name>`), and the shared `objects`/`refs`/`logs` a commit on the run branch
-//!   writes, plus any write root the unit was handed that lies inside the clone.
-//! - **Untouched:** everything outside the clone. The seat's own configuration home, package
-//!   caches (`~/.npm`, `~/.cargo`, `~/Library/Caches`, …) and the network behave exactly as
+//!   writes, plus any write root the unit was handed that lies inside a protected root. A store
+//!   containing the unit's own tree is not protected.
+//! - **Untouched:** other paths outside the clone and engine stores. The seat's configuration
+//!   home, package caches (`~/.npm`, `~/.cargo`, `~/Library/Caches`, …) and the network behave as
 //!   before, so a normal build, install or commit inside the worktree is unchanged.
 //!
 //! macOS arms it with `sandbox-exec` (`(allow default)` + a write deny on the protected roots +
@@ -47,9 +49,9 @@ use wicked_apps_core::HardenedCommand;
 /// The repository boundary for one worker spawn, before it is rendered for a launcher.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RepoBoundary {
-    /// Directories made read-only (canonical).
+    /// Directories and files made read-only (canonical, existing).
     pub(crate) protected: Vec<PathBuf>,
-    /// Directories inside `protected` given back as writable (canonical, existing).
+    /// Roots inside `protected` given back as writable (canonical, existing); the own tree first.
     pub(crate) admitted: Vec<PathBuf>,
     /// Single files inside `protected` given back as writable. `FETCH_HEAD` (a `git fetch` in the
     /// worktree writes it in place) is admitted on both launchers — bwrap binds it when it exists.
@@ -168,6 +170,74 @@ pub(crate) fn repo_boundary(cwd: &Path, write_roots: &[PathBuf]) -> Option<RepoB
         admitted,
         admitted_files,
     })
+}
+
+/// Existing engine stores for the default host floor. Resolve the repo graphs through the
+/// engine's resolver (including its env override), and classify each state home's entries so
+/// a state home that is `$HOME` never denies the whole home. Project graphs stay writable:
+/// their readers still create WAL sidecars (core#1621).
+fn engine_store_paths(state_home: Option<&Path>) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = crate::code_graph::repo_graph_root_for(state_home)
+        .into_iter()
+        .collect();
+    let registry = crate::state_home::registry().expect("embedded state-home registry is valid");
+    for home in crate::execute_wrapped::state_home_candidates(state_home) {
+        let Ok(entries) = std::fs::read_dir(home) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            if name != "project-graphs"
+                && name
+                    .to_str()
+                    .is_some_and(|n| registry.classify(n).is_some())
+            {
+                paths.push(entry.path());
+            }
+        }
+    }
+    let mut paths: Vec<PathBuf> = paths
+        .into_iter()
+        .filter_map(|p| p.canonicalize().ok())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+impl RepoBoundary {
+    /// Add canonical, existing engine stores to the same deny set both launchers render.
+    /// `repo_boundary` admits the unit's tree first; a store containing it must stay writable.
+    fn protect_engine_stores(&mut self, stores: &[PathBuf], write_roots: &[PathBuf]) {
+        for store in stores {
+            if self
+                .admitted
+                .first()
+                .is_some_and(|tree| tree.starts_with(store))
+            {
+                continue;
+            }
+            if !self.protected.contains(store) {
+                self.protected.push(store.clone());
+            }
+        }
+        for root in write_roots {
+            // Match repo_boundary: a replaced grant leaf must not admit its symlink target.
+            if root
+                .symlink_metadata()
+                .is_ok_and(|m| m.file_type().is_symlink())
+            {
+                continue;
+            }
+            if let Ok(path) = root.canonicalize() {
+                if self.protected.iter().any(|store| path.starts_with(store))
+                    && !self.admitted.contains(&path)
+                {
+                    self.admitted.push(path);
+                }
+            }
+        }
+    }
 }
 
 fn sbpl_quote(p: &Path) -> String {
@@ -688,19 +758,21 @@ fn launcher_name(tool: &Path) -> &'static str {
 }
 
 /// The default worker wrapper for a spawn in `cwd` for seat/CLI `seat`: the repository boundary
-/// rendered for this host's launcher with the launcher's name, or why it did not arm (not a run
-/// worktree, a self-sandboxing seat, no launcher, a launcher that cannot arm here) — the worker
-/// then spawns as before.
+/// plus engine stores, rendered for this host's launcher with its name, or why it did not arm
+/// (not a run worktree, a self-sandboxing seat, no launcher, a launcher that cannot arm here) —
+/// the worker then spawns as before.
 pub(crate) fn default_worker_sandbox(
     cwd: &Path,
     write_roots: &[PathBuf],
     seat: &str,
+    state_home: Option<&Path>,
 ) -> Result<ArmedFloor, FloorUnarmed> {
     if seat_arms_its_own_os_sandbox(seat) {
         return Err(FloorUnarmed::SeatArmsItsOwn);
     }
-    let boundary = repo_boundary(cwd, write_roots).ok_or(FloorUnarmed::NotAWorktree)?;
+    let mut boundary = repo_boundary(cwd, write_roots).ok_or(FloorUnarmed::NotAWorktree)?;
     let tool = boundary_launcher()?;
+    boundary.protect_engine_stores(&engine_store_paths(state_home), write_roots);
     Ok(ArmedFloor {
         sandbox: crate::validator::WorkerSandbox {
             wrapper: launcher_argv(tool, &boundary),
@@ -1829,6 +1901,189 @@ esac
         assert!(!seat_arms_its_own_os_sandbox("opencode"));
     }
 
+    fn engine_store_fixture(base: &Path) -> (PathBuf, Vec<PathBuf>) {
+        let home = base.join("state-home");
+        for dir in ["repo-graphs/k", "gateway", "project-graphs"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        for file in [
+            "repo-graphs/k/estate.db",
+            "core.db",
+            "core.db-wal",
+            "unregistered",
+        ] {
+            std::fs::write(home.join(file), "engine state\n").unwrap();
+        }
+        let stores = ["repo-graphs", "core.db", "core.db-wal", "gateway"]
+            .map(|name| home.join(name).canonicalize().unwrap())
+            .to_vec();
+        (home, stores)
+    }
+
+    #[test]
+    fn engine_store_paths_protect_registered_entries_without_denying_the_state_home_1626() {
+        let base = std::env::temp_dir().join(format!("wicked-wsb-stores-{}", uuid::Uuid::new_v4()));
+        let (home, stores) = engine_store_fixture(&base);
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&home);
+        let paths = engine_store_paths(Some(&home));
+        for store in &stores {
+            assert!(paths.contains(store), "missing {store:?}: {paths:?}");
+            assert_eq!(paths.iter().filter(|p| *p == store).count(), 1);
+        }
+        for allowed in [
+            &home,
+            &home.join("project-graphs"),
+            &home.join("unregistered"),
+        ] {
+            assert!(
+                !paths.contains(&allowed.canonicalize().unwrap()),
+                "{paths:?}"
+            );
+        }
+        assert!(paths
+            .iter()
+            .all(|p| p.canonicalize().is_ok_and(|real| &real == p)));
+        drop(pin);
+        // The resolver's override can place the repo graphs outside either state home.
+        let override_pin =
+            crate::code_graph::test_support::GraphRootPin::at(&base.join("override"));
+        let paths = engine_store_paths(Some(&home));
+        assert!(paths.contains(&override_pin.root.canonicalize().unwrap()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn engine_stores_are_denied_before_admitted_sbpl_roots_1626() {
+        let (base, _clone, own, _sibling) = clone_with_two_runs("store-sbpl");
+        let (_home, stores) = engine_store_fixture(&base);
+        let mut boundary = repo_boundary(&own, &[]).unwrap();
+        boundary.protect_engine_stores(&stores, &[]);
+        let profile = sbpl_profile(&boundary);
+        let first_allow = profile.find("(allow file-write*").unwrap();
+        for store in &stores {
+            let deny = format!("(deny file-write* (subpath {}))\n", sbpl_quote(store));
+            assert!(profile.find(&deny).unwrap() < first_allow, "{profile}");
+            assert_eq!(profile.matches(&deny).count(), 1);
+        }
+        let own_allow = format!(
+            "(allow file-write* (subpath {}))\n",
+            sbpl_quote(&own.canonicalize().unwrap())
+        );
+        assert!(profile.contains(&own_allow), "{profile}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn engine_stores_are_read_only_before_the_bwrap_tree_bind_1626() {
+        let (base, _clone, own, _sibling) = clone_with_two_runs("store-bwrap");
+        let (_home, stores) = engine_store_fixture(&base);
+        let mut boundary = repo_boundary(&own, &[]).unwrap();
+        boundary.protect_engine_stores(&stores, &[]);
+        let argv = bwrap_argv(Path::new("bwrap"), &boundary);
+        let tree = own.canonicalize().unwrap().to_string_lossy().into_owned();
+        let own_bind = argv
+            .windows(3)
+            .position(|w| w == ["--bind", tree.as_str(), tree.as_str()])
+            .unwrap();
+        for store in &stores {
+            let store = store.to_string_lossy();
+            let deny = argv
+                .windows(3)
+                .position(|w| w == ["--ro-bind", store.as_ref(), store.as_ref()])
+                .unwrap();
+            assert!(deny < own_bind, "{argv:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn engine_stores_admit_handed_roots_and_skip_stores_containing_the_tree_1626() {
+        let (base, _clone, own, _sibling) = clone_with_two_runs("store-admit");
+        let (home, mut stores) = engine_store_fixture(&base);
+        let inbox = home.join("gateway/inbox");
+        std::fs::create_dir_all(&inbox).unwrap();
+        let roots = vec![inbox.clone(), base.join("linked-inbox")];
+        #[cfg(unix)]
+        let ungranted = {
+            let target = home.join("gateway/ungranted");
+            std::fs::create_dir_all(&target).unwrap();
+            std::os::unix::fs::symlink(&target, &roots[1]).unwrap();
+            target.canonicalize().unwrap()
+        };
+        let containing_store = base.canonicalize().unwrap();
+        stores.push(containing_store.clone());
+        let mut boundary = repo_boundary(&own, &[]).unwrap();
+        boundary.protect_engine_stores(&stores, &roots);
+        assert!(!boundary.protected.contains(&containing_store));
+        assert!(boundary
+            .protected
+            .contains(&home.join("gateway").canonicalize().unwrap()));
+        assert!(boundary.admitted.contains(&inbox.canonicalize().unwrap()));
+        assert!(boundary.admitted.contains(&own.canonicalize().unwrap()));
+        #[cfg(unix)]
+        assert!(!boundary.admitted.contains(&ungranted));
+        let once = boundary.clone();
+        boundary.protect_engine_stores(&stores, &roots);
+        assert_eq!(
+            boundary, once,
+            "adding the same stores and grants is idempotent"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#1626: the default host floor denies engine writes at the OS and keeps the tree writable.
+    #[cfg(unix)]
+    #[test]
+    fn the_default_floor_denies_repo_graph_writes_but_allows_the_worktree_1626() {
+        let (base, _clone, own, _sibling) = clone_with_two_runs("store-write");
+        let (home, _stores) = engine_store_fixture(&base);
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&home);
+        let Ok(armed) = default_worker_sandbox(&own, &[], "claude", Some(&home)) else {
+            eprintln!("worker_sandbox: no launcher can arm here — the #1626 proof skips");
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        };
+        let db = home.join("repo-graphs/k/estate.db");
+        let script = r#"
+import errno, sys
+try:
+    open(sys.argv[1], 'w').write('seat write\n')
+    print('store=wrote')
+except OSError as e:
+    print('store=' + errno.errorcode.get(e.errno, str(e.errno)))
+open('mine.txt', 'w').write('seat write\n')
+print('tree=wrote')
+"#;
+        let wrapper = &armed.sandbox.wrapper;
+        let out = Command::new(&wrapper[0])
+            .hardened()
+            .args(&wrapper[1..])
+            .args(["python3", "-c", script])
+            .arg(&db)
+            .current_dir(&own)
+            .output()
+            .expect("the wrapped worker spawns");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout} / {stderr}");
+        assert!(
+            stdout
+                .lines()
+                .any(|l| l == "store=EPERM" || l == "store=EROFS"),
+            "engine writes must fail at the OS: {stdout} / {stderr}"
+        );
+        assert!(
+            stdout.lines().any(|l| l == "tree=wrote"),
+            "{stdout} / {stderr}"
+        );
+        assert_eq!(std::fs::read_to_string(&db).unwrap(), "engine state\n");
+        assert_eq!(
+            std::fs::read_to_string(own.join("mine.txt")).unwrap(),
+            "seat write\n"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_unit_in_a_package_dir_below_its_worktree_gets_the_same_boundary() {
         let (base, _clone, own, _sibling) = clone_with_two_runs("subdir");
@@ -1845,6 +2100,9 @@ esac
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn the_boundary_arms_wherever_the_platform_launcher_runs() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (tool, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
             (
                 "sandbox-exec",
@@ -1871,7 +2129,7 @@ esac
         }
         let (base, _clone, own, _sibling) = clone_with_two_runs("arms");
         assert!(
-            default_worker_sandbox(&own, &[], "claude").is_ok(),
+            default_worker_sandbox(&own, &[], "claude", None).is_ok(),
             "{tool} runs on this host, so the repository boundary must arm"
         );
         let _ = std::fs::remove_dir_all(&base);
@@ -1879,25 +2137,28 @@ esac
 
     #[test]
     fn default_worker_sandbox_names_why_it_did_not_arm() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         // IG1-core-1: a scratch dir is not a worktree; a codex seat arms its own sandbox (checked
         // first, so it holds even inside a run worktree).
         let dir = std::env::temp_dir().join(format!("wicked-wsb-reason-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         assert_eq!(
-            default_worker_sandbox(&dir, &[], "claude").err(),
+            default_worker_sandbox(&dir, &[], "claude", None).err(),
             Some(FloorUnarmed::NotAWorktree)
         );
         let (base, _clone, own, _sibling) = clone_with_two_runs("reason");
         for seat in ["codex", "codex-acp", "/usr/local/bin/codex"] {
             assert_eq!(
-                default_worker_sandbox(&own, &[], seat).err(),
+                default_worker_sandbox(&own, &[], seat, None).err(),
                 Some(FloorUnarmed::SeatArmsItsOwn),
                 "{seat}"
             );
         }
         // In a worktree a non-codex seat either arms (naming its launcher) or names the launcher
         // gap — never NotAWorktree.
-        match default_worker_sandbox(&own, &[], "claude") {
+        match default_worker_sandbox(&own, &[], "claude", None) {
             Ok(armed) => assert!(["sandbox-exec", "bwrap"].contains(&armed.tool)),
             Err(e) => assert!(
                 matches!(e, FloorUnarmed::NoLauncher | FloorUnarmed::CannotArm),
@@ -1977,8 +2238,12 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_creator_cannot_write_a_sibling_worktree_or_the_clone_root_548() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (base, clone, own, sibling) = clone_with_two_runs("escape");
-        let Ok(sandbox) = default_worker_sandbox(&own, &[], "claude").map(|a| a.sandbox) else {
+        let Ok(sandbox) = default_worker_sandbox(&own, &[], "claude", None).map(|a| a.sandbox)
+        else {
             eprintln!("worker_sandbox: no launcher can arm on this host — the #548 proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;
