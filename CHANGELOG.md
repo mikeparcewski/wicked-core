@@ -44,6 +44,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
+  resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
+  database with `PermissionDenied` naming the linked path.
+
 - **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
   hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
