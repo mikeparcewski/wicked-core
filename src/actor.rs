@@ -34484,6 +34484,125 @@ mod live_output_stream_tests {
     }
 
     #[test]
+    fn live_output_redacts_tokens_at_every_chunk_split_on_the_wire() {
+        let dir = std::env::temp_dir().join(format!("wicked-live-redact-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("live.db");
+        let core = crate::Core::spawn_with_engine(
+            db.to_str().unwrap().to_string(),
+            Arc::new(StubDispatcher),
+            Arc::new(NoopRunner),
+        );
+        let events = core.subscribe();
+        let tokens = [
+            format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4)),
+            format!(concat!("AK", "IA", "{}"), "FAKE1234".repeat(2)),
+            format!(concat!("sk", "-ant-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("xo", "xb-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("gl", "pat-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("np", "m_", "{}"), "Fake1234".repeat(4) + "Abcd"),
+            format!(concat!("github", "_pat_", "{}"), "Fake7".repeat(4)),
+        ];
+        let mut expected = HashMap::new();
+        for token in &tokens {
+            for (whole, token_splits_only) in [
+                (format!("préface {token} after"), false),
+                // Padding forces a mid-stream release before the step result finishes the carry.
+                (
+                    format!("préface {token} after {}", "word ".repeat(60)),
+                    true,
+                ),
+            ] {
+                let redacted = crate::tool_activity::redact(&whole);
+                assert!(!redacted.contains(token), "fixture must match the redactor");
+                let token_start = whole.find(token).unwrap();
+                let token_end = token_start + token.len();
+                for split in whole
+                    .char_indices()
+                    .map(|(i, _)| i)
+                    .chain(std::iter::once(whole.len()))
+                    .filter(|split| !token_splits_only || (token_start..=token_end).contains(split))
+                {
+                    let run_id = format!("split-{}", expected.len());
+                    expected.insert(run_id.clone(), redacted.clone());
+                    for chunk in [&whole[..split], &whole[split..]] {
+                        core.tx
+                            .send(Command::CliOutputDelta {
+                                run_id: run_id.clone(),
+                                ord: 3,
+                                attempt: 2,
+                                chunk: chunk.into(),
+                                process_gen: None,
+                                launch_seq: 0,
+                            })
+                            .expect("actor alive");
+                    }
+                    core.tx
+                        .send(Command::ApplyStepResult {
+                            output: crate::workflow::StepOutput {
+                                run_id,
+                                unit_ix: 0,
+                                attempt: 2,
+                                output: String::new(),
+                                status: crate::workflow::StepStatus::Ok,
+                                usage: None,
+                                files: Vec::new(),
+                                tools: Vec::new(),
+                                governed: false,
+                            },
+                            agent_verdict: None,
+                            evidence: Default::default(),
+                            process_gen: None,
+                            launch_seq: 0,
+                            ack: None,
+                        })
+                        .expect("actor alive");
+                }
+            }
+        }
+        drop(core);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut raw: HashMap<String, String> = HashMap::new();
+        let mut throttled: HashMap<String, String> = HashMap::new();
+        loop {
+            let remaining = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .expect("actor did not shut down within the deadline");
+            match events.recv_timeout(remaining) {
+                Ok(ev) => {
+                    let field = match &ev {
+                        CoreEvent::CliOutputDelta { .. } => "chunk",
+                        CoreEvent::UnitOutputDelta { .. } => "text",
+                        _ => continue,
+                    };
+                    let wire = ev.to_json();
+                    let serialized = wire.to_string();
+                    for token in &tokens {
+                        assert!(!serialized.contains(token), "secret on the wire: {wire}");
+                    }
+                    let run_id = wire["session"].as_str().unwrap().to_string();
+                    let joined = if field == "chunk" {
+                        &mut raw
+                    } else {
+                        &mut throttled
+                    };
+                    joined
+                        .entry(run_id)
+                        .or_default()
+                        .push_str(wire[field].as_str().unwrap());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    panic!("actor did not shut down within the deadline");
+                }
+            }
+        }
+        // core#1653: checking the joined wire text catches leaked halves too.
+        assert_eq!(raw, expected);
+        assert_eq!(throttled, expected);
+    }
+
+    #[test]
     fn cli_output_chunks_surface_as_throttled_unit_output_deltas() {
         let dir = std::env::temp_dir().join(format!("wicked-live-output-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
