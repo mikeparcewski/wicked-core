@@ -3712,12 +3712,12 @@ fn sed_may_write(args: &[&str]) -> bool {
 
 /// Whether a word that is not plain can only be a FILE operand: its first character is a literal
 /// no expansion, glob or brace can turn into an option (`-i`), and the shell cannot split it into
-/// more words. Two shapes: a WHOLE double-quoted word (no splitting inside quotes) whose first
-/// character inside is safe, and an UNQUOTED word with no `$`, backtick or quote, whose only
-/// specials are `\\`, globs and braces (they yield words with the same literal prefix). An
-/// unquoted `a$x` or `` a`cmd` `` fails toward "may write": `x=' -i'` splits it into `a` and `-i`,
-/// and GNU sed reads an option after an operand. Anything else (`$x`, `{`, `*`, `~`, a leading `-`)
-/// fails toward "may write" too.
+/// more words. Two shapes, each with no `$`, backtick or inner quote (`"a$@"` and `"q${arr[@]}"`
+/// split even inside double quotes): a WHOLE double-quoted word, and an UNQUOTED word whose only
+/// specials are `\\`, globs and braces (they yield words with the same literal prefix). `a$x` or
+/// `` a`cmd` `` fails toward "may write": `x=' -i'` splits it into `a` and `-i`, and GNU sed reads
+/// an option after an operand. Anything else (`$x`, `{`, `*`, `~`, a leading `-`) fails toward
+/// "may write" too.
 fn plain_operand_start(raw: &str) -> bool {
     let safe = |inner: &str| {
         inner
@@ -3726,7 +3726,9 @@ fn plain_operand_start(raw: &str) -> bool {
             .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_'))
     };
     if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
-        return !inner.contains('"') && safe(inner);
+        // `"a$@"` and `"q${arr[@]}"` still split inside quotes, so a `$` or backtick is out here
+        // as it is for an unquoted word.
+        return !inner.contains(['"', '$', '`']) && safe(inner);
     }
     !raw.contains(['$', '`', '"', '\'']) && safe(raw)
 }
@@ -8480,8 +8482,9 @@ mod tests {
             &["'s/a/b/'", "C:\\x\\file.rs"],
             &["-n", "1p", "\"/srv/$X/f\""],
             &["-n", "1p", "'f'", "\"./$X\""],
-            &["p", "\"a$x\""],
+            &["p", "\"./c d\""],
             &["p", "C:\\dir\\f"],
+            &["p", "\"C:\\dir\\f\""],
             &["p", "f", "a*", "b{1,2}", "./c\\ d"],
             &["'s/[a-z]*//g'", "f"],
             &["'s/[]x]/y/'", "f"],
@@ -8520,6 +8523,10 @@ mod tests {
             // An unquoted word that expands splits (`x=' -i'`), and GNU sed reads an option after
             // an operand.
             &["'s/a/b/'", "/outside/file", "a$x"],
+            &["p", "\"a$x\""],
+            &["p", "/outside/file", "\"a$@\""],
+            &["p", "/outside/file", "\"q${arr[@]}\""],
+            &["p", "/outside/file", "\"a`echo -i`\""],
             &["p", "f", "a$(echo", "-i)"],
             &["p", "f", "a`echo -i`"],
             &["p", "f", "a'$x'b"],
