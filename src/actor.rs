@@ -5908,7 +5908,10 @@ pub(crate) fn resume_run_inner(
                 // terminal. A resume is an explicit operator/campaign restart (the environment
                 // may have been fixed), so it grants a fresh failover budget instead of
                 // refusing forever; the seat walk restarts from the currently assigned seat.
-                Some(None) => unit.worker_failed_clis.clear(),
+                Some(None) => {
+                    unit.worker_failed_clis.clear();
+                    unit.content_refused_clis.clear();
+                }
                 // Not a worker failure (judged rejection) — keep the crew#277 behavior:
                 // re-dispatch the same assigned seat.
                 None => {}
@@ -7302,6 +7305,8 @@ fn apply_step_result(
         } else {
             None
         };
+        let content_refused =
+            unit.tool_cmd.is_none() && crate::acp_runner::is_content_refusal(&output.output);
         if let Some(reason) = seat_refusal {
             let cli = unit
                 .assigned_cli
@@ -7379,6 +7384,8 @@ fn apply_step_result(
                 ),
             }
         } else if let Some(signature) = (unit.tool_cmd.is_none()
+            // A content refusal belongs to this unit, never the run-wide repeated-crash bench.
+            && !content_refused
             && output.status == crate::workflow::StepStatus::Failed
             && crate::execute_wrapped::wrapped_exit_code(&output.output).is_some_and(|c| c != 0))
         .then(|| crate::domain::failure_signature(&output.output))
@@ -7698,6 +7705,7 @@ fn apply_step_result(
                 }
             } else if human_present
                 && seat_refusal.is_none()
+                && !content_refused
                 && output.attempt > 0
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
@@ -7794,6 +7802,7 @@ fn apply_step_result(
                 return Ok(StepApplied::Paused);
             } else if human_present
                 && seat_refusal.is_none()
+                && !content_refused
                 && output.attempt == 0
                 && !pa_timed_out
             {
@@ -7806,6 +7815,8 @@ fn apply_step_result(
                 // failure skips the judge and takes the failover ladder below (the seat is already
                 // benched; the work moves to the next eligible seat); with no seat left it pauses
                 // at the failure gate instead of failing.
+                // (core#1492) A content refusal likewise skips triage and takes that ladder,
+                // recording only this unit's failed seat; it does not bench the seat.
                 // Blocking CLI work — runs off-thread; the decision returns as
                 // `FailureTriageReady` and the run stays Executing meanwhile.
                 // StepFailed fires IMMEDIATELY — it signals the worker failure, not the
@@ -7937,6 +7948,7 @@ fn apply_step_result(
         if unit.tool_cmd.is_none()
             && (crate::acp_runner::is_worker_originated_failure(&output.output)
                 || seat_refusal.is_some()
+                || content_refused
                 || pa_timed_out)
         {
             let failed_cli = unit
@@ -7950,11 +7962,19 @@ fn apply_step_result(
                 unit.worker_failed_clis.push(failed_cli.clone());
                 put_node(store, unit.to_node())?;
             }
+            if content_refused && !unit.content_refused_clis.contains(&failed_cli) {
+                unit.content_refused_clis.push(failed_cli.clone());
+                put_node(store, unit.to_node())?;
+            }
             let seats_tried = unit.worker_failed_clis.len();
             let unit_ix = output.unit_ix;
             // Immutable selection ends the `unit` borrow; the branch re-borrows before mutating.
             let next_seat = next_failover_seat(&units, unit_ix, &eligible_roster_keys(&session));
             if let Some(next) = next_seat {
+                if content_refused {
+                    // Keep the refused attempt before a re-pick changes its seat or attempt.
+                    persist_rejected_transcript(store, &session, &units[unit_ix], &output.output);
+                }
                 // (DES-ASK-TEAM-CHAT-001 §4.1) A PA step of a team run moving seats moves the
                 // PA: the roster, the pending PA steps and the record follow, and the change is a
                 // team fact (`path.repicked`), because `path.started.cli` is one.
@@ -7989,6 +8009,11 @@ fn apply_step_result(
                 unit.assigned_cli = Some(next.clone());
                 unit.assigned_invocation = invocation;
                 put_node(store, unit.to_node())?;
+                let failure = if content_refused {
+                    "refused this unit's content (refused_content)"
+                } else {
+                    "failed (worker error)"
+                };
                 emit(
                     subscribers,
                     CoreEvent::StepFailed {
@@ -7996,7 +8021,7 @@ fn apply_step_result(
                         ord,
                         attempt: output.attempt,
                         detail: format!(
-                            "seat '{failed_cli}' failed (worker error); failing over to '{next}' \
+                            "seat '{failed_cli}' {failure}; failing over to '{next}' \
                              (seats worker-failed on this unit: {seats_tried}/{}){}",
                             session.clis.len().max(seats_tried),
                             failover_distinctness
@@ -8049,6 +8074,11 @@ fn apply_step_result(
                     crate::domain::benched_summary(&session.benched_seats, session.clis.len())
                         .unwrap_or_else(|| "no other seat is configured".to_string());
                 let why = match seat_refusal {
+                    _ if content_refused => format!(
+                        "dead seat: '{failed_cli}' refused this unit's content (refused_content) \
+                         on unit {ord} and no eligible seat remains (tried: {}) — {bench}",
+                        unit.worker_failed_clis.join(", ")
+                    ),
                     Some(reason) => format!(
                         "dead seat: '{failed_cli}' {} on unit {ord} ({}) and no eligible seat \
                          remains — {bench}",
@@ -9915,7 +9945,24 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
         .join(", ");
     // (codex r2) Whether a result exists is the gate's own fact (a dead-seat gate has none), never
     // inferred from the history list: a seat that failed once and then answered gave this result.
-    match unit.assigned_cli.as_deref().filter(|_| has_result) {
+    let by = unit.assigned_cli.as_deref().filter(|_| has_result);
+    // (core#1492) A provider's content refusal is named plainly: a compliant seat now rules on
+    // work another provider refused.
+    let refused = if unit.content_refused_clis.is_empty() {
+        String::new()
+    } else {
+        let who = unit
+            .content_refused_clis
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match by {
+            Some(by) => format!(" [{who} refused this content; moved to `{by}`]"),
+            None => format!(" [{who} refused this content]"),
+        }
+    };
+    let base = match by {
         Some(by) => format!(
             " [failover: this step's earlier attempts on {seats} ended without a result the step \
              could use (a seat failure, or an answer the engine refused) and moved on; this result \
@@ -9927,7 +9974,8 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
              step could use (a seat failure, or an answer the engine refused); no seat produced a \
              result]"
         ),
-    }
+    };
+    format!("{base}{refused}")
 }
 
 fn denial_gate_prompt_body(
@@ -33845,6 +33893,191 @@ mod seat_failover_tests {
         assert!(matches!(applied, StepApplied::Continuing));
         assert_eq!(session.status, SessionStatus::Executing);
         assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"));
+    }
+
+    /// core#1492: an attended provider content refusal skips triage and uses the unit's ladder.
+    #[test]
+    fn core_1492_a_codex_content_refusal_fails_the_unit_over_instead_of_triage() {
+        let run_id = format!("content-refusal-failover-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["codex", "pi"],
+            SessionStatus::Executing,
+            0,
+        );
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.human_confirm = HumanConfirm::All;
+        put_node(&mut store, session.to_node()).unwrap();
+        // The same provider may refuse another unit without becoming a run-wide dead seat.
+        for ord in 1..=2 {
+            seed_unit(
+                &mut store,
+                &run_id,
+                ord,
+                &format!("u{ord}"),
+                "codex",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+        }
+        let refusal =
+            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
+        for unit_ix in 0..2 {
+            if unit_ix > 0 {
+                let mut session = crate::domain::get_session(&store, &run_id)
+                    .unwrap()
+                    .unwrap();
+                session.unit_ix = unit_ix;
+                session.attempt = 0;
+                put_node(&mut store, session.to_node()).unwrap();
+            }
+            let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+            assert!(matches!(applied, StepApplied::Continuing));
+            assert_eq!(session.status, SessionStatus::Executing);
+            assert_eq!(session.attempt, 1);
+            assert_eq!(units[unit_ix].assigned_cli.as_deref(), Some("pi"));
+            assert_eq!(units[unit_ix].worker_failed_clis, vec!["codex".to_string()]);
+            assert!(session.benched_seats.is_empty());
+            let transcript = crate::domain::get_unit_transcript(&store, &units[unit_ix].id)
+                .expect("the refused output survives failover on its unit");
+            assert_eq!(transcript.output.as_deref(), Some(refusal));
+            assert_eq!(transcript.resolution, crate::execute::RESOLUTION_REJECTED);
+            assert_eq!(transcript.attempt, Some(0));
+        }
+    }
+
+    #[test]
+    fn core_1492_an_exhausted_content_refusal_parks_at_the_dead_seat_gate() {
+        let run_id = format!("content-refusal-exhausted-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(&mut store, &run_id, &["codex"], SessionStatus::Executing, 0);
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.human_confirm = HumanConfirm::All;
+        put_node(&mut store, session.to_node()).unwrap();
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "codex",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let refusal =
+            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
+        let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert!(session.benched_seats.is_empty());
+        assert_eq!(units[0].worker_failed_clis, vec!["codex".to_string()]);
+        assert_eq!(units[0].status, UnitStatus::Rejected);
+        let denial = units[0].denial.as_ref().expect("the dead-seat denial");
+        assert_eq!(denial.source, crate::domain::DENIAL_SOURCE_DEAD_SEAT);
+        assert!(units[0]
+            .denial_reason
+            .as_deref()
+            .unwrap()
+            .contains("refused_content"));
+        let transcript = crate::domain::get_unit_transcript(&store, &units[0].id)
+            .expect("the refused output survives exhaustion");
+        assert_eq!(transcript.output.as_deref(), Some(refusal));
+    }
+
+    /// core#1492 (round 2): a second refusal after a rework (attempt > 0) still fails over; it does
+    /// not park at the core#556 launch-refusal gate, and the gate note names the refusal plainly.
+    #[test]
+    fn core_1492_a_content_refusal_on_a_later_attempt_fails_over_and_the_note_discloses_it() {
+        let run_id = format!("content-refusal-attempt-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["codex", "pi"],
+            SessionStatus::Executing,
+            0,
+        );
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.human_confirm = HumanConfirm::All;
+        session.attempt = 1;
+        put_node(&mut store, session.to_node()).unwrap();
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "codex",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let refusal =
+            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
+        let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(units[0].assigned_cli.as_deref(), Some("pi"));
+        assert_eq!(units[0].content_refused_clis, vec!["codex".to_string()]);
+        let note = failover_note(&units[0], true);
+        assert!(
+            note.contains("`codex` refused this content; moved to `pi`"),
+            "{note}"
+        );
+        // A plain worker failure is not disclosed as a content refusal.
+        let mut plain = units[0].clone();
+        plain.content_refused_clis.clear();
+        assert!(!failover_note(&plain, true).contains("refused this content"));
+        // Every seat tried: the refusal is still named, with no seat moved to.
+        let none = failover_note(&units[0], false);
+        assert!(none.contains("`codex` refused this content]"), "{none}");
+    }
+
+    #[test]
+    fn core_1492_content_refusal_requires_a_nonzero_wrapped_exit_and_a_tail_signature() {
+        use crate::acp_runner::is_content_refusal;
+
+        let codex = "This content was FLAGGED FOR POSSIBLE CYBERSECURITY RISK.";
+        assert!(is_content_refusal(&format!(
+            "(cli `codex` exited 1) {codex}"
+        )));
+        assert!(!is_content_refusal(codex));
+        assert!(!is_content_refusal(&format!(
+            "(cli `codex` exited 0) {codex}"
+        )));
+        assert!(!is_content_refusal(&format!(
+            "(cli `codex` exited 1) {codex}\n{}",
+            "x".repeat(4096)
+        )));
+        assert!(!is_content_refusal(
+            "(cli `codex` exited 1) unrelated failure"
+        ));
+        let claude =
+            "This appears to violate our usage policy. I am UNABLE TO RESPOND TO THIS REQUEST.";
+        assert!(is_content_refusal(&format!(
+            "(cli `claude` exited 1) {claude}"
+        )));
+        for phrase in [
+            "appears to violate our usage policy",
+            "unable to respond to this request",
+        ] {
+            assert!(!is_content_refusal(&format!(
+                "(cli `claude` exited 1) {phrase}"
+            )));
+        }
+        // The byte boundary of the tail may land inside a multibyte character.
+        assert!(is_content_refusal(&format!(
+            "(cli `codex` exited 1) {}{codex}",
+            "界".repeat(1024)
+        )));
     }
 
     /// A resume of a worker-failed run must NOT re-dispatch the seat that failed the unit

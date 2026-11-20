@@ -1320,6 +1320,11 @@ pub struct WorkUnit {
     /// resume/restart. `#[serde(default)]` for back-compat with units persisted before this field.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub worker_failed_clis: Vec<String>,
+    /// (core#1492) The subset of [`Self::worker_failed_clis`] that REFUSED this unit's content (a
+    /// provider content-policy refusal). Disclosed on the gate so a reader knows another provider
+    /// refused the work a compliant seat now rules on. `#[serde(default)]` for back-compat.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content_refused_clis: Vec<String>,
     /// (crew#972) EVERY seat this Build/Recon unit was dispatched on — its first seat and each seat
     /// a reassign, failover or bench reseat moved it to. Stamped at dispatch and kept, except for a
     /// worker failure that changed nothing ([`Self::author_probe`]): a seat that built any attempt
@@ -1949,6 +1954,7 @@ impl WorkUnit {
             capture_report: None,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            content_refused_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
             observed_providers: Vec::new(),

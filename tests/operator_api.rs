@@ -96,6 +96,7 @@ mod tests {
             executes_code: false,
             tool_cmd: None,
             worker_failed_clis: Vec::new(),
+            content_refused_clis: Vec::new(),
             authored_by: Vec::new(),
             authored_binaries: Vec::new(),
             observed_providers: Vec::new(),
