@@ -1106,6 +1106,80 @@ pub fn redact(cmd: &str) -> String {
     redact_config_pairs(&out)
 }
 
+/// core#1653: known text after a cut lets the matcher recognize lead-ins with whitespace.
+/// Covers the 40-byte npm token and 28-byte auth lead-in; quoted values spanning more than
+/// 256 bytes after a cut can exceed this limit. The last bytes wait for more text or finish.
+const LIVE_REDACT_LOOKAHEAD: usize = 256;
+/// core#1653: bound retained text even when a whitespace-free run has no safe cut.
+const LIVE_REDACT_HOLD_MAX: usize = 16 * 1024;
+
+/// core#1653: redact across chunk boundaries before either live-output stream sees text.
+#[derive(Default)]
+pub(crate) struct RedactStream {
+    pending: String,
+}
+
+impl RedactStream {
+    /// Release at the latest cut right after whitespace that leaves at least
+    /// `LIVE_REDACT_LOOKAHEAD` bytes after it and satisfies the matcher check
+    /// `redact(head) + redact(rest) == redact(pending)`; otherwise hold the text.
+    /// Past `LIVE_REDACT_HOLD_MAX` with no such cut, a char-boundary cut bounds memory.
+    /// Text that ends a line (not a shell continuation) is released whole at once: the engine's
+    /// liveness notes end with a newline, and a stall watchdog reads them as the seat being alive.
+    pub(crate) fn push(&mut self, chunk: &str) -> String {
+        self.pending.push_str(chunk);
+        let end = self.pending.len();
+        if self.pending.ends_with('\n')
+            && !continuation()
+                .find_iter(&self.pending)
+                .any(|m| m.end() == end)
+        {
+            return redact(&std::mem::take(&mut self.pending));
+        }
+        let Some(limit) = self.pending.len().checked_sub(LIVE_REDACT_LOOKAHEAD) else {
+            return String::new();
+        };
+        let whole = redact(&self.pending);
+        let cut = self
+            .pending
+            .char_indices()
+            .rev()
+            .filter_map(|(i, c)| {
+                let s = i + c.len_utf8();
+                (c.is_whitespace() && s <= limit).then_some(s)
+            })
+            .find(|&s| {
+                let mut split = redact(&self.pending[..s]);
+                split.push_str(&redact(&self.pending[s..]));
+                split == whole
+            });
+        let cut = cut.or_else(|| {
+            if self.pending.len() <= LIVE_REDACT_HOLD_MAX {
+                return None;
+            }
+            // A whitespace-free run over 16 KiB can split a token (core#1653's bound).
+            let mut s = limit;
+            while !self.pending.is_char_boundary(s) {
+                s -= 1;
+            }
+            Some(s)
+        });
+        match cut {
+            Some(s) => {
+                let released = redact(&self.pending[..s]);
+                self.pending = self.pending[s..].to_string();
+                released
+            }
+            None => String::new(),
+        }
+    }
+
+    /// Return the whole tail, redacted, when the stream ends at a step result or cancel.
+    pub(crate) fn finish(self) -> String {
+        redact(&self.pending)
+    }
+}
+
 /// The stored option a person picked from the event wire, which shows options redacted (core#1643):
 /// the one comparison rule for every question's options, so the pick still resolves to the exact
 /// original the seat offered.
@@ -1163,6 +1237,108 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn redact_stream_matches_whole_text_at_every_split() {
+        let tokens = [
+            format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4)),
+            format!(concat!("AK", "IA", "{}"), "FAKE1234".repeat(2)),
+            format!(concat!("sk", "-ant-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("xo", "xb-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("gl", "pat-", "{}"), "Fake7".repeat(4)),
+            format!(concat!("np", "m_", "{}"), "Fake1234".repeat(4) + "Abcd"),
+            format!(concat!("github", "_pat_", "{}"), "Fake7".repeat(4)),
+        ];
+        let mut cases: Vec<String> = tokens
+            .iter()
+            .map(|token| format!("before {token} after"))
+            .collect();
+        cases.extend(
+            [
+                "Authorization: Bearer private-value",
+                "invoke --token private-value",
+                "NAME_TOKEN = \"private value\"",
+                "npm config set //h/:_authToken private-value",
+                "mkdir -p visible-directory",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        for case in cases {
+            // core#1653: padding exercises releases before finish, including UTF-8 cuts.
+            let whole = format!("préface {case} {}", "word ".repeat(60));
+            let expected = redact(&whole);
+            for split in whole
+                .char_indices()
+                .map(|(i, _)| i)
+                .chain(std::iter::once(whole.len()))
+            {
+                let mut stream = RedactStream::default();
+                let mut out = stream.push(&whole[..split]);
+                out.push_str(&stream.push(&whole[split..]));
+                out.push_str(&stream.finish());
+                assert_eq!(out, expected, "split at {split}: {case}");
+            }
+            let mut stream = RedactStream::default();
+            let mut out = String::new();
+            // Three chunks split both the lead-in and its value.
+            let first = whole.find(&case).unwrap() + 2;
+            let second = first + case.len() / 2;
+            for chunk in [&whole[..first], &whole[first..second], &whole[second..]] {
+                out.push_str(&stream.push(chunk));
+            }
+            out.push_str(&stream.finish());
+            assert_eq!(out, expected, "three chunks: {case}");
+        }
+    }
+
+    #[test]
+    fn redact_stream_keeps_context_across_whitespace_cuts() {
+        for head in [
+            "Authorization: Bearer ",
+            "invoke --token ",
+            "NAME_TOKEN = ",
+            "npm config set //h/:_authToken ",
+            "mkdir -p ",
+        ] {
+            // Keep the final space inside lookahead so cuts inside the lead-in are tried.
+            let value = "v".repeat(LIVE_REDACT_LOOKAHEAD - 2);
+            let whole = format!("before; {head}{value}");
+            let mut stream = RedactStream::default();
+            let mut out = stream.push(&format!("before; {head}"));
+            out.push_str(&stream.push(&value));
+            out.push_str(&stream.finish());
+            assert_eq!(out, redact(&whole), "{head}");
+        }
+    }
+
+    #[test]
+    fn redact_stream_releases_a_finished_line_at_once_but_not_a_continuation() {
+        // An engine liveness note is never held (core#1653).
+        let mut stream = RedactStream::default();
+        assert_eq!(stream.push("\nfloor - 5 min\n"), "\nfloor - 5 min\n");
+        assert!(stream.pending.is_empty());
+        // A continued line is held: the value on the next line is cut as in the whole text.
+        let whole = "curl --token \\\nprivate-value next\n";
+        let mut stream = RedactStream::default();
+        assert_eq!(stream.push("curl --token \\\n"), "");
+        let out = stream.push("private-value next\n");
+        assert_eq!(out, redact(whole));
+        assert!(!out.contains("private-value"), "{out}");
+        assert!(stream.pending.is_empty());
+    }
+
+    #[test]
+    fn redact_stream_bounds_whitespace_free_pending_on_char_boundaries() {
+        let whole = "界".repeat(LIVE_REDACT_HOLD_MAX / 3 + 100);
+        let mut stream = RedactStream::default();
+        let mut out = stream.push(&whole);
+        assert!(!out.is_empty(), "core#1653: an oversized blob must release");
+        assert!(stream.pending.len() <= LIVE_REDACT_LOOKAHEAD + 3);
+        assert!(stream.pending.len() <= LIVE_REDACT_HOLD_MAX);
+        out.push_str(&stream.finish());
+        assert_eq!(out, whole);
+    }
 
     fn sink(root: &str, run: &str) -> (ToolActivitySink, Arc<Mutex<Vec<Value>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
