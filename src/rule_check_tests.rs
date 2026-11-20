@@ -205,6 +205,8 @@ fn run_steps(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: c,
@@ -532,6 +534,8 @@ fn no_distinct_seat_means_every_rule_to_check_is_unchecked_with_no_call() {
     let f = job_facts(&[], None, None, &c);
     let r = check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &rules,
             facts: &f,
             change: &c,
@@ -572,6 +576,7 @@ fn skip_of(row: &RuleVerdict, reason: &str) -> RuleSkip {
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }
 }
 
@@ -776,6 +781,8 @@ fn a_rule_out_of_the_runs_steps_is_not_applicable_with_its_fact_and_no_call() {
     let seats = seats();
     let r = check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &[mcp],
             facts: &f,
             change: &c,
@@ -1414,6 +1421,8 @@ fn run_told(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: &c,
@@ -1509,6 +1518,7 @@ fn a_confirmed_waiver_is_labelled_with_the_instruction_and_the_reason() {
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     };
     let r = run_told(&[rule], &judge, &[skip], Some(&first));
     assert_eq!(r.rows[0].status, RuleStatus::Skipped);
@@ -1644,6 +1654,8 @@ fn changed_instructions_check_the_rule_again() {
     let calls = judge.calls.load(Ordering::SeqCst);
     let again = check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &[r1],
             facts: &f,
             change: &c,
@@ -1823,6 +1835,8 @@ fn run_packs(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: c,
@@ -2796,6 +2810,7 @@ fn a_changed_record_re_judges_and_an_old_skip_no_longer_applies() {
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     };
     let skips = [skip];
     let same = run_packs(
@@ -3043,6 +3058,8 @@ fn pol_2101_needs_no_judge_when_no_agent_wrote_code_and_holds_when_creators_are_
     let seatless = |records: &[CreatorRecord], no_agent_code: bool| {
         check(
             &CheckInput {
+                seat_attempt: None,
+                rulings: &[],
                 rules: &rules,
                 facts: &f,
                 change: &c,
@@ -3122,6 +3139,8 @@ fn run_stage(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: c,
@@ -3267,10 +3286,9 @@ fn at_delivery_the_deferred_rules_are_checked_against_the_pr_text() {
     assert_eq!(gone.rows.len(), 1);
     assert_eq!(gone.rows[0].status, RuleStatus::Unchecked);
     assert!(gone.hold().is_some());
-    // The judge is told the review decided applicability, not the text's own match.
-    assert!(broken.prompts.lock().unwrap()[0]
-        .1
-        .contains("the review deferred it to this delivery"));
+    let prompt = broken.prompts.lock().unwrap()[0].1.clone();
+    assert!(!prompt.contains("applies —") && !prompt.contains("Engine: applies"));
+    assert!(prompt.contains("the rule's own words decide"));
     let silent = Fake::new(&[]);
     let r = run_stage(&rules, &c, &silent, CheckStage::Delivery, &[], &deferred);
     assert_eq!(r.rows[0].status, RuleStatus::Unchecked);
@@ -3340,6 +3358,8 @@ fn run_seated(
     let seats: Vec<String> = seats.iter().map(|s| s.to_string()).collect();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: c,
@@ -3841,6 +3861,8 @@ fn run_pol_2101(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &rules,
             facts: &f,
             change: c,
@@ -4300,6 +4322,8 @@ fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
     let seats = vec!["codex".to_string()];
     let r = check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &rules,
             facts: &f,
             change: &c,
@@ -4458,6 +4482,8 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
     let seats = vec!["codex".to_string(), "pi".to_string()];
     let r = check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &[rule("R1", "x")],
             facts: &f,
             change: &c,
@@ -4540,6 +4566,8 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
         let seats = vec!["codex".to_string(), "pi".to_string()];
         check(
             &CheckInput {
+                seat_attempt: None,
+                rulings: &[],
                 rules: &[rule("R1", "x")],
                 facts: &f,
                 change: c,
@@ -4694,6 +4722,8 @@ fn run_carried_in(
     let seats = seats();
     check(
         &CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules,
             facts: &f,
             change: c,
@@ -4982,4 +5012,168 @@ fn core_1493_a_changed_rule_match_is_judged_again() {
         RuleStatus::Skipped,
         "a changed match is judged again"
     );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_own_skip(
+    rules: &[ConformanceRule],
+    c: &Change,
+    judge: &Fake,
+    told: &str,
+    skips: &[RuleSkip],
+    seat_attempt: Option<u32>,
+    rulings: &[crate::domain::OperatorRuling],
+) -> RuleCheckReport {
+    let facts = job_facts(&bug_steps(), None, None, c);
+    let seats = seats();
+    check(
+        &CheckInput {
+            rules,
+            facts: &facts,
+            change: c,
+            floor: Some("repo checks passed"),
+            prior: None,
+            skips,
+            seat_attempt,
+            rulings,
+            seats: &seats,
+            no_seat: None,
+            base: "b0",
+            instructions: Some(told),
+            engine_record: Some("the reviewer read the work"),
+            creator_records: None,
+            reviewer_record: None,
+            no_agent_code: false,
+            stage: CheckStage::Review,
+            deliver_tokens: &[],
+            deferred: &[],
+            settled: &[],
+            carried: &[],
+        },
+        judge,
+        &NoMachine,
+    )
+}
+
+#[test]
+fn own_skip_lands_on_a_judge_only_rerun_despite_changed_bytes() {
+    let rules = [rule("R1", "no duplicated built-in")];
+    let judge = Fake::new(&[]);
+    let first = run_own_skip(&rules, &change(), &judge, "x", &[], Some(1), &[]);
+    let mut skip = carried_skip(&first, "binary fixture");
+    skip.seat_attempt = Some(1);
+    let moved = change_of(&format!("{DIFF}+// more\n"), &["src/add.rs"]);
+    let again = run_own_skip(&rules, &moved, &judge, "x", &[skip], Some(1), &[]);
+    assert_eq!(again.rows[0].status, RuleStatus::Skipped);
+    assert!(again.rows[0]
+        .reason
+        .contains("on this re-check (nothing ran since)"));
+    assert_ne!(again.rows[0].evidence_key, first.rows[0].evidence_key);
+}
+
+#[test]
+fn own_skip_does_not_cover_a_new_seat_attempt_with_changed_bytes() {
+    let rules = [rule("R1", "no duplicated built-in")];
+    let judge = Fake::new(&[]);
+    let first = run_own_skip(&rules, &change(), &judge, "x", &[], Some(1), &[]);
+    let mut skip = carried_skip(&first, "binary fixture");
+    skip.seat_attempt = Some(1);
+    let moved = change_of(&format!("{DIFF}+// more\n"), &["src/add.rs"]);
+    let again = run_own_skip(&rules, &moved, &judge, "x", &[skip], Some(2), &[]);
+    assert_ne!(again.rows[0].status, RuleStatus::Skipped);
+}
+
+#[test]
+fn own_skip_and_confirmed_waiver_survive_retry_with_new_instructions() {
+    let rules = [rule("R1", "no duplicated built-in")];
+    let judge = Fake::new(&[]);
+    let first = run_own_skip(&rules, &change(), &judge, "x", &[], Some(1), &[]);
+    for instruction in [None, Some("use the manual loop".to_string())] {
+        let mut skip = carried_skip(&first, "avoids the argument limit");
+        skip.instruction = instruction.clone();
+        let again = run_own_skip(
+            &rules,
+            &change(),
+            &judge,
+            "retry with a note",
+            &[skip],
+            Some(2),
+            &[],
+        );
+        assert_eq!(again.rows[0].status, RuleStatus::Skipped);
+        assert_ne!(again.rows[0].evidence_key, first.rows[0].evidence_key);
+        assert!(again.rows[0].reason.contains(if instruction.is_some() {
+            "waived by instruction (use the manual loop), confirmed by"
+        } else {
+            "kept through the retry"
+        }));
+    }
+}
+
+#[test]
+fn own_skip_retry_yields_to_a_later_ruling_naming_that_rule() {
+    let rules = [rule("R1", "no duplicated built-in")];
+    let judge = Fake::new(&[]);
+    let first = run_own_skip(&rules, &change(), &judge, "x", &[], Some(1), &[]);
+    let skip = carried_skip(&first, "fine here");
+    for (text, at, action, skipped) in [
+        ("enforce (r1), please", 2, "amend", false),
+        ("enforce R1", 2, "request_changes", false),
+        ("enforce R1", 2, "land", false),
+        ("enforce R1.", 2, "amend", false),
+        ("enforce R1-extra R1.other R1_more AR1", 2, "amend", true),
+        ("enforce R1", 1, "amend", true),
+        ("enforce R1", 2, "other", true),
+    ] {
+        let ruling = crate::domain::OperatorRuling {
+            action: action.into(),
+            text: text.into(),
+            attempt: 1,
+            at,
+        };
+        let again = run_own_skip(
+            &rules,
+            &change(),
+            &judge,
+            "retry with a note",
+            std::slice::from_ref(&skip),
+            Some(2),
+            &[ruling],
+        );
+        assert_eq!(
+            again.rows[0].status == RuleStatus::Skipped,
+            skipped,
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn own_skip_retry_does_not_carry_a_process_rule() {
+    let rules = [pack("RVWL-1001")];
+    let judge = Fake::new(&[]);
+    let first = run_own_skip(&rules, &change(), &judge, "x", &[], Some(1), &[]);
+    let mut skip = carried_skip(&first, "fine here");
+    // (core#1345) Even an equal carry key cannot carry a process rule through a retry.
+    let retry = run_own_skip(
+        &rules,
+        &change(),
+        &judge,
+        "retry with a note",
+        &[],
+        Some(2),
+        &[],
+    );
+    skip.carry_key = retry.carry_keys.get("RVWL-1001").cloned();
+    assert!(skip.carry_key.is_some());
+    let again = run_own_skip(
+        &rules,
+        &change(),
+        &judge,
+        "retry with a note",
+        &[skip],
+        Some(2),
+        &[],
+    );
+    assert_ne!(again.rows[0].status, RuleStatus::Skipped);
 }
