@@ -44,6 +44,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
+  resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
+  database with `PermissionDenied` naming the linked path.
+
 - **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
   process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
   on both the first attempt and every retry. The FAIL reaches the gate instead of being replaced
