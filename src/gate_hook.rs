@@ -50,6 +50,9 @@ use crate::execute::advance_to_gate_running;
 /// file.
 pub const DECISIONS_PATH_ENV: &str = "WICKED_DECISIONS_PATH";
 
+/// The launcher's resolved governance root, shared with each hook's evidence fence.
+pub const GOV_ROOT_ENV: &str = "WICKED_GOV_ROOT";
+
 /// Environment variables the launcher sets to carry the unit's governance `scope`/`phase` to the
 /// gate-hook subprocess. Passing them via env (NOT interpolated into the shell-executed hook command)
 /// is what keeps caller-controlled data out of the command string — closing the injection / fail-open
@@ -5917,28 +5920,36 @@ pub(crate) fn gov_root_for(
         .unwrap_or_else(|| temp.join("wicked-core-gov"))
 }
 
+/// Resolve the launcher's override before considering the hook's own home candidates.
+fn resolve_gov_root(
+    root_override: Option<std::ffi::OsString>,
+    homes: &[Option<std::ffi::OsString>],
+    temp: &std::path::Path,
+) -> std::path::PathBuf {
+    if let Some(root) = root_override {
+        let root = std::path::PathBuf::from(root);
+        if !root.as_os_str().is_empty() && root.is_absolute() {
+            return root;
+        }
+    }
+    gov_root_for(homes, temp)
+}
+
 /// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
-/// directory for a run, so a later change to `HOME` (a child env) cannot move it. `WICKED_GOV_ROOT`
-/// is the test seam: a non-empty, absolute override takes precedence, including in integration
-/// tests that link the non-test library. Otherwise unit tests keep the temp root: they pin `HOME`
-/// per test, which a process-wide root must not latch.
+/// directory for a run, so a later change to `HOME` (a child env) cannot move it. The launcher passes
+/// its resolved root via `WICKED_GOV_ROOT`: a non-empty, absolute override takes precedence.
+/// Otherwise unit tests keep the temp root: they pin `HOME` per test, which a process-wide root
+/// must not latch.
 pub(crate) fn gov_root() -> std::path::PathBuf {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
-        if let Some(root) = std::env::var_os("WICKED_GOV_ROOT") {
-            let root = std::path::PathBuf::from(root);
-            if !root.as_os_str().is_empty() && root.is_absolute() {
-                return root;
-            }
-        }
         let temp = std::env::temp_dir();
-        if cfg!(test) {
-            return temp.join("wicked-core-gov");
-        }
-        gov_root_for(
-            &[std::env::var_os("HOME"), std::env::var_os("USERPROFILE")],
-            &temp,
-        )
+        let homes = if cfg!(test) {
+            [None, None]
+        } else {
+            [std::env::var_os("HOME"), std::env::var_os("USERPROFILE")]
+        };
+        resolve_gov_root(std::env::var_os(GOV_ROOT_ENV), &homes, &temp)
     })
     .clone()
 }
@@ -12281,6 +12292,26 @@ mod boundary_tests {
     // failure looks like a logic bug — and a module-local lock would leave the race open against
     // every other module's env-mutating tests.
     use crate::test_env::ENV_LOCK as ENV;
+
+    #[test]
+    fn hook_resolves_the_root_the_launcher_passed() {
+        let base = std::env::current_dir().unwrap();
+        let temp = base.join("fake-temp");
+        let home_a = base.join("launcher-home");
+        let home_b = base.join("hook-home");
+        let root = resolve_gov_root(None, &[Some(home_a.clone().into_os_string())], &temp);
+        let hook = resolve_gov_root(
+            Some(root.clone().into_os_string()),
+            &[Some(home_b.into_os_string())],
+            &temp,
+        );
+        assert_eq!(root, home_a.join(".wicked").join("core-gov"));
+        assert_eq!(hook, root);
+        let run_dir = root.join(run_dir_name("hook-gov-root"));
+        assert_eq!(hook.join(run_dir_name("hook-gov-root")), run_dir);
+        let decisions = run_dir.join("attempt-0").join("decisions.ndjson");
+        assert!(decisions.starts_with(&hook));
+    }
 
     #[test]
     fn gov_root_is_under_home_not_the_temp_dir() {
