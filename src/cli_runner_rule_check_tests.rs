@@ -2533,6 +2533,7 @@ fn a_judge_only_rerun_reuses_the_process_rows_of_the_reviewed_attempt() {
         attempt: 0,
         seats: Vec::new(),
         monitors: Vec::new(),
+        team: None,
         consumed: false,
         at: 1,
     });
@@ -2569,6 +2570,7 @@ fn a_judge_only_rerun_reuses_the_process_rows_of_the_reviewed_attempt() {
     // the worker serves instead of the re-judge) are this attempt's own record.
     let armed = input.unit.requested_rejudge.clone().unwrap();
     input.unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+        team: None,
         consumed: true,
         ..armed.clone()
     });

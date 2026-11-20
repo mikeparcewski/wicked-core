@@ -1158,6 +1158,8 @@ pub struct UnitTeamView {
     pub ledger_source: Option<String>,
     /// (T5) The S row the gate read; `None` for a synthesized or local snapshot.
     pub ledger_ref: Option<String>,
+    /// (core#1396) The producing attempt when the gate carried an unchanged team record.
+    pub carried_from: Option<u32>,
     /// (T5) The attempt ledger's `final_pass`, once the unit folded.
     pub final_pass: Option<String>,
     /// (T5) Whether the attempt's ledger pauses the run (DES-001 §6.7).
@@ -1219,6 +1221,7 @@ pub(crate) fn run_team_view(
                     .and_then(|t| t.ledger_source)
                     .map(|l| l.as_str().to_string()),
                 ledger_ref: u.team.as_ref().and_then(|t| t.ledger_ref.clone()),
+                carried_from: u.team.as_ref().and_then(|t| t.carried_from),
                 final_pass: u
                     .team
                     .as_ref()

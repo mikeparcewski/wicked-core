@@ -1978,6 +1978,7 @@ pub(crate) fn apply_and_finish_unit(
     unit.requested_rejudge = match unit.requested_rejudge.take() {
         Some(r) if !r.consumed => Some(crate::domain::RequestedRejudge {
             output: String::new(),
+            team: None,
             consumed: true,
             ..r
         }),
@@ -5524,6 +5525,11 @@ mod judge_bench_tests {
             .unwrap(),
         );
         unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            team: Some(Box::new(crate::domain::UnitTeamSnapshot::stamped(
+                crate::team::events::Transport::Bus,
+                None,
+                None,
+            ))),
             output: "the reviewed output".into(),
             attempt: 1,
             seats: vec!["b".into()],
@@ -5846,9 +5852,9 @@ mod judge_bench_tests {
         // Consumed: never honored again, its output dropped, its basis (the seat attempt judged
         // and its monitors) kept for a next re-judge.
         let consumed = |u: &crate::domain::WorkUnit| {
-            u.requested_rejudge
-                .as_ref()
-                .is_some_and(|r| r.consumed && r.output.is_empty() && r.attempt == 1)
+            u.requested_rejudge.as_ref().is_some_and(|r| {
+                r.consumed && r.output.is_empty() && r.team.is_none() && r.attempt == 1
+            })
         };
         let (approved, source, u) = fold_rejudge("rejudge-floor-red", true, false);
         assert!(!approved, "a judge PASS never admits a failed floor");

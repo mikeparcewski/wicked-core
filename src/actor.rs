@@ -18986,6 +18986,7 @@ fn rejudge_request(
         attempt,
         seats: r.eligible,
         monitors: crate::cli_runner::unit_team_monitors(cursor),
+        team: cursor.team.clone().map(Box::new),
         consumed: false,
         at: crate::interaction::now_millis(),
     })
@@ -19124,6 +19125,7 @@ fn rules_recheck_request(
             attempt,
             seats: Vec::new(),
             monitors: crate::cli_runner::unit_team_monitors(cursor),
+            team: cursor.team.clone().map(Box::new),
             consumed: false,
             at,
         },
@@ -29445,6 +29447,7 @@ mod request_changes_tests {
             attempt: 1,
             seats: vec!["pi".into()],
             monitors: vec!["pi".into()],
+            team: None,
             consumed: true,
             at: 0,
         });
@@ -29499,6 +29502,7 @@ mod request_changes_tests {
             attempt: 1,
             seats: vec!["copilot".into()],
             monitors: vec!["pi".into()],
+            team: None,
             consumed: true,
             at: 0,
         });
@@ -29611,6 +29615,35 @@ mod request_changes_tests {
             uuid::Uuid::nil(),
             false,
         )
+    }
+
+    #[test]
+    fn both_rejudge_arming_paths_preserve_the_reviewed_team_record() {
+        for rules in [false, true] {
+            let run_id = format!("rejudge-team-{rules}");
+            let mut store = open_store(Some(":memory:")).unwrap();
+            if rules {
+                seed_rules_unchecked(&mut store, &run_id);
+            } else {
+                seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+            }
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            let mut reviewed = crate::domain::UnitTeamSnapshot::stamped(
+                crate::team::events::Transport::Bus,
+                None,
+                Some(crate::team::events::LedgerSource::Folded),
+            );
+            reviewed.inputs_key = Some("reviewed-inputs".into());
+            reviewed.carried_from = Some(1);
+            units[2].team = Some(reviewed.clone());
+            put_node(&mut store, units[2].to_node()).unwrap();
+            let request = if rules {
+                rules_recheck_request(&store, &run_id, &[], None).unwrap().0
+            } else {
+                rejudge_request(&store, &run_id).unwrap()
+            };
+            assert_eq!(request.team.as_deref(), Some(&reviewed));
+        }
     }
 
     /// (DES-RULE-CHECK-001 rev 2, A.7.5, codex r1) The run's rule-council budget is charged
@@ -30114,6 +30147,7 @@ mod request_changes_tests {
             attempt: 1,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            team: None,
             consumed: false,
             at: 0,
         });
