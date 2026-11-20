@@ -5954,6 +5954,39 @@ pub(crate) fn gov_root() -> std::path::PathBuf {
     .clone()
 }
 
+/// Verify that the resolved root can hold governance artifacts without falling back to temp.
+pub(crate) fn probe_gov_root(root: &Path) -> Result<(), String> {
+    let probe = || -> std::io::Result<()> {
+        create_dir_all_private(root)?;
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = root.join(format!(
+            ".write-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)?;
+        // Close before removing so the probe also works on Windows.
+        drop(file);
+        std::fs::remove_file(&path)
+    };
+    probe().map_err(|e| {
+        format!(
+            "governance root {} is not writable: {e}; give the daemon a writable HOME or set \
+             {GOV_ROOT_ENV} to a writable absolute directory, then restart (core#1620)",
+            root.display()
+        )
+    })
+}
+
+/// Latch readiness once per process; fixing an unavailable root requires a daemon restart.
+pub(crate) fn gov_root_ready() -> Result<(), String> {
+    static READY: std::sync::OnceLock<Result<(), String>> = std::sync::OnceLock::new();
+    READY.get_or_init(|| probe_gov_root(&gov_root())).clone()
+}
+
 pub(crate) const GOV_DIR_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
 
 /// Best-effort startup sweep of old governance directories whose runs are no longer live.
@@ -12331,6 +12364,39 @@ mod boundary_tests {
         assert_eq!(gov_root_for(&usable, &temp), root);
         assert_eq!(gov_root_for(&[None, Some("rel".into())], &temp), fallback);
         assert_eq!(gov_root_for(&[], &temp), fallback);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_gov_root_names_an_unwritable_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = std::env::temp_dir().join(format!(
+            "wicked-gov-probe-unwritable-{}",
+            std::process::id()
+        ));
+        let root = parent.join("core-gov");
+        std::fs::create_dir_all(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500)).unwrap();
+        if std::fs::write(parent.join("write-check"), b"").is_ok() {
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::remove_dir_all(&parent).unwrap();
+            eprintln!("skipping: 0500 parent is still writable (running as root)");
+            return;
+        }
+
+        let denied = probe_gov_root(&root);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ready = probe_gov_root(&root);
+        let leftovers = std::fs::read_dir(&root).map(|entries| entries.count());
+        std::fs::remove_dir_all(&parent).unwrap();
+
+        let why = denied.expect_err("an unwritable parent must refuse the governance root");
+        assert!(why.contains(root.to_str().unwrap()), "{why}");
+        assert!(why.contains("WICKED_GOV_ROOT"), "{why}");
+        assert!(why.contains("restart"), "{why}");
+        ready.expect("a writable root must pass the probe");
+        assert_eq!(leftovers.unwrap(), 0, "the probe must remove its file");
     }
 
     #[test]

@@ -853,6 +853,10 @@ pub(crate) fn run(
         }
     };
 
+    if let Err(why) = crate::gate_hook::gov_root_ready() {
+        eprintln!("wicked-core: {why}; every governed unit will be refused");
+    }
+
     // Arm the governance store path for in-process governed dispatch (DES-OUTGOV-003 §4). The store now
     // exists on disk, so the gate-hook subprocess can open it read-only to evaluate tool-calls.
     GOV_DB_PATH.with(|c| *c.borrow_mut() = Some(path.clone()));

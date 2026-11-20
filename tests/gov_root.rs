@@ -141,6 +141,55 @@ fn probe_gov_root() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn an_unwritable_home_is_named_at_boot() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let base = scratch().join("unwritable-home-boot");
+    let home = base.join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
+    if std::fs::write(home.join("write-check"), b"").is_ok() {
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(&base).unwrap();
+        eprintln!("skipping: 0500 HOME is still writable (running as root)");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wicked-core"))
+        .args(["status", "--db"])
+        .arg(base.join("store.db"))
+        .env_remove("USERPROFILE")
+        .env_remove("WICKED_GOV_ROOT")
+        .env("HOME", &home)
+        .output();
+    // Restore permissions and clean up before asserting, including when the child failed to spawn.
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::remove_dir_all(&base).unwrap();
+
+    let output = output.expect("status runs");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let root = home.join(".wicked/core-gov");
+    assert!(
+        stderr.contains(root.to_str().unwrap()),
+        "boot must name the unwritable governance root {}: {stderr}",
+        root.display()
+    );
+    assert!(
+        stderr.contains("WICKED_GOV_ROOT"),
+        "boot must name the writable-root remedy: {stderr}"
+    );
+    assert!(
+        stderr.contains("every governed unit will be refused"),
+        "boot must explain the effect on governed units: {stderr}"
+    );
+    assert!(
+        output.status.success(),
+        "status must remain usable: {stderr}"
+    );
+}
+
 /// SAFETY (`ctor(unsafe)`): pre-main, single-threaded; only arms the per-process emit spool.
 #[ctor::ctor(unsafe)]
 fn arm_hermetic_emit_spool() {
