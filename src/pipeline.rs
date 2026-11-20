@@ -1858,21 +1858,14 @@ pub(crate) fn apply_and_finish_unit(
     // evaluator, under the dead-seat class (reassign it to a distinct seat, or relaunch reduced).
     let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
         let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
-        evaluator_relation(&units, unit)
-            .filter(|rel| rel.on_builder_seat)
-            .and_then(|_| unit.assigned_cli.clone())
-            .map(|seat| {
-                crate::domain::UnitDenial::new(
-                    DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
-                    format!(
-                        "unit {} checks work built on `{seat}` and ran on that same seat; the run \
-                         requires a distinct evaluator ({}) — reassign it to a distinct signed-in \
-                         seat and approve to re-run, or relaunch with reduced assurance",
-                        unit.ord,
-                        crate::assurance::DISTINCT_EVALUATOR
-                    ),
-                )
-            })
+        // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
+        evaluator_relation(
+            &units,
+            unit,
+            evidence.observed_providers.as_deref().or(Some(&[])),
+        )
+        .filter(|rel| rel.on_builder_seat)
+        .map(|rel| rel.denial(unit))
     } else {
         None
     };
@@ -2258,6 +2251,8 @@ pub(crate) fn apply_and_finish_unit(
         &assurance,
         attempt,
         GateFacts {
+            // (core#1540) An unobserved attempt proves only its seat key at the gate.
+            own_observed: evidence.observed_providers.as_deref().or(Some(&[])),
             pinned: unit.validator.as_ref().filter(|v| v.approved).map(|_| {
                 if workdir.is_some() && det_reached_verdict {
                     Ok(())
@@ -3020,12 +3015,33 @@ struct EvaluatorRelation {
     creator: Option<String>,
     /// Whether the unit's own seat is one of its builders' seats.
     on_builder_seat: bool,
+    conflict: Option<String>,
+}
+
+impl EvaluatorRelation {
+    fn denial(&self, unit: &crate::domain::WorkUnit) -> crate::domain::UnitDenial {
+        crate::domain::UnitDenial::new(
+            DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
+            format!(
+                "unit {} ran on `{}`, {}; the run requires a distinct evaluator ({}) — \
+                 reassign it to a distinct signed-in seat and approve to re-run, or relaunch \
+                 with reduced assurance",
+                unit.ord,
+                unit.assigned_cli.as_deref().unwrap_or("unknown"),
+                self.conflict
+                    .as_deref()
+                    .unwrap_or("the seat that authored the work"),
+                crate::assurance::DISTINCT_EVALUATOR
+            ),
+        )
+    }
 }
 
 /// `None` for a unit that is not a Review/Test agent unit or has no builder before it.
 fn evaluator_relation(
     units: &[crate::domain::WorkUnit],
     unit: &crate::domain::WorkUnit,
+    own_observed: Option<&[crate::observed_provider::Provider]>,
 ) -> Option<EvaluatorRelation> {
     use crate::domain::StageKind;
     if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
@@ -3042,16 +3058,18 @@ fn evaluator_relation(
         return None;
     }
     let authors = work_authors(units, unit.ord);
+    let providers = work_author_providers(units, unit.ord);
+    let conflict = unit.assigned_cli.as_deref().and_then(|seat| {
+        crate::observed_provider::shares_identity(seat, own_observed, &authors, &providers)
+    });
     Some(EvaluatorRelation {
         creator: builders
             .iter()
             .max_by_key(|u| u.ord)
             .and_then(|c| c.assigned_cli.clone())
             .or_else(|| gatherers.last().cloned()),
-        on_builder_seat: unit
-            .assigned_cli
-            .as_ref()
-            .is_some_and(|e| authors.iter().any(|a| a == e)),
+        on_builder_seat: conflict.is_some(),
+        conflict,
     })
 }
 
@@ -3145,6 +3163,25 @@ pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<S
     out
 }
 
+/// (core#1540) The providers of exactly the units counted by `work_authors`.
+pub(crate) fn work_author_providers(
+    units: &[crate::domain::WorkUnit],
+    ord: u32,
+) -> Vec<crate::observed_provider::Provider> {
+    let checker = units.iter().find(|u| u.ord == ord);
+    let mut out = Vec::new();
+    for u in units.iter().filter(|u| {
+        (u.ord < ord && authors_work(u)) || checker.is_some_and(|c| report_author_unit(u, c))
+    }) {
+        for p in &u.observed_providers {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
 /// (DES-CATALOG-002 §5.1) A report's gatherer: an agent unit of the catalog `understand` entry,
 /// read step or not — except the PA's scope step, which states what the plan will touch and
 /// gathers no finding.
@@ -3155,21 +3192,14 @@ pub(crate) fn is_report_gatherer(u: &crate::domain::WorkUnit) -> bool {
 }
 
 /// (DES-CATALOG-002 §5.1) The seats that gathered what a cited-findings (or fidelity-to-source)
-/// unit rechecks: every earlier agent unit of the catalog `understand` entry — its current seat and
-/// every seat it was dispatched on — whether or not it is a read step. Empty for a unit whose
-/// rubric does not exclude gatherers.
+/// unit rechecks: earlier `understand` units and report steps (core#1366), including their prior
+/// seats, whether or not they are read steps. Empty when the rubric does not exclude gatherers.
 pub(crate) fn report_gatherer_seats(
     units: &[crate::domain::WorkUnit],
     checker: &crate::domain::WorkUnit,
 ) -> Vec<String> {
-    if !crate::rubric::excludes_gatherers(checker.rubric.as_deref()) {
-        return Vec::new();
-    }
     let mut out: Vec<String> = Vec::new();
-    for u in units
-        .iter()
-        .filter(|u| u.ord < checker.ord && is_report_gatherer(u))
-    {
+    for u in units.iter().filter(|u| report_author_unit(u, checker)) {
         for s in u
             .assigned_cli
             .iter()
@@ -3182,6 +3212,14 @@ pub(crate) fn report_gatherer_seats(
         }
     }
     out
+}
+
+// (core#1366) Earlier reports author the findings a later report rechecks too.
+fn report_author_unit(u: &crate::domain::WorkUnit, checker: &crate::domain::WorkUnit) -> bool {
+    u.ord < checker.ord
+        && crate::rubric::excludes_gatherers(checker.rubric.as_deref())
+        && (is_report_gatherer(u)
+            || (u.tool_cmd.is_none() && crate::rubric::excludes_gatherers(u.rubric.as_deref())))
 }
 
 /// (operator ruling 2026-10-14, the fallback judge) The BINARIES every author of the work a unit at
@@ -3485,6 +3523,7 @@ pub(crate) fn operator_waiver(r: &crate::repo_checks::RepoChecksReport) -> Optio
 
 /// What the fold observed, for [`gate_receipt`].
 struct GateFacts<'a> {
+    own_observed: Option<&'a [crate::observed_provider::Provider]>,
     /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
     pinned: Option<Result<(), String>>,
     /// `None`: the floor did not apply; `Some(Ok)`: checks executed; `Some(Err((reason, detail)))`.
@@ -3539,7 +3578,7 @@ fn gate_receipt(
     let seat = unit.assigned_cli.clone();
     // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
     let units = crate::domain::session_units(store, session_id).unwrap_or_default();
-    match evaluator_relation(&units, unit) {
+    match evaluator_relation(&units, unit, f.own_observed) {
         Some(rel) => {
             r.creator = rel.creator;
             r.evaluator = seat.clone();
@@ -3551,7 +3590,10 @@ fn gate_receipt(
                     } else {
                         a::SKIP_NO_DISTINCT_SEAT
                     },
-                    Some(format!("evaluated on a seat that built the work, `{e}`")),
+                    Some(format!(
+                        "evaluated on `{e}`, {}",
+                        rel.conflict.unwrap_or_default()
+                    )),
                 ),
                 (Some(_), false) => r.ran(a::DISTINCT_EVALUATOR),
                 (None, _) => {}
@@ -6398,7 +6440,8 @@ mod member_read_step_tests {
         let units = [triage.clone(), fix, verify.clone()];
         assert_eq!(super::work_authors(&units, 3), vec!["claude".to_string()]);
         assert!(!super::fallback_work_authors(&units, 3).contains(&"codex".to_string()));
-        let rel = super::evaluator_relation(&units, &verify).expect("a builder precedes it");
+        let rel =
+            super::evaluator_relation(&units, &verify, Some(&[])).expect("a builder precedes it");
         assert!(
             !rel.on_builder_seat,
             "codex authored nothing the test checks"
@@ -6469,7 +6512,8 @@ mod guarded_read_step_tests {
         );
         let units = [build.clone(), arch.clone(), test.clone()];
         assert_eq!(super::work_authors(&units, 8), vec!["claude".to_string()]);
-        let rel = super::evaluator_relation(&units, &test).expect("a builder precedes it");
+        let rel =
+            super::evaluator_relation(&units, &test, Some(&[])).expect("a builder precedes it");
         assert!(!rel.on_builder_seat, "codex built nothing the test checks");
         assert_eq!(rel.creator.as_deref(), Some("claude"));
         assert!(!super::fallback_work_authors(&units, 8).contains(&"codex".to_string()));
@@ -6608,14 +6652,142 @@ mod guarded_read_step_tests {
         check.rubric = Some("cited-findings".into());
         check.assigned_cli = Some("a".into());
         let units = [gather.clone(), check.clone()];
-        let rel = super::evaluator_relation(&units, &units[1]).expect("a relation");
+        let rel = super::evaluator_relation(&units, &units[1], Some(&[])).expect("a relation");
         assert!(rel.on_builder_seat);
         let mut got = super::work_authors(&units, check.ord);
         got.sort();
         assert_eq!(got, ["a", "z"]);
         check.rubric = None;
         let units = [gather, check];
-        assert!(super::evaluator_relation(&units, &units[1]).is_none());
+        assert!(super::evaluator_relation(&units, &units[1], Some(&[])).is_none());
+    }
+
+    #[test]
+    fn semantic_counts_the_earlier_review_as_a_report_author() {
+        let mut diff = unit(1, StageKind::Recon, PhaseRole::Neutral, "claude");
+        diff.catalog = Some("understand".into());
+        diff.worktree_guarded = true;
+        diff.observed_providers = vec!["gatherer:443".into()];
+        let mut review = unit(2, StageKind::Review, PhaseRole::Evaluator, "codex");
+        review.catalog = Some("critique".into());
+        review.rubric = Some("cited-findings".into());
+        review.observed_providers = vec!["report:443".into()];
+        review.authored_by = vec!["earlier-review-seat".into()];
+        review.gathered_by = vec!["earlier-report-seat".into()];
+        let mut semantic = review.clone();
+        semantic.ord = 3;
+        semantic.authored_by.clear();
+        semantic.gathered_by.clear();
+        let units = [diff, review, semantic];
+        let authors = super::work_authors(&units, 3);
+        assert_eq!(
+            super::work_author_providers(&units, 3),
+            vec!["gatherer:443", "report:443"]
+        );
+        for author in [
+            "claude",
+            "codex",
+            "earlier-review-seat",
+            "earlier-report-seat",
+        ] {
+            assert!(authors.iter().any(|a| a == author), "{author}: {authors:?}");
+        }
+        assert!(
+            super::evaluator_relation(&units, &units[2], Some(&[]))
+                .unwrap()
+                .on_builder_seat
+        );
+    }
+
+    #[test]
+    fn an_unobserved_evaluator_is_not_denied_on_last_seen_at_the_gate() {
+        use wicked_apps_core::ToNode;
+
+        // (core#1540) An earlier launch sharing the author provider is only a seat-selection hint.
+        let provider = format!("gate-fact-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "gate-fact-author");
+        build.observed_providers = vec![provider.clone()];
+        let review = unit(
+            2,
+            StageKind::Review,
+            PhaseRole::Evaluator,
+            "gate-fact-reviewer",
+        );
+        let units = [build, review.clone()];
+        crate::observed_provider::record_receipt(
+            "gate-fact-reviewer",
+            Some(vec![provider.clone()]),
+        );
+        crate::observed_provider::record_receipt("gate-fact-reviewer", None);
+        let evidence = crate::workflow::UnitEvidence::default();
+        assert!(
+            super::evaluator_relation(&units, &review, None)
+                .unwrap()
+                .on_builder_seat
+        );
+        let gate_observed = evidence.observed_providers.as_deref().or(Some(&[]));
+        let rel = super::evaluator_relation(&units, &review, gate_observed).unwrap();
+        assert!(!rel.on_builder_seat);
+        assert!(rel.conflict.is_none());
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_nodes(&mut store, &[units[0].to_node(), review.to_node()]).unwrap();
+        let receipt = super::gate_receipt(
+            &store,
+            "r",
+            &review,
+            &crate::assurance::RunAssurance::default(),
+            1,
+            super::GateFacts {
+                own_observed: gate_observed,
+                pinned: None,
+                checks: None,
+                checks_waived: None,
+                judge: None,
+                judge_skipped: None,
+                rules: None,
+                eval_ran: false,
+                eval_error: None,
+                tree: None,
+            },
+        );
+        assert!(receipt
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::DISTINCT_EVALUATOR));
+        assert!(!receipt
+            .skipped
+            .iter()
+            .any(|s| s.instrument == crate::assurance::DISTINCT_EVALUATOR));
+        let observed = [provider];
+        assert!(
+            super::evaluator_relation(&units, &review, Some(&observed))
+                .unwrap()
+                .on_builder_seat
+        );
+        let mut on_author = review;
+        on_author.assigned_cli = Some("gate-fact-author".into());
+        assert!(
+            super::evaluator_relation(&units, &on_author, gate_observed)
+                .unwrap()
+                .on_builder_seat
+        );
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn evaluator_on_another_key_calling_the_authors_provider_is_not_distinct() {
+        let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "codex");
+        build.observed_providers = vec!["chatgpt.com:443".into()];
+        let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "claude");
+        let units = [build, review.clone()];
+        let observed = vec!["chatgpt.com:443".into()];
+        assert_eq!(super::work_author_providers(&units, 2), observed);
+        let rel = super::evaluator_relation(&units, &review, Some(&observed)).unwrap();
+        assert!(rel.on_builder_seat);
+        let denial = rel.denial(&review);
+        assert_eq!(denial.source, super::DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
+        assert!(denial.reason.contains("observed calling `chatgpt.com:443`"));
+        assert!(denial.reason.contains("`codex`"));
     }
 }
 

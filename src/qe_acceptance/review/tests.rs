@@ -375,7 +375,27 @@ fn candidates_come_from_the_runs_own_non_author_seats_in_order() {
 }
 
 #[test]
-fn reduced_assurance_relaxes_authors_only_and_instances_are_distinct() {
+fn provider_sharing_qe_candidate_is_last_and_only_on_a_reduced_basis() {
+    let s = session(&["claude", "pi", "opencode", "codex"], true);
+    let mut build = creator(2, "claude");
+    let provider = format!("qe-identity-{}:443", uuid::Uuid::new_v4());
+    build.observed_providers = vec![provider.clone()];
+    crate::observed_provider::record_receipt("pi", Some(vec![provider]));
+    let qe = qe_unit("codex", Path::new("/l/.wicked-qe"));
+    let got = candidates(&s, &[build.clone()], &qe);
+    assert_eq!(got[0].seat, "opencode");
+    let pi = got.iter().position(|c| c.seat == "pi").unwrap();
+    assert!(pi > got.iter().position(|c| c.seat == "codex").unwrap());
+    assert_eq!(got[pi].basis, BASIS_REDUCED);
+    let full = session(&["claude", "pi", "opencode", "codex"], false);
+    assert!(!candidates(&full, &[build], &qe)
+        .iter()
+        .any(|c| c.seat == "pi"));
+    crate::observed_provider::take_receipts();
+}
+
+#[test]
+fn reduced_assurance_relaxes_authors_including_instances_of_their_cli_key() {
     let ledger = Path::new("/l/.wicked-qe");
     let units = vec![creator(2, "claude")];
     let on_author = qe_unit("claude", ledger);
@@ -389,15 +409,17 @@ fn reduced_assurance_relaxes_authors_only_and_instances_are_distinct() {
     // Never a launch-excluded seat, even in reduced assurance.
     reduced.exclude_seats = vec!["claude".into()];
     assert!(candidates(&reduced, &units, &on_author).is_empty());
-    // Another instance of the creator's CLI is a distinct reviewer, labelled same_cli.
+    // (core#1540) An instance retains its author's CLI key identity.
     let s = session(&["claude", "claude#2"], false);
+    assert!(candidates(&s, &units, &qe_unit("claude#2", ledger)).is_empty());
+    let s = session(&["claude", "claude#2"], true);
     let got = candidates(&s, &units, &qe_unit("claude#2", ledger));
-    assert_eq!(got.len(), 1);
+    assert_eq!(got.len(), 2);
     assert_eq!(
-        (got[0].seat.as_str(), got[0].basis.as_str()),
-        ("claude#2", BASIS_EXECUTOR)
+        (got[1].seat.as_str(), got[1].basis.as_str()),
+        ("claude#2", BASIS_REDUCED)
     );
-    assert!(got[0].same_cli);
+    assert!(got[1].same_cli);
 }
 
 #[test]

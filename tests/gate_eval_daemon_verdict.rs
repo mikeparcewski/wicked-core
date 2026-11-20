@@ -91,6 +91,18 @@ fn py_literal(v: &serde_json::Value) -> String {
 }
 
 #[test]
+fn daemon_refuses_a_judge_outside_eligible_seats_without_a_model_call() {
+    let out = probe(
+        "mod._evaluate = lambda *args: (_ for _ in ()).throw(AssertionError('model called'))\n\
+         print(json.dumps(mod._handle({'work_author': 'codex', 'eligible_seats': ['pi']})))\n",
+    );
+    let (pass, reason, judge): (bool, String, Option<String>) =
+        serde_json::from_str(out.trim()).unwrap();
+    assert!(!pass && judge.is_none());
+    assert!(reason.contains("eligible_seats"), "{reason}");
+}
+
+#[test]
 fn the_bus_path_daemon_fails_closed_on_the_captured_incident() {
     let literal = py_literal(&serde_json::json!(CAPTURED));
     let out = probe(&format!(
