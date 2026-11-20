@@ -6300,7 +6300,7 @@ const ARMED_BOUNDARY_KEY: &str = "_wicked_gov_boundary";
 
 /// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as claims).
 /// The carrier-less spelling, kept for the tests that drive the fold directly (a log an older
-/// launcher wrote); both carriers call [`write_armed_marker_for`] in production.
+/// launcher wrote).
 #[cfg(test)]
 pub fn write_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<()> {
     write_armed_marker_for(decisions_path, phase, None)
@@ -6308,8 +6308,8 @@ pub fn write_armed_marker(decisions_path: &Path, phase: &str) -> anyhow::Result<
 
 /// Append the ARMED sentinel for `phase` to the decisions log (under the same advisory lock as
 /// claims), naming the CARRIER that armed the unit under [`ARMED_CARRIER_KEY`] (issue #463).
-/// Called by the launcher when it arms input governance for a governed unit, BEFORE the CLI runs;
-/// `collect_hook_decisions` stamps the carrier onto every record of the phase.
+/// Test fixture for older launchers; production wrapped units always use the relayed marker.
+#[cfg(test)]
 pub fn write_armed_marker_for(
     decisions_path: &Path,
     phase: &str,

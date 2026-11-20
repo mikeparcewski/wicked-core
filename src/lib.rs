@@ -285,6 +285,7 @@ pub use gate_hook::{
     ESTATE_DB_ENV, ESTATE_READ_VERBS, GATE_CATALOG_ENV, GATE_DB_ENV, GATE_PHASE_ENV,
     GATE_PHASE_ID_ENV, GATE_PROTOCOL_VERSION, GATE_SCOPE_ENV,
 };
+pub use hook_relay::relay_client;
 pub use index_budget::{
     index_budget, index_budget_for_files, IndexBudget, IndexBudgetCount, INDEX_BUDGET_FLOOR,
     INDEX_BUDGET_PAD_PERCENT, INDEX_BUDGET_PER_FILE,

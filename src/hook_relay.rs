@@ -1,4 +1,4 @@
-//! The gate hook for a claude seat in the container floor (slice C3).
+//! The host-side gate-hook relay for governed claude seats.
 //!
 //! A governed claude unit is judged before every tool call by `wicked-core gate-hook`, a HOST
 //! binary claude runs as a command hook. Inside a Linux seat container that binary does not
@@ -8,6 +8,8 @@
 //! gateway routes it to this relay on the host's loopback, and the relay runs the unchanged host
 //! `gate-hook` with exactly the environment the seat's command would have carried, then answers
 //! in claude's hook JSON, which the command prints as its own answer.
+//! Host seats use [`relay_client`] over loopback instead of busybox through the gateway;
+//! neither client evaluates policy or writes governance evidence inside the seat's sandbox.
 //!
 //! Why a command and not claude's `type: "http"` hook (core#988): Claude Code refuses an HTTP
 //! hook whose host resolves to a private or link-local address (only loopback is exempt), and
@@ -133,7 +135,7 @@ pub(crate) const NOT_A_DECISION: &str =
 /// the shell is missing). `-Y off`: the seat's proxy variables never apply to the relay. `None`
 /// when `token` is not the hex a relay token is (it is spliced into the command).
 pub(crate) fn hook_command(token: &str) -> Option<String> {
-    if token.is_empty() || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+    if !valid_token(token) {
         return None;
     }
     let bb = crate::container_floor::FLOOR_BUSYBOX;
@@ -145,6 +147,154 @@ pub(crate) fn hook_command(token: &str) -> Option<String> {
          case \"$out\" in '{{'*) printf '%s' \"$out\" ;; \
          *) echo '{NOT_A_DECISION}' >&2; exit 2 ;; esac"
     ))
+}
+
+pub(crate) fn valid_token(token: &str) -> bool {
+    !token.is_empty() && token.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The host seat's `gate-hook --relay <port> <token>` client. No environment or store is
+/// consulted: stdin is posted to loopback and only the relay's decision reaches stdout.
+/// Every failure exits with claude's blocking code, 2; policy is never evaluated locally.
+pub fn relay_client(args: &[String]) -> i32 {
+    relay_client_with_io(
+        args,
+        &mut std::io::stdin().lock(),
+        &mut std::io::stdout().lock(),
+        &mut std::io::stderr().lock(),
+    )
+}
+
+fn relay_client_with_io(
+    args: &[String],
+    input: &mut impl Read,
+    output: &mut impl Write,
+    error: &mut impl Write,
+) -> i32 {
+    let result = (|| {
+        let [port, token] = args else {
+            return Err(UNREACHABLE);
+        };
+        let port = port.parse::<u16>().map_err(|_| UNREACHABLE)?;
+        if !valid_token(token) {
+            return Err(UNREACHABLE);
+        }
+        let mut body = Vec::new();
+        input
+            .take(MAX_BODY as u64 + 1)
+            .read_to_end(&mut body)
+            .map_err(|_| UNREACHABLE)?;
+        if body.len() > MAX_BODY {
+            return Err(UNREACHABLE);
+        }
+        let reply = relay_post(port, token, &body)?;
+        output
+            .write_all(&reply)
+            .and_then(|()| output.flush())
+            .map_err(|_| UNREACHABLE)
+    })();
+    match result {
+        Ok(()) => 0,
+        Err(reason) => {
+            let _ = writeln!(error, "{reason}");
+            2
+        }
+    }
+}
+
+fn relay_post(port: u16, token: &str, body: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let deadline = Instant::now() + HOOK_TIMEOUT + Duration::from_secs(25);
+    // A literal SocketAddr bypasses DNS and every proxy environment variable on all platforms.
+    let address = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    let stream =
+        TcpStream::connect_timeout(&address, Duration::from_secs(5)).map_err(|_| UNREACHABLE)?;
+    let mut conn = ClientConnection { stream, deadline };
+    write!(
+        conn,
+        "POST /hook/{token} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .and_then(|()| conn.write_all(body))
+    .map_err(|_| UNREACHABLE)?;
+    let mut reader = BufReader::new(conn);
+    let mut budget = MAX_HEAD;
+    let line = bounded_line(&mut reader, &mut budget).ok_or(UNREACHABLE)?;
+    let mut status = line.split_whitespace();
+    if status.next() != Some("HTTP/1.1")
+        || !status
+            .next()
+            .and_then(|s| s.parse::<u16>().ok())
+            .is_some_and(|s| (200..300).contains(&s))
+    {
+        return Err(NOT_A_DECISION);
+    }
+    let mut length = None;
+    let mut headers = 0;
+    loop {
+        let line = bounded_line(&mut reader, &mut budget).ok_or(UNREACHABLE)?;
+        if line == "\r\n" {
+            break;
+        }
+        if line.is_empty() {
+            return Err(UNREACHABLE);
+        }
+        headers += 1;
+        if headers > MAX_HEADERS {
+            return Err(NOT_A_DECISION);
+        }
+        let (key, value) = line.split_once(':').ok_or(NOT_A_DECISION)?;
+        if key.eq_ignore_ascii_case("content-length") {
+            let n = value.trim().parse::<usize>().map_err(|_| NOT_A_DECISION)?;
+            if n > MAX_BODY || length.replace(n).is_some() {
+                return Err(NOT_A_DECISION);
+            }
+        } else if key.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(NOT_A_DECISION);
+        }
+    }
+    let mut reply = vec![0; length.ok_or(NOT_A_DECISION)?];
+    reader.read_exact(&mut reply).map_err(|_| UNREACHABLE)?;
+    if reply.first() != Some(&b'{')
+        || !serde_json::from_slice::<serde_json::Value>(&reply).is_ok_and(|v| v.is_object())
+    {
+        return Err(NOT_A_DECISION);
+    }
+    Ok(reply)
+}
+
+/// Each socket operation gets only the remainder of one absolute read/write deadline.
+/// A peer sending partial headers or body bytes cannot restart the client's time budget.
+struct ClientConnection {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl ClientConnection {
+    fn remaining(&self) -> std::io::Result<Duration> {
+        self.deadline
+            .checked_duration_since(Instant::now())
+            .filter(|left| !left.is_zero())
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))
+    }
+}
+
+impl Read for ClientConnection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.stream.set_read_timeout(Some(self.remaining()?))?;
+        self.stream.read(buf)
+    }
+}
+
+impl Write for ClientConnection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.set_write_timeout(Some(self.remaining()?))?;
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
 }
 
 /// What one unit's gate hook runs with: the seat command's explicit variables and its working
@@ -1251,6 +1401,229 @@ impl Drop for InFlight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn client_call(port: u16, token: &str, mut payload: &[u8]) -> (i32, Vec<u8>, Vec<u8>) {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let code = relay_client_with_io(
+            &[port.to_string(), token.to_string()],
+            &mut payload,
+            &mut out,
+            &mut err,
+        );
+        (code, out, err)
+    }
+
+    const CLIENT_PAYLOAD: &[u8] = br#"{"tool_name":"Bash","tool_input":{"command":"ls"}}"#;
+
+    #[test]
+    fn relay_client_fails_closed_without_local_evaluation_1621() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir = std::env::temp_dir().join(format!("wicked-client-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("decisions.ndjson");
+        let previous = std::env::var_os(crate::gate_hook::DECISIONS_PATH_ENV);
+        std::env::set_var(crate::gate_hook::DECISIONS_PATH_ENV, &log);
+        let closed = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let closed_port = closed.local_addr().unwrap().port();
+        drop(closed);
+        let (code, out, err) = client_call(closed_port, "ab12", CLIENT_PAYLOAD);
+        assert_eq!(code, 2);
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(String::from_utf8(err).unwrap().trim(), UNREACHABLE);
+        assert!(!log.exists(), "a failed client must never evaluate locally");
+        // A route the relay does not serve, another non-2xx response, and non-object answers.
+        for (status, body) in [
+            ("404 Not Found", "{}"),
+            ("503 Service Unavailable", "{}"),
+            ("200 OK", "not JSON"),
+            ("200 OK", "[]"),
+            ("200 OK", "{broken"),
+        ] {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                let (conn, _) = listener.accept().unwrap();
+                conn.set_read_timeout(Some(crate::test_env::PATIENT))
+                    .unwrap();
+                let mut reader = BufReader::new(conn);
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line, "POST /hook/ab12 HTTP/1.1\r\n");
+                let mut length = None;
+                loop {
+                    line.clear();
+                    assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((key, value)) = line.split_once(':') {
+                        if key.eq_ignore_ascii_case("content-length") {
+                            length = Some(value.trim().parse::<usize>().unwrap());
+                        }
+                    }
+                }
+                let mut payload = vec![0; length.unwrap()];
+                reader.read_exact(&mut payload).unwrap();
+                assert_eq!(payload, CLIENT_PAYLOAD);
+                respond(reader.into_inner(), status, body);
+            });
+            let (code, out, err) = client_call(port, "ab12", CLIENT_PAYLOAD);
+            server.join().unwrap();
+            assert_eq!(code, 2, "{status}: {body}");
+            assert!(out.is_empty(), "{out:?}");
+            assert_eq!(String::from_utf8(err).unwrap().trim(), NOT_A_DECISION);
+            assert!(!log.exists(), "a failed client must never evaluate locally");
+        }
+        match previous {
+            Some(value) => std::env::set_var(crate::gate_hook::DECISIONS_PATH_ENV, value),
+            None => std::env::remove_var(crate::gate_hook::DECISIONS_PATH_ENV),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn relay_client_refuses_unreadable_or_oversized_stdin_and_invalid_arguments_1621() {
+        struct Unreadable;
+        impl Read for Unreadable {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("unreadable stdin"))
+            }
+        }
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        assert_eq!(
+            relay_client_with_io(
+                &["1".into(), "ab12".into()],
+                &mut Unreadable,
+                &mut out,
+                &mut err
+            ),
+            2
+        );
+        assert!(out.is_empty());
+        assert_eq!(String::from_utf8(err).unwrap().trim(), UNREACHABLE);
+        let (code, out, err) = client_call(1, "ab12", &vec![b'x'; MAX_BODY + 1]);
+        assert_eq!(code, 2);
+        assert!(out.is_empty());
+        assert_eq!(String::from_utf8(err).unwrap().trim(), UNREACHABLE);
+        for args in [
+            vec![],
+            vec!["1".into()],
+            vec!["not-a-port".into(), "ab12".into()],
+            vec!["1".into(), "ab12; echo unsafe".into()],
+            vec!["1".into(), "ab12".into(), "extra".into()],
+        ] {
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            assert_eq!(
+                relay_client_with_io(&args, &mut Unreadable, &mut out, &mut err),
+                2
+            );
+            assert!(out.is_empty());
+            assert_eq!(String::from_utf8(err).unwrap().trim(), UNREACHABLE);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn relay_client_records_deny_only_for_the_live_tokens_unit_1621() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("wicked-relay-binding-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("fake-wicked-core");
+        crate::test_env::install_stub(
+            &fake,
+            r#"#!/bin/sh
+cat > /dev/null
+printf '%s\n' "{\"_wicked_tool_call\":\"Bash\",\"_wicked_tool_phase\":\"unit-5\",\"_wicked_hook_invocation\":\"$WICKED_HOOK_INVOCATION\"}" >> "$WICKED_DECISIONS_PATH"
+printf '%s\n' '{"claim_id":"policy-deny:unit-5","scope":"s","phase":"unit-5","policy_ids":["test-policy"],"decision":"deny","obligations":["denied by test policy"],"evaluated_context_ref":"sha256:p","criteria":"c","evaluator_identity":"wicked-governance","evaluated_at":1792454400}' >> "$WICKED_DECISIONS_PATH"
+echo 'denied by test policy' >&2
+exit 2
+"#,
+        );
+        let previous = std::env::var_os("WICKED_CORE_EXE");
+        std::env::set_var("WICKED_CORE_EXE", &fake);
+        let a_log = dir.join("a.ndjson");
+        let b_log = dir.join("b.ndjson");
+        let context = |log: &std::path::Path| HookContext {
+            env: vec![
+                (
+                    crate::gate_hook::DECISIONS_PATH_ENV.into(),
+                    Some(log.as_os_str().to_os_string()),
+                ),
+                (crate::gate_hook::GATE_SCOPE_ENV.into(), Some("s".into())),
+                (
+                    crate::gate_hook::GATE_PHASE_ENV.into(),
+                    Some("unit-5".into()),
+                ),
+            ],
+            cwd: Some(dir.clone()),
+        };
+        let a = mint_token();
+        let b = mint_token();
+        let a_registration = register(&a, context(&a_log)).unwrap();
+        let b_registration = register(&b, context(&b_log)).unwrap();
+        let port = port().unwrap();
+        let (code, out, err) = client_call(port, &a, CLIENT_PAYLOAD);
+        assert_eq!(code, 0);
+        assert!(err.is_empty(), "{err:?}");
+        let answer: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+        assert_eq!(
+            answer["hookSpecificOutput"]["permissionDecisionReason"],
+            "denied by test policy"
+        );
+        let a_before = std::fs::read_to_string(&a_log).unwrap();
+        let records: Vec<serde_json::Value> = a_before
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records.len(),
+            2,
+            "only the host hook's annotation and Deny: {a_before}"
+        );
+        assert_eq!(records[1]["decision"], "deny");
+        assert!(!b_log.exists());
+        drop(b_registration);
+        for token in [mint_token(), b] {
+            let (code, out, err) = client_call(port, &token, CLIENT_PAYLOAD);
+            // Unknown/revoked tokens receive the relay's explicit deny JSON, never a local judgement.
+            assert_eq!(code, 0);
+            assert!(err.is_empty());
+            let answer: serde_json::Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(answer["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert!(answer["hookSpecificOutput"]["permissionDecisionReason"]
+                .as_str()
+                .unwrap()
+                .contains("unknown or revoked"));
+            assert_eq!(std::fs::read_to_string(&a_log).unwrap(), a_before);
+            assert!(!b_log.exists());
+        }
+        assert!(!a_registration.finish());
+        match previous {
+            Some(value) => std::env::set_var("WICKED_CORE_EXE", value),
+            None => std::env::remove_var("WICKED_CORE_EXE"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_container_hook_command_is_byte_identical_1621() {
+        assert_eq!(hook_command("ab12").unwrap(), format!(
+            "out=$(/floor/busybox wget -q -Y off -T {} --header 'Content-Type: application/json' \
+             --post-file - -O - http://agw:8711/hook/ab12) || {{ echo 'the gate hook could not reach the engine relay; the call is denied (fail closed)' >&2; exit 2; }}; \
+             case \"$out\" in '{{'*) printf '%s' \"$out\" ;; \
+             *) echo 'the relay answer is not a hook decision; the call is denied (fail closed)' >&2; exit 2 ;; esac",
+            HOOK_TIMEOUT.as_secs() + 25
+        ));
+    }
 
     #[test]
     fn the_answer_maps_the_gate_hooks_exit_to_claudes_hook_json() {

@@ -9,7 +9,7 @@
 //!   wicked-core resume --session <id>             # resume a paused/interrupted run
 //!   wicked-core cancel --session <id>             # cancel a run
 //!   wicked-core launch --problem "..."            # STUB self-test: deterministic stub output, no real CLI, no gates
-//!   wicked-core gate-hook --scope S --phase P     # PreToolUse governance hook (claude invokes this)
+//!   wicked-core gate-hook --relay <port> <token>  # PreToolUse relay client (claude invokes this)
 //!   wicked-core output-gate-hook --scope S --phase P  # per-OUTPUT guardrail: governs generated
 //!       # output text on stdin (policy-over-output + conformance-rule recall) → decisions.ndjson
 //!   wicked-core provision-validator --criterion "..."   # author a deterministic validator (UNAPPROVED)
@@ -225,8 +225,9 @@ const SUBCOMMAND_USAGE: &[(&str, &str)] = &[
     ),
     (
         "gate-hook",
-        "wicked-core gate-hook [--protocol-version]\n  \
-         The PreToolUse hook. Arguments travel by environment variable; `--protocol-version` prints \
+        "wicked-core gate-hook [--protocol-version] | gate-hook --relay <port> <token>\n  \
+         The PreToolUse hook. `--relay` posts stdin to the host relay without reading env or stores.\n  \
+         Evaluation arguments travel by environment variable; `--protocol-version` prints \
          the handshake the engine checks before arming a run.",
     ),
     (
@@ -384,6 +385,11 @@ fn main() {
         // command does has to be answerable without doing any of it.
         if handled_help("gate-hook", &args) {
             return;
+        }
+        // A governed seat only posts to loopback. Dispatch even malformed relay arguments here:
+        // they must fail closed in the client, never fall through to local evaluation.
+        if args.get(2).map(String::as_str) == Some("--relay") {
+            std::process::exit(wicked_core::relay_client(&args[3..]));
         }
         // The handshake the launcher probes BEFORE arming a run. Answered before anything else so it
         // stays cheap and cannot be affected by store/policy state (core#167).

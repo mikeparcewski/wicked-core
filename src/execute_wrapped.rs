@@ -4421,11 +4421,22 @@ impl WrappedCliStepRunner {
                 // still gets the repository boundary plus engine stores — its own tree writable,
                 // protected roots read-only at the OS (`worker_sandbox`). Not armed (not a run
                 // worktree, a self-sandboxing seat, no launcher) spawns exactly as before.
+                let governance = gov_env
+                    .as_ref()
+                    .map(|g| {
+                        vec![
+                            crate::gate_hook::gov_root(),
+                            g.decisions_path
+                                .with_file_name(format!("settings-{}.json", g.phase)),
+                        ]
+                    })
+                    .unwrap_or_default();
                 match crate::worker_sandbox::default_worker_sandbox(
                     &cwd,
                     &worker_write_roots,
                     &cli_key,
                     operational_home,
+                    &governance,
                 ) {
                     Ok(armed) => {
                         floor = Ok(armed.tool);
@@ -4912,7 +4923,7 @@ impl WrappedCliStepRunner {
             let cancel_token = self.register_token(input);
             // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
             let timeout = crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs);
-            // Container floor: the relay judges this unit's hook calls with exactly the env the
+            // The relay judges this unit's hook calls with exactly the env the
             // seat command carries (what a command hook would have inherited).
             // Revoked when this guard drops: after the seat, or on any early return or unwind.
             let hook_registration = gov_env
@@ -5502,6 +5513,19 @@ fn quote_exe_command(exe: &str) -> String {
     }
 }
 
+/// A host seat invokes only the loopback client; evaluation and evidence writes stay in the
+/// relay's host process. Only a validated hex token and numeric port enter the shell command.
+fn host_gate_hook(token: &str, port: u16) -> Option<serde_json::Value> {
+    if !crate::hook_relay::valid_token(token) {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "command",
+        "command": format!("{} --relay {port} {token}", quote_exe_command(&resolve_wicked_core_exe())),
+        "timeout": 90,
+    }))
+}
+
 /// A container seat's gate hook: a command hook that posts each tool call to the engine's relay
 /// through the gateway with the floor's busybox ([`crate::hook_relay::hook_command`]). Not
 /// claude's HTTP hook: Claude Code refuses one whose host resolves to a private address, and the
@@ -5866,7 +5890,7 @@ fn which_binary(name: &str) -> Result<String, ()> {
 /// ENV (never interpolated into the shell hook command) so caller-controlled ids cannot inject shell
 /// metacharacters.
 struct GovLaunch {
-    /// Container floor: the unit's gate-hook relay token (its settings name the relayed hook).
+    /// The unit's gate-hook relay token (its settings always name a relayed hook).
     hook_token: Option<String>,
     decisions_path: PathBuf,
     db_path: String,
@@ -6212,8 +6236,7 @@ fn write_private_exclusive(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// `--` guard), and return the env the launcher sets on the child. Settings + decisions live under a
 /// per-run/attempt dir OUTSIDE the worktree (no repo pollution).
 ///
-/// SECURITY: the hook command is a CONSTANT (`"<exe>" gate-hook`) — only the trusted `current_exe()` is
-/// interpolated (double-quoted for spaces; it contains no shell metacharacters). Scope/phase (which
+/// SECURITY: the hook command contains only the trusted exe, relay port and hex token. Scope/phase (which
 /// embed the caller-controlled `session_id`/`unit.id`) travel via `WICKED_GATE_SCOPE`/`WICKED_GATE_PHASE`
 /// env, so no attacker-controlled data ever reaches the shell-executed command string — closing the
 /// injection / fail-open hole a naive double-quoted argv would open.
@@ -6250,19 +6273,17 @@ fn arm_input_governance(
     if let Err(why) = check_gate_protocol(&exe) {
         return Err(std::io::Error::other(why));
     }
-    // exit 2 = deny ⇒ claude aborts the tool-call; matcher "*" governs EVERY tool. Only the exe is
-    // interpolated (scope/phase go via env). Quote it per-platform so a `$`/backtick in the install path
-    // can't be shell-expanded (POSIX single-quote disables ALL expansion; on Windows cmd `$`/backtick are
-    // not special, so double-quote for spaces — a `"` is illegal in a Windows path anyway).
-    let command = quote_exe_command(&exe);
-    // Container floor: the seat cannot run the host binary, so its hook posts each call to the
-    // engine's relay through the gateway (`crate::hook_relay`), keyed by a per-unit token.
-    let hook_token = crate::container_floor::container_mode().then(crate::hook_relay::mint_token);
-    let hook = match &hook_token {
-        Some(t) => container_gate_hook(t)
-            .ok_or_else(|| std::io::Error::other("the gate hook's relay token is not hex"))?,
-        None => serde_json::json!({ "type": "command", "command": command }),
-    };
+    // Every governed hook is judged outside the seat sandbox by the host relay. Refuse to arm
+    // when it cannot listen; there is no in-seat evaluation/evidence-writing path.
+    let port = crate::hook_relay::port()
+        .ok_or_else(|| std::io::Error::other("the gate hook relay could not listen"))?;
+    let token = crate::hook_relay::mint_token();
+    let hook = if crate::container_floor::container_mode() {
+        container_gate_hook(&token)
+    } else {
+        host_gate_hook(&token, port)
+    }
+    .ok_or_else(|| std::io::Error::other("the gate hook's relay token is not hex"))?;
     // D-7 (DES-L4 PR-⑦): the CLI-registered estate MCP is NO LONGER handed to the worker — no
     // `--mcp-config` file, no `mcpServers`, no `permissions.allow` for it. Grounding is the estate
     // SHIM garden's skills run (`wicked-garden run scripts/_estate_client.py --readonly …`), which
@@ -6314,17 +6335,10 @@ fn arm_input_governance(
     // Write the ARMED marker BEFORE the CLI runs: its presence lets the actor-side fold distinguish a
     // governed unit that legitimately made no tool-calls (marker only) from one whose evidence was erased
     // or whose hook never fired (marker absent → fail closed). Closes the council evidence-integrity blocker.
-    // A relayed hook (container floor) is named on the marker, so a unit whose calls never
+    // The relayed hook is named on the marker, so a unit whose calls never
     // reached the relay is attributed to the relay, not to a managed-hooks setting (core#988).
-    match &hook_token {
-        Some(_) => crate::gate_hook::write_relayed_armed_marker(&decisions_path, &phase),
-        None => crate::gate_hook::write_armed_marker_for(
-            &decisions_path,
-            &phase,
-            Some(crate::gate_hook::CARRIER_WRAPPED_CLI),
-        ),
-    }
-    .map_err(|e| std::io::Error::other(e.to_string()))?;
+    crate::gate_hook::write_relayed_armed_marker(&decisions_path, &phase)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     // Insert `--settings <path>` right after the binary so it parses as a flag (never demoted past the
     // prompt / a `--` guard).
     argv.insert(1, settings_path.to_string_lossy().into_owned());
@@ -6340,7 +6354,7 @@ fn arm_input_governance(
         extra_write_roots: gov.extra_write_roots.clone(),
         extra_read_roots: gov.extra_read_roots.clone(),
         skills_root: skills_root.map(Path::to_path_buf),
-        hook_token,
+        hook_token: Some(token),
     })
 }
 
@@ -8950,6 +8964,24 @@ mod tests {
     }
     use super::*;
 
+    #[test]
+    fn the_host_gate_hook_always_uses_a_validated_relay_token_1621() {
+        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        let hook = host_gate_hook("ab12", 12345).unwrap();
+        assert_eq!(hook["type"], "command");
+        assert_eq!(hook["timeout"], 90);
+        assert_eq!(
+            hook["command"],
+            format!(
+                "{} --relay 12345 ab12",
+                quote_exe_command(&resolve_wicked_core_exe())
+            )
+        );
+        for token in ["", "ab12; rm -rf /", "../token"] {
+            assert!(host_gate_hook(token, 12345).is_none());
+        }
+    }
+
     /// Codex gw-r1 (P1): the container seat's gate hook fails CLOSED when the relay cannot be
     /// reached, and carries only the unit's token. core#988: it is a COMMAND hook (claude refuses
     /// an HTTP hook to the gateway's private address) that posts with the floor's busybox, and a
@@ -10471,7 +10503,7 @@ mod tests {
         let _no_snapshot = VarGuard::unset(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
         let (base, _clone, own, _sibling) =
             crate::worker_sandbox::tests::clone_with_two_runs("ig1c2-wrapped");
-        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy", None).is_err() {
+        if crate::worker_sandbox::default_worker_sandbox(&own, &[], "agy", None, &[]).is_err() {
             eprintln!("execute_wrapped: no launcher can arm here — the IG1-core-2 proof skips");
             let _ = std::fs::remove_dir_all(&base);
             return;
@@ -11033,10 +11065,9 @@ mod tests {
 
     #[test]
     fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
-        // Arming builds the deny fence from the process-global `CLAUDE_CONFIG_DIR`/HOME; hold the
-        // env lock (read side) so a concurrent writer — the unspellable-path test pins a comma
-        // config dir under the write lock — cannot be observed mid-flight (Windows CI on a212fa5).
-        let _env = ENV_LOCK.read().unwrap_or_else(|p| p.into_inner());
+        // Pin the host floor and protect the process-global config/home inputs arming reads.
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _host = VarGuard::set("WICKED_SEAT_FLOOR", Path::new("host"));
         // Governance now refuses to arm against a CLI speaking another protocol (core#167).
         // This test is about what arming WRITES, so give it a matching CLI.
         seed_probe_for_test(
@@ -11158,9 +11189,17 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(
-            cmd.contains("gate-hook"),
-            "runs the gate-hook subcommand: {cmd}"
+            cmd.contains("gate-hook --relay "),
+            "host hooks must judge through the relay: {cmd}"
         );
+        let token = g
+            .hook_token
+            .as_deref()
+            .expect("host units have a relay token");
+        assert!(cmd.ends_with(&format!(" {} {token}", crate::hook_relay::port().unwrap())));
+        assert_eq!(json["hooks"]["PreToolUse"][0]["hooks"][0]["timeout"], 90);
+        let marker = std::fs::read_to_string(&g.decisions_path).unwrap();
+        assert!(marker.contains("relay"), "{marker}");
         // SECURITY: the command carries NO caller-controlled data — scope/phase go via env, not the shell
         // string. Only the (trusted, double-quoted) exe is interpolated.
         assert!(
