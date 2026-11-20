@@ -1136,7 +1136,12 @@ mod tests {
         assert!(logs_complete(Some(&arm), Some(&restarted), true, true));
         assert!(!logs_complete(Some(&arm), Some(&restarted), false, true));
         assert!(!logs_complete(Some(&arm), Some(&restarted), true, false));
-        assert!(!logs_complete(Some(&restarted), Some(&restarted), false, true));
+        assert!(!logs_complete(
+            Some(&restarted),
+            Some(&restarted),
+            false,
+            true
+        ));
         let twice = state("agw-a", "uid-a", 2);
         assert!(!logs_complete(Some(&arm), Some(&twice), true, true));
         assert!(logs_complete(Some(&restarted), Some(&twice), true, true));

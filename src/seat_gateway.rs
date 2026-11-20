@@ -3937,7 +3937,10 @@ mod tests {
         assert!(redact_check(&escaped), "the raw bytes have no key prefix");
         let records = parse_records(&escaped, "1");
         assert_eq!(records.len(), 1, "the safe envelope is kept");
-        assert!(records[0].text.is_empty(), "the decoded value is also checked");
+        assert!(
+            records[0].text.is_empty(),
+            "the decoded value is also checked"
+        );
         assert_eq!(records[0].model, None);
     }
 

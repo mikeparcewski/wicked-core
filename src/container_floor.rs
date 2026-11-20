@@ -2016,11 +2016,9 @@ impl GatewayLease {
     /// Revoke the seat's key and return what the gateway recorded for it (model requests:
     /// status, model, tool calls, text, usage — never a credential).
     pub(crate) fn release(mut self) -> GatewayObservation {
-        let (records, complete) = self.gw.records(
-            &self.since,
-            &self.unit,
-            self.arm_log_state.as_ref(),
-        );
+        let (records, complete) =
+            self.gw
+                .records(&self.since, &self.unit, self.arm_log_state.as_ref());
         self.revoke();
         GatewayObservation::new(records, complete, &self.run)
     }
@@ -3439,7 +3437,9 @@ mod tests {
         let observation = GatewayObservation::new(records.clone(), complete, "run-a");
         assert_eq!(observation.providers, None);
         assert_eq!(observation.records, records);
-        assert!(GatewayObservation::new(records, true, "run-a").providers.is_some());
+        assert!(GatewayObservation::new(records, true, "run-a")
+            .providers
+            .is_some());
     }
 
     /// core#1461 (runs d0f84ace, 12a50f95): the claude seat's `--settings` file was narrowed around
