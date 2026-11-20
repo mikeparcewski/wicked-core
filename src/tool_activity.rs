@@ -1124,8 +1124,18 @@ impl RedactStream {
     /// `LIVE_REDACT_LOOKAHEAD` bytes after it and satisfies the matcher check
     /// `redact(head) + redact(rest) == redact(pending)`; otherwise hold the text.
     /// Past `LIVE_REDACT_HOLD_MAX` with no such cut, a char-boundary cut bounds memory.
+    /// Text that ends a line (not a shell continuation) is released whole at once: the engine's
+    /// liveness notes end with a newline, and a stall watchdog reads them as the seat being alive.
     pub(crate) fn push(&mut self, chunk: &str) -> String {
         self.pending.push_str(chunk);
+        let end = self.pending.len();
+        if self.pending.ends_with('\n')
+            && !continuation()
+                .find_iter(&self.pending)
+                .any(|m| m.end() == end)
+        {
+            return redact(&std::mem::take(&mut self.pending));
+        }
         let Some(limit) = self.pending.len().checked_sub(LIVE_REDACT_LOOKAHEAD) else {
             return String::new();
         };
@@ -1300,6 +1310,22 @@ mod tests {
             out.push_str(&stream.finish());
             assert_eq!(out, redact(&whole), "{head}");
         }
+    }
+
+    #[test]
+    fn redact_stream_releases_a_finished_line_at_once_but_not_a_continuation() {
+        // An engine liveness note is never held (core#1653).
+        let mut stream = RedactStream::default();
+        assert_eq!(stream.push("\nfloor - 5 min\n"), "\nfloor - 5 min\n");
+        assert!(stream.pending.is_empty());
+        // A continued line is held: the value on the next line is cut as in the whole text.
+        let whole = "curl --token \\\nprivate-value next\n";
+        let mut stream = RedactStream::default();
+        assert_eq!(stream.push("curl --token \\\n"), "");
+        let out = stream.push("private-value next\n");
+        assert_eq!(out, redact(whole));
+        assert!(!out.contains("private-value"), "{out}");
+        assert!(stream.pending.is_empty());
     }
 
     #[test]
