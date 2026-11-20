@@ -195,8 +195,7 @@ impl WritePosture {
 /// The DELIVERABLE ROOTS a fenced creator may write: EXACTLY the run's launch-validated
 /// `extra_write_roots` ([`crate::workflow::GovernanceContext::extra_write_roots`]) as paths, in
 /// declaration order, nothing added and nothing dropped — nothing else. Not the unit cwd (the tree
-/// under review, which the fence excludes), not the repo-graph key directory the filesystem
-/// boundary also admits (engine scratch, written by the estate MCP — never a seat's deliverable),
+/// under review, which the fence excludes), not the repo-graph key directory (read-only to a seat, core#1602),
 /// not the state home. ONE derivation for every carrier (independent review of #444, F-02), reached
 /// through [`admitted_roots`]: the ACP fence holds it in-process, the wrapped launcher arms it on
 /// [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`] for the hook subprocess, and the gate hook judges

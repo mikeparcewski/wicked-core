@@ -1149,6 +1149,8 @@ fn domain_graph_cmd(args: &[String]) {
     // optional `metadata.coverage` + `requirement.corroboration` this build emits.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
 
+    // Declared before the store so it drops after it: the graph goes back to DELETE mode (core#1602).
+    let _settle = wicked_core::RepoGraphWrite::begin(std::path::Path::new(&store_path(args)));
     let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {
@@ -1318,7 +1320,9 @@ fn domain_graph_cmd(args: &[String]) {
 /// (DES-OUTGOV-005 decision #4). Opens the store directly for a brief read; never spawns the actor.
 fn coverage_cmd(args: &[String]) {
     let json_stdout = args.iter().any(|a| a == "--json");
-    let store = match wicked_apps_core::open_store(Some(&store_path(args))) {
+    // Read-only (core#1602): a seat reads the repo graph through a read grant, and a read-write
+    // open sets WAL mode, which needs sidecar writes the seat no longer has.
+    let store = match wicked_apps_core::open_store_ro(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {
             fail(&format!("coverage: open store failed: {e}"));
@@ -3219,5 +3223,26 @@ mod seat_login_usage_tests {
             .unwrap()
             .1;
         assert!(usage.contains("|refresh>"));
+    }
+}
+
+#[cfg(test)]
+mod coverage_read_only_tests {
+    /// core#1602: a seat has no write grant on the repo graph's directory, so `coverage` (which
+    /// the launcher pins to that graph) must open it read-only: a read-write open sets WAL mode
+    /// and needs sidecar files in the directory.
+    #[test]
+    fn coverage_opens_the_store_read_only() {
+        let src = include_str!("wicked-core.rs");
+        let body = src
+            .split("fn coverage_cmd(")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn ").next())
+            .expect("coverage_cmd is in this file");
+        assert!(
+            body.contains("open_store_ro("),
+            "coverage must read-only open"
+        );
+        assert!(!body.contains("open_store("), "coverage must not rw-open");
     }
 }

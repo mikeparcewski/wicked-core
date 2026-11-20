@@ -260,6 +260,7 @@ pub use campaign::{
 pub use cli_runner::{TASK_COMPLETED, TASK_DISPATCHED};
 pub use code_graph::{
     index_repo, rank_symbols, recon_repo, repo_graph_root_for_store, CheckoutIndex, RankedSymbol,
+    RepoGraphWrite,
 };
 pub use command::InjectTarget;
 pub use container_floor::{default_seat_floor, seat_image_main};
