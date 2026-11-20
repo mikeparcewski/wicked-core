@@ -210,10 +210,21 @@ fn codec(replica: &Path, args: &[&str], stdin: &[u8]) -> std::process::Output {
 /// The codec with `jail` as its Landlock launcher (`-` = none: this host has no Landlock).
 #[cfg(unix)]
 fn codec_jailed(replica: &Path, args: &[&str], stdin: &[u8], jail: &str) -> std::process::Output {
+    codec_program(replica, args, stdin, jail, sync::POD_CODEC)
+}
+
+#[cfg(unix)]
+fn codec_program(
+    replica: &Path,
+    args: &[&str],
+    stdin: &[u8],
+    jail: &str,
+    program: &str,
+) -> std::process::Output {
     use std::io::Write as _;
     let mut c = std::process::Command::new("python3");
     c.hardened()
-        .args(["-I", "-c", sync::POD_CODEC])
+        .args(["-I", "-c", program])
         .args(args)
         .env("WICKED_SYNC_ROOT", replica)
         .env("WICKED_SYNC_JAIL", jail)
@@ -270,7 +281,7 @@ fn k8s_the_pod_codec_mirrors_a_tree_without_following_links_and_packs_it_back() 
     }]);
     assert!(!codec(&replica, &["unpack", &plan], &other).status.success());
     // Pack it back: the same entries.
-    let packed = codec(&replica, &["pack", &plan], b"");
+    let packed = codec(&replica, &["pack", &plan], b"{}");
     assert!(
         packed.status.success(),
         "{}",
@@ -318,7 +329,7 @@ fn k8s_the_pod_codec_lists_a_git_tree_by_git_and_never_packs_its_git_dir() {
         &format!("touch {}", marker.display()),
     ]);
     let plan = json!([["w", "tree", [".git"]]]).to_string();
-    let packed = codec(&replica, &["pack", &plan], b"");
+    let packed = codec(&replica, &["pack", &plan], br#"{"w": []}"#);
     assert!(
         packed.status.success(),
         "{}",
@@ -592,7 +603,8 @@ fn k8s_a_cargo_build_in_a_tree_without_a_target_ignore_writes_no_target_back() {
         .map(|r| (seat::replica_of(scope, &r.host).unwrap(), r))
         .collect();
     let pack_plan = seat::codec_plan(&refs).to_string();
-    let packed = codec(&replica, &["pack", &pack_plan], b"");
+    let tracked = json!({(seat::replica_of(scope, &tree).unwrap()): []}).to_string();
+    let packed = codec(&replica, &["pack", &pack_plan], tracked.as_bytes());
     assert!(
         packed.status.success(),
         "{}",
@@ -1608,7 +1620,7 @@ fn k8s_the_production_plan_packs_and_unpacks_through_the_pod_codec() {
         "{}",
         String::from_utf8_lossy(&up.stderr)
     );
-    let packed = codec(&replica, &["pack", &plan], b"");
+    let packed = codec(&replica, &["pack", &plan], b"{}");
     assert!(
         packed.status.success(),
         "{}",
@@ -1841,7 +1853,7 @@ fn k8s_a_tree_with_no_commit_still_sends_an_empty_git_root_that_replaces_a_plant
         &[],
         None,
     );
-    let (body, plan, base, _) =
+    let (body, plan, base, _, _) =
         seat::copy_in_stream(None, &host, &roots, true, &Default::default()).unwrap();
     assert!(base.is_none(), "an unborn tree has no base");
     let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
@@ -2151,7 +2163,7 @@ fn k8s_the_pod_codec_leaves_an_oversized_untracked_file_out_before_reading_it() 
     std::fs::create_dir_all(replica.join("e")).unwrap();
     std::fs::write(replica.join("e/verdict.json"), "{}").unwrap();
     let plan = json!([["w", "tree", [".git"], []], ["e", "plain", [], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": []}"#);
     assert!(
         out.status.success(),
         "{}",
@@ -2196,7 +2208,7 @@ fn k8s_the_pod_codec_never_leaves_a_tracked_edit_or_evidence_out_for_an_artifact
     std::fs::create_dir_all(replica.join("e")).unwrap();
     std::fs::write(replica.join("e/verdict.json"), "{\"verdict\":\"FAIL\"}\n").unwrap();
     let plan = json!([["w", "tree", [".git"], []], ["e", "plain", [], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": ["z_source.rs"]}"#);
     assert!(
         out.status.success(),
         "{}",
@@ -2248,8 +2260,10 @@ fn k8s_the_pod_codec_refuses_a_write_back_whose_tracked_files_or_evidence_cannot
         .open(t.join("data.bin"))
         .unwrap();
     f.set_len(sync::MAX_STREAM + 1).unwrap();
+    // The replica index cannot make a host-tracked file eligible for a limit skip.
+    git_in(&t, &["rm", "-q", "-f", "--cached", "data.bin"]);
     let plan = json!([["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": ["data.bin"]}"#);
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -2263,7 +2277,7 @@ fn k8s_the_pod_codec_refuses_a_write_back_whose_tracked_files_or_evidence_cannot
     let f = std::fs::File::create(replica.join("e/evidence.log")).unwrap();
     f.set_len(sync::MAX_STREAM + 1).unwrap();
     let plan = json!([["e", "plain", [], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], b"{}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success(), "evidence was left out silently");
     assert!(err.contains("e/evidence.log"), "{err}");
@@ -2292,7 +2306,7 @@ fn k8s_the_pod_codec_matches_cache_dirs_exactly_and_never_over_tracked_files() {
     std::fs::create_dir_all(t.join("cache")).unwrap();
     std::fs::write(t.join("cache/x.txt"), "x").unwrap();
     let plan = json!([["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": ["src/file.rs"]}"#);
     assert!(
         out.status.success(),
         "{}",
@@ -2325,7 +2339,8 @@ fn k8s_the_pod_codec_matches_cache_dirs_exactly_and_never_over_tracked_files() {
     .collect();
     let mut entries = sync::check_entries_against(&roots[0], &[], &base).unwrap();
     entries.retain(|e| !left.iter().any(|s| s.covers(&e.path)));
-    let (writes, deletes) = seat::delta_keeping(&host, &base, entries, &left).unwrap();
+    let (writes, deletes) =
+        seat::delta_keeping(&host, &base, entries, &sync::SkipSet::new(&left), &|| false).unwrap();
     assert!(deletes.is_empty(), "{deletes:?}");
     assert!(
         writes
@@ -2369,7 +2384,7 @@ fn k8s_the_pod_codec_leaves_tagged_build_output_out() {
     std::fs::write(t.join("baseline-target/CACHEDIR.TAG"), SIG).unwrap();
     std::fs::write(t.join("baseline-target/debug/x.o"), "obj").unwrap();
     let plan = json!([["p", "plain", [], []], ["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": ["lib.rs"]}"#);
     assert!(
         out.status.success(),
         "{}",
@@ -2471,7 +2486,7 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
     sync::refuse_unsafe_skips(&outer, Mode::Plain, &[sk("extra/new-target", "cache")]).unwrap();
     let _ = std::fs::remove_dir_all(&outer);
     // The seat rewrote its own index (`git rm --cached`) and planted a tag beside its edit: the
-    // pod calls `src` a cache, the host's index still tracks it and refuses.
+    // host's copy-in tracked set protects the edit even after the pod index loses it.
     let replica = tmp("skip-index");
     let w = replica.join("w");
     std::fs::create_dir_all(w.join("src")).unwrap();
@@ -2480,14 +2495,15 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
     git_in(&w, &["add", "src/file.rs"]);
     git_in(&w, &["commit", "-q", "-m", "a"]);
     std::fs::write(w.join("src/file.rs"), "the seat's edit\n").unwrap();
-    git_in(&w, &["rm", "-q", "--cached", "src/file.rs"]);
+    git_in(&w, &["rm", "-q", "-r", "--cached", "src"]);
     std::fs::write(
         w.join("src/CACHEDIR.TAG"),
         b"Signature: 8a477f597d28d172789f06886806bc55\n",
     )
     .unwrap();
     let plan = json!([["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let tracked = json!({"w": ["src/file.rs"]}).to_string();
+    let out = codec(&replica, &["pack", &plan], tracked.as_bytes());
     assert!(
         out.status.success(),
         "{}",
@@ -2495,12 +2511,12 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
     );
     let mut roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
     let left = sync::take_skipped(&mut roots[0]).unwrap();
-    assert_eq!(left, vec![sk("src", "cache")], "the pod trusts its index");
-    let err = sync::refuse_unsafe_skips(&t, Mode::Tree, &left).unwrap_err();
-    assert!(
-        err.contains("src/file.rs") && err.contains("nothing was written back"),
-        "{err}"
-    );
+    assert!(left.is_empty(), "the host's tracked paths are protected");
+    assert!(roots[0]
+        .entries
+        .iter()
+        .any(|e| e.path == "src/file.rs" && e.data == b"the seat's edit\n"));
+    sync::refuse_unsafe_skips(&t, Mode::Tree, &left).unwrap();
     // A path a skip may alias on a folding host is never deleted (`src/file.rs` vs a skipped
     // `SRC/file.rs`), while a path the pod really dropped still is.
     let base: std::collections::HashMap<String, [u8; 32]> = ["src/file.rs", "lib"]
@@ -2510,8 +2526,14 @@ fn k8s_the_host_refuses_a_skip_over_tracked_work_or_outside_a_git_tree() {
             (r.to_string(), sync::digest(&entry(Kind::File, r, &d)))
         })
         .collect();
-    let (_, deletes) =
-        seat::delta_keeping(&t, &base, Vec::new(), &[sk("SRC/file.rs", "limit")]).unwrap();
+    let (_, deletes) = seat::delta_keeping(
+        &t,
+        &base,
+        Vec::new(),
+        &sync::SkipSet::new(&[sk("SRC/file.rs", "limit")]),
+        &|| false,
+    )
+    .unwrap();
     assert_eq!(deletes, vec!["lib".to_string()]);
     for d in [plain, t, replica] {
         let _ = std::fs::remove_dir_all(d);
@@ -2550,7 +2572,7 @@ fn k8s_a_skip_never_covers_a_repository_below_beside_or_a_submodule() {
     // The pod never calls it a cache: the nested repository's edit comes back.
     std::fs::write(extra.join("file.rs"), "edited\n").unwrap();
     let plan = json!([["p", "plain", [], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], b"{}");
     assert!(
         out.status.success(),
         "{}",
@@ -2633,7 +2655,7 @@ fn k8s_the_pod_codec_never_leaves_out_a_repository_free_trees_files_or_a_tracked
     let f = std::fs::File::create(t.join("result.bin")).unwrap();
     f.set_len(sync::MAX_STREAM + 1).unwrap();
     let plan = json!([["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], b"{}");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         !out.status.success(),
@@ -2660,7 +2682,7 @@ fn k8s_the_pod_codec_never_leaves_out_a_repository_free_trees_files_or_a_tracked
     )
     .unwrap();
     std::fs::write(t.join("src/new.rs"), "fn n() {}\n").unwrap();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], br#"{"w": ["src"]}"#);
     assert!(
         out.status.success(),
         "{}",
@@ -2705,7 +2727,14 @@ fn k8s_a_left_out_path_is_never_a_deletion() {
             why: "limit".into(),
         },
     ];
-    let (writes, deletes) = seat::delta_keeping(&host, &base, Vec::new(), &left).unwrap();
+    let (writes, deletes) = seat::delta_keeping(
+        &host,
+        &base,
+        Vec::new(),
+        &sync::SkipSet::new(&left),
+        &|| false,
+    )
+    .unwrap();
     assert!(writes.is_empty());
     assert_eq!(deletes, vec!["gone.txt".to_string()]);
     let (_, all) = seat::delta(&host, &base, Vec::new()).unwrap();
@@ -2737,13 +2766,220 @@ fn k8s_a_left_out_path_is_never_a_deletion() {
     assert!(limit.covers("src") && !limit.covers("src/gone.rs"));
     // (codex r1) A host change under a skip is no conflict: nothing there is written or deleted.
     std::fs::write(host.join("target/debug/old.o"), "changed on the host").unwrap();
-    let (_, deletes) = seat::delta_keeping(&host, &base, Vec::new(), &left).unwrap();
+    let (_, deletes) = seat::delta_keeping(
+        &host,
+        &base,
+        Vec::new(),
+        &sync::SkipSet::new(&left),
+        &|| false,
+    )
+    .unwrap();
     assert_eq!(deletes, vec!["gone.txt".to_string()]);
     assert!(
         seat::delta(&host, &base, Vec::new()).is_err(),
         "delta alone calls it a conflict"
     );
     let _ = std::fs::remove_dir_all(&host);
+}
+
+/// (core#1517) A pod cannot force unbounded skip matching work on the host.
+#[test]
+fn k8s_the_host_bounds_left_out_paths() {
+    let mut root = Root {
+        replica: "w".into(),
+        mode: Mode::Tree,
+        entries: vec![entry(Kind::Skipped, "cache", b"cache"); sync::MAX_SKIPS],
+    };
+    assert_eq!(
+        sync::take_skipped(&mut root).unwrap().len(),
+        sync::MAX_SKIPS
+    );
+    root.entries = vec![entry(Kind::Skipped, "cache", b"cache"); sync::MAX_SKIPS + 1];
+    let err = sync::take_skipped(&mut root).unwrap_err();
+    assert!(err.contains(&(sync::MAX_SKIPS + 1).to_string()), "{err}");
+    assert!(err.contains("limit"), "{err}");
+}
+
+/// (core#1517) The codec bounds cache and limit skips together, before returning success.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_bounds_left_out_paths() {
+    let replica = tmp("skip-bound");
+    let tree = replica.join("w");
+    std::fs::create_dir_all(tree.join("cache")).unwrap();
+    git_in(&tree, &["init", "-q"]);
+    std::fs::write(
+        tree.join("cache/CACHEDIR.TAG"),
+        b"Signature: 8a477f597d28d172789f06886806bc55\n",
+    )
+    .unwrap();
+    for name in ["a.bin", "b.bin"] {
+        std::fs::File::create(tree.join(name))
+            .unwrap()
+            .set_len(sync::MAX_STREAM + 1)
+            .unwrap();
+    }
+    // Keep the fixture small while exercising pack's real skip emission for both reasons.
+    let bound = format!("MAX_SKIPS = {}", sync::MAX_SKIPS);
+    assert!(sync::POD_CODEC.contains(bound.as_str()));
+    let program = sync::POD_CODEC.replace(bound.as_str(), "MAX_SKIPS = 2");
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec_program(&replica, &["pack", &plan], br#"{"w": []}"#, "-", &program);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success());
+    assert!(
+        err.contains("3 left-out paths") && err.contains("limit of 2"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1517) A host tree with no repository sends no tracked set: a `.git` the seat made is never
+/// consulted, so nothing is protected or left out for the limit and the seat's files come back.
+#[cfg(unix)]
+#[test]
+fn k8s_the_pod_never_reads_its_own_index_when_the_host_sent_none() {
+    let replica = tmp("missing-tracked");
+    let tree = replica.join("w");
+    std::fs::create_dir_all(&tree).unwrap();
+    git_in(&tree, &["init", "-q"]);
+    std::fs::write(tree.join("new.rs"), "new\n").unwrap();
+    let plan = json!([["w", "tree", [".git"], []]]).to_string();
+    let out = codec(&replica, &["pack", &plan], b"{}");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    assert!(roots[0].entries.iter().any(|e| e.path == "new.rs"));
+    let _ = std::fs::remove_dir_all(&replica);
+}
+
+/// (core#1517) Copy-in records the host index independently of its content baseline.
+#[cfg(unix)]
+#[test]
+fn k8s_copy_in_snapshots_host_tracked_paths_for_each_tree() {
+    let host = tmp("tracked-snapshot");
+    let repo = host.join("repo");
+    let empty = host.join("empty");
+    let scratch = host.join("scratch");
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::create_dir_all(&empty).unwrap();
+    std::fs::create_dir_all(&scratch).unwrap();
+    git_in(&repo, &["init", "-q"]);
+    git_in(&empty, &["init", "-q"]);
+    std::fs::write(repo.join("src/file.rs"), "tracked\n").unwrap();
+    std::fs::write(repo.join("new.rs"), "untracked\n").unwrap();
+    git_in(&repo, &["add", "src/file.rs"]);
+    let roots: Vec<PlanRoot> = [&repo, &empty, &scratch]
+        .into_iter()
+        .map(|path| PlanRoot {
+            host: path.clone(),
+            mode: Mode::Tree,
+            skip: vec![".git".into()],
+            back: true,
+            files: Vec::new(),
+            masks: Vec::new(),
+            repo: false,
+        })
+        .collect();
+    let (_, _, _, baseline, tracked) =
+        seat::copy_in_stream(None, &repo, &roots, false, &Default::default()).unwrap();
+    assert!(baseline[&repo].contains_key("new.rs"));
+    git_in(&repo, &["rm", "-q", "-r", "--cached", "src"]);
+    assert_eq!(tracked.get(&repo), Some(&Some(vec!["src/file.rs".into()])));
+    assert_eq!(tracked.get(&empty), Some(&Some(Vec::new())));
+    assert_eq!(tracked.get(&scratch), Some(&None));
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+/// (core#1517) Both entry indexing and baseline matching observe cancellation every 4096 paths.
+#[test]
+fn k8s_skip_matching_can_be_cancelled_mid_loop() {
+    for matching_baseline in [false, true] {
+        let paths: Vec<String> = (0..4097).map(|i| format!("cache/{i}")).collect();
+        let (base, entries) = if matching_baseline {
+            (
+                paths.into_iter().map(|p| (p, [0; 32])).collect(),
+                Vec::new(),
+            )
+        } else {
+            (
+                std::collections::HashMap::new(),
+                paths.iter().map(|p| entry(Kind::File, p, b"x")).collect(),
+            )
+        };
+        let skips = sync::SkipSet::new(&[sync::Skipped {
+            path: "cache".into(),
+            why: "cache".into(),
+        }]);
+        let calls = std::cell::Cell::new(0);
+        let cancelled = || {
+            calls.set(calls.get() + 1);
+            calls.get() == 2
+        };
+        let err = seat::delta_keeping(Path::new("unused"), &base, entries, &skips, &cancelled)
+            .unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+        assert_eq!(calls.get(), 2);
+    }
+}
+
+/// (core#1517) Indexed skip matching preserves exact coverage and folded alias semantics.
+#[test]
+fn k8s_skip_set_matches_individual_skips() {
+    let cases = [
+        ("src", "cache"),
+        ("src/nested", "cache"),
+        ("one.bin", "limit"),
+        ("SRC", "cache"),
+        ("s\u{200c}rc", "cache"),
+        ("café", "cache"),
+        ("STRASSE.bin", "limit"),
+    ];
+    let paths = [
+        "src",
+        "src/file.rs",
+        "src/nested/file.rs",
+        "src2/file.rs",
+        "srcfile.rs",
+        "SRC/file.rs",
+        "s\u{200c}rc/file.rs",
+        "one.bin",
+        "ONE.BIN",
+        "one.bin/child",
+        "cafe\u{301}/file",
+        "straße.bin",
+        "straße.bin/child",
+        "other",
+    ];
+    // Each skip alone, the combined set, and the empty set catch interactions and boundaries.
+    for skips in (0..cases.len())
+        .map(|i| &cases[i..i + 1])
+        .chain([&cases[..], &[]])
+    {
+        let left: Vec<sync::Skipped> = skips
+            .iter()
+            .map(|(path, why)| sync::Skipped {
+                path: (*path).into(),
+                why: (*why).into(),
+            })
+            .collect();
+        let set = sync::SkipSet::new(&left);
+        for path in paths {
+            assert_eq!(
+                set.covers(path),
+                left.iter().any(|s| s.covers(path)),
+                "{left:?}: {path}"
+            );
+            assert_eq!(
+                set.may_alias(path),
+                left.iter().any(|s| s.may_alias(path)),
+                "{left:?}: {path}"
+            );
+        }
+    }
 }
 
 /// (core#1498, codex r1) A planted tag never hides tracked work, an ignored tag still marks its
@@ -2771,7 +3007,11 @@ fn k8s_a_cache_tag_never_hides_tracked_work_and_needs_no_listing() {
     std::fs::write(t.join("baseline-target/CACHEDIR.TAG"), SIG).unwrap();
     std::fs::write(t.join("baseline-target/debug/parser.o"), "obj").unwrap();
     let plan = json!([["w", "tree", [".git"], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(
+        &replica,
+        &["pack", &plan],
+        br#"{"w": [".gitignore", "src/changed.rs", "src/deleted.rs"]}"#,
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -3021,7 +3261,7 @@ fn k8s_an_embedded_repo_neither_breaks_the_codec_nor_persists() {
     git_in(&t.join("sub"), &["init", "-q"]);
     std::fs::write(t.join("sub/x"), "x").unwrap();
     let plan = json!([[tree, "tree", [".git"]]]).to_string();
-    let packed = codec(&replica, &["pack", &plan], b"");
+    let packed = codec(&replica, &["pack", &plan], br#"{"home/u/wt": ["a.txt"]}"#);
     assert!(
         packed.status.success(),
         "{}",
@@ -3638,7 +3878,7 @@ fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
         masks: Vec::new(),
         repo: false,
     };
-    let (stream, _, _, baseline) =
+    let (stream, _, _, baseline, _) =
         seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap();
     let roots = sync::decode(&mut stream.as_slice(), sync::MAX_STREAM).unwrap();
     let paths: Vec<&str> = roots[0].entries.iter().map(|e| e.path.as_str()).collect();
@@ -3653,7 +3893,7 @@ fn k8s_a_plain_roots_git_metadata_never_travels_either_way() {
     let out = codec(
         &replica,
         &["pack", &json!([["p", "plain", []]]).to_string()],
-        b"",
+        b"{}",
     );
     let back = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
     assert_eq!(back[0].entries.len(), 1);
@@ -3872,7 +4112,7 @@ fn k8s_a_plain_roots_host_read_is_reused_only_while_the_host_is_unchanged() {
         repo: false,
     };
     let body = |r: &PlanRoot| {
-        let (b, _, _, _) = seat::copy_in_stream(
+        let (b, _, _, _, _) = seat::copy_in_stream(
             None,
             &base,
             std::slice::from_ref(r),
@@ -3938,7 +4178,7 @@ fn k8s_the_replica_git_is_rebuilt_only_for_a_new_commit_or_mask() {
         repo: false,
     };
     let git_of = |r: &PlanRoot| {
-        let (b, _, base, _) =
+        let (b, _, base, _, _) =
             seat::copy_in_stream(None, &t, std::slice::from_ref(r), true, &Default::default())
                 .unwrap();
         let d = sync::decode(&mut b.as_slice(), sync::MAX_STREAM).unwrap();
@@ -4063,7 +4303,7 @@ fn k8s_a_read_only_repo_is_copied_as_git_lists_it_not_whole() {
     };
     let roots = plan_with_repo(&tree, &repo, false);
     // Before the fix: "the unit's copy-in is larger than 536870912 bytes (at …/target/…)".
-    let (body, plan, _, _) =
+    let (body, plan, _, _, _) =
         seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap();
     let r = roots.iter().find(|r| r.host == repo).unwrap();
     assert!(r.repo && r.mode == Mode::Plain && !r.back, "{r:?}");
@@ -4107,7 +4347,7 @@ fn k8s_a_writable_plain_root_with_a_git_dir_is_not_a_repo_projection() {
     let roots = plan_with_repo(&tree, &repo, true);
     let r = roots.iter().find(|r| r.host == repo).unwrap();
     assert!(!r.repo, "{r:?}");
-    let (body, _, _, _) =
+    let (body, _, _, _, _) =
         seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap();
     let decoded = sync::decode(&mut body.as_slice(), sync::MAX_STREAM).unwrap();
     let rep = seat::replica_of(None, &repo).unwrap();
@@ -4209,7 +4449,7 @@ fn k8s_left_out_paths_are_exact_and_their_host_links_are_checked() {
     std::fs::write(replica.join("p/.git/objects/cache/CACHEDIR.TAG"), SIG).unwrap();
     std::fs::write(replica.join("p/notes.md"), "n").unwrap();
     let plan = json!([["p", "plain", [], []]]).to_string();
-    let out = codec(&replica, &["pack", &plan], b"");
+    let out = codec(&replica, &["pack", &plan], b"{}");
     assert!(
         out.status.success(),
         "{}",
