@@ -5666,19 +5666,19 @@ fn core_1482_a_cancelled_runs_check_is_killed() {
 #[test]
 fn core_1482_the_floor_refuses_to_start_below_its_free_space_minimum() {
     const GIB: u64 = 1 << 30;
-    let why = disk_guard(Some(8 * GIB), 15).expect("refused");
+    let why = disk_guard(Some(8 * GIB), 15, 0, 20).expect("refused");
     assert!(
         why.starts_with("environment:") && why.contains("8.0 GiB free") && why.contains("15 GiB"),
         "{why}"
     );
     assert!(why.contains("not a failure of the change"), "{why}");
-    assert_eq!(disk_guard(Some(40 * GIB), 15), None);
+    assert_eq!(disk_guard(Some(40 * GIB), 15, 0, 20), None);
     assert_eq!(
-        disk_guard(None, 15),
+        disk_guard(None, 15, 0, 20),
         None,
         "unknown free space never refuses"
     );
-    assert_eq!(disk_guard(Some(1), 0), None, "0 turns the guard off");
+    assert_eq!(disk_guard(Some(1), 0, 0, 20), None, "0 turns the guard off");
 }
 
 /// (core#1482) The guard runs before any check, after the cache's own reclamation: a floor on a

@@ -5055,13 +5055,22 @@ pub(crate) fn floor_cancelled(run_id: Option<&str>) -> bool {
 }
 
 /// (core#1482) The free space a floor needs on the check cache's volume before it starts, in GiB:
-/// `WICKED_FLOOR_MIN_FREE_GB`, else 15 (an estate floor peaks near 41 GB; two at once filled a
-/// 90 GB host). `0` turns the guard off.
+/// `WICKED_FLOOR_MIN_FREE_GB`, else 15. `0` disables the minimum only; in-flight floors still
+/// reserve [`floor_peak_gib`] each.
 pub(crate) fn floor_min_free_gib() -> u64 {
     std::env::var("WICKED_FLOOR_MIN_FREE_GB")
         .ok()
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(15)
+}
+
+/// (core#1560) The GiB reserved per in-flight floor: `WICKED_FLOOR_PEAK_GB`, else 20.
+/// `0` disables the reservation term only.
+fn floor_peak_gib() -> u64 {
+    std::env::var("WICKED_FLOOR_PEAK_GB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20)
 }
 
 /// The bytes free on the volume holding `path` (the cache cap's own reading, `volume_space`);
@@ -5085,19 +5094,59 @@ thread_local! {
     pub(crate) static TEST_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
-/// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
-/// failure), or `None`: `free` bytes against `min_gib`. Unknown free space never refuses.
-pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
+/// (core#1482, core#1560) Why the floor must not start for lack of disk (an ENVIRONMENT failure,
+/// never a check failure), or `None`: `free` bytes against `min_gib + in_flight * peak_gib`.
+/// Unknown free space never refuses.
+pub(crate) fn disk_guard(
+    free: Option<u64>,
+    min_gib: u64,
+    in_flight: usize,
+    peak_gib: u64,
+) -> Option<String> {
     let free = free?;
-    let min = min_gib.saturating_mul(1 << 30);
-    (min > 0 && free < min).then(|| {
+    let required_gib = min_gib.saturating_add((in_flight as u64).saturating_mul(peak_gib));
+    let required = required_gib.saturating_mul(1 << 30);
+    (free < required).then(|| {
         format!(
             "environment: the host has {:.1} GiB free on the check cache's volume, under the \
-             floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
-             space, then retry the step — this is not a failure of the change",
+             floor's requirement of {required_gib} GiB: minimum {min_gib} GiB \
+             (WICKED_FLOOR_MIN_FREE_GB) plus {in_flight} other floor(s) running at {peak_gib} GiB \
+             each (WICKED_FLOOR_PEAK_GB); no check ran. Free disk space, then retry the step — \
+             this is not a failure of the change",
             free as f64 / (1u64 << 30) as f64
         )
     })
+}
+
+/// (core#1560) Admission and reservation share one process-wide lock. A slot spans every pass of
+/// the floor; all returns and unwinds release it.
+static IN_FLIGHT_FLOORS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+struct FloorSlot {
+    in_flight: &'static std::sync::Mutex<usize>,
+}
+
+impl FloorSlot {
+    fn admit(free: Option<u64>) -> Result<Self, String> {
+        let (in_flight, min_gib, peak_gib) =
+            (&IN_FLIGHT_FLOORS, floor_min_free_gib(), floor_peak_gib());
+        #[cfg(test)]
+        let (in_flight, min_gib, peak_gib) =
+            test_seam::floor_admission_config().unwrap_or((in_flight, min_gib, peak_gib));
+        let mut count = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(why) = disk_guard(free, min_gib, *count, peak_gib) {
+            return Err(why);
+        }
+        *count += 1;
+        Ok(Self { in_flight })
+    }
+}
+
+impl Drop for FloorSlot {
+    fn drop(&mut self) {
+        let mut count = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        *count -= 1;
+    }
 }
 
 fn run_floor_inner(
@@ -5138,6 +5187,8 @@ fn run_floor_body(
             "the run was cancelled: its floor does not start".into(),
         );
     }
+    // Declared before the scratch so the reservation also spans its cleanup on early returns.
+    let _floor_slot;
     // The scratch FIRST: its short `TMPDIR` under the system temp dir is the boundary's SECOND
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
@@ -5149,15 +5200,14 @@ fn run_floor_body(
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
-    // (core#1482) The disk guard, measured AFTER the scratch's preparation: that runs the cache
-    // cap's lease-protected eviction (which frees stale leaves when the volume is short), and it
-    // creates the cache root, so its volume can be read on a fresh home.
-    if let Some(why) = check_cache_root()
-        .ok()
-        .and_then(|root| disk_guard(free_bytes(&root), floor_min_free_gib()))
-    {
-        return runner_refused(worktree, ctx, why);
-    }
+    // (core#1482, core#1560) Admit AFTER scratch preparation: its lease-protected eviction frees
+    // stale leaves, and it creates the cache root so its volume can be read on a fresh home.
+    // The slot reserves room for this floor until every pass and cleanup has finished.
+    let free = check_cache_root().ok().and_then(|root| free_bytes(&root));
+    _floor_slot = match FloorSlot::admit(free) {
+        Ok(slot) => slot,
+        Err(why) => return runner_refused(worktree, ctx, why),
+    };
     // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
     if let Some(root) = scratch.logs.parent() {
         crate::floor_log::gc(
@@ -10941,17 +10991,38 @@ fn log_cap() -> u64 {
     crate::floor_log::MAX_STREAM_BYTES
 }
 
-/// Per-thread stand-ins for the host's load, the retry's headroom wait and the log cap: a floor
-/// runs on its caller's thread, so a test pins what IT sees without touching any other test.
+/// Per-thread stand-ins for floor admission, the host's load, the retry's headroom wait and the
+/// log cap: a floor runs on its caller's thread, so a test pins what IT sees without touching any
+/// other test.
 #[cfg(test)]
 pub(crate) mod test_seam {
     use std::cell::{Cell, RefCell};
     type Hook = Box<dyn FnOnce()>;
+    type Admission = (&'static std::sync::Mutex<usize>, u64, u64);
     thread_local! {
         static BEFORE_SPAWN: RefCell<Option<Hook>> = const { RefCell::new(None) };
         static LOAD: Cell<Option<(Option<f64>, usize)>> = const { Cell::new(None) };
         static CAP: Cell<Option<u64>> = const { Cell::new(None) };
         static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
+        static ADMISSION: Cell<Option<Admission>> = const { Cell::new(None) };
+    }
+    pub(super) fn floor_admission_config() -> Option<Admission> {
+        ADMISSION.with(Cell::get)
+    }
+    /// Isolate the admission counter and sizes from other floors running in parallel tests.
+    pub(super) fn floor_admission(
+        count: &'static std::sync::Mutex<usize>,
+        min_gib: u64,
+        peak_gib: u64,
+    ) -> FloorAdmission {
+        let previous = ADMISSION.with(|c| c.replace(Some((count, min_gib, peak_gib))));
+        FloorAdmission(previous)
+    }
+    pub(super) struct FloorAdmission(Option<Admission>);
+    impl Drop for FloorAdmission {
+        fn drop(&mut self) {
+            ADMISSION.with(|c| c.set(self.0));
+        }
     }
     pub(crate) fn exclusion() -> Option<bool> {
         EXCLUDE.with(Cell::get)
@@ -11051,6 +11122,75 @@ pub(crate) mod tests {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
         crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
+    }
+
+    #[test]
+    fn core_1560_disk_admission_reserves_space_for_other_floors() {
+        const GIB: u64 = 1 << 30;
+        let why = disk_guard(Some(34 * GIB), 15, 1, 20).expect("one floor reserves 20 GiB");
+        assert!(
+            why.starts_with("environment:")
+                && why.contains("1 other floor(s) running")
+                && why.contains("35 GiB")
+                && why.contains("WICKED_FLOOR_PEAK_GB"),
+            "{why}"
+        );
+        assert_eq!(disk_guard(Some(34 * GIB), 15, 0, 20), None);
+        assert_eq!(disk_guard(Some(35 * GIB), 15, 1, 20), None);
+        assert_eq!(disk_guard(Some(34 * GIB), 15, 1, 0), None);
+        assert!(disk_guard(Some(14 * GIB), 15, 1, 0).is_some());
+        assert!(disk_guard(Some(19 * GIB), 0, 1, 20).is_some());
+        assert_eq!(disk_guard(None, 15, 1, 20), None);
+        assert!(disk_guard(Some(34 * GIB), u64::MAX, usize::MAX, u64::MAX).is_some());
+    }
+
+    #[test]
+    fn core_1560_a_floor_slot_is_reserved_until_its_guard_drops() {
+        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        const GIB: u64 = 1 << 30;
+        let first = FloorSlot::admit(Some(36 * GIB)).expect("the first floor fits");
+        assert!(FloorSlot::admit(Some(34 * GIB)).is_err());
+        drop(first);
+        let second = FloorSlot::admit(Some(34 * GIB)).expect("the first floor released its slot");
+        assert_eq!(*COUNT.lock().unwrap(), 1);
+        drop(second);
+        assert_eq!(*COUNT.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn core_1560_a_refusing_floor_releases_its_slot() {
+        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let wt = scratch("floor-slot-refusal");
+        std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+        std::fs::write(wt.join(CONFIG_PATH), "{invalid json").unwrap();
+        let first = FloorSlot::admit(Some(36 << 30)).expect("the first floor fits");
+        TEST_FREE_BYTES.with(|c| c.set(34 << 30));
+        let refused = run_floor(&wt, &FloorContext::default());
+        assert_eq!(refused.outcome(), "not_run", "{refused:?}");
+        assert!(refused.checks.is_empty(), "{refused:?}");
+        assert!(
+            refused.sandbox_error.as_deref().is_some_and(|why| {
+                why.starts_with("environment:") && why.contains("1 other floor(s) running")
+            }),
+            "{refused:?}"
+        );
+        assert_eq!(*COUNT.lock().unwrap(), 1, "a refusal must not take a slot");
+        drop(first);
+        let report = run_floor(&wt, &FloorContext::default());
+        TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+        assert!(!report.passed, "{report:?}");
+        assert!(report.checks.is_empty(), "{report:?}");
+        assert!(report.detect_error.is_some(), "{report:?}");
+        assert_eq!(
+            *COUNT.lock().unwrap(),
+            0,
+            "the refusing floor leaked its slot"
+        );
+        let next = FloorSlot::admit(Some(34 << 30)).expect("the refused floor released its slot");
+        drop(next);
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     #[test]

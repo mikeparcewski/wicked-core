@@ -44,6 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Floor disk admission accounts for other floors already running (core#1560).** A process-wide reservation
+  requires the free-space minimum plus 20 GiB per in-flight floor, checked and reserved under one mutex.
+  `WICKED_FLOOR_PEAK_GB` sets that per-floor reservation (`0` disables only the reservation term).
+  The slot is held through retry passes and released on every exit; refusals name the other running floors
+  and remain environment refusals with no check run.
+
 - **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
   hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
