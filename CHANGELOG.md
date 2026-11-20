@@ -48,6 +48,11 @@ Two release tracks share this file, newest entry first regardless of track:
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.
 
+- **Per-run governance files survive macOS temp purges (core#1430).** Decisions logs, settings,
+  policy databases and gateway records now live under `~/.wicked/core-gov/<run>` (HOME, else
+  USERPROFILE), with a temp fallback only when no home is resolvable. Existing temp directories
+  are adopted once on a best-effort basis, and gateway record writes recreate missing parents.
+
 - **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
   process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
   on both the first attempt and every retry. The FAIL reaches the gate instead of being replaced

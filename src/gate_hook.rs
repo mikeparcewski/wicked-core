@@ -421,15 +421,11 @@ pub(crate) struct BoundaryCtx {
 /// worker wrote its scratch (temp_dir() alone would have missed it). Same symlink-aware
 /// containment as every other boundary comparison.
 fn in_system_temp(resolved: &std::path::Path) -> bool {
-    // ONE temp_dir() read for both the exclusion and the inclusion set — two reads could
-    // diverge under a concurrently-mutated temp env and make the gov-root exclusion judge a
-    // different tree than the carve-out (Copilot).
     let sys_temp = std::env::temp_dir();
-    // The governance evidence tree ALSO lives under temp (`$TMPDIR/wicked-core-gov/…` — the
-    // decisions logs the fold reads). A blocked write there is a tamper attempt against the
-    // audit trail, not scratch: it must NOT ride the scratch carve-out. (It is still blocked
-    // either way; this keeps it unit-FATAL.)
-    if crate::path_policy::resolved_is_within(resolved, &sys_temp.join("wicked-core-gov")) {
+    // The governance evidence tree must never ride the scratch carve-out: a blocked write
+    // there is a tamper attempt against the audit trail and stays unit-FATAL. The exclusion
+    // matters when gov_root() falls back to temp, or HOME itself is under temp in a test.
+    if crate::path_policy::resolved_is_within(resolved, &gov_root()) {
         return false;
     }
     let mut temps = vec![sys_temp];
@@ -5795,13 +5791,59 @@ fn encode_run_id(run_id: &str) -> String {
         .collect()
 }
 
+/// Pure resolution of the governance root: `<home>/.wicked/core-gov`, else the legacy temp root.
+/// Outside the state home on purpose, so granting a seat access to a run's files does not unmask
+/// the state home's core.db (core#1430); `~/.wicked` is already a worker-denied home subdir.
+pub(crate) fn gov_root_for(
+    home: Option<std::ffi::OsString>,
+    temp: &std::path::Path,
+) -> std::path::PathBuf {
+    match home.filter(|h| !h.is_empty()) {
+        Some(h) => std::path::PathBuf::from(h).join(".wicked").join("core-gov"),
+        // Embedders/tests without a resolvable home keep the legacy temp root.
+        None => temp.join("wicked-core-gov"),
+    }
+}
+
+/// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
+/// directory for a run, so a later change to `HOME` (a test pinning it, a child env) cannot move it.
+pub(crate) fn gov_root() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        gov_root_for(
+            std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
+            &std::env::temp_dir(),
+        )
+    })
+    .clone()
+}
+
 /// The per-run governance directory (outside any worktree). Cleared on a FRESH (re-)launch of a run id
 /// so a prior terminal run's stale decisions can't fail a new run — see the launcher; resume/redrive
 /// deliberately do NOT clear it (they continue the same run's log).
 pub fn gov_run_dir(run_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("wicked-core-gov")
-        .join(run_dir_name(run_id))
+    gov_run_dir_in(
+        &gov_root(),
+        &std::env::temp_dir().join("wicked-core-gov"),
+        run_id,
+    )
+}
+
+/// [`gov_run_dir`] over explicit roots. Adopts an in-flight run's directory from the legacy temp
+/// root once across an upgrade; a failed move (including across filesystems) is best effort, and
+/// only the new location is used afterwards.
+fn gov_run_dir_in(
+    root: &std::path::Path,
+    legacy_root: &std::path::Path,
+    run_id: &str,
+) -> std::path::PathBuf {
+    let dir = root.join(run_dir_name(run_id));
+    let legacy = legacy_root.join(run_dir_name(run_id));
+    if dir != legacy && !dir.exists() && legacy.exists() {
+        let _ = create_dir_all_private(root);
+        let _ = std::fs::rename(&legacy, &dir);
+    }
+    dir
 }
 
 /// The per-run DIRECTORY NAME every engine-owned per-run scratch tree keys on — the governance
@@ -11838,6 +11880,49 @@ mod boundary_tests {
     // every other module's env-mutating tests.
     use crate::test_env::ENV_LOCK as ENV;
 
+    #[test]
+    fn gov_root_is_under_home_not_the_temp_dir() {
+        let temp = std::path::Path::new("/var/folders/xx/T");
+        let root = gov_root_for(Some("/home/op".into()), temp);
+        assert_eq!(root, std::path::PathBuf::from("/home/op/.wicked/core-gov"));
+        assert!(!root.starts_with(temp));
+        // No resolvable home: the legacy temp root, the only case that may live under temp.
+        assert_eq!(gov_root_for(None, temp), temp.join("wicked-core-gov"));
+        assert_eq!(
+            gov_root_for(Some("".into()), temp),
+            temp.join("wicked-core-gov")
+        );
+    }
+
+    #[test]
+    fn gov_run_dir_adopts_a_legacy_temp_dir_once() {
+        let base =
+            std::env::temp_dir().join(format!("core-1430-{}", uuid::Uuid::new_v4().simple()));
+        let (root, legacy_root) = (base.join("new"), base.join("legacy"));
+        let log = "attempt-0/decisions.ndjson";
+        let legacy = legacy_root.join(run_dir_name("r1"));
+        std::fs::create_dir_all(legacy.join("attempt-0")).unwrap();
+        std::fs::write(legacy.join(log), "existing decisions\n").unwrap();
+
+        let dir = gov_run_dir_in(&root, &legacy_root, "r1");
+        assert_eq!(dir, root.join(run_dir_name("r1")));
+        assert_eq!(
+            std::fs::read_to_string(dir.join(log)).unwrap(),
+            "existing decisions\n"
+        );
+        assert!(!legacy.exists());
+
+        // Once adopted, a new legacy tree must not replace the active run's evidence.
+        std::fs::create_dir_all(legacy.join("attempt-0")).unwrap();
+        std::fs::write(legacy.join(log), "stale decisions\n").unwrap();
+        assert_eq!(gov_run_dir_in(&root, &legacy_root, "r1"), dir);
+        assert_eq!(
+            std::fs::read_to_string(dir.join(log)).unwrap(),
+            "existing decisions\n"
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         match write {
@@ -14033,10 +14118,11 @@ mod boundary_tests {
     /// blocked Bash redirect to `/private/tmp/out.txt`. A blocked write into the SYSTEM temp is
     /// benign scratch: STILL blocked, STILL audited, but ADVISORY — on the Bash arm and the
     /// direct-tool arm alike. The gov-tree control proves the carve-out excludes the audit trail
-    /// (a tamper attempt against the decisions logs stays fatal even though they live under temp),
+    /// (a tamper attempt against the decisions logs stays fatal wherever they live),
     /// and the home control proves everything outside temp stays fatal.
     #[test]
     fn a_scratch_write_into_the_system_temp_is_advisory_not_fatal() {
+        let _env = ENV.read().unwrap_or_else(|p| p.into_inner());
         let wt = std::env::temp_dir().join("wicked-boundary-wt-tmp");
         std::fs::create_dir_all(&wt).unwrap();
         let roots = crate::path_policy::AllowedRoots {
@@ -14069,11 +14155,9 @@ mod boundary_tests {
             "a Write-tool scratch into the system temp must be ADVISORY"
         );
 
-        // Control 1: the governance evidence tree lives under temp and must NOT ride the
-        // carve-out — a write there is a tamper attempt against the audit trail.
-        let gov = std::env::temp_dir()
-            .join("wicked-core-gov")
-            .join("some-run/attempt-0/decisions.ndjson");
+        // Control 1: a write into the active governance evidence tree is a tamper attempt
+        // against the audit trail, even if the root falls back to temp.
+        let gov = gov_root().join("some-run/attempt-0/decisions.ndjson");
         let (_, fatal) = boundary_denial_with(
             &roots,
             &wt,
@@ -14083,10 +14167,7 @@ mod boundary_tests {
             "Write",
         )
         .expect("blocked");
-        assert!(
-            fatal,
-            "a write into the gov evidence tree stays FATAL despite being under temp"
-        );
+        assert!(fatal, "a write into the gov evidence tree stays FATAL");
 
         // Control 2: an escape anywhere else (unix: a home-shaped path) stays fatal.
         #[cfg(unix)]

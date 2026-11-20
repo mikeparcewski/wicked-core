@@ -6331,10 +6331,10 @@ fn arm_input_governance(
     let dir = decisions_path
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
+        .unwrap_or_else(crate::gate_hook::gov_root);
     crate::gate_hook::create_dir_all_private(&dir)?;
     // Per-unit settings file, written with the O_EXCL (symlink-safe) discipline (see
-    // `write_private_exclusive`) so a local attacker who predicts the deterministic temp path can't
+    // `write_private_exclusive`) so a local attacker who predicts the deterministic path can't
     // redirect the write.
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
