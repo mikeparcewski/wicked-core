@@ -44,12 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **Provider content refusals fail the unit over to the next eligible seat (core#1492).** Recognized
-  Codex and Claude refusals with a nonzero wrapped CLI exit skip failure triage and use the existing
-  failover ladder, preserving the refused transcript without benching the seat. With no eligible
-  seat left, an attended run parks at the dead-seat gate for reassignment. The gate's failover note
-  names the refusal ("`codex` refused this content; moved to `pi`").
-
+- **Tests account for container-floor limits and actor ordering (core#1489).** Gate the voice hand-off test on an armable floor, check the send-back draft's held state without a render jail, flush ask events with Ping, and await shutdown subscriber disconnection directly.
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.

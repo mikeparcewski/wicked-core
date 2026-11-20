@@ -1237,11 +1237,15 @@ mod tests {
         }
         f.core.tx.send(Command::EmitEvent(created)).unwrap();
         f.core.tx.send(Command::EmitEvent(resolved)).unwrap();
-        f.core.sessions().unwrap();
-        assert!(matches!(
-            events.try_recv(),
-            Err(std::sync::mpsc::TryRecvError::Empty)
-        ));
+        // Ping is acknowledged behind the queued events; sessions() reads the read model.
+        // Drain Ping's heartbeat (not logged) while checking that no elicitation frame escaped.
+        f.core.ping();
+        for event in events.try_iter() {
+            assert!(!matches!(
+                event,
+                CoreEvent::ElicitationCreated { .. } | CoreEvent::ElicitationResolved { .. }
+            ));
+        }
         assert_eq!(f.core.run_events(&f.run).len(), 2);
     }
 
@@ -1363,8 +1367,8 @@ mod tests {
             .is_ok();
         assert_ne!(closer.join().unwrap(), human);
         frame(&events, "elicitationResolved");
-        // An actor read flushes any queued close event before inspecting the durable trail.
-        f.core.sessions().unwrap();
+        // Ping is acknowledged behind any queued close event; sessions() reads the read model.
+        f.core.ping();
         assert_eq!(
             f.core
                 .run_events(&f.run)
