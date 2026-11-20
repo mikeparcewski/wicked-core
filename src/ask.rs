@@ -269,9 +269,15 @@ fn multi_answer(
                 .ok_or_else(|| anyhow::anyhow!("a multi-select answer holds only choices"))
         })
         .collect::<anyhow::Result<_>>()?;
-    if let Some(bad) = picked.iter().find(|p| !choices.iter().any(|c| c == *p)) {
-        anyhow::bail!("{bad:?} is not one of the choices");
+    // (core#1643) The person picked from the event's redacted choices; resolve each to the original.
+    let mut originals: Vec<&str> = Vec::with_capacity(picked.len());
+    for shown in &picked {
+        match crate::tool_activity::original_option(choices, shown) {
+            Some(original) => originals.push(original.as_str()),
+            None => anyhow::bail!("{shown:?} is not one of the choices"),
+        }
     }
+    let picked = originals;
     let mut ordered: Vec<&str> = choices
         .iter()
         .map(String::as_str)
@@ -375,11 +381,18 @@ impl Registry {
                 response,
             )?)
         } else {
+            let shown = response
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow::anyhow!("accept requires a string response"))?;
+            // (core#1643) A pick of a redacted choice resolves to the original the seat offered.
+            let choices = self
+                .entries
+                .get(id)
+                .and_then(|p| p.request.choices.as_deref())
+                .unwrap_or_default();
             Some(
-                response
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| anyhow::anyhow!("accept requires a string response"))?
-                    .to_owned(),
+                crate::tool_activity::original_option(choices, shown)
+                    .map_or_else(|| shown.to_owned(), Clone::clone),
             )
         };
         let p = self.entries.remove(id).expect("entry checked above");
@@ -993,6 +1006,38 @@ mod tests {
         let records = f.core.run_events(&f.run);
         assert_eq!(records.len(), 2);
         assert_eq!(records[1]["answer"], "B");
+    }
+
+    /// (core#1643) The wire shows choices redacted; a multi-select pick of the shown form resolves to
+    /// the stored originals.
+    #[test]
+    fn multi_answer_resolves_redacted_picks_to_the_original_choices() {
+        let original = "Run pytest -p no:randomly".to_string();
+        let shown = crate::tool_activity::redact(&original);
+        assert_ne!(shown, original);
+        let choices = vec![original.clone(), "plain".to_string()];
+        let answer = multi_answer(
+            &choices,
+            AskMulti {
+                min: None,
+                max: None,
+            },
+            Some(&serde_json::json!([shown, "plain"])),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&answer).unwrap(),
+            choices
+        );
+        assert!(multi_answer(
+            &choices,
+            AskMulti {
+                min: None,
+                max: None
+            },
+            Some(&serde_json::json!(["forged"])),
+        )
+        .is_err());
     }
 
     fn multi_request() -> AskRequest {

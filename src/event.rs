@@ -1882,6 +1882,50 @@ pub(crate) fn gate_choices(gate_kind: &str) -> Option<(&'static [&'static str], 
     }
 }
 
+/// (core#1643) Event members that are DATA, never seat prose: engine-minted identities and refs
+/// that clients compare, key on, look up or hand back (run/session ids, seat keys, the elicitation
+/// id, workflow/skill refs, git refs/shas/trees, the gate kind and its answer tokens `choices`, finding
+/// ids). The redactor's prefix rules would cut a branch such as `feature/sk-<20 chars>`, which would
+/// break the lookup. They pass `to_json` byte-identical; every other string is redacted. Elicitation
+/// `options` are NOT here: they are shown redacted and compared redacted (`tool_activity::original_option`).
+const EVENT_DATA_KEYS: &[&str] = &[
+    "type",
+    "session",
+    "runId",
+    "state",
+    "signal",
+    "gateKind",
+    "cli",
+    "cliKey",
+    "seat",
+    "recipientCli",
+    "previousCli",
+    "newCli",
+    "judgeCli",
+    "workflowId",
+    "skillRef",
+    "suggestionRef",
+    "elicitationId",
+    "terminalId",
+    "acpSessionId",
+    "baseRef",
+    "baseCommit",
+    "localHead",
+    "runBranch",
+    "head",
+    "sha",
+    "tree",
+    "treeBefore",
+    "treeAfter",
+    "baseBefore",
+    "baseAfter",
+    "beforeTree",
+    "afterTree",
+    "contentHash",
+    "choices",
+    "findingIds",
+];
+
 impl CoreEvent {
     /// Serialize to the tagged JSON object (`{ "type": "...", ...fields }`) that IS this event's
     /// wire identity — the shape the studio's `/ws` stream carries and the shape the durable event
@@ -1910,7 +1954,7 @@ impl CoreEvent {
     /// removed: adding a variant without mapping it is now a BUILD failure, not a mystery event.
     pub fn to_json(&self) -> serde_json::Value {
         use serde_json::json;
-        match self {
+        let mut value = match self {
             CoreEvent::Heartbeat => json!({ "type": "heartbeat" }),
             CoreEvent::SessionStarted {
                 session,
@@ -3507,13 +3551,154 @@ impl CoreEvent {
                 }
                 v
             }
+        };
+        // Operator terminal sessions carry their own shell bytes, not seat-authored prose.
+        if !matches!(
+            self,
+            CoreEvent::TerminalOpened { .. }
+                | CoreEvent::TerminalOutput { .. }
+                | CoreEvent::TerminalExited { .. }
+        ) {
+            crate::tool_activity::redact_json_except(&mut value, EVENT_DATA_KEYS);
         }
+        value
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_data_keys_pass_byte_identical_and_prose_beside_them_is_cut() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        // Looks like a key by the prefix rules, but is a branch the client looks up.
+        let branch = format!("feature/{}-{}", "sk", "implement-authentication-flow");
+        assert_ne!(
+            crate::tool_activity::redact(&branch),
+            branch,
+            "fixture must be cut by redact"
+        );
+        let ev = CoreEvent::RunBaseResolved {
+            session: "s".into(),
+            base_ref: Some(branch.clone()),
+            base_commit: "abc".into(),
+            local_head: "def".into(),
+            behind: 0,
+            fetched: false,
+            lifted: false,
+            note: Some(format!("see {token}")),
+            run_branch: branch.clone(),
+        }
+        .to_json();
+        assert_eq!(ev["baseRef"], branch);
+        assert_eq!(ev["runBranch"], branch);
+        assert_eq!(ev["note"], "see ***");
+    }
+
+    #[test]
+    fn seat_prose_is_redacted_on_the_event_wire() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let text = format!("I used {token} to push");
+        let triage = CoreEvent::FailureTriaged {
+            session: "s".into(),
+            ord: 1,
+            decision: "fail".into(),
+            analysis: text.clone(),
+        }
+        .to_json();
+        assert_eq!(triage["analysis"], "I used *** to push");
+        assert!(!triage.to_string().contains(&token));
+
+        let delta = CoreEvent::CliOutputDelta {
+            session: "s".into(),
+            ord: 1,
+            chunk: text,
+        }
+        .to_json();
+        assert_eq!(delta["chunk"], "I used *** to push");
+        assert!(!delta.to_string().contains(&token));
+    }
+
+    #[test]
+    fn event_redaction_reaches_strings_in_arrays() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let event = CoreEvent::ElicitationCreated {
+            session: "s".into(),
+            epoch: 1,
+            elicitation_id: "e".into(),
+            message: "Choose".into(),
+            options: Some(vec![format!("Use {token}"), "Keep going".into()]),
+            prop_type: Some("string".into()),
+            recommended: Some(1),
+            source: None,
+            ord: None,
+            attempt: None,
+            seat: None,
+            multi: None,
+        }
+        .to_json();
+        assert_eq!(event["options"][0], "Use ***");
+        assert_eq!(event["options"][1], "Keep going");
+        assert!(!event.to_string().contains(&token));
+    }
+
+    #[test]
+    fn ordinary_event_prose_is_byte_identical() {
+        let prose = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        let actual = CoreEvent::FailureTriaged {
+            session: "s".into(),
+            ord: 1,
+            decision: "fail".into(),
+            analysis: prose.into(),
+        }
+        .to_json();
+        let expected = serde_json::json!({
+            "type": "failureTriaged", "session": "s", "ord": 1,
+            "decision": "fail", "analysis": prose,
+        });
+        assert_eq!(
+            actual["analysis"].as_str().unwrap().as_bytes(),
+            prose.as_bytes()
+        );
+        assert_eq!(
+            actual.to_string().as_bytes(),
+            expected.to_string().as_bytes()
+        );
+    }
+
+    #[test]
+    fn operator_terminal_events_are_not_redacted() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let output = CoreEvent::TerminalOutput {
+            id: token.clone(),
+            seq: 1,
+            bytes_b64: token.clone(),
+        }
+        .to_json();
+        assert_eq!(
+            output,
+            serde_json::json!({
+                "type": "terminalOutput", "id": token, "seq": 1, "bytesB64": token,
+            })
+        );
+        assert_eq!(
+            CoreEvent::TerminalOpened {
+                id: "t".into(),
+                cwd: token.clone(),
+            }
+            .to_json()["cwd"],
+            token
+        );
+        assert_eq!(
+            CoreEvent::TerminalExited {
+                id: token.clone(),
+                status: Some(0),
+            }
+            .to_json()["id"],
+            token
+        );
+    }
 
     /// core#759: a `team_dispute` pause names its three answers (and recommends sending the
     /// finding back) on the wire; every other gate kind carries no `choices` key at all — a

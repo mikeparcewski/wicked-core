@@ -402,7 +402,7 @@ impl ElicitationMaps {
         run_id: &str,
         elicitation_id: &str,
         action: String,
-        response: Option<serde_json::Value>,
+        mut response: Option<serde_json::Value>,
     ) -> anyhow::Result<()> {
         let entry = self
             .pending
@@ -434,13 +434,17 @@ impl ElicitationMaps {
                     )
                 })?;
             const FREE_TEXT_CAP: usize = 64 * 1024;
+            let mut picked: Option<String> = None;
             match &entry.options {
-                Some(options) if !options.iter().any(|option| option == value) => {
-                    anyhow::bail!(
+                // (core#1643) The person picked from the event's REDACTED options, so the pick is
+                // compared in redacted form and resolves to the stored original the seat offered.
+                Some(options) => match crate::tool_activity::original_option(options, value) {
+                    Some(original) => picked = Some(original.clone()),
+                    None => anyhow::bail!(
                         "elicitation {} response is not one of the allowed options",
                         elicitation_id
-                    );
-                }
+                    ),
+                },
                 None if value.len() > FREE_TEXT_CAP => {
                     anyhow::bail!(
                         "elicitation {} response exceeds {} bytes",
@@ -449,6 +453,9 @@ impl ElicitationMaps {
                     );
                 }
                 _ => {}
+            }
+            if let Some(original) = picked {
+                response = Some(serde_json::Value::String(original));
             }
         }
 
@@ -3966,6 +3973,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rx.recv().unwrap().response, Some(serde_json::json!("yes")));
+    }
+
+    /// (core#1643) The event shows the redacted option; picking it resolves to the stored original.
+    #[test]
+    fn redacted_option_pick_resolves_to_the_stored_original() {
+        let mut m = maps();
+        let option = "Run pytest -p no:randomly".to_string();
+        let shown = crate::tool_activity::redact(&option);
+        assert_ne!(shown, option, "fixture must be cut by the redactor");
+        let (rx, ..) = m
+            .register(
+                "run-red",
+                1,
+                "e-red",
+                "pick",
+                Some(vec![option.clone()]),
+                "answer",
+            )
+            .unwrap();
+        assert!(m
+            .deliver(
+                "run-red",
+                "e-red",
+                "accept".into(),
+                Some(serde_json::json!("forged"))
+            )
+            .is_err());
+        m.deliver(
+            "run-red",
+            "e-red",
+            "accept".into(),
+            Some(serde_json::json!(shown)),
+        )
+        .unwrap();
+        assert_eq!(rx.recv().unwrap().response, Some(serde_json::json!(option)));
     }
 
     /// Test 7: 8 KB byte-length message cap — a 4-byte-per-codepoint string of 2,049

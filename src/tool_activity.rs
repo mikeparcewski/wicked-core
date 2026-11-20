@@ -1106,6 +1106,48 @@ pub fn redact(cmd: &str) -> String {
     redact_config_pairs(&out)
 }
 
+/// The stored option a person picked from the event wire, which shows options redacted (core#1643):
+/// the one comparison rule for every question's options, so the pick still resolves to the exact
+/// original the seat offered.
+pub(crate) fn original_option<'a>(options: &'a [String], shown: &str) -> Option<&'a String> {
+    options.iter().find(|option| redact(option) == shown)
+}
+
+/// Cut secrets from JSON string values with the same matcher used for tool activity.
+pub(crate) fn redact_json_strings(value: &mut Value) {
+    redact_json_except(value, &[]);
+}
+
+/// [`redact_json_strings`], leaving every object member whose key is in `exempt` (at any depth)
+/// byte-identical: identity and reference fields that consumers compare, key on or hand back.
+pub(crate) fn redact_json_except(value: &mut Value, exempt: &[&str]) {
+    match value {
+        Value::String(text) => *text = redact(text),
+        Value::Array(values) => {
+            for value in values {
+                redact_json_except(value, exempt);
+            }
+        }
+        Value::Object(map) => {
+            for (key, value) in map.iter_mut() {
+                if !exempt.contains(&key.as_str()) {
+                    redact_json_except(value, exempt);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Redact only the named record fields, leaving executable/replayed fields intact.
+pub(crate) fn redact_fields(map: &mut serde_json::Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        if let Some(value) = map.get_mut(*key) {
+            redact_json_strings(value);
+        }
+    }
+}
+
 fn clip(s: &str) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= TARGET_MAX {

@@ -102,6 +102,7 @@ impl ToNode for InteractionRequest {
         {
             node.metadata = map;
         }
+        crate::tool_activity::redact_fields(&mut node.metadata, &["prompt", "answer"]);
         node
     }
 }
@@ -239,6 +240,25 @@ pub fn resolve_open_for_session(
 mod tests {
     use super::*;
     use wicked_apps_core::open_store;
+
+    #[test]
+    fn recorded_prompt_and_answer_redact_tokens_and_preserve_plain_prose() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let sensitive = format!("I used {token} to push");
+        let plain = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        for (text, expected) in [(sensitive.as_str(), "I used *** to push"), (plain, plain)] {
+            let mut request = open_gate("s", 1, None, text, "def", 1);
+            request.answer = Some(text.into());
+            let recorded = InteractionRequest::from_node(&request.to_node()).unwrap();
+            assert_eq!(recorded.prompt.as_bytes(), expected.as_bytes());
+            assert_eq!(
+                recorded.answer.as_deref().unwrap().as_bytes(),
+                expected.as_bytes()
+            );
+            assert!(!recorded.prompt.contains(&token));
+            assert!(!recorded.answer.as_deref().unwrap().contains(&token));
+        }
+    }
 
     #[test]
     fn request_round_trips_through_node() {
