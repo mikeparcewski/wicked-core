@@ -29,8 +29,10 @@
 //! on a phase; in the standalone P0 path it opens the phase if absent purely so the veto is
 //! observable, but the execute backend remains the phase opener of record.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use wicked_apps_core::{
     open_store_ro, ConformanceClaim, Decision, GraphRead, GraphStore, HardenedCommand, NodeKind,
@@ -421,15 +423,11 @@ pub(crate) struct BoundaryCtx {
 /// worker wrote its scratch (temp_dir() alone would have missed it). Same symlink-aware
 /// containment as every other boundary comparison.
 fn in_system_temp(resolved: &std::path::Path) -> bool {
-    // ONE temp_dir() read for both the exclusion and the inclusion set — two reads could
-    // diverge under a concurrently-mutated temp env and make the gov-root exclusion judge a
-    // different tree than the carve-out (Copilot).
     let sys_temp = std::env::temp_dir();
-    // The governance evidence tree ALSO lives under temp (`$TMPDIR/wicked-core-gov/…` — the
-    // decisions logs the fold reads). A blocked write there is a tamper attempt against the
-    // audit trail, not scratch: it must NOT ride the scratch carve-out. (It is still blocked
-    // either way; this keeps it unit-FATAL.)
-    if crate::path_policy::resolved_is_within(resolved, &sys_temp.join("wicked-core-gov")) {
+    // The governance evidence tree must never ride the scratch carve-out: a blocked write
+    // there is a tamper attempt against the audit trail and stays unit-FATAL. The exclusion
+    // matters when gov_root() falls back to temp, or HOME itself is under temp in a test.
+    if crate::path_policy::resolved_is_within(resolved, &gov_root()) {
         return false;
     }
     let mut temps = vec![sys_temp];
@@ -5795,13 +5793,87 @@ fn encode_run_id(run_id: &str) -> String {
         .collect()
 }
 
+/// Pure resolution of the governance root: `<home>/.wicked/core-gov` for the first candidate home
+/// that is non-empty and absolute, else the legacy temp root. Outside the state home on purpose, so
+/// granting a seat access to a run's files does not unmask the state home's core.db (core#1430);
+/// `~/.wicked` is already a worker-denied home subdir.
+pub(crate) fn gov_root_for(
+    homes: &[Option<std::ffi::OsString>],
+    temp: &std::path::Path,
+) -> std::path::PathBuf {
+    homes
+        .iter()
+        .flatten()
+        .map(std::path::PathBuf::from)
+        .find(|h| h.is_absolute())
+        .map(|h| h.join(".wicked").join("core-gov"))
+        // Embedders without a usable home keep the temp root.
+        .unwrap_or_else(|| temp.join("wicked-core-gov"))
+}
+
+/// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
+/// directory for a run, so a later change to `HOME` (a child env) cannot move it. Unit tests keep
+/// the temp root: they pin `HOME` per test, which a process-wide root must not latch.
+pub(crate) fn gov_root() -> std::path::PathBuf {
+    static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        if cfg!(test) {
+            return temp.join("wicked-core-gov");
+        }
+        gov_root_for(
+            &[std::env::var_os("HOME"), std::env::var_os("USERPROFILE")],
+            &temp,
+        )
+    })
+    .clone()
+}
+
+pub(crate) const GOV_DIR_RETENTION: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+
+/// Best-effort startup sweep of old governance directories whose runs are no longer live.
+pub(crate) fn sweep_stale_gov_dirs(
+    root: &Path,
+    live_dir_names: &HashSet<String>,
+    max_age: Duration,
+    now: SystemTime,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !metadata.is_dir()
+            || entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| live_dir_names.contains(name))
+        {
+            continue;
+        }
+        let Ok(modified) = metadata.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
+        if age >= max_age && std::fs::remove_dir_all(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// The per-run governance directory (outside any worktree). Cleared on a FRESH (re-)launch of a run id
 /// so a prior terminal run's stale decisions can't fail a new run — see the launcher; resume/redrive
-/// deliberately do NOT clear it (they continue the same run's log).
+/// deliberately do NOT clear it (they continue the same run's log). A run in flight across the
+/// upgrade that moved the root re-arms on its next attempt (the old temp dir is not read).
 pub fn gov_run_dir(run_id: &str) -> std::path::PathBuf {
-    std::env::temp_dir()
-        .join("wicked-core-gov")
-        .join(run_dir_name(run_id))
+    gov_root().join(run_dir_name(run_id))
 }
 
 /// The per-run DIRECTORY NAME every engine-owned per-run scratch tree keys on — the governance
@@ -11838,6 +11910,72 @@ mod boundary_tests {
     // every other module's env-mutating tests.
     use crate::test_env::ENV_LOCK as ENV;
 
+    #[test]
+    fn gov_root_is_under_home_not_the_temp_dir() {
+        // Absolute on every platform (a bare "/home/op" has no drive on Windows).
+        let base = std::env::current_dir().unwrap();
+        let (temp, home) = (base.join("fake-temp"), base.join("fake-home"));
+        let fallback = temp.join("wicked-core-gov");
+        let root = gov_root_for(&[Some(home.clone().into_os_string())], &temp);
+        assert_eq!(root, home.join(".wicked").join("core-gov"));
+        assert!(!root.starts_with(&temp));
+        // Empty or relative candidates fall through to the next one, then to the temp root.
+        let usable = [
+            Some("".into()),
+            Some(".".into()),
+            Some(home.into_os_string()),
+        ];
+        assert_eq!(gov_root_for(&usable, &temp), root);
+        assert_eq!(gov_root_for(&[None, Some("rel".into())], &temp), fallback);
+        assert_eq!(gov_root_for(&[], &temp), fallback);
+    }
+
+    #[test]
+    fn sweep_stale_gov_dirs_removes_only_old_non_live_directories() {
+        use std::collections::HashSet;
+        use std::time::{Duration, SystemTime};
+
+        let root = std::env::temp_dir().join(format!("wicked-gov-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (old, live) = (root.join("old"), root.join("live"));
+        for dir in [&old, &live] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let file = root.join("loose-file");
+        std::fs::write(&file, "keep").unwrap();
+        let max_age = Duration::from_secs(14 * 24 * 60 * 60);
+        let live_names = HashSet::from(["live".to_string()]);
+
+        // Everything is fresh: nothing goes, whatever its run's state.
+        let now = SystemTime::now();
+        assert_eq!(sweep_stale_gov_dirs(&root, &live_names, max_age, now), 0);
+        assert!(old.is_dir());
+
+        // Fifteen days later (no mtime games: portable): the non-live dir goes, nothing else.
+        let later = now + max_age + Duration::from_secs(86_400);
+        assert_eq!(sweep_stale_gov_dirs(&root, &live_names, max_age, later), 1);
+        assert!(!old.exists(), "old non-live directory must be removed");
+        assert!(live.is_dir(), "old live directory must be kept");
+        assert!(file.is_file(), "even an old loose file must be kept");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sweep_stale_gov_dirs_missing_root_returns_zero() {
+        let root =
+            std::env::temp_dir().join(format!("wicked-gov-sweep-missing-{}", std::process::id()));
+        assert!(!root.exists());
+        assert_eq!(
+            sweep_stale_gov_dirs(
+                &root,
+                &std::collections::HashSet::new(),
+                std::time::Duration::from_secs(14 * 24 * 60 * 60),
+                std::time::SystemTime::now(),
+            ),
+            0
+        );
+    }
+
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
         let _g = ENV.write().unwrap_or_else(|e| e.into_inner());
         match write {
@@ -14033,10 +14171,11 @@ mod boundary_tests {
     /// blocked Bash redirect to `/private/tmp/out.txt`. A blocked write into the SYSTEM temp is
     /// benign scratch: STILL blocked, STILL audited, but ADVISORY — on the Bash arm and the
     /// direct-tool arm alike. The gov-tree control proves the carve-out excludes the audit trail
-    /// (a tamper attempt against the decisions logs stays fatal even though they live under temp),
+    /// (a tamper attempt against the decisions logs stays fatal wherever they live),
     /// and the home control proves everything outside temp stays fatal.
     #[test]
     fn a_scratch_write_into_the_system_temp_is_advisory_not_fatal() {
+        let _env = ENV.read().unwrap_or_else(|p| p.into_inner());
         let wt = std::env::temp_dir().join("wicked-boundary-wt-tmp");
         std::fs::create_dir_all(&wt).unwrap();
         let roots = crate::path_policy::AllowedRoots {
@@ -14069,11 +14208,9 @@ mod boundary_tests {
             "a Write-tool scratch into the system temp must be ADVISORY"
         );
 
-        // Control 1: the governance evidence tree lives under temp and must NOT ride the
-        // carve-out — a write there is a tamper attempt against the audit trail.
-        let gov = std::env::temp_dir()
-            .join("wicked-core-gov")
-            .join("some-run/attempt-0/decisions.ndjson");
+        // Control 1: a write into the active governance evidence tree is a tamper attempt
+        // against the audit trail, even if the root falls back to temp.
+        let gov = gov_root().join("some-run/attempt-0/decisions.ndjson");
         let (_, fatal) = boundary_denial_with(
             &roots,
             &wt,
@@ -14083,10 +14220,7 @@ mod boundary_tests {
             "Write",
         )
         .expect("blocked");
-        assert!(
-            fatal,
-            "a write into the gov evidence tree stays FATAL despite being under temp"
-        );
+        assert!(fatal, "a write into the gov evidence tree stays FATAL");
 
         // Control 2: an escape anywhere else (unix: a home-shaped path) stays fatal.
         #[cfg(unix)]
@@ -16012,12 +16146,10 @@ mod boundary_tests {
              presence check and still allows the governance pin to be rewritten"
         );
         assert!(
-            launcher
-                .contains("armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref())"),
-            "the ONLY widenings must be the launch-validated extra_write_roots riding the \
-             governance context and the ENGINE-resolved repo-graph key dir \
-             (`graph_write_dir`, never worker-controlled) — not env, not the unit, not the \
-             workflow def"
+            launcher.contains("armed_write_roots(&cwd, &g.extra_write_roots)"),
+            "the ONLY widening must be the launch-validated extra_write_roots riding the \
+             governance context (the repo-graph key dir is read-only, core#1602) — not env, not \
+             the unit, not the workflow def"
         );
         // The launch side must actually judge those extras — remove the validation and the
         // widening becomes an unvetted door straight past FINDING-098.

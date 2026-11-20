@@ -765,7 +765,7 @@ pub(crate) struct FloorInputs {
     /// The unit's working directory (its worktree, a package dir below it, or a run sandbox).
     pub(crate) cwd: PathBuf,
     /// The write roots the unit was handed. Under the full posture: the armed write set (cwd
-    /// first, the launch extras, the graph key dir). Under a fenced posture: only the posture's
+    /// first, the launch extras; the graph key dir is read-only, core#1602). Under a fenced posture: only the posture's
     /// admitted roots (the notes root, the QE ledger root, a creator's deliverable roots).
     pub(crate) write_roots: Vec<PathBuf>,
     /// The READ-ONLY profile (a fenced posture): no write grant on the tree, and none on the

@@ -200,6 +200,7 @@ pub fn add_node_note(
     note: &str,
     author: &str,
 ) -> anyhow::Result<()> {
+    let _settle = crate::code_graph::RepoGraphWrite::begin(Path::new(graph_db));
     let bin = crate::code_graph::indexer_bin();
     let out = Command::new(&bin)
         .hardened()
@@ -229,6 +230,7 @@ pub fn add_node_note(
 /// Index a documentation path (a folder or file of code/non-code docs) into a graph db so its content
 /// becomes part of the application's graph. Returns the graph db path.
 pub fn index_docs(path: &str, graph_db: &str) -> anyhow::Result<String> {
+    let _settle = crate::code_graph::RepoGraphWrite::begin(Path::new(graph_db));
     let bin = crate::code_graph::indexer_bin();
     if let Some(parent) = Path::new(graph_db).parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -249,6 +251,7 @@ pub fn index_docs(path: &str, graph_db: &str) -> anyhow::Result<String> {
 
 /// Write a `role` annotation for `symbol` onto the graph (provenance = enrichment, author = the CLI).
 fn annotate_symbol(graph_db: &str, symbol: &str, note: &str, cli: &str) -> bool {
+    let _settle = crate::code_graph::RepoGraphWrite::begin(Path::new(graph_db));
     let bin = crate::code_graph::indexer_bin();
     Command::new(&bin)
         .hardened()

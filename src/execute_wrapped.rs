@@ -4003,15 +4003,30 @@ impl WrappedCliStepRunner {
                 || pi_json
                 || (container && opencode_json_mode(&binary, &argv))
                 || agy_json;
+            // core#1602: settle only a repo graph vouched for by the read-grant classifier.
+            // Estate re-enables WAL on every engine write, so seat launch is the single choke
+            // point for making a read-only open possible without granting sidecar writes.
+            if let Some(key_dir) = input.governance.as_ref().and_then(|g| {
+                repo_read_root_at(
+                    g.code_graph_db.as_deref(),
+                    crate::code_graph::repo_graph_root_for(self.operational_home.as_deref())
+                        .as_deref(),
+                )
+            }) {
+                let db = PathBuf::from(key_dir).join(crate::code_graph::CODE_GRAPH_DB_FILE);
+                // A repo never indexed has no graph file yet: nothing to settle, no warning.
+                if db.exists() {
+                    if let Err(error) = crate::code_graph::settle_graph_journal(&db) {
+                        tracing::warn!(db = %db.display(), %error, "could not settle repo graph journal at seat launch");
+                    }
+                }
+            }
             // Boundary 1 is deliberately layered below the existing Claude gate-hook, ACP
             // admission, and wrapped deny fence. It is WRITE containment only — not a read jail
             // or exfiltration/DLP protection; worker model egress remains open.
-            let graph_write = input.governance.as_ref().and_then(|g| {
-                graph_write_dir(g.code_graph_db.as_deref(), self.operational_home.as_deref())
-            });
             let worker_write_roots = input.governance.as_ref().map_or_else(
                 || vec![cwd.clone()],
-                |g| armed_write_root_paths(&cwd, &g.extra_write_roots, graph_write.as_deref()),
+                |g| armed_write_root_paths(&cwd, &g.extra_write_roots),
             );
             let os_sandbox = worker_os_sandbox_enabled(&cli_key);
             let governed = input.governance.is_some();
@@ -4082,7 +4097,7 @@ impl WrappedCliStepRunner {
                     _ => None,
                 };
                 let floor_roots: Vec<PathBuf> = if fenced {
-                    let mut r = crate::write_posture::unit_admitted_roots(
+                    crate::write_posture::unit_admitted_roots(
                         write_posture,
                         &input.unit,
                         &input
@@ -4090,9 +4105,7 @@ impl WrappedCliStepRunner {
                             .as_ref()
                             .map(|g| g.extra_write_roots.clone())
                             .unwrap_or_default(),
-                    );
-                    r.extend(graph_write.iter().cloned());
-                    r
+                    )
                 } else {
                     worker_write_roots.clone()
                 };
@@ -4765,29 +4778,13 @@ impl WrappedCliStepRunner {
                 arm_worker_estate_channel(&mut cmd, g);
                 // Arm the unit's filesystem boundary (FINDING-045/098). The WRITE roots are the
                 // worktree FIRST, then only the LAUNCHER-declared deliverable roots riding the
-                // governance context (core#259 — validated at launch against the pin tree), plus
-                // that graph's own key directory under THIS daemon's repo-graph root (WAL-mode
-                // SQLite creates `-wal`/`-shm`/journal siblings; see `graph_write_dir`); guarded
-                // by `the_launcher_arms_the_write_root`: any wider root would let a governed
-                // worker rewrite the pin/workflow that gates its own work (the FINDING-098
-                // escape). The graph dir is ENGINE-resolved off the actor's `code_graph_db`,
-                // never worker-controlled, and is exactly one key dir — a sibling repo's graph
-                // stays out of reach. A `code_graph_db` in any other shape (an in-tree path from a
-                // pre-core#406 record included) adds NO write root: a graph is never in the tree,
-                // and widening on a path nobody vouched for is the escape itself. The extractor's
-                // annotation writes ride `wicked-estate annotate` (a Bash call), which
-                // `boundary_denial` does not path-judge; only Write/Edit/Read tool-calls carrying
-                // a `path` are judged.
+                // governance context (core#259 — validated at launch against the pin tree).
+                // The graph key dir is READ only: granting directory writes would let a seat
+                // replace estate.db (core#1602). Its journal is settled before arming the seat.
                 cmd.env(
                     crate::gate_hook::WRITE_ROOTS_ENV,
-                    armed_write_roots(&cwd, &g.extra_write_roots, graph_write.as_deref()),
+                    armed_write_roots(&cwd, &g.extra_write_roots),
                 );
-                // The EXACT graph dir just armed, so the hook's write-root witness skips the
-                // engine's store and nothing else (a root that merely LOOKS like a graph dir —
-                // `/tmp/repo-graphs/app` — stays witnessed).
-                if let Some(dir) = &graph_write {
-                    cmd.env(crate::gate_hook::GRAPH_WRITE_DIR_ENV, dir);
-                }
                 // Arm the unit's PHASE SCOPE (core#296) — the SECOND boundary, orthogonal to the
                 // roots above. The write roots answer "where may this unit write" and the worktree
                 // is inside its own roots, so they had nothing to say about run d1bc72c2's recon
@@ -5121,24 +5118,18 @@ impl WrappedCliStepRunner {
 
 /// The `WICKED_WRITE_ROOTS` value for a governed unit (core#259): the unit cwd FIRST, widened by
 /// ONLY the launcher-declared extras riding the governance context — validated at launch against
-/// the pin tree, so this join cannot introduce a root the launch did not judge — plus, when the
-/// repo has a graph under this daemon's repo-graph root, that graph's own key directory
-/// (`graph_dir`, from [`graph_write_dir`]: engine-resolved, per-key precise, `None` for anything
-/// not in that shape — an in-tree path included, core#406). When
-/// a root cannot be joined (it contains the platform's PATH separator), falls back to the NARROW
+/// the pin tree, so this join cannot introduce a root the launch did not judge. Graph directories
+/// are read-only and never join this list (core#1602). When a root cannot be joined (it contains
+/// the platform's PATH separator), falls back to the NARROW
 /// cwd-only boundary — dropping the widening is a degraded run; dropping the boundary would be an
 /// escape.
-fn armed_write_roots(
-    cwd: &Path,
-    extras: &[String],
-    graph_dir: Option<&Path>,
-) -> std::ffi::OsString {
+fn armed_write_roots(cwd: &Path, extras: &[String]) -> std::ffi::OsString {
     // No widening ⇒ the pre-#259 boundary, byte-identical — and no join_paths round-trip that
     // could misattribute a separator-collision in the CWD to the (empty) extras (Copilot).
-    if extras.is_empty() && graph_dir.is_none() {
+    if extras.is_empty() {
         return cwd.as_os_str().to_os_string();
     }
-    let paths = armed_write_root_paths(cwd, extras, graph_dir);
+    let paths = armed_write_root_paths(cwd, extras);
     let write_roots: Vec<std::ffi::OsString> = paths
         .iter()
         .map(|path| path.as_os_str().to_os_string())
@@ -5153,16 +5144,11 @@ fn armed_write_roots(
 
 /// The one source of truth for both `WICKED_WRITE_ROOTS` and Boundary 1's kernel profile.
 /// The in-boundary scratch directory is a child of `cwd`, so no extra writable carve-out exists.
-pub(crate) fn armed_write_root_paths(
-    cwd: &Path,
-    extras: &[String],
-    graph_dir: Option<&Path>,
-) -> Vec<PathBuf> {
+pub(crate) fn armed_write_root_paths(cwd: &Path, extras: &[String]) -> Vec<PathBuf> {
     // Keep the worktree spelling first: this is both the policy boundary's primary root and the
     // kernel profile's primary root. The source-level guard in gate_hook pins this ordering.
     let mut root_strings: Vec<std::ffi::OsString> = vec![cwd.as_os_str().to_os_string()];
     root_strings.extend(extras.iter().map(std::ffi::OsString::from));
-    root_strings.extend(graph_dir.map(|dir| dir.as_os_str().to_os_string()));
     let roots: Vec<PathBuf> = root_strings.iter().map(PathBuf::from).collect();
     if roots.len() == 1 || std::env::join_paths(roots.iter().map(|root| root.as_os_str())).is_ok() {
         roots
@@ -5888,11 +5874,8 @@ struct GovLaunch {
     /// graph, (b) widen the READ boundary to exactly the graph's key dir — and (c) set
     /// `$WICKED_ESTATE_DB` so the worker's estate CLI channel (`wicked-core coverage`,
     /// `wicked-estate`) resolves the SAME repo graph — see [`arm_worker_estate_channel`].
-    /// The WRITE boundary widens ONLY by that same key dir (WAL/journal siblings;
-    /// [`graph_write_dir`]); a path in any other shape — the pre-core#406 in-tree one included —
-    /// widens nothing: the extractor's store annotations ride Bash, which the boundary does not
-    /// path-judge, and a wider write root would let a worker rewrite its own gate pin. `None` for
-    /// a repo-less run.
+    /// The graph never widens the WRITE boundary: its journal is settled to DELETE mode at seat
+    /// launch so the seat needs only read access. `None` for a repo-less run.
     code_graph_db: Option<String>,
     /// LAUNCHER-declared extra WRITE roots for the run's deliverables (core#259), copied from
     /// [`crate::workflow::GovernanceContext::extra_write_roots`] — already validated at launch
@@ -5921,9 +5904,8 @@ struct GovLaunch {
 ///
 /// Set to `code_graph_db` — the repo's own engine-resolved graph (under the state home; `code_graph.rs`),
 /// the SAME store FINDING-069
-/// already hands the worker's estate MCP and the one store the worker is allowed to write. NEVER
-/// `gov.db_path` (the operational store): a worker `wicked-estate index .` against the repo graph
-/// rebuilds its own graph, but against the operational store its delete-sweep removes every
+/// already hands the worker's estate MCP. The seat reads this graph with no write grant. NEVER
+/// `gov.db_path` (the operational store): an indexer's delete-sweep against it removes every
 /// operational node (FINDING-067). Left UNSET when the repo was never indexed — no store beats the
 /// wrong store (the shim then refuses an unpinned store, `gate_hook::classify_estate_command`). Since
 /// D-7 (DES-L4 PR-⑦) this env is the ONE graph hand-off on the wrapped carrier — the CLI-registered
@@ -5970,7 +5952,7 @@ fn repo_read_root(
 /// for (`actor::project_code_graph_db`), `<state home>/project-graphs/<id>/code-graph.db` → EXACTLY
 /// the bound project's directory ([`crate::code_graph::classify_project_graph_db_at`]: no link,
 /// this state home only). Tried only after the repo shape, which keeps its exact behaviour. It never
-/// joins a write list: [`graph_write_dir`] does not call it.
+/// joins a write list.
 fn project_graph_dir(code_graph_db: Option<&str>, state_home: Option<&Path>) -> Option<PathBuf> {
     crate::code_graph::classify_project_graph_db_at(
         std::path::Path::new(code_graph_db?),
@@ -5985,31 +5967,6 @@ fn repo_read_root_at(
 ) -> Option<std::ffi::OsString> {
     crate::code_graph::classify_code_graph_db_at(std::path::Path::new(code_graph_db?), graph_root)
         .map(PathBuf::into_os_string)
-}
-
-/// The graph directory a governed worker needs WRITE access to — opening a WAL-mode SQLite db
-/// creates `-wal`/`-shm`/journal files IN ITS DIRECTORY (the same fact
-/// `validator::run_validator_reporting` grants its coverage sandbox for; P8 #9 / core#217) — or
-/// `None` for anything that is not a code graph under THIS daemon's root (fail-closed; the in-tree
-/// shape included — core#406). Per-key precise: the grant is EXACTLY `<root>/<key>/`, so a sibling
-/// repo's graph stays out of a worker's write reach. `state_home` as in [`repo_read_root`].
-pub(crate) fn graph_write_dir(
-    code_graph_db: Option<&str>,
-    state_home: Option<&Path>,
-) -> Option<PathBuf> {
-    graph_write_dir_at(
-        code_graph_db,
-        crate::code_graph::repo_graph_root_for(state_home).as_deref(),
-    )
-    // crew#1497: never a project graph. Its directory is granted READ only ([`repo_read_root`]):
-    // crew leaves the graph in DELETE journal mode and the seat's estate opens it read-only
-    // (wicked-estate 0.35.7), so a seat needs no write there and can change nothing in it (no link
-    // swap, no forged crew manifest, no planted temp file).
-}
-
-/// [`graph_write_dir`] with the repo-graph root injected — pure, so the grant tests never read env.
-fn graph_write_dir_at(code_graph_db: Option<&str>, graph_root: Option<&Path>) -> Option<PathBuf> {
-    crate::code_graph::classify_code_graph_db_at(std::path::Path::new(code_graph_db?), graph_root)
 }
 
 /// The READ roots for a governed unit, as ONE assembly both carriers share (core#260): the
@@ -6331,10 +6288,10 @@ fn arm_input_governance(
     let dir = decisions_path
         .parent()
         .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::temp_dir().join("wicked-core-gov"));
+        .unwrap_or_else(crate::gate_hook::gov_root);
     crate::gate_hook::create_dir_all_private(&dir)?;
     // Per-unit settings file, written with the O_EXCL (symlink-safe) discipline (see
-    // `write_private_exclusive`) so a local attacker who predicts the deterministic temp path can't
+    // `write_private_exclusive`) so a local attacker who predicts the deterministic path can't
     // redirect the write.
     let settings_path = dir.join(format!("settings-{phase}.json"));
     let bytes = serde_json::to_vec(&settings).map_err(std::io::Error::other)?;
@@ -9059,12 +9016,10 @@ mod tests {
                 None,
                 "an in-tree shaped path is not a graph — no read root, whatever root is live"
             );
-            assert_eq!(graph_write_dir_at(db.to_str(), root.as_deref()), None);
         }
         // Through the env/state-home-reading wrappers too.
         for sh in [None, Some(state_home.as_path())] {
             assert_eq!(repo_read_root(db.to_str(), sh), None);
-            assert_eq!(graph_write_dir(db.to_str(), sh), None);
         }
         // relative + shaped → None (would resolve against the worktree cwd).
         let rel = Path::new("repo").join(crate::code_graph::code_graph_rel());
@@ -9103,10 +9058,12 @@ mod tests {
             Some(key_dir.clone()),
             "the read grant is the key dir under THIS daemon's root"
         );
-        assert_eq!(
-            graph_write_dir(db.to_str(), Some(&state_home)),
-            Some(key_dir.clone()),
-            "so is the write grant"
+        let cwd = base.join("wc-worker-worktree");
+        assert!(
+            armed_write_root_paths(&cwd, &[])
+                .iter()
+                .all(|w| !w.starts_with(&key_dir) && !key_dir.starts_with(w)),
+            "no seat write root may reach the graph key dir"
         );
         assert_eq!(
             repo_read_root(db.to_str(), Some(&base.join("wc-other-state-home"))),
@@ -9123,10 +9080,8 @@ mod tests {
         );
     }
 
-    /// AC4a+b — the grants are per-key precise: read AND write land on EXACTLY the graph's own
-    /// `<root>/<key>/` directory, and the grant computed for key A contains neither the sibling
-    /// key B's dir nor the repo-graphs root itself (the boundary's root test is
-    /// root-or-descendant — `path_policy` — so "not a prefix" IS "not reachable").
+    /// core#1602: the read grant lands on EXACTLY the graph's own key directory, while no seat
+    /// write root reaches that directory. The read grant cannot reach a sibling graph either.
     #[test]
     fn grants_are_per_key_precise_and_siblings_stay_out_of_reach() {
         let base = std::env::current_dir().unwrap();
@@ -9139,14 +9094,23 @@ mod tests {
         let key_dir_b = db_b.parent().unwrap().to_path_buf();
         assert_ne!(key_dir_a, key_dir_b, "precondition: distinct keys");
 
-        // (a) READ and WRITE grants are exactly key A's dir.
+        // (a) READ is exactly key A's dir; WRITE has no root inside or above either graph dir.
         let read_a = repo_read_root_at(db_a.to_str(), Some(&estate_root))
             .map(std::path::PathBuf::from)
             .expect("a graph under the root grants a read root");
-        let write_a = graph_write_dir_at(db_a.to_str(), Some(&estate_root))
-            .expect("a graph under the root grants its key dir for WAL/journal writes");
         assert_eq!(read_a, key_dir_a);
-        assert_eq!(write_a, key_dir_a);
+        let cwd = base.join("wc-grants-worktree");
+        let extras = vec![base.join("wc-grants-inbox").to_str().unwrap().to_string()];
+        let writes = armed_write_root_paths(&cwd, &extras);
+        assert_eq!(writes, vec![cwd, PathBuf::from(&extras[0])]);
+        for dir in [&key_dir_a, &key_dir_b] {
+            assert!(
+                writes
+                    .iter()
+                    .all(|w| !w.starts_with(dir) && !dir.starts_with(w)),
+                "no seat write root may reach a graph key dir: {writes:?} vs {dir:?}"
+            );
+        }
         assert_ne!(
             read_a, estate_root,
             "NEVER the repo-graphs root — that is every repo's graph at once"
@@ -9154,7 +9118,7 @@ mod tests {
 
         // (b) sibling precision: key B's dir is not under the grant computed for key A.
         assert!(
-            !key_dir_b.starts_with(&read_a) && !key_dir_b.starts_with(&write_a),
+            !key_dir_b.starts_with(&read_a),
             "a worker granted key A must not reach key B: {key_dir_b:?} vs {read_a:?}"
         );
 
@@ -9176,11 +9140,6 @@ mod tests {
             ),
             None,
             "a db directly under the repo-graphs root has no key dir to grant"
-        );
-        assert_eq!(
-            graph_write_dir_at(rel.to_str(), Some(&estate_root)),
-            None,
-            "the write grant fails closed on the same shapes"
         );
     }
 
@@ -9220,20 +9179,11 @@ mod tests {
             Some(dir_a.clone()),
             "the read grant is project A's own directory"
         );
-        assert_eq!(
-            graph_write_dir(db_a.to_str(), Some(&sh)),
-            None,
-            "a project graph is never a write grant: a seat can change nothing in its directory"
-        );
         let cwd = base.join("worktree");
         assert!(
-            !armed_write_root_paths(
-                &cwd,
-                &[],
-                graph_write_dir(db_a.to_str(), Some(&sh)).as_deref()
-            )
-            .iter()
-            .any(|w| w.starts_with(&root) || root.starts_with(w)),
+            !armed_write_root_paths(&cwd, &[])
+                .iter()
+                .any(|w| w.starts_with(&root) || root.starts_with(w)),
             "no write root reaches the project graphs"
         );
         let reads = assemble_read_roots(db_a.to_str(), Some(&sh), &[], None);
@@ -9254,7 +9204,6 @@ mod tests {
         let other = base.join("other-state");
         std::fs::create_dir_all(other.join("project-graphs")).unwrap();
         assert_eq!(repo_read_root(db_a.to_str(), Some(&other)), None);
-        assert_eq!(graph_write_dir(db_a.to_str(), Some(&other)), None);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -9366,11 +9315,6 @@ mod tests {
                 None,
                 "{why}: {db:?}"
             );
-            assert_eq!(
-                graph_write_dir(db.to_str(), Some(&sh)),
-                None,
-                "{why}: {db:?}"
-            );
         }
         assert_eq!(repo_read_root(None, Some(&sh)), None);
         let _ = std::fs::remove_dir_all(&base);
@@ -9404,7 +9348,6 @@ mod tests {
         for id in ["attacker", "escape", "dblink"] {
             let db = root.join(id).join("code-graph.db");
             assert_eq!(repo_read_root(db.to_str(), Some(&sh)), None, "{id}");
-            assert_eq!(graph_write_dir(db.to_str(), Some(&sh)), None, "{id}");
         }
         // A `project-graphs` root that is itself a link.
         let sh2 = base.join("state2");
@@ -9415,7 +9358,6 @@ mod tests {
             .join("victim")
             .join("code-graph.db");
         assert_eq!(repo_read_root(via.to_str(), Some(&sh2)), None);
-        assert_eq!(graph_write_dir(via.to_str(), Some(&sh2)), None);
         // A state home reached through a configured link: granted, at the real directory.
         let sh_link = base.join("state-link");
         link(&sh, &sh_link);
@@ -9427,11 +9369,6 @@ mod tests {
             repo_read_root(db.to_str(), Some(&sh_link)).map(PathBuf::from),
             Some(root.join("victim")),
             "the read grant is the real project dir"
-        );
-        assert_eq!(
-            graph_write_dir(db.to_str(), Some(&sh_link)),
-            None,
-            "never a write grant"
         );
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -9453,10 +9390,6 @@ mod tests {
         let expected = repo_read_root_at(db.to_str(), Some(&repo_root));
         assert!(expected.is_some(), "precondition: the repo shape grants");
         assert_eq!(repo_read_root(db.to_str(), Some(&sh)), expected);
-        assert_eq!(
-            graph_write_dir(db.to_str(), Some(&sh)),
-            graph_write_dir_at(db.to_str(), Some(&repo_root))
-        );
         // Lexical, as before: the repo key dir need not exist on disk to be granted.
         assert!(!db.parent().unwrap().exists());
         let _ = std::fs::remove_dir_all(&base);
@@ -13663,34 +13596,17 @@ mod tests {
         let cwd = std::path::Path::new("/wt/run-1");
         let inbox = "/abs/drafts-inbox".to_string();
 
-        // No widening: exactly the cwd (the pre-#259 boundary, byte-identical). This is also the
-        // boundary for a `code_graph_db` in any shape but `<root>/<key>/estate.db` (an in-tree path
-        // from a pre-core#406 record, say): `graph_write_dir` → None, so its arming is
-        // indistinguishable from no-graph.
-        assert_eq!(armed_write_roots(cwd, &[], None), cwd.as_os_str());
+        // No widening: exactly the cwd (the pre-#259 boundary, byte-identical). A graph db in
+        // any shape has no effect on the write roots (core#1602).
+        assert_eq!(armed_write_roots(cwd, &[]), cwd.as_os_str());
 
         // With extras: split_paths recovers [cwd, inbox] in that order.
-        let joined = armed_write_roots(cwd, std::slice::from_ref(&inbox), None);
+        let joined = armed_write_roots(cwd, std::slice::from_ref(&inbox));
         let roots: Vec<std::path::PathBuf> = std::env::split_paths(&joined).collect();
         assert_eq!(
             roots,
             vec![cwd.to_path_buf(), std::path::PathBuf::from(&inbox)],
             "cwd first, then the declared inbox"
-        );
-
-        // With a graph key dir: it joins AFTER the declared extras — the worker's WAL/journal
-        // writes land in exactly its own key dir, nothing wider.
-        let key_dir = std::path::Path::new("/estate/repo-abc123def456");
-        let joined = armed_write_roots(cwd, std::slice::from_ref(&inbox), Some(key_dir));
-        let roots: Vec<std::path::PathBuf> = std::env::split_paths(&joined).collect();
-        assert_eq!(
-            roots,
-            vec![
-                cwd.to_path_buf(),
-                std::path::PathBuf::from(&inbox),
-                key_dir.to_path_buf()
-            ],
-            "cwd first, then extras, then the graph's own key dir"
         );
 
         // A root the platform cannot join → NARROW fallback, not escape. The unjoinable
@@ -13702,7 +13618,7 @@ mod tests {
             "/abs/evil:extra".to_string()
         };
         assert_eq!(
-            armed_write_roots(cwd, &[bad], None),
+            armed_write_roots(cwd, &[bad]),
             cwd.as_os_str(),
             "unjoinable extras must collapse to the cwd-only boundary"
         );
@@ -13929,6 +13845,20 @@ mod tests {
             "execute_wrapped no longer wires the governed worker's estate CLI channel to the repo \
              graph — `wicked-core coverage` falls back to the empty global store and the coverage \
              gate denies genuinely-covered repos (#229 × #9b)"
+        );
+    }
+
+    #[test]
+    fn the_launcher_settles_the_graph_without_arming_a_graph_write_dir() {
+        let src = include_str!("execute_wrapped.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            production.contains("crate::code_graph::settle_graph_journal("),
+            "settle the graph at launch so read-only seats need no sidecar writes"
+        );
+        assert!(
+            !production.contains("GRAPH_WRITE_DIR_ENV"),
+            "the graph key dir must never be armed as a seat write root"
         );
     }
 

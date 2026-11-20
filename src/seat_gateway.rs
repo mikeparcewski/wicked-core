@@ -2195,10 +2195,10 @@ pub(crate) fn write_records(path: &Path, records: &[GatewayRecord]) {
             body.push('\n');
         }
     }
-    let written = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
+    let written = path
+        .parent()
+        .map_or(Ok(()), crate::gate_hook::create_dir_all_private)
+        .and_then(|()| fs::OpenOptions::new().create(true).append(true).open(path))
         .and_then(|mut f| f.write_all(body.as_bytes()));
     if let Err(e) = written {
         eprintln!(
@@ -3812,6 +3812,30 @@ mod tests {
         );
         assert_eq!(rejected[0].input_tokens, None);
         assert!(parse_records(ACCESS_LOG, "2").is_empty());
+    }
+
+    #[test]
+    fn write_records_recreates_a_vanished_run_dir() {
+        let dir = TempDir::new();
+        let run_dir = dir.0.join("run/attempt-0");
+        let path = run_dir.join("gateway-unit-1.ndjson");
+        let records = parse_records(ACCESS_LOG, "1");
+        assert!(!records.is_empty());
+        let expected = records
+            .iter()
+            .map(|r| format!("{}\n", serde_json::to_string(r).unwrap()))
+            .collect::<String>();
+
+        assert!(!run_dir.exists());
+        write_records(&path, &records);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        // Appends preserve earlier records while the directory remains present.
+        write_records(&path, &records);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected.repeat(2));
+
+        fs::remove_dir_all(dir.0.join("run")).unwrap();
+        write_records(&path, &records);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
     }
 
     #[test]

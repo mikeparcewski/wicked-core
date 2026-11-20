@@ -153,6 +153,7 @@ pub fn change_digest_since(repo: &str, days: u32) -> String {
 
 /// Parse the indexer's `--json` `[{file,kind,name}]` output.
 fn indexer_refs(graph_db: &str, subcommand: &str, n: usize) -> Vec<CodeRef> {
+    let _settle = crate::code_graph::RepoGraphWrite::begin(std::path::Path::new(graph_db));
     let out = Command::new(indexer_bin())
         .hardened()
         .args([subcommand, "--json", "--db", graph_db])
@@ -169,6 +170,7 @@ fn indexer_refs(graph_db: &str, subcommand: &str, n: usize) -> Vec<CodeRef> {
 
 /// Graph stats (`nodes=.. edges=.. files=..` + `repo: branch=.. dirty`).
 pub fn graph_stats(graph_db: &str) -> GraphStats {
+    let _settle = crate::code_graph::RepoGraphWrite::begin(std::path::Path::new(graph_db));
     let mut s = GraphStats::default();
     let Ok(out) = Command::new(indexer_bin())
         .hardened()
