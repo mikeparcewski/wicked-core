@@ -788,21 +788,26 @@ const SECRET_WORD: &str = secret_word!();
 /// A name that says it holds a secret.
 const SECRET_NAME: &str = concat!(r"[A-Za-z0-9_.-]*", secret_word!(), r"[A-Za-z0-9_.-]*");
 
-fn redactors() -> &'static [(regex::Regex, &'static str)] {
-    static R: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
+enum Cut {
+    With(&'static str),
+    ShortFlag,
+}
+
+fn redactors() -> &'static [(regex::Regex, Cut)] {
+    static R: std::sync::OnceLock<Vec<(regex::Regex, Cut)>> = std::sync::OnceLock::new();
     R.get_or_init(|| {
         let re = |p: String| regex::Regex::new(&p).expect("redaction pattern");
         vec![
             // An auth header's value, quoted or not, with or without a scheme word.
             (
                 re(r#"(?i)((?:proxy-)?authorization:\s*(?:bearer|basic|token|digest)?\s*)[^\s'"]+"#.into()),
-                "${1}***",
+                Cut::With("${1}***"),
             ),
-            (re(r#"(?i)\b(bearer\s+)[^\s'"]+"#.into()), "${1}***"),
+            (re(r#"(?i)\b(bearer\s+)[^\s'"]+"#.into()), Cut::With("${1}***")),
             // Other secret-named headers (`X-Api-Key: …`, `Cookie: …`).
             (
                 re(format!(r#"(?i)(\b(?:{SECRET_NAME}|cookie|x-api-key):\s*)[^\s'"]+"#)),
-                "${1}***",
+                Cut::With("${1}***"),
             ),
             // (crew#1623) A JSON member whose key names a secret (a CI log prints API bodies and
             // config dumps): `"password": "v"`, `'api_key':'v'`. The value is the one quoted string.
@@ -810,24 +815,32 @@ fn redactors() -> &'static [(regex::Regex, &'static str)] {
                 re(format!(
                     r#"(["']{SECRET_NAME}["']\s*:\s*)(?:"(?:[^"\\]|\\.)*"|'[^']*')"#
                 )),
-                "${1}***",
+                Cut::With("${1}***"),
             ),
             // `NAME=value` and `--name=value` / `--name value` / `-p value` where the name says secret.
             // (core#1577) `name = value` too, and a quoted name: an ini / credentials-file line
             // (`aws_secret_access_key = …`), an `.npmrc` `//host/:_authToken=…`.
             (
                 re(format!(r#"(\b{SECRET_NAME}['"]?[ \t]*=[ \t]*){VALUE}"#)),
-                "${1}***",
+                Cut::With("${1}***"),
             ),
-            (re(format!(r"((?:^|\s)--?{SECRET_NAME}\s+){VALUE}")), "${1}***"),
-            (re(format!(r"((?:^|\s)-(?:u|p)\s+){VALUE}")), "${1}***"),
-            (re(format!(r"((?:^|\s)--user(?:\s+|=)){VALUE}")), "${1}***"),
+            (re(format!(r"((?:^|\s)--?{SECRET_NAME}\s+){VALUE}")), Cut::With("${1}***")),
+            (re(format!(r"((?:^|\s)-(?:u|p)\s+){VALUE}")), Cut::ShortFlag),
+            (re(format!(r"((?:^|\s)--user(?:\s+|=)){VALUE}")), Cut::With("${1}***")),
             // (core#1577) `-uuser:password`, the attached spelling (a colon says it is a login).
-            (re(format!(r#"((?:^|\s)-u)[^\s:'"]+:{VALUE}"#)), "${1}***"),
+            (re(format!(r#"((?:^|\s)-u)[^\s:'"]+:{VALUE}"#)), Cut::With("${1}***")),
             // Credentials in a URL: `user:password@` and (core#1577) a bare token as the userinfo,
             // `https://TOKEN@host/…` (a user name alone is cut too; it is often the token). The
             // userinfo ends the authority's first part: an `@` after `/`, `?` or `#` is not one.
-            (re(r#"(://)[^/?#\s@'"]+@"#.into()), "${1}***@"),
+            (re(r#"(://)[^/?#\s@'"]+@"#.into()), Cut::With("${1}***@")),
+            // (core#1643 / W8) Bare tokens also occur in seat prose without a named field.
+            (re(r"\bgh[pousr]_[A-Za-z0-9]{20,}".into()), Cut::With("***")),
+            (re(r"\bgithub_pat_[A-Za-z0-9_]{20,}".into()), Cut::With("***")),
+            (re(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b".into()), Cut::With("***")),
+            (re(r"\bsk-(?:ant-|proj-|svc-)?[A-Za-z0-9_-]{20,}".into()), Cut::With("***")),
+            (re(r"\bxox[abprs]-[A-Za-z0-9-]{10,}".into()), Cut::With("***")),
+            (re(r"\bglpat-[A-Za-z0-9_-]{20,}".into()), Cut::With("***")),
+            (re(r"\bnpm_[A-Za-z0-9]{36}".into()), Cut::With("***")),
         ]
     })
 }
@@ -843,10 +856,44 @@ fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
     R.get_or_init(|| {
         let re = |p: &str| regex::Regex::new(p).expect("redaction pattern");
         (
-            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:\s|$)"#),
+            re(r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:\s+-\S+)*\s+(?:config(?:ure)?|c)(?:[ \t]|$)"#),
             re(r#"^(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])+"#),
             re(SECRET_WORD),
         )
+    })
+}
+
+/// Parentheses outside quotes and escapes, with byte offsets for slicing shell words.
+fn unquoted_parens(text: &str) -> impl Iterator<Item = (usize, char)> + '_ {
+    let mut quote = None;
+    let mut escaped = false;
+    text.char_indices().filter_map(move |(i, c)| {
+        if escaped {
+            escaped = false;
+            return None;
+        }
+        if quote == Some('\'') {
+            if c == '\'' {
+                quote = None;
+            }
+            return None;
+        }
+        if c == '\\' {
+            escaped = true;
+            return None;
+        }
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            return None;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '(' | ')' => return Some((i, c)),
+            _ => {}
+        }
+        None
     })
 }
 
@@ -856,7 +903,7 @@ fn config_rules() -> &'static (regex::Regex, regex::Regex, regex::Regex) {
 /// judged as an assignment. A secret-named word right after a valued flag, followed by another
 /// secret-named word and then a non-flag word, is the flag's value (`--profile prod-auth
 /// aws_secret_access_key …`), so the next word is the key.
-fn config_cuts(cmd: &str, head: &regex::Regex, stop_at_paren: bool) -> Vec<(usize, usize)> {
+fn config_cuts(cmd: &str, head: &regex::Regex) -> Vec<(usize, usize)> {
     let (_, word, secret_word) = config_rules();
     let flag = |w: &str| w.starts_with('-');
     let secret = |w: &str| !flag(w) && !w.contains('=') && secret_word.is_match(w);
@@ -868,25 +915,38 @@ fn config_cuts(cmd: &str, head: &regex::Regex, stop_at_paren: bool) -> Vec<(usiz
         };
         let mut words: Vec<&str> = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::new();
+        // Include the head's leading delimiter: it may be the opening `(` of `$(…)`.
+        let depth = unquoted_parens(&cmd[..m.end()]).fold(0usize, |depth, (_, c)| {
+            if c == '(' {
+                depth + 1
+            } else {
+                depth.saturating_sub(1)
+            }
+        });
         let mut pos = m.end();
         loop {
             let rest = &cmd[pos..];
             let start = pos + (rest.len() - rest.trim_start_matches([' ', '\t']).len());
             match word.find(&cmd[start..]) {
                 Some(w) if start > pos || spans.is_empty() => {
-                    words.push(w.as_str());
-                    spans.push((start, start + w.end()));
-                    pos = start + w.end();
+                    let close = if depth > 0 {
+                        unquoted_parens(w.as_str())
+                            .find(|(_, c)| *c == ')')
+                            .map(|(i, _)| i)
+                    } else {
+                        None
+                    };
+                    let end = start + close.unwrap_or(w.end());
+                    if end > start {
+                        words.push(&cmd[start..end]);
+                        spans.push((start, end));
+                    }
+                    pos = end;
+                    if close.is_some() {
+                        break;
+                    }
                 }
                 _ => break,
-            }
-        }
-        // (core#1580) The added head's command ends at the first word with a `)`: `$(aws … V) echo …`
-        // must not read the words after the substitution as part of it. Main's head keeps its scan.
-        if stop_at_paren {
-            if let Some(p) = words.iter().position(|w| w.contains(')')) {
-                words.truncate(p + 1);
-                spans.truncate(p + 1);
             }
         }
         let mut i = 0;
@@ -898,6 +958,18 @@ fn config_cuts(cmd: &str, head: &regex::Regex, stop_at_paren: bool) -> Vec<(usiz
                 && words.get(i + 2).is_some_and(|w| !w.starts_with('-'));
             if secret(words[i]) && !flag_value {
                 cut.push(spans[i + 1]);
+                // (core#1589) A cut key can itself name another secret's value. Scoped npm
+                // keys use the auth-key rule below, so certfile/keyfile paths stay visible.
+                // Keep the original pair traversal as well: these cuts only add to its cuts.
+                let mut key = i + 1;
+                while key + 1 < words.len()
+                    && secret(words[key])
+                    && !words[key].trim_matches(['"', '\'']).starts_with("//")
+                    && !flag(words[key + 1])
+                {
+                    cut.push(spans[key + 1]);
+                    key += 1;
+                }
                 i += 2;
             } else {
                 i += 1;
@@ -916,23 +988,24 @@ fn config_cuts(cmd: &str, head: &regex::Regex, stop_at_paren: bool) -> Vec<(usiz
                 cut.push(spans[k + 1]);
             }
         }
-        from = pos;
+        // Resume before a closing `)` so another config command after it is still found.
+        from = spans.last().map_or(m.end(), |&(_, end)| end);
     }
     cut
 }
 
 /// (core#1580) The same command head with VALUED global flags allowed before the subcommand
 /// (`npm --userconfig ci.npmrc config set …`, `aws --profile p configure set …`). It is ADDED to
-/// main's head (`config_rules().0`, unchanged), never substituted for it: both heads cut, and
-/// the cuts are merged, so everything main masks stays masked. A flag takes one value word that
-/// does not start with `-` (quoted fragments whole); it never crosses an unquoted `|`, `;`, `&`
+/// main's head (`config_rules().0`), never substituted for it: both heads cut, and
+/// the cuts are merged, so everything main masks stays masked. A flag can take one value word,
+/// including one starting with `-` (quoted fragments whole); it never crosses an unquoted `|`, `;`, `&`
 /// or backtick, and the subcommand must be followed by a blank or the end, so a newline after it
 /// ends the command (the next line is a command of its own).
 fn valued_flag_head() -> &'static regex::Regex {
     static R: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     R.get_or_init(|| {
         regex::Regex::new(
-            r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:[ \t]+-[^\s|;&`]+(?:[ \t]+(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`-])(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])*)?)+[ \t]+(?:config(?:ure)?|c)(?:[ \t]|$)"#,
+            r#"(?:^|[\s;&|(`'"])(?:npm|pnpm|yarn|aws|git|gh|gcloud|az|docker|kubectl|helm|composer|pip|poetry|bundle|conda)(?:[ \t]+-[^\s|;&`]+(?:[ \t]+(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s'"\\|;&`])*)?)+[ \t]+(?:config(?:ure)?|c)(?:[ \t]|$)"#,
         )
         .expect("redaction pattern")
     })
@@ -940,8 +1013,8 @@ fn valued_flag_head() -> &'static regex::Regex {
 
 /// Main's head and the valued-flag head, each cutting, the cuts merged (core#1580).
 fn redact_config_pairs(cmd: &str) -> String {
-    let mut cut = config_cuts(cmd, &config_rules().0, false);
-    cut.extend(config_cuts(cmd, valued_flag_head(), true));
+    let mut cut = config_cuts(cmd, &config_rules().0);
+    cut.extend(config_cuts(cmd, valued_flag_head()));
     cut.sort_unstable();
     let mut out = String::with_capacity(cmd.len());
     let mut last = 0;
@@ -964,6 +1037,42 @@ fn continuation() -> &'static regex::Regex {
     R.get_or_init(|| regex::Regex::new(r"\\[ \t]*\r?\n").expect("continuation pattern"))
 }
 
+/// (core#1575) Only these literal invocations give `-u` / `-p` a non-credential meaning.
+/// Inspect the original text for every match: a previously cut operand is still an operand,
+/// so `mkdir -p x -p secret` cannot exempt its second flag, nor can a wrapper exempt one.
+fn keep_short_flag(cmd: &str, start: usize, head: &str) -> bool {
+    let offset = head.find('-').expect("short flag");
+    let flag = &head[offset..offset + 2];
+    let before = &cmd[..start + offset];
+    let invocation = before
+        .rsplit([';', '&', '|', '\n', '(', '`'])
+        .next()
+        .unwrap_or("");
+    if invocation.contains(['\'', '"', '\\']) {
+        return false;
+    }
+    let assignment = |w: &&str| {
+        w.split_once('=').is_some_and(|(name, _)| {
+            let mut chars = name.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    };
+    let words: Vec<_> = invocation
+        .split_whitespace()
+        .skip_while(assignment)
+        .collect();
+    let flags = match words.as_slice() {
+        ["mkdir", flags @ ..] if flag == "-p" => flags,
+        ["env", flags @ ..] if flag == "-u" => flags,
+        ["git", "push" | "branch", flags @ ..] if flag == "-u" => flags,
+        _ => return false,
+    };
+    flags.iter().all(|w| w.starts_with('-'))
+}
+
 /// A command with secrets cut, quoted or not: auth header values, secret-named assignments, headers
 /// and flags, config CLIs' secret keys, `-u` / `-p` / `--user` values, and credentials in a URL.
 /// A shell line continuation is joined first, as the shell joins it, so a value on the next line
@@ -971,8 +1080,28 @@ fn continuation() -> &'static regex::Regex {
 /// the two lines joined).
 pub fn redact(cmd: &str) -> String {
     let mut out = continuation().replace_all(cmd, "").into_owned();
-    for (re, with) in redactors() {
-        out = re.replace_all(&out, *with).into_owned();
+    for (re, cut) in redactors() {
+        out = match cut {
+            Cut::With(with) => re.replace_all(&out, *with).into_owned(),
+            Cut::ShortFlag => {
+                let mut next = String::with_capacity(out.len());
+                let mut last = 0;
+                for caps in re.captures_iter(&out) {
+                    let m = caps.get(0).expect("short flag match");
+                    let head = caps.get(1).expect("short flag head");
+                    next.push_str(&out[last..m.start()]);
+                    if keep_short_flag(&out, head.start(), head.as_str()) {
+                        next.push_str(m.as_str());
+                    } else {
+                        next.push_str(head.as_str());
+                        next.push_str("***");
+                    }
+                    last = m.end();
+                }
+                next.push_str(&out[last..]);
+                next
+            }
+        };
     }
     redact_config_pairs(&out)
 }
@@ -1391,6 +1520,225 @@ mod tests {
         assert_eq!(target_of("Bash", &json!({}), root), None);
     }
 
+    /// Step 0: every cut row from core#1577/#1580, plus credential short flags.
+    #[test]
+    fn redact_never_under_redacts_what_main_masked() {
+        let secret = format!("fake-regression-{}", "Q7".repeat(5));
+        let rows = [
+            "npm config set --global //h/:_authToken token{s} --location=user",
+            "npm config --global set //h/:_authToken {s}",
+            "aws configure set --profile \"ci account\" aws_secret_access_key {s}",
+            "npm c set //h/:_authToken {s}",
+            "refused: `npm config set //h/:_authToken {s}`",
+            "sh -c 'npm config set //h/:_authToken {s}'",
+            "aws configure set --profile prod-auth aws_secret_access_key {s}",
+            "aws configure set --profile \"R&D\" aws_secret_access_key {s}",
+            "npm config set registry https://r.example.test //h/:_authToken {s}",
+            "npm config set //one/:_authToken {s} //two/:_authToken {s}",
+            "npm config set //h/:_authToken 'prefix'{s}",
+            "aws configure set aws_secret_access_key \"prefix\\\"{s}\"",
+            "tool --password {s}\\ tail run",
+            "npm config set '//h/:_authToken'={s}",
+            "curl --user=bot:{s} https://h",
+            "curl -ubot:{s} https://h",
+            "curl --user \\  \n bot:{s} https://h",
+            "git push https://{s}@example.test/o/r.git",
+            "printf 'aws_session_token = {s}' >> creds",
+            "aws_secret_access_key = {s}",
+            "api_key = {s}",
+            "password=\"{s}\"",
+            "password='{s}'",
+            "export API_KEY=\"{s}\"",
+            "{\"password\":\"{s}\",\"api_key\": '{s}'}",
+            "npm --userconfig ci.npmrc config set //registry/:_authToken {s}",
+            "aws --profile p configure set aws_secret_access_key {s}",
+            "aws --profile \"ci account\" --region eu-west-1 configure set aws_secret_access_key {s}",
+            "aws --profile=p --no-cli-pager configure set aws_secret_access_key {s}",
+            "out=$(aws --profile p configure set aws_secret_access_key {s})",
+            "out=$(aws configure set aws_secret_access_key {s})",
+            "echo `npm --userconfig cfg.npmrc config set //h/:_authToken {s}`",
+            "aws --profile p configure set aws_secret_access_key {s}\necho READY",
+            "cd x; npm --userconfig cfg.npmrc config set //h/:_authToken {s}; echo ok",
+            "aws --profile p configure set aws_secret_access_key {s} && echo done",
+            "true || aws --profile p configure set aws_secret_access_key {s} | cat",
+            "AWS_PAGER= aws --profile p configure set aws_secret_access_key {s}",
+            "FOO=1 BAR=2 npm --userconfig cfg.npmrc config set //h/:_authToken {s} --location=user",
+            "sh -c 'aws --profile p configure set aws_secret_access_key {s}'",
+            "out=$(aws --profile p configure set aws_secret_access_key {s}) echo token READY",
+            "npm config set registry https://auth.example.test/ //h/:_authToken {s}",
+            "npm config set registry https://auth.example.test/ \"//h/:_authToken\" {s}",
+            "npm --userconfig cfg.npmrc config set registry https://auth.example.test/ //h/:_authToken {s} --location=user",
+            "npm --userconfig cfg.npmrc config set //one/:_authToken {s} //two/:_authToken {s}",
+            "npm config set //h/:_authToken {s}",
+            "curl -u {s}: host",
+            "curl -u {s}:password host",
+            "sshpass -p {s} \\\n ssh h",
+            "mysql -p {s}",
+            "mysql -p {s} -p {s}",
+            "tool -u {s}",
+            "docker login -p {s}",
+        ];
+        for raw in rows {
+            let cmd = raw.replace("{s}", &secret);
+            let out = redact(&cmd);
+            assert!(!out.contains(&secret), "{cmd:?} -> {out:?}");
+        }
+    }
+
+    #[test]
+    fn config_commands_respect_unquoted_substitution_boundaries() {
+        let secret = format!("fake-config-{}", "Z9".repeat(5));
+        let rows = [
+            (
+                "out=$(aws configure set aws_secret_access_key {s}) echo token READY",
+                "out=$(aws configure set aws_secret_access_key ***) echo token READY",
+            ),
+            (
+                "out=$(aws --profile p configure set aws_secret_access_key {s}) echo token READY",
+                "out=$(aws --profile p configure set aws_secret_access_key ***) echo token READY",
+            ),
+            (
+                "out=$(aws configure set aws_secret_access_key '{s})tail') echo token READY",
+                "out=$(aws configure set aws_secret_access_key ***) echo token READY",
+            ),
+            (
+                "out=$(aws --profile p configure set aws_secret_access_key \"{s})tail\") echo token READY",
+                "out=$(aws --profile p configure set aws_secret_access_key ***) echo token READY",
+            ),
+            (
+                "out=$(npm config set //h/:_authToken {s}\\)tail) echo token READY",
+                "out=$(npm config set //h/:_authToken ***) echo token READY",
+            ),
+            (
+                "out=$(aws --profile p configure set region \"eu)tail\" aws_secret_access_key {s}) echo token READY",
+                "out=$(aws --profile p configure set region \"eu)tail\" aws_secret_access_key ***) echo token READY",
+            ),
+            (
+                "out=$(aws configure set aws_secret_access_key {s}) npm config set //h/:_authToken {s}",
+                "out=$(aws configure set aws_secret_access_key ***) npm config set //h/:_authToken ***",
+            ),
+            (
+                "out=$(aws --profile p configure set aws_secret_access_key {s}) aws --profile p configure set aws_secret_access_key {s}",
+                "out=$(aws --profile p configure set aws_secret_access_key ***) aws --profile p configure set aws_secret_access_key ***",
+            ),
+            (
+                "npm config set //h/:_authToken {s})tail",
+                "npm config set //h/:_authToken ***",
+            ),
+            (
+                "echo '('; npm config set //h/:_authToken {s})tail",
+                "echo '('; npm config set //h/:_authToken ***",
+            ),
+            (
+                "echo \"escaped \\\"(\"; npm config set //h/:_authToken {s})tail",
+                "echo \"escaped \\\"(\"; npm config set //h/:_authToken ***",
+            ),
+            (
+                "echo \\(; npm config set //h/:_authToken {s})tail",
+                "echo \\(; npm config set //h/:_authToken ***",
+            ),
+            (
+                "aws --profile -x configure set aws_secret_access_key {s}",
+                "aws --profile -x configure set aws_secret_access_key ***",
+            ),
+            (
+                "aws --profile -x --region eu configure set aws_secret_access_key {s}",
+                "aws --profile -x --region eu configure set aws_secret_access_key ***",
+            ),
+            (
+                "npm config set registry https://auth.example.test/ aws_secret_access_key {s}",
+                "npm config set registry https://auth.example.test/ *** ***",
+            ),
+            (
+                "npm config set registry https://auth.example.test/ auth_key secret_key {s}",
+                "npm config set registry https://auth.example.test/ *** *** ***",
+            ),
+        ];
+        for (raw, want) in rows {
+            let cmd = raw.replace("{s}", &secret);
+            let out = redact(&cmd);
+            assert_eq!(out, want, "{cmd:?}");
+            assert!(!out.contains(&secret), "{cmd:?} -> {out:?}");
+        }
+        for kept in [
+            "aws configure\necho token READY",
+            "npm config\necho token READY",
+            "aws --profile p configure\necho token READY",
+            "echo '(already closed)' ; npm config set region eu)tail",
+            "echo \\( ; npm config set region eu)tail",
+        ] {
+            assert_eq!(redact(kept), kept, "{kept:?}");
+        }
+    }
+
+    #[test]
+    fn only_known_noncredential_short_flag_invocations_keep_the_operand() {
+        for kept in [
+            "git push -u origin",
+            "git branch -u origin/main",
+            "mkdir -p /etc/x",
+            "env -u VAR cmd",
+            "FOO=1 BAR=2 git push --verbose -u origin",
+            "mkdir --verbose -p /etc/x",
+            "env --ignore-environment -u VAR cmd",
+            "echo done; git push -u origin",
+            "true && mkdir -p /etc/x",
+            "true | env -u VAR cmd",
+            "echo done\ngit push -u origin",
+            "out=$(git push -u origin)",
+            "echo `git push -u origin`",
+        ] {
+            assert_eq!(redact(kept), kept, "{kept:?}");
+        }
+        let secret = format!("fake-short-flag-{}", "Q7".repeat(5));
+        for (raw, want) in [
+            (
+                "sshpass -p {s} git push -u origin",
+                "sshpass -p *** git push -u ***",
+            ),
+            ("mkdir -p x -p {s}", "mkdir -p x -p ***"),
+            ("git push remote -u {s}", "git push remote -u ***"),
+            ("sudo mkdir -p {s}", "sudo mkdir -p ***"),
+            ("sh -c 'mkdir -p {s}'", "sh -c 'mkdir -p ***'"),
+            ("'mkdir' -p {s}", "'mkdir' -p ***"),
+            ("mkdir -u {s}", "mkdir -u ***"),
+            ("env -p {s}", "env -p ***"),
+            ("git checkout -u {s}", "git checkout -u ***"),
+            ("9BAD=1 mkdir -p {s}", "9BAD=1 mkdir -p ***"),
+        ] {
+            let cmd = raw.replace("{s}", &secret);
+            assert_eq!(redact(&cmd), want, "{cmd:?}");
+        }
+    }
+
+    #[test]
+    fn bare_tokens_are_cut_in_prose() {
+        let mut tokens = Vec::new();
+        for kind in ['p', 'o', 'u', 's', 'r'] {
+            tokens.push(format!("gh{kind}_{}", "Fake7".repeat(4)));
+        }
+        tokens.push(format!("github_{}{}", "pat_", "Fake_7".repeat(4)));
+        for prefix in ["AKIA", "ASIA"] {
+            tokens.push(format!("{prefix}{}", "FAKE".repeat(4)));
+        }
+        for prefix in ["", "ant-", "proj-", "svc-"] {
+            tokens.push(format!("sk-{prefix}{}", "Fake_7-".repeat(4)));
+        }
+        for kind in ['a', 'b', 'p', 'r', 's'] {
+            tokens.push(format!("xox{kind}-{}", "fake-7".repeat(2)));
+        }
+        tokens.push(format!("glpat-{}", "Fake_7-".repeat(4)));
+        tokens.push(format!("npm_{}", "Fake77".repeat(6)));
+        for token in tokens {
+            let cmd = format!("I used {token} to push");
+            let out = redact(&cmd);
+            assert_eq!(out, "I used *** to push", "{cmd:?}");
+            assert!(!out.contains(&token), "{cmd:?} -> {out:?}");
+        }
+        let ordinary = "task-runner skeleton-key";
+        assert_eq!(redact(ordinary), ordinary);
+    }
+
     /// core#1577 (codex r1 on the fix): each shape the redactor missed, with what it must record. The
     /// secret is built at run time (secret scanners read test files too); `{s}` marks it.
     #[test]
@@ -1549,14 +1897,14 @@ mod tests {
                 "aws --profile=p --no-cli-pager configure set aws_secret_access_key {s}",
                 "aws --profile=p --no-cli-pager configure set aws_secret_access_key ***",
             ),
-            // Command substitution: as main treats the unflagged form, the `)` rides with the value.
+            // Command substitution: keep the closing `)` after cutting the value.
             (
                 "out=$(aws --profile p configure set aws_secret_access_key {s})",
-                "out=$(aws --profile p configure set aws_secret_access_key ***",
+                "out=$(aws --profile p configure set aws_secret_access_key ***)",
             ),
             (
                 "out=$(aws configure set aws_secret_access_key {s})",
-                "out=$(aws configure set aws_secret_access_key ***",
+                "out=$(aws configure set aws_secret_access_key ***)",
             ),
             (
                 "echo `npm --userconfig cfg.npmrc config set //h/:_authToken {s}`",
@@ -1596,7 +1944,7 @@ mod tests {
             // `)` ends the added head's command; a following word is its own command.
             (
                 "out=$(aws --profile p configure set aws_secret_access_key {s}) echo token READY",
-                "out=$(aws --profile p configure set aws_secret_access_key *** echo token READY",
+                "out=$(aws --profile p configure set aws_secret_access_key ***) echo token READY",
             ),
             // The issue's other shape: a secret-named word ahead of the key does not hide its value
             // (main cuts the key word there; the value is cut as well).
