@@ -18653,13 +18653,16 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// The registries a judge is drawn from: [`crate::registry_roster`] and the full registry.
+/// The registries a judge is drawn from: [`crate::registry_records_classed`] and the full registry.
 fn judge_registries() -> (Vec<crate::AgenticCli>, Vec<crate::AgenticCli>) {
     #[cfg(test)]
     if let Some(r) = REJUDGE_REGISTRY.with(|c| c.borrow().clone()) {
         return r;
     }
-    (crate::registry_roster(), crate::cli_runner::full_registry())
+    (
+        crate::registry_records_classed(),
+        crate::cli_runner::full_registry(),
+    )
 }
 
 /// (rejudge) Whether `run_id`'s open gate can re-run its judge now: the cursor unit is denied
@@ -29035,6 +29038,66 @@ mod request_changes_tests {
         u.member_step = Some(Default::default());
         let p = denial_gate_prompt(&u, "judge_unavailable", reason, None, "");
         assert!(p.contains("approve to re-run the phase"), "{p}");
+    }
+
+    /// core#1522: judge registry reads leave the worker home untouched; sign-in still prepares it.
+    #[test]
+    fn judge_registry_reads_do_not_prepare_seat_directories() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let home = std::env::temp_dir().join(format!("wicked-1522-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&home).unwrap();
+        let names = [
+            "WICKED_WORKER_HOME",
+            "HOME",
+            "WICKED_WORKER_INHERIT_OPERATOR_CONFIG",
+        ];
+        let prev: Vec<_> = names.iter().map(std::env::var_os).collect();
+        std::env::set_var("WICKED_WORKER_HOME", &home);
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("WICKED_WORKER_INHERIT_OPERATOR_CONFIG");
+        REJUDGE_REGISTRY.with(|c| *c.borrow_mut() = None);
+
+        let (records, _) = judge_registries();
+        let empty_after_read = std::fs::read_dir(&home).unwrap().next().is_none();
+        let roster = crate::registry_roster();
+        let claude_prepared = home.join("claude").is_dir();
+
+        for (k, v) in names.into_iter().zip(prev) {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+
+        assert!(
+            empty_after_read,
+            "judge registry reads must not create seat directories"
+        );
+        assert!(
+            claude_prepared,
+            "the sign-in roster still prepares seat directories"
+        );
+        assert!(roster
+            .iter()
+            .find(|c| c.key == "claude")
+            .unwrap()
+            .login_invocation
+            .is_some());
+        assert!(!records.is_empty());
+        assert_eq!(
+            records
+                .iter()
+                .map(|c| (&c.key, &c.governance_class))
+                .collect::<Vec<_>>(),
+            roster
+                .iter()
+                .map(|c| (&c.key, &c.governance_class))
+                .collect::<Vec<_>>()
+        );
+        assert!(records.iter().all(|c| c.governance_class.is_some()));
     }
 
     /// (rejudge) A FIX step (creator, claude) whose gate held `judge_unavailable` on attempt 2:
