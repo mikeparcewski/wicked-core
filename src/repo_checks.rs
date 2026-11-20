@@ -7222,6 +7222,44 @@ fn cat_batch(
     answered
 }
 
+/// Stream regular blobs in their checkout form under `tree`'s own attributes and only the
+/// source repository's end-of-line settings. Like the host export, this uses a private repository
+/// with no filter drivers, hooks, or host configuration. Callers must reject newlines in paths.
+pub(crate) fn checkout_bytes(
+    source_git_dir: &Path,
+    tree: &str,
+    blobs: Vec<(String, String)>,
+    each: impl FnMut(usize, Vec<u8>) -> Result<(), String>,
+) -> Result<(), String> {
+    let conv = std::env::temp_dir().join("wicked-core-floor").join(format!(
+        "pod-conv-{}-{}",
+        std::process::id(),
+        floor_checkout_nonce()
+    ));
+    let result = (|| {
+        std::fs::create_dir_all(&conv)
+            .map_err(|e| format!("the pod floor's conversion dir could not be created: {e}"))?;
+        let held = HeldDir::open(&conv)?;
+        // A detached HEAD containing a tree object id is accepted by cat-file: it need only
+        // look like an object id. Attribute lookup uses the explicit `tree`, not HEAD's type.
+        write_private_git_dir(&held, "git", source_git_dir, source_git_dir, tree, true)?;
+        let convert = git_has_attr_source();
+        let inputs = blobs
+            .into_iter()
+            .map(|(oid, path)| {
+                if convert {
+                    format!("{oid} {path}")
+                } else {
+                    oid
+                }
+            })
+            .collect();
+        cat_batch(&conv.join("git"), tree, convert, inputs, each)
+    })();
+    let _ = std::fs::remove_dir_all(&conv);
+    result
+}
+
 /// Whether a path component names the export's `.git` on some filesystem: `.git` in any case,
 /// and its NTFS aliases (trailing dots/spaces, an `:` alternate stream, the `git~1` short name),
 /// which Windows resolves to the same directory (git's own `is_ntfs_dotgit`).
@@ -7264,7 +7302,7 @@ fn write_tree_blobs(
 /// process. Without it the export cannot convert under the exported tree's own attributes, so it
 /// writes the raw blobs, as before eol conversion existed, rather than fail every floor export on
 /// an older git (Ubuntu 22.04 ships 2.34).
-fn git_has_attr_source() -> bool {
+pub(crate) fn git_has_attr_source() -> bool {
     static HAS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *HAS.get_or_init(|| {
         // spawn-audit: hardened — a capability probe: `git --attr-source=<x> version` exits 0 on a
@@ -8646,9 +8684,10 @@ pub const OUTCOME_COULD_NOT_RUN: &str = "could_not_run";
 pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// The versioned base-cache record (core#1060 r9 keyed the cache by sandbox policy; v4 adds the
 /// base inventory; v14, F24: a check in a package directory the change introduced is decided as
-/// the change's own, so a recorded `base_red_unseparated` for one is not reused): a record of any
-/// other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 14;
+/// the change's own, so a recorded `base_red_unseparated` for one is not reused; v15, core#1422:
+/// the pod floor's copies are converted like a checkout, so a base result recorded from a raw
+/// copy is not reused): a record of any other version, or a bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 15;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
