@@ -1149,6 +1149,8 @@ fn domain_graph_cmd(args: &[String]) {
     // optional `metadata.coverage` + `requirement.corroboration` this build emits.
     let schema_version = flag(args, "--schema-version").unwrap_or_else(|| "1.1.0".to_string());
 
+    // Declared before the store so it drops after it: the graph goes back to DELETE mode (core#1602).
+    let _settle = wicked_core::RepoGraphWrite::begin(std::path::Path::new(&store_path(args)));
     let mut store = match wicked_apps_core::open_store(Some(&store_path(args))) {
         Ok(s) => s,
         Err(e) => {

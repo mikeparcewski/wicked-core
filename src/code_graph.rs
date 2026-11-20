@@ -222,8 +222,8 @@ pub(crate) const IN_TREE_CODE_GRAPH_DIR: &str = ".codegraph";
 /// The filename every code-graph database carries: `<root>/<key>/estate.db`.
 pub(crate) const CODE_GRAPH_DB_FILE: &str = "estate.db";
 
-/// Settle a repo graph once at seat launch, after the engine's writers have closed it. Estate
-/// selects WAL on every read-write open, so this belongs at launch rather than at each writer.
+/// Settle a repo graph into DELETE journal mode: at seat launch, and after every engine write
+/// ([`RepoGraphWrite`]); estate selects WAL on every read-write open.
 /// DELETE mode lets the seat read without a directory write grant (core#1602). The caller logs
 /// a failure and continues without retrying; opening an absent graph must not create a new db.
 pub(crate) fn settle_graph_journal(db: &Path) -> rusqlite::Result<String> {
@@ -240,6 +240,51 @@ pub(crate) fn settle_graph_journal(db: &Path) -> rusqlite::Result<String> {
         ));
     }
     Ok(mode)
+}
+
+/// core#1602: held across every engine write to a repo graph. Estate sets WAL on every read-write
+/// open, and when the last connection closes SQLite deletes `-wal`/`-shm` but leaves the WAL flag
+/// in the db header, so a seat (read-only directory) that opens the graph next cannot create the
+/// sidecars and reads nothing. Dropping the guard (declare it BEFORE the store or child it covers,
+/// so it drops after them) puts the graph back in DELETE mode. A path that is not a repo graph
+/// under the repo-graph root is left alone. A failure warns; it is not retried.
+pub struct RepoGraphWrite {
+    db: Option<PathBuf>,
+}
+
+impl RepoGraphWrite {
+    /// Guard `db` if it is a repo graph: under this thread's repo-graph root, or, for a process
+    /// with no bound state home (the `wicked-core domain-graph` tool a daemon on a custom `--db`
+    /// spawns), anywhere shaped `<...>/repo-graphs/<key>/estate.db`.
+    pub fn begin(db: &Path) -> Self {
+        let own_root = db
+            .parent()
+            .and_then(Path::parent)
+            .filter(|r| r.file_name().is_some_and(|n| n == REPO_GRAPHS_DIRNAME));
+        let guard = Self::begin_at(db, repo_graph_root().as_deref());
+        if guard.db.is_some() {
+            return guard;
+        }
+        Self::begin_at(db, own_root)
+    }
+
+    pub(crate) fn begin_at(db: &Path, root: Option<&Path>) -> Self {
+        Self {
+            db: classify_code_graph_db_at(db, root).map(|_| db.to_path_buf()),
+        }
+    }
+}
+
+impl Drop for RepoGraphWrite {
+    fn drop(&mut self) {
+        let Some(db) = self.db.take() else { return };
+        if !db.exists() {
+            return;
+        }
+        if let Err(error) = settle_graph_journal(&db) {
+            tracing::warn!(db = %db.display(), %error, "could not settle repo graph journal after a write");
+        }
+    }
 }
 
 /// Env var overriding the repo-graph root wholesale — precedence 1 in [`repo_graph_root`] and the
@@ -1085,6 +1130,7 @@ fn index_at_base_with(
 fn mark_not_a_base(db: &Path, why: &str) {
     use wicked_apps_core::GraphWrite;
     let warn = |e: String| tracing::warn!(db = %db.display(), "{why}, and the graph could not be marked not-a-base: {e}");
+    let _settle = RepoGraphWrite::begin(db);
     let mut store = match open_store(Some(&db.to_string_lossy())) {
         Ok(s) => s,
         Err(e) => return warn(format!("open: {e}")),
@@ -1108,6 +1154,7 @@ fn run_indexer(
     db: &Path,
     budget: &crate::index_budget::IndexBudget,
 ) -> Result<(), String> {
+    let _settle = RepoGraphWrite::begin(db);
     let mut child = Command::new(bin)
         .hardened()
         .arg("index")
@@ -1205,6 +1252,7 @@ fn index_checkout_with(
 fn record_registered_root(db: &Path, repo: &Path, worktree: &Path) {
     use wicked_apps_core::GraphStoreMutExt;
     let warn = |why: String| tracing::warn!(db = %db.display(), "D8 left the graph's root at the run worktree: {why}");
+    let _settle = RepoGraphWrite::begin(db);
     let mut store = match open_store(Some(&db.to_string_lossy())) {
         Ok(s) => s,
         Err(e) => return warn(format!("the graph could not be opened: {e}")),
@@ -1262,6 +1310,7 @@ pub(crate) fn base_index_refusal(
 pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
     let graph = code_graph_path_for_write(repo)?;
     let graph_str = graph.to_string_lossy().to_string();
+    let _settle = RepoGraphWrite::begin(&graph);
     let bin = indexer_bin();
     let out = Command::new(&bin)
         .hardened()
@@ -1287,6 +1336,7 @@ pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
 
 /// Rank the top-`n` most central code symbols in an indexed graph (global PageRank over CALLS/IMPORTS).
 pub fn rank_symbols(graph_path: &str, n: usize) -> anyhow::Result<Vec<RankedSymbol>> {
+    let _settle = RepoGraphWrite::begin(Path::new(graph_path));
     let store = open_store(Some(graph_path))
         .map_err(|e| anyhow::anyhow!("open code graph {graph_path}: {e}"))?;
     // Total distinct source files — the denominator for the call-spread ubiquity test.
@@ -2259,6 +2309,76 @@ mod tests {
         assert!(settle_graph_journal(&absent).is_err());
         assert!(!absent.exists());
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn a_guarded_engine_write_leaves_the_graph_readable_in_a_read_only_dir() {
+        let root = scratch("write-guard");
+        let key_dir = root.join("repo-0123456789ab");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let db = key_dir.join(CODE_GRAPH_DB_FILE);
+        {
+            // The graph as a seat finds it: DELETE mode.
+            let c = rusqlite::Connection::open(&db).unwrap();
+            c.execute_batch("CREATE TABLE t (v INTEGER); INSERT INTO t VALUES (1)")
+                .unwrap();
+        }
+        // An engine writer opens it read-write the way estate does (WAL) and closes it.
+        let write = |db: &Path| {
+            let c = rusqlite::Connection::open(db).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").unwrap();
+            c.execute("INSERT INTO t VALUES (2)", []).unwrap();
+        };
+        let ro_count = |db: &Path| -> rusqlite::Result<i64> {
+            let uri = format!("file:{}?mode=ro", db.display());
+            rusqlite::Connection::open_with_flags(
+                uri,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+            )?
+            .query_row("SELECT count(*) FROM t", [], |r| r.get(0))
+        };
+        #[cfg(unix)]
+        let lock_dir = |mode: u32| {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        #[cfg(not(unix))]
+        let lock_dir = |_mode: u32| {};
+
+        // Unguarded: the WAL flag outlives the sidecars, and a seat's read-only open fails.
+        write(&db);
+        lock_dir(0o555);
+        #[cfg(unix)]
+        assert!(
+            ro_count(&db).is_err(),
+            "precondition: a WAL graph with no sidecars is unreadable in a read-only dir"
+        );
+        lock_dir(0o755);
+
+        // Guarded: the same write, settled when it finishes.
+        {
+            let _settle = RepoGraphWrite::begin_at(&db, Some(&root));
+            write(&db);
+        }
+        lock_dir(0o555);
+        assert_eq!(ro_count(&db).unwrap(), 3);
+        lock_dir(0o755);
+
+        // A path that is not a repo graph under the root is left alone.
+        let other = scratch("write-guard-other").join(CODE_GRAPH_DB_FILE);
+        {
+            let _settle = RepoGraphWrite::begin_at(&other, Some(&root));
+            let c = rusqlite::Connection::open(&other).unwrap();
+            c.pragma_update(None, "journal_mode", "WAL").unwrap();
+            c.execute_batch("CREATE TABLE t (v INTEGER)").unwrap();
+            drop(c);
+        }
+        let c = rusqlite::Connection::open(&other).unwrap();
+        let mode: String = c
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The boot-time migration: a registered repo whose graph sits under the legacy estate home and
