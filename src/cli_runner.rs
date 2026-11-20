@@ -4021,6 +4021,22 @@ fn exclude_monitors<'a>(
     ))
 }
 
+/// (core#1610) Undo only the monitor widening for a retry, preserving the original exclusions
+/// and any creators excluded afterward. A creator that is also a monitor stays excluded.
+fn monitor_retry_excluded<'a>(
+    excluded: &[&'a str],
+    without_monitors: &[&str],
+    creators: &[String],
+) -> Vec<&'a str> {
+    excluded
+        .iter()
+        .copied()
+        .filter(|seat| {
+            without_monitors.contains(seat) || creators.iter().any(|c| c.as_str() == *seat)
+        })
+        .collect()
+}
+
 /// (crew#972) A verdict rendered by a team monitor that [`exclude_monitors`] re-admitted: labelled
 /// on the gate, its receipt and the delivery receipt as a [`crate::assurance::JudgeFallback`] (no
 /// preferred seat — there was none) and named in the run's live output. The monitor is still a
@@ -6073,16 +6089,14 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 });
             // A cold seat's provider was unknown to the monitor pre-check. The exhausted
             // rotation has now observed it: re-admit only the monitors and retry once.
+            let monitor_retry = monitor_retry_excluded(&excluded, &without_monitors, &creators);
             if verdict
                 .as_ref()
                 .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
                 && monitor_fallback.is_none()
-                && excluded != without_monitors
-                && creators
-                    .iter()
-                    .all(|c| without_monitors.contains(&c.as_str()))
+                && monitor_retry != excluded
             {
-                excluded = without_monitors;
+                excluded = monitor_retry;
                 monitor_fallback =
                     exclude_monitors(&mut excluded, &team_monitors, &creators, |_| false);
                 author_ids = author_identities(&excluded, registry);
@@ -6301,16 +6315,14 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     });
                 // As on the pinned path, a cold provider observation can undo only the
                 // monitor widening, through one retry of the same rotation.
+                let monitor_retry = monitor_retry_excluded(&excluded, &without_monitors, &creators);
                 if verdict
                     .as_ref()
                     .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
                     && monitor_fallback.is_none()
-                    && excluded != without_monitors
-                    && creators
-                        .iter()
-                        .all(|c| without_monitors.contains(&c.as_str()))
+                    && monitor_retry != excluded
                 {
-                    excluded = without_monitors;
+                    excluded = monitor_retry;
                     monitor_fallback =
                         exclude_monitors(&mut excluded, &team_monitors, &creators, |_| false);
                     author_ids = author_identities(&excluded, registry);
@@ -9515,10 +9527,150 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// (core#1606 review) The monitor re-admission retry never re-admits a CREATOR: an Evaluator
-    /// unit's creators (`work_authors`) are widened into the exclusion after the monitors, so the
-    /// retry is refused unless they were already excluded. Every case below ends held (the work
-    /// provider is shared by every seat the rotation may ask) and the creator is never asked.
+    /// An Evaluator's creators are excluded after the monitor snapshot. Both rotations must
+    /// re-admit the independent monitor after a cold refusal while keeping the creators out.
+    #[test]
+    fn core_1610_the_monitor_retry_readmits_a_monitor_when_creators_were_widened_in() {
+        struct Gatewayed {
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let provider = if seat.starts_with("codex-j1610-") {
+                    "chatgpt.com:443"
+                } else {
+                    "api.anthropic.com:443"
+                };
+                crate::observed_provider::record_receipt(&seat, Some(vec![provider.into()]));
+                if input.unit.session_id == "validator" {
+                    self.asked.lock().unwrap().push(seat);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            // spawn-audit: test-only — a git fixture; reads no engine state.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let dir = std::env::temp_dir().join(format!("wcore-1610-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "."]);
+        git(&dir, &["config", "user.email", "t@example.invalid"]);
+        git(&dir, &["config", "user.name", "t"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("x"), "work\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "work"]);
+        let baseline = crate::worktree_guard::snapshot(&dir, &dir).unwrap();
+        for pinned in [true, false] {
+            let tag = if pinned { "pinned" } else { "default" };
+            let monitor = format!("codex-j1610-{tag}");
+            let pi = format!("pi-j1610-{tag}");
+            let creator = format!("claude-j1610-{tag}");
+            let reviewer = format!("rev-j1610-{tag}");
+            assert!(crate::observed_provider::last_seen(&pi).is_none());
+            assert!(crate::observed_provider::last_seen(&monitor).is_none());
+            let mut unit = crate::domain::WorkUnit::pending("r:u2", "r", 2, "review the work");
+            unit.role = crate::workflow::PhaseRole::Evaluator;
+            unit.assigned_cli = Some(reviewer.clone());
+            unit.default_floor = !pinned;
+            unit.worktree_baseline = Some(baseline.clone());
+            if pinned {
+                unit.validator = Some(crate::validator::DeterministicValidator {
+                    criterion: "the work is correct".into(),
+                    script: "test -f x".into(),
+                    approved: true,
+                });
+            } else {
+                // A default re-judge reads the already observed work without re-running its floor.
+                unit.observed_providers = vec!["api.anthropic.com:443".into()];
+            }
+            unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+                output: "the work".into(),
+                attempt: 1,
+                seats: Vec::new(),
+                monitors: vec![monitor.clone()],
+                consumed: pinned,
+                at: 0,
+            });
+            let input = StepInput {
+                run_id: "r".into(),
+                unit_ix: 1,
+                attempt: 2,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let roster = vec![
+                seat(&creator, "claude -p {PROMPT}"),
+                seat(&reviewer, "rev -p {PROMPT}"),
+                seat(&monitor, "codex exec {PROMPT}"),
+                seat(&pi, "pi -p {PROMPT}"),
+            ];
+            let runner = Arc::new(Gatewayed {
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let dynr: Arc<dyn StepRunner> = runner.clone();
+            let noop: &DeltaSink = &|_: &str| {};
+            let run_roster: Vec<String> = roster.iter().map(|c| c.key.clone()).collect();
+            let (_, verdict, evidence) = run_unit_and_judge_with_fallback(
+                &dynr,
+                &input,
+                noop,
+                &roster,
+                &run_roster,
+                &[],
+                &[],
+                std::slice::from_ref(&creator),
+            );
+            let asked = runner.asked.lock().unwrap().clone();
+            let verdict = verdict.expect("the monitor judges");
+            assert!(verdict.pass, "{tag}: {verdict:?} asked {asked:?}");
+            assert_eq!(verdict.judge_cli.as_deref(), Some(monitor.as_str()));
+            assert!(
+                !asked.contains(&creator),
+                "{tag}: the creator judged its own work: {asked:?}"
+            );
+            assert_eq!(asked, [pi, monitor]);
+            assert!(evidence.judge_skipped.is_none());
+            assert!(
+                verdict
+                    .judge_fallback
+                    .as_ref()
+                    .is_some_and(|f| f.label.contains("team-monitor fallback")),
+                "{tag}: {verdict:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// (core#1606 review, core#1610) The monitor retry keeps an Evaluator's creators excluded.
+    /// An independent monitor may pass; a monitor sharing the work's provider leaves the gate
+    /// held. Neither case may ask the creator to judge its own work.
     #[test]
     fn core_1593_the_monitor_retry_never_lets_a_creator_judge_its_own_work() {
         struct Gatewayed {
@@ -9658,10 +9810,17 @@ mod tests {
                 "{tag}: the creator judged its own work: {asked:?} {verdict:?}"
             );
             assert!(asked.contains(&pi), "{tag}: the search ran: {asked:?}");
-            assert!(
-                verdict.as_ref().is_none_or(|v| !v.pass),
-                "{tag}: a refused or creator verdict passed: {verdict:?} asked {asked:?}"
-            );
+            if monitor_provider == "chatgpt.com:443" {
+                let verdict = verdict.expect("the independent monitor judges");
+                assert!(verdict.pass, "{tag}: {verdict:?} asked {asked:?}");
+                assert_eq!(verdict.judge_cli.as_deref(), Some(monitor.as_str()));
+                assert!(asked.contains(&monitor), "{tag}: {asked:?}");
+            } else {
+                assert!(
+                    verdict.as_ref().is_none_or(|v| !v.pass),
+                    "{tag}: a refused or creator verdict passed: {verdict:?} asked {asked:?}"
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
