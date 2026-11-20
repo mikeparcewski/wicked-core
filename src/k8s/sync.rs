@@ -21,6 +21,7 @@
 //! replaced with a link is never followed, and replaces each file by rename, so no partial file
 //! is ever visible.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -34,6 +35,8 @@ pub(crate) const END: u8 = b'E';
 pub(crate) const MAX_STREAM: u64 = 512 << 20;
 /// The most entries one stream may carry.
 pub(crate) const MAX_ENTRIES: usize = 400_000;
+/// The most left-out paths a write-back may report.
+pub(crate) const MAX_SKIPS: usize = 100_000;
 /// The most roots one stream may carry (a unit has a handful).
 pub(crate) const MAX_ROOTS: usize = 4096;
 
@@ -246,6 +249,7 @@ pub(crate) struct Skipped {
 impl Skipped {
     /// (core#1518 codex confirm #5) Whether `rel` may be the same host path as one this skip left
     /// out, on a folding host (`cache/x` under a skipped `CACHE`): such a path is never deleted.
+    #[cfg(test)]
     pub(crate) fn may_alias(&self, rel: &str) -> bool {
         let (r, p) = (fold(rel), fold(&self.path));
         r == p
@@ -256,6 +260,7 @@ impl Skipped {
 
     /// Whether `rel` is left out by this skip: a cache dir covers everything under it; a file left
     /// out for the limit covers that one path only (codex r1: never a subtree it replaced).
+    #[cfg(test)]
     pub(crate) fn covers(&self, rel: &str) -> bool {
         // (codex r2) EXACT spelling, never folded: the pod lists paths as they are and the copy-in
         // baseline keeps the host's spelling, so a folded alias (`s\u{200c}rc`, `SRC`) can never
@@ -288,10 +293,75 @@ impl Skipped {
     }
 }
 
+/// (core#1517) Build once per root: exact limit paths and cache ancestor prefixes, with folded
+/// sets for deletion protection on a host that aliases names. Matching never scans the skips.
+pub(crate) struct SkipSet {
+    limits: HashSet<String>,
+    caches: HashSet<String>,
+    folded_limits: HashSet<String>,
+    folded_caches: HashSet<String>,
+}
+
+impl SkipSet {
+    pub(crate) fn new(skips: &[Skipped]) -> Self {
+        let mut set = Self {
+            limits: HashSet::new(),
+            caches: HashSet::new(),
+            folded_limits: HashSet::new(),
+            folded_caches: HashSet::new(),
+        };
+        for skip in skips {
+            let (exact, folded) = if skip.why == "limit" {
+                (&mut set.limits, &mut set.folded_limits)
+            } else {
+                (&mut set.caches, &mut set.folded_caches)
+            };
+            exact.insert(skip.path.clone());
+            folded.insert(fold(&skip.path));
+        }
+        set
+    }
+
+    fn matches(limits: &HashSet<String>, caches: &HashSet<String>, rel: &str) -> bool {
+        if limits.contains(rel) {
+            return true;
+        }
+        let mut prefix = rel;
+        loop {
+            if caches.contains(prefix) {
+                return true;
+            }
+            match prefix.rsplit_once('/') {
+                Some((parent, _)) => prefix = parent,
+                None => return false,
+            }
+        }
+    }
+
+    pub(crate) fn covers(&self, rel: &str) -> bool {
+        Self::matches(&self.limits, &self.caches, rel)
+    }
+
+    pub(crate) fn may_alias(&self, rel: &str) -> bool {
+        Self::matches(&self.folded_limits, &self.folded_caches, &fold(rel))
+    }
+}
+
 /// (core#1498) Remove the [`Kind::Skipped`] entries from a written-back root and return them, each
 /// path checked as a plain relative, non-git path with a known reason: nothing the pod skipped is
 /// ever written, and none of it reads as a deletion.
 pub(crate) fn take_skipped(root: &mut Root) -> Result<Vec<Skipped>, String> {
+    let count = root
+        .entries
+        .iter()
+        .filter(|e| e.kind == Kind::Skipped)
+        .count();
+    if count > MAX_SKIPS {
+        return Err(format!(
+            "the pod reported {count} left-out paths, more than the write-back's limit of \
+             {MAX_SKIPS}; nothing was written back"
+        ));
+    }
     let mut out = Vec::new();
     let mut kept = Vec::with_capacity(root.entries.len());
     for e in std::mem::take(&mut root.entries) {
@@ -454,7 +524,7 @@ fn git_entry_below(dir: &Path) -> Result<Option<PathBuf>, String> {
 
 /// The files the host's repository tracks under `root` (relative to it), or `None` when `root`
 /// is in no git work tree; `Err` when git cannot list a repository that is there.
-fn host_tracked(root: &Path) -> Result<Option<Vec<String>>, String> {
+pub(crate) fn host_tracked(root: &Path) -> Result<Option<Vec<String>>, String> {
     let inside = git(root)
         .args(["rev-parse", "--is-inside-work-tree"])
         .output()
@@ -1383,7 +1453,8 @@ pub(crate) fn apply(
 ///   lists, so ignored build output stays), `git` replaces the root whole, `seed` writes only when
 ///   the root does not exist yet.
 /// - `pack <plan>`: the roots of the plan (JSON `[[replica, mode, [skip...]], ...]`) as a stream on
-///   stdout: `tree` = what git lists, `plain` = every file and link.
+///   stdout: `tree` = what git lists, `plain` = every file and link. Stdin supplies the host
+///   copy-in tracked sets as JSON `{replica: [paths]}`; absent roots have no repository.
 /// - `bundle <tree> <base>`: the commits on the tree's HEAD since `base`, as a git bundle on
 ///   stdout (empty output = none).
 pub(crate) const POD_CODEC: &str = r#"
@@ -1528,7 +1599,12 @@ def plain_list(rootfd):
     walk(rootfd, "")
     return sorted(out)
 def head(out, k, p, n):
-    global SENT, ENTRIES
+    global SENT, ENTRIES, SKIPS
+    if k == b"s":
+        SKIPS += 1
+        if SKIPS > MAX_SKIPS:
+            die("the pod reported %d left-out paths, more than the write-back's limit of %d; "
+                "nothing was written back" % (SKIPS, MAX_SKIPS))
     p = p.encode("utf-8", "surrogateescape")
     # (core#1498, codex r1) Every record is counted against both limits the engine's decoder
     # enforces, so a pack that the engine would refuse dies here, never mid-stream.
@@ -1552,6 +1628,8 @@ BUDGET = MAX - (64 << 20)
 SENT = 0
 MAX_ENTRIES = 400000
 ENTRIES = 0
+MAX_SKIPS = 100000
+SKIPS = 0
 # (core#1498) The cache-directory tag (bford.info/cachedir): cargo writes it into every target
 # dir, whatever its name; a directory holding it is build output and never comes back.
 TAG = "CACHEDIR.TAG"
@@ -1605,12 +1683,6 @@ def caches(rootfd, rels, tracked):
         # repository or a submodule below it): when in doubt, it is not skipped.
         if is_tag(rootfd, d + "/" + TAG) and not holds_git(rootfd, d): out.append(d)
     return out
-def tracked_list(root):
-    # None: no repository (a session's scratch tree), so nothing of it is untracked output.
-    if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"): return None
-    r = git(root, "ls-files", "-z", "-c")
-    if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
-    return [x.decode("utf-8", "surrogateescape") for x in r.stdout.split(b"\0") if x]
 SEEDING = ".wicked-seeding"
 def emit(out, rootfd, rel, leave=None):
     fd, name = parent(rootfd, rel, False)
@@ -1760,7 +1832,7 @@ def planned(rootfd, rel):
         n = st.st_size if reg or stat.S_ISLNK(st.st_mode) else 0
         return 13 + len(rel.encode("utf-8", "surrogateescape")) + n, reg
     finally: os.close(fd)
-def pack(plan):
+def pack(plan, host_tracked):
     out = sys.stdout.buffer; out.write(b"WKS1\n")
     work = []; fits = set()
     try:
@@ -1772,12 +1844,14 @@ def pack(plan):
             if m == "files":
                 work[-1][4].extend((rel, False) for rel in skip)
                 continue
+            # The seat can rewrite its index; only the host's copy-in set protects work.
+            # Absence means the host has no repository there (a `.git` the seat made counts for nothing).
+            tracked = host_tracked.get(r) if m == "tree" else None
             rels = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
             # No root but the tree's own `.git` root carries git metadata, either way (codex
             # b2-sync #17): a plain root's repository stays on the host.
             rels = [x for x in rels if not any(under(x, s) for s in skip)
                     and not (m in ("tree", "plain") and isgit(x))]
-            tracked = tracked_list(R + "/" + r) if m == "tree" else None
             # (core#1498) Build output (a tagged cache dir) never comes back: named once, so
             # the host keeps whatever it had there and the step says it was left out. Matched
             # exactly (core#1518 codex-check), as the host matches it.
@@ -1853,7 +1927,7 @@ op = sys.argv[1]
 # (a cut stream, a kill) is a client that may have left this codec running.
 try:
     if op == "unpack": unpack(json.loads(sys.argv[2]))
-    elif op == "pack": pack(json.loads(sys.argv[2]))
+    elif op == "pack": pack(json.loads(sys.argv[2]), json.load(sys.stdin))
     elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
     else: die("unknown op")
 except SystemExit: raise

@@ -503,6 +503,8 @@ pub(crate) struct Seat {
     pub(crate) branch: Option<String>,
     /// What every root that comes back held at copy-in.
     pub(crate) baseline: Mutex<Baseline>,
+    /// The host index for each tree at copy-in; the pod index never decides what may be skipped.
+    pub(crate) tracked: Mutex<Tracked>,
     /// The unit's seat homes, re-synced right before the CLI starts (placeholder files).
     pub(crate) seat_dirs: Vec<PathBuf>,
     /// Writable dirs that neither come back nor stay (fenced scratch): removed at settle.
@@ -1003,18 +1005,25 @@ pub(crate) fn head_branch(tree: &Path) -> Result<Option<String>, String> {
 /// write-back applies only what the seat changed against it (review r1).
 pub(crate) type Baseline = HashMap<PathBuf, HashMap<String, [u8; 32]>>;
 
-/// The copy-in stream of `roots` (the host's side), the tree's base commit and the baseline.
+/// The host index at copy-in for every tree root; `None` records a repository-free tree.
+pub(crate) type Tracked = HashMap<PathBuf, Option<Vec<String>>>;
+
+/// The encoded roots, pod plan, base commit, baseline and host tracked sets from copy-in.
+pub(crate) type CopyInStream = (Vec<u8>, Value, Option<String>, Baseline, Tracked);
+
+/// The copy-in stream of `roots` (the host's side), with its baseline and tracked sets.
 pub(crate) fn copy_in_stream(
     scope: Option<&str>,
     tree: &Path,
     roots: &[PlanRoot],
     with_git: bool,
     seeded: &HashSet<String>,
-) -> Result<(Vec<u8>, Value, Option<String>, Baseline), String> {
+) -> Result<CopyInStream, String> {
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
     let mut base = None;
     let mut baseline = Baseline::new();
+    let mut tracked = Tracked::new();
     // The bytes read so far (review r3): a root over the stream's limit is refused as it is read,
     // never after the whole of it is in memory.
     let mut budget: u64 = 0;
@@ -1025,6 +1034,9 @@ pub(crate) fn copy_in_stream(
     for r in roots {
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
+        if r.mode == Mode::Tree {
+            tracked.insert(r.host.clone(), sync::host_tracked(&r.host)?);
+        }
         if r.mode == Mode::Seed {
             // Sent once per replica, outside the unit's budget: an oversized cache is left out.
             let entries = if seeded.contains(&replica) {
@@ -1209,7 +1221,7 @@ pub(crate) fn copy_in_stream(
                 .join(" "),
         ),
     );
-    Ok((sync::encode(&stream), plan, base, baseline))
+    Ok((sync::encode(&stream), plan, base, baseline, tracked))
 }
 
 /// A seat cache's entries for its first copy into a replica; empty (with a note) when the caches
@@ -1262,7 +1274,7 @@ pub(crate) fn copy_in(
     tree: &Path,
     roots: &[PlanRoot],
     with_git: bool,
-) -> Result<(Option<String>, Baseline), (FloorUnarmed, String)> {
+) -> Result<(Option<String>, Baseline, Tracked), (FloorUnarmed, String)> {
     let seeded: HashSet<String> = {
         let g = SEEDED.lock().unwrap_or_else(|p| p.into_inner());
         roots
@@ -1273,8 +1285,9 @@ pub(crate) fn copy_in(
             .collect()
     };
     // What could not be copied in is said as that (fix-k8s-chat), never `root_unresolvable`.
-    let (body, plan, base, baseline) = copy_in_stream(scope, tree, roots, with_git, &seeded)
-        .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
+    let (body, plan, base, baseline, tracked) =
+        copy_in_stream(scope, tree, roots, with_git, &seeded)
+            .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::CopyInRefused,
@@ -1310,7 +1323,7 @@ pub(crate) fn copy_in(
             }
         }
     }
-    Ok((base, baseline))
+    Ok((base, baseline, tracked))
 }
 
 /// The facts one seat pod is armed with.
@@ -1895,7 +1908,7 @@ pub(crate) fn arm(
     let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
     clear_stale(kube, &ns)?;
     super::clock::mark("clear_stale");
-    let (base, baseline) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
+    let (base, baseline, tracked) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
     drop(_arming);
     // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
     let branch = match &base {
@@ -1947,6 +1960,7 @@ pub(crate) fn arm(
         base,
         branch,
         baseline: Mutex::new(baseline),
+        tracked: Mutex::new(tracked),
         seat_dirs: s.seat_dirs.to_vec(),
         scratch,
         mounted,
@@ -2226,7 +2240,7 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         .cloned()
         .collect();
     if !homes.is_empty() {
-        let (_, more) = copy_in(
+        let (_, more, tracked) = copy_in(
             &seat.kube,
             &seat.ns,
             seat.scope.as_deref(),
@@ -2237,6 +2251,9 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         .map_err(|(_, e)| e)?;
         if let Ok(mut b) = seat.baseline.lock() {
             b.extend(more);
+        }
+        if let Ok(mut t) = seat.tracked.lock() {
+            t.extend(tracked);
         }
     }
     let r = seat.kube.call(
@@ -2569,11 +2586,32 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         refs.push((replica_of(seat.scope.as_deref(), &r.host)?, r));
     }
     let plan = codec_plan(&refs).to_string();
+    let host_tracked = {
+        let tracked = seat
+            .tracked
+            .lock()
+            .map_err(|_| "the copy-in tracked sets are poisoned")?;
+        let mut host_tracked = HashMap::new();
+        for (replica, root) in &refs {
+            if root.mode == Mode::Tree {
+                let snapshot = tracked.get(&root.host).ok_or_else(|| {
+                    format!(
+                        "the copy-in tracked set for {} is missing",
+                        root.host.display()
+                    )
+                })?;
+                if let Some(paths) = snapshot {
+                    host_tracked.insert(replica.as_str(), paths);
+                }
+            }
+        }
+        serde_json::to_vec(&host_tracked).map_err(|e| e.to_string())?
+    };
     let r = codec(
         &seat.kube,
         &seat.ns,
         &["pack", &plan],
-        None,
+        Some(&host_tracked),
         Duration::from_secs(300),
     );
     if !r.ok() {
@@ -2595,7 +2633,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     // Every root checked before anything is fetched or applied; diffed against the host only
     // after the commits are in (below), so the conflict check reads the host as it is when the
     // write-back lands, not minutes earlier (codex b2-seat #4).
-    let mut checked: Vec<(&PlanRoot, Vec<Entry>, Vec<sync::Skipped>)> = Vec::new();
+    let mut checked: Vec<(&PlanRoot, Vec<Entry>, Vec<sync::Skipped>, sync::SkipSet)> = Vec::new();
     let mut warnings: Vec<String> = Vec::new();
     for ((replica, want), got) in refs.iter().zip(roots.iter_mut()) {
         if &got.replica != replica {
@@ -2613,14 +2651,26 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             baseline.get(&want.host).unwrap_or(&empty),
         )
         .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
-        entries.retain(|e| !left_out.iter().any(|s| s.covers(&e.path)));
+        let skips = sync::SkipSet::new(&left_out);
+        let mut matched = 0usize;
+        let mut matching_cancelled = false;
+        entries.retain(|e| {
+            if matched.is_multiple_of(4096) && cancelled() {
+                matching_cancelled = true;
+            }
+            matched += 1;
+            !matching_cancelled && !skips.covers(&e.path)
+        });
+        if matching_cancelled {
+            return Err("the unit was cancelled during write-back; nothing came back".into());
+        }
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
         }
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             entries.retain(|e| !in_node_modules(&e.path));
         }
-        checked.push((want, entries, left_out));
+        checked.push((want, entries, left_out, skips));
     }
     let tree_back = back
         .iter()
@@ -2671,7 +2721,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         }
     }
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
-    for (want, entries, left_out) in checked {
+    for (want, entries, left_out, skips) in checked {
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
         let mut retained = retained_links(&entries, &base);
         retained.extend(
@@ -2679,7 +2729,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
                 format!("the write-back of {} was refused: {e}", want.host.display())
             })?,
         );
-        let (writes, mut deletes) = delta_keeping(&want.host, &base, entries, &left_out)?;
+        let (writes, mut deletes) = delta_keeping(&want.host, &base, entries, &skips, cancelled)?;
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             deletes.retain(|d| !in_node_modules(d));
         }
@@ -3002,22 +3052,29 @@ pub(crate) fn delta_keeping(
     host: &Path,
     base: &HashMap<String, [u8; 32]>,
     entries: Vec<Entry>,
-    left_out: &[sync::Skipped],
+    skips: &sync::SkipSet,
+    cancelled: &dyn Fn() -> bool,
 ) -> Result<(Vec<Entry>, Vec<String>), String> {
     // (codex r1) Left out BEFORE the deletion check: a path the host changed meanwhile under a
     // skip is no conflict, because nothing of it is written or deleted.
     // (core#1518 codex confirm #5) Nor a host path the pod sent nothing for that a skip may alias
     // on a folding host (`src/file.rs` under a skipped `SRC/file.rs`): kept, never deleted.
-    let sent: std::collections::HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
-    let kept: HashMap<String, [u8; 32]> = base
-        .iter()
-        .filter(|(p, _)| {
-            !left_out
-                .iter()
-                .any(|s| s.covers(p) || (!sent.contains(p.as_str()) && s.may_alias(p)))
-        })
-        .map(|(p, d)| (p.clone(), *d))
-        .collect();
+    let mut sent = HashSet::new();
+    for (i, e) in entries.iter().enumerate() {
+        if i.is_multiple_of(4096) && cancelled() {
+            return Err("the unit was cancelled during write-back; nothing came back".into());
+        }
+        sent.insert(e.path.as_str());
+    }
+    let mut kept = HashMap::new();
+    for (i, (p, d)) in base.iter().enumerate() {
+        if i.is_multiple_of(4096) && cancelled() {
+            return Err("the unit was cancelled during write-back; nothing came back".into());
+        }
+        if !skips.covers(p) && (sent.contains(p.as_str()) || !skips.may_alias(p)) {
+            kept.insert(p.clone(), *d);
+        }
+    }
     delta(host, &kept, entries)
 }
 
@@ -3371,6 +3428,7 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         base: None,
         branch: None,
         baseline: Mutex::new(Baseline::new()),
+        tracked: Mutex::new(Tracked::new()),
         seat_dirs: Vec::new(),
         scratch: Vec::new(),
         mounted: vec![tree.to_path_buf()],
