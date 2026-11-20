@@ -7273,6 +7273,8 @@ pub(crate) fn checkout_bytes(
             ])
             .current_dir(&conv)
             .env("GIT_DIR", &source_git_dir)
+            // The id was listed from this object store already; never fetch one that is not.
+            .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(std::process::Stdio::null());
         isolate_git_config(&mut resolve);
         let resolved = resolve
