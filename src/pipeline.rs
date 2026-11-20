@@ -1913,7 +1913,19 @@ pub(crate) fn apply_and_finish_unit(
     // The FIRST layer that denied names the gate; (operator ruling 2026-10-21) every layer
     // after it is kept too (`WorkUnit::denials_behind`), so an answer that overrides ONE layer —
     // the operator's judgment over a failed repo-checks floor — can see the rest still deny.
-    let mut layers = [
+    let prior_fold = PriorFold {
+        behind: prior_denials_behind,
+        tree: prior_floor_tree,
+    };
+    let fold_refresh = FoldRefresh {
+        floor_carried,
+        tree: evidence.repo_checks.as_ref().and_then(|r| r.tree.clone()),
+        judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
+        qe: evidence.qe_review.is_some(),
+        seat: seat_ran,
+        rules: evidence.rule_check.is_some(),
+    };
+    let vetoes = [
         guard_denial.map(|r| crate::domain::UnitDenial::new("worktree_guard", r)),
         same_seat_denial,
         det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)),
@@ -1927,6 +1939,8 @@ pub(crate) fn apply_and_finish_unit(
         rule_broken,
         evaluator_denial,
         hook_denial,
+    ];
+    let holds = [
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
         // NO other layer denied — the operator's judgment at its gate then answers the one open
         // question, never a governance veto hidden behind it. (core#969, codex r1) That holds for
@@ -1940,9 +1954,30 @@ pub(crate) fn apply_and_finish_unit(
         judge_hold,
         unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
         qe_unavailable,
-    ]
-    .into_iter()
-    .flatten();
+    ];
+    // #1062: an earlier, unrefreshed layer decides approval too, not just the record written
+    // after a denial. Fresh words replace their layer's old word, even when it has new details.
+    let (standing_holds, standing_vetoes): (Vec<_>, Vec<_>) =
+        standing_denials(&prior_fold, &fold_refresh)
+            .into_iter()
+            .filter(|d| {
+                !vetoes
+                    .iter()
+                    .chain(holds.iter())
+                    .flatten()
+                    .any(|f| f.source == d.source)
+            })
+            .partition(|d| {
+                judge_absent_behind_floor(d)
+                    || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+                    || crate::qe_acceptance::review::could_not_judge(d)
+            });
+    let mut layers = vetoes
+        .into_iter()
+        .flatten()
+        .chain(standing_vetoes)
+        .chain(holds.into_iter().flatten())
+        .chain(standing_holds);
     let validator_denial = layers.next();
     // (xreview r7) The winner as the layers ranked it, kept: output governance can replace it in
     // `apply_unit`'s outcome, and the record must still hold it.
@@ -2038,21 +2073,7 @@ pub(crate) fn apply_and_finish_unit(
     unit.denials_behind = if outcome.approved {
         Some(Vec::new())
     } else {
-        denials_behind_after_fold(
-            fresh_denials,
-            PriorFold {
-                behind: prior_denials_behind,
-                tree: prior_floor_tree,
-            },
-            FoldRefresh {
-                floor_carried,
-                tree: evidence.repo_checks.as_ref().and_then(|r| r.tree.clone()),
-                judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
-                qe: evidence.qe_review.is_some(),
-                seat: seat_ran,
-                rules: evidence.rule_check.is_some(),
-            },
-        )
+        denials_behind_after_fold(fresh_denials, prior_fold, fold_refresh)
     };
     unit.status = if outcome.approved {
         UnitStatus::Done
@@ -2858,11 +2879,44 @@ fn denials_behind_after_fold(
     prior: PriorFold,
     now: FoldRefresh,
 ) -> Option<Vec<crate::domain::UnitDenial>> {
+    // No record of what denied before: unless every layer was asked again, the record
+    // remains unknown (and cannot authorize an override), as it did before standing ranking.
+    if now.same_tree_as(&prior) && prior.behind.is_none() && !(now.judge && now.qe && now.seat) {
+        return None;
+    }
+    let mut out = fresh;
+    for d in standing_denials(&prior, &now) {
+        if !out.iter().any(|f| f.source == d.source) {
+            out.push(d);
+        }
+    }
+    Some(out)
+}
+
+impl FoldRefresh {
+    fn same_tree_as(&self, prior: &PriorFold) -> bool {
+        // A floor fix or a check rewriting files asked no other layer about the new tree.
+        // Preserve those denials until the unit's own seat runs again, as for the fold record.
+        !self.seat
+            || self.floor_carried
+            || self.tree.is_none()
+            || prior.tree.is_none()
+            || self.tree == prior.tree
+    }
+}
+
+/// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
+/// supplies no invented denials; the fold record separately preserves its unknown state.
+fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::UnitDenial> {
+    if !now.same_tree_as(prior) {
+        return Vec::new();
+    }
     let judge_layer =
         |s: &str| s == "agent_validator" || s == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE;
     let qe_layer = |s: &str| {
         s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
             || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
+            || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE
     };
     let floor = |s: &str| {
         s == crate::repo_checks::DENIAL_SOURCE || s == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
@@ -2883,32 +2937,13 @@ fn denials_behind_after_fold(
             now.seat
         }
     };
-    let every_layer_refreshed = now.judge && now.qe && now.seat;
-    // A changed tree is new work only when the seat itself made it (xreview r7): a floor fix's
-    // seat or a check that rewrote files asked no other layer about the new tree.
-    let same_tree = !now.seat
-        || now.floor_carried
-        || now.tree.is_none()
-        || prior.tree.is_none()
-        || now.tree == prior.tree;
-    if !same_tree {
-        return Some(fresh);
-    }
-    let mut out = fresh;
-    let earlier = match prior.behind {
-        Some(behind) => behind,
-        // No record of what denied before (a unit persisted before the record existed — a new
-        // unit starts known-empty): unless this fold asked every layer again, it cannot know
-        // either, whatever its tree (xreview r6: a guarded step's report carries none).
-        None if !every_layer_refreshed => return None,
-        None => Vec::new(),
-    };
-    for d in earlier {
-        if !floor(&d.source) && !refreshed(&d.source) && !out.contains(&d) {
-            out.push(d);
-        }
-    }
-    Some(out)
+    prior
+        .behind
+        .iter()
+        .flatten()
+        .filter(|d| !floor(&d.source) && !refreshed(&d.source))
+        .cloned()
+        .collect()
 }
 
 fn agent_verdict_denial(
@@ -5753,6 +5788,133 @@ mod judge_bench_tests {
         assert!(!approved, "no record of what denied behind it: fail-closed");
     }
 
+    /// #1062: an extend re-run asks the checks and judge again, but never the executor's
+    /// input governance. Its earlier veto must decide the fold even when every fresh layer passes.
+    #[test]
+    fn a_passing_extend_fold_still_rejects_a_standing_governance_denial() {
+        let sid = "extend-standing-governance";
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        units[0].repo_checks_floor = true;
+        let output = crate::workflow::stub_output(&units[0]);
+        let report = |passed: bool| {
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "skipped": [], "passed": passed,
+                "sandbox_level": "sandboxed", "tree": "same-tree",
+                "checks": [{"name": "test", "argv": ["npm", "test"], "source": "t",
+                    "exit_code": if passed { Some(0) } else { None },
+                    "timed_out": !passed, "duration_ms": 1,
+                    "stdout_tail": "", "stderr_tail": ""}]
+            }))
+            .unwrap()
+        };
+        let judge = crate::validator::AgentVerdict {
+            pass: true,
+            reasoning: "PASS".into(),
+            judge_cli: Some("b".into()),
+            judge_distinct: Some(true),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        let first = apply_and_finish_unit(
+            &mut store,
+            &mut units[0],
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            0,
+            true, // A governed turn with no hook proof: a real input-governance denial.
+            true,
+            &cli_keys,
+            Some(&judge),
+            &crate::workflow::UnitEvidence {
+                repo_checks: Some(report(false)),
+                ..Default::default()
+            },
+            &mut |_| {},
+            None,
+        )
+        .expect("first fold");
+        assert!(!first.approved);
+        assert_eq!(
+            first.denial.unwrap().source,
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT
+        );
+        let mut unit = crate::domain::session_units(&store, sid).unwrap().remove(0);
+        assert!(unit
+            .denials_behind
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|d| d.source == "input_governance"));
+        unit.repo_checks.as_mut().unwrap().requested_rerun = Some(crate::repo_checks::FloorRerun {
+            mode: crate::repo_checks::FloorRerunMode::Extend,
+            waive: Vec::new(),
+            output: output.clone(),
+            fix: None,
+        });
+        put_node(&mut store, unit.to_node()).unwrap();
+        let second = apply_and_finish_unit(
+            &mut store,
+            &mut unit,
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            1,
+            false, // No executor seat and no fresh input-governance log.
+            false,
+            &cli_keys,
+            Some(&judge),
+            &crate::workflow::UnitEvidence {
+                repo_checks: Some(report(true)),
+                ..Default::default()
+            },
+            &mut |_| {},
+            None,
+        )
+        .expect("extend fold");
+        assert!(
+            !second.approved,
+            "passing checks cannot clear an unrefreshed veto"
+        );
+        assert_eq!(second.denial.unwrap().source, "input_governance");
+        let persisted = crate::domain::session_units(&store, sid).unwrap().remove(0);
+        assert_eq!(persisted.status, UnitStatus::Rejected);
+        assert_eq!(persisted.denial.unwrap().source, "input_governance");
+        assert!(persisted.repo_checks.unwrap().requested_rerun.is_none());
+    }
+
     /// (rig run ea73afc0) A creator attempt's fold with a fresh FAILED floor report: `reply` is the
     /// seat's answer and `tree_changed` what the engine measured. Returns the unit's denial reason.
     fn fold_retry_answer(sid: &str, reply: &str, tree_changed: Option<bool>) -> Option<String> {
@@ -6773,6 +6935,26 @@ mod denials_behind_tests {
             refresh(true, "t1", false, false),
         );
         assert_eq!(out, None);
+    }
+
+    /// #1062: a fresh QE word replaces a could-not-judge hold even when no executor seat ran.
+    #[test]
+    fn a_fresh_qe_review_clears_an_earlier_inconclusive_hold() {
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(
+                Some(vec![d(
+                    crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE,
+                )]),
+                "repo_checks",
+                "t1",
+            ),
+            FoldRefresh {
+                qe: true,
+                ..floor_only("t1")
+            },
+        );
+        assert_eq!(sources(&out), Some(vec![]));
     }
 
     /// A changed tree is new work: only this fold's own layers count.

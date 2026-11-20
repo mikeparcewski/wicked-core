@@ -19586,6 +19586,7 @@ pub(crate) fn refuse_before_resolving(
 /// the unit was denied because no judge could rule (`judge_unavailable`), or no QE reviewer could
 /// judge its evidence. (DES-APPS-001 §9.3, K0) Never the QE layer of an Apps publish: there the
 /// operator standing in for the QE reviewer would be a QE skip, so the approve is a retry.
+/// A stored veto behind that hold also requires a retry: the seat must re-ask every layer.
 pub(crate) fn approve_is_operator_judgment(
     session: &crate::domain::AgentSession,
     u: &crate::domain::WorkUnit,
@@ -19597,6 +19598,12 @@ pub(crate) fn approve_is_operator_judgment(
         && u.denial.as_ref().is_some_and(|d| {
             d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
                 || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+        })
+        && u.denials_behind.as_deref().is_none_or(|behind| {
+            behind.iter().all(|d| {
+                pipeline::judge_absent_behind_floor(d)
+                    || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+            })
         })
 }
 
@@ -27205,6 +27212,23 @@ mod request_changes_tests {
         ));
         v.denial_reason = Some("opencode (judge gave no verdict)".into());
         put_node(store, v.to_node()).unwrap();
+    }
+
+    #[test]
+    fn approve_is_not_operator_judgment_with_a_standing_governance_veto() {
+        let run_id = format!("op-judge-standing-veto-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let mut unit = crate::domain::session_units(&store, &run_id).unwrap()[3].clone();
+        assert!(approve_is_operator_judgment(&session, &unit));
+        unit.denials_behind = Some(vec![UnitDenial::new("input_governance", "policy denied")]);
+        assert!(
+            !approve_is_operator_judgment(&session, &unit),
+            "plain approve must retry every layer when governance still vetoes"
+        );
     }
 
     #[test]
