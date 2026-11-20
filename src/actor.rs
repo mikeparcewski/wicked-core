@@ -35,6 +35,7 @@ use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
 use wicked_apps_core::HardenedCommand;
 
+mod dead_seat_reprobe;
 mod dispatch_probe;
 pub(crate) mod gate_actions;
 mod power_gate;
@@ -579,8 +580,8 @@ pub(crate) fn sidecar_base(path: &str) -> String {
 /// (core#1390) The most commands moved off the channel per turn of the actor loop.
 const BACKLOG_DRAIN: usize = 256;
 
-/// Channel-silence window that counts as "idle" for the WAL checkpoint (the `recv_timeout` on the
-/// actor loop). Small enough to notice idleness promptly; the min interval below (not this tick)
+/// Actor receive timeout: notices due dead-seat sweeps even with idle checkpoints disabled.
+/// Channel silence also counts as "idle" for the WAL checkpoint; its minimum interval below
 /// bounds how often a checkpoint actually runs.
 const WAL_IDLE_TICK: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -1258,13 +1259,15 @@ pub(crate) fn run(
     // TRUNCATE-checkpoints them: passive auto-checkpoints keep deferring while `open_readonly`
     // gate-hook subprocesses ride the WAL. The ONLY safe place to checkpoint is HERE, on the actor
     // thread via the actor's own connections (a second writer connection breaks single-writer). The
-    // loop below turns the blocking `recv` into `recv_timeout(WAL_IDLE_TICK)`: a full tick of
+    // loop below uses `recv_timeout(WAL_IDLE_TICK)`: a full tick of
     // channel silence is the idle signal, and the checkpoint additionally requires
     // `in_flight.is_empty()` (a live worker posts results through this channel — its run is not
     // idle) plus a min interval, so it can never add latency to a step. `busy` results defer
     // harmlessly; the store-side `wal_autocheckpoint` bound is the backstop.
     let wal_min_interval = wal_checkpoint_min_interval();
     let mut last_wal_checkpoint = std::time::Instant::now();
+    let mut last_dead_seat_sweep = std::time::Instant::now();
+    let mut probing = HashSet::new();
     // (core#1390) Per-command timing + the backlog. Commands already sent are moved off the
     // channel into `backlog` in arrival order and taken from its front, so the order
     // they run in is the channel's order exactly; only the count of those waiting becomes visible.
@@ -1275,6 +1278,21 @@ pub(crate) fn run(
     let mut backlog: std::collections::VecDeque<Command> = std::collections::VecDeque::new();
 
     loop {
+        // Check before every command as well as idle ticks: a chatty UI cannot starve the sweep.
+        if last_dead_seat_sweep.elapsed() >= dead_seat_reprobe::DEAD_SEAT_SWEEP {
+            last_dead_seat_sweep = std::time::Instant::now();
+            if let Err(e) = dead_seat_reprobe::sweep(
+                &store,
+                &runner,
+                // The worker's own registry (unfiltered), read only if a probe runs.
+                crate::cli_runner::full_registry,
+                &self_tx,
+                &mut probing,
+                crate::seat_bench::now_ms(),
+            ) {
+                eprintln!("wicked-core: dead-seat bench sweep: {e}");
+            }
+        }
         // (DES-TEAMING-002 P1, review of #623 round 4) A held `confirm_gate` reply never outlives
         // its run. At the top of every iteration — so after EVERY command, whichever arm ran and
         // however it left the match (`continue` included) — each held reply whose run ended (any
@@ -1289,13 +1307,6 @@ pub(crate) fn run(
             );
             team_gate::settle_held_replies(&store, &mut team_replies);
         }
-        // Loop-mode selection: the knob decides ONCE, at actor start, whether this loop ever
-        // wakes on its own. Disabled (`None`) means disabled — the plain blocking `recv()` of
-        // the pre-checkpoint loop, zero periodic wakeups — not a 5s tick that skips the work.
-        // The two arms differ only in how `cmd` is obtained, so the `None` arm is byte-equivalent
-        // to the original `while let Ok(cmd) = rx.recv()` head; no timing test can pin "never
-        // wakes" without sleeping, so the equivalence is by construction here rather than by test
-        // (the knob parse itself is pinned in `wal_checkpoint_min_interval_honors_the_env_knob`).
         // How many commands waited for the actor when it became free (the one it runs next
         // included) — after a long command, the queue that built up behind it. Bounded per turn,
         // so a sustained producer can never hold the oldest command back.
@@ -1304,25 +1315,18 @@ pub(crate) fn run(
         let cmd = if let Some(cmd) = backlog.pop_front() {
             cmd
         } else {
-            match wal_min_interval {
-                None => match rx.recv() {
-                    Ok(cmd) => cmd,
-                    // Unreachable in practice (the actor holds `self_tx`, so the channel can't
-                    // close; `Shutdown` is the real exit) — the old `while let Ok(..)` behavior.
-                    Err(_) => break,
-                },
-                Some(interval) => match rx.recv_timeout(WAL_IDLE_TICK) {
-                    Ok(cmd) => cmd,
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            match rx.recv_timeout(WAL_IDLE_TICK) {
+                Ok(cmd) => cmd,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    if let Some(interval) = wal_min_interval {
                         if in_flight.is_empty() && last_wal_checkpoint.elapsed() >= interval {
                             checkpoint_wals(&mut store, memory.as_mut(), knowledge.as_mut());
                             last_wal_checkpoint = std::time::Instant::now();
                         }
-                        continue;
                     }
-                    // Same unreachable-in-practice defensive break as the blocking arm.
-                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-                },
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
         };
         // Dropped at the end of this iteration, whichever way the arm leaves it.
@@ -2588,6 +2592,18 @@ pub(crate) fn run(
                         // from the Stale arm above, durably advancing the cursor. `None` on all
                         // non-bus paths so the drop is a no-op there.
                     }
+                }
+            }
+            Command::DeadSeatReprobed { run_id, reprobes } => {
+                if let Err(e) = dead_seat_reprobe::fold(
+                    &mut store,
+                    &mut subscribers,
+                    &self_tx,
+                    &mut probing,
+                    &run_id,
+                    &reprobes,
+                ) {
+                    emit_run_error(&mut subscribers, &run_id, e);
                 }
             }
             Command::ConfirmGate {
@@ -6654,45 +6670,8 @@ fn apply_step_result(
             .collect();
         let reprobes =
             crate::seat_bench::reconcile_with_refusals(&evidence.bench_reprobes, &refusals);
-        let applied = crate::seat_bench::apply_reprobes(&mut session.benched_seats, &reprobes);
-        if !applied.is_empty() {
-            // A seat back from a launcher quota or sign-in bench: the run's launch roster says
-            // usable, so a plan revision that re-reads it does not bench the seat again.
-            for a in &applied {
-                if let (crate::seat_bench::Applied::Returned { cli, .. }, Some(tp)) =
-                    (a, session.team_plan.as_mut())
-                {
-                    crate::seat_bench::clear_launcher_health(&mut tp.roster, cli);
-                }
-            }
-            put_node(store, session.to_node())?;
-            let ord = units.get(output.unit_ix).map_or(0, |u| u.ord);
-            for a in applied {
-                emit(
-                    subscribers,
-                    match a {
-                        crate::seat_bench::Applied::Returned { cli, reason } => {
-                            CoreEvent::SeatBenchLifted {
-                                session: run_id.clone(),
-                                ord,
-                                cli,
-                                reason,
-                            }
-                        }
-                        crate::seat_bench::Applied::Rebenched {
-                            cli, reason, until, ..
-                        } => CoreEvent::SeatBenched {
-                            session: run_id.clone(),
-                            ord,
-                            cli,
-                            reason,
-                            source: "reprobe".to_string(),
-                            benched_until_ms: until,
-                        },
-                    },
-                );
-            }
-        }
+        let ord = units.get(output.unit_ix).map_or(0, |u| u.ord);
+        dead_seat_reprobe::fold_bench_reprobes(store, subscribers, &mut session, ord, &reprobes)?;
     }
     // (F-7R3-001, review F3) The seats with a SUCCESSFUL unit in this run so far — read before
     // `unit` borrows the list; a quota-class refusal below benches only a seat without one.
