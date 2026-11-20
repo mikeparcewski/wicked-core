@@ -14,6 +14,8 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **CI: the selftest pin moves to wicked-ci 3bd45ae (the advisory verdict now concludes, wicked-ci#76/#81).** The selftest job grants `checks: write` so the called workflow can publish its verdict check run; the advisory job still never blocks a merge.
+
 ### Added
 
 - **A power run sends a delivered PR's red required check back to Build (crew#1623).** When the deliver script's trusted verdict is
