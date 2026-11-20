@@ -2,6 +2,7 @@
 //! seats, no store).
 
 use super::*;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use wicked_governance::{ConfSeverity, ConformanceRule};
@@ -4136,15 +4137,34 @@ fn big_file(path: &str, n: usize, width: usize) -> String {
     s
 }
 
+/// Every diff line needs its own occurrence; repeated headers in the parts may be left over.
+fn parts_omit_nothing(diff: &str, parts: &[String]) -> Result<(), String> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in parts.iter().flat_map(|part| part.lines()) {
+        *counts.entry(line.to_string()).or_default() += 1;
+    }
+    for line in diff.lines() {
+        match counts.get_mut(line) {
+            Some(count) if *count > 0 => *count -= 1,
+            _ => return Err(format!("missing occurrence of line: {line:?}")),
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn core_1474_parts_leave_nothing_out_and_repeat_each_files_header() {
+    let hunk = format!("@@ -0,0 +1,3000 @@\n{}", "+x\n".repeat(3000));
+    let repeated = format!(
+        "diff --git a/repeated.txt b/repeated.txt\n--- a/repeated.txt\n+++ b/repeated.txt\n{hunk}{hunk}"
+    );
     let diff = format!(
-        "{}{}{}",
+        "{}{}{}{repeated}",
         big_file("Cargo.lock", 9000, 30),
         DIFF,
         big_file("src/gen.rs", 3000, 40)
     );
-    let cap = 64 * 1024;
+    let cap = 4 * 1024;
     let parts = diff_parts(&diff, cap);
     assert!(parts.len() > 3, "{}", parts.len());
     for p in &parts {
@@ -4155,15 +4175,28 @@ fn core_1474_parts_leave_nothing_out_and_repeat_each_files_header() {
             &p[..60]
         );
     }
-    // Nothing left out: every line of the diff is in a part, in order (headers may repeat).
-    let joined: String = parts.concat();
-    let mut at = 0;
-    for line in diff.lines() {
-        let found = joined[at..]
-            .find(line)
-            .expect("every line of the change is in a part");
-        at += found;
-    }
+    assert_eq!(parts_omit_nothing(&diff, &parts), Ok(()));
+    // A broken splitter keeps just one of the repeated added lines across all parts.
+    let broken_splitter = |diff: &str| {
+        let mut kept = false;
+        diff_parts(diff, cap)
+            .into_iter()
+            .map(|part| {
+                let mut broken = String::new();
+                for line in part.split_inclusive('\n') {
+                    if line == "+x\n" {
+                        if kept {
+                            continue;
+                        }
+                        kept = true;
+                    }
+                    broken.push_str(line);
+                }
+                broken
+            })
+            .collect::<Vec<String>>()
+    };
+    assert!(parts_omit_nothing(&diff, &broken_splitter(&diff)).is_err());
     assert!(
         diff_parts(DIFF, cap) == vec![DIFF.to_string()],
         "a small change is one part"
@@ -4308,6 +4341,8 @@ fn core_1474_a_lockfile_heavy_diff_is_judged_whole_in_parts() {
         "{}",
         prompts.len()
     );
+    assert_eq!(r.calls, prompts.len() as u32);
+    assert_eq!(r.waves, prompts.len() as u32);
     assert!(
         prompts.iter().all(|p| p.starts_with("PART ")),
         "each part is named"
@@ -4453,6 +4488,12 @@ fn core_1474_a_part_the_seat_cannot_answer_moves_the_batch_to_another_seat() {
         r.rows[0]
     );
     let calls = judge.0.lock().unwrap();
+    assert_eq!(r.calls, calls.len() as u32);
+    assert_eq!(
+        r.waves,
+        calls.len() as u32,
+        "both rounds include their parts"
+    );
     assert!(
         calls
             .iter()
@@ -4550,6 +4591,8 @@ fn core_1474_parts_keep_a_broken_name_the_total_and_never_lose_the_change() {
             "not every part was read"
         );
         assert!(r.parts >= 4, "{}", r.parts);
+        assert_eq!(r.calls, 2, "the first part and the failed second part");
+        assert_eq!(r.waves, 2, "the failed part attempt counts too");
         if matches!(part2, JudgeAnswer::SeatFailed(_)) {
             assert!(r.refused.contains(&"codex".to_string()), "{:?}", r.refused);
         }
