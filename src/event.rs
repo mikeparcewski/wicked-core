@@ -1882,6 +1882,50 @@ pub(crate) fn gate_choices(gate_kind: &str) -> Option<(&'static [&'static str], 
     }
 }
 
+/// (core#1643) Event members that are DATA, never seat prose: engine-minted identities and refs
+/// that clients compare, key on, look up or hand back (run/session ids, seat keys, the elicitation
+/// id, workflow/skill refs, git refs/shas/trees, the gate kind and its answer tokens `choices`, finding
+/// ids). The redactor's prefix rules would cut a branch such as `feature/sk-<20 chars>`, which would
+/// break the lookup. They pass `to_json` byte-identical; every other string is redacted. Elicitation
+/// `options` are NOT here: they are shown redacted and compared redacted (`tool_activity::original_option`).
+const EVENT_DATA_KEYS: &[&str] = &[
+    "type",
+    "session",
+    "runId",
+    "state",
+    "signal",
+    "gateKind",
+    "cli",
+    "cliKey",
+    "seat",
+    "recipientCli",
+    "previousCli",
+    "newCli",
+    "judgeCli",
+    "workflowId",
+    "skillRef",
+    "suggestionRef",
+    "elicitationId",
+    "terminalId",
+    "acpSessionId",
+    "baseRef",
+    "baseCommit",
+    "localHead",
+    "runBranch",
+    "head",
+    "sha",
+    "tree",
+    "treeBefore",
+    "treeAfter",
+    "baseBefore",
+    "baseAfter",
+    "beforeTree",
+    "afterTree",
+    "contentHash",
+    "choices",
+    "findingIds",
+];
+
 impl CoreEvent {
     /// Serialize to the tagged JSON object (`{ "type": "...", ...fields }`) that IS this event's
     /// wire identity — the shape the studio's `/ws` stream carries and the shape the durable event
@@ -3515,7 +3559,7 @@ impl CoreEvent {
                 | CoreEvent::TerminalOutput { .. }
                 | CoreEvent::TerminalExited { .. }
         ) {
-            crate::tool_activity::redact_json_strings(&mut value);
+            crate::tool_activity::redact_json_except(&mut value, EVENT_DATA_KEYS);
         }
         value
     }
@@ -3524,6 +3568,33 @@ impl CoreEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn event_data_keys_pass_byte_identical_and_prose_beside_them_is_cut() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        // Looks like a key by the prefix rules, but is a branch the client looks up.
+        let branch = format!("feature/{}-{}", "sk", "implement-authentication-flow");
+        assert_ne!(
+            crate::tool_activity::redact(&branch),
+            branch,
+            "fixture must be cut by redact"
+        );
+        let ev = CoreEvent::RunBaseResolved {
+            session: "s".into(),
+            base_ref: Some(branch.clone()),
+            base_commit: "abc".into(),
+            local_head: "def".into(),
+            behind: 0,
+            fetched: false,
+            lifted: false,
+            note: Some(format!("see {token}")),
+            run_branch: branch.clone(),
+        }
+        .to_json();
+        assert_eq!(ev["baseRef"], branch);
+        assert_eq!(ev["runBranch"], branch);
+        assert_eq!(ev["note"], "see ***");
+    }
 
     #[test]
     fn seat_prose_is_redacted_on_the_event_wire() {
