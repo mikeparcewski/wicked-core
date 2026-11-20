@@ -3823,6 +3823,13 @@ impl WrappedCliStepRunner {
             eprintln!("wicked-core: unit {} on '{cli_key}': ask MCP server not handed (requires a supported governed container seat, a loopback crew URL with a port, a ready gateway MCP route and no ambient wicked collision)", input.unit.ord);
         }
 
+        // All governed carriers share the root readiness latched at boot (core#1620).
+        if input.governance.is_some() {
+            if let Err(why) = crate::gate_hook::gov_root_ready() {
+                return governance_refusal(input, &why);
+            }
+        }
+
         // GOVERNED unit + claude → arm INPUT governance (DES-OUTGOV-003 §2): write a per-run settings
         // file declaring a PreToolUse gate-hook (every tool; exit 2 = deny ⇒ claude aborts the call),
         // insert `--settings <file>`, and return the child env (decisions log + absolute store path).
