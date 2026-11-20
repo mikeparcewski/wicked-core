@@ -390,11 +390,53 @@ pub(crate) fn take_skipped(root: &mut Root) -> Result<Vec<Skipped>, String> {
 /// compared folded (a zero-width or re-cased alias of a tracked dir is caught). Either refuses the
 /// whole write-back naming the path: tracked work and the QE evidence (a plain root) are never
 /// left behind under a success, whatever the seat did to its own index or names.
-pub(crate) fn refuse_unsafe_skips(host: &Path, mode: Mode, left: &[Skipped]) -> Result<(), String> {
+/// (core#1535) A root with no repository on the host honors no skip (the seat's tag is the only
+/// evidence there), and `incoming` (the tip the landing installs in the unit's tree) counts as
+/// tracked too: the installed index never names a file the write-back left out.
+pub(crate) fn refuse_unsafe_skips(
+    host: &Path,
+    mode: Mode,
+    left: &[Skipped],
+    incoming: Option<&str>,
+) -> Result<(), String> {
     if left.is_empty() {
         return Ok(());
     }
-    let tracked = host_tracked(host)?;
+    let mut tracked = host_tracked(host)?;
+    // (core#1535 item 2) The index the landing installs protects files too.
+    if let Some(new) = incoming {
+        let out = git(host)
+            .args(["ls-tree", "-r", "-z", "--name-only", new])
+            .output()
+            .map_err(|e| format!("git ls-tree in {}: {e}", host.display()))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git ls-tree in {} failed: {}",
+                host.display(),
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        let paths = tracked.get_or_insert_with(Vec::new);
+        paths.extend(
+            out.stdout
+                .split(|b| *b == 0)
+                .filter(|x| !x.is_empty())
+                .map(|x| String::from_utf8_lossy(x).into_owned()),
+        );
+        paths.sort();
+        paths.dedup();
+    }
+    // (core#1535 item 1) A seat's tag proves nothing without a host repository.
+    if tracked.is_none() {
+        let s = &left[0];
+        return Err(format!(
+            "`{}` was left out ({}), but this {} root has no repository on the host, so nothing \
+             proves it is build output; nothing was written back",
+            s.path,
+            s.why,
+            mode.as_str()
+        ));
+    }
     if let Some(s) = left
         .iter()
         .find(|s| s.why == "limit" && (mode != Mode::Tree || tracked.is_none()))
@@ -1659,7 +1701,7 @@ def is_tag(rootfd, rel):
 def inside(rel, d): return rel == d or rel.startswith(d + "/")
 def caches(rootfd, rels, tracked):
     # Every directory the listed paths sit in is checked for the tag, listed or not (codex r1: an
-    # ignored CACHEDIR.TAG still marks its dir). Never the root itself, and in a git tree never a
+    # ignored CACHEDIR.TAG still marks its dir). Never the root itself, and in a repository never a
     # dir that holds a tracked file (codex r1: a planted tag never hides tracked edits or deletions),
     # compared folded (core#1518 codex-check: a tagged `s<ZWNJ>rc` is `src` on a folding host, so
     # it would hide tracked `src/file.rs` and the host would delete it).
@@ -1845,9 +1887,13 @@ def pack(plan, host_tracked):
                 work[-1][4].extend((rel, False) for rel in skip)
                 continue
             # The seat can rewrite its index; only the host's copy-in set protects work.
-            # Absence means the host has no repository there (a `.git` the seat made counts for nothing).
-            tracked = host_tracked.get(r) if m == "tree" else None
-            rels = tree_list(R + "/" + r) if m == "tree" else plain_list(rootfd)
+            # Absence means no host repository there (a `.git` the seat made counts for nothing).
+            # (core#1535 item 1) Written-back plain repositories use the host snapshot too.
+            tracked = host_tracked.get(r) if m in ("tree", "plain") else None
+            # (core#1535 item 4) Untracking and ignoring a host file cannot hide its edit.
+            if m == "tree":
+                rels = sorted(set(tree_list(R + "/" + r)) | set(tracked or ()))
+            else: rels = plain_list(rootfd)
             # No root but the tree's own `.git` root carries git metadata, either way (codex
             # b2-sync #17): a plain root's repository stays on the host.
             rels = [x for x in rels if not any(under(x, s) for s in skip)
@@ -1855,13 +1901,13 @@ def pack(plan, host_tracked):
             # (core#1498) Build output (a tagged cache dir) never comes back: named once, so
             # the host keeps whatever it had there and the step says it was left out. Matched
             # exactly (core#1518 codex-check), as the host matches it.
-            left = caches(rootfd, rels, tracked)
+            left = caches(rootfd, rels, tracked) if tracked is not None else []
             work[-1][3].extend(left)
             # Only an untracked file of a tree WITH a repository may be left out for the limit
             # (codex confirm #2): a repository-free tree's files all come back, like a plain root's.
             held = set(tracked or ())
-            work[-1][4].extend((rel, tracked is not None and rel not in held) for rel in rels
-                               if not any(inside(rel, c) for c in left))
+            work[-1][4].extend((rel, m == "tree" and tracked is not None and rel not in held)
+                               for rel in rels if not any(inside(rel, c) for c in left))
         # (core#1518 codex-check) What MUST come back (a tree's tracked files, everything of a
         # plain root, the planned files) is sized first, and only the room it leaves goes to the
         # untracked files of a git tree, smallest first: a large artifact never pushes a tracked
@@ -1874,7 +1920,12 @@ def pack(plan, host_tracked):
                 if got is None: continue
                 cost, reg = got
                 (may if leavable and reg else must).append((cost, r, rel))
-        need = sum(c for c, _, _ in must)
+        # (core#1535 item 5) Root, cache and END records always need room too.
+        need = 13 + sum(c for c, _, _ in must)
+        for r, m, _, left, _ in work:
+            need += 13 + len(r.encode("utf-8", "surrogateescape")) + len(m)
+            need += sum(13 + len(c.encode("utf-8", "surrogateescape")) + len("cache")
+                        for c in left)
         if need > MAX:
             big = ", ".join("%s/%s (%d bytes)" % (r, rel, c) for c, r, rel in sorted(must, reverse=True)[:5])
             die("the unit's tracked changes and evidence need %d bytes, more than the write-back's "

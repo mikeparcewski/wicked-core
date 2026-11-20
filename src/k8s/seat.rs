@@ -1005,7 +1005,7 @@ pub(crate) fn head_branch(tree: &Path) -> Result<Option<String>, String> {
 /// write-back applies only what the seat changed against it (review r1).
 pub(crate) type Baseline = HashMap<PathBuf, HashMap<String, [u8; 32]>>;
 
-/// The host index at copy-in for every tree root; `None` records a repository-free tree.
+/// (core#1535 item 1) The host index for trees and written-back plain roots; `None` means no repo.
 pub(crate) type Tracked = HashMap<PathBuf, Option<Vec<String>>>;
 
 /// The encoded roots, pod plan, base commit, baseline and host tracked sets from copy-in.
@@ -1034,7 +1034,7 @@ pub(crate) fn copy_in_stream(
     for r in roots {
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
-        if r.mode == Mode::Tree {
+        if r.mode == Mode::Tree || (r.mode == Mode::Plain && r.back) {
             tracked.insert(r.host.clone(), sync::host_tracked(&r.host)?);
         }
         if r.mode == Mode::Seed {
@@ -2593,7 +2593,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             .map_err(|_| "the copy-in tracked sets are poisoned")?;
         let mut host_tracked = HashMap::new();
         for (replica, root) in &refs {
-            if root.mode == Mode::Tree {
+            if root.mode == Mode::Tree || (root.mode == Mode::Plain && root.back) {
                 let snapshot = tracked.get(&root.host).ok_or_else(|| {
                     format!(
                         "the copy-in tracked set for {} is missing",
@@ -2640,8 +2640,6 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             return Err("the write-back's roots are out of order".into());
         }
         let left_out = sync::take_skipped(got)
-            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
-        sync::refuse_unsafe_skips(&want.host, want.mode, &left_out)
             .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
         warnings.extend(left_out.iter().map(|s| s.describe(&want.host)));
         let empty = HashMap::new();
@@ -2707,6 +2705,16 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         }
         _ => None,
     };
+    // (core#1535 item 2) Check once, with the fetched tip, before HEAD checks or host changes.
+    for (want, _, left_out, _) in &checked {
+        let incoming = if want.mode == Mode::Tree && want.host == seat.tree {
+            commits.as_ref().map(|(new, _)| new.as_str())
+        } else {
+            None
+        };
+        sync::refuse_unsafe_skips(&want.host, want.mode, left_out, incoming)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+    }
     // The host's HEAD must still be the base the commits fast-forward (review r2), checked
     // before any file changes.
     if let (Some(_), Some(base)) = (&commits, &seat.base) {
@@ -2723,9 +2731,10 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
     for (want, entries, left_out, skips) in checked {
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
+        let aliased = kept_by_alias(&base, &entries, &skips);
         let mut retained = retained_links(&entries, &base);
         retained.extend(
-            left_out_links(&want.host, &left_out).map_err(|e| {
+            left_out_links(&want.host, &left_out, &aliased).map_err(|e| {
                 format!("the write-back of {} was refused: {e}", want.host.display())
             })?,
         );
@@ -2733,9 +2742,8 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             deletes.retain(|d| !in_node_modules(d));
         }
-        // The pod's `ls-files -c -o --exclude-standard` lists every tracked file, ignored or
-        // not, so a tracked path it does not list was deleted (codex b2-seat #10). Only an
-        // untracked one the host's ignore rules now match is no deletion (the safe side).
+        // (core#1535 item 4) The pod lists the host's tracked set too: an absent tracked path
+        // was deleted. An untracked one the host's ignore rules match is no deletion.
         if want.mode == Mode::Tree && !deletes.is_empty() {
             deletes = tree_deletions(&want.host, deletes)?;
         }
@@ -3046,6 +3054,26 @@ pub(crate) fn apply_roots(plans: &[RootPlan<'_>]) -> Result<(), String> {
     Ok(())
 }
 
+fn alias_keeps(path: &str, sent: &HashSet<&str>, skips: &sync::SkipSet) -> bool {
+    !skips.covers(path) && !sent.contains(path) && skips.may_alias(path)
+}
+
+/// (core#1535 item 3) Baseline paths kept only because a skip may alias them, sorted.
+pub(crate) fn kept_by_alias(
+    base: &HashMap<String, [u8; 32]>,
+    entries: &[Entry],
+    skips: &sync::SkipSet,
+) -> Vec<String> {
+    let sent: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    let mut kept: Vec<String> = base
+        .keys()
+        .filter(|p| alias_keeps(p, &sent, skips))
+        .cloned()
+        .collect();
+    kept.sort();
+    kept
+}
+
 /// (core#1498) [`delta`], with every path the pod left out kept as the host has it: never written
 /// (the pod sent none of it) and never a deletion.
 pub(crate) fn delta_keeping(
@@ -3071,7 +3099,7 @@ pub(crate) fn delta_keeping(
         if i.is_multiple_of(4096) && cancelled() {
             return Err("the unit was cancelled during write-back; nothing came back".into());
         }
-        if !skips.covers(p) && (sent.contains(p.as_str()) || !skips.may_alias(p)) {
+        if !skips.covers(p) && !alias_keeps(p, &sent, skips) {
             kept.insert(p.clone(), *d);
         }
     }
@@ -3086,6 +3114,7 @@ pub(crate) fn delta_keeping(
 pub(crate) fn left_out_links(
     host: &Path,
     left_out: &[sync::Skipped],
+    aliased: &[String],
 ) -> Result<Vec<Entry>, String> {
     let mut out = Vec::new();
     let mut push_link = |rel: String| -> Result<(), String> {
@@ -3120,6 +3149,10 @@ pub(crate) fn left_out_links(
                 push_link(format!("{}/{rel}", s.path))?;
             }
         }
+    }
+    // (core#1535 item 3) Folded keeps retain host links outside the skip's exact spelling.
+    for rel in aliased {
+        push_link(rel.clone())?;
     }
     Ok(out)
 }
