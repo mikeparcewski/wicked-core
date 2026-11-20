@@ -5171,11 +5171,25 @@ pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
 
 /// (core#1560) Admission and release share one process-wide lock and condition variable. A slot
 /// spans every pass of the floor; all returns and unwinds release it and wake waiting floors.
-static IN_FLIGHT_FLOORS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static IN_FLIGHT_FLOORS: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
 static FLOOR_SLOT_RELEASED: std::sync::Condvar = std::sync::Condvar::new();
 
+struct FloorSet {
+    count: usize,
+    baseline: Option<u64>,
+}
+
+impl FloorSet {
+    const fn new() -> Self {
+        Self {
+            count: 0,
+            baseline: None,
+        }
+    }
+}
+
 struct FloorSlot {
-    in_flight: &'static std::sync::Mutex<usize>,
+    in_flight: &'static std::sync::Mutex<FloorSet>,
     released: &'static std::sync::Condvar,
 }
 
@@ -5198,7 +5212,7 @@ impl FloorSlot {
         #[cfg(test)]
         let (in_flight, released, min_gib, peak_gib) =
             test_seam::floor_admission_config().unwrap_or((in_flight, released, min_gib, peak_gib));
-        let mut count = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        let mut floors = in_flight.lock().unwrap_or_else(|p| p.into_inner());
         let started = Instant::now();
         let mut logged = false;
         loop {
@@ -5209,17 +5223,28 @@ impl FloorSlot {
             if let Some(why) = disk_guard(available, min_gib) {
                 return Err(why);
             }
-            let required_gib = min_gib.saturating_add((*count as u64).saturating_mul(peak_gib));
-            let needs_slot = min_gib > 0
-                && *count > 0
-                && available.is_some_and(|bytes| bytes < required_gib.saturating_mul(1 << 30));
+            // (core#1617) Live free space already reflects the set's disk use. Subtract that
+            // delta once from the set's reservation, in bytes to retain fractional GiB.
+            // External disk use also counts toward this delta; disk_guard still enforces
+            // the hard minimum before admission.
+            let set_used = floors
+                .baseline
+                .zip(available)
+                .map_or(0, |(baseline, bytes)| baseline.saturating_sub(bytes));
+            let reserve = (floors.count as u64)
+                .saturating_mul(peak_gib)
+                .saturating_mul(1 << 30)
+                .saturating_sub(set_used);
+            let required = min_gib.saturating_mul(1 << 30).saturating_add(reserve);
+            let needs_slot =
+                min_gib > 0 && floors.count > 0 && available.is_some_and(|bytes| bytes < required);
             if !needs_slot || started.elapsed() >= wait {
                 let admitted = logged.then(|| {
                     let seconds = started.elapsed().as_secs();
                     if needs_slot {
                         format!(
                             "admitted at the {seconds} s wait cap with {} other floor(s) still running ({:.1} GiB free)",
-                            *count,
+                            floors.count,
                             available.unwrap() as f64 / (1u64 << 30) as f64
                         )
                     } else {
@@ -5227,7 +5252,10 @@ impl FloorSlot {
                     }
                 });
                 note_admission_status(None, admitted);
-                *count += 1;
+                if floors.count == 0 {
+                    floors.baseline = available;
+                }
+                floors.count += 1;
                 return Ok(Self {
                     in_flight,
                     released,
@@ -5235,7 +5263,7 @@ impl FloorSlot {
             }
             let waiting = format!(
                 "waiting for a disk slot ({} other floor(s) running, {:.1} GiB free)",
-                *count,
+                floors.count,
                 available.unwrap() as f64 / (1u64 << 30) as f64
             );
             if !logged {
@@ -5246,8 +5274,8 @@ impl FloorSlot {
             let timeout = wait
                 .saturating_sub(started.elapsed())
                 .min(Duration::from_secs(5));
-            count = released
-                .wait_timeout(count, timeout)
+            floors = released
+                .wait_timeout(floors, timeout)
                 .unwrap_or_else(|p| p.into_inner())
                 .0;
         }
@@ -5256,9 +5284,12 @@ impl FloorSlot {
 
 impl Drop for FloorSlot {
     fn drop(&mut self) {
-        let mut count = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        *count -= 1;
-        drop(count);
+        let mut floors = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        floors.count -= 1;
+        if floors.count == 0 {
+            floors.baseline = None;
+        }
+        drop(floors);
         self.released.notify_all();
     }
 }
@@ -11153,10 +11184,11 @@ fn log_cap() -> u64 {
 /// other test.
 #[cfg(test)]
 pub(crate) mod test_seam {
+    use super::FloorSet;
     use std::cell::{Cell, RefCell};
     type Hook = Box<dyn FnOnce()>;
     type Admission = (
-        &'static std::sync::Mutex<usize>,
+        &'static std::sync::Mutex<FloorSet>,
         &'static std::sync::Condvar,
         u64,
         u64,
@@ -11165,7 +11197,7 @@ pub(crate) mod test_seam {
     // using one Condvar with different mutexes can panic on some platforms.
     static ADMISSION_WAKEUPS: std::sync::Mutex<
         Vec<(
-            &'static std::sync::Mutex<usize>,
+            &'static std::sync::Mutex<FloorSet>,
             &'static std::sync::Condvar,
         )>,
     > = std::sync::Mutex::new(Vec::new());
@@ -11181,7 +11213,7 @@ pub(crate) mod test_seam {
     }
     /// Isolate the admission counter and sizes from other floors running in parallel tests.
     pub(super) fn floor_admission(
-        count: &'static std::sync::Mutex<usize>,
+        count: &'static std::sync::Mutex<FloorSet>,
         min_gib: u64,
         peak_gib: u64,
     ) -> FloorAdmission {
@@ -11328,7 +11360,7 @@ pub(crate) mod tests {
 
     #[test]
     fn core_1616_a_waiting_admission_updates_its_floor_now() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let first = FloorSlot::admit(&|| Some(34 << 30), None).unwrap();
         let now = FloorNow::default();
@@ -11349,7 +11381,7 @@ pub(crate) mod tests {
         probed.recv_timeout(Duration::from_secs(10)).unwrap();
         // The probe holds the admission lock; reacquiring it observes the published wait note.
         let count = COUNT.lock().unwrap();
-        assert_eq!(*count, 1, "a waiting floor has no reservation");
+        assert_eq!(count.count, 1, "a waiting floor has no reservation");
         assert_eq!(
             now.lock().unwrap().describe().as_deref(),
             Some("waiting for a disk slot (1 other floor(s) running, 34.0 GiB free)")
@@ -11381,7 +11413,7 @@ pub(crate) mod tests {
 
     #[test]
     fn core_1616_the_wait_cap_is_visible_on_the_floor_now() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let first = FloorSlot::admit(&|| Some(34 << 30), None).unwrap();
         let now = FloorNow::default();
@@ -11408,7 +11440,7 @@ pub(crate) mod tests {
 
     #[test]
     fn core_1616_admission_without_a_wait_records_nothing() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let now = FloorNow::default();
         let slot = with_floor_now(&now, || FloorSlot::admit(&|| Some(40 << 30), None)).unwrap();
@@ -11418,6 +11450,78 @@ pub(crate) mod tests {
         assert_eq!(passes.describe(), None);
         drop(passes);
         drop(slot);
+    }
+
+    #[test]
+    fn core_1617_running_floors_disk_use_reduces_the_reservation_once_per_set() {
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let first = FloorSlot::admit(&|| Some(60 << 30), None).unwrap();
+        let second = FloorSlot::admit(&|| Some(60 << 30), None).unwrap();
+        let now = FloorNow::default();
+        // Of the two floors' 40 GiB reservation, 35 GiB is already reflected in free space.
+        let third = with_floor_now(&now, || {
+            FloorSlot::admit_with_wait(&|| Some(25 << 30), None, Duration::from_millis(100))
+        })
+        .unwrap();
+        assert_eq!(COUNT.lock().unwrap().count, 3);
+        assert_eq!(
+            now.lock().unwrap().describe(),
+            None,
+            "25 GiB covers the 15 GiB minimum plus 5 GiB still reserved; no wait is needed"
+        );
+        drop(third);
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn core_1617_unused_reservations_still_require_a_slot() {
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let first = FloorSlot::admit(&|| Some(34 << 30), None).unwrap();
+        let now = FloorNow::default();
+        let second = with_floor_now(&now, || {
+            FloorSlot::admit_with_wait(&|| Some(34 << 30), None, Duration::from_millis(100))
+        })
+        .unwrap();
+        let passes = now.lock().unwrap();
+        assert!(
+            passes.admitted.as_deref().unwrap().contains("wait cap"),
+            "with no disk use, 34 GiB cannot cover the 15 + 20 GiB requirement"
+        );
+        drop(passes);
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn core_1617_a_new_set_uses_a_fresh_baseline() {
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let first = FloorSlot::admit(&|| Some(60 << 30), None).unwrap();
+        let second = FloorSlot::admit(&|| Some(60 << 30), None).unwrap();
+        drop(first);
+        assert_eq!(COUNT.lock().unwrap().baseline, Some(60 << 30));
+        drop(second);
+        assert_eq!(COUNT.lock().unwrap().count, 0);
+        assert_eq!(COUNT.lock().unwrap().baseline, None);
+
+        let first = FloorSlot::admit(&|| Some(30 << 30), None).unwrap();
+        assert_eq!(COUNT.lock().unwrap().baseline, Some(30 << 30));
+        let now = FloorNow::default();
+        let second = with_floor_now(&now, || {
+            FloorSlot::admit_with_wait(&|| Some(34 << 30), None, Duration::from_millis(100))
+        })
+        .unwrap();
+        let passes = now.lock().unwrap();
+        assert!(
+            passes.admitted.as_deref().unwrap().contains("wait cap"),
+            "free space above the new 30 GiB baseline must not consume the reservation"
+        );
+        drop(passes);
+        drop(second);
+        drop(first);
     }
 
     #[test]
@@ -11440,7 +11544,7 @@ pub(crate) mod tests {
 
     #[test]
     fn core_1560_a_floor_waits_for_a_slot_instead_of_refusing() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let first = FloorSlot::admit(&|| Some(34 << 30), None).expect("the first floor fits");
         let (probing, probed) = std::sync::mpsc::channel();
@@ -11452,7 +11556,7 @@ pub(crate) mod tests {
                 Some(34 << 30)
             };
             let admitted = FloorSlot::admit(&free, None).map(|slot| {
-                assert_eq!(*COUNT.lock().unwrap(), 1);
+                assert_eq!(COUNT.lock().unwrap().count, 1);
                 drop(slot);
             });
             done.send(admitted).unwrap();
@@ -11462,19 +11566,19 @@ pub(crate) mod tests {
             result.recv_timeout(Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        assert_eq!(*COUNT.lock().unwrap(), 1, "a waiter holds no slot");
+        assert_eq!(COUNT.lock().unwrap().count, 1, "a waiter holds no slot");
         drop(first);
         result
             .recv_timeout(Duration::from_secs(2))
             .expect("dropping a slot wakes the waiter before its 5-second poll")
             .expect("the waiting floor must be admitted, never refused");
         waiter.join().unwrap();
-        assert_eq!(*COUNT.lock().unwrap(), 0);
+        assert_eq!(COUNT.lock().unwrap().count, 0);
     }
 
     #[test]
     fn core_1560_a_floor_is_admitted_at_the_wait_deadline() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let first = FloorSlot::admit(&|| Some(34 << 30), None).expect("the first floor fits");
         let started = Instant::now();
@@ -11482,16 +11586,16 @@ pub(crate) mod tests {
             .expect("the deadline admits even while the other floor still holds its slot");
         assert!(started.elapsed() >= Duration::from_secs(1));
         assert!(started.elapsed() < Duration::from_secs(20));
-        assert_eq!(*COUNT.lock().unwrap(), 2);
+        assert_eq!(COUNT.lock().unwrap().count, 2);
         drop(second);
-        assert_eq!(*COUNT.lock().unwrap(), 1);
+        assert_eq!(COUNT.lock().unwrap().count, 1);
         drop(first);
-        assert_eq!(*COUNT.lock().unwrap(), 0);
+        assert_eq!(COUNT.lock().unwrap().count, 0);
     }
 
     #[test]
     fn core_1560_below_minimum_refuses_regardless_of_in_flight_floors() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         for held in [false, true] {
             let first = held.then(|| FloorSlot::admit(&|| Some(34 << 30), None).unwrap());
@@ -11499,15 +11603,15 @@ pub(crate) mod tests {
             let why = refused.err().expect("below the minimum always refuses");
             assert!(why.starts_with("environment:"), "{why}");
             assert!(why.contains("minimum of 15 GiB"), "{why}");
-            assert_eq!(*COUNT.lock().unwrap(), usize::from(held));
+            assert_eq!(COUNT.lock().unwrap().count, usize::from(held));
             drop(first);
         }
-        assert_eq!(*COUNT.lock().unwrap(), 0);
+        assert_eq!(COUNT.lock().unwrap().count, 0);
     }
 
     #[test]
     fn core_1560_a_cancelled_run_stops_waiting_for_a_slot() {
-        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
         const RUN: &str = "core-1560-cancelled-admission";
         clear_floor_cancel(RUN);
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
@@ -11538,9 +11642,13 @@ pub(crate) mod tests {
             .expect_err("a cancelled floor must not be admitted");
         assert_eq!(why, "the run was cancelled: its floor does not start");
         waiter.join().unwrap();
-        assert_eq!(*COUNT.lock().unwrap(), 1, "a refusal must not take a slot");
+        assert_eq!(
+            COUNT.lock().unwrap().count,
+            1,
+            "a refusal must not take a slot"
+        );
         drop(first);
-        assert_eq!(*COUNT.lock().unwrap(), 0);
+        assert_eq!(COUNT.lock().unwrap().count, 0);
     }
 
     #[test]
