@@ -65,6 +65,7 @@ pub(super) fn sweep(
                     &session.benched_seats,
                     now,
                     &|_| {},
+                    Some(&session.id),
                 );
                 reprobes
             }))

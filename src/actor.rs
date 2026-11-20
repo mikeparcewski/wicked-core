@@ -3395,6 +3395,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -3448,6 +3449,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -5169,13 +5171,15 @@ fn ballot_dispatcher(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     container_floor: bool,
+    parent_run_id: Option<&str>,
 ) -> (Arc<dyn Dispatcher + Send + Sync>, Option<&'static str>) {
     if !container_floor {
         return (dispatcher.clone(), Some(crate::decision::BALLOTS_IN_HOST));
     }
-    match dispatcher
-        .with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(runner.clone())))
-    {
+    match dispatcher.with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(
+        runner.clone(),
+        parent_run_id,
+    ))) {
         Some(carried) => (carried, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)),
         None => (dispatcher.clone(), None),
     }
@@ -7956,6 +7960,7 @@ fn apply_step_result(
                             &eligible_registry_roster(&run_roster_keys, &benched_keys),
                             &*runner2,
                             &ctx,
+                            Some(&run_id2),
                         )
                     }));
                     let (decision, analysis) = match result {
@@ -13513,6 +13518,7 @@ fn dispatch_unit_with(
                 let words =
                     rule_instructions_words(&session.problem, &session.intent_amendments, &units);
                 crate::cli_runner::DeliveryRuleCtx {
+                    run_id: run_id.to_string(),
                     db_path: g.db_path,
                     project: session.project_id.clone(),
                     repo: session.repo_ref.clone(),
@@ -16996,6 +17002,8 @@ fn start_send_back(
             1,
             prompt,
         );
+        // (core#1413) The lead's re-plan belongs to the held run.
+        unit.parent_run_id = Some(rid.clone());
         unit.assigned_cli = Some(lead);
         unit.assigned_invocation = Some(invocation);
         let input = StepInput {
@@ -41420,10 +41428,10 @@ mod council_ballot_tests {
         let real: Arc<dyn Dispatcher + Send + Sync> =
             Arc::new(wicked_council::dispatch::RealDispatcher::default());
         let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
-        let (host, at) = ballot_dispatcher(&real, &runner, false);
+        let (host, at) = ballot_dispatcher(&real, &runner, false, None);
         assert!(Arc::ptr_eq(&host, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_HOST));
-        let (carried, at) = ballot_dispatcher(&real, &runner, true);
+        let (carried, at) = ballot_dispatcher(&real, &runner, true, None);
         assert!(!Arc::ptr_eq(&carried, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER));
     }

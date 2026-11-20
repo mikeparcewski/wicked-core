@@ -794,12 +794,13 @@ pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool
 struct SeatRuleJudge<'a> {
     seats: &'a [crate::AgenticCli],
     runner: &'a dyn StepRunner,
+    parent_run_id: Option<&'a str>,
 }
 
 impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
         match self.seats.iter().find(|c| c.key == seat) {
-            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner),
+            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner, self.parent_run_id),
             None => {
                 crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
             }
@@ -1855,6 +1856,7 @@ fn settle_rule_disputes(
 /// (SWAP 6) What the deliver step's rule check needs, resolved on the actor thread (it holds the
 /// store): the rule store, the run's facts, the judge pool and the creators to keep out of it.
 pub(crate) struct DeliveryRuleCtx {
+    pub run_id: String,
     pub db_path: String,
     pub project: Option<String>,
     pub repo: Option<String>,
@@ -1950,6 +1952,7 @@ pub(crate) fn delivery_rule_check(
     let judge = SeatRuleJudge {
         seats: &ctx.pool,
         runner: &*ctx.runner,
+        parent_run_id: Some(&ctx.run_id),
     };
     let report = crate::rule_check::check(
         &crate::rule_check::CheckInput {
@@ -2429,6 +2432,7 @@ fn run_rule_check_with(
     let judge = SeatRuleJudge {
         seats: pool,
         runner,
+        parent_run_id: Some(&input.run_id),
     };
     let mut report = with_floor_heartbeat(
         emit_delta,
@@ -3031,6 +3035,7 @@ pub(crate) fn reprobe_due_benches(
     bench: &[crate::domain::BenchedSeat],
     now: i64,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> (
     Vec<crate::domain::BenchedSeat>,
     Vec<crate::seat_bench::BenchReprobe>,
@@ -3045,7 +3050,7 @@ pub(crate) fn reprobe_due_benches(
                 .iter()
                 .find(|c| c.key == b.cli)
                 .or_else(|| registry.iter().find(|c| c.key == key))?;
-            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner);
+            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner, parent_run_id);
             let r = crate::seat_bench::reprobe_outcome(
                 b,
                 answer.as_deref().map_err(String::as_str),
@@ -4529,6 +4534,7 @@ fn fallback_judge(
     runner: &dyn StepRunner,
     note_refusals: &RefusalSink<'_>,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> FallbackJudge {
     if candidates.is_empty() {
         return FallbackJudge::NoCandidate;
@@ -4574,6 +4580,7 @@ fn fallback_judge(
             excluded,
             std::slice::from_ref(seat),
             runner,
+            parent_run_id,
         );
         note_refusals(&refused);
         match verdict {
@@ -4660,6 +4667,7 @@ fn judge_error_or_fallback(
     runner: &dyn StepRunner,
     note_refusals: &RefusalSink<'_>,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> crate::validator::AgentVerdict {
     // (core#1543) The rotation ran out of INDEPENDENT judges: the ladder continues the same search
     // over the fallback seats; only when it runs out too does the gate hold.
@@ -4710,6 +4718,7 @@ fn judge_error_or_fallback(
         runner,
         note_refusals,
         emit_delta,
+        parent_run_id,
     );
     // The hold names the rotation's own same-provider approvals too, not only the ladder's.
     let preferred_refusals = match &independent {
@@ -5781,6 +5790,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             fallback.bench,
             crate::seat_bench::now_ms(),
             emit_delta,
+            Some(&input.run_id),
         )
     } else {
         (fallback.bench.to_vec(), Vec::new())
@@ -6113,6 +6123,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
@@ -6180,6 +6191,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &excluded,
                         roster,
                         &**runner,
+                        Some(&input.run_id),
                     )
                 });
             // A cold seat's provider was unknown to the monitor pre-check. The exhausted
@@ -6212,6 +6224,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             &excluded,
                             roster,
                             &**runner,
+                            Some(&input.run_id),
                         )
                     });
                 verdict = retried;
@@ -6294,6 +6307,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     &**runner,
                     &note_refusals,
                     emit_delta,
+                    Some(&input.run_id),
                 ),
             })
         };
@@ -6382,6 +6396,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
@@ -6406,6 +6421,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             &excluded,
                             roster,
                             &**runner,
+                            Some(&input.run_id),
                         )
                     });
                 // As on the pinned path, a cold provider observation can undo only the
@@ -6432,6 +6448,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                                 &excluded,
                                 roster,
                                 &**runner,
+                                Some(&input.run_id),
                             )
                         });
                     verdict = retried;
@@ -6480,6 +6497,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                 })
             } else {
@@ -10687,6 +10705,7 @@ mod tests {
             &Gw,
             &noop_refusals,
             noop,
+            None,
         ) {
             FallbackJudge::Answered(av) => {
                 assert_eq!(av.judge_cli.as_deref(), Some("agy"), "{av:?}");
@@ -10709,6 +10728,7 @@ mod tests {
                 &Gw,
                 &noop_refusals,
                 noop,
+                None,
             ),
             FallbackJudge::Failed(_)
         ));
@@ -10783,6 +10803,7 @@ mod tests {
             &runner,
             &noop_refusals,
             noop,
+            None,
         );
         assert!(!v.pass && v.judge_cli.is_none(), "{v:?}");
         assert!(

@@ -64,6 +64,7 @@ mod tests {
             base_skill_ref: None,
             id: format!("u-opapi-{ord}"),
             session_id: "s-opapi".to_string(),
+            parent_run_id: None,
             ord,
             description: desc.to_string(),
             stage: StageKind::Build,
