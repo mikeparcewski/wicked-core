@@ -3682,7 +3682,9 @@ fn sed_may_write(args: &[&str]) -> bool {
         for (at, c) in cluster.char_indices() {
             match c {
                 'n' | 'E' | 'r' | 's' | 'u' | 'z' => continue,
-                'e' | 'l' => {
+                // `l` is not here: BSD sed's `-l` takes no argument while GNU's takes one, so which
+                // word is the script depends on the sed that runs (fails toward "may write").
+                'e' => {
                     let rest = &cluster[at + 1..];
                     let value = if rest.is_empty() {
                         let v = words.get(i).cloned().flatten();
@@ -3692,9 +3694,7 @@ fn sed_may_write(args: &[&str]) -> bool {
                         Some(rest.to_string())
                     };
                     let Some(value) = value else { return true };
-                    if c == 'e' {
-                        scripts.push(value);
-                    }
+                    scripts.push(value);
                     break;
                 }
                 _ => return true, // `i` (in place), `f` (a script file), or unknown
@@ -3710,19 +3710,25 @@ fn sed_may_write(args: &[&str]) -> bool {
     !scripts.iter().all(|s| sed_script_reads_only(s))
 }
 
-/// Whether a word that is not plain can only be a FILE operand: it starts with a literal character
-/// that no expansion, glob or brace can turn into an option (`-i`), a script or another word. A
-/// quoted word counts by its first character inside the quote. Anything else (`$x`, `` `…` ``, `{`,
-/// `*`, `~`, a leading `-`) fails toward "may write".
+/// Whether a word that is not plain can only be a FILE operand: its first character is a literal
+/// no expansion, glob or brace can turn into an option (`-i`), and the shell cannot split it into
+/// more words. Two shapes: a WHOLE double-quoted word (no splitting inside quotes) whose first
+/// character inside is safe, and an UNQUOTED word with no `$`, backtick or quote, whose only
+/// specials are `\\`, globs and braces (they yield words with the same literal prefix). An
+/// unquoted `a$x` or `` a`cmd` `` fails toward "may write": `x=' -i'` splits it into `a` and `-i`,
+/// and GNU sed reads an option after an operand. Anything else (`$x`, `{`, `*`, `~`, a leading `-`)
+/// fails toward "may write" too.
 fn plain_operand_start(raw: &str) -> bool {
-    let inner = raw
-        .strip_prefix('"')
-        .or_else(|| raw.strip_prefix('\''))
-        .unwrap_or(raw);
-    inner
-        .chars()
-        .next()
-        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_'))
+    let safe = |inner: &str| {
+        inner
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_'))
+    };
+    if let Some(inner) = raw.strip_prefix('"').and_then(|r| r.strip_suffix('"')) {
+        return !inner.contains('"') && safe(inner);
+    }
+    !raw.contains(['$', '`', '"', '\'']) && safe(raw)
 }
 
 /// One `sed` argument as the shell hands it over, when that is certain: a word with no quoting or
@@ -8474,6 +8480,9 @@ mod tests {
             &["'s/a/b/'", "C:\\x\\file.rs"],
             &["-n", "1p", "\"/srv/$X/f\""],
             &["-n", "1p", "'f'", "\"./$X\""],
+            &["p", "\"a$x\""],
+            &["p", "C:\\dir\\f"],
+            &["p", "f", "a*", "b{1,2}", "./c\\ d"],
             &["'s/[a-z]*//g'", "f"],
             &["'s/[]x]/y/'", "f"],
             &["-E", "'s/^ +//;s/ +$//'", "f"],
@@ -8493,7 +8502,6 @@ mod tests {
             &["=", "f"],
             &["-nE", "'1~2p'", "f"],
             &["-ne", "'1,40p'", "f"],
-            &["-n", "-l", "80", "'l'", "f"],
             &["--quiet", "--", "'$p'", "f"],
             &["\"1,5p\"", "f"],
         ] {
@@ -8504,6 +8512,17 @@ mod tests {
             &["--in-place=.bak", "s/a/b/", "f"],
             &["-f", "x.sed", "f"],
             &["'s/a/b/w out'", "f"],
+            // `-l` takes an argument on GNU sed and none on BSD sed: which word is the script
+            // depends on the sed that runs, so any `-l` is judged as possibly writing.
+            &["-n", "-l", "80", "'l'", "f"],
+            &["-n", "-l", "'/x/w evil'", "p"],
+            &["-nl", "'/x/w evil'", "p"],
+            // An unquoted word that expands splits (`x=' -i'`), and GNU sed reads an option after
+            // an operand.
+            &["'s/a/b/'", "/outside/file", "a$x"],
+            &["p", "f", "a$(echo", "-i)"],
+            &["p", "f", "a`echo -i`"],
+            &["p", "f", "a'$x'b"],
             &["-n", "1p", "\"$X\""],
             &["-n", "1p", "$X"],
             &["-n", "1p", "{-i,f}"],
@@ -11105,6 +11124,8 @@ mod tests {
             "sed -f /outside/script.sed f",
             "sed -i 'w /outside/x' f",
             "sed -ni p f",
+            "x=' -i'; sed 's/a/b/' /outside/file a$x",
+            "sed -n -l '/x/w evil' p",
             "sed -n '/[/s|]/w evil1||' f",
             "sed 's#[#]#g;s.#w evil2.x.1' f",
         ] {
