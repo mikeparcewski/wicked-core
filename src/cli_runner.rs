@@ -9640,7 +9640,7 @@ mod tests {
                 &run_roster,
                 &[],
                 &[],
-                &[creator.clone()],
+                std::slice::from_ref(&creator),
             );
             let asked = runner.asked.lock().unwrap().clone();
             assert!(
