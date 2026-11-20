@@ -2471,6 +2471,7 @@ impl Filler<'_> {
     /// on success, `Failed(log)` when the install itself failed (the script's exit 3, after its
     /// `WICKED-FILL-START` line) and `reach` answers from the pod, `Err` for anything else (the
     /// cluster, the copy, the deadline, an unreachable registry). The pod goes on every path.
+    #[allow(clippy::too_many_arguments)]
     fn run_install(
         &self,
         tree: &str,
