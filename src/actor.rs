@@ -3494,9 +3494,7 @@ pub(crate) fn run(
                             if s.status != SessionStatus::Executing {
                                 return Ok(None);
                             }
-                            let units = crate::domain::session_units(&store, &run_id)?;
-                            Ok(units
-                                .get(s.unit_ix)
+                            Ok(crate::domain::session_unit_at(&store, &run_id, s.unit_ix)?
                                 .filter(|u| {
                                     matches!(
                                         u.status,
@@ -34428,6 +34426,58 @@ mod live_output_stream_tests {
                 governed: false,
             }
         }
+    }
+
+    /// core#1520 W6: a corrupt running unit must not give the next unit its operator message.
+    #[test]
+    fn inject_refuses_an_undecodable_running_unit_without_queuing() {
+        use crate::domain::{put_nodes, UnitStatus, WorkUnit};
+        use wicked_apps_core::open_store;
+
+        let run_id = format!("inject-corrupt-unit-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db");
+        {
+            let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+            let mut session = super::sessions_detail_fold_tests::session(&run_id);
+            session.status = SessionStatus::Executing;
+            session.unit_ix = 0;
+            let mut first = WorkUnit::pending(format!("{run_id}:u1"), &run_id, 1, "running");
+            first.status = UnitStatus::Distributed;
+            first.assigned_cli = Some("codex".into());
+            let mut corrupt = first.to_node();
+            corrupt
+                .metadata
+                .insert("description".into(), serde_json::json!(false));
+            let mut second = WorkUnit::pending(format!("{run_id}:u2"), &run_id, 2, "next");
+            second.assigned_cli = Some("codex".into());
+            put_nodes(&mut store, &[session.to_node(), corrupt, second.to_node()]).unwrap();
+        } // Release the seed writer before starting the actor.
+        let core = crate::Core::spawn_with_engine(
+            db.to_str().unwrap().to_string(),
+            Arc::new(StubDispatcher),
+            Arc::new(NoopRunner),
+        );
+        let result = core.inject_worker_message(
+            &run_id,
+            "stay on this step",
+            crate::command::InjectTarget::All,
+        );
+        // Drain both possible owners before asserting, so the pre-fix failure leaves no queue.
+        let running = crate::power::take_operator_messages(&run_id, "codex", 1);
+        let next = crate::power::take_operator_messages(&run_id, "codex", 2);
+        let err = result
+            .expect_err("an unreadable running unit must refuse the inject")
+            .to_string();
+        assert!(
+            err.contains("could not tell which step is running") && err.contains("not queued"),
+            "{err}"
+        );
+        assert!(
+            running.is_empty() && next.is_empty(),
+            "no unit may inherit the message"
+        );
     }
 
     #[test]
