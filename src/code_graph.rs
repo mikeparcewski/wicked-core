@@ -75,11 +75,12 @@
 //! upgrade with no live graph: the repo record's finding says so and names the remedy (re-run
 //! onboarding), and the boot logs one such line per affected repo next to the migration notices.
 //!
-//! **Per-key sandbox grants.** A governed worker is granted read+write on EXACTLY its own
-//! `<root>/<key>/` directory (write because opening a WAL-mode SQLite db creates `-wal`/`-shm`/
-//! journal files in its directory) — never the `repo-graphs` root or the state home, because every
-//! OTHER repo's graph lives one sibling over and a worker must not be able to reach it.
-//! [`classify_code_graph_db_at`] is the one shape recogniser both grants key off; a path in the
+//! **Per-key sandbox grants.** A governed worker is granted READ only on EXACTLY its own
+//! `<root>/<key>/` directory — never the `repo-graphs` root or the state home, because every
+//! OTHER repo's graph lives one sibling over and a worker must not be able to reach it. At seat
+//! launch, [`settle_graph_journal`] switches the graph to DELETE journal mode so a read-only open
+//! needs no sidecar writes. A directory write grant would also let a seat replace `estate.db`.
+//! [`classify_code_graph_db_at`] is the shape recogniser the read grant keys off; a path in the
 //! in-tree shape classifies as NOTHING (no grant — the graph is never there). Note the trade: a
 //! graph's file paths still anchor to the repo root the indexer ran over, but the per-key grant
 //! does not include that root — a worker reads source from its own worktree instead.
@@ -220,6 +221,16 @@ pub(crate) const IN_TREE_CODE_GRAPH_DIR: &str = ".codegraph";
 
 /// The filename every code-graph database carries: `<root>/<key>/estate.db`.
 pub(crate) const CODE_GRAPH_DB_FILE: &str = "estate.db";
+
+/// Settle a repo graph once at seat launch, after the engine's writers have closed it. Estate
+/// selects WAL on every read-write open, so this belongs at launch rather than at each writer.
+/// DELETE mode lets the seat read without a directory write grant (core#1602). The caller logs
+/// a failure and continues without retrying; opening an absent graph must not create a new db.
+pub(crate) fn settle_graph_journal(db: &Path) -> rusqlite::Result<String> {
+    let conn =
+        rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))
+}
 
 /// Env var overriding the repo-graph root wholesale — precedence 1 in [`repo_graph_root`] and the
 /// module ADR. TH-8's environment manifest should list it.
@@ -464,12 +475,12 @@ pub(crate) fn has_in_tree_code_graph(repo: &Path) -> bool {
 
 /// Classify an ABSOLUTE graph path against an injected root (pure): `Some(<root>/<key>)` — the
 /// EXACT key directory — for `<root>/<key>/estate.db` whose key segment passes estate's label
-/// rule, `None` for everything else. This is the ONE shape recognition the sandbox grants key off
-/// (`execute_wrapped::repo_read_root` / `graph_write_dir`): relative paths, wrong filenames, a db
-/// directly under the root, a key dir under a DIFFERENT root (an env root that moved since the
-/// path was minted), and the legacy in-tree shape `<repo>/.codegraph/estate.db` all classify as
-/// nothing and grant nothing — taking a parent off an arbitrary path hands a worker an over-broad
-/// root, and a graph is never in the tree (module ADR).
+/// rule, `None` for everything else. This is the ONE shape recognition the sandbox read grant and
+/// launch-time journal settling key off (`execute_wrapped::repo_read_root`): relative paths, wrong
+/// filenames, a db directly under the root, a key dir under a DIFFERENT root (an env root that
+/// moved since the path was minted), and the legacy in-tree shape `<repo>/.codegraph/estate.db`
+/// all classify as nothing and grant nothing — taking a parent off an arbitrary path hands a
+/// worker an over-broad root, and a graph is never in the tree (module ADR).
 pub(crate) fn classify_code_graph_db_at(db: &Path, root: Option<&Path>) -> Option<PathBuf> {
     if !db.is_absolute() || db.file_name().is_none_or(|n| n != CODE_GRAPH_DB_FILE) {
         return None;
@@ -2177,6 +2188,50 @@ mod tests {
                 .unwrap();
         c.query_row("SELECT count(*) FROM t", [], |r| r.get(0))
             .unwrap()
+    }
+
+    #[test]
+    fn settling_a_wal_graph_preserves_rows_for_a_read_only_seat() {
+        let base = scratch("settle-journal");
+        let db = base.join(CODE_GRAPH_DB_FILE);
+        let writer = sqlite_with_rows(&db, 7);
+        // Leave committed rows in the WAL even after dropping the engine's writer. Settling
+        // must recover them before removing the sidecars, with no writer holding the db open.
+        writer
+            .set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+        drop(writer);
+        let wal = base.join(format!("{CODE_GRAPH_DB_FILE}-wal"));
+        let shm = base.join(format!("{CODE_GRAPH_DB_FILE}-shm"));
+        assert!(std::fs::metadata(&wal).unwrap().len() > 0);
+        assert!(shm.exists());
+
+        assert_eq!(settle_graph_journal(&db).unwrap(), "delete");
+        assert!(!wal.exists(), "settling must remove the WAL");
+        assert!(!shm.exists(), "settling must remove shared memory");
+
+        let reader =
+            rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .unwrap();
+        let mode: String = reader
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        let rows: Vec<i64> = reader
+            .prepare("SELECT v FROM t ORDER BY v")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(rows, (0..7).collect::<Vec<i64>>());
+        drop(reader);
+        assert!(!wal.exists(), "a read-only seat must need no WAL");
+        assert!(!shm.exists(), "a read-only seat must need no shared memory");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// The boot-time migration: a registered repo whose graph sits under the legacy estate home and
