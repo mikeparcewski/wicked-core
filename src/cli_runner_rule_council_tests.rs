@@ -500,7 +500,11 @@ fn a_carried_disputes_judge_cannot_arbitrate_after_another_seat_authors_with_its
     input.unit.authored_binaries = vec!["pi".into()];
     let again = FakeCouncil::new("carried-author-bin-2", kept_1);
     let r = settle_with(&input, &judge, "VERDICT: PASS", &again, &pair);
-    assert_eq!(again.convened(), 0, "an author binary equal to the judge is excluded");
+    assert_eq!(
+        again.convened(),
+        0,
+        "an author binary equal to the judge is excluded"
+    );
     assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
     assert!(r.hold().is_some());
 }
@@ -523,7 +527,11 @@ fn a_carried_disputes_arbiter_excludes_a_benched_creators_registered_binary() {
     let live: Vec<crate::AgenticCli> = ["codex", "pi"].into_iter().map(seat).collect();
     let again = FakeCouncil::new("carried-benched-creator-2", kept_1);
     let r = settle_in(&input, &judge, "VERDICT: PASS", &again, &reg, &live);
-    assert_eq!(again.convened(), 0, "benching a creator does not erase its identity");
+    assert_eq!(
+        again.convened(),
+        0,
+        "benching a creator does not erase its identity"
+    );
     assert_eq!(row(&r, "R1").status, RuleStatus::Disputed);
     assert!(r.hold().is_some());
 }
