@@ -3622,13 +3622,9 @@ fn command_contains_write_capable_program(command: &str) -> bool {
 /// ([`sed_script_reads_only`]). `-e` in a cluster takes the cluster's rest, or the next word, as
 /// a script; with no `-e`, the first operand is the script, as sed reads it.
 fn sed_may_write(args: &[&str]) -> bool {
-    let mut words: Vec<String> = Vec::with_capacity(args.len());
-    for a in args {
-        match plain_sed_word(a) {
-            Some(w) => words.push(w),
-            None => return true,
-        }
-    }
+    // A word that is not plain is only tolerated as a FILE operand ([`plain_operand_start`]):
+    // sed writes through its options and script, never through an operand's spelling.
+    let words: Vec<Option<String>> = args.iter().map(|a| plain_sed_word(a)).collect();
     const LONG_FLAGS: [&str; 10] = [
         "--quiet",
         "--silent",
@@ -3642,14 +3638,21 @@ fn sed_may_write(args: &[&str]) -> bool {
         "--sandbox",
     ];
     let mut scripts: Vec<String> = Vec::new();
-    let mut operands: Vec<String> = Vec::new();
+    let mut operands: Vec<Option<String>> = Vec::new();
     let mut options_done = false;
     let mut i = 0;
     while i < words.len() {
-        let w = words[i].as_str();
+        let at = i;
         i += 1;
+        let Some(w) = words[at].as_deref() else {
+            if options_done || plain_operand_start(args[at]) {
+                operands.push(None);
+                continue;
+            }
+            return true;
+        };
         if options_done || w == "-" || !w.starts_with('-') {
-            operands.push(w.to_string());
+            operands.push(Some(w.to_string()));
             continue;
         }
         if w == "--" {
@@ -3665,8 +3668,8 @@ fn sed_may_write(args: &[&str]) -> bool {
                 continue;
             }
             if long == "expression" {
-                match words.get(i) {
-                    Some(v) => scripts.push(v.clone()),
+                match words.get(i).cloned().flatten() {
+                    Some(v) => scripts.push(v),
                     None => return true,
                 }
                 i += 1;
@@ -3682,7 +3685,7 @@ fn sed_may_write(args: &[&str]) -> bool {
                 'e' | 'l' => {
                     let rest = &cluster[at + 1..];
                     let value = if rest.is_empty() {
-                        let v = words.get(i).cloned();
+                        let v = words.get(i).cloned().flatten();
                         i += 1;
                         v
                     } else {
@@ -3700,11 +3703,26 @@ fn sed_may_write(args: &[&str]) -> bool {
     }
     if scripts.is_empty() {
         match operands.first() {
-            Some(script) => scripts.push(script.clone()),
-            None => return true,
+            Some(Some(script)) => scripts.push(script.clone()),
+            _ => return true,
         }
     }
     !scripts.iter().all(|s| sed_script_reads_only(s))
+}
+
+/// Whether a word that is not plain can only be a FILE operand: it starts with a literal character
+/// that no expansion, glob or brace can turn into an option (`-i`), a script or another word. A
+/// quoted word counts by its first character inside the quote. Anything else (`$x`, `` `…` ``, `{`,
+/// `*`, `~`, a leading `-`) fails toward "may write".
+fn plain_operand_start(raw: &str) -> bool {
+    let inner = raw
+        .strip_prefix('"')
+        .or_else(|| raw.strip_prefix('\''))
+        .unwrap_or(raw);
+    inner
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_'))
 }
 
 /// One `sed` argument as the shell hands it over, when that is certain: a word with no quoting or
@@ -8452,6 +8470,10 @@ mod tests {
             &["-n", "1,40p", "f"][..],
             &["s/a/b/", "f"],
             &["-n", "'/[0-9]/p'", "f"],
+            // A non-plain FILE operand (a Windows path, a quoted `$VAR` path) is not a script.
+            &["'s/a/b/'", "C:\\x\\file.rs"],
+            &["-n", "1p", "\"/srv/$X/f\""],
+            &["-n", "1p", "'f'", "\"./$X\""],
             &["'s/[a-z]*//g'", "f"],
             &["'s/[]x]/y/'", "f"],
             &["-E", "'s/^ +//;s/ +$//'", "f"],
@@ -8482,6 +8504,11 @@ mod tests {
             &["--in-place=.bak", "s/a/b/", "f"],
             &["-f", "x.sed", "f"],
             &["'s/a/b/w out'", "f"],
+            &["-n", "1p", "\"$X\""],
+            &["-n", "1p", "$X"],
+            &["-n", "1p", "{-i,f}"],
+            &["-n", "1p", "*"],
+            &["\"s/a/$B/\"", "f"],
             &["-n", "'/[/s|]/w evil1||'", "f"],
             &["'s#[#]#g;s.#w evil2.x.1'", "f"],
             &["'y/[/]/ab/'", "f"],
