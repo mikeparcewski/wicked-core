@@ -1062,10 +1062,8 @@ mod tests {
         // And the rejected transcript record keeps the partial output, flagged.
         let t = get_unit_transcript(&store, "s:review").expect("rejected transcript record");
         assert!(t.partial);
-        assert_eq!(
-            t.output.as_deref(),
-            Some("found AKIAIOSFODNN7EXAMPLE in the config")
-        );
+        // (core#1643) The governed run saw the live output; the stored record cuts the token.
+        assert_eq!(t.output.as_deref(), Some("found *** in the config"));
 
         // CONTROL: the same triggering output under a DIFFERENT phase is untouched. This is what
         // separates the fix from "widen until everything matches" — scoping must still hold.
