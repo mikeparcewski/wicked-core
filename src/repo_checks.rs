@@ -3658,6 +3658,8 @@ impl Drop for PrivateTmp {
 #[derive(Debug, Default)]
 pub(crate) struct FloorPasses {
     started: Vec<(String, Tree, Instant)>,
+    waiting: Option<String>,
+    admitted: Option<String>,
 }
 
 /// The slot one floor's passes are recorded into, shared with its heartbeat thread.
@@ -3717,21 +3719,42 @@ pub(crate) fn note_pass(check: &str, tree: Tree) {
     });
 }
 
+/// Publish disk admission through the same slot the floor's heartbeat reads.
+fn note_admission_status(waiting: Option<String>, admitted: Option<String>) {
+    FLOOR_NOW.with(|c| {
+        if let Some(now) = c.borrow().as_ref() {
+            let mut passes = now.lock().unwrap_or_else(|p| p.into_inner());
+            passes.waiting = waiting;
+            passes.admitted = admitted;
+        }
+    });
+}
+
 impl FloorPasses {
     /// The latest pass, in words: ``now `test` on the base (pass 2 of `test`), 31 min in``.
-    /// `None` before the first pass starts.
+    /// A disk-slot wait takes precedence; its admission stays visible alongside later passes.
     pub(crate) fn describe(&self) -> Option<String> {
-        let (name, tree, at) = self.started.last()?;
+        if let Some(waiting) = &self.waiting {
+            return Some(waiting.clone());
+        }
+        let Some((name, tree, at)) = self.started.last() else {
+            return self.admitted.clone();
+        };
         let pass = self.started.iter().filter(|(n, _, _)| n == name).count();
         let on = match (tree, pass) {
             (Tree::Base, _) => "on the base",
             (Tree::Head, 1) => "on the change",
             (Tree::Head, _) => "on the change again",
         };
-        Some(format!(
+        let mut description = format!(
             "now `{name}` {on} (pass {pass} of `{name}`), {} min in",
             at.elapsed().as_secs() / 60
-        ))
+        );
+        if let Some(admitted) = &self.admitted {
+            description.push_str("; ");
+            description.push_str(admitted);
+        }
+        Some(description)
     }
 }
 
@@ -5191,20 +5214,35 @@ impl FloorSlot {
                 && *count > 0
                 && available.is_some_and(|bytes| bytes < required_gib.saturating_mul(1 << 30));
             if !needs_slot || started.elapsed() >= wait {
+                let admitted = logged.then(|| {
+                    let seconds = started.elapsed().as_secs();
+                    if needs_slot {
+                        format!(
+                            "admitted at the {seconds} s wait cap with {} other floor(s) still running ({:.1} GiB free)",
+                            *count,
+                            available.unwrap() as f64 / (1u64 << 30) as f64
+                        )
+                    } else {
+                        format!("admitted after waiting {seconds} s for a disk slot")
+                    }
+                });
+                note_admission_status(None, admitted);
                 *count += 1;
                 return Ok(Self {
                     in_flight,
                     released,
                 });
             }
+            let waiting = format!(
+                "waiting for a disk slot ({} other floor(s) running, {:.1} GiB free)",
+                *count,
+                available.unwrap() as f64 / (1u64 << 30) as f64
+            );
             if !logged {
-                eprintln!(
-                    "wicked-core: repo checks floor — waiting for a disk slot ({} other floor(s) running, {:.1} GiB free)",
-                    *count,
-                    available.unwrap() as f64 / (1u64 << 30) as f64
-                );
+                eprintln!("wicked-core: repo checks floor — {waiting}");
                 logged = true;
             }
+            note_admission_status(Some(waiting), None);
             let timeout = wait
                 .saturating_sub(started.elapsed())
                 .min(Duration::from_secs(5));
@@ -11263,6 +11301,123 @@ pub(crate) mod tests {
         let leaf = scratch_dir_for(&check_cache_root().unwrap(), wt, None);
         std::fs::create_dir_all(&leaf).unwrap();
         crate::validator::detect_floor_sandbox(&[wt.to_path_buf(), leaf])
+    }
+
+    #[test]
+    fn core_1616_description_shows_waiting_then_admission_with_the_pass() {
+        let waiting = "waiting for a disk slot (1 other floor(s) running, 34.0 GiB free)";
+        let admitted = "admitted after waiting 2 s for a disk slot";
+        let mut passes = FloorPasses {
+            waiting: Some(waiting.into()),
+            ..FloorPasses::default()
+        };
+        assert_eq!(passes.describe().as_deref(), Some(waiting));
+        passes.waiting = None;
+        passes.admitted = Some(admitted.into());
+        assert_eq!(passes.describe().as_deref(), Some(admitted));
+        passes
+            .started
+            .push(("test".into(), Tree::Head, Instant::now()));
+        assert_eq!(
+            passes.describe().unwrap(),
+            format!("now `test` on the change (pass 1 of `test`), 0 min in; {admitted}")
+        );
+        passes.waiting = Some(waiting.into());
+        assert_eq!(passes.describe().as_deref(), Some(waiting));
+    }
+
+    #[test]
+    fn core_1616_a_waiting_admission_updates_its_floor_now() {
+        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let first = FloorSlot::admit(&|| Some(34 << 30), None).unwrap();
+        let now = FloorNow::default();
+        let waiting_now = std::sync::Arc::clone(&now);
+        let (probing, probed) = std::sync::mpsc::channel();
+        let (done, result) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+            let free = || {
+                probing.send(()).unwrap();
+                Some(34 << 30)
+            };
+            let admitted = with_floor_now(&waiting_now, || {
+                FloorSlot::admit_with_wait(&free, None, Duration::from_secs(30))
+            });
+            done.send(admitted.map(drop)).unwrap();
+        });
+        probed.recv_timeout(Duration::from_secs(10)).unwrap();
+        // The probe holds the admission lock; reacquiring it observes the published wait note.
+        let count = COUNT.lock().unwrap();
+        assert_eq!(*count, 1, "a waiting floor has no reservation");
+        assert_eq!(
+            now.lock().unwrap().describe().as_deref(),
+            Some("waiting for a disk slot (1 other floor(s) running, 34.0 GiB free)")
+        );
+        assert!(matches!(
+            result.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
+        drop(count);
+        drop(first);
+        result
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        waiter.join().unwrap();
+        let passes = now.lock().unwrap();
+        assert_eq!(passes.waiting, None);
+        let admitted = passes
+            .admitted
+            .as_deref()
+            .expect("admission records the wait");
+        assert!(
+            admitted.starts_with("admitted after waiting "),
+            "{admitted}"
+        );
+        assert!(admitted.ends_with(" s for a disk slot"), "{admitted}");
+        assert_eq!(passes.describe().as_deref(), Some(admitted));
+    }
+
+    #[test]
+    fn core_1616_the_wait_cap_is_visible_on_the_floor_now() {
+        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let first = FloorSlot::admit(&|| Some(34 << 30), None).unwrap();
+        let now = FloorNow::default();
+        let second = with_floor_now(&now, || {
+            FloorSlot::admit_with_wait(&|| Some(34 << 30), None, Duration::from_millis(100))
+        })
+        .unwrap();
+        let passes = now.lock().unwrap();
+        assert_eq!(passes.waiting, None);
+        let admitted = passes
+            .admitted
+            .as_deref()
+            .expect("the cap records admission");
+        assert!(admitted.starts_with("admitted at the "), "{admitted}");
+        assert!(
+            admitted.ends_with(" s wait cap with 1 other floor(s) still running (34.0 GiB free)"),
+            "{admitted}"
+        );
+        assert_eq!(passes.describe().as_deref(), Some(admitted));
+        drop(passes);
+        drop(second);
+        drop(first);
+    }
+
+    #[test]
+    fn core_1616_admission_without_a_wait_records_nothing() {
+        static COUNT: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+        let _admission = test_seam::floor_admission(&COUNT, 15, 20);
+        let now = FloorNow::default();
+        let slot = with_floor_now(&now, || FloorSlot::admit(&|| Some(40 << 30), None)).unwrap();
+        let passes = now.lock().unwrap();
+        assert_eq!(passes.waiting, None);
+        assert_eq!(passes.admitted, None);
+        assert_eq!(passes.describe(), None);
+        drop(passes);
+        drop(slot);
     }
 
     #[test]
