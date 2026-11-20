@@ -388,7 +388,16 @@ pub(crate) fn snapshot_through(
     worktree: &Path,
     git_dir: &Path,
 ) -> anyhow::Result<WorktreeSnapshot> {
-    let pinned: [(&str, &Path); 2] = [("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    snapshot_through_inner(worktree, git_dir, &[])
+}
+
+fn snapshot_through_inner(
+    worktree: &Path,
+    git_dir: &Path,
+    extra_env: &[(&str, &Path)],
+) -> anyhow::Result<WorktreeSnapshot> {
+    let mut pinned = vec![("GIT_DIR", git_dir), ("GIT_WORK_TREE", worktree)];
+    pinned.extend_from_slice(extra_env);
     let head = git_string(
         worktree,
         &["rev-parse", "--verify", "--quiet", "HEAD"],
@@ -399,7 +408,7 @@ pub(crate) fn snapshot_through(
     let head_ref = git_string(worktree, &["symbolic-ref", "-q", "HEAD"], &pinned)
         .ok()
         .filter(|r| !r.is_empty());
-    let tmp_index = scratch_index_path();
+    let tmp_index = plain_path(scratch_index_path());
     // A stale scratch file from a crashed run would seed the index — refuse to start from one.
     let _ = std::fs::remove_file(&tmp_index);
     // The engine scratch is excluded through git's own exclude mechanism — a scratch excludes
@@ -410,11 +419,8 @@ pub(crate) fn snapshot_through(
     let excludes = tmp_index.with_extension("exclude");
     std::fs::write(&excludes, format!("/{ENGINE_SCRATCH_DIR}/\n"))?;
     let excludes_arg = format!("core.excludesFile={}", excludes.display());
-    let env: [(&str, &Path); 3] = [
-        ("GIT_DIR", git_dir),
-        ("GIT_WORK_TREE", worktree),
-        ("GIT_INDEX_FILE", tmp_index.as_path()),
-    ];
+    let mut env = pinned;
+    env.push(("GIT_INDEX_FILE", tmp_index.as_path()));
     let result = (|| -> anyhow::Result<String> {
         // Seed from HEAD's tree so committed-but-ignored paths stay tracked (see above). On an
         // unborn branch there is nothing to seed: `add -A` builds the index from scratch.
@@ -466,6 +472,46 @@ pub(crate) fn snapshot_through(
 pub fn snapshot(worktree: &Path, repo_root: &Path) -> anyhow::Result<WorktreeSnapshot> {
     let git_dir = pinned_git_dir(worktree, repo_root)?;
     snapshot_through(worktree, &git_dir)
+}
+
+/// The same content tree as [`snapshot_through`], without writing into the repository's object
+/// store. New blobs and trees live only in a per-call scratch directory; existing objects are
+/// read through the COMMON git directory, including for a linked worktree's pinned git dir.
+pub(crate) fn snapshot_tree_readonly(worktree: &Path, git_dir: &Path) -> anyhow::Result<String> {
+    let worktree = plain_path(worktree.to_path_buf());
+    let git_dir = plain_path(git_dir.to_path_buf());
+    let common = git_string(
+        &worktree,
+        &["rev-parse", "--git-common-dir"],
+        &[
+            ("GIT_DIR", git_dir.as_path()),
+            ("GIT_WORK_TREE", worktree.as_path()),
+        ],
+    )?;
+    // rev-parse may return a relative path, relative to the command's working directory.
+    let objects = plain_path(std::fs::canonicalize(
+        worktree.join(common).join("objects"),
+    )?);
+    let temporary_objects = plain_path(scratch_index_path().with_extension("objects"));
+    std::fs::create_dir(&temporary_objects)?;
+    let result = snapshot_through_inner(
+        &worktree,
+        &git_dir,
+        &[
+            ("GIT_OBJECT_DIRECTORY", temporary_objects.as_path()),
+            ("GIT_ALTERNATE_OBJECT_DIRECTORIES", objects.as_path()),
+        ],
+    )
+    .map(|snapshot| snapshot.tree);
+    // Remove newly written objects on success AND on any snapshot error.
+    let _ = std::fs::remove_dir_all(&temporary_objects);
+    result
+}
+
+/// Read-only content tree pinned to the registered repository, as [`snapshot`] pins its snapshot.
+pub(crate) fn snapshot_readonly(worktree: &Path, repo_root: &Path) -> anyhow::Result<String> {
+    let git_dir = pinned_git_dir(worktree, repo_root)?;
+    snapshot_tree_readonly(worktree, &git_dir)
 }
 
 /// (F-7R2-005, wave 6) Did the worktree's CONTENT change since `baseline`? Re-snapshots through
@@ -995,7 +1041,7 @@ pub(crate) fn denial_reason(unit: &crate::domain::WorkUnit, m: &WorktreeMutation
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::domain::WorkUnit;
 
@@ -1049,6 +1095,7 @@ mod tests {
         );
         let snap = snapshot(&wt, &repo).expect("snapshot");
         assert!(!snap.tree.is_empty());
+        assert_eq!(snapshot_readonly(&wt, &repo).unwrap(), snap.tree);
         assert!(
             !marker.exists(),
             "a repository hook ran during the snapshot: {:?}",
@@ -1059,7 +1106,7 @@ mod tests {
     /// A repo with one commit and a linked worktree on `wicked/<tag>` — the engine's real layout —
     /// with the creator's work left UNCOMMITTED in it (one tracked modification, one new file),
     /// exactly the state a `verify` phase inherits.
-    fn creator_worktree(tag: &str) -> PathBuf {
+    pub(crate) fn creator_worktree(tag: &str) -> PathBuf {
         let base = scratch(tag);
         let repo = base.join("repo");
         std::fs::create_dir_all(repo.join("src")).unwrap();
@@ -1100,6 +1147,79 @@ mod tests {
     /// The registered repository a [`creator_worktree`] was linked from.
     fn repo_of(wt: &Path) -> PathBuf {
         wt.parent().unwrap().join("repo")
+    }
+
+    /// Include every object file's relative path AND bytes, including packed objects and info.
+    fn object_files(objects: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(
+            root: &Path,
+            dir: &Path,
+            files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, files);
+                } else {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        std::fs::read(&path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut files = std::collections::BTreeMap::new();
+        collect(objects, objects, &mut files);
+        files
+    }
+
+    #[test]
+    fn readonly_snapshot_matches_without_writing_objects_or_indexes() {
+        for linked in [false, true] {
+            let wt = creator_worktree(if linked {
+                "readonly-linked"
+            } else {
+                "readonly-main"
+            });
+            let repo = repo_of(&wt);
+            let worktree = if linked { &wt } else { &repo };
+            run_git(worktree, &["reset", "--hard", "HEAD"]);
+            run_git(worktree, &["clean", "-fd"]);
+            let git_dir = pinned_git_dir(worktree, &repo).unwrap();
+            let objects = repo.join(".git/objects");
+            for state in ["clean", "modified", "untracked", "deleted"] {
+                match state {
+                    "modified" => {
+                        std::fs::write(worktree.join("src/a.ts"), "changed after HEAD\n").unwrap();
+                        // Committed-but-ignored paths must stay tracked in both modes.
+                        std::fs::write(worktree.join("config/settings.local.json"), "{}\n")
+                            .unwrap();
+                    }
+                    "untracked" => {
+                        std::fs::write(worktree.join("src/new.ts"), "new content\n").unwrap();
+                    }
+                    "deleted" => std::fs::remove_file(worktree.join("src/a.ts")).unwrap(),
+                    _ => {}
+                }
+                let before = object_files(&objects);
+                let index = std::fs::read(git_dir.join("index")).unwrap();
+                let main_index = std::fs::read(repo.join(".git/index")).unwrap();
+                let readonly = snapshot_tree_readonly(worktree, &git_dir).unwrap();
+                assert_eq!(snapshot_readonly(worktree, &repo).unwrap(), readonly);
+                assert_eq!(object_files(&objects), before, "{linked}/{state}: objects");
+                assert_eq!(std::fs::read(git_dir.join("index")).unwrap(), index);
+                assert_eq!(std::fs::read(repo.join(".git/index")).unwrap(), main_index);
+                assert_eq!(snapshot(worktree, &repo).unwrap().tree, readonly);
+                if state == "modified" {
+                    assert_ne!(
+                        object_files(&objects),
+                        before,
+                        "ordinary snapshot adds objects"
+                    );
+                }
+            }
+            std::fs::remove_dir_all(wt.parent().unwrap()).unwrap();
+        }
     }
 
     fn guarded_unit() -> WorkUnit {

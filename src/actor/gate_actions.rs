@@ -224,9 +224,8 @@ fn plan_actions(cursor: Option<&WorkUnit>, ord: u32, rev: Option<u32>) -> GateAc
 /// A consent gate's answers (core#820): every ordinary answer the decision path's checks take
 /// (approve = the plan's default; send back, an intent amendment, …), each of the dry-run plan's
 /// choices after the approve, and reject. An Apps publish's consent takes only reject until it can
-/// produce (the publish QE backstop) — judged on the QE record's own tree: the current tree's
-/// snapshot writes git objects, which this read never does, so a tree changed since the QE PASS is
-/// refused when the answer arrives (wicked-core#1534).
+/// produce (the publish QE backstop), judged on the current worktree's tree just as the decision
+/// path judges it. The snapshot confines new git objects to temporary storage (wicked-core#1534).
 fn consent_actions(
     store: &dyn GraphStore,
     session: &AgentSession,
@@ -236,12 +235,8 @@ fn consent_actions(
 ) -> anyhow::Result<Vec<GateAction>> {
     let reject = act("reject", "stop", NoteRule::None);
     if crate::apps::is_publish(session) {
-        let reviewed = units
-            .iter()
-            .find(|u| crate::qe_acceptance::is_qe_unit(u) && u.tool_cmd.is_none())
-            .and_then(|u| u.qe_review.as_ref())
-            .and_then(|r| r.tree.clone());
-        if crate::apps::publish_consent_refusal(session, units, reviewed.as_deref()).is_some() {
+        let current = super::current_worktree_tree_readonly(store, session);
+        if crate::apps::publish_consent_refusal(session, units, current.as_deref()).is_some() {
             return Ok(vec![reject]);
         }
     }
@@ -545,7 +540,115 @@ fn approve_intent(
 
 #[cfg(test)]
 mod tests {
-    use super::approve_intent;
+    use super::*;
+    use wicked_apps_core::ToNode;
+
+    /// A publish's choices must describe the tree the engine will judge when answered.
+    #[test]
+    fn publish_consent_offers_only_reject_after_the_reviewed_tree_changes() {
+        let wt = crate::worktree_guard::tests::creator_worktree("publish-consent-tree");
+        let repo = wt.parent().unwrap().join("repo");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let registered = crate::repo::register_repo(
+            &mut store,
+            crate::repo::RepoSpec {
+                name: "publish-consent-tree".into(),
+                root_path: repo.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let run_id = "publish-consent-tree";
+        let mut session = crate::actor::sessions_detail_fold_tests::session(run_id);
+        let declared =
+            crate::catalog::builtin_preset_instruments(crate::apps::APPS_PUBLISH).unwrap();
+        session.assurance = crate::apps::contract(
+            crate::assurance::RunAssurance::new(Some(&declared), false),
+            Some(crate::apps::AppsContract {
+                preset: crate::apps::APPS_PUBLISH.into(),
+            }),
+            &crate::assurance::QeOverride::Auto,
+        )
+        .unwrap();
+        session.workdir = Some(wt.to_string_lossy().into_owned());
+        session.repo_ref = Some(registered.id);
+        session.unit_ix = 2;
+        crate::domain::put_node(&mut store, session.to_node()).unwrap();
+        let mut plan = WorkUnit::pending(format!("{run_id}:plan"), run_id, 1, "plan");
+        plan.status = crate::domain::UnitStatus::Done;
+        plan.tool_cmd = Some(vec!["unused".into()]);
+        crate::domain::put_node(&mut store, plan.to_node()).unwrap();
+        let outcome = crate::execute::apply_unit(
+            &mut store,
+            &plan,
+            r#"{"dry_run":true,"choices":[{"id":"site","label":"Publish site","default":true}]}"#,
+            &session.workflow_id,
+            crate::scope::EntityMode::Shared,
+            run_id,
+            None,
+            0,
+        )
+        .unwrap();
+        assert!(outcome.approved);
+        let mut qe = WorkUnit::pending(format!("{run_id}:qe"), run_id, 2, "qe");
+        qe.repo_checks_floor = true;
+        qe.role = crate::workflow::PhaseRole::Evaluator;
+        qe.status = crate::domain::UnitStatus::Done;
+        qe.assigned_cli = Some("claude".into());
+        qe.qe_acceptance = session.assurance.qe.clone();
+        let tree = crate::worktree_guard::snapshot(&wt, &repo).unwrap().tree;
+        qe.qe_review = Some(crate::domain::QeReview {
+            outcome: crate::qe_acceptance::review::OUTCOME_PASS.into(),
+            reason: "PASS".into(),
+            evidence_dir: Some("/ev/qe-1".into()),
+            qe_run_id: Some("qe-1".into()),
+            tree: Some(tree.clone()),
+            verdict: Some("PASS".into()),
+            attempts: vec![crate::domain::QeReviewAttempt {
+                seat: "codex".into(),
+                basis: crate::qe_acceptance::review::BASIS_DISTINCT.into(),
+                same_cli: false,
+                status: "verdict".into(),
+                session: "nonce".into(),
+                governed: true,
+                tool_activity: false,
+                attempt: 0,
+            }],
+        });
+        let mut produce = WorkUnit::pending(format!("{run_id}:produce"), run_id, 3, "produce");
+        produce.gate = crate::workflow::GateSpec::ConsentBefore;
+        produce.tool_cmd = Some(vec!["unused".into()]);
+        produce.depends_on = vec!["plan".into()];
+        for unit in [&qe, &produce] {
+            crate::domain::put_node(&mut store, unit.to_node()).unwrap();
+        }
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let offered = || {
+            consent_actions(&store, &session, &units, 3, super::super::CONSENT_GATE_KIND)
+                .unwrap()
+                .into_iter()
+                .map(|a| a.action)
+                .collect::<Vec<_>>()
+        };
+        let unchanged = offered();
+        assert!(unchanged.iter().any(|a| a == "approve"), "{unchanged:?}");
+        assert!(
+            unchanged.iter().any(|a| a == "consent:site"),
+            "{unchanged:?}"
+        );
+        assert!(unchanged.iter().any(|a| a == "reject"), "{unchanged:?}");
+
+        std::fs::write(wt.join("src/a.ts"), "changed after QE PASS\n").unwrap();
+        assert_ne!(
+            crate::worktree_guard::snapshot(&wt, &repo).unwrap().tree,
+            tree
+        );
+        assert_eq!(offered(), ["reject"]);
+        // An unreadable current tree must also fail closed with the same QE PASS present.
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert_eq!(offered(), ["reject"]);
+        std::fs::remove_dir_all(repo.parent().unwrap()).unwrap();
+    }
 
     /// A failed step's gate (triage could not apply its flag, or escalated) re-runs the step.
     #[test]
