@@ -44,13 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **Floor disk admission waits for a slot while other floors run (core#1560).** Below the free-space
-  minimum plus 20 GiB per in-flight floor (`WICKED_FLOOR_PEAK_GB`), admission waits for a slot release
-  and periodically rechecks free space. `WICKED_FLOOR_ADMIT_WAIT_S` bounds the wait (default 900 seconds,
-  maximum 3600); at the deadline the floor is admitted anyway. Only free space below the minimum
-  (`WICKED_FLOOR_MIN_FREE_GB`) causes a disk refusal; `0` turns the guard and wait off. Cancellation
-  stops a waiting floor. Slots span retry passes and cleanup, and every release wakes waiting floors.
-
+- **Tests account for container-floor limits and actor ordering (core#1489).** Gate the voice hand-off test on an armable floor, check the send-back draft's held state without a render jail, flush ask events with Ping, and await shutdown subscriber disconnection directly.
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.

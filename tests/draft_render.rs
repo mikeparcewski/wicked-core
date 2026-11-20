@@ -379,11 +379,12 @@ fn review_ctx(r: &Run) -> Vec<(String, String)> {
 }
 
 /// Whether this host has no render jail (Windows, Linux without a usable bwrap): the step records
-/// `unjailed_host` and the run still completes; the one condition under which these tests stop early.
-fn unjailed(r: &Run) -> bool {
+/// `unjailed_host`. The send-back review still reads and fails the 3-page draft, holding the run at
+/// the human gate; the other runs complete. Check that expected shape before stopping early.
+fn unjailed(r: &Run, completes: bool) -> bool {
     let rec = record(r);
     if rec.cause.as_deref() == Some("unjailed_host") {
-        assert!(completed(&r.events), "{:?}", types(&r.events));
+        assert_eq!(completed(&r.events), completes, "{:?}", types(&r.events));
         assert!(
             !(cfg!(target_os = "macos")
                 && wicked_core::sandbox_availability().0 == SandboxLevel::Sandboxed),
@@ -400,7 +401,7 @@ fn unjailed(r: &Run) -> bool {
 fn a_measured_draft_completes_and_the_review_cites_the_engines_count() {
     let text = "<!doctype html><p>MODE:MEASURED PAGES:2</p>";
     let r = run("measured", &[text]);
-    if unjailed(&r) {
+    if unjailed(&r, true) {
         return;
     }
     assert!(completed(&r.events), "{:?}", types(&r.events));
@@ -454,7 +455,7 @@ fn an_unmeasured_draft_is_recorded_honestly_and_the_run_completes() {
         ("badreport", "<p>MODE:NONE</p>", "bad_report"),
     ] {
         let r = run(name, &[text]);
-        if unjailed(&r) {
+        if unjailed(&r, true) {
             return;
         }
         assert!(completed(&r.events), "{name}: {:?}", types(&r.events));
@@ -486,7 +487,7 @@ fn a_send_back_re_measures_the_reworked_draft() {
     let v1 = "<p>MODE:MEASURED PAGES:3</p>";
     let v2 = "<p>MODE:MEASURED PAGES:1</p>";
     let mut r = run("sendback", &[v1, v2]);
-    if unjailed(&r) {
+    if unjailed(&r, false) {
         return;
     }
     assert!(
