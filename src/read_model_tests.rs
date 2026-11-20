@@ -220,8 +220,19 @@ fn once_the_actor_takes_shutdown_no_read_is_answered_off_it() {
     let events = core.subscribe();
     core.shutdown_for_test();
     // Queued Ping replies drop before subscribers during shutdown, so wait for disconnection
-    // itself. The floor's test timeout bounds a hang without timing the actor's cleanup here.
-    while events.recv().is_ok() {}
+    // itself. The deadline only exists to fail a hung actor with a clear message; it never
+    // decides a pass.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        match events.recv_timeout(Duration::from_secs(1)) {
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Ok(_) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                Instant::now() < deadline,
+                "the actor never dropped its subscribers after Shutdown (60 s)"
+            ),
+        }
+    }
     assert!(
         core.sessions().is_err(),
         "a stopped actor's reads fail, as before"
