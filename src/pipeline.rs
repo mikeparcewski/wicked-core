@@ -2270,6 +2270,10 @@ pub(crate) fn apply_and_finish_unit(
             // same tree was carried); a refused, missing or empty report is a skip.
             checks: match evidence.repo_checks.as_ref().or(carried.as_ref()) {
                 Some(r) if !r.checks.is_empty() => Some(Ok(())),
+                Some(r) if r.environment_refusal().is_some() => Some(Err((
+                    crate::assurance::SKIP_ERROR,
+                    r.sandbox_error.clone(),
+                ))),
                 Some(r) if r.sandbox_error.is_some() => Some(Err((
                     crate::assurance::SKIP_NO_BOUNDARY,
                     r.sandbox_error.clone(),
