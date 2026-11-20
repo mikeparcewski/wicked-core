@@ -440,6 +440,9 @@ pub(crate) enum FloorUnarmed {
     /// arm only, which no Windows host reaches (the k8s module allows its dead code there).
     #[cfg_attr(not(unix), allow(dead_code))]
     CopyInRefused,
+    /// Kubernetes runner: a partial clone lacks objects needed for the seat's recent history.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    PartialClone,
 }
 
 impl FloorUnarmed {
@@ -573,6 +576,14 @@ impl FloorUnarmed {
                 "copy_in_refused: the unit's files could not be copied into its seat (more than \
                  the copy-in stream carries, too many files, or a file that cannot be read)"
             }
+            FloorUnarmed::PartialClone => {
+                "partial_clone: the repository is a partial clone (cloned with --filter) and \
+                 objects of its recent history were never fetched, so the seat's copy of its \
+                 history cannot be made — the engine does not fetch them: in the repository run \
+                 `git config --unset remote.<name>.partialclonefilter` and \
+                 `git fetch --refetch <name>` (<name> is the remote marked promisor, usually \
+                 origin), or clone it again without --filter, then retry"
+            }
         }
     }
 
@@ -607,6 +618,7 @@ impl FloorUnarmed {
             FloorUnarmed::ExecStreamLost => "exec_stream_lost",
             FloorUnarmed::PidsUnlimited => "pids_unlimited",
             FloorUnarmed::CopyInRefused => "copy_in_refused",
+            FloorUnarmed::PartialClone => "partial_clone",
         }
     }
 }
@@ -796,6 +808,14 @@ pub(crate) fn floor_refusal_text(cli: &str, why: FloorUnarmed) -> String {
         return format!(
             "({agent} is signed out: sign it in (Agents → Sign in), then retry — its seat \
              '{cli}' could not run this unit: {})",
+            why.describe()
+        );
+    }
+    if why == FloorUnarmed::PartialClone {
+        return format!(
+            "(seat '{cli}' could not run this governed unit: its seat container did not arm — {}; \
+             the unit is refused rather than run outside the floor (fail closed) — every seat \
+             copies the same repository, so fix it, then retry)",
             why.describe()
         );
     }
@@ -1837,6 +1857,14 @@ esac
         // Every other refusal keeps its floor wording.
         let other = floor_refusal_text("agy", FloorUnarmed::NoSeatImage);
         assert!(other.starts_with("(seat 'agy' could not run"), "{other}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_partial_clone_refusal_says_to_fix_the_shared_repository() {
+        let text = floor_refusal_text("pi", FloorUnarmed::PartialClone);
+        assert!(text.contains("did not arm — partial_clone"), "{text}");
+        assert!(!text.contains("fail over"), "{text}");
     }
 
     fn git(dir: &Path, args: &[&str]) {
