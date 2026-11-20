@@ -119,6 +119,7 @@ pub(crate) struct ProbeInputs {
     pub(crate) repo_id: String,
     pub(crate) repo_root: String,
     pub(crate) code_graph_db: String,
+    pub(crate) graph_key: String,
 }
 
 impl ProbeInputs {
@@ -128,6 +129,7 @@ impl ProbeInputs {
             repo_id: repo.id.clone(),
             repo_root: repo.root_path.clone(),
             code_graph_db: repo.code_graph_db.clone(),
+            graph_key: repo.graph_key.clone(),
         }
     }
 }
@@ -245,6 +247,7 @@ fn run(seq: u64, job: ProbeJob) -> DispatchProbe {
                 &job.session,
                 job.unit.ord,
                 Some(&root),
+                Some(&job.repo.graph_key),
                 Some((b.tree.as_str(), Path::new(g))),
             ),
         }),

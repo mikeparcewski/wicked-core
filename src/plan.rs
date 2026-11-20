@@ -3141,6 +3141,7 @@ mod tests {
     }
 
     fn repo_at(id: &str, root: &str) -> crate::repo::RepoEntry {
+        let graph_key = crate::code_graph::mint_repo_graph_key(id);
         crate::repo::RepoEntry {
             id: id.to_string(),
             name: id.to_string(),
@@ -3149,9 +3150,10 @@ mod tests {
             registered_at: 0,
             // Through the engine's ONE resolver, never a hand-join — a second spelling here is
             // exactly the FINDING-069 drift this fixture exists to test against.
-            code_graph_db: crate::code_graph::resolved_code_graph_db(std::path::Path::new(root))
+            code_graph_db: crate::code_graph::resolved_code_graph_db(&graph_key)
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default(),
+            graph_key,
             findings: Vec::new(),
         }
     }

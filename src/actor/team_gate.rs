@@ -2827,13 +2827,13 @@ pub(super) fn apply_review(
 
 // ── T4: re-plan (DES-TEAMING-002 §8.7) ───────────────────────────────────────────────────────────
 
-/// The run's repo root, for the graph a score reads.
-fn repo_root(store: &dyn GraphStore, session: &AgentSession) -> Option<PathBuf> {
+/// The run's persisted graph key, for the graph a score reads.
+fn graph_key_for_run(store: &dyn GraphStore, session: &AgentSession) -> Option<String> {
     session
         .repo_ref
         .as_deref()
         .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
-        .map(|r| PathBuf::from(r.root_path))
+        .map(|r| r.graph_key)
 }
 
 /// (T4) The supervisor's diff measurement (`Command::TeamRescored`): score it against the run's
@@ -2858,13 +2858,13 @@ pub(super) fn on_rescored(
     {
         return Ok(());
     }
-    let root = repo_root(&*store, &session);
+    let graph_key = graph_key_for_run(&*store, &session);
     let Some(tp) = session.team_plan.as_ref().filter(|t| t.accepted_rev > 0) else {
         return Ok(());
     };
     let scored = crate::plan_gate::diff_score_for_run(
         paths,
-        root.as_deref(),
+        graph_key.as_deref(),
         session.base_commit.as_deref(),
     );
     let score = scored.assessment.score;
@@ -3080,7 +3080,7 @@ pub(super) fn apply_scope(
     }) {
         return Ok(());
     }
-    let root = repo_root(&*store, &session);
+    let graph_key = graph_key_for_run(&*store, &session);
     let now = crate::interaction::now_millis();
     // (program DES-POWER-MODE) INTAKE: the scope step was also the QE plan. Its RIGOR line can
     // only raise the score the plan is decided on, and may keep `design` / `test_plan` phased.
@@ -3106,7 +3106,7 @@ pub(super) fn apply_scope(
         &pa_seat(&session),
         scope.ord,
         scope.last_attempt.unwrap_or(0),
-        root.as_deref(),
+        graph_key.as_deref(),
         session.base_commit.as_deref(),
         // (round 2, M1) T4's diff re-score runs only for a teamed run (the supervisor measures
         // the settled diff); an un-teamed repo run's declared scope would never be corrected.
@@ -3495,11 +3495,11 @@ pub(super) fn apply_held_revision(
     // (rev 15, ASK-K2b) A PA change that crosses into work is scored as an intent score against
     // the run's graph: the actor hands the scope (it holds the session; `revise` stays pure).
     let scope = crate::plan_gate::ScoreScope {
-        repo_root: session
+        graph_key: session
             .repo_ref
             .as_deref()
             .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-            .map(|r| std::path::PathBuf::from(r.root_path)),
+            .map(|r| r.graph_key),
         base_commit: session.base_commit.clone(),
     };
     for l in &prior.plan_lines {

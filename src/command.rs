@@ -566,13 +566,13 @@ pub(crate) enum Command {
         reply: Sender<anyhow::Result<Option<crate::RunTeamView>>>,
     },
     /// (DES-TEAMING-002 T8 (e)) Preview a launch plan: the launch's plan resolution, precheck,
-    /// score (against `repo_root` at `base_commit`, resolved by the caller off the actor), floor
+    /// score (using `graph_key` at `base_commit`, resolved by the caller off the actor), floor
     /// fill, approval matrix and def checks — nothing persisted or published.
     PreviewPlan {
         plan: crate::plan::PlanSteps,
         project_id: Option<String>,
         repo_ref: Option<String>,
-        repo_root: Option<std::path::PathBuf>,
+        graph_key: Option<String>,
         base_commit: Option<String>,
         deliver_step: Option<crate::plan::PlanStep>,
         human_confirm: crate::domain::HumanConfirm,

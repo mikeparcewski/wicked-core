@@ -399,7 +399,7 @@ pub(crate) const NO_DIFF_RESCORE: &str = "no diff re-score on an un-teamed run";
 /// recorded as the proposal's touch set). A repo-less run's `RISK` has no diff to correct.
 pub(crate) fn scope_score(
     hold: &ScopeHold,
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
     diff_rescored: bool,
 ) -> (Scored, Option<Vec<String>>) {
@@ -424,7 +424,7 @@ pub(crate) fn scope_score(
                 floor_override: None,
             };
             (
-                super::intent_score_for_run(&plan, repo_root, base_commit),
+                super::intent_score_for_run(&plan, graph_key, base_commit),
                 Some(touch),
             )
         }
@@ -478,7 +478,7 @@ pub(crate) fn decide_scoped(
     pa_seat: &str,
     scope_ord: u32,
     scope_attempt: u32,
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
     diff_rescored: bool,
     human_confirm: &HumanConfirm,
@@ -493,7 +493,7 @@ pub(crate) fn decide_scoped(
         .accepted
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("run {run_id} has no scope rev"))?;
-    let (mut scored, touch) = scope_score(&hold, repo_root, base_commit, diff_rescored);
+    let (mut scored, touch) = scope_score(&hold, graph_key, base_commit, diff_rescored);
     // (core#747) A one-seat roster has nothing to separate: the plan still decides here, and
     // the score's reasons say what that costs — every step lands on the one seat, and a review
     // or test step, which distribution never leaves on its creator's seat in a team run, needs

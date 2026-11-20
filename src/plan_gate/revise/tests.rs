@@ -573,7 +573,7 @@ fn a_first_creator_pa_change_is_scored_from_its_touch_and_held_as_first_creator(
         r#"[{"catalog":"build","id":"build"}]"#,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
-            repo_root: Some(std::env::temp_dir()),
+            graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
             base_commit: None,
         }),
     );
@@ -634,7 +634,7 @@ fn continuing_a_delivering_ask_in_build_gains_the_deliver_step() {
         r#"[{"catalog":"build","id":"build"}]"#,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
-            repo_root: Some(std::env::temp_dir()),
+            graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
             base_commit: None,
         }),
     );
@@ -743,7 +743,7 @@ fn a_code_executing_first_creator_step_on_a_repo_less_path_is_refused() {
         r#"[{"catalog":"build","id":"build"}]"#,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
-            repo_root: None,
+            graph_key: None,
             base_commit: None,
         }),
     );
@@ -812,7 +812,7 @@ fn held_first_creator(hc: &HumanConfirm) -> TeamPlanState {
         r#"[{"catalog":"build","id":"build"}]"#,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
-            repo_root: Some(std::env::temp_dir()),
+            graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
             base_commit: None,
         }),
     );
@@ -974,7 +974,7 @@ fn a_first_creator_change_with_no_touch_fails_closed_with_the_pa_declared_no_sco
         r#"[{"catalog":"build","id":"build"}]"#,
         None,
         Some(ScoreScope {
-            repo_root: Some(std::env::temp_dir()),
+            graph_key: Some(crate::code_graph::mint_repo_graph_key("test-repo")),
             base_commit: Some("abc".into()),
         }),
     );
@@ -1059,7 +1059,7 @@ fn a_same_block_restatement_does_not_cross_into_work() {
         r#"[{"catalog":"review","id":"check"},{"catalog":"review","executes_code":true}]"#,
         Some(r#"["src/retire.ts"]"#),
         Some(ScoreScope {
-            repo_root: None,
+            graph_key: None,
             base_commit: None,
         }),
     );

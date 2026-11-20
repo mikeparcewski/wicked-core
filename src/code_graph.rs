@@ -24,7 +24,8 @@
 //!    thread that never spawned a `Core` (the fallback crew's `crewStateHome()` makes for the
 //!    same callers);
 //!
-//! and `<key>` is [`repo_graph_key`]'s `<repo-dir-name>-<12-hex-of-sha256(canonical-root)>`. A
+//! and `<key>` is the repo record's persisted `graph_key` (core#1419). New registrations mint it
+//! from the repo id; pre-#1419 records adopt their legacy path-derived key at boot. A
 //! directory per key (rather than `<key>.db` files in one flat folder) keeps the db and its
 //! WAL/journal siblings together, so removing a repo's graph is one `rm -rf` that cannot strand a
 //! `-wal` describing a database that is gone.
@@ -59,8 +60,8 @@
 //! graph under the old `<home>/.wicked-estate/repo-graphs/<key>` and none under the new root copies
 //! each one — [`migrate_legacy_repo_graphs`], through SQLite's online-backup API (page-consistent
 //! even for a WAL-mode db another connection still holds open; a plain file copy of
-//! `estate.db`+`-wal`+`-shm` is not) — and logs one line per repo. The key is a pure function of
-//! the repo root, so the source and destination agree without a lookup table. The SOURCE IS LEFT
+//! `estate.db`+`-wal`+`-shm` is not) — and logs one line per repo. The source uses the legacy
+//! root-derived key; the destination uses the repo record's persisted key. The SOURCE IS LEFT
 //! IN PLACE (an operator deletes `~/.wicked-estate/repo-graphs` once the new daemon is verified;
 //! the engine never deletes anything it did not write) and a destination that already exists is
 //! never overwritten. The copy is CRASH-SAFE: the backup lands in a temp sibling
@@ -456,12 +457,10 @@ const KEY_STEM_LEN: usize = 64 - 1 - KEY_HASH_LEN;
 /// `-` is trimmed, and an empty stem falls back to `repo`; the digest is always appended, so a
 /// sanitized collision still yields distinct keys.
 ///
-/// Canonicalization (falling back to [`std::path::absolute`], then the path as given, for a root
-/// that is gone) is what makes the key STABLE across spellings: `/var/...` and `/private/var/...`,
-/// a relative registration and its absolute record, all hash to the same key — so the record, the
-/// indexer, the dispatch-time resolver, and the boot-time migration all land on the same
-/// directory, under whichever root is live.
-pub(crate) fn repo_graph_key(repo: &Path) -> String {
+/// For pre-#1419 records only. Canonicalization falls back to [`std::path::absolute`], then the
+/// path as given, for a root that is gone. Boot pins this legacy derivation on the repo record;
+/// subsequent reads use the persisted key.
+pub(crate) fn legacy_repo_graph_key(repo: &Path) -> String {
     use sha2::{Digest, Sha256};
     let canon = std::fs::canonicalize(repo)
         .or_else(|_| std::path::absolute(repo))
@@ -495,24 +494,48 @@ pub(crate) fn repo_graph_key(repo: &Path) -> String {
     format!("{stem}-{digest}")
 }
 
-/// One repo's graph db under a given root — `<root>/<key>/estate.db` — split out so tests can
-/// spell the expected path without a second hand-join.
-pub(crate) fn repo_graph_db_at(root: &Path, repo: &Path) -> PathBuf {
-    root.join(repo_graph_key(repo)).join(CODE_GRAPH_DB_FILE)
+/// Mint a label-safe graph identity from a registry id, once at registration (core#1419).
+pub(crate) fn mint_repo_graph_key(repo_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest: String = Sha256::digest(repo_id.as_bytes())
+        .iter()
+        .take(KEY_HASH_LEN / 2)
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let stem: String = repo_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(KEY_STEM_LEN)
+        .collect();
+    let stem = stem.trim_start_matches('-');
+    let stem = if stem.is_empty() { "repo" } else { stem };
+    format!("{stem}-{digest}")
 }
 
-/// Where `repo`'s code graph lives — or would live, for a repo never indexed. THE resolver: every
-/// spelling of a per-repo graph path (the record's `code_graph_db`, the indexer's `--db`, the
-/// dispatch-time MCP scope) comes from here. `None` when no root resolves at all (module ADR) —
-/// never a path inside `repo`.
-pub(crate) fn resolved_code_graph_db(repo: &Path) -> Option<PathBuf> {
-    resolved_code_graph_db_at(repo, repo_graph_root().as_deref())
+/// One repo's graph db under a given root — `<root>/<key>/estate.db` — split out so tests can
+/// spell the expected path without a second hand-join.
+pub(crate) fn repo_graph_db_at(root: &Path, key: &str) -> PathBuf {
+    root.join(key).join(CODE_GRAPH_DB_FILE)
+}
+
+/// Where the persisted `key`'s code graph lives — or would live, for a repo never indexed.
+/// THE resolver: every per-repo graph path (the record's `code_graph_db`, the indexer's `--db`,
+/// the dispatch-time MCP scope) comes from here. `None` when no root resolves at all (module ADR) —
+/// never a path inside a checkout.
+pub(crate) fn resolved_code_graph_db(key: &str) -> Option<PathBuf> {
+    resolved_code_graph_db_at(key, repo_graph_root().as_deref())
 }
 
 /// [`resolved_code_graph_db`] with the root injected — the pure core tests drive without
 /// mutating process env. Whether `<repo>/.codegraph/` exists is deliberately NOT consulted.
-fn resolved_code_graph_db_at(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
-    root.map(|r| repo_graph_db_at(r, repo))
+fn resolved_code_graph_db_at(key: &str, root: Option<&Path>) -> Option<PathBuf> {
+    root.map(|r| repo_graph_db_at(r, key))
 }
 
 /// `<repo>/.codegraph` — the directory a pre-core#406 engine (or crew's pre-ADR onboarding)
@@ -614,9 +637,9 @@ pub(crate) fn classify_project_graph_db_at(db: &Path, root: Option<&Path>) -> Op
 }
 
 /// Estate's label rule (`repo_scope.rs::validate_label`), applied to a key path segment: 1–64
-/// chars of `[A-Za-z0-9._-]`, never `.`/`..`, no leading `-`. [`repo_graph_key`] mints only
+/// chars of `[A-Za-z0-9._-]`, never `.`/`..`, no leading `-`. [`mint_repo_graph_key`] mints only
 /// passing keys; the classifier re-checks so a hand-built path cannot smuggle a traversal segment.
-fn is_valid_key(seg: &std::ffi::OsStr) -> bool {
+pub(crate) fn is_valid_key(seg: &std::ffi::OsStr) -> bool {
     let Some(s) = seg.to_str() else { return false };
     !s.is_empty()
         && s.len() <= 64
@@ -697,21 +720,20 @@ fn refuse_linked_graph(db: &Path) -> std::io::Result<()> {
 /// Always under the live root (module ADR): a repo carrying an in-tree `.codegraph/` still mints
 /// here, never refreshes the in-tree file. An error when no root resolves — never a fallback into
 /// the working tree.
-pub(crate) fn code_graph_path_for_write(repo: &Path) -> std::io::Result<PathBuf> {
-    code_graph_path_for_write_at(repo, repo_graph_root().as_deref())
+pub(crate) fn code_graph_path_for_write(key: &str) -> std::io::Result<PathBuf> {
+    code_graph_path_for_write_at(key, repo_graph_root().as_deref())
 }
 
 /// [`code_graph_path_for_write`] with the root injected (pure apart from the `create_dir_all`;
 /// tests drive it at a scratch root so nothing touches a real home).
-fn code_graph_path_for_write_at(repo: &Path, root: Option<&Path>) -> std::io::Result<PathBuf> {
-    let graph = resolved_code_graph_db_at(repo, root).ok_or_else(|| {
+fn code_graph_path_for_write_at(key: &str, root: Option<&Path>) -> std::io::Result<PathBuf> {
+    let graph = resolved_code_graph_db_at(key, root).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!(
-                "no repo-graph root resolves for {}: set {REPO_GRAPH_ROOT_ENV}, run under a daemon \
-                 (the root is <state home>/{REPO_GRAPHS_DIRNAME}), or set HOME (USERPROFILE on \
-                 Windows) — a graph is never minted inside the working tree",
-                repo.display()
+                "no repo-graph root resolves for graph key {key}: set {REPO_GRAPH_ROOT_ENV}, run \
+                 under a daemon (the root is <state home>/{REPO_GRAPHS_DIRNAME}), or set HOME \
+                 (USERPROFILE on Windows) — a graph is never minted inside the working tree"
             ),
         )
     })?;
@@ -729,13 +751,13 @@ fn code_graph_path_for_write_at(repo: &Path, root: Option<&Path>) -> std::io::Re
 /// Creates nothing. A consumer choosing a store to hand a governed worker must treat `None` as "no
 /// graph, ship no estate MCP" and never as license to substitute the operational store, which is the
 /// store a worker can delete (FINDING-067).
-pub(crate) fn existing_code_graph(repo: &Path) -> Option<PathBuf> {
-    existing_code_graph_at(repo, repo_graph_root().as_deref())
+pub(crate) fn existing_code_graph(key: &str) -> Option<PathBuf> {
+    existing_code_graph_at(key, repo_graph_root().as_deref())
 }
 
 /// [`existing_code_graph`] with the root injected — the pure core tests drive.
-fn existing_code_graph_at(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
-    resolved_code_graph_db_at(repo, root).filter(|g| {
+fn existing_code_graph_at(key: &str, root: Option<&Path>) -> Option<PathBuf> {
+    resolved_code_graph_db_at(key, root).filter(|g| {
         refuse_linked_graph(g).is_ok() && std::fs::symlink_metadata(g).is_ok_and(|m| m.is_file())
     })
 }
@@ -813,10 +835,10 @@ impl GraphMigration {
 
 /// Bring every registered repo's graph from the pre-core#406 estate home under the live root —
 /// ONCE (a destination that exists is never touched), through SQLite's online-backup API, leaving
-/// the source in place (module ADR). `repos` is `(repo id, repo root)` for each registered repo;
+/// the source in place (module ADR). `repos` is `(repo id, repo root, graph key)` per registration;
 /// the root of the calling thread ([`repo_graph_root`]) is the destination.
 pub(crate) fn migrate_legacy_repo_graphs<'a>(
-    repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    repos: impl IntoIterator<Item = (&'a str, &'a Path, &'a str)>,
 ) -> Vec<GraphMigration> {
     match (repo_graph_root(), legacy_repo_graph_root()) {
         (Some(root), Some(legacy)) => {
@@ -836,7 +858,7 @@ const BOOT_MIGRATION_BUDGET: std::time::Duration = std::time::Duration::from_sec
 /// [`migrate_legacy_repo_graphs`] with both roots and the overall budget injected — pure apart
 /// from the copies.
 fn migrate_legacy_repo_graphs_at<'a>(
-    repos: impl IntoIterator<Item = (&'a str, &'a Path)>,
+    repos: impl IntoIterator<Item = (&'a str, &'a Path, &'a str)>,
     root: &Path,
     legacy_root: &Path,
     budget: std::time::Duration,
@@ -848,9 +870,9 @@ fn migrate_legacy_repo_graphs_at<'a>(
     }
     let started = std::time::Instant::now();
     let mut out = Vec::new();
-    for (repo_id, repo) in repos {
-        let from = repo_graph_db_at(legacy_root, repo);
-        let to = repo_graph_db_at(root, repo);
+    for (repo_id, repo, key) in repos {
+        let from = repo_graph_db_at(legacy_root, &legacy_repo_graph_key(repo));
+        let to = repo_graph_db_at(root, key);
         // A boot killed mid-copy leaves `estate.db.migrating-<pid>` beside — never AT — the
         // served path; sweep it before deciding, so the copy below starts clean.
         if let Some(key_dir) = to.parent() {
@@ -1107,26 +1129,28 @@ pub(crate) enum BaseIndex {
 /// fails closed).
 pub(crate) fn index_at_base(
     repo: &Path,
+    key: &str,
     worktree: &Path,
     base_commit: &str,
     root: Option<&Path>,
 ) -> Result<BaseIndex, String> {
-    index_at_base_with(&indexer_bin(), repo, worktree, base_commit, root, None)
+    index_at_base_with(&indexer_bin(), repo, key, worktree, base_commit, root, None)
 }
 
 fn index_at_base_with(
     bin: &str,
     repo: &Path,
+    key: &str,
     worktree: &Path,
     base_commit: &str,
     root: Option<&Path>,
     bound: IndexBound,
 ) -> Result<BaseIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(db) = resolved_code_graph_db_at(repo, root) {
+    if let Some(db) = resolved_code_graph_db_at(key, root) {
         refuse_linked_graph(&db).map_err(|e| e.to_string())?;
     }
-    let Some(db) = existing_code_graph_at(repo, root) else {
+    let Some(db) = existing_code_graph_at(key, root) else {
         return Ok(BaseIndex::NoGraph);
     };
     let current = wicked_apps_core::open_store_ro(Some(&db.to_string_lossy()))
@@ -1235,11 +1259,13 @@ pub enum CheckoutIndex {
 /// return an error.
 pub fn index_checkout(
     repo: &Path,
+    key: &str,
     held_by: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<CheckoutIndex, String> {
     index_checkout_with(
         &indexer_bin(),
         repo,
+        key,
         repo_graph_root().as_deref(),
         None,
         held_by,
@@ -1249,15 +1275,16 @@ pub fn index_checkout(
 fn index_checkout_with(
     bin: &str,
     repo: &Path,
+    key: &str,
     root: Option<&Path>,
     bound: IndexBound,
     held_by: impl FnOnce() -> Result<Vec<String>, String>,
 ) -> Result<CheckoutIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(db) = resolved_code_graph_db_at(repo, root) {
+    if let Some(db) = resolved_code_graph_db_at(key, root) {
         refuse_linked_graph(&db).map_err(|e| e.to_string())?;
     }
-    let Some(db) = existing_code_graph_at(repo, root) else {
+    let Some(db) = existing_code_graph_at(key, root) else {
         return Ok(CheckoutIndex::NoGraph);
     };
     let held = held_by()?;
@@ -1335,8 +1362,8 @@ pub(crate) fn base_index_refusal(
 }
 
 /// Index `repo` into its code graph via the wicked-estate indexer subprocess. Returns the db path.
-pub fn index_repo(repo: &Path) -> anyhow::Result<String> {
-    let graph = code_graph_path_for_write(repo)?;
+pub fn index_repo(repo: &Path, key: &str) -> anyhow::Result<String> {
+    let graph = code_graph_path_for_write(key)?;
     let graph_str = graph.to_string_lossy().to_string();
     let _settle = RepoGraphWrite::begin(&graph);
     let bin = indexer_bin();
@@ -1422,8 +1449,8 @@ pub fn rank_symbols(graph_path: &str, n: usize) -> anyhow::Result<Vec<RankedSymb
 
 /// Recon a repo end-to-end: index it, then return its `n` most central symbols. This is the
 /// graph-native recon view — "what matters in this codebase" — fed to the CLIs + shown in the UI.
-pub fn recon_repo(repo: &Path, n: usize) -> anyhow::Result<Vec<RankedSymbol>> {
-    let graph = index_repo(repo)?;
+pub fn recon_repo(repo: &Path, key: &str, n: usize) -> anyhow::Result<Vec<RankedSymbol>> {
+    let graph = index_repo(repo, key)?;
     rank_symbols(&graph, n)
 }
 
@@ -1536,6 +1563,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d8_a_stale_repo_graph_is_reindexed_at_the_run_base() {
+        let key = mint_repo_graph_key("test-repo");
         const OLD: &str = "3071a7632882ade840e3c73772eaf44288c6b4c3";
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-base-index");
@@ -1552,6 +1580,7 @@ mod tests {
             index_at_base_with(
                 bin,
                 &repo,
+                &key,
                 &wt,
                 BASE,
                 Some(&root),
@@ -1563,7 +1592,7 @@ mod tests {
         assert_eq!(run(&never, 5), Ok(BaseIndex::NoGraph));
 
         // Stale: the scorer would fail closed at 100 ...
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         graph_at(&db, OLD);
         assert!(matches!(
             age(&db, BASE),
@@ -1631,6 +1660,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_checkout_reindex_runs_the_onboarding_command_under_the_launch_lock() {
+        let key = mint_repo_graph_key("test-repo");
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("checkout-index");
         let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
@@ -1645,11 +1675,11 @@ mod tests {
         let never = dir.join("never-run").to_string_lossy().into_owned();
         // Never onboarded: nothing to re-index, nothing runs.
         assert_eq!(
-            index_checkout_with(&never, &repo, Some(&root), patient, || Ok(vec![])),
+            index_checkout_with(&never, &repo, &key, Some(&root), patient, || Ok(vec![])),
             Ok(CheckoutIndex::NoGraph)
         );
 
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         graph_at(&db, "3071a7632882ade840e3c73772eaf44288c6b4c3");
         // A clean graph at the base, as estate would record a clean checkout at it.
         let clean = dir.join("clean.db");
@@ -1672,14 +1702,17 @@ mod tests {
             ),
         );
         let (r, d, w) = (root.clone(), repo.clone(), wt.clone());
-        let base =
-            std::thread::spawn(move || index_at_base_with(&d8, &d, &w, BASE, Some(&r), patient));
+        let base_key = key.clone();
+        let base = std::thread::spawn(move || {
+            index_at_base_with(&d8, &d, &base_key, &w, BASE, Some(&r), patient)
+        });
         while !started.exists() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
         let (r, c, d) = (root.clone(), checkout.clone(), repo.clone());
+        let checkout_key = key.clone();
         let waiter = std::thread::spawn(move || {
-            index_checkout_with(&c, &d, Some(&r), patient, || Ok(vec![]))
+            index_checkout_with(&c, &d, &checkout_key, Some(&r), patient, || Ok(vec![]))
         });
         // While D8's index is RUNNING, the checkout re-index has not started its own.
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1706,18 +1739,19 @@ mod tests {
         assert!(index_checkout_with(
             &script("fails", "exit 3"),
             &repo,
+            &key,
             Some(&root),
             patient,
-            || Ok(vec![])
+            || Ok(vec![]),
         )
         .unwrap_err()
         .contains("failed"));
         // A run executing on the repo holds the graph: nothing runs, the runs are named.
         let before = std::fs::read_to_string(&log).unwrap();
         assert_eq!(
-            index_checkout_with(&checkout, &repo, Some(&root), patient, || Ok(vec![
+            index_checkout_with(&checkout, &repo, &key, Some(&root), patient, || Ok(vec![
                 "run-7".to_string()
-            ])),
+            ]),),
             Ok(CheckoutIndex::Held(vec!["run-7".to_string()]))
         );
         assert_eq!(
@@ -1734,12 +1768,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_base_index_that_did_not_finish_leaves_a_graph_no_run_trusts() {
+        let key = mint_repo_graph_key("test-repo");
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-partial");
         let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         graph_at(&db, "3071a7632882ade840e3c73772eaf44288c6b4c3");
         let partial = dir.join("partial.db");
         graph_at(&partial, BASE);
@@ -1752,6 +1787,7 @@ mod tests {
         let out = index_at_base_with(
             &p.to_string_lossy(),
             &repo,
+            &key,
             &wt,
             BASE,
             Some(&root),
@@ -1771,13 +1807,14 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn d8_reindexes_a_graph_indexed_from_a_dirty_checkout_at_the_base() {
+        let key = mint_repo_graph_key("test-repo");
         use wicked_apps_core::GraphWrite;
         const BASE: &str = "e9d64e746433a8db220597d6030772163ce984b9";
         let dir = scratch("d8-dirty");
         let (root, repo, wt) = (dir.join("graphs"), dir.join("repo"), dir.join("wt"));
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&wt).unwrap();
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         {
             let mut g = open_store(Some(&db.to_string_lossy())).unwrap();
@@ -1808,6 +1845,7 @@ mod tests {
         let out = index_at_base_with(
             &p.to_string_lossy(),
             &repo,
+            &key,
             &wt,
             BASE,
             Some(&root),
@@ -1948,17 +1986,35 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_home);
     }
 
-    /// The key: `<dir-name>-<12 hex>`, estate-label-legal, stable across spellings of one root,
+    #[test]
+    fn minted_repo_graph_keys_are_label_legal_and_keep_ids_distinct() {
+        for id in ["", "-", ".", "..", "a/b", "a b@c", "世界", &"x".repeat(200)] {
+            let key = mint_repo_graph_key(id);
+            assert!(is_valid_key(std::ffi::OsStr::new(&key)), "{id:?}: {key}");
+            assert!(key.len() <= 64);
+            let digest = key.rsplit('-').next().unwrap();
+            assert_eq!(digest.len(), 12);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_eq!(mint_repo_graph_key(id), key);
+        }
+        assert_ne!(mint_repo_graph_key("a/b"), mint_repo_graph_key("a b"));
+        let long = "x".repeat(200);
+        let longer = "x".repeat(201);
+        assert_eq!(mint_repo_graph_key(&long).len(), 64);
+        assert_ne!(mint_repo_graph_key(&long), mint_repo_graph_key(&longer));
+    }
+
+    /// The legacy key: `<dir-name>-<12 hex>`, label-legal, stable across spellings of one root,
     /// distinct across different roots sharing a dir name.
     #[test]
-    fn the_key_is_the_dir_name_plus_a_digest_and_is_label_legal() {
+    fn the_legacy_key_is_the_dir_name_plus_a_digest_and_is_label_legal() {
         let a = scratch("key-a").join("api");
         let b = scratch("key-b").join("api");
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
 
-        let key_a = repo_graph_key(&a);
-        let key_b = repo_graph_key(&b);
+        let key_a = legacy_repo_graph_key(&a);
+        let key_b = legacy_repo_graph_key(&b);
         assert!(
             key_a.starts_with("api-"),
             "the dir name leads, so an operator can map the key back to a repo: {key_a}"
@@ -1971,12 +2027,12 @@ mod tests {
             "two repos sharing a dir name must get distinct keys — the digest is over the root"
         );
         assert_eq!(
-            repo_graph_key(&a),
+            legacy_repo_graph_key(&a),
             key_a,
             "same root ⇒ same key, every time"
         );
         // Canonicalization folds spellings: `<a>/.` and `<a>` are the same repo.
-        assert_eq!(repo_graph_key(&a.join(".")), key_a);
+        assert_eq!(legacy_repo_graph_key(&a.join(".")), key_a);
 
         // Every minted key passes estate's label rule — it becomes a path segment.
         for key in [&key_a, &key_b] {
@@ -1990,7 +2046,7 @@ mod tests {
         // Sanitization: illegal chars collapse to `-`, and the key still carries the digest.
         let weird = scratch("key-w").join("a b@c");
         std::fs::create_dir_all(&weird).unwrap();
-        let key_w = repo_graph_key(&weird);
+        let key_w = legacy_repo_graph_key(&weird);
         assert!(key_w.starts_with("a-b-c-"), "{key_w}");
         assert!(is_valid_key(std::ffi::OsStr::new(&key_w)), "{key_w}");
     }
@@ -2002,6 +2058,7 @@ mod tests {
     /// file is neither read nor touched — it is only recognised, for the repo-card finding.
     #[test]
     fn an_in_tree_graph_is_never_adopted_for_resolution_read_or_write() {
+        let key = mint_repo_graph_key("test-repo");
         let base = scratch("never-in-tree");
         let repo = base.join("repo");
         let in_tree = repo.join(code_graph_rel());
@@ -2009,20 +2066,20 @@ mod tests {
         std::fs::write(&in_tree, b"185 MB of graph, notionally, tracked by git").unwrap();
         let in_tree_before = std::fs::metadata(&in_tree).unwrap().modified().unwrap();
         let root = base.join("state-home").join("repo-graphs");
-        let want = repo_graph_db_at(&root, &repo);
+        let want = repo_graph_db_at(&root, &key);
 
         assert_eq!(
-            resolved_code_graph_db_at(&repo, Some(&root)),
+            resolved_code_graph_db_at(&key, Some(&root)),
             Some(want.clone()),
             "resolution is the live root, whatever sits in the tree"
         );
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&root)),
+            existing_code_graph_at(&key, Some(&root)),
             None,
             "the READ path does not see the in-tree file — nothing under the root has been indexed"
         );
         assert_eq!(
-            code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
+            code_graph_path_for_write_at(&key, Some(&root)).unwrap(),
             want,
             "the WRITE path mints under the root — never refreshes the in-tree file"
         );
@@ -2040,14 +2097,14 @@ mod tests {
         // Once the indexer writes under the root, the read side finds it there.
         std::fs::write(&want, b"indexed").unwrap();
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&root)).as_deref(),
+            existing_code_graph_at(&key, Some(&root)).as_deref(),
             Some(want.as_path())
         );
         // No root at all: NOTHING resolves — never a fallback into the tree (the pre-#406
         // behaviour), and the write side is an error rather than a path.
-        assert_eq!(resolved_code_graph_db_at(&repo, None), None);
-        assert_eq!(existing_code_graph_at(&repo, None), None);
-        let err = code_graph_path_for_write_at(&repo, None).unwrap_err();
+        assert_eq!(resolved_code_graph_db_at(&key, None), None);
+        assert_eq!(existing_code_graph_at(&key, None), None);
+        let err = code_graph_path_for_write_at(&key, None).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
         assert!(err.to_string().contains(REPO_GRAPH_ROOT_ENV), "{err}");
 
@@ -2058,22 +2115,23 @@ mod tests {
     /// tree stays untouched, and the read side still answers `None` until something indexes.
     #[test]
     fn a_fresh_repo_mints_under_the_root_and_leaves_the_tree_clean() {
+        let key = mint_repo_graph_key("test-repo");
         let base = scratch("mint");
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let root = base.join("repo-graphs");
 
-        let want = repo_graph_db_at(&root, &repo);
+        let want = repo_graph_db_at(&root, &key);
         assert_eq!(
-            resolved_code_graph_db_at(&repo, Some(&root)),
+            resolved_code_graph_db_at(&key, Some(&root)),
             Some(want.clone())
         );
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&root)),
+            existing_code_graph_at(&key, Some(&root)),
             None,
             "no graph anywhere ⇒ None — never a path to a database nothing wrote (FINDING-069)"
         );
-        let for_write = code_graph_path_for_write_at(&repo, Some(&root)).unwrap();
+        let for_write = code_graph_path_for_write_at(&key, Some(&root)).unwrap();
         assert_eq!(for_write, want);
         assert!(want.parent().unwrap().is_dir(), "the key dir is created");
         assert!(
@@ -2086,11 +2144,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_repo_graph_is_refused_for_read_and_write() {
+        let key = mint_repo_graph_key("test-repo");
         let base = scratch("linked-repo-graph");
         let repo = base.join("repo");
         let root = base.join("repo-graphs");
         std::fs::create_dir_all(&repo).unwrap();
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         std::fs::create_dir_all(db.parent().unwrap()).unwrap();
         let target = base.join("other.db");
         std::fs::write(&target, b"indexed elsewhere").unwrap();
@@ -2100,8 +2159,8 @@ mod tests {
             if dangling {
                 std::fs::remove_file(&target).unwrap();
             }
-            assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
-            let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+            assert_eq!(existing_code_graph_at(&key, Some(&root)), None);
+            let err = code_graph_path_for_write_at(&key, Some(&root)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(err.to_string().contains(&db.display().to_string()), "{err}");
         }
@@ -2112,6 +2171,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_writer_lock_or_sidecar_is_refused_for_read_and_write() {
+        let key = mint_repo_graph_key("test-repo");
         for suffix in [
             ".writer.lock",
             ".writer.lock-journal",
@@ -2125,7 +2185,7 @@ mod tests {
             let repo = base.join("repo");
             let root = base.join("repo-graphs");
             std::fs::create_dir_all(&repo).unwrap();
-            let db = repo_graph_db_at(&root, &repo);
+            let db = repo_graph_db_at(&root, &key);
             std::fs::create_dir_all(db.parent().unwrap()).unwrap();
             std::fs::write(&db, b"indexed").unwrap();
             let mut sibling = db.as_os_str().to_os_string();
@@ -2135,8 +2195,8 @@ mod tests {
             std::fs::write(&target, b"not a database").unwrap();
             std::os::unix::fs::symlink(&target, &sibling).unwrap();
 
-            assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
-            let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+            assert_eq!(existing_code_graph_at(&key, Some(&root)), None);
+            let err = code_graph_path_for_write_at(&key, Some(&root)).unwrap_err();
             assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
             assert!(
                 err.to_string().contains(&sibling.display().to_string()),
@@ -2144,11 +2204,8 @@ mod tests {
             );
 
             std::fs::remove_file(&sibling).unwrap();
-            assert_eq!(existing_code_graph_at(&repo, Some(&root)), Some(db.clone()));
-            assert_eq!(
-                code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
-                db
-            );
+            assert_eq!(existing_code_graph_at(&key, Some(&root)), Some(db.clone()));
+            assert_eq!(code_graph_path_for_write_at(&key, Some(&root)).unwrap(), db);
             let _ = std::fs::remove_dir_all(&base);
         }
     }
@@ -2156,6 +2213,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_planted_writer_lock_link_is_a_named_reindex_refusal() {
+        let key = mint_repo_graph_key("test-repo");
         for suffix in [".writer.lock", ".writer.lock-wal"] {
             let base = scratch(&format!("linked-writer-lock-reindex{suffix}"));
             let repo = base.join("repo");
@@ -2163,7 +2221,7 @@ mod tests {
             let root = base.join("repo-graphs");
             std::fs::create_dir_all(&repo).unwrap();
             std::fs::create_dir_all(&worktree).unwrap();
-            let db = repo_graph_db_at(&root, &repo);
+            let db = repo_graph_db_at(&root, &key);
             graph_at(&db, "old-commit");
             let mut lock = db.as_os_str().to_os_string();
             lock.push(suffix);
@@ -2180,9 +2238,17 @@ mod tests {
             let bin = stub.to_string_lossy();
             let patient = Some(crate::test_env::PATIENT);
 
-            let checkout = index_checkout_with(&bin, &repo, Some(&root), patient, || Ok(vec![]));
-            let indexed =
-                index_at_base_with(&bin, &repo, &worktree, "new-base", Some(&root), patient);
+            let checkout =
+                index_checkout_with(&bin, &repo, &key, Some(&root), patient, || Ok(vec![]));
+            let indexed = index_at_base_with(
+                &bin,
+                &repo,
+                &key,
+                &worktree,
+                "new-base",
+                Some(&root),
+                patient,
+            );
             for result in [checkout.map(|_| ()), indexed.map(|_| ())] {
                 let err = result.unwrap_err();
                 assert!(err.contains("refusing symlinked repo graph path"), "{err}");
@@ -2197,20 +2263,21 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_symlinked_repo_graph_key_dir_is_refused_for_read_and_write() {
+        let key = mint_repo_graph_key("test-repo");
         let base = scratch("linked-repo-graph-key");
         let repo = base.join("repo");
         let root = base.join("repo-graphs");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&root).unwrap();
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         let key_dir = db.parent().unwrap();
         let target = base.join("other-key");
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join(CODE_GRAPH_DB_FILE), b"indexed elsewhere").unwrap();
         std::os::unix::fs::symlink(&target, key_dir).unwrap();
 
-        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
-        let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+        assert_eq!(existing_code_graph_at(&key, Some(&root)), None);
+        let err = code_graph_path_for_write_at(&key, Some(&root)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(
             err.to_string().contains(&key_dir.display().to_string()),
@@ -2223,19 +2290,17 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_plain_repo_graph_still_resolves_for_read_and_write() {
+        let key = mint_repo_graph_key("test-repo");
         let base = scratch("plain-repo-graph");
         let repo = base.join("repo");
         let root = base.join("repo-graphs");
         std::fs::create_dir_all(&repo).unwrap();
-        let db = code_graph_path_for_write_at(&repo, Some(&root)).unwrap();
-        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+        let db = code_graph_path_for_write_at(&key, Some(&root)).unwrap();
+        assert_eq!(existing_code_graph_at(&key, Some(&root)), None);
         std::fs::write(&db, b"indexed").unwrap();
 
-        assert_eq!(existing_code_graph_at(&repo, Some(&root)), Some(db.clone()));
-        assert_eq!(
-            code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
-            db
-        );
+        assert_eq!(existing_code_graph_at(&key, Some(&root)), Some(db.clone()));
+        assert_eq!(code_graph_path_for_write_at(&key, Some(&root)).unwrap(), db);
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2246,6 +2311,7 @@ mod tests {
     /// every other resolver test injects its root and never reads env.
     #[test]
     fn the_env_override_redirects_the_root_away_from_every_home() {
+        let key = mint_repo_graph_key("test-repo");
         let _env = REPO_GRAPH_ROOT_ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -2260,9 +2326,9 @@ mod tests {
         std::fs::create_dir_all(&state_home).unwrap();
         let _scope = StateHomeScope::for_store(state_home.join("core.db").to_str().unwrap());
 
-        let resolved = resolved_code_graph_db(&repo).expect("a root resolves");
-        let for_write = code_graph_path_for_write(&repo).unwrap();
-        assert_eq!(resolved, repo_graph_db_at(&over, &repo));
+        let resolved = resolved_code_graph_db(&key).expect("a root resolves");
+        let for_write = code_graph_path_for_write(&key).unwrap();
+        assert_eq!(resolved, repo_graph_db_at(&over, &key));
         assert_eq!(for_write, resolved);
         assert!(resolved.starts_with(&over), "{resolved:?}");
         assert!(
@@ -2271,7 +2337,7 @@ mod tests {
         );
         if let Some(default_root) = repo_graph_root_from(None, None, home_dir()) {
             assert!(
-                !default_root.join(repo_graph_key(&repo)).exists(),
+                !default_root.join(&key).exists(),
                 "the override must keep the real home untouched"
             );
         }
@@ -2291,9 +2357,9 @@ mod tests {
         let repo = base.join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         let root = base.join("repo-graphs");
-        let key = repo_graph_key(&repo);
+        let key = mint_repo_graph_key("test-repo");
 
-        let db = repo_graph_db_at(&root, &repo);
+        let db = repo_graph_db_at(&root, &key);
         assert_eq!(
             classify_code_graph_db_at(&db, Some(&root)),
             Some(root.join(&key)),
@@ -2501,14 +2567,20 @@ mod tests {
         }
         // alpha: legacy only → migrates. beta: legacy AND live → the live one wins, untouched.
         // gamma: never indexed → nothing.
-        let _alpha_writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &alpha), 7);
-        let _beta_legacy_writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &beta), 3);
-        let _beta_live_writer = sqlite_with_rows(&repo_graph_db_at(&root, &beta), 1);
-        let beta_live_before = std::fs::read(repo_graph_db_at(&root, &beta)).unwrap();
+        let alpha_key = mint_repo_graph_key("alpha");
+        let beta_key = mint_repo_graph_key("beta");
+        let alpha_legacy = repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&alpha));
+        let beta_legacy = repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&beta));
+        let beta_live = repo_graph_db_at(&root, &beta_key);
+        let _alpha_writer = sqlite_with_rows(&alpha_legacy, 7);
+        let _beta_legacy_writer = sqlite_with_rows(&beta_legacy, 3);
+        let _beta_live_writer = sqlite_with_rows(&beta_live, 1);
+        let beta_live_before = std::fs::read(&beta_live).unwrap();
+        let gamma_key = mint_repo_graph_key("gamma");
         let repos = [
-            ("alpha", alpha.as_path()),
-            ("beta", beta.as_path()),
-            ("gamma", gamma.as_path()),
+            ("alpha", alpha.as_path(), alpha_key.as_str()),
+            ("beta", beta.as_path(), beta_key.as_str()),
+            ("gamma", gamma.as_path(), gamma_key.as_str()),
         ];
 
         let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, BOOT_MIGRATION_BUDGET);
@@ -2516,28 +2588,28 @@ mod tests {
             out,
             vec![GraphMigration::Copied {
                 repo_id: "alpha".into(),
-                from: repo_graph_db_at(&legacy_root, &alpha),
-                to: repo_graph_db_at(&root, &alpha),
+                from: repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&alpha)),
+                to: repo_graph_db_at(&root, &mint_repo_graph_key("alpha")),
             }],
             "exactly alpha migrates: {out:?}"
         );
         assert_eq!(
-            row_count(&repo_graph_db_at(&root, &alpha)),
+            row_count(&repo_graph_db_at(&root, &mint_repo_graph_key("alpha"))),
             7,
             "the copy is page-consistent — the un-checkpointed WAL rows arrived too, with the \
              source still open"
         );
         assert!(
-            repo_graph_db_at(&legacy_root, &alpha).is_file(),
+            repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&alpha)).is_file(),
             "the source is left in place — the engine deletes nothing it did not write"
         );
         assert_eq!(
-            std::fs::read(repo_graph_db_at(&root, &beta)).unwrap(),
+            std::fs::read(repo_graph_db_at(&root, &mint_repo_graph_key("beta"))).unwrap(),
             beta_live_before,
             "a graph already under the root is never overwritten"
         );
         assert!(
-            !root.join(repo_graph_key(&gamma)).exists(),
+            !root.join(mint_repo_graph_key("gamma")).exists(),
             "a repo with no legacy graph mints nothing"
         );
         assert!(out[0].notice().contains("alpha") && out[0].notice().contains("core#406"));
@@ -2555,11 +2627,15 @@ mod tests {
         // A source that is not a database fails CLOSED: reported, the torn destination removed.
         let delta = base.join("delta");
         std::fs::create_dir_all(&delta).unwrap();
-        let bad = repo_graph_db_at(&legacy_root, &delta);
+        let bad = repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&delta));
         std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
         std::fs::write(&bad, b"not a sqlite database").unwrap();
         let out = migrate_legacy_repo_graphs_at(
-            [("delta", delta.as_path())],
+            [(
+                "delta",
+                delta.as_path(),
+                mint_repo_graph_key("delta").as_str(),
+            )],
             &root,
             &legacy_root,
             BOOT_MIGRATION_BUDGET,
@@ -2569,7 +2645,7 @@ mod tests {
             "{out:?}"
         );
         assert!(
-            !root.join(repo_graph_key(&delta)).exists(),
+            !root.join(mint_repo_graph_key("delta")).exists(),
             "a failed copy leaves no torn destination for a worker to open"
         );
         assert!(bad.is_file(), "…and the source is untouched");
@@ -2589,9 +2665,9 @@ mod tests {
         let repo = base.join("alpha");
         std::fs::create_dir_all(&repo).unwrap();
         // Many pages, so a one-page step cannot finish in one go.
-        let from = repo_graph_db_at(&legacy_root, &repo);
+        let from = repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&repo));
         let _writer = sqlite_with_rows(&from, 5_000);
-        let to = repo_graph_db_at(&root, &repo);
+        let to = repo_graph_db_at(&root, &mint_repo_graph_key("alpha"));
         let key_dir = to.parent().unwrap().to_path_buf();
 
         // 1. The copy is interrupted (one step of one page, then the budget runs out).
@@ -2608,7 +2684,7 @@ mod tests {
             "nothing is ever written AT the served path before Done"
         );
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&root)),
+            existing_code_graph_at(&mint_repo_graph_key("alpha"), Some(&root)),
             None,
             "the resolver never sees a copy in flight"
         );
@@ -2623,11 +2699,18 @@ mod tests {
         //    `estate.db` — the resolver still answers None.
         let stray = key_dir.join(format!("{CODE_GRAPH_DB_FILE}{MIGRATING_INFIX}424242"));
         std::fs::write(&stray, b"half a database").unwrap();
-        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+        assert_eq!(
+            existing_code_graph_at(&mint_repo_graph_key("alpha"), Some(&root)),
+            None
+        );
 
         // 3. Next boot: the stray is swept and the legacy source is copied in full.
         let out = migrate_legacy_repo_graphs_at(
-            [("alpha", repo.as_path())],
+            [(
+                "alpha",
+                repo.as_path(),
+                mint_repo_graph_key("alpha").as_str(),
+            )],
             &root,
             &legacy_root,
             BOOT_MIGRATION_BUDGET,
@@ -2646,7 +2729,7 @@ mod tests {
             "the second boot copies the intact source in full"
         );
         assert_eq!(
-            existing_code_graph_at(&repo, Some(&root)).as_deref(),
+            existing_code_graph_at(&mint_repo_graph_key("alpha"), Some(&root)).as_deref(),
             Some(to.as_path())
         );
         assert!(
@@ -2659,7 +2742,11 @@ mod tests {
         // A third boot: nothing to do (and the completed copy is never re-copied).
         assert_eq!(
             migrate_legacy_repo_graphs_at(
-                [("alpha", repo.as_path())],
+                [(
+                    "alpha",
+                    repo.as_path(),
+                    mint_repo_graph_key("alpha").as_str()
+                )],
                 &root,
                 &legacy_root,
                 BOOT_MIGRATION_BUDGET
@@ -2749,8 +2836,14 @@ mod tests {
         let clean = base.join("clean");
         std::fs::create_dir_all(&alpha).unwrap();
         std::fs::create_dir_all(&clean).unwrap();
-        let _writer = sqlite_with_rows(&repo_graph_db_at(&legacy_root, &alpha), 3);
-        let repos = [("alpha", alpha.as_path()), ("clean", clean.as_path())];
+        let legacy = repo_graph_db_at(&legacy_root, &legacy_repo_graph_key(&alpha));
+        let _writer = sqlite_with_rows(&legacy, 3);
+        let alpha_key = mint_repo_graph_key("alpha");
+        let clean_key = mint_repo_graph_key("clean");
+        let repos = [
+            ("alpha", alpha.as_path(), alpha_key.as_str()),
+            ("clean", clean.as_path(), clean_key.as_str()),
+        ];
 
         let out =
             migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, std::time::Duration::ZERO);
@@ -2759,7 +2852,7 @@ mod tests {
             "{out:?}"
         );
         assert!(
-            !repo_graph_db_at(&root, &alpha).exists(),
+            !repo_graph_db_at(&root, &mint_repo_graph_key("alpha")).exists(),
             "a deferred repo is not touched"
         );
         assert!(out[0].notice().contains("deferred") && out[0].notice().contains("next boot"));
@@ -2776,8 +2869,11 @@ mod tests {
             matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
             "{out:?}"
         );
-        assert_eq!(row_count(&repo_graph_db_at(&root, &alpha)), 3);
-        std::fs::remove_dir_all(root.join(repo_graph_key(&alpha))).unwrap();
+        assert_eq!(
+            row_count(&repo_graph_db_at(&root, &mint_repo_graph_key("alpha"))),
+            3
+        );
+        std::fs::remove_dir_all(root.join(mint_repo_graph_key("alpha"))).unwrap();
 
         // Next boot, normal budget: copied.
         let out = migrate_legacy_repo_graphs_at(repos, &root, &legacy_root, BOOT_MIGRATION_BUDGET);
@@ -2785,7 +2881,10 @@ mod tests {
             matches!(&out[..], [GraphMigration::Copied { repo_id, .. }] if repo_id == "alpha"),
             "{out:?}"
         );
-        assert_eq!(row_count(&repo_graph_db_at(&root, &alpha)), 3);
+        assert_eq!(
+            row_count(&repo_graph_db_at(&root, &mint_repo_graph_key("alpha"))),
+            3
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }

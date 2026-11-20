@@ -114,17 +114,17 @@ fn index_auth_graph(e: &Engine, repo_id: &str, head: &str) {
             ),
         )
     };
-    let root_path = e
+    let graph_key = e
         .core
         .list_repos()
         .unwrap()
         .into_iter()
         .find(|r| r.id == repo_id)
         .expect("the repo")
-        .root_path;
+        .graph_key;
     let db = e.rig.dir.join("core.db");
     let root = crate::code_graph::repo_graph_root_for_store(db.to_str().unwrap()).unwrap();
-    let graph_db = crate::code_graph::repo_graph_db_at(&root, std::path::Path::new(&root_path));
+    let graph_db = crate::code_graph::repo_graph_db_at(&root, &graph_key);
     std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
     let mut nodes = vec![node("login_file", "src/auth/login.rs")];
     let mut edges = Vec::new();

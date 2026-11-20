@@ -392,7 +392,7 @@ fn a_qe_skip_on_publish_is_refused_at_launch_and_qe_is_forced() {
         u.repo_checks_floor = true;
         u.role = PhaseRole::Evaluator;
         assert!(matches!(
-            crate::qe_acceptance::on_dispatch(&s, &u, None, None),
+            crate::qe_acceptance::on_dispatch(&s, &u, None, None, None),
             crate::qe_acceptance::Dispatched::Unchanged
         ));
     }

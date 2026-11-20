@@ -83,7 +83,7 @@ fn waived_at(ord: u32) -> QeAcceptance {
 fn a_run_that_does_not_require_qe_acceptance_is_never_decided() {
     let s = session(RunAssurance::default());
     assert!(matches!(
-        on_dispatch(&s, &qe_unit(3), None, None),
+        on_dispatch(&s, &qe_unit(3), None, None, None),
         Dispatched::Unchanged
     ));
 }
@@ -95,7 +95,7 @@ fn an_operator_decision_is_never_rescored_or_revoked() {
         s.base_commit = Some("b".into());
         for u in [qe_unit(3), creator(2)] {
             assert!(
-                matches!(on_dispatch(&s, &u, None, None), Dispatched::Unchanged),
+                matches!(on_dispatch(&s, &u, None, None, None), Dispatched::Unchanged),
                 "{over:?}"
             );
         }
@@ -105,7 +105,7 @@ fn an_operator_decision_is_never_rescored_or_revoked() {
 #[test]
 fn the_qe_unit_with_no_repo_diff_is_required_with_the_reason() {
     let s = session(requiring());
-    let Dispatched::Decided(d) = on_dispatch(&s, &qe_unit(3), None, None) else {
+    let Dispatched::Decided(d) = on_dispatch(&s, &qe_unit(3), None, None, None) else {
         panic!("decided");
     };
     assert_eq!((d.status.as_str(), d.basis.as_str()), ("required", "diff"));
@@ -115,7 +115,7 @@ fn the_qe_unit_with_no_repo_diff_is_required_with_the_reason() {
     let mut s2 = s.clone();
     s2.assurance.qe = Some(d);
     assert!(matches!(
-        on_dispatch(&s2, &qe_unit(3), None, None),
+        on_dispatch(&s2, &qe_unit(3), None, None, None),
         Dispatched::Unchanged
     ));
 }
@@ -125,15 +125,15 @@ fn the_qe_unit_with_no_repo_diff_is_required_with_the_reason() {
 #[test]
 fn a_score_computed_ahead_is_the_dispatchs_own_and_is_the_one_used() {
     let s = session(requiring());
-    let ahead = score_ahead(&s, 3, None, None);
-    let Dispatched::Decided(own) = on_dispatch(&s, &qe_unit(3), None, None) else {
+    let ahead = score_ahead(&s, 3, None, None, None);
+    let Dispatched::Decided(own) = on_dispatch(&s, &qe_unit(3), None, None, None) else {
         panic!("decided");
     };
     assert_eq!(ahead, own, "same inputs, same score");
     let mut marked = ahead.clone();
     marked.reason = "scored ahead".into();
     let Dispatched::Decided(used) =
-        on_dispatch_with(&s, &qe_unit(3), None, None, Some(marked.clone()))
+        on_dispatch_with(&s, &qe_unit(3), None, None, None, Some(marked.clone()))
     else {
         panic!("decided");
     };
@@ -144,7 +144,7 @@ fn a_score_computed_ahead_is_the_dispatchs_own_and_is_the_one_used() {
     // An operator decision is still never rescored, whatever score is handed in.
     let fixed = session(requiring().with_qe_override(&QeOverride::Force).unwrap());
     assert!(matches!(
-        on_dispatch_with(&fixed, &qe_unit(3), None, None, Some(marked)),
+        on_dispatch_with(&fixed, &qe_unit(3), None, None, None, Some(marked)),
         Dispatched::Unchanged
     ));
 }
@@ -153,7 +153,7 @@ fn a_score_computed_ahead_is_the_dispatchs_own_and_is_the_one_used() {
 fn a_creator_after_a_waiver_revokes_it() {
     let mut s = session(requiring());
     s.assurance.qe = Some(waived_at(4));
-    let Dispatched::Decided(d) = on_dispatch(&s, &creator(5), None, None) else {
+    let Dispatched::Decided(d) = on_dispatch(&s, &creator(5), None, None, None) else {
         panic!("revoked");
     };
     assert_eq!(d.status, "required");
@@ -166,7 +166,7 @@ fn a_creator_after_a_waiver_revokes_it() {
     let mut review = WorkUnit::pending("s:review", "s", 5, "review");
     review.role = PhaseRole::Evaluator;
     assert!(matches!(
-        on_dispatch(&s, &review, None, None),
+        on_dispatch(&s, &review, None, None, None),
         Dispatched::Unchanged
     ));
 }
@@ -563,7 +563,10 @@ fn any_tree_changing_unit_after_a_waiver_revokes_it() {
     cutover.executes_code = true;
     for u in [produce, tool, cutover] {
         assert!(
-            matches!(on_dispatch(&s, &u, None, None), Dispatched::Decided(ref d) if d.status == "required"),
+            matches!(
+                on_dispatch(&s, &u, None, None, None),
+                Dispatched::Decided(ref d) if d.status == "required"
+            ),
             "{}",
             u.id
         );
@@ -572,7 +575,7 @@ fn any_tree_changing_unit_after_a_waiver_revokes_it() {
     deliver.role = PhaseRole::Creator;
     deliver.tool_cmd = Some(vec!["deliver".into()]);
     assert!(matches!(
-        on_dispatch(&s, &deliver, None, None),
+        on_dispatch(&s, &deliver, None, None, None),
         Dispatched::Unchanged
     ));
 }
@@ -599,7 +602,8 @@ fn a_qe_dispatch_carrying_a_floor_fix_is_required() {
         .expect("a repo-checks report with a requested fix"),
     );
     let git_dir = repo.dir.join(".git");
-    let Dispatched::Decided(d) = on_dispatch(&s, &u, Some(&repo.dir), Some((&tree, &git_dir)))
+    let Dispatched::Decided(d) =
+        on_dispatch(&s, &u, Some(&repo.dir), None, Some((&tree, &git_dir)))
     else {
         panic!("decided");
     };
@@ -712,7 +716,7 @@ fn a_redo_dispatch_keeps_qe_required_on_its_tree() {
     let mut u = qe_unit(3);
     // No redo: the dispatch re-scores (here, to "no repository diff").
     assert!(matches!(
-        on_dispatch(&s, &u, None, Some(("t1", git))),
+        on_dispatch(&s, &u, None, None, Some(("t1", git))),
         Dispatched::Decided(_)
     ));
     u.qe_redos.push(crate::domain::QeRedo {
@@ -726,12 +730,12 @@ fn a_redo_dispatch_keeps_qe_required_on_its_tree() {
         at: 1,
     });
     assert!(matches!(
-        on_dispatch(&s, &u, None, Some(("t1", git))),
+        on_dispatch(&s, &u, None, None, Some(("t1", git))),
         Dispatched::Unchanged
     ));
     // Another tree is new work: it scores again.
     assert!(matches!(
-        on_dispatch(&s, &u, None, Some(("t2", git))),
+        on_dispatch(&s, &u, None, None, Some(("t2", git))),
         Dispatched::Decided(_)
     ));
 }

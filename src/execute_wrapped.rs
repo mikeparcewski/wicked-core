@@ -9102,10 +9102,8 @@ mod tests {
         }
         let base = std::env::current_dir().unwrap();
         let state_home = base.join("wc-custom-state-home");
-        let repo = base.join("wc-custom-repo");
-        let key_dir = state_home
-            .join("repo-graphs")
-            .join(crate::code_graph::repo_graph_key(&repo));
+        let key = crate::code_graph::mint_repo_graph_key("wc-custom-repo");
+        let key_dir = state_home.join("repo-graphs").join(&key);
         let db = key_dir.join(crate::code_graph::CODE_GRAPH_DB_FILE);
         assert_eq!(
             repo_read_root(db.to_str(), Some(&state_home)).map(PathBuf::from),
@@ -9140,10 +9138,10 @@ mod tests {
     fn grants_are_per_key_precise_and_siblings_stay_out_of_reach() {
         let base = std::env::current_dir().unwrap();
         let estate_root = base.join("wc-grants-root");
-        let repo_a = base.join("wc-grants-a");
-        let repo_b = base.join("wc-grants-b");
-        let db_a = crate::code_graph::repo_graph_db_at(&estate_root, &repo_a);
-        let db_b = crate::code_graph::repo_graph_db_at(&estate_root, &repo_b);
+        let key_a = crate::code_graph::mint_repo_graph_key("wc-grants-a");
+        let key_b = crate::code_graph::mint_repo_graph_key("wc-grants-b");
+        let db_a = crate::code_graph::repo_graph_db_at(&estate_root, &key_a);
+        let db_b = crate::code_graph::repo_graph_db_at(&estate_root, &key_b);
         let key_dir_a = db_a.parent().unwrap().to_path_buf();
         let key_dir_b = db_b.parent().unwrap().to_path_buf();
         assert_ne!(key_dir_a, key_dir_b, "precondition: distinct keys");
@@ -9440,7 +9438,8 @@ mod tests {
         }
         let (base, sh) = project_graph_home("repo", &["p1"]);
         let repo_root = sh.join("repo-graphs");
-        let db = crate::code_graph::repo_graph_db_at(&repo_root, &base.join("some-repo"));
+        let key = crate::code_graph::mint_repo_graph_key("some-repo");
+        let db = crate::code_graph::repo_graph_db_at(&repo_root, &key);
         let expected = repo_read_root_at(db.to_str(), Some(&repo_root));
         assert!(expected.is_some(), "precondition: the repo shape grants");
         assert_eq!(repo_read_root(db.to_str(), Some(&sh)), expected);
@@ -19402,8 +19401,6 @@ mod project_graph_end_to_end_tests {
         // The run repo's OWN graph, on disk and healthy — so "bound to the project graph" is a
         // CHOICE between two live stores, not the only answer available. Under the repo-graph
         // root, never in the checkout (core#406).
-        let repo_graph = crate::code_graph::repo_graph_db_at(&graph_root.root, &repo_root);
-        graph_with(&repo_graph, &["alpha"]);
 
         // The project's co-located graph: the run's repo AND a sibling it could never see before.
         let project_db = dir
@@ -19427,6 +19424,8 @@ mod project_graph_end_to_end_tests {
                 registered_at: 0,
             })
             .unwrap();
+        let repo_graph = crate::code_graph::repo_graph_db_at(&graph_root.root, &repo.graph_key);
+        graph_with(&repo_graph, &["alpha"]);
 
         let spec = |id: &str, pg: Option<crate::ProjectGraphBinding>| crate::LaunchSpec {
             base_ref: None,

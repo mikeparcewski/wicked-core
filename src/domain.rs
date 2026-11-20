@@ -2763,17 +2763,21 @@ mod tests {
             .is_empty());
     }
 
-    /// codex r3 on wicked-core#1230: two registrations of ONE checkout share its graph, so a run
-    /// filed under either holds it for both.
+    /// Legacy aliases hold the same persisted graph even after their roots diverge (core#1419).
+    /// A new registration at the same root with a different key does not hold that graph.
     #[test]
-    fn a_run_under_an_alias_of_the_same_checkout_holds_the_graph() {
+    fn a_run_under_an_alias_of_the_same_graph_holds_the_graph() {
         let mut store = wicked_apps_core::open_store(Some(":memory:")).expect("store");
         let dir = std::env::temp_dir().join(format!("wicked-alias-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let root = dir.to_string_lossy().into_owned();
-        let repo = |id: &str, root: &str| crate::repo::RepoEntry {
+        let shared_key = crate::code_graph::legacy_repo_graph_key(&dir);
+        let other_key = crate::code_graph::mint_repo_graph_key("c");
+        let repo = |id: &str, root: &str, key: &str| crate::repo::RepoEntry {
             id: id.to_string(),
             name: id.to_string(),
+            graph_key: key.to_string(),
             root_path: root.to_string(),
             default_branch: "main".to_string(),
             registered_at: 1,
@@ -2787,9 +2791,9 @@ mod tests {
             ..sample_session()
         };
         let nodes = vec![
-            repo("a", &root).to_node(),
-            repo("b", &format!("{root}/.")).to_node(),
-            repo("c", "/somewhere/else").to_node(),
+            repo("a", &root, &shared_key).to_node(),
+            repo("b", &format!("{root}/moved"), &shared_key).to_node(),
+            repo("c", &root, &other_key).to_node(),
             run.to_node(),
         ];
         put_nodes(&mut store, &nodes).expect("put");

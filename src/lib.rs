@@ -1933,7 +1933,7 @@ impl Core {
             let t: Vec<&str> = t.iter().map(String::as_str).collect();
             !t.is_empty() && crate::review_scale::signals_from_paths(&t).behavioural()
         });
-        let (repo_root, base_commit) = match repo_ref {
+        let (graph_key, base_commit) = match repo_ref {
             None => (None, None),
             Some(id) => {
                 let repo = self
@@ -1946,7 +1946,7 @@ impl Core {
                 } else {
                     None
                 };
-                (Some(std::path::PathBuf::from(repo.root_path)), base)
+                (Some(repo.graph_key), base)
             }
         };
         let (reply, rx) = channel();
@@ -1955,7 +1955,7 @@ impl Core {
                 plan,
                 project_id: project_id.map(str::to_string),
                 repo_ref: repo_ref.map(str::to_string),
-                repo_root,
+                graph_key,
                 base_commit,
                 deliver_step,
                 human_confirm,

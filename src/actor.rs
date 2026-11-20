@@ -218,7 +218,7 @@ pub(crate) fn in_process_governance() -> Option<crate::workflow::GovernanceConte
 /// fallback onto something nobody vouched for.
 fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<String> {
     let repo = crate::repo::get_repo(store, repo_ref?).ok().flatten()?;
-    let path = crate::code_graph::existing_code_graph(std::path::Path::new(&repo.root_path))?;
+    let path = crate::code_graph::existing_code_graph(&repo.graph_key)?;
     Some(path.to_string_lossy().into_owned())
 }
 
@@ -1116,6 +1116,14 @@ pub(crate) fn run(
     // leaked them — the exact failure DES R1 forbids). Holds its own `pty_map` clone.
     let _pty_reaper = terminal::PtyReaper::new(pty_map.clone());
 
+    match crate::repo::pin_graph_keys(&mut store) {
+        Ok(pinned) => {
+            for (id, key) in pinned {
+                eprintln!("wicked-core: repo `{id}`: pinned graph key `{key}` (core#1419)");
+            }
+        }
+        Err(e) => eprintln!("wicked-core: could not pin repo graph keys (core#1419): {e:#}"),
+    }
     let boot_repos = crate::repo::list_repos(&store);
     // One-time repo-graph migration (core#406, `code_graph.rs` ADR): a registered repo whose graph
     // sits under the pre-#406 estate home (`~/.wicked-estate/repo-graphs/<key>`) and nowhere under
@@ -1123,11 +1131,13 @@ pub(crate) fn run(
     // per repo; the source is left in place for the operator to remove. A boot with nothing to
     // migrate (every boot after the first) is silent and costs one `stat` per registered repo.
     if let Ok(repos) = &boot_repos {
-        for outcome in crate::code_graph::migrate_legacy_repo_graphs(
-            repos
-                .iter()
-                .map(|r| (r.id.as_str(), std::path::Path::new(&r.root_path))),
-        ) {
+        for outcome in crate::code_graph::migrate_legacy_repo_graphs(repos.iter().map(|r| {
+            (
+                r.id.as_str(),
+                std::path::Path::new(&r.root_path),
+                r.graph_key.as_str(),
+            )
+        })) {
             eprintln!("{}", outcome.notice());
         }
         // The repos the migration cannot help (F-024: indexed IN-TREE, which is never read) come
@@ -1585,12 +1595,16 @@ pub(crate) fn run(
                     // Read the repo from the store (fast, no git subprocess) so the worker thread
                     // can create the worktree with its root_path without holding a store handle.
                     // `create_worktree` (git worktree add) is moved off the actor thread below.
-                    let (repo_ref, repo_root) = if let Some(ref repo_id) = spec.repo_ref {
+                    let (repo_ref, repo_root, graph_key) = if let Some(repo_id) = &spec.repo_ref {
                         let repo = crate::repo::get_repo(&store, repo_id)?
                             .ok_or_else(|| anyhow::anyhow!("repo not registered: {repo_id}"))?;
-                        (Some(repo_id.clone()), Some(repo.root_path.clone()))
+                        (
+                            Some(repo_id.clone()),
+                            Some(repo.root_path),
+                            Some(repo.graph_key),
+                        )
                     } else {
-                        (None, None)
+                        (None, None, None)
                     };
                     // Project filing (DES-PROJECT-001 §2.2): validate BEFORE the stub write so an
                     // invalid/archived project is a synchronous Err with NO session persisted —
@@ -1885,7 +1899,9 @@ pub(crate) fn run(
                     // seconds on large repos) does not block the actor. For repo-less runs there is
                     // no git I/O; enqueue WorktreeReady directly on the actor thread to avoid an
                     // unnecessary thread spawn for the common case.
-                    if let (Some(root), Some(ref_id)) = (repo_root, repo_ref) {
+                    if let (Some(root), Some(ref_id), Some(graph_key)) =
+                        (repo_root, repo_ref, graph_key)
+                    {
                         let tx = self_tx.clone();
                         let rid = run_id.clone();
                         // D8: resolved here, where the thread's state home is bound.
@@ -1923,6 +1939,7 @@ pub(crate) fn run(
                                         // (the base tree) before the run starts.
                                         let indexed = crate::code_graph::index_at_base(
                                             std::path::Path::new(&root),
+                                            &graph_key,
                                             &wt,
                                             &b.commit,
                                             graph_root.as_deref(),
@@ -2177,15 +2194,15 @@ pub(crate) fn run(
                 // against THIS worktree's base commit, floor-filled, composed into
                 // `<run>:plan-1` (a team run) and held for approval when the matrix says so.
                 // Its state lands on the stub before `pre_distribute` carries the stub forward.
-                let repo_root = repo_ref
+                let graph_key = repo_ref
                     .as_deref()
                     .and_then(|id| crate::repo::get_repo(&store, id).ok().flatten())
-                    .map(|r| std::path::PathBuf::from(r.root_path));
+                    .map(|r| r.graph_key);
                 let team = team_plan_at_launch(
                     &mut store,
                     &registry,
                     &spec,
-                    repo_root.as_deref(),
+                    graph_key.as_deref(),
                     base_commit.as_deref(),
                     true,
                 );
@@ -4548,7 +4565,7 @@ pub(crate) fn run(
                 plan,
                 project_id,
                 repo_ref,
-                repo_root,
+                graph_key,
                 base_commit,
                 deliver_step,
                 human_confirm,
@@ -4559,7 +4576,7 @@ pub(crate) fn run(
                     plan,
                     project_id.as_deref(),
                     repo_ref.as_deref(),
-                    repo_root.as_deref(),
+                    graph_key.as_deref(),
                     base_commit.as_deref(),
                     deliver_step,
                     &human_confirm,
@@ -5237,7 +5254,7 @@ fn team_plan_at_launch(
     store: &mut dyn GraphStore,
     registry: &crate::workflow::WorkflowRegistry,
     spec: &LaunchSpec,
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
     persist: bool,
 ) -> anyhow::Result<
@@ -5327,7 +5344,7 @@ fn team_plan_at_launch(
     // read-only scope step alone, and the launch plan is decided at that step's boundary
     // (`team_gate::apply_scope`), before any creator step dispatches.
     if crate::plan_gate::needs_pa_scope(&plan) {
-        let unbound = repo_root.is_none() && spec.repo_ref.is_none();
+        let unbound = graph_key.is_none() && spec.repo_ref.is_none();
         let (state, def) = crate::plan_gate::scope_rev(
             run_id,
             &plan,
@@ -5344,7 +5361,7 @@ fn team_plan_at_launch(
         };
         return register_launch_plan(store, registry, spec, state, def, persist).map(Some);
     }
-    let scored = crate::plan_gate::intent_score_for_run(&plan, repo_root, base_commit);
+    let scored = crate::plan_gate::intent_score_for_run(&plan, graph_key, base_commit);
     // (WT-C3) A launch is not teamed yet (teaming is positive evidence: an acknowledged
     // `path.started`), so its testing-rule context fails closed on `kinds`.
     let rules =
@@ -5434,7 +5451,7 @@ fn preview_launch_plan(
     plan: crate::plan::PlanSteps,
     project_id: Option<&str>,
     repo_ref: Option<&str>,
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
     deliver_step: Option<crate::plan::PlanStep>,
     human_confirm: &crate::domain::HumanConfirm,
@@ -5465,7 +5482,7 @@ fn preview_launch_plan(
     let preview = crate::plan_gate::preview_plan(
         &plan,
         human_confirm,
-        repo_root,
+        graph_key,
         base_commit,
         deliver_step.as_ref(),
         &rules,
@@ -5563,11 +5580,11 @@ pub(crate) fn launch_run_inner(
     // (DES-TEAMING-002 T3) A preset (or plan) launch goes through the plan pipeline here too, so a
     // campaign node can never skip its plan_approval gate. This path observes no base commit, so
     // a declared touch set fails closed at 100.
-    let repo_root = repo_ref
+    let graph_key = repo_ref
         .as_deref()
         .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
-        .map(|r| std::path::PathBuf::from(r.root_path));
-    let mut team = team_plan_at_launch(store, registry, &spec, repo_root.as_deref(), None, false)?;
+        .map(|r| r.graph_key);
+    let mut team = team_plan_at_launch(store, registry, &spec, graph_key.as_deref(), None, false)?;
     // (DES-ASK-TEAM-CHAT-001 §4.1; T2 §8.1) The PA: the launcher's choice, or — on a team run — a
     // uniform random draw. The roster (and the plan state's copy of it) is re-ordered with the
     // pick first BEFORE anything is planned or distributed, so `clis.first()` is the PA everywhere.
@@ -12760,11 +12777,10 @@ fn dispatch_unit_with(
     // waiver. Persisted on the session BEFORE the unit runs, published, and stamped on the QE unit
     // so its prompt says whether to run the acceptance pipeline.
     {
-        let repo_root = session
+        let repo = session
             .repo_ref
             .as_deref()
-            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-            .map(|r| std::path::PathBuf::from(r.root_path));
+            .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten());
         let baseline = unit.worktree_baseline.as_ref().and_then(|b| {
             b.git_dir
                 .as_deref()
@@ -12776,7 +12792,8 @@ fn dispatch_unit_with(
         let decided = crate::qe_acceptance::on_dispatch_with(
             &session,
             &unit,
-            repo_root.as_deref(),
+            repo.as_ref().map(|r| std::path::Path::new(&r.root_path)),
+            repo.as_ref().map(|r| r.graph_key.as_str()),
             baseline,
             scored,
         );
@@ -17321,14 +17338,14 @@ fn stage_edit(
             }
         };
     }
-    let repo_root = session
+    let graph_key = session
         .repo_ref
         .as_deref()
         .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
-        .map(|r| std::path::PathBuf::from(r.root_path));
+        .map(|r| r.graph_key);
     let scored = crate::plan_gate::intent_score_for_run(
         &edit,
-        repo_root.as_deref(),
+        graph_key.as_deref(),
         session.base_commit.as_deref(),
     );
     let decided = crate::plan_gate::decide(
@@ -36231,6 +36248,7 @@ mod worker_code_graph_tests {
         let entry = RepoEntry {
             id: id.into(),
             name: id.into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(root),
             root_path: root.to_string_lossy().into_owned(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -36464,7 +36482,8 @@ mod worker_code_graph_tests {
         let root = scratch("indexed");
         let pin = crate::code_graph::test_support::GraphRootPin::at(&scratch("indexed-root"));
         let mut store = open_store(Some(":memory:")).unwrap();
-        let graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let graph = crate::code_graph::repo_graph_db_at(&pin.root, &key);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         std::fs::write(&graph, b"not really sqlite, but it is a file").unwrap();
         let decoy = root.join(crate::code_graph::code_graph_rel());
@@ -36497,7 +36516,8 @@ mod worker_code_graph_tests {
 
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = scratch("override-repo");
-        let graph = crate::code_graph::repo_graph_db_at(&override_root, &root);
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let graph = crate::code_graph::repo_graph_db_at(&override_root, &key);
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         std::fs::write(&graph, b"indexed under the override root").unwrap();
         register(&mut store, "override", &root);
@@ -36532,7 +36552,8 @@ mod worker_code_graph_tests {
         let root = scratch("dir-not-file");
         let pin = crate::code_graph::test_support::GraphRootPin::at(&scratch("dir-not-file-root"));
         let mut store = open_store(Some(":memory:")).unwrap();
-        std::fs::create_dir_all(crate::code_graph::repo_graph_db_at(&pin.root, &root)).unwrap();
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        std::fs::create_dir_all(crate::code_graph::repo_graph_db_at(&pin.root, &key)).unwrap();
         register(&mut store, "dir-not-file", &root);
 
         assert_eq!(repo_code_graph_db(&store, Some("dir-not-file")), None);
@@ -36685,6 +36706,7 @@ mod project_graph_binding_tests {
         let entry = RepoEntry {
             id: id.into(),
             name: id.into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(root),
             root_path: root.to_string_lossy().into_owned(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -37218,7 +37240,8 @@ mod project_graph_binding_tests {
         let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &key);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"a file is all this arm checks for").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -37251,7 +37274,8 @@ mod project_graph_binding_tests {
         let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &key);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         graph_with(&repo_graph, &["wicked-core"]);
         register(&mut store, "wicked-core", &root);
@@ -37288,7 +37312,8 @@ mod project_graph_binding_tests {
         let pin = crate::code_graph::test_support::GraphRootPin::at(&dir);
         let mut store = open_store(Some(":memory:")).unwrap();
         let root = dir.join("repo");
-        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &root);
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let repo_graph = crate::code_graph::repo_graph_db_at(&pin.root, &key);
         std::fs::create_dir_all(repo_graph.parent().unwrap()).unwrap();
         std::fs::write(&repo_graph, b"the run repo's own graph").unwrap();
         register(&mut store, "wicked-core", &root);
@@ -37854,10 +37879,11 @@ mod coverage_store_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let pin = crate::code_graph::test_support::GraphRootPin::at(&dir.join("state"));
-        let want = crate::code_graph::repo_graph_db_at(&pin.root, &dir);
+        let key = crate::code_graph::mint_repo_graph_key("coverage");
+        let want = crate::code_graph::repo_graph_db_at(&pin.root, &key);
         std::fs::create_dir_all(want.parent().unwrap()).unwrap();
         std::fs::write(&want, b"x").unwrap();
-        let got = crate::code_graph::existing_code_graph(&dir)
+        let got = crate::code_graph::existing_code_graph(&key)
             .expect("an indexed repo must resolve its graph under the root");
 
         // EXACT path, not a substring. A `contains("estate.db")` would also pass if the resolver
