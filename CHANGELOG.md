@@ -44,6 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Tests account for container-floor limits and actor ordering (core#1489).** Gate the voice hand-off test on an armable floor, check the send-back draft's held state without a render jail, flush ask events with Ping, and await shutdown subscriber disconnection directly.
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.
