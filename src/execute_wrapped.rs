@@ -3054,6 +3054,12 @@ impl WrappedCliStepRunner {
     }
 }
 
+/// (core#1538) Complete an evaluator's FAIL before runtime recovery can replace this attempt
+/// with a rerun. The later cli_runner promotion stays idempotent.
+fn complete_runtime_attempt(unit: &WorkUnit, out: StepOutput, emit: &DeltaSink) -> StepOutput {
+    crate::cli_runner::verdict_completes_the_turn(unit, out, emit)
+}
+
 impl WrappedCliStepRunner {
     /// (program context-block-core) One launch ATTEMPT with the run's context block pinned: the
     /// block this attempt is handed is resolved when it starts (`run_context::pin`; a recovery
@@ -3095,7 +3101,7 @@ impl WrappedCliStepRunner {
     /// back; a runtime that stays down ends as the runner's infrastructure line, never as the
     /// seat's failure ([`crate::runtime_wait`]).
     fn exec_through_runtime_blips(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
-        let first = self.exec_pinned(input, emit);
+        let first = complete_runtime_attempt(&input.unit, self.exec_pinned(input, emit), emit);
         // A run's governed unit only: the engine's own judge / triage / ballot sessions keep their
         // own failure handling and budgets, and are never benched for a runtime fault (xreview on
         // #1129 — a judge rotation would otherwise wait a whole window per judge seat).
@@ -3168,7 +3174,7 @@ impl WrappedCliStepRunner {
                 elapsed: &elapsed,
                 notify: &mut notify,
             },
-            &mut || self.exec_pinned(input, emit),
+            &mut || complete_runtime_attempt(&input.unit, self.exec_pinned(input, emit), emit),
         )
     }
 }
@@ -8578,6 +8584,67 @@ mod agy_tests;
 
 #[cfg(test)]
 mod tests {
+    /// core#1538: recovery must see an evaluator's FAIL as a completed turn, both on the first
+    /// attempt and on a rerun. Otherwise a runtime blip can replace that FAIL with a later PASS.
+    #[test]
+    fn runtime_recovery_preserves_an_evaluator_fail_on_every_attempt() {
+        let mut unit = WorkUnit::pending("r:review", "r", 2, "review");
+        unit.role = crate::workflow::PhaseRole::Evaluator;
+        let emit = |_: &str| {};
+        let out = |status, text: &str| StepOutput {
+            run_id: "r".into(),
+            unit_ix: 0,
+            attempt: 0,
+            output: text.into(),
+            status,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: true,
+        };
+        let fail_text = "finding: regression remains\nVERDICT: FAIL\n(cli `codex` exited 1)";
+        for fail_on_rerun in [false, true] {
+            let mut answers = vec![
+                out(StepStatus::Failed, fail_text),
+                out(StepStatus::Ok, "VERDICT: PASS"),
+            ]
+            .into_iter();
+            let first = if fail_on_rerun {
+                out(StepStatus::Failed, "runtime interrupted the turn")
+            } else {
+                answers.next().unwrap()
+            };
+            // Each failed attempt would see a runtime blip followed by recovery. If a FAIL is
+            // not promoted before ride_out sees it, the next attempt returns PASS instead.
+            let mut probes = 0;
+            let mut down_now = || {
+                probes += 1;
+                probes % 2 == 1
+            };
+            let mut reruns = 0;
+            let got = crate::runtime_wait::ride_out(
+                complete_runtime_attempt(&unit, first, &emit),
+                "codex",
+                Duration::from_secs(10),
+                crate::runtime_wait::Host {
+                    down_now: &mut down_now,
+                    sleep: &mut |_| true,
+                    cancelled: &|| false,
+                    elapsed: &|| Duration::ZERO,
+                    notify: &mut |_, _| {},
+                },
+                &mut || {
+                    reruns += 1;
+                    complete_runtime_attempt(&unit, answers.next().unwrap(), &emit)
+                },
+            );
+            assert_eq!(got.status, StepStatus::Ok);
+            assert_eq!(got.output, fail_text, "the gate must receive the FAIL");
+            assert_eq!(reruns, if fail_on_rerun { 1 } else { 0 });
+            assert_eq!(probes, if fail_on_rerun { 2 } else { 0 });
+        }
+    }
+
     #[test]
     fn container_config_selection_matches_arming_and_preserves_ungoverned_host_home() {
         for (governed, mode, expected) in [
