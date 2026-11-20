@@ -24,6 +24,16 @@ use wicked_governance::{register_policy, Effect, Policy, Severity, Trigger};
 
 const BIN: &str = env!("CARGO_BIN_EXE_wicked-core");
 
+/// Isolate governance writes before the non-test library can cache the operator's home root.
+/// SAFETY (`ctor(unsafe)`): pre-main, single-threaded; only sets one process env var.
+#[ctor::ctor(unsafe)]
+fn isolate_governance_root() {
+    let root = std::env::temp_dir().join(format!("wc-govrun-gov-{}", std::process::id()));
+    unsafe {
+        std::env::set_var("WICKED_GOV_ROOT", root);
+    }
+}
+
 fn scratch(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("wc-govrun-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

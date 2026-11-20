@@ -3816,6 +3816,9 @@ mod tests {
 
     #[test]
     fn write_records_recreates_a_vanished_run_dir() {
+        #[cfg(unix)]
+        use std::os::unix::fs::PermissionsExt;
+
         let dir = TempDir::new();
         let run_dir = dir.0.join("run/attempt-0");
         let path = run_dir.join("gateway-unit-1.ndjson");
@@ -3829,6 +3832,11 @@ mod tests {
         assert!(!run_dir.exists());
         write_records(&path, &records);
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
         // Appends preserve earlier records while the directory remains present.
         write_records(&path, &records);
         assert_eq!(fs::read_to_string(&path).unwrap(), expected.repeat(2));
@@ -3836,6 +3844,11 @@ mod tests {
         fs::remove_dir_all(dir.0.join("run")).unwrap();
         write_records(&path, &records);
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&run_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
     }
 
     #[test]

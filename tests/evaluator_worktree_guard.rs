@@ -48,6 +48,16 @@ use wicked_core::{
     RepoSpec, SessionStatus, StepInput, StepOutput, StepRunner, StepStatus,
 };
 
+/// Isolate governance writes before the non-test library can cache the operator's home root.
+/// SAFETY (`ctor(unsafe)`): pre-main, single-threaded; only sets one process env var.
+#[ctor::ctor(unsafe)]
+fn isolate_governance_root() {
+    let root = std::env::temp_dir().join(format!("wc-evaluator-guard-gov-{}", std::process::id()));
+    unsafe {
+        std::env::set_var("WICKED_GOV_ROOT", root);
+    }
+}
+
 /// Route every fire-and-forget `wicked.*` emission this binary triggers to a per-process temp spool
 /// instead of the operator's real replay queue (core#311). Every binary in this suite carries this
 /// block; `harness_hygiene.rs` fails the suite if one is missing.
