@@ -1849,3 +1849,78 @@ fn k3c_an_unpresented_completion_cuts_no_window() {
         .block
         .is_none_or(|b| !b.output.contains("p-unp")));
 }
+
+// (core#1396) Content identity follows what the final pass reads, including redaction.
+#[test]
+fn team_inputs_key_tracks_content_tree_and_team_inputs() {
+    let mut unit = input("key", 1, 1, None).unit;
+    let key = team_inputs_key(&unit, "done", Some("tree-a"));
+    assert_eq!(key, team_inputs_key(&unit, "done", Some("tree-a")));
+    assert_ne!(key, team_inputs_key(&unit, "other", Some("tree-a")));
+    assert_ne!(key, team_inputs_key(&unit, "done", Some("tree-b")));
+    assert_ne!(key, team_inputs_key(&unit, "done", None));
+    unit.description.push_str(" changed criterion");
+    assert_ne!(key, team_inputs_key(&unit, "done", Some("tree-a")));
+    let key = team_inputs_key(&unit, "done", None);
+    unit.pool_seating = Some(crate::domain::PoolSeating {
+        requested: 2,
+        seated: 2,
+        monitors: vec!["codex#2".into()],
+        missing: Vec::new(),
+        shortfall: None,
+    });
+    assert_ne!(key, team_inputs_key(&unit, "done", None));
+    let secret = ["example", "value"].join("-");
+    let raw = format!("API_TOKEN={secret} done");
+    let redacted = crate::tool_activity::redact(&raw);
+    assert_ne!(raw, redacted);
+    assert_eq!(
+        team_inputs_key(&unit, &raw, None),
+        team_inputs_key(&unit, &redacted, None),
+    );
+}
+
+#[test]
+fn team_inputs_key_tracks_the_claimed_criterion_role_kind_and_phase() {
+    let unit = input("key-fields", 1, 1, None).unit;
+    let key = team_inputs_key(&unit, "done", None);
+    let mut changed = unit.clone();
+    changed.validator = Some(crate::validator::DeterministicValidator {
+        criterion: "another criterion".into(),
+        script: "true".into(),
+        approved: true,
+    });
+    assert_ne!(key, team_inputs_key(&changed, "done", None));
+    let pinned = team_inputs_key(&changed, "done", None);
+    changed.description.push_str(" unused with a validator");
+    assert_eq!(pinned, team_inputs_key(&changed, "done", None));
+    let validator = changed.validator.as_mut().unwrap();
+    validator.criterion.push_str(" changed");
+    assert_ne!(pinned, team_inputs_key(&changed, "done", None));
+    let mut changed = unit.clone();
+    changed.role = crate::workflow::PhaseRole::Evaluator;
+    assert_ne!(key, team_inputs_key(&changed, "done", None));
+    let mut changed = unit.clone();
+    changed.tool_cmd = Some(vec!["true".into()]);
+    assert_ne!(key, team_inputs_key(&changed, "done", None));
+    let mut changed = unit;
+    changed.id = "key-fields:another-phase".into();
+    assert_ne!(key, team_inputs_key(&changed, "done", None));
+}
+
+#[test]
+fn merge_snapshot_preserves_a_carried_record_and_its_pause() {
+    let stamp = bus_stamp(3);
+    let mut reviewed = bus_stamp(2);
+    let mut ledger = authored_ledger();
+    ledger.findings[0].status = FindingStatus::Unanswered;
+    ledger.refresh_pause();
+    reviewed.ledger = Some(ledger);
+    reviewed.inputs_key = Some("reviewed-inputs".into());
+    reviewed.carried_from = Some(1);
+    let merged = merge_snapshot(Some(&stamp), Some(reviewed.clone())).unwrap();
+    assert_eq!(merged.inputs_key, reviewed.inputs_key);
+    assert_eq!(merged.carried_from, Some(1));
+    assert_eq!(merged.ledger, reviewed.ledger);
+    assert!(merged.ledger.unwrap().team_pause);
+}

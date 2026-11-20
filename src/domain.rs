@@ -507,6 +507,12 @@ pub struct UnitTeamSnapshot {
     /// or local snapshot — consumers then read [`Self::ledger`] (§6 `gate.opened.ledger_ref`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger_ref: Option<String>,
+    /// (core#1396) Content identity of the output, tree and team inputs this pass read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inputs_key: Option<String>,
+    /// (core#1396) The attempt that produced a carried record; a carry never claims a fresh pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub carried_from: Option<u32>,
     /// (T5) The attempt's ledger: S's fold, the worker's fail-closed synthesis, or the local empty
     /// ledger of an un-teamed unit. `teamPause` is recomputed on every parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -530,6 +536,8 @@ impl UnitTeamSnapshot {
             stream_floor: None,
             claimed_event_id: None,
             ledger_ref: None,
+            inputs_key: None,
+            carried_from: None,
             ledger: None,
             transcript: None,
         }
@@ -1069,9 +1077,13 @@ pub struct RequestedRejudge {
     /// even when the re-judge attempt's own team snapshot no longer names them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub monitors: Vec<String>,
+    /// (core#1396) The reviewed gate's team record, preserved across dispatch's fresh stamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<Box<crate::domain::UnitTeamSnapshot>>,
     /// The re-judge attempt has folded: the request stays on the unit only as the BASIS of the
     /// next re-judge (`attempt` and `monitors` — the seat attempt whose output is still the one
-    /// judged), its output dropped; the worker never honors it. Cleared once a seat runs again.
+    /// judged), its output and team record dropped; the worker never honors it. Cleared once a
+    /// seat runs again.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub consumed: bool,
     /// When it was armed (unix millis).

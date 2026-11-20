@@ -607,11 +607,13 @@ export declare class Core {
   /**
    * A team run's transport and its units' team snapshots — the persisted state behind crew's
    * `GET /api/v1/runs/:id/team` — as JSON `{ runId, transport, reason, streamFloor, planRev,
-   * pending, units: [{ ord, transport, reason, ledgerSource, ledgerRef, finalPass, teamPause,
-   * findings }] }`. Per unit (the last four `null` until the unit's attempt folded):
+   * pending, units: [{ ord, transport, reason, ledgerSource, ledgerRef, carriedFrom, finalPass,
+   * teamPause, findings }] }`. Per unit (the last five `null` until the unit's attempt folded):
    * `ledgerSource` is where its ledger came from (`"folded"` by the supervisor, `"synthesized"`
    * by the worker on the final-pass timeout, `"no_bus"`); `ledgerRef` is the supervisor row the
    * gate read (`"ledger.folded#<ord>:<attempt>"`, `null` for a synthesized or local ledger);
+   * `carriedFrom` names the attempt that produced a carried team record (`null` for a fresh
+   * pass); the reviewed output and team inputs were unchanged, so the final pass did not re-run.
    * `finalPass` is the ledger's `final_pass` (`"completed"`, `"timed_out"`, `"skipped"`,
    * `"stream_gap"`); `teamPause` true means an unresolved HIGH (or an incomplete record) stands
    * without a council YES, so the run pauses `team_dispute` before the next dispatch;

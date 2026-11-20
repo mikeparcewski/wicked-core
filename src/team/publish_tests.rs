@@ -709,3 +709,20 @@ fn a_torn_or_odd_tombstone_still_supersedes() {
     assert!(rig.types("run-t7").is_empty(), "{:?}", rig.types("run-t7"));
     assert!(rig.types("run-t8").is_empty(), "{:?}", rig.types("run-t8"));
 }
+
+#[test]
+fn run_team_view_discloses_the_carried_attempt() {
+    let session: crate::domain::AgentSession = serde_json::from_value(serde_json::json!({
+        "id": "carry", "workflow_id": "wf", "problem": "review", "entity_mode": "isolated",
+        "clis": [], "status": "executing"
+    }))
+    .unwrap();
+    let mut unit = crate::domain::WorkUnit::pending("carry:u1", "carry", 1, "review");
+    unit.team_run = true;
+    let mut team = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+    team.carried_from = Some(1);
+    unit.team = Some(team);
+    let view = run_team_view(&session, &[unit], true).unwrap();
+    let wire = serde_json::to_value(view).unwrap();
+    assert_eq!(wire["units"][0]["carriedFrom"], 1);
+}

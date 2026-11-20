@@ -5062,6 +5062,72 @@ fn run_unit_and_judge_on(
     (output, verdict, evidence)
 }
 
+/// (core#1396) A known tree, including the no-workdir case. An unreadable tree has no identity.
+fn team_tree(input: &StepInput, known: Option<&str>) -> Option<Option<String>> {
+    let Some(wd) = input.workdir.as_deref() else {
+        return Some(None);
+    };
+    if let Some(tree) = known {
+        return Some(Some(tree.to_string()));
+    }
+    let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
+    crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
+        .ok()
+        .map(|s| Some(s.tree))
+}
+
+/// (core#1396) Carry exactly what the reviewed gate read, only with a complete content identity.
+fn carried_team(
+    input: &StepInput,
+    tree: impl FnOnce() -> Option<Option<String>>,
+) -> Option<crate::domain::UnitTeamSnapshot> {
+    use crate::team::events::{LedgerSource, Transport};
+    if input.unit.team.as_ref()?.transport != Transport::Bus
+        || input
+            .unit
+            .repo_checks
+            .as_ref()
+            .is_some_and(|r| r.requested_rerun.is_some())
+    {
+        return None;
+    }
+    let request = input
+        .unit
+        .requested_rejudge
+        .as_ref()
+        .filter(|j| !j.consumed)?;
+    let reviewed = request.team.as_ref()?;
+    if reviewed.transport != Transport::Bus
+        || reviewed.ledger_source != Some(LedgerSource::Folded)
+        || reviewed.ledger.as_ref()?.final_pass != crate::team::FinalPass::Completed
+    {
+        return None;
+    }
+    let (ord, attempt) = reviewed
+        .ledger_ref
+        .as_deref()?
+        .strip_prefix("ledger.folded#")?
+        .split_once(':')?;
+    if ord.parse::<u32>().ok()? != input.unit.ord {
+        return None;
+    }
+    let attempt = attempt.parse::<u32>().ok()?;
+    // Read last: the tree read re-hashes the worktree, paid only for a carry candidate.
+    let tree = tree()?;
+    let key = crate::team::runner::team_inputs_key(&input.unit, &request.output, tree.as_deref());
+    if reviewed.inputs_key.as_deref()? != key {
+        return None;
+    }
+    let mut snapshot = (**reviewed).clone();
+    let producing_attempt = snapshot.carried_from.unwrap_or(attempt);
+    snapshot.carried_from = Some(producing_attempt);
+    snapshot.reason = Some(format!(
+        "team record carried from attempt {producing_attempt}: the reviewed output and the \
+         team's inputs are unchanged, so the team final pass did not re-run"
+    ));
+    Some(snapshot)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_unit_and_judge_in<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -5088,7 +5154,17 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // worker. `step.claimed` goes out BEFORE the turn starts (so it precedes every row of the
     // turn, §4.3); a claim that failed AND could not be tombstoned fails the step here, before
     // any work (fail closed, §4.8 row 5).
-    let attempt_team = match crate::team::runner::claim(team, input) {
+    // (core#1396) Decide before claiming: a carry publishes no new turn or final pass.
+    let claim = match carried_team(input, || team_tree(input, None)) {
+        Some(snapshot) => {
+            if let Some(reason) = snapshot.reason.as_deref() {
+                engine_note(emit_delta, reason);
+            }
+            Ok(crate::team::runner::Attempt::Carried(Box::new(snapshot)))
+        }
+        None => crate::team::runner::claim(team, input),
+    };
+    let attempt_team = match claim {
         Ok(a) => a,
         Err(why) => {
             eprintln!("wicked-core: unit {}: {why}", input.unit.ord);
@@ -5512,19 +5588,33 @@ fn run_unit_and_judge_in<'scope, 'env>(
         // synthesis on timeout). The snapshot is the attempt's `UnitEvidence.team`.
         let team: Option<crate::domain::UnitTeamSnapshot> = match &attempt_team {
             crate::team::runner::Attempt::NotTeam => None,
-            crate::team::runner::Attempt::Local(s) => Some((**s).clone()),
+            crate::team::runner::Attempt::Local(s) | crate::team::runner::Attempt::Carried(s) => {
+                Some((**s).clone())
+            }
             // Presented = the block was built from a read stream AND a seat turn consumed it: a
             // repo-checks re-run never runs the seat, and a carrier that refused the launch before
             // any prompt (a skills refusal) returns a failed output with no turn behind it (codex
             // review of #740 round 7) — only an `Ok` turn proves the seat saw its prior context.
-            crate::team::runner::Attempt::Claimed(c) => Some(crate::team::runner::complete_with(
-                c,
-                &output,
-                boundary_read
-                    && floor_rerun.is_none()
-                    && rejudge.is_none()
-                    && output.status == StepStatus::Ok,
-            )),
+            crate::team::runner::Attempt::Claimed(c) => {
+                let mut snapshot = crate::team::runner::complete_with(
+                    c,
+                    &output,
+                    boundary_read
+                        && floor_rerun.is_none()
+                        && rejudge.is_none()
+                        && output.status == StepStatus::Ok,
+                );
+                if output.status == StepStatus::Ok {
+                    snapshot.inputs_key = team_tree(input, current_tree.as_deref()).map(|tree| {
+                        crate::team::runner::team_inputs_key(
+                            &input.unit,
+                            &output.output,
+                            tree.as_deref(),
+                        )
+                    });
+                }
+                Some(snapshot)
+            }
         };
         let qe = qe.join().unwrap_or_else(|p| std::panic::resume_unwind(p));
         (qe, team)
@@ -8616,6 +8706,7 @@ mod tests {
             attempt: 2,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            team: None,
             consumed: false,
             at: 0,
         });
@@ -8859,6 +8950,7 @@ mod tests {
             attempt: 2,
             seats: vec!["pi".into()],
             monitors: Vec::new(),
+            team: None,
             consumed: false,
             at: 0,
         });
@@ -9329,6 +9421,7 @@ mod tests {
             attempt: 1,
             seats: Vec::new(),
             monitors: vec!["codex-j1592".into()],
+            team: None,
             consumed: true,
             at: 0,
         });
@@ -9485,6 +9578,7 @@ mod tests {
                 attempt: 1,
                 seats: Vec::new(),
                 monitors: vec![monitor.clone()],
+                team: None,
                 consumed: pinned,
                 at: 0,
             });
@@ -9612,6 +9706,7 @@ mod tests {
                 attempt: 1,
                 seats: Vec::new(),
                 monitors: vec![monitor.clone()],
+                team: None,
                 consumed: pinned,
                 at: 0,
             });
@@ -9767,6 +9862,7 @@ mod tests {
                 attempt: 1,
                 seats: Vec::new(),
                 monitors: vec![monitor.clone()],
+                team: None,
                 consumed: pinned,
                 at: 0,
             });
@@ -10846,6 +10942,7 @@ mod tests {
             attempt: 1,
             seats: Vec::new(),
             monitors: vec!["codex".into()],
+            team: None,
             consumed: false,
             at: 0,
         });
@@ -13587,6 +13684,217 @@ mod t5_bus_worker_tests {
                 governed: false,
             }
         }
+    }
+
+    // (core#1396) The reviewed record survives dispatch in the re-judge request.
+    fn rejudge_input(run: &str, floor: i64) -> StepInput {
+        let mut unit = crate::domain::WorkUnit::pending(format!("{run}:u1"), run, 1, "step 1");
+        unit.assigned_cli = Some("claude#1".into());
+        unit.team_run = true;
+        let mut stamp = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+        stamp.stream_floor = Some(floor);
+        unit.team = Some(stamp.clone());
+        stamp.ledger_source = Some(tev::LedgerSource::Folded);
+        stamp.ledger_ref = Some("ledger.folded#1:1".into());
+        stamp.ledger = Some(crate::team::TeamLedger::new(
+            crate::team::FinalPass::Completed,
+            Vec::new(),
+            Vec::new(),
+            Default::default(),
+        ));
+        stamp.inputs_key = Some(crate::team::runner::team_inputs_key(&unit, "done", None));
+        unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "done".into(),
+            attempt: 1,
+            seats: Vec::new(),
+            monitors: Vec::new(),
+            team: Some(Box::new(stamp)),
+            consumed: false,
+            at: 0,
+        });
+        StepInput {
+            run_id: run.into(),
+            unit_ix: 0,
+            attempt: 2,
+            unit,
+            workflow_id: format!("{run}:plan-1"),
+            entity_mode: EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        }
+    }
+
+    struct NoSeatTurn;
+    impl StepRunner for NoSeatTurn {
+        fn run_unit(&self, _: &StepInput) -> StepOutput {
+            panic!("a judge-only re-run must not run the creator seat");
+        }
+    }
+
+    #[test]
+    fn a_rejudge_carries_the_unchanged_team_record_without_publishing_a_turn() {
+        let rig = rig("rejudge-team-carry");
+        let run = "rejudge-team-carry";
+        let floor = match rig
+            .team_bus()
+            .publish(&fixture(tev::PATH_STARTED, 0, run))
+            .unwrap()
+        {
+            PublishOutcome::Published(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let input = rejudge_input(run, floor);
+        let reviewed = input
+            .unit
+            .requested_rejudge
+            .as_ref()
+            .unwrap()
+            .team
+            .as_ref()
+            .unwrap();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoSeatTurn);
+        let team = TeamRunner::from_config(
+            &TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+                .with_final_pass_budget(Duration::from_millis(300)),
+        );
+        let notes = Arc::new(std::sync::Mutex::new(String::new()));
+        let live_notes = notes.clone();
+        let sink = move |s: &str| live_notes.lock().unwrap().push_str(s);
+        let (_, _, evidence) =
+            run_unit_and_judge_with_team(&runner, &input, &sink, &[], None, team.as_ref());
+        let rows = rig.rows(run);
+        assert!(
+            rows.iter()
+                .all(|(_, t, _)| t != tev::STEP_CLAIMED && t != tev::STEP_COMPLETED),
+            "{rows:?}"
+        );
+        let snapshot = evidence.team.unwrap();
+        assert_eq!(snapshot.carried_from, Some(1));
+        assert_eq!(snapshot.ledger, reviewed.ledger);
+        assert_eq!(snapshot.ledger_ref, reviewed.ledger_ref);
+        assert!(notes
+            .lock()
+            .unwrap()
+            .contains("team record carried from attempt 1"));
+        assert!(snapshot
+            .reason
+            .unwrap()
+            .contains("the team final pass did not re-run"));
+    }
+
+    #[test]
+    fn a_rejudge_with_changed_output_runs_the_team_pass() {
+        let rig = rig("rejudge-team-changed");
+        let run = "rejudge-team-changed";
+        let floor = match rig
+            .team_bus()
+            .publish(&fixture(tev::PATH_STARTED, 0, run))
+            .unwrap()
+        {
+            PublishOutcome::Published(id) => id,
+            o => panic!("{o:?}"),
+        };
+        let mut input = rejudge_input(run, floor);
+        let key = crate::team::runner::team_inputs_key(&input.unit, "other output", None);
+        input
+            .unit
+            .requested_rejudge
+            .as_mut()
+            .unwrap()
+            .team
+            .as_mut()
+            .unwrap()
+            .inputs_key = Some(key);
+        let runner: Arc<dyn StepRunner> = Arc::new(NoSeatTurn);
+        let team = TeamRunner::from_config(
+            &TeamConfig::new(Some(rig.bus.clone()), Some(rig.outbox.clone()))
+                .with_final_pass_budget(Duration::from_millis(300)),
+        );
+        let (_, _, evidence) =
+            run_unit_and_judge_with_team(&runner, &input, &|_| {}, &[], None, team.as_ref());
+        let rows = rig.rows(run);
+        assert!(
+            rows.iter().any(|(_, t, _)| t == tev::STEP_CLAIMED),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|(_, t, _)| t == tev::STEP_COMPLETED),
+            "{rows:?}"
+        );
+        let snapshot = evidence.team.unwrap();
+        assert_eq!(snapshot.carried_from, None);
+        assert_eq!(
+            snapshot.inputs_key,
+            Some(crate::team::runner::team_inputs_key(
+                &input.unit,
+                "done",
+                None
+            )),
+        );
+    }
+
+    #[test]
+    fn an_uncertain_team_record_is_never_carried() {
+        let good = rejudge_input("rejudge-team-refused", 1);
+        assert_eq!(
+            carried_team(&good, || Some(None)).unwrap().carried_from,
+            Some(1),
+        );
+        assert!(carried_team(&good, || None).is_none(), "unreadable tree");
+        for case in 0..12 {
+            let mut input = good.clone();
+            let request = input.unit.requested_rejudge.as_mut().unwrap();
+            let team = request.team.as_mut().unwrap();
+            match case {
+                0 => team.ledger_source = Some(tev::LedgerSource::Synthesized),
+                1 => team.ledger.as_mut().unwrap().final_pass = crate::team::FinalPass::TimedOut,
+                2 => team.inputs_key = None,
+                3 => request.consumed = true,
+                4 => team.ledger_ref = Some("ledger.folded#2:1".into()),
+                5 => team.ledger_ref = Some("unparseable".into()),
+                6 => team.transport = tev::Transport::None,
+                7 => request.team = None,
+                8 => team.ledger.as_mut().unwrap().final_pass = crate::team::FinalPass::StreamGap,
+                9 => team.ledger_ref = None,
+                10 => team.ledger = None,
+                11 => input.unit.team.as_mut().unwrap().transport = tev::Transport::None,
+                _ => unreachable!(),
+            }
+            assert!(carried_team(&input, || Some(None)).is_none(), "case {case}");
+        }
+        assert!(carried_team(&good, || Some(Some("changed-tree".into()))).is_none());
+        let mut unreadable = good.clone();
+        unreadable.workdir = Some(std::env::temp_dir().join("no-team-baseline"));
+        assert!(team_tree(&unreadable, None).is_none());
+        let mut floor_rerun = good.clone();
+        floor_rerun.unit.repo_checks = Some(
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": true,
+                "sandbox_level": "none", "requested_rerun": { "mode": "extend" }
+            }))
+            .unwrap(),
+        );
+        assert!(carried_team(&floor_rerun, || Some(None)).is_none());
+        let mut twice = good;
+        let team = twice
+            .unit
+            .requested_rejudge
+            .as_mut()
+            .unwrap()
+            .team
+            .as_mut()
+            .unwrap();
+        team.ledger_ref = Some("ledger.folded#1:2".into());
+        team.carried_from = Some(1);
+        assert_eq!(
+            carried_team(&twice, || Some(None)).unwrap().carried_from,
+            Some(1),
+        );
     }
 
     #[test]

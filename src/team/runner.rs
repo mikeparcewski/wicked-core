@@ -23,6 +23,7 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use super::events::{
     self as tev, AdviceDelivered, Channel, DeliveryOutcome, Envelope, LedgerSource, StepClaimed,
@@ -175,6 +176,8 @@ pub enum Attempt {
     /// `path.started`), or this attempt's `step.claimed` failed. The snapshot is built locally and
     /// never published (§4.1, §4.8 rows 1/5/6).
     Local(Box<UnitTeamSnapshot>),
+    /// (core#1396) The reviewed gate's record, carried without another team turn or final pass.
+    Carried(Box<UnitTeamSnapshot>),
     /// The attempt's `step.claimed` is on the bus.
     Claimed(Box<Claimed>),
 }
@@ -213,11 +216,64 @@ pub(crate) fn seat_of(input: &StepInput) -> String {
 
 /// The plan step a unit carries: its phase id (the composed plan's step id), else `unit-<ord>`.
 pub fn step_id_of(input: &StepInput) -> String {
-    input
-        .unit
-        .phase_id()
+    team_step_id(&input.unit)
+}
+
+fn team_step_id(unit: &crate::domain::WorkUnit) -> String {
+    unit.phase_id()
         .map(str::to_string)
-        .unwrap_or_else(|| format!("unit-{}", input.unit.ord))
+        .unwrap_or_else(|| format!("unit-{}", unit.ord))
+}
+
+fn team_criterion(unit: &crate::domain::WorkUnit) -> &str {
+    unit.validator
+        .as_ref()
+        .map(|v| v.criterion.as_str())
+        .unwrap_or(&unit.description)
+}
+
+fn team_kind(unit: &crate::domain::WorkUnit) -> &'static str {
+    if unit.tool_cmd.is_some() {
+        "tool"
+    } else {
+        "agent"
+    }
+}
+
+fn team_monitors(unit: &crate::domain::WorkUnit) -> &[String] {
+    unit.pool_seating
+        .as_ref()
+        .map(|p| p.monitors.as_slice())
+        .unwrap_or_default()
+}
+
+/// (core#1396) What the final pass reads, independent of attempt numbers and wall-clock time.
+/// `None` is the no-workdir marker; callers must refuse an unreadable workdir's tree.
+pub fn team_inputs_key(unit: &crate::domain::WorkUnit, output: &str, tree: Option<&str>) -> String {
+    fn field(hash: &mut Sha256, bytes: &[u8]) {
+        hash.update((bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    let mut hash = Sha256::new();
+    field(&mut hash, b"team-inputs/v1");
+    field(&mut hash, crate::tool_activity::redact(output).as_bytes());
+    let marker: &[u8] = if tree.is_some() {
+        b"tree"
+    } else {
+        b"no-workdir"
+    };
+    field(&mut hash, marker);
+    field(&mut hash, tree.unwrap_or_default().as_bytes());
+    field(&mut hash, team_criterion(unit).as_bytes());
+    field(&mut hash, unit.role.token().as_bytes());
+    field(&mut hash, team_kind(unit).as_bytes());
+    field(&mut hash, team_step_id(unit).as_bytes());
+    let monitors = team_monitors(unit);
+    hash.update((monitors.len() as u64).to_le_bytes());
+    for monitor in monitors {
+        field(&mut hash, monitor.as_bytes());
+    }
+    format!("{:x}", hash.finalize())
 }
 
 fn envelope(run_id: &str, ord: u32, attempt: u32, by: &str, re: Option<String>) -> Envelope {
@@ -256,6 +312,8 @@ pub fn local_snapshot(stamped: &UnitTeamSnapshot, reason: Option<String>) -> Uni
         stream_floor: None,
         claimed_event_id: None,
         ledger_ref: None,
+        inputs_key: None,
+        carried_from: None,
         ledger: Some(empty_ledger(FinalPass::Skipped)),
         transcript: Some(empty_transcript()),
     }
@@ -322,12 +380,7 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
     let step_id = step_id_of(input);
     let baseline = input.unit.worktree_baseline.as_ref();
     let reviewing = input.unit.member_step.as_ref().and_then(|m| m.reviewing);
-    let criterion = input
-        .unit
-        .validator
-        .as_ref()
-        .map(|v| v.criterion.clone())
-        .unwrap_or_else(|| input.unit.description.clone());
+    let criterion = team_criterion(&input.unit).to_string();
     let ev = TeamEvent {
         env: envelope(&run_id, ord, attempt, &by, None),
         body: TeamBody::StepClaimed(StepClaimed {
@@ -335,28 +388,10 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
             role: input.unit.role.token().to_string(),
             // A unit carries no phase kind; what it IS for the team is an agent turn or the
             // engine's own tool command.
-            kind: if input.unit.tool_cmd.is_some() {
-                "tool".into()
-            } else {
-                "agent".into()
-            },
-            phase: input
-                .unit
-                .phase_id()
-                .map(str::to_string)
-                .unwrap_or_else(|| step_id.clone()),
-            // (ASK-K3b) A step with no validator pin still has a criterion for its members: the
-            // unit's description — the composed step's instructions, i.e. the question an answer
-            // step was asked (codex review of #739).
-            criterion: cap_utf8(
-                input
-                    .unit
-                    .validator
-                    .as_ref()
-                    .map(|v| v.criterion.as_str())
-                    .unwrap_or(&input.unit.description),
-                2 * 1024,
-            ),
+            kind: team_kind(&input.unit).to_string(),
+            phase: step_id.clone(),
+            // (ASK-K3b) A step with no validator pin still has its description as the criterion.
+            criterion: cap_utf8(team_criterion(&input.unit), 2 * 1024),
             baseline_tree: baseline.map(|b| b.tree.clone()),
             repo: input.workdir.as_ref().map(|wd| tev::RepoRef {
                 workdir: wd.to_string_lossy().into_owned(),
@@ -367,12 +402,7 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 .as_ref()
                 .and_then(|g| g.code_graph_db.clone()),
             // (core#810) The unit's pool monitors, as distribution seated them.
-            monitors: input
-                .unit
-                .pool_seating
-                .as_ref()
-                .map(|p| p.monitors.clone())
-                .unwrap_or_default(),
+            monitors: team_monitors(&input.unit).to_vec(),
         }),
     };
     let why = match publish_bounded(runner, &ev) {
@@ -899,6 +929,8 @@ fn snapshot(
         stream_floor: Some(claimed.stream_floor),
         claimed_event_id: Some(claimed.claimed_id),
         ledger_ref,
+        inputs_key: None,
+        carried_from: None,
         ledger: Some(ledger),
         transcript: Some(transcript),
     }
@@ -1353,6 +1385,8 @@ pub fn merge_snapshot(
             stream_floor: stamped.stream_floor,
             claimed_event_id: None,
             ledger_ref: None,
+            inputs_key: None,
+            carried_from: None,
             ledger: Some(empty_ledger(FinalPass::StreamGap)),
             transcript: Some(empty_transcript()),
         }),
