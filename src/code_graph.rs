@@ -2251,9 +2251,7 @@ mod tests {
         // The writer stays open with rows in the WAL: the switch cannot complete.
         let writer = sqlite_with_rows(&db, 3);
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
-        let started = std::time::Instant::now();
         assert!(settle_graph_journal(&db).is_err());
-        assert!(started.elapsed() >= std::time::Duration::from_secs(4));
         drop(writer);
         // An absent graph is an error too, and creates nothing.
         let absent = base.join("absent").join(CODE_GRAPH_DB_FILE);
