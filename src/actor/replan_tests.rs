@@ -67,6 +67,59 @@ fn cli(key: &str) -> AgenticCli {
     }
 }
 
+/// (core#1610 W4) A repeat-page reset keeps known-empty provider history through a revision,
+/// even though the retained attempt still records an earlier dispatch.
+#[test]
+fn a_revision_keeps_a_retained_units_observation_reset() {
+    use wicked_apps_core::ToNode;
+
+    let _ = wicked_apps_core::emit::hermetic_test_spool();
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let def: crate::workflow::WorkflowDef = serde_json::from_value(json!({
+        "id": "reset:plan-1",
+        "base_skill_ref": "",
+        "phases": [{"id": "produce", "kind": "recon", "gate": "auto"}]
+    }))
+    .unwrap();
+    let session: crate::domain::AgentSession = serde_json::from_value(json!({
+        "id": "reset",
+        "workflow_id": def.id,
+        "problem": "retain the repeat-page observation reset",
+        "entity_mode": crate::EntityMode::Shared,
+        "clis": ["a"],
+        "status": SessionStatus::Executing,
+        "team_plan": crate::plan_gate::TeamPlanState {
+            roster: vec![serde_json::to_value(cli("a")).unwrap()],
+            ..Default::default()
+        }
+    }))
+    .unwrap();
+    let mut old =
+        crate::actor::check_def_plans(&mut store, &def, &session.problem, &session.id, None)
+            .unwrap()
+            .remove(0);
+    assert!(!old.observation_reset, "a newly planned unit has no reset");
+    old.last_attempt = Some(3);
+    old.observation_reset = true;
+    crate::domain::put_node(&mut store, old.to_node()).unwrap();
+
+    let mut sink = crate::event_log::EventSink::default();
+    super::revise_units(&mut store, &mut sink, &session, def).unwrap();
+
+    let units = crate::domain::session_units(&store, &session.id).unwrap();
+    assert_eq!(units.len(), 1);
+    let kept = &units[0];
+    assert_eq!(kept.id, old.id);
+    assert_eq!(kept.last_attempt, Some(3));
+    assert!(kept.observed_providers.is_empty());
+    assert!(!kept.providers_unobserved);
+    assert!(!kept.observation_pending);
+    assert!(
+        kept.observation_reset,
+        "a revision must preserve the repeat-page reset until the next dispatch"
+    );
+}
+
 /// What the scripted worker does on one dispatch.
 #[derive(Default)]
 struct Turn {
