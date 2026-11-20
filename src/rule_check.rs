@@ -377,7 +377,8 @@ pub struct RuleCheckReport {
     /// Judge calls made (batches + single re-asks).
     #[serde(default)]
     pub calls: u32,
-    /// Rounds of calls: the batch rounds plus the rounds of single re-asks.
+    /// Rounds of calls: the batch rounds plus the rounds of single re-asks, including serial part
+    /// calls in each round.
     #[serde(default)]
     pub waves: u32,
     #[serde(default)]
@@ -3901,6 +3902,7 @@ fn judge_rows(
         judge,
         pool,
     );
+    report.waves += round.serial_parts;
     let (mut answered, mut why) = (round.answered, round.why);
     // (F20, F22) Each rule left unanswered is asked alone, on a seat other than the one whose answer
     // did not count (or that ran out of time) when another is live. A miss that carried a BROKEN
@@ -3914,6 +3916,7 @@ fn judge_rows(
         let par = missing.len().min(MAX_PARALLEL);
         report.waves += missing.len().div_ceil(par) as u32;
         let again = run_pool(pending, missing, first, par, input, judge, pool);
+        report.waves += again.serial_parts;
         answered.extend(again.answered);
         // Both rounds' reasons stand: the first names its seat (or the failed seats), the re-ask
         // its own.
@@ -4077,6 +4080,8 @@ struct Round {
     answered: Answered,
     why: BTreeMap<usize, String>,
     left: BTreeMap<usize, Retry>,
+    /// The most later-part calls attempted by any batch in this round.
+    serial_parts: u32,
 }
 
 /// What the workers of one check share: the calls made, the seats that failed as seats (never
@@ -4111,6 +4116,7 @@ fn run_pool(
     let answered: Mutex<Answered> = Mutex::new(BTreeMap::new());
     let why: Mutex<BTreeMap<usize, String>> = Mutex::new(BTreeMap::new());
     let left: Mutex<BTreeMap<usize, Retry>> = Mutex::new(BTreeMap::new());
+    let serial_parts = std::sync::atomic::AtomicU32::new(0);
     let paths: Vec<&str> = match input.stage {
         // (pi s6) At review a KEPT always cites a changed path: with none known, nothing can be
         // cited (a one-byte sentinel matches no cite), never "no requirement".
@@ -4293,6 +4299,7 @@ fn run_pool(
                 // what they found that holds (a BROKEN, a holding miss) is kept, marked cut (the
                 // whole change was not read); with nothing holding, the batch is retried elsewhere.
                 let mut unread_from: Option<usize> = None;
+                let mut batch_serial_parts = 0;
                 if let (Some((seat, first)), true) = (&got, total_parts > 1) {
                     let bar: &[&str] = &paths;
                     let holds_any = |outs: &[&String]| {
@@ -4309,6 +4316,7 @@ fn run_pool(
                         } else {
                             pool.calls
                                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            batch_serial_parts += 1;
                             Some(judge.ask(seat, &part_text(k)))
                         };
                         let w = match answer {
@@ -4354,6 +4362,7 @@ fn run_pool(
                         break;
                     }
                 }
+                serial_parts.fetch_max(batch_serial_parts, std::sync::atomic::Ordering::Relaxed);
                 match got {
                     Some((seat, out)) => {
                         // A KEPT on the change cites a changed file; on a record it quotes it.
@@ -4513,6 +4522,7 @@ fn run_pool(
         answered: answered.into_inner().unwrap(),
         why: why.into_inner().unwrap(),
         left: left.into_inner().unwrap(),
+        serial_parts: serial_parts.into_inner(),
     }
 }
 
