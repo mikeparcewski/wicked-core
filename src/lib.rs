@@ -620,12 +620,25 @@ pub fn registry_records() -> Vec<AgenticCli> {
         .collect()
 }
 
+/// The usable registry records with their governance classes, without filling sign-in / sign-out
+/// commands or preparing seat directories. Read-only judge selection consults these records.
+pub fn registry_records_classed() -> Vec<AgenticCli> {
+    registry_records()
+        .into_iter()
+        .map(|mut c| {
+            // (IG1-core-3) The seat's governance class, derived per call from its record.
+            c.governance_class = Some(wicked_council::governance_class(&c).as_wire().to_string());
+            c
+        })
+        .collect()
+}
+
 /// Resolve the council roster from the registry (built-ins merged with the user's
 /// `~/.config/wicked-council/clis.toml`), keeping every seat that may vote OR work (core#572:
 /// routing reads `seat_eligible_for_work`, a decision's ballots `enabled_for_council`). This is
 /// what a consumer passes as [`LaunchSpec::clis`] for a real run.
 pub fn registry_roster() -> Vec<AgenticCli> {
-    registry_records()
+    registry_records_classed()
         .into_iter()
         .map(|mut c| {
             // Fill the seat's sign-in command from the built-in table when the registry entry
@@ -641,8 +654,6 @@ pub fn registry_roster() -> Vec<AgenticCli> {
             if c.logout_invocation.is_none() {
                 c.logout_invocation = wicked_council::types::default_logout_invocation(&c.key);
             }
-            // (IG1-core-3) The seat's governance class, derived per call from its record.
-            c.governance_class = Some(wicked_council::governance_class(&c).as_wire().to_string());
             c
         })
         .collect()
