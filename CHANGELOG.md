@@ -50,6 +50,11 @@ Two release tracks share this file, newest entry first regardless of track:
   The slot is held through retry passes and released on every exit; refusals name the other running floors
   and remain environment refusals with no check run.
 
+- **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
+  process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
+  on both the first attempt and every retry. The FAIL reaches the gate instead of being replaced
+  by a later retry's PASS.
+
 - **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
   hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which
