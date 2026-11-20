@@ -44,11 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **Floor disk admission accounts for other floors already running (core#1560).** A process-wide reservation
-  requires the free-space minimum plus 20 GiB per in-flight floor, checked and reserved under one mutex.
-  `WICKED_FLOOR_PEAK_GB` sets that per-floor reservation (`0` disables only the reservation term).
-  The slot is held through retry passes and released on every exit; refusals name the other running floors
-  and remain environment refusals with no check run.
+- **Floor disk admission waits for a slot while other floors run (core#1560).** Below the free-space
+  minimum plus 20 GiB per in-flight floor (`WICKED_FLOOR_PEAK_GB`), admission waits for a slot release
+  and periodically rechecks free space. `WICKED_FLOOR_ADMIT_WAIT_S` bounds the wait (default 900 seconds,
+  maximum 3600); at the deadline the floor is admitted anyway. Only free space below the minimum
+  (`WICKED_FLOOR_MIN_FREE_GB`) causes a disk refusal; `0` turns the guard and wait off. Cancellation
+  stops a waiting floor. Slots span retry passes and cleanup, and every release wakes waiting floors.
 
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or

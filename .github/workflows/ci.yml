@@ -26,9 +26,6 @@ env:
   # Offline embedder — the memory engine must not download a model in CI (matches the tests' own default).
   WICKED_MEMORY_EMBEDDER: hash
   CARGO_TERM_COLOR: always
-  # core#1560: the engine reserves disk per running floor; the integration tests run many floors at once
-  # on a runner that is not the production host, so the reservation term is off here (the minimum stays).
-  WICKED_FLOOR_PEAK_GB: "0"
 
 jobs:
   check:
