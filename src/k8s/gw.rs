@@ -39,6 +39,49 @@ pub(crate) struct Gw {
     pub(crate) dir: PathBuf,
 }
 
+/// The pod identity and gateway restart count bounding a launch's logs (core#1546).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LogState {
+    pod: String,
+    uid: String,
+    restarts: u64,
+}
+
+impl LogState {
+    pub(crate) fn from_pod(pod: &serde_json::Value) -> Option<Self> {
+        let gateway = pod
+            .pointer("/status/containerStatuses")?
+            .as_array()?
+            .iter()
+            .find(|c| c["name"].as_str() == Some("gateway"))?;
+        Some(Self {
+            pod: pod.pointer("/metadata/name")?.as_str()?.to_string(),
+            uid: pod.pointer("/metadata/uid")?.as_str()?.to_string(),
+            restarts: gateway["restartCount"].as_u64()?,
+        })
+    }
+}
+
+/// Whether current and previous logs can cover the launch (core#1546).
+pub(crate) fn logs_complete(
+    arm: Option<&LogState>,
+    release: Option<&LogState>,
+    previous_ok: bool,
+    current_ok: bool,
+) -> bool {
+    let (Some(arm), Some(release)) = (arm, release) else {
+        return false;
+    };
+    arm.pod == release.pod
+        && arm.uid == release.uid
+        && release
+            .restarts
+            .checked_sub(arm.restarts)
+            .is_some_and(|delta| delta <= 1)
+        && current_ok
+        && (release.restarts == 0 || previous_ok)
+}
+
 /// Where a writer write lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Volume {
@@ -338,39 +381,65 @@ impl Gw {
     /// quarantine or an eviction replaces it), the serving pod first, else the one whose writer
     /// runs; unchanged when none can be read.
     pub(crate) fn current(&self) -> Gw {
-        let pods =
-            match self
-                .kube
-                .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
-            {
-                Ok(p) => p,
-                Err(_) => return self.clone(),
-            };
-        match cluster::running_pod(&pods).or_else(|| cluster::writer_running(&pods)) {
-            Some(pod) => Gw {
-                pod,
-                ..self.clone()
-            },
-            None => self.clone(),
-        }
+        self.find_current().unwrap_or_else(|| self.clone())
     }
 
-    /// The gateway's access-log records for `unit` since `since` (unix seconds).
-    pub(crate) fn records(&self, since: &str, unit: &str) -> Vec<GatewayRecord> {
+    /// Observation needs a known current pod, including successful discovery (core#1546).
+    fn find_current(&self) -> Option<Gw> {
+        let pods = self
+            .kube
+            .list_owned(Some(&self.ns), "pods", &[(super::ROLE_LABEL, "gateway")])
+            .ok()?;
+        let pod = cluster::running_pod(&pods).or_else(|| cluster::writer_running(&pods))?;
+        Some(Gw {
+            pod,
+            ..self.clone()
+        })
+    }
+
+    /// The named pod's identity and gateway restart count, unknown on a failed read (core#1546).
+    pub(crate) fn log_state(&self) -> Option<LogState> {
+        self.kube
+            .get_json(Some(&self.ns), "pod", &self.pod)
+            .ok()
+            .flatten()
+            .as_ref()
+            .and_then(LogState::from_pod)
+    }
+
+    /// The launch's access-log records and whether the available logs cover it (core#1546).
+    pub(crate) fn records(
+        &self,
+        since: &str,
+        unit: &str,
+        arm: Option<&LogState>,
+    ) -> (Vec<GatewayRecord>, bool) {
+        let Some(gw) = self.find_current() else {
+            return (Vec::new(), false);
+        };
         let since = since
             .parse::<u64>()
             .map(super::rfc3339)
             .unwrap_or_else(|_| super::rfc3339(0));
         let t = format!("--since-time={since}");
-        // The container's previous run too (codex b2-gw #8): a gateway restart mid-unit keeps
-        // the records before it. A pod replaced mid-unit still loses its predecessor's.
+        let release = gw.log_state();
         let mut out = Vec::new();
+        let mut previous_ok = false;
+        let mut current_ok = false;
         for previous in [true, false] {
-            let mut a = vec!["logs", "-c", "gateway", self.pod.as_str(), t.as_str()];
+            if previous && !release.as_ref().is_some_and(|s| s.restarts > 0) {
+                continue;
+            }
+            let mut a = vec!["logs", "-c", "gateway", gw.pod.as_str(), t.as_str()];
             if previous {
                 a.push("--previous");
             }
-            let r = self.kube.call(Some(&self.ns), &a, None, EXEC_TIMEOUT);
+            let r = gw.kube.call(Some(&gw.ns), &a, None, EXEC_TIMEOUT);
+            if previous {
+                previous_ok = r.ok();
+            } else {
+                current_ok = r.ok();
+            }
             if !r.ok() {
                 continue;
             }
@@ -383,7 +452,11 @@ impl Gw {
                 unit,
             ));
         }
-        out
+        // A restart during the reads can split the two logs too (core#1546).
+        let stable = release == gw.find_current().and_then(|current| current.log_state());
+        let complete = stable && logs_complete(arm, release.as_ref(), previous_ok, current_ok);
+        // Known limits (core#1546): no durable accumulation; rotation and clock skew are unseen.
+        (out, complete)
     }
 }
 
@@ -1038,4 +1111,50 @@ pub(crate) fn seat_sign_in(
 #[cfg(not(unix))]
 pub(crate) fn claude_seat_token(_gw: &Gw) -> Result<String, String> {
     Err("seat sign-ins need a Unix host".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_completeness_requires_the_same_pod_and_all_available_logs_1546() {
+        let state = |name: &str, uid: &str, restarts: u64| {
+            LogState::from_pod(&serde_json::json!({
+                "metadata": {"name": name, "uid": uid},
+                "status": {"containerStatuses": [
+                    {"name": "writer", "restartCount": 99},
+                    {"name": "gateway", "restartCount": restarts}
+                ]}
+            }))
+            .unwrap()
+        };
+        let arm = state("agw-a", "uid-a", 0);
+        assert!(logs_complete(Some(&arm), Some(&arm), false, true));
+        assert!(!logs_complete(Some(&arm), Some(&arm), true, false));
+        let restarted = state("agw-a", "uid-a", 1);
+        assert!(logs_complete(Some(&arm), Some(&restarted), true, true));
+        assert!(!logs_complete(Some(&arm), Some(&restarted), false, true));
+        assert!(!logs_complete(Some(&arm), Some(&restarted), true, false));
+        assert!(!logs_complete(Some(&restarted), Some(&restarted), false, true));
+        let twice = state("agw-a", "uid-a", 2);
+        assert!(!logs_complete(Some(&arm), Some(&twice), true, true));
+        assert!(logs_complete(Some(&restarted), Some(&twice), true, true));
+        assert!(!logs_complete(Some(&twice), Some(&arm), true, true));
+        for replaced in [state("agw-b", "uid-b", 0), state("agw-a", "uid-b", 0)] {
+            assert!(!logs_complete(Some(&arm), Some(&replaced), true, true));
+        }
+        assert!(!logs_complete(None, Some(&arm), true, true));
+        assert!(!logs_complete(Some(&arm), None, true, true));
+        for pod in [
+            serde_json::json!({}),
+            serde_json::json!({"metadata": {"name": "agw-a", "uid": "uid-a"}}),
+            serde_json::json!({
+                "metadata": {"name": "agw-a", "uid": "uid-a"},
+                "status": {"containerStatuses": [{"name": "gateway"}]}
+            }),
+        ] {
+            assert!(LogState::from_pod(&pod).is_none());
+        }
+    }
 }

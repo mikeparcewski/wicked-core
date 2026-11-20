@@ -1971,26 +1971,58 @@ impl std::fmt::Debug for ArmedContainer {
 /// How many times a lease retries an unconfirmed revocation before quarantining the gateway.
 const REVOKE_ATTEMPTS: usize = 3;
 
+/// A full launch nonce keeps overlapping executions distinct (core#1546).
+fn gateway_unit(run: &str, ord: u32) -> String {
+    format!("{run}#{ord}@{}", uuid::Uuid::new_v4().simple())
+}
+
 /// One seat's registration on the daemon's gateway: its key is revoked and its records read
 /// when the unit ends.
 #[derive(Debug)]
 pub(crate) struct GatewayLease {
     gw: crate::k8s::gw::Gw,
+    arm_log_state: Option<crate::k8s::gw::LogState>,
     key: String,
     /// `<run>#<ord>@<nonce>`: the identity the gateway's records carry for this execution.
     pub(crate) unit: String,
+    run: String,
     since: String,
+}
+
+/// Evidence may be partial; only complete logs establish providers (core#1546).
+pub(crate) struct GatewayObservation {
+    pub(crate) records: Vec<crate::seat_gateway::GatewayRecord>,
+    pub(crate) providers: Option<Vec<crate::observed_provider::Provider>>,
+}
+
+impl GatewayObservation {
+    fn new(
+        mut records: Vec<crate::seat_gateway::GatewayRecord>,
+        complete: bool,
+        run: &str,
+    ) -> Self {
+        // Unit and run must both belong to this lease (core#1546).
+        records.retain(|record| record.run == run);
+        let providers = if complete {
+            crate::observed_provider::providers_of(&records)
+        } else {
+            None
+        };
+        Self { records, providers }
+    }
 }
 
 impl GatewayLease {
     /// Revoke the seat's key and return what the gateway recorded for it (model requests:
     /// status, model, tool calls, text, usage — never a credential).
-    pub(crate) fn release(mut self) -> Vec<crate::seat_gateway::GatewayRecord> {
-        // The gateway pod as it runs now, not as it ran at arm (review r6 #15).
-        self.gw = self.gw.current();
-        let records = self.gw.records(&self.since, &self.unit);
+    pub(crate) fn release(mut self) -> GatewayObservation {
+        let (records, complete) = self.gw.records(
+            &self.since,
+            &self.unit,
+            self.arm_log_state.as_ref(),
+        );
         self.revoke();
-        records
+        GatewayObservation::new(records, complete, &self.run)
     }
 
     /// Revoke the key once; a revocation the gateway does not confirm is retried, and if it still
@@ -2459,10 +2491,7 @@ pub(crate) fn arm_noting(
                     });
                 }
                 crate::k8s::clock::mark("sign_in");
-                let unit = format!(
-                    "{run_id}#{ord}@{}",
-                    &uuid::Uuid::new_v4().simple().to_string()[..8]
-                );
+                let unit = gateway_unit(run_id, ord);
                 let seat_args = crate::seat_gateway::seat_args_for(cli, kind.kind);
                 let copilot_account = (cli == "copilot"
                     && kind
@@ -2490,8 +2519,10 @@ pub(crate) fn arm_noting(
                 let ip = gw.service_ip.clone();
                 let lease = GatewayLease {
                     gw: gw.clone(),
+                    arm_log_state: gw.log_state(),
                     key: key.key.clone(),
                     unit,
+                    run: run_id.to_string(),
                     since,
                 };
                 crate::k8s::gw::register_live(&gw, key.clone()).map_err(down)?;
@@ -3360,6 +3391,56 @@ mod agy_tests;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_unit_has_a_full_uuid_nonce_1546() {
+        let unit = gateway_unit("run-a", 7);
+        let nonce = unit.strip_prefix("run-a#7@").unwrap();
+        assert_eq!(nonce.len(), 32);
+        assert!(nonce.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert_ne!(unit, gateway_unit("run-a", 7));
+    }
+
+    #[test]
+    fn another_run_with_the_same_unit_is_not_this_launch_1546() {
+        let records = crate::seat_gateway::parse_records(
+            include_str!("../tests/fixtures/gateway/access-log.ndjson"),
+            "1",
+        );
+        let mut other = records[0].clone();
+        other.run = "run-b".into();
+        other.endpoint = Some("another-provider:443".into());
+        let observation =
+            GatewayObservation::new(vec![other.clone(), records[0].clone()], true, "run-a");
+        assert_eq!(observation.records, records);
+        assert_eq!(observation.providers, Some(vec!["gw1-stub:8080".into()]));
+        let wrong_run = GatewayObservation::new(vec![other], true, "run-a");
+        assert!(wrong_run.records.is_empty());
+        assert_eq!(wrong_run.providers, None);
+    }
+
+    #[test]
+    fn a_replaced_gateway_pod_makes_the_launch_unobserved_1546() {
+        let state = |name: &str, uid: &str| {
+            crate::k8s::gw::LogState::from_pod(&serde_json::json!({
+                "metadata": {"name": name, "uid": uid},
+                "status": {"containerStatuses": [{"name": "gateway", "restartCount": 0}]}
+            }))
+            .unwrap()
+        };
+        let arm = state("agw-a", "uid-a");
+        let release = state("agw-b", "uid-b");
+        let records = crate::seat_gateway::parse_records(
+            include_str!("../tests/fixtures/gateway/access-log.ndjson"),
+            "1",
+        );
+        assert!(crate::observed_provider::providers_of(&records).is_some());
+        let complete = crate::k8s::gw::logs_complete(Some(&arm), Some(&release), true, true);
+        let observation = GatewayObservation::new(records.clone(), complete, "run-a");
+        assert_eq!(observation.providers, None);
+        assert_eq!(observation.records, records);
+        assert!(GatewayObservation::new(records, true, "run-a").providers.is_some());
+    }
 
     /// core#1461 (runs d0f84ace, 12a50f95): the claude seat's `--settings` file was narrowed around
     /// the run's declared draft root only AFTER the arm, whose copy-in had already put the host
