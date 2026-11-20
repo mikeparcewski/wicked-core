@@ -1651,8 +1651,18 @@ impl RepoChecksReport {
         (!notes.is_empty()).then(|| notes.join("; "))
     }
 
+    /// An environment refusal carries its own cause and advice, distinct from a missing boundary.
+    pub fn environment_refusal(&self) -> Option<&str> {
+        self.sandbox_error
+            .as_deref()
+            .filter(|e| is_environment_refusal(e))
+    }
+
     /// The operator-facing denial when `!passed`.
     pub fn denial_reason(&self) -> String {
+        if let Some(e) = self.environment_refusal() {
+            return format!("repo checks floor could not run: {e}");
+        }
         if let Some(e) = &self.sandbox_error {
             return format!(
                 "repo checks floor failed: {CRITERION}. The checks were NOT run: {e} — the floor \
@@ -5085,6 +5095,14 @@ thread_local! {
     pub(crate) static TEST_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
 }
 
+/// The wire prefix for a floor's environment refusal, whose text carries its own advice.
+pub const ENVIRONMENT_REFUSAL_PREFIX: &str = "environment:";
+
+/// Whether a refusal describes the environment rather than a missing OS write boundary.
+pub fn is_environment_refusal(error: &str) -> bool {
+    error.starts_with(ENVIRONMENT_REFUSAL_PREFIX)
+}
+
 /// (core#1482) Why the floor must not start for lack of disk (an ENVIRONMENT failure, never a check
 /// failure), or `None`: `free` bytes against `min_gib`. Unknown free space never refuses.
 pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
@@ -5092,8 +5110,8 @@ pub(crate) fn disk_guard(free: Option<u64>, min_gib: u64) -> Option<String> {
     let min = min_gib.saturating_mul(1 << 30);
     (min > 0 && free < min).then(|| {
         format!(
-            "environment: the host has {:.1} GiB free on the check cache's volume, under the \
-             floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
+            "{ENVIRONMENT_REFUSAL_PREFIX} the host has {:.1} GiB free on the check cache's volume, \
+             under the floor's minimum of {min_gib} GiB (WICKED_FLOOR_MIN_FREE_GB); no check ran. Free disk \
              space, then retry the step — this is not a failure of the change",
             free as f64 / (1u64 << 30) as f64
         )
@@ -10920,6 +10938,31 @@ pub(crate) fn run_one_with(
         };
         if let Some(msg) = launcher {
             result.spawn_error = Some(msg);
+        }
+    }
+    // (core#1605) ENOSPC on a cache volume below the admission minimum is infrastructure,
+    // not a failed check to retry or compare with the base. Output alone is repo-controlled:
+    // require the volume reading too, and keep any earlier launcher/log/signal diagnosis.
+    if failed
+        && !result.timed_out
+        && result.spawn_error.is_none()
+        && [&result.stdout_tail, &result.stderr_tail]
+            .iter()
+            .any(|tail| tail.contains("No space left on device") || tail.contains("os error 28"))
+    {
+        let min_gib = floor_min_free_gib();
+        if let Some(free) = check_cache_root()
+            .ok()
+            .and_then(|root| free_bytes(&root))
+            .filter(|free| disk_guard(Some(*free), min_gib).is_some())
+        {
+            result.spawn_error = Some(format!(
+                "{ENVIRONMENT_REFUSAL_PREFIX} the disk filled during `{}` ({:.1} GiB free, \
+                 minimum {min_gib} GiB; WICKED_FLOOR_MIN_FREE_GB). Free disk space, then retry; \
+                 not a failure of the change",
+                check.name,
+                free as f64 / (1u64 << 30) as f64
+            ));
         }
     }
     // ANNOTATION only (DES-FLOOR-V2): the ids a runner printed, both streams, first sight order.

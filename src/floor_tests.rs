@@ -5700,3 +5700,252 @@ fn core_1482_a_floor_short_of_disk_runs_nothing_and_says_environment() {
     );
     let _ = std::fs::remove_dir_all(&wt);
 }
+
+/// core#1611: an admission refusal carries disk advice, never a missing-boundary diagnosis.
+#[test]
+fn core_1611_disk_refusal_denial_names_disk_space_not_a_missing_sandbox() {
+    let wt = scratch("disk-denial");
+    let why = disk_guard(Some(1 << 30), 15).expect("disk refused");
+    let report = runner_refused(&wt, &FloorContext::default(), why);
+    let denial = report.denial_reason();
+    assert!(
+        denial.contains("1.0 GiB free") && denial.contains("Free disk space"),
+        "{denial}"
+    );
+    assert!(
+        !denial.contains("OS write boundary") && !denial.contains("sandbox tool"),
+        "{denial}"
+    );
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// core#1611: drive the gate's existing fold so both the floor note and ungated reason are checked.
+#[test]
+fn core_1611_disk_refusal_gate_advice_names_disk_space_not_sandbox_installation() {
+    use crate::event::CoreEvent;
+    use crate::scope::EntityMode;
+    use wicked_apps_core::ToNode;
+    use wicked_council::AgenticCli;
+
+    let wt = scratch("disk-gate-advice");
+    let cli = AgenticCli {
+        key: "a".into(),
+        display_name: "a".into(),
+        binary: "unused".into(),
+        headless_invocation: "unused {PROMPT}".into(),
+        category: Default::default(),
+        input_mode: Default::default(),
+        version_probe: vec![],
+        trust_flags: vec![],
+        alt_binaries: vec![],
+        confidence: Default::default(),
+        enabled_for_council: true,
+        seat_eligible_for_work: true,
+        acp: None,
+        capabilities: None,
+        login_invocation: None,
+        logout_invocation: None,
+        governance_class: None,
+        credential: None,
+        free_tier: None,
+        health: None,
+    };
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let sid = "disk-gate-advice-1611";
+    let crate::pipeline::Planned {
+        mut units,
+        workflow_id,
+        cli_keys,
+        mut session,
+    } = crate::pipeline::plan_and_distribute(
+        &mut store,
+        &[cli],
+        "Do step one.",
+        EntityMode::Shared,
+        sid,
+        crate::domain::HumanConfirm::None,
+        false,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        &mut |_| {},
+        None,
+        false,
+        false,
+        Vec::new(),
+        None,
+        true,
+        &crate::assurance::QeOverride::Auto,
+    )
+    .expect("plan");
+    session.workdir = Some(wt.to_string_lossy().into_owned());
+    crate::domain::put_node(&mut store, session.to_node()).unwrap();
+    let unit = &mut units[0];
+    unit.default_floor = true;
+    unit.repo_checks_floor = false;
+    unit.worktree_guarded = false;
+    let report = runner_refused(
+        &wt,
+        &FloorContext::default(),
+        disk_guard(Some(1 << 30), 15).unwrap(),
+    );
+    let evidence = crate::workflow::UnitEvidence {
+        tree_changed: Some(true),
+        repo_checks: Some(report),
+        judge_skipped: Some("test: no judge".into()),
+        ..Default::default()
+    };
+    let mut seen = Vec::new();
+    crate::pipeline::apply_and_finish_unit(
+        &mut store,
+        unit,
+        "did step one",
+        &workflow_id,
+        EntityMode::Shared,
+        sid,
+        0,
+        false,
+        false,
+        &cli_keys,
+        None,
+        &evidence,
+        &mut |e| seen.push(e),
+        None,
+    )
+    .expect("fold");
+    let (floor_note, ungated_reason) = seen
+        .iter()
+        .find_map(|e| match e {
+            CoreEvent::GateEvaluated {
+                floor_note,
+                ungated_reason,
+                ..
+            } => Some((
+                floor_note.as_deref().unwrap(),
+                ungated_reason.as_deref().unwrap(),
+            )),
+            _ => None,
+        })
+        .expect("gate evaluated");
+    for text in [floor_note, ungated_reason] {
+        assert!(
+            text.contains("1.0 GiB free") && text.contains("Free disk space"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("OS write boundary") && !text.contains("sandbox tool"),
+            "{text}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
+/// core#1605: ENOSPC plus a low cache volume is recorded once as could_not_run. The same
+/// diagnostic with plenty of space remains a check failure (repo output alone cannot refuse).
+#[cfg(unix)]
+#[test]
+fn core_1605_disk_filling_during_a_check_records_the_cause_without_retry_or_base() {
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(8.0, 4);
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+            for (key, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let _restore = Restore(
+        [
+            (UNSANDBOXED_OPT_IN_ENV, "1"),
+            (crate::checks_container::RUNNER_ENV, "sandbox"),
+            ("WICKED_FLOOR_MIN_FREE_GB", "15"),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            (key, prior)
+        })
+        .collect(),
+    );
+    let wt = scratch("disk-filled-during-check");
+    std::fs::create_dir_all(wt.join("node_modules")).unwrap(); // no install, no network
+    std::fs::write(wt.join(".gitignore"), "node_modules/\nattempts\n").unwrap();
+    std::fs::write(wt.join("package.json"), serde_json::json!({
+        "scripts": {"test": "echo run >> attempts; echo 'No space left on device (os error 28)' >&2; exit 101"}
+    }).to_string()).unwrap();
+    let base = git_repo_with_commit(&wt);
+    let ctx = FloorContext {
+        base_head: Some(base),
+        git_dir: Some(wt.join(".git")),
+        ..FloorContext::default()
+    };
+    // Admission sees plenty; the next check's spawn changes only this thread's disk reading.
+    TEST_FREE_BYTES.with(|c| c.set(40 << 30));
+    seam::before_spawn(|| TEST_FREE_BYTES.with(|c| c.set(1 << 30)));
+    let report = run_floor(&wt, &ctx);
+    TEST_FREE_BYTES.with(|c| c.set(40 << 30));
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "test")
+        .expect("test ran");
+    assert_eq!(check.exit_code, Some(101), "{check:?}");
+    assert_eq!(check.outcome(), "could_not_run", "{check:?}");
+    assert_eq!(
+        check.decision.as_ref().expect("decided").outcome,
+        OUTCOME_COULD_NOT_RUN,
+        "{check:?}"
+    );
+    let cause = check.spawn_error.as_deref().expect("recorded disk cause");
+    assert!(
+        cause.starts_with("environment:")
+            && cause.contains("1.0 GiB free")
+            && cause.contains("15 GiB")
+            && cause.contains("`test`"),
+        "{cause}"
+    );
+    assert!(
+        check.reruns.is_empty() && check.retry.is_none() && check.base.is_none(),
+        "{check:?}"
+    );
+    assert!(
+        !check.logs.iter().any(|l| l.attempt.contains("retry")),
+        "{check:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(wt.join("attempts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!report.passed, "{report:?}");
+    assert!(
+        report.denial_reason().contains(cause),
+        "{}",
+        report.denial_reason()
+    );
+
+    let plenty = run_floor(&wt, &ctx);
+    let check = plenty
+        .checks
+        .iter()
+        .find(|c| c.name == "test")
+        .expect("test ran");
+    assert_eq!(check.outcome(), "failed", "{check:?}");
+    assert!(check.spawn_error.is_none(), "{check:?}");
+    assert!(!plenty.passed, "{plenty:?}");
+    let _ = std::fs::remove_dir_all(&wt);
+}

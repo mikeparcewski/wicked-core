@@ -28,6 +28,18 @@ pub struct SessionResult {
     pub rejected: usize,
 }
 
+/// The refusal's own advice for an environment problem; sandbox installation only for an
+/// unarmed boundary. Shared by the default floor's stderr, floor note and ungated reason.
+fn floor_refusal_advice(report: Option<&crate::repo_checks::RepoChecksReport>) -> String {
+    if let Some(error) = report.and_then(|r| r.environment_refusal()) {
+        return error.to_string();
+    }
+    let error = report
+        .and_then(|r| r.sandbox_error.as_deref())
+        .unwrap_or("no OS write boundary could be armed");
+    format!("{error} (install an OS sandbox tool: sandbox-exec on macOS, bubblewrap on Linux)")
+}
+
 /// Run a full governed session SYNCHRONOUSLY, emitting [`CoreEvent`]s as it progresses. Everything
 /// persists on the ONE `store`: the session node, each work-unit node, phase nodes, conformance
 /// claims, and each approved unit's work-output node. This is the straight-through driver (used by
@@ -1449,7 +1461,7 @@ pub(crate) fn apply_and_finish_unit(
                      floor could not run ({}); disclosed as UNGATED on the deterministic layer, \
                      not denied (F-7R2-005)",
                     unit.ord,
-                    report.sandbox_error.as_deref().unwrap_or("no OS write boundary")
+                    floor_refusal_advice(Some(report))
                 );
                     None
                 } else if let Some(carry) = (!report.passed
@@ -2176,13 +2188,8 @@ pub(crate) fn apply_and_finish_unit(
             }
             (true, Some(true)) if default_floor_refused_unsandboxed => format!(
                 "no pinned validator; the unit changed the worktree tree but the repo checks \
-                 could not run — {} (install an OS sandbox tool: sandbox-exec on macOS, \
-                 bubblewrap on Linux)",
-                evidence
-                    .repo_checks
-                    .as_ref()
-                    .and_then(|r| r.sandbox_error.clone())
-                    .unwrap_or_else(|| "no OS write boundary could be armed".to_string())
+                 could not run — {}",
+                floor_refusal_advice(evidence.repo_checks.as_ref())
             ),
             (true, _) => "no pinned validator and the repo checks did not run".to_string(),
         }
@@ -2205,13 +2212,8 @@ pub(crate) fn apply_and_finish_unit(
             }
             (true, Some(true)) if default_floor_refused_unsandboxed => format!(
                 "no deterministic floor: no pinned validator; the unit changed the worktree tree \
-                 but the repo checks could not run — {} (install an OS sandbox tool: \
-                 sandbox-exec on macOS, bubblewrap on Linux)",
-                evidence
-                    .repo_checks
-                    .as_ref()
-                    .and_then(|r| r.sandbox_error.clone())
-                    .unwrap_or_else(|| "no OS write boundary could be armed".to_string())
+                 but the repo checks could not run — {}",
+                floor_refusal_advice(evidence.repo_checks.as_ref())
             ),
             (true, _) => "no deterministic floor: no pinned validator and the repo checks did \
                           not run"
