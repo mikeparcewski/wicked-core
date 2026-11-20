@@ -94,6 +94,11 @@ pub(crate) enum Command {
         run_id: String,
         reply: Sender<anyhow::Result<SessionStatus>>,
     },
+    /// Internal: a parked dead-seat run's due bench was probed off the actor thread.
+    DeadSeatReprobed {
+        run_id: String,
+        reprobes: Vec<crate::seat_bench::BenchReprobe>,
+    },
     /// Resolve a human-confirm gate on a paused run: `Approve` (optionally amending the next unit's
     /// instruction) resumes execution; `Reject` cancels the run. Errors if the run isn't paused.
     ConfirmGate {
@@ -691,6 +696,7 @@ impl Command {
             Command::WorktreeReady { .. } => "WorktreeReady",
             Command::WorktreeFailed { .. } => "WorktreeFailed",
             Command::ResumeRun { .. } => "ResumeRun",
+            Command::DeadSeatReprobed { .. } => "DeadSeatReprobed",
             Command::ConfirmGate { .. } => "ConfirmGate",
             Command::PlanSendBackReady { .. } => "PlanSendBackReady",
             Command::RejudgeReadiness { .. } => "RejudgeReadiness",
