@@ -143,12 +143,94 @@ fn probe_gov_root() {
 
 #[cfg(unix)]
 #[test]
+fn a_non_default_state_home_gets_its_own_root_and_never_sweeps_the_home_root() {
+    use std::time::{Duration, SystemTime};
+
+    let base = scratch().join("non-default-state-home");
+    let home = base.join("home");
+    let state_home = base.join("rig");
+    let other_run = home.join(".wicked/core-gov/other-daemon-run");
+    std::fs::create_dir_all(&other_run).unwrap();
+    std::fs::create_dir_all(&state_home).unwrap();
+    let aged = std::fs::File::open(&other_run).and_then(|dir| {
+        dir.set_modified(SystemTime::now() - Duration::from_secs(20 * 24 * 60 * 60))
+    });
+    if let Err(e) = aged {
+        std::fs::remove_dir_all(&base).unwrap();
+        eprintln!("skipping: cannot age the governance directory: {e}");
+        return;
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wicked-core"))
+        .args(["status", "--db"])
+        .arg(state_home.join("core.db"))
+        .env_remove("USERPROFILE")
+        .env_remove("WICKED_GOV_ROOT")
+        .env("HOME", &home)
+        .output();
+    let other_run_survived = other_run.is_dir();
+    let sibling_created = base.join("rig-core-gov").is_dir();
+    std::fs::remove_dir_all(&base).unwrap();
+
+    let output = output.expect("status runs");
+    assert!(
+        output.status.success(),
+        "status must remain usable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        other_run_survived,
+        "another daemon's old run must survive boot"
+    );
+    assert!(
+        sibling_created,
+        "the boot probe must create the state home's sibling root"
+    );
+}
+
+#[test]
+fn the_default_state_home_keeps_the_home_root() {
+    let base = scratch().join("default-state-home");
+    let home = base.join("home");
+    let state_home = home.join(".wicked-crew");
+    std::fs::create_dir_all(&state_home).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_wicked-core"))
+        .args(["status", "--db"])
+        .arg(state_home.join("core.db"))
+        .env_remove("USERPROFILE")
+        .env_remove("WICKED_GOV_ROOT")
+        .env("HOME", &home)
+        .output();
+    let home_root_created = home.join(".wicked/core-gov").is_dir();
+    let sibling_created = home.join(".wicked-crew-core-gov").exists();
+    std::fs::remove_dir_all(&base).unwrap();
+
+    let output = output.expect("status runs");
+    assert!(
+        output.status.success(),
+        "status must remain usable: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        home_root_created,
+        "the default state home must keep the home root"
+    );
+    assert!(
+        !sibling_created,
+        "the default state home must not get a sibling root"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn an_unwritable_home_is_named_at_boot() {
     use std::os::unix::fs::PermissionsExt;
 
     let base = scratch().join("unwritable-home-boot");
     let home = base.join("home");
-    std::fs::create_dir_all(&home).unwrap();
+    let state_home = home.join(".wicked-crew");
+    std::fs::create_dir_all(&state_home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o500)).unwrap();
     if std::fs::write(home.join("write-check"), b"").is_ok() {
         std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -159,7 +241,7 @@ fn an_unwritable_home_is_named_at_boot() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_wicked-core"))
         .args(["status", "--db"])
-        .arg(base.join("store.db"))
+        .arg(state_home.join("store.db"))
         .env_remove("USERPROFILE")
         .env_remove("WICKED_GOV_ROOT")
         .env("HOME", &home)

@@ -5902,10 +5902,10 @@ fn encode_run_id(run_id: &str) -> String {
         .collect()
 }
 
-/// Pure resolution of the governance root: `<home>/.wicked/core-gov` for the first candidate home
-/// that is non-empty and absolute, else the legacy temp root. Outside the state home on purpose, so
-/// granting a seat access to a run's files does not unmask the state home's core.db (core#1430);
-/// `~/.wicked` is already a worker-denied home subdir.
+/// Home rule for the default state home or no state home: `<home>/.wicked/core-gov` for the first
+/// non-empty, absolute home, else the legacy temp root. `resolve_gov_root` gives any other state
+/// home a `<state home>-core-gov` sibling (core#1663). Both stay outside the state home so granting
+/// a seat access to a run's files does not unmask the state home's core.db (core#1430).
 pub(crate) fn gov_root_for(
     homes: &[Option<std::ffi::OsString>],
     temp: &std::path::Path,
@@ -5920,9 +5920,10 @@ pub(crate) fn gov_root_for(
         .unwrap_or_else(|| temp.join("wicked-core-gov"))
 }
 
-/// Resolve the launcher's override before considering the hook's own home candidates.
+/// Resolve the launcher's override first (core#1649), then the state-home rule (core#1663).
 fn resolve_gov_root(
     root_override: Option<std::ffi::OsString>,
+    state_home: Option<&std::path::Path>,
     homes: &[Option<std::ffi::OsString>],
     temp: &std::path::Path,
 ) -> std::path::PathBuf {
@@ -5932,15 +5933,39 @@ fn resolve_gov_root(
             return root;
         }
     }
+    if let Some(sh) = state_home {
+        let is_default = homes
+            .iter()
+            .flatten()
+            .map(std::path::PathBuf::from)
+            .find(|home| home.is_absolute())
+            .is_some_and(|home| {
+                crate::state_home::same_dir(
+                    sh,
+                    &home.join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME),
+                )
+            });
+        if !is_default && sh.file_name().is_some() {
+            let mut sibling = sh.as_os_str().to_os_string();
+            sibling.push("-core-gov");
+            return sibling.into();
+        }
+    }
     gov_root_for(homes, temp)
 }
 
-/// The governance root, resolved ONCE per process: the launcher and the fold must derive the same
-/// directory for a run, so a later change to `HOME` (a child env) cannot move it. The launcher passes
-/// its resolved root via `WICKED_GOV_ROOT`: a non-empty, absolute override takes precedence.
-/// Otherwise unit tests keep the temp root: they pin `HOME` per test, which a process-wide root
-/// must not latch.
+/// The governance root: an absolute, non-empty `WICKED_GOV_ROOT` wins (core#1649); otherwise the
+/// default state home keeps `~/.wicked/core-gov`, and any other state home gets the sibling
+/// `<state home>-core-gov`, outside it per core#1430 (core#1663). With no state home, use the home
+/// rule. The first latch wins: one daemon per process. The launcher passes the resolved root to
+/// hooks via `WICKED_GOV_ROOT`, so every caller uses the same directory.
 pub(crate) fn gov_root() -> std::path::PathBuf {
+    gov_root_for_state_home(None)
+}
+
+/// Latch the daemon's root before its boot probe (core#1663). Unit tests ignore state homes and
+/// home candidates so a process-wide latch cannot select one test actor's temporary state home.
+pub(crate) fn gov_root_for_state_home(state_home: Option<&Path>) -> std::path::PathBuf {
     static ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
     ROOT.get_or_init(|| {
         let temp = std::env::temp_dir();
@@ -5949,7 +5974,8 @@ pub(crate) fn gov_root() -> std::path::PathBuf {
         } else {
             [std::env::var_os("HOME"), std::env::var_os("USERPROFILE")]
         };
-        resolve_gov_root(std::env::var_os(GOV_ROOT_ENV), &homes, &temp)
+        let state_home = if cfg!(test) { None } else { state_home };
+        resolve_gov_root(std::env::var_os(GOV_ROOT_ENV), state_home, &homes, &temp)
     })
     .clone()
 }
@@ -12327,14 +12353,88 @@ mod boundary_tests {
     use crate::test_env::ENV_LOCK as ENV;
 
     #[test]
+    fn resolve_gov_root_obeys_override_state_home_and_home_precedence() {
+        let base =
+            std::env::temp_dir().join(format!("wicked-gov-root-precedence-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let temp = base.join("fake-temp");
+        let home = base.join("fake-home");
+        let homes = [Some("".into()), Some(home.clone().into_os_string())];
+        let state_home = base.join("rig");
+        let default_state_home = home.join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME);
+        let root_override = base.join("override");
+        let home_root = home.join(".wicked/core-gov");
+
+        assert_eq!(
+            resolve_gov_root(
+                Some(root_override.clone().into_os_string()),
+                Some(&state_home),
+                &homes,
+                &temp,
+            ),
+            root_override
+        );
+        for root_override in [None, Some("".into()), Some("relative-root".into())] {
+            assert_eq!(
+                resolve_gov_root(root_override, Some(&state_home), &homes, &temp),
+                base.join("rig-core-gov")
+            );
+        }
+        assert_eq!(
+            resolve_gov_root(None, Some(&state_home), &[None, None], &temp),
+            base.join("rig-core-gov")
+        );
+        assert_eq!(
+            resolve_gov_root(None, Some(&default_state_home), &homes, &temp),
+            home_root
+        );
+        assert_eq!(resolve_gov_root(None, None, &homes, &temp), home_root);
+        // A filesystem root has no file name to which the sibling suffix can be appended.
+        assert_eq!(
+            resolve_gov_root(None, home.ancestors().last(), &homes, &temp),
+            home_root
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_differently_spelled_default_state_home_keeps_the_home_root() {
+        let base = std::env::temp_dir().join(format!(
+            "wicked-gov-default-state-home-{}",
+            std::process::id()
+        ));
+        let home = base.join("home");
+        let default_state_home = home.join(crate::state_home::DEFAULT_STATE_HOME_DIRNAME);
+        std::fs::create_dir_all(default_state_home.join("child")).unwrap();
+        let alias = base.join("state-home-alias");
+        std::os::unix::fs::symlink(&default_state_home, &alias).unwrap();
+        let homes = [Some(home.clone().into_os_string())];
+
+        let via_symlink = resolve_gov_root(None, Some(&alias), &homes, &base);
+        let via_parent = resolve_gov_root(
+            None,
+            Some(&default_state_home.join("child/..")),
+            &homes,
+            &base,
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+
+        let expected = home.join(".wicked/core-gov");
+        assert_eq!(via_symlink, expected);
+        assert_eq!(via_parent, expected);
+    }
+
+    #[test]
     fn hook_resolves_the_root_the_launcher_passed() {
         let base = std::env::current_dir().unwrap();
         let temp = base.join("fake-temp");
         let home_a = base.join("launcher-home");
         let home_b = base.join("hook-home");
-        let root = resolve_gov_root(None, &[Some(home_a.clone().into_os_string())], &temp);
+        let root = resolve_gov_root(None, None, &[Some(home_a.clone().into_os_string())], &temp);
         let hook = resolve_gov_root(
             Some(root.clone().into_os_string()),
+            None,
             &[Some(home_b.into_os_string())],
             &temp,
         );
