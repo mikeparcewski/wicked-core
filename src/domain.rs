@@ -2060,6 +2060,10 @@ impl ToNode for WorkUnit {
         {
             node.metadata = map;
         }
+        crate::tool_activity::redact_fields(
+            &mut node.metadata,
+            &["denial_reason", "denial", "denials_behind"],
+        );
         node
     }
 }
@@ -2405,6 +2409,43 @@ pub struct SessionView {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unit_denials_redact_tokens_without_changing_executable_fields() {
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let prose = format!("I used {token} to push");
+        let mut unit = WorkUnit::pending("s:u1", "s", 1, "build it");
+        unit.denial_reason = Some(prose.clone());
+        unit.denial = Some(UnitDenial::new("worker_failure", &prose));
+        unit.denials_behind = Some(vec![UnitDenial::new("evaluator", &prose)]);
+        unit.tool_cmd = Some(vec!["echo".into(), token.clone()]);
+        unit.instructions = Some(prose.clone());
+        let node = unit.to_node();
+        assert_eq!(node.metadata["denial_reason"], "I used *** to push");
+        assert_eq!(node.metadata["denial"]["reason"], "I used *** to push");
+        assert_eq!(
+            node.metadata["denials_behind"][0]["reason"],
+            "I used *** to push"
+        );
+        assert_eq!(
+            node.metadata["tool_cmd"],
+            serde_json::json!(["echo", token])
+        );
+        assert_eq!(node.metadata["instructions"], prose);
+        // Recording must not mutate the unit that the engine executes/replays.
+        assert_eq!(unit.denial_reason.as_deref(), Some(prose.as_str()));
+    }
+
+    #[test]
+    fn plain_unit_denials_are_byte_identical() {
+        let prose = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        let mut unit = WorkUnit::pending("s:u1", "s", 1, "build it");
+        unit.denial_reason = Some(prose.into());
+        unit.denial = Some(UnitDenial::new("worker_failure", prose));
+        unit.denials_behind = Some(vec![UnitDenial::new("evaluator", prose)]);
+        let expected = serde_json::to_value(&unit).unwrap();
+        assert_eq!(serde_json::Value::Object(unit.to_node().metadata), expected);
+    }
+
     /// (C5) A bench binding every call replaces a governed-only one for the same seat, never the
     /// reverse; a record persisted before the field reads as binding every call.
     /// (core#1010, core#1017) A crash's signature is the exit status plus its last meaningful

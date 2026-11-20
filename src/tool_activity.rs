@@ -1106,6 +1106,33 @@ pub fn redact(cmd: &str) -> String {
     redact_config_pairs(&out)
 }
 
+/// Cut secrets from JSON string values with the same matcher used for tool activity.
+pub(crate) fn redact_json_strings(value: &mut Value) {
+    match value {
+        Value::String(text) => *text = redact(text),
+        Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value);
+            }
+        }
+        Value::Object(map) => {
+            for value in map.values_mut() {
+                redact_json_strings(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Redact only the named record fields, leaving executable/replayed fields intact.
+pub(crate) fn redact_fields(map: &mut serde_json::Map<String, Value>, keys: &[&str]) {
+    for key in keys {
+        if let Some(value) = map.get_mut(*key) {
+            redact_json_strings(value);
+        }
+    }
+}
+
 fn clip(s: &str) -> String {
     let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.chars().count() <= TARGET_MAX {

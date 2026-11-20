@@ -58,6 +58,8 @@ impl RunMemory {
         scope: Scope,
         now: i64,
     ) -> anyhow::Result<()> {
+        let content: String = content.into();
+        let content = crate::tool_activity::redact(&content);
         let mem = Memory::new(MemKind::Episode, Tier::Episodic, scope, content, now);
         self.engine
             .capture(&mem)
@@ -289,6 +291,30 @@ pub fn validate_scope_path(path: &str) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::*;
+
+    #[test]
+    fn captured_memory_redacts_tokens_and_preserves_plain_prose() {
+        // Use the default lexical embedder directly: no model download or env mutation.
+        let mut memory = RunMemory {
+            engine: MemoryEngine::in_memory().unwrap(),
+        };
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        memory
+            .capture(format!("I used {token} to push"), Scope::root(), 1)
+            .unwrap();
+        let plain = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        memory.capture(plain, Scope::root(), 2).unwrap();
+        let rows = memory.list(&Scope::root(), 10).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].content.as_bytes(), plain.as_bytes());
+        assert_eq!(rows[1].content, "I used *** to push");
+        assert!(rows.iter().all(|row| !row.content.contains(&token)));
+    }
 }
 
 #[cfg(test)]

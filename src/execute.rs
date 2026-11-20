@@ -425,6 +425,7 @@ fn work_output_node(
             m.insert("denial".into(), v);
         }
     }
+    crate::tool_activity::redact_fields(m, &["output", "denial_reason", "denial"]);
     node
 }
 
@@ -501,6 +502,7 @@ pub(crate) fn record_attempt_output(
     if !output.trim().is_empty() {
         m.insert("output".into(), s(output));
     }
+    crate::tool_activity::redact_fields(m, &["output"]);
     put_node(store, node)
 }
 
@@ -508,7 +510,55 @@ pub(crate) fn record_attempt_output(
 mod tests {
     use super::*;
     use crate::domain::{get_unit_transcript, get_work_output, WorkUnit};
-    use wicked_apps_core::open_store;
+    use wicked_apps_core::{open_store, GraphRead};
+
+    #[test]
+    fn attempt_output_redacts_tokens_and_preserves_plain_prose() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let unit = WorkUnit::pending("s:u1", "s", 1, "build it");
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let sensitive = format!("I used {token} to push");
+        let plain = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        for (attempt, output, expected) in [
+            (0, sensitive.as_str(), "I used *** to push"),
+            (1, plain, plain),
+        ] {
+            record_attempt_output(&mut store, &unit, attempt, "failed", output).unwrap();
+            let node = store
+                .get_node(&attempt_output_symbol(&unit.id, attempt))
+                .unwrap()
+                .unwrap();
+            let stored = node.metadata["output"].as_str().unwrap();
+            assert_eq!(stored.as_bytes(), expected.as_bytes());
+            assert!(!stored.contains(&token));
+        }
+    }
+
+    #[test]
+    fn rejected_output_and_denials_redact_tokens_and_preserve_plain_prose() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let unit = WorkUnit::pending("s:u1", "s", 1, "build it");
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let sensitive = format!("I used {token} to push");
+        let plain = "  Reviewed café.\r\n\tKeep  both spaces.\n";
+        for (output, expected) in [(sensitive.as_str(), "I used *** to push"), (plain, plain)] {
+            let denial = UnitDenial::new("worker_failure", output);
+            record_rejected_output(&mut store, &unit, "s", output, &denial, 0).unwrap();
+            let node = store
+                .get_node(&synthetic_symbol(WORK_OUTPUT, &unit.id))
+                .unwrap()
+                .unwrap();
+            for value in [
+                &node.metadata["output"],
+                &node.metadata["denial_reason"],
+                &node.metadata["denial"]["reason"],
+            ] {
+                assert_eq!(value.as_str().unwrap().as_bytes(), expected.as_bytes());
+                assert!(!value.as_str().unwrap().contains(&token));
+            }
+            assert!(get_work_output(&store, &unit.id).is_none());
+        }
+    }
 
     /// Seam finding #2: a dual-validator / evaluator deny (governance itself ALLOWS) must drive the
     /// phase to `Rejected` and write NO approved `work_output` — no Approved phase and no stale
