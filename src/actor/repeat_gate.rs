@@ -198,6 +198,7 @@ pub(super) fn after_pass(
                 u.rework_of = None;
                 u.rework_amendment = None;
                 u.worker_failed_clis.clear();
+                u.content_refused_clis.clear();
                 // Who wrote the previous page is not who writes this one: the page's reviewer is
                 // excluded only by this pass's authors (codex r5 on #1226: a seat switch between
                 // pages left both seats authors and no reviewer could be seated). Earlier passes'

@@ -5908,7 +5908,10 @@ pub(crate) fn resume_run_inner(
                 // terminal. A resume is an explicit operator/campaign restart (the environment
                 // may have been fixed), so it grants a fresh failover budget instead of
                 // refusing forever; the seat walk restarts from the currently assigned seat.
-                Some(None) => unit.worker_failed_clis.clear(),
+                Some(None) => {
+                    unit.worker_failed_clis.clear();
+                    unit.content_refused_clis.clear();
+                }
                 // Not a worker failure (judged rejection) — keep the crew#277 behavior:
                 // re-dispatch the same assigned seat.
                 None => {}
@@ -7702,6 +7705,7 @@ fn apply_step_result(
                 }
             } else if human_present
                 && seat_refusal.is_none()
+                && !content_refused
                 && output.attempt > 0
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
@@ -7956,6 +7960,10 @@ fn apply_step_result(
             // list so it never hands the unit straight back to a seat that already failed it.
             if !unit.worker_failed_clis.contains(&failed_cli) {
                 unit.worker_failed_clis.push(failed_cli.clone());
+                put_node(store, unit.to_node())?;
+            }
+            if content_refused && !unit.content_refused_clis.contains(&failed_cli) {
+                unit.content_refused_clis.push(failed_cli.clone());
                 put_node(store, unit.to_node())?;
             }
             let seats_tried = unit.worker_failed_clis.len();
@@ -9937,7 +9945,24 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
         .join(", ");
     // (codex r2) Whether a result exists is the gate's own fact (a dead-seat gate has none), never
     // inferred from the history list: a seat that failed once and then answered gave this result.
-    match unit.assigned_cli.as_deref().filter(|_| has_result) {
+    let by = unit.assigned_cli.as_deref().filter(|_| has_result);
+    // (core#1492) A provider's content refusal is named plainly: a compliant seat now rules on
+    // work another provider refused.
+    let refused = if unit.content_refused_clis.is_empty() {
+        String::new()
+    } else {
+        let who = unit
+            .content_refused_clis
+            .iter()
+            .map(|c| format!("`{c}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        match by {
+            Some(by) => format!(" [{who} refused this content; moved to `{by}`]"),
+            None => format!(" [{who} refused this content]"),
+        }
+    };
+    let base = match by {
         Some(by) => format!(
             " [failover: this step's earlier attempts on {seats} ended without a result the step \
              could use (a seat failure, or an answer the engine refused) and moved on; this result \
@@ -9949,7 +9974,8 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
              step could use (a seat failure, or an answer the engine refused); no seat produced a \
              result]"
         ),
-    }
+    };
+    format!("{base}{refused}")
 }
 
 fn denial_gate_prompt_body(
@@ -33961,6 +33987,56 @@ mod seat_failover_tests {
         let transcript = crate::domain::get_unit_transcript(&store, &units[0].id)
             .expect("the refused output survives exhaustion");
         assert_eq!(transcript.output.as_deref(), Some(refusal));
+    }
+
+    /// core#1492 (round 2): a second refusal after a rework (attempt > 0) still fails over; it does
+    /// not park at the core#556 launch-refusal gate, and the gate note names the refusal plainly.
+    #[test]
+    fn core_1492_a_content_refusal_on_a_later_attempt_fails_over_and_the_note_discloses_it() {
+        let run_id = format!("content-refusal-attempt-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["codex", "pi"],
+            SessionStatus::Executing,
+            0,
+        );
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.human_confirm = HumanConfirm::All;
+        session.attempt = 1;
+        put_node(&mut store, session.to_node()).unwrap();
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "codex",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let refusal =
+            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
+        let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(session.status, SessionStatus::Executing);
+        assert_eq!(units[0].assigned_cli.as_deref(), Some("pi"));
+        assert_eq!(units[0].content_refused_clis, vec!["codex".to_string()]);
+        let note = failover_note(&units[0], true);
+        assert!(
+            note.contains("`codex` refused this content; moved to `pi`"),
+            "{note}"
+        );
+        // A plain worker failure is not disclosed as a content refusal.
+        let mut plain = units[0].clone();
+        plain.content_refused_clis.clear();
+        assert!(!failover_note(&plain, true).contains("refused this content"));
+        // Every seat tried: the refusal is still named, with no seat moved to.
+        let none = failover_note(&units[0], false);
+        assert!(none.contains("`codex` refused this content]"), "{none}");
     }
 
     #[test]
