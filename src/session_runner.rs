@@ -862,6 +862,7 @@ mod tests {
             observed_providers: Vec::new(),
             providers_unobserved: false,
             observation_pending: false,
+            observation_reset: false,
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,
