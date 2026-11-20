@@ -3591,7 +3591,7 @@ fn command_contains_write_capable_program(command: &str) -> bool {
                 }
                 // (PRODUCT-WORKS J6) `sed` writes only in-place, from a script file this scan
                 // cannot read, or through a script command that writes (`w`, `s///w`, `e`). A
-                // print-only read (`sed -n 1,40p SKILL.md`, the shape seats use to read a file
+                // read-only script (`sed -n 1,40p SKILL.md`, the shape seats use to read a file
                 // after `cd`-ing into a read root) is not write-capable: counting it made a design
                 // step's `cd <skill dir> && ls && sed -n …p` a boundary WRITE that denied the unit.
                 if basename == "sed" && sed_may_write(&words[idx + 1..]) {
@@ -3607,7 +3607,7 @@ fn command_contains_write_capable_program(command: &str) -> bool {
 /// them) may write a file. Fails toward "may write" on anything it cannot settle (codex/agy review
 /// on #1135): a word whose quoting or expansion is not plain ([`plain_sed_word`]); in-place
 /// (`-i…`, `--in-place…`, an `i` anywhere in a short-option cluster); a script file (`-f…`,
-/// `--file…`, an `f` in a cluster); any option it does not know; a script that is not print-only
+/// `--file…`, an `f` in a cluster); any option it does not know; a script not proven read-only
 /// ([`sed_script_reads_only`]). `-e` in a cluster takes the cluster's rest, or the next word, as
 /// a script; with no `-e`, the first operand is the script, as sed reads it.
 fn sed_may_write(args: &[&str]) -> bool {
@@ -3712,11 +3712,52 @@ fn plain_sed_word(w: &str) -> Option<String> {
     (!w.contains(SPECIAL)).then(|| w.to_string())
 }
 
-/// A `sed` script made only of print/inspect commands — each `;`/newline-separated command an
+/// A `sed` script made only of read-only commands — each `;`/newline-separated command an
 /// optional address (`N`, `$`, `/re/`, `N~M`, a `,`-range of those, optionally `!`) followed by
-/// one of `p P l = q Q d n N` — writes nothing. Anything else (`w`, `s…/w file`, `e`, `r`, braces)
-/// is judged as possibly writing.
+/// one of `p P l = q Q d n N`, a fully parsed substitution without `w`/`e`, or a transliteration
+/// — writes nothing. Anything unparsed is judged as possibly writing. Splitting first deliberately
+/// refuses even a `;`/newline inside a substitution field rather than guessing its command boundary.
 fn sed_script_reads_only(script: &str) -> bool {
+    // Consume one field through its unescaped delimiter. An escape consumes the next character,
+    // including a delimiter or another backslash; an unfinished escape/field fails closed.
+    fn field(s: &str, delimiter: char) -> Option<&str> {
+        let mut chars = s.char_indices();
+        while let Some((at, c)) = chars.next() {
+            if c == '\\' {
+                chars.next()?;
+            } else if c == delimiter {
+                return Some(&s[at + c.len_utf8()..]);
+            }
+        }
+        None
+    }
+
+    fn transform(cmd: &str) -> bool {
+        let mut chars = cmd.chars();
+        let Some(verb @ ('s' | 'y')) = chars.next() else {
+            return false;
+        };
+        let Some(delimiter) = chars.next() else {
+            return false;
+        };
+        if delimiter.is_alphanumeric()
+            || delimiter.is_whitespace()
+            || matches!(delimiter, '\\' | ';' | '}')
+        {
+            return false;
+        }
+        let Some(flags) = field(chars.as_str(), delimiter).and_then(|s| field(s, delimiter)) else {
+            return false;
+        };
+        match verb {
+            's' => flags
+                .chars()
+                .all(|c| c.is_ascii_digit() || matches!(c, 'g' | 'p' | 'i' | 'I' | 'm' | 'M')),
+            'y' => flags.is_empty(),
+            _ => false,
+        }
+    }
+
     fn addr(s: &str) -> Option<&str> {
         if let Some(rest) = s.strip_prefix('$') {
             return Some(rest);
@@ -3760,7 +3801,7 @@ fn sed_script_reads_only(script: &str) -> bool {
                 }
             }
             let rest = rest.trim_start().strip_prefix('!').unwrap_or(rest).trim();
-            matches!(rest, "p" | "P" | "l" | "=" | "q" | "Q" | "d" | "n" | "N")
+            matches!(rest, "p" | "P" | "l" | "=" | "q" | "Q" | "d" | "n" | "N") || transform(rest)
         })
 }
 
@@ -5496,7 +5537,8 @@ pub(crate) fn evaluate_tool_call(
                 !advisory,
             );
         } else {
-            append_boundary_deny(decisions_path, scope, phase, tool, &reason, fatal);
+            let command = context.get("command").and_then(serde_json::Value::as_str);
+            append_boundary_deny(decisions_path, scope, phase, tool, &reason, command, fatal);
         }
         eprintln!("wicked-governance: DENY ({})", seat_text(&reason));
         if !shell_read_denied {
@@ -6650,6 +6692,7 @@ fn append_boundary_deny(
     phase: &str,
     tool: &str,
     reason: &str,
+    command: Option<&str>,
     fatal: bool,
 ) {
     // (core#1569) Redacted once, here: every reader of the record sees only this copy.
@@ -6675,7 +6718,9 @@ fn append_boundary_deny(
         phase: phase.to_string(),
         policy_ids: vec![rule.to_string()],
         decision: Decision::Deny,
-        obligations: vec![reason.to_string()],
+        obligations: std::iter::once(reason.to_string())
+            .chain(command.map(seat_text))
+            .collect(),
         evaluated_context_ref: "sha256:boundary".to_string(),
         criteria,
         evaluator_identity: BOUNDARY_EVALUATOR.to_string(),
@@ -6934,7 +6979,7 @@ impl HookDecisionRecord {
     }
 
     /// (core#716) Whether this record is a blocked filesystem-boundary WRITE — `(reason, command)`
-    /// when it is (`command` empty: the boundary recorder files the reason only). The unit gate
+    /// when it is (`command` empty for a path-bearing tool or an older record). The unit gate
     /// discloses it as `workerToolCallDenied` when the unit's floor passed and the fold therefore
     /// did not deny on it ([`fold_input_denial_after_floor`]).
     pub fn boundary_write_refusal(&self) -> Option<(String, String)> {
@@ -7378,12 +7423,26 @@ fn fold_input_denial_pass(
             && !is_advisory_deny(&claim)
             && !disclosed_after_floor
         {
+            let mut reason = format!(
+                "input governance denied a tool-call in {phase} (claim {})",
+                claim.claim_id
+            );
+            if is_blocked_boundary_write(&claim) {
+                reason.push_str(": ");
+                reason.push_str(&refused_command_record(
+                    claim
+                        .obligations
+                        .first()
+                        .map(String::as_str)
+                        .unwrap_or_default(),
+                ));
+                if let Some(command) = claim.obligations.get(1).filter(|c| !c.is_empty()) {
+                    reason.push_str(&format!(" (command: {})", refused_command_record(command)));
+                }
+            }
             denial = Some(crate::domain::UnitDenial {
                 source: "input_governance".to_string(),
-                reason: format!(
-                    "input governance denied a tool-call in {phase} (claim {})",
-                    claim.claim_id
-                ),
+                reason,
                 claim_id: Some(claim.claim_id.clone()),
                 rule_ids: claim.policy_ids.clone(),
                 denied_tool: tool_for_claim,
@@ -7904,7 +7963,7 @@ mod tests {
             "wicked-estate index .",
             false,
         );
-        append_boundary_deny(log_s, "s", "unit-1", "Read", "outside", false);
+        append_boundary_deny(log_s, "s", "unit-1", "Read", "outside", None, false);
         append_remote_write_deny(log_s, "s", "unit-1", "remote write", "git push");
         append_mcp_deny(log_s, "s", "unit-1", "mcp__x__y", "mcp");
         append_infra_deny(log_s, "s", "unit-1", "Bash", "infra");
@@ -8289,6 +8348,15 @@ mod tests {
         };
         let s = shell_read_951_path(&skill);
         for read in [
+            format!("cd {s} && grep -rn pattern SKILL.md"),
+            format!("cd {s} && grep -rn pattern SKILL.md | sed 's/a/b/g' | awk '{{print $1}}'"),
+            format!("cd {s} && sed -E 's/^ +//;s/ +$//' SKILL.md"),
+            format!("cd {s} && sed -n 's/a/b/p' SKILL.md"),
+            format!("cd {s} && sed 'y/abc/xyz/' SKILL.md"),
+            format!("cd {s} && sed '3,9s#a#b#gI' SKILL.md"),
+            format!("cd {s} && awk '{{print $1}}' SKILL.md | sort | uniq -c"),
+            format!("cd {s} && awk -F/ '{{print $1}}' SKILL.md"),
+            format!("cd {s} && grep pattern SKILL.md 2>/dev/null"),
             format!("cd {s} && ls && sed -n 1,40p SKILL.md"),
             format!("cd {s} && ls && sed -n '1,40p' SKILL.md"),
             format!("cd {s} && sed -n -e '/^## /p' -e '$p' SKILL.md"),
@@ -8304,6 +8372,15 @@ mod tests {
             format!("cd {s} && sed -ni 'p' SKILL.md"),
             format!("cd {s} && sed -n 'w copy.md' SKILL.md"),
             format!("cd {s} && sed 's/a/b/w changed.md' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/e' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/;w out' SKILL.md"),
+            format!("cd {s} && sed 's/a;w out/b/' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/gw out' SKILL.md"),
+            format!("cd {s} && sed 'y/a/b/;w x' SKILL.md"),
+            format!("cd {s} && sed 's/a/b' SKILL.md"),
+            format!("cd {s} && sed 's|a|b|w x' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/ w x' SKILL.md"),
+            format!("cd {s} && sed 's/a/b/\nw out' SKILL.md"),
             format!("cd {s} && sed -f edit.sed SKILL.md"),
             format!("cd {s} && sed -n '1e touch x' SKILL.md"),
             format!("cd {s} && sed -ne 'w escaped.txt' -e p SKILL.md"),
@@ -8324,9 +8401,19 @@ mod tests {
     }
 
     #[test]
-    fn sed_may_write_reads_print_only_scripts_and_fails_toward_writing() {
+    fn sed_may_write_reads_only_parsed_scripts_and_fails_toward_writing() {
         for read in [
             &["-n", "1,40p", "f"][..],
+            &["s/a/b/", "f"],
+            &["-E", "'s/^ +//;s/ +$//'", "f"],
+            &["-n", "s/a/b/p", "f"],
+            &["y/abc/xyz/", "f"],
+            &["3,9s#a#b#gI", "f"],
+            &["'s/a/b/2gpIiMm'", "f"],
+            &["'/x/!s/a/b/g'", "f"],
+            &[r"'s/a\/b/c\/d/g'", "f"],
+            &[r"'s/a\\/b\\/'", "f"],
+            &[r"'y/ab\//xy\//'", "f"],
             &["-n", "'$p'", "f"],
             &["-n", "-e", "/x/p", "f"],
             &["--expression=5q", "f"],
@@ -8345,7 +8432,26 @@ mod tests {
             &["-i", "s/a/b/", "f"][..],
             &["--in-place=.bak", "s/a/b/", "f"],
             &["-f", "x.sed", "f"],
-            &["s/a/b/", "f"],
+            &["'s/a/b/w out'", "f"],
+            &["s/a/b/e", "f"],
+            &["'s/a/b/;w out'", "f"],
+            &["'s/a;w out/b/'", "f"],
+            &["'s/a/b/gw out'", "f"],
+            &["'y/a/b/;w x'", "f"],
+            &["s/a/b", "f"],
+            &["'s|a|b|w x'", "f"],
+            &["'s/a/b/ w x'", "f"],
+            &["'s/a/b/\nw out'", "f"],
+            &[r"'s/a/b\/'", "f"],
+            &["'s/a/b/g extra'", "f"],
+            &["'y/a/b/g'", "f"],
+            &["'y/a/b'", "f"],
+            &["'s;a;b;'", "f"],
+            &["'s}a}b}'", "f"],
+            &["'s a b '", "f"],
+            &["'s1a1b1'", "f"],
+            &["'sZaZbZ'", "f"],
+            &[r"'s\a\b\'", "f"],
             &["-n", "w out", "f"],
             &["-n", "1r other", "f"],
             &["-n", "{p}", "f"],
@@ -10688,6 +10794,7 @@ mod tests {
                 "unit-2",
                 "Bash",
                 "path outside this unit's boundary: /srv/elsewhere/x (write)",
+                None,
                 true,
             )
         };
@@ -10886,6 +10993,102 @@ mod tests {
         );
     }
 
+    /// core#1494: the card keeps the selected boundary claim's path and command, including when
+    /// reading an older, unredacted log. Each detail is redacted and capped independently.
+    #[test]
+    fn a_boundary_denial_names_its_path_and_command_redacted_and_capped() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core1494-card-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let token = "ghp_core1494SECRETvalue0123456789";
+        let reason = "Bash `cd` leaves the unit boundary: /skills/editor-scaffold (write)";
+        let command = format!("GH_TOKEN={token} cd /skills/editor-scaffold && sed -i 's/a/b/' f");
+        for (attempt, why, cmd) in [
+            (0, reason.to_string(), Some(command.clone())),
+            (
+                1,
+                format!("{reason} GH_TOKEN={token} {}", "€".repeat(2048)),
+                Some(format!("{command} {}", "€".repeat(2048))),
+            ),
+            (2, reason.to_string(), None),
+            (3, reason.to_string(), Some(String::new())),
+        ] {
+            let path = decisions_path_for(&run_id, attempt);
+            write_armed_marker(&path, "unit-2").unwrap();
+            write_hook_fired(&path, "unit-2");
+            let mut claim = allow_claim("boundary-deny:unit-2", "unit-2");
+            claim.decision = Decision::Deny;
+            claim.evaluator_identity = BOUNDARY_EVALUATOR.to_string();
+            claim.policy_ids = vec![BOUNDARY_WRITE_RULE_ID.to_string()];
+            claim.obligations = vec![why.clone()];
+            if let Some(cmd) = &cmd {
+                claim.obligations.push(cmd.clone());
+            }
+            append_annotated_claim(path.to_str().unwrap(), "unit-2", "Bash", &claim);
+            // A later denial must not supply the card's details.
+            claim.obligations = vec!["later reason".to_string(), "later command".to_string()];
+            append_annotated_claim(path.to_str().unwrap(), "unit-2", "Bash", &claim);
+            let denial = fold_input_denial(&mut store, &run_id, attempt, "unit-2", true)
+                .unwrap()
+                .expect("a blocked boundary write denies");
+            let mut expected = format!(
+                "input governance denied a tool-call in unit-2 (claim boundary-deny:unit-2): {}",
+                refused_command_record(&why)
+            );
+            if let Some(cmd) = cmd.filter(|c| !c.is_empty()) {
+                expected.push_str(&format!(" (command: {})", refused_command_record(&cmd)));
+            }
+            assert_eq!(denial.reason, expected);
+            assert!(denial.reason.contains("/skills/editor-scaffold"));
+            assert!(!denial.reason.contains(token), "{}", denial.reason);
+            assert_eq!(denial.claim_id.as_deref(), Some("boundary-deny:unit-2"));
+            assert_eq!(denial.denied_tool.as_deref(), Some("Bash"));
+        }
+        let path = decisions_path_for(&run_id, 4);
+        write_armed_marker(&path, "unit-2").unwrap();
+        write_hook_fired(&path, "unit-2");
+        let mut policy = allow_claim("policy-deny", "unit-2");
+        policy.decision = Decision::Deny;
+        policy.obligations = vec![reason.to_string(), command];
+        append_annotated_claim(path.to_str().unwrap(), "unit-2", "Bash", &policy);
+        let denial = fold_input_denial(&mut store, &run_id, 4, "unit-2", true)
+            .unwrap()
+            .expect("a policy denial still denies");
+        assert_eq!(
+            denial.reason,
+            "input governance denied a tool-call in unit-2 (claim policy-deny)"
+        );
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    #[test]
+    fn a_boundary_refusal_records_the_redacted_command_beside_its_reason() {
+        let run_id = format!("core1494-record-{}", std::process::id());
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let path = decisions_path_for(&run_id, 0);
+        let token = "ghp_core1494SECRETvalue0123456789";
+        let command = format!("GH_TOKEN={token} sed -i 's/a/b/' /skills/f");
+        let reason = "path outside this unit's boundary: /skills/f (write)";
+        append_boundary_deny(
+            path.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            reason,
+            Some(&command),
+            true,
+        );
+        let records = collect_hook_decisions(&run_id, 0, "unit-2");
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].boundary_write_refusal(),
+            Some((reason.to_string(), seat_text(&command)))
+        );
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains(token), "{raw}");
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
     /// core#716 — a blocked filesystem-boundary WRITE on a unit whose deterministic floor PASSED is
     /// disclosed, not a denial (dogfood run `3580f771`: the build floor passed and one refused
     /// exploratory `Bash` probe outside the worktree denied the unit). Without a passing floor the
@@ -10905,6 +11108,7 @@ mod tests {
             "unit-2",
             "Bash",
             "path outside this unit's boundary: /srv/elsewhere/.wicked-vault/config.json (write)",
+            None,
             true,
         );
         let fold = |store: &mut dyn GraphStore, attempt: u32, floor_passed: bool| {
@@ -10991,6 +11195,7 @@ mod tests {
             "unit-5",
             "Read",
             "path outside this unit's boundary: /other/repo/domain-modeler.md (read)",
+            None,
             false,
         );
         assert_eq!(
@@ -11014,6 +11219,7 @@ mod tests {
             "unit-5",
             "Write",
             "path outside this unit's boundary: /etc/evil (write)",
+            None,
             true,
         );
         let write_denial = fold_input_denial(&mut store, &run_id, 1, "unit-5", true).unwrap();
@@ -11041,6 +11247,7 @@ mod tests {
             "unit-5",
             "Read",
             "path outside this unit's boundary: /other/probe (read)",
+            None,
             false,
         );
         let mut policy_deny = allow_claim("POL-042", "unit-5");
@@ -11064,6 +11271,7 @@ mod tests {
             "exec",
             "Read",
             "path outside this unit's boundary: /other/read (read)",
+            None,
             false,
         );
         let summary = apply_hook_decisions(&mut store, "advisory-drain", &p3).unwrap();
@@ -14907,6 +15115,7 @@ mod boundary_tests {
             "unit-2",
             "Read",
             "path outside this unit's boundary: /other/repo/notes.md (read)",
+            None,
             false,
         );
         // The fatal arm: a WRITE escape.
@@ -14916,6 +15125,7 @@ mod boundary_tests {
             "unit-2",
             "Bash",
             "Bash write leaves the unit boundary: /etc/hosts (write)",
+            None,
             true,
         );
         // The post-hoc witness (issue #541) fires ON a tool call, so its record names that call.
@@ -16541,8 +16751,24 @@ mod phase_scope_tests {
         append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, &cmd, false);
         append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, &cmd, true);
         let boundary = format!("path outside the worktree (write): `{cmd}`");
-        append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, true);
-        append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, false);
+        append_boundary_deny(
+            log,
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            &boundary,
+            Some(&cmd),
+            true,
+        );
+        append_boundary_deny(
+            log,
+            "wf/unit-1",
+            "unit-1",
+            "Bash",
+            &boundary,
+            Some(&cmd),
+            false,
+        );
         let remote = format!("{REMOTE_WRITE_REASON_PREFIX} `{cmd}`");
         append_remote_write_deny(log, "wf/unit-1", "unit-1", &remote, &cmd);
         append_phase_scope_deny(log, "wf/unit-1", "unit-1", "Bash", &boundary, Some(&cmd));
@@ -16615,8 +16841,16 @@ mod phase_scope_tests {
             let reason = format!("refused: `{cmd}`");
             append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, cmd, false);
             append_estate_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, cmd, true);
-            append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, true);
-            append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, false);
+            append_boundary_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, Some(cmd), true);
+            append_boundary_deny(
+                log,
+                "wf/unit-1",
+                "unit-1",
+                "Bash",
+                &reason,
+                Some(cmd),
+                false,
+            );
             let remote = format!("{REMOTE_WRITE_REASON_PREFIX} `{cmd}`");
             append_remote_write_deny(log, "wf/unit-1", "unit-1", &remote, cmd);
             append_phase_scope_deny(log, "wf/unit-1", "unit-1", "Bash", &reason, Some(cmd));
