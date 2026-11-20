@@ -3468,6 +3468,17 @@ fn collect_bash_write_targets(
                         targets.push((*f).to_string());
                     }
                 }
+                // (core#1634) A `w`/`W` command or flag, `e`, a script file or an unparseable
+                // script writes where the text cannot say: block it like any unresolved write
+                // target, with or without a `cd`. The in-place flags are not the reason here.
+                let script_args: Vec<&str> = args
+                    .iter()
+                    .copied()
+                    .filter(|w| !(w.starts_with("-i") || w.starts_with("--in-place")))
+                    .collect();
+                if sed_may_write(&script_args) {
+                    targets.push(format!("$(sed {})", script_args.join(" ")));
+                }
             }
             "rm" => {
                 for w in &words[idx + 1..] {
@@ -3719,14 +3730,43 @@ fn plain_sed_word(w: &str) -> Option<String> {
 /// refuses even a `;`/newline inside a substitution field rather than guessing its command boundary.
 fn sed_script_reads_only(script: &str) -> bool {
     // Consume one field through its unescaped delimiter. An escape consumes the next character,
-    // including a delimiter or another backslash; an unfinished escape/field fails closed.
-    fn field(s: &str, delimiter: char) -> Option<&str> {
-        let mut chars = s.char_indices();
-        while let Some((at, c)) = chars.next() {
+    // including a delimiter or another backslash (refused outright when `escapes` is false); an
+    // unfinished escape/field fails closed. A bracket expression is skipped whole, but only when
+    // every sed agrees where it ends: BSD sed reads a delimiter inside `[...]` as literal and GNU
+    // sed does not, so a delimiter, backslash, newline or nested `[` inside one (or one never
+    // closed) is not judged read-only.
+    fn field(s: &str, delimiter: char, escapes: bool) -> Option<&str> {
+        let chars: Vec<(usize, char)> = s.char_indices().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            let (at, c) = chars[i];
             if c == '\\' {
-                chars.next()?;
+                if !escapes {
+                    return None;
+                }
+                chars.get(i + 1)?;
+                i += 2;
+            } else if c == '[' {
+                i += 1;
+                if chars.get(i).map(|x| x.1) == Some('^') {
+                    i += 1;
+                }
+                if chars.get(i).map(|x| x.1) == Some(']') {
+                    i += 1;
+                }
+                loop {
+                    match chars.get(i)?.1 {
+                        ']' => break,
+                        '[' | '\\' | '\n' => return None,
+                        d if d == delimiter => return None,
+                        _ => i += 1,
+                    }
+                }
+                i += 1;
             } else if c == delimiter {
                 return Some(&s[at + c.len_utf8()..]);
+            } else {
+                i += 1;
             }
         }
         None
@@ -3742,11 +3782,13 @@ fn sed_script_reads_only(script: &str) -> bool {
         };
         if delimiter.is_alphanumeric()
             || delimiter.is_whitespace()
-            || matches!(delimiter, '\\' | ';' | '}')
+            || matches!(delimiter, '\\' | ';' | '}' | '[' | ']')
         {
             return false;
         }
-        let Some(flags) = field(chars.as_str(), delimiter).and_then(|s| field(s, delimiter)) else {
+        let Some(flags) =
+            field(chars.as_str(), delimiter, true).and_then(|s| field(s, delimiter, true))
+        else {
             return false;
         };
         match verb {
@@ -3763,13 +3805,9 @@ fn sed_script_reads_only(script: &str) -> bool {
             return Some(rest);
         }
         if let Some(rest) = s.strip_prefix('/') {
-            let end = rest.find('/')?;
             // (agy review on #1135) An escaped delimiter (`/\/,/`) moves where the address ends;
             // this scan does not model escapes, so a regex holding one is not judged read-only.
-            if rest[..end].contains('\\') {
-                return None;
-            }
-            return Some(&rest[end + 1..]);
+            return field(rest, '/', false);
         }
         let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
         if digits == 0 {
@@ -8353,6 +8391,9 @@ mod tests {
             format!("cd {s} && sed -E 's/^ +//;s/ +$//' SKILL.md"),
             format!("cd {s} && sed -n 's/a/b/p' SKILL.md"),
             format!("cd {s} && sed 'y/abc/xyz/' SKILL.md"),
+            format!("cd {s} && sed -n '/[0-9]/p' SKILL.md"),
+            format!("cd {s} && sed 's/[a-z]*//g' SKILL.md"),
+            format!("cd {s} && sed -E 's/[^ ]+ //' SKILL.md"),
             format!("cd {s} && sed '3,9s#a#b#gI' SKILL.md"),
             format!("cd {s} && awk '{{print $1}}' SKILL.md | sort | uniq -c"),
             format!("cd {s} && awk -F/ '{{print $1}}' SKILL.md"),
@@ -8373,6 +8414,11 @@ mod tests {
             format!("cd {s} && sed -n 'w copy.md' SKILL.md"),
             format!("cd {s} && sed 's/a/b/w changed.md' SKILL.md"),
             format!("cd {s} && sed 's/a/b/e' SKILL.md"),
+            format!("cd {s} && sed -n '/[/s|]/w evil1||' f"),
+            format!("cd {s} && sed 's#[#]#g;s.#w evil2.x.1' f"),
+            format!("cd {s} && sed 'y/[/]/ab/' f"),
+            format!("cd {s} && sed 's/[[:space:]]//' f"),
+            format!("cd {s} && sed 's/[a/b/' f"),
             format!("cd {s} && sed 's/a/b/;w out' SKILL.md"),
             format!("cd {s} && sed 's/a;w out/b/' SKILL.md"),
             format!("cd {s} && sed 's/a/b/gw out' SKILL.md"),
@@ -8405,6 +8451,9 @@ mod tests {
         for read in [
             &["-n", "1,40p", "f"][..],
             &["s/a/b/", "f"],
+            &["-n", "'/[0-9]/p'", "f"],
+            &["'s/[a-z]*//g'", "f"],
+            &["'s/[]x]/y/'", "f"],
             &["-E", "'s/^ +//;s/ +$//'", "f"],
             &["-n", "s/a/b/p", "f"],
             &["y/abc/xyz/", "f"],
@@ -8433,6 +8482,11 @@ mod tests {
             &["--in-place=.bak", "s/a/b/", "f"],
             &["-f", "x.sed", "f"],
             &["'s/a/b/w out'", "f"],
+            &["-n", "'/[/s|]/w evil1||'", "f"],
+            &["'s#[#]#g;s.#w evil2.x.1'", "f"],
+            &["'y/[/]/ab/'", "f"],
+            &["'s/[[:space:]]//'", "f"],
+            &["'s/[a/b/'", "f"],
             &["s/a/b/e", "f"],
             &["'s/a/b/;w out'", "f"],
             &["'s/a;w out/b/'", "f"],
@@ -10991,6 +11045,53 @@ mod tests {
             refused_command_record("git push origin main"),
             "git push origin main"
         );
+    }
+
+    /// core#1634: a `sed` whose script may write (a `w`/`W` command or flag, `e`, a script file, an
+    /// in-place flag beside one) is a write-capable command with or without a `cd`; a read-only
+    /// script is not.
+    #[test]
+    fn a_writing_sed_is_judged_without_a_cd_and_a_reading_sed_is_not() {
+        use crate::path_policy::AllowedRoots;
+        let base = std::env::temp_dir().join(format!("wicked-1634-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let check = |cmd: &str| {
+            boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &serde_json::json!({ "command": cmd }),
+                "Bash",
+            )
+        };
+        for write in [
+            "sed -n 'w /outside/x' f",
+            "sed -n '1e touch /outside/x' f",
+            "sed 's/a/b/w /outside/x' f",
+            "sed -f /outside/script.sed f",
+            "sed -i 'w /outside/x' f",
+            "sed -ni p f",
+            "sed -n '/[/s|]/w evil1||' f",
+            "sed 's#[#]#g;s.#w evil2.x.1' f",
+        ] {
+            assert!(check(write).is_some(), "a write: {write}");
+        }
+        for read in [
+            "sed -n '1,40p' f",
+            "sed 's/a/b/g' f | head",
+            "sed -n '/[0-9]/p' f",
+            "sed -i 's/a/b/' f",
+        ] {
+            assert_eq!(check(read), None, "a read or an in-tree edit: {read}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// core#1494: the card keeps the selected boundary claim's path and command, including when
