@@ -186,6 +186,12 @@ pub(crate) struct Captured {
     pub(crate) tail: Vec<u8>,
     /// Why the blob could not be stored, when it could not.
     pub(crate) error: Option<String>,
+    /// The store's own I/O error reported a full device.
+    pub(crate) no_space: bool,
+}
+
+fn no_space(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::StorageFull || error.raw_os_error() == Some(28)
 }
 
 impl Captured {
@@ -203,6 +209,8 @@ impl Captured {
 
 struct State {
     file: Option<std::fs::File>,
+    #[cfg(test)]
+    write_error: Option<std::io::Error>,
     tmp: PathBuf,
     hasher: Sha256,
     bytes: u64,
@@ -211,6 +219,7 @@ struct State {
     tail: Vec<u8>,
     closed: bool,
     error: Option<String>,
+    no_space: bool,
 }
 
 impl State {
@@ -227,7 +236,15 @@ impl State {
             self.hasher.update(kept);
             self.bytes += kept.len() as u64;
             if let Some(f) = self.file.as_mut() {
-                if let Err(e) = f.write_all(kept) {
+                #[cfg(test)]
+                let written = self
+                    .write_error
+                    .take()
+                    .map_or_else(|| f.write_all(kept), Err);
+                #[cfg(not(test))]
+                let written = f.write_all(kept);
+                if let Err(e) = written {
+                    self.no_space = no_space(&e);
                     self.error = Some(format!("the floor log could not be written: {e}"));
                     self.file = None;
                     let _ = std::fs::remove_file(&self.tmp);
@@ -249,26 +266,43 @@ pub(crate) struct Capture {
     done: std::sync::mpsc::Receiver<()>,
 }
 
+#[cfg(test)]
+thread_local! {
+    static NEXT_WRITE_ERROR: std::cell::RefCell<Option<std::io::Error>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+/// Fail the next capture's first write on this thread, including its reader thread.
+#[cfg(test)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) fn fail_next_write(error: std::io::Error) {
+    NEXT_WRITE_ERROR.with(|e| *e.borrow_mut() = Some(error));
+}
+
 /// Start capturing `r` into the store at `dir` (created when missing), keeping at most `cap` bytes.
 pub(crate) fn capture<R: Read + Send + 'static>(mut r: R, dir: &Path, cap: u64) -> Capture {
     let tmp = dir.join(format!(".part-{}", uuid::Uuid::new_v4().simple()));
-    let (file, error) = match std::fs::create_dir_all(dir).and_then(|()| {
+    let (file, error, no_space) = match std::fs::create_dir_all(dir).and_then(|()| {
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
     }) {
-        Ok(f) => (Some(f), None),
+        Ok(f) => (Some(f), None, false),
         Err(e) => (
             None,
             Some(format!(
                 "the floor log store `{}` could not be written: {e}",
                 dir.display()
             )),
+            no_space(&e),
         ),
     };
     let state = Arc::new(Mutex::new(State {
         file,
+        #[cfg(test)]
+        write_error: NEXT_WRITE_ERROR.with(|e| e.borrow_mut().take()),
         tmp,
         hasher: Sha256::new(),
         bytes: 0,
@@ -277,6 +311,7 @@ pub(crate) fn capture<R: Read + Send + 'static>(mut r: R, dir: &Path, cap: u64) 
         tail: Vec::with_capacity(TAIL * 2),
         closed: false,
         error,
+        no_space,
     }));
     let (done_tx, done) = std::sync::mpsc::channel();
     let shared = Arc::clone(&state);
@@ -337,6 +372,7 @@ impl Capture {
             });
             if let Err(e) = stored {
                 let _ = std::fs::remove_file(&s.tmp);
+                s.no_space = no_space(&e);
                 error = Some(format!("the floor log could not be stored: {e}"));
             }
         }
@@ -350,6 +386,7 @@ impl Capture {
             truncated: s.truncated,
             tail,
             error,
+            no_space: s.no_space,
         }
     }
 }
