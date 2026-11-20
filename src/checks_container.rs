@@ -4,8 +4,9 @@
 //! copy of the pinned tree into it, executes checks through `kubectl exec`, and verifies the
 //! tree after each check. Copies are converted as a checkout of that tree converts: its own
 //! `.gitattributes` text/eol rules and the source repository's `core.autocrlf`/`eol`, with no
-//! filter driver, hook, or host configuration. The pod's rc file must agree with the command's
-//! exit status.
+//! filter driver, hook, or host configuration. Conversion needs git >= 2.40 (`--attr-source`);
+//! older git writes raw blobs, as the host floor export does. The pod's rc file must agree with
+//! the command's exit status.
 //! Each side carries a private `.git`: HEAD names its copied snapshot, `origin/<default>` names
 //! the run base, and no other history is exported. If rebuilding `.git` fails, the tree still
 //! runs and the engine logs the failed step. Host hooks and repository configuration are never
@@ -442,6 +443,8 @@ pub(crate) fn npm_ci(check: &RepoCheck) -> Option<&[String]> {
 // ---------------------------------------------------------------------------------------------
 // The tree copy: converted as a checkout under the tree's .gitattributes text/eol rules and
 // the source core.autocrlf/eol, with no filter driver, hook, or host configuration.
+// Conversion needs git >= 2.40 (--attr-source); older git writes raw blobs, as the host floor
+// export does.
 // ---------------------------------------------------------------------------------------------
 
 /// One entry of a tree to copy in.
@@ -912,6 +915,8 @@ pub(crate) enum Expect {
 /// Write `entries` of `tree` (with `mtimes`) as a tar to `out`. Regular files are converted
 /// exactly as a checkout of `tree` converts: its own `.gitattributes` text/eol rules and the
 /// source repository's `core.autocrlf`/`eol`, with no filter driver, hook, or host configuration.
+/// Conversion needs git >= 2.40 (`--attr-source`); older git writes raw blobs, as the host floor
+/// export does.
 /// Symlink targets stay raw. Returns what each copied path holds for the after-check comparison.
 pub(crate) fn write_tree_tar(
     git_dir: &Path,
@@ -927,6 +932,8 @@ pub(crate) fn write_tree_tar(
 /// text/eol rules and the source repository's `core.autocrlf`/`eol`, with no filter driver, hook,
 /// or host configuration. Git metadata is outside the verified tree's `held`; link targets stay
 /// raw. Tar members group files before links, but `held` retains the input order for verification.
+/// Conversion needs git >= 2.40 (`--attr-source`); older git writes raw blobs, as the host floor
+/// export does.
 fn write_side_tar(
     git_dir: &Path,
     tree: &str,
@@ -949,12 +956,11 @@ fn write_side_tar(
         .enumerate()
         .filter(|(_, (e, _))| !e.is_link())
         .collect();
-    // parse_ls_tree refuses control characters, so a path cannot forge a batch input line.
     let blobs = files
         .iter()
         .map(|(_, (e, _))| (e.oid.clone(), e.path.clone()))
         .collect();
-    crate::repo_checks::checkout_bytes(git_dir, tree, blobs, |i, body| {
+    crate::repo_checks::checkout_bytes(git_dir, tree, blobs, true, |i, body| {
         let (index, (e, t)) = files[i];
         tar_member(&mut out, &e.path, e.mode, *t, &body)
             .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
@@ -968,16 +974,24 @@ fn write_side_tar(
         held.push((index, (e.path.clone(), expect)));
         Ok(())
     })?;
-    for (index, (e, t)) in entries.iter().zip(mtimes).enumerate() {
-        if e.is_link() {
-            let body = read_blob(git_dir, tree, &e.path)
-                .ok_or_else(|| format!("the link target of `{}` could not be read", e.path))?;
-            tar_member(&mut out, &e.path, e.mode, *t, &body)
-                .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
-            let expect = Expect::Link(String::from_utf8_lossy(&body).into_owned());
-            held.push((index, (e.path.clone(), expect)));
-        }
-    }
+    let links: Vec<_> = entries
+        .iter()
+        .zip(mtimes)
+        .enumerate()
+        .filter(|(_, (e, _))| e.is_link())
+        .collect();
+    let blobs = links
+        .iter()
+        .map(|(_, (e, _))| (e.oid.clone(), e.path.clone()))
+        .collect();
+    crate::repo_checks::checkout_bytes(git_dir, tree, blobs, false, |i, body| {
+        let (index, (e, t)) = links[i];
+        tar_member(&mut out, &e.path, e.mode, *t, &body)
+            .map_err(|err| format!("writing `{}` into the container: {err}", e.path))?;
+        let expect = Expect::Link(String::from_utf8_lossy(&body).into_owned());
+        held.push((index, (e.path.clone(), expect)));
+        Ok(())
+    })?;
     if let Some(files) = git {
         for dir in [
             ".git",

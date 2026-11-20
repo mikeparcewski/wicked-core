@@ -7222,28 +7222,76 @@ fn cat_batch(
     answered
 }
 
-/// Stream regular blobs in their checkout form under `tree`'s own attributes and only the
-/// source repository's end-of-line settings. Like the host export, this uses a private repository
-/// with no filter drivers, hooks, or host configuration. Callers must reject newlines in paths.
+/// Stream blobs, optionally converted under `tree`'s own attributes and only the source
+/// repository's end-of-line settings. Like the host export, this uses a private repository
+/// with no filter drivers, hooks, or host configuration. Conversion needs git >= 2.40
+/// (`--attr-source`); older git writes raw blobs, as the host floor export does.
 pub(crate) fn checkout_bytes(
     source_git_dir: &Path,
     tree: &str,
     blobs: Vec<(String, String)>,
+    convert: bool,
     each: impl FnMut(usize, Vec<u8>) -> Result<(), String>,
 ) -> Result<(), String> {
-    let conv = std::env::temp_dir().join("wicked-core-floor").join(format!(
+    if blobs.is_empty() {
+        return Ok(());
+    }
+    for (oid, path) in &blobs {
+        if oid.is_empty() || !oid.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("the tree holds an invalid blob oid {oid:?}"));
+        }
+        if path.is_empty() || path.chars().any(char::is_control) {
+            return Err(format!("the tree holds an unsafe path {path:?}"));
+        }
+    }
+    // Source paths may be relative or name a gitfile; neither may become the command's cwd.
+    // `absolute`, not `canonicalize`: no Windows verbatim (`\\?\`) prefix reaches GIT_DIR.
+    let source_git_dir = std::path::absolute(source_git_dir)
+        .map_err(|e| format!("the source git directory could not be resolved: {e}"))?;
+    let parent = std::env::temp_dir().join("wicked-core-floor");
+    std::fs::create_dir_all(&parent)
+        .map_err(|e| format!("the pod floor's conversion parent could not be created: {e}"))?;
+    let conv = parent.join(format!(
         "pod-conv-{}-{}",
         std::process::id(),
         floor_checkout_nonce()
     ));
+    // Fail closed on a pre-existing leaf, and only clean up a leaf this call created.
+    std::fs::create_dir(&conv)
+        .map_err(|e| format!("the pod floor's conversion dir could not be created: {e}"))?;
     let result = (|| {
-        std::fs::create_dir_all(&conv)
-            .map_err(|e| format!("the pod floor's conversion dir could not be created: {e}"))?;
         let held = HeldDir::open(&conv)?;
+        // spawn-audit: hardened — resolve the source tree with isolated inherited git config.
+        let mut resolve = Command::new("git");
+        resolve
+            .hardened()
+            .args([
+                "rev-parse",
+                "--verify",
+                "--end-of-options",
+                &format!("{tree}^{{tree}}"),
+            ])
+            .current_dir(&conv)
+            .env("GIT_DIR", &source_git_dir)
+            .stdin(std::process::Stdio::null());
+        isolate_git_config(&mut resolve);
+        let resolved = resolve
+            .output()
+            .map_err(|e| format!("the source tree could not be resolved: {e}"))?;
+        if !resolved.status.success() {
+            return Err(format!(
+                "the source tree could not be resolved: {}",
+                String::from_utf8_lossy(&resolved.stderr).trim()
+            ));
+        }
+        let tree = String::from_utf8_lossy(&resolved.stdout).trim().to_string();
+        if tree.is_empty() || !tree.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("the resolved source tree is not a hex object id".to_string());
+        }
         // A detached HEAD containing a tree object id is accepted by cat-file: it need only
         // look like an object id. Attribute lookup uses the explicit `tree`, not HEAD's type.
-        write_private_git_dir(&held, "git", source_git_dir, source_git_dir, tree, true)?;
-        let convert = git_has_attr_source();
+        write_private_git_dir(&held, "git", &source_git_dir, &conv, &tree, true)?;
+        let convert = convert && git_has_attr_source();
         let inputs = blobs
             .into_iter()
             .map(|(oid, path)| {
@@ -7254,7 +7302,7 @@ pub(crate) fn checkout_bytes(
                 }
             })
             .collect();
-        cat_batch(&conv.join("git"), tree, convert, inputs, each)
+        cat_batch(&conv.join("git"), &tree, convert, inputs, each)
     })();
     let _ = std::fs::remove_dir_all(&conv);
     result
@@ -17592,6 +17640,36 @@ mod floor_pass_tests {
         // The slot is removed when the work returns: a later pass is not recorded into it.
         note_pass("lint", Tree::Head);
         assert!(now.lock().unwrap().describe().unwrap().contains("`test`"));
+    }
+}
+
+#[cfg(test)]
+mod checkout_bytes_tests {
+    use super::checkout_bytes;
+    use std::path::Path;
+
+    #[test]
+    fn refuses_unsafe_batch_inputs_and_skips_empty_batches() {
+        let source = Path::new("missing-checkout-bytes-test-git-dir");
+        for (oid, path, error) in [
+            ("abcdef", "line\nbreak", "unsafe path"),
+            ("abcdef", "line\rbreak", "unsafe path"),
+            ("abcdef", "", "unsafe path"),
+            ("not-hex", "file", "invalid blob oid"),
+        ] {
+            let result = checkout_bytes(
+                source,
+                "HEAD",
+                vec![(oid.to_string(), path.to_string())],
+                true,
+                |_, _| panic!("an invalid batch must not call each"),
+            );
+            assert!(result.unwrap_err().contains(error));
+        }
+        assert!(checkout_bytes(source, "HEAD", Vec::new(), true, |_, _| {
+            panic!("an empty batch must not call each")
+        })
+        .is_ok());
     }
 }
 

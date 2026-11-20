@@ -551,7 +551,7 @@ mod private_git {
         git(&f.repo, &["config", "core.autocrlf", "false"]);
         std::fs::write(
             f.repo.join(".gitattributes"),
-            "*.cmd text eol=crlf\n*.bin binary\n",
+            "*.cmd text eol=crlf filter=evil\n*.bin binary\n",
         )
         .unwrap();
         std::fs::write(f.repo.join("run.cmd"), b"echo ok\n").unwrap();
@@ -571,6 +571,7 @@ mod private_git {
         );
         assert_eq!(read_blob(&f.git_dir, &f.base, "data.bin").unwrap(), binary);
 
+        // Build the reference before configuring the driver: an unconfigured filter is ignored.
         let checkout = f.root.join("checkout");
         git(
             &f.repo,
@@ -596,6 +597,14 @@ mod private_git {
         );
         assert_eq!(std::fs::read(checkout.join("data.bin")).unwrap(), binary);
 
+        let marker = f.root.join("evil-filter-ran");
+        let smudge = format!(
+            "touch '{}'; exit 1",
+            marker.to_str().unwrap().replace('\'', "'\\''")
+        );
+        git(&f.repo, &["config", "filter.evil.smudge", &smudge]);
+        git(&f.repo, &["config", "filter.evil.required", "true"]);
+
         // Neither writer may consult the source worktree's uncommitted attributes.
         std::fs::write(f.repo.join(".gitattributes"), "*.cmd -text\n").unwrap();
         for (side, id) in [("commit", &f.base), ("tree", &f.head_tree)] {
@@ -609,6 +618,7 @@ mod private_git {
                     write_side_tar(&f.git_dir, id, &entries, &times, None, &mut archive)
                 }
                 .unwrap();
+                assert!(!marker.exists(), "a repository filter driver ran");
                 let out = extract_archive(&f, &format!("{side}-{fill}"), &archive);
                 assert_eq!(held.len(), entries.len());
                 for ((path, expect), entry) in held.iter().zip(&entries) {
