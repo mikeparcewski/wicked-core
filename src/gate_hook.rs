@@ -11871,16 +11871,22 @@ mod boundary_tests {
 
     #[test]
     fn gov_root_is_under_home_not_the_temp_dir() {
-        let temp = std::path::Path::new("/var/folders/xx/T");
+        // Absolute on every platform (a bare "/home/op" has no drive on Windows).
+        let base = std::env::current_dir().unwrap();
+        let (temp, home) = (base.join("fake-temp"), base.join("fake-home"));
         let fallback = temp.join("wicked-core-gov");
-        let root = gov_root_for(&[Some("/home/op".into())], temp);
-        assert_eq!(root, std::path::PathBuf::from("/home/op/.wicked/core-gov"));
-        assert!(!root.starts_with(temp));
+        let root = gov_root_for(&[Some(home.clone().into_os_string())], &temp);
+        assert_eq!(root, home.join(".wicked").join("core-gov"));
+        assert!(!root.starts_with(&temp));
         // Empty or relative candidates fall through to the next one, then to the temp root.
-        let usable = [Some("".into()), Some(".".into()), Some("/home/op".into())];
-        assert_eq!(gov_root_for(&usable, temp), root);
-        assert_eq!(gov_root_for(&[None, Some("rel".into())], temp), fallback);
-        assert_eq!(gov_root_for(&[], temp), fallback);
+        let usable = [
+            Some("".into()),
+            Some(".".into()),
+            Some(home.into_os_string()),
+        ];
+        assert_eq!(gov_root_for(&usable, &temp), root);
+        assert_eq!(gov_root_for(&[None, Some("rel".into())], &temp), fallback);
+        assert_eq!(gov_root_for(&[], &temp), fallback);
     }
 
     fn with_roots<T>(write: Option<&str>, f: impl FnOnce() -> T) -> T {
