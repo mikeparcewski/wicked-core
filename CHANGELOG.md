@@ -44,6 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Judge independence recovers after a daemon restart and a repeat-page reset (core#1593, core#1549).**
+  When a cold judge search finds no independent provider, the pinned and default rotations retry once
+  with excluded team monitors re-admitted and disclose a monitor's verdict. A fresh repeat page keeps
+  unique attempt keys while treating its cleared provider history as known empty; legacy records and
+  launches awaiting observation still count as unobserved.
+
 - **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
   hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which

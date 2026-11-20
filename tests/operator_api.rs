@@ -101,6 +101,7 @@ mod tests {
             observed_providers: Vec::new(),
             providers_unobserved: false,
             observation_pending: false,
+            observation_reset: false,
             author_probe: None,
             team_run: false,
             team: None,

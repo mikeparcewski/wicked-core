@@ -12397,6 +12397,7 @@ fn dispatch_unit_with(
     if unit.tool_cmd.is_none()
         && (unit.observation_pending
             || (previously_dispatched
+                && !unit.observation_reset
                 && unit.observed_providers.is_empty()
                 && !unit.providers_unobserved))
     {
@@ -12405,6 +12406,7 @@ fn dispatch_unit_with(
     if unit.tool_cmd.is_none() {
         unit.observation_pending = true;
     }
+    unit.observation_reset = false;
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);

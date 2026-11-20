@@ -1349,6 +1349,10 @@ pub struct WorkUnit {
     /// dispatch, that launch's providers are unknown.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observation_pending: bool,
+    /// (core#1549) A repeat-page reset left known-empty provider history while retaining
+    /// `last_attempt` for unique dispatch keys. Consumed by the next dispatch.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub observation_reset: bool,
     /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
     /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
     /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
@@ -1950,6 +1954,7 @@ impl WorkUnit {
             observed_providers: Vec::new(),
             providers_unobserved: false,
             observation_pending: false,
+            observation_reset: false,
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,

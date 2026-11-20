@@ -5919,6 +5919,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 );
             }
             // (crew#972) The monitors first, so a monitor is re-admitted before a creator is.
+            let without_monitors = excluded.clone();
             monitor_fallback =
                 exclude_monitors(&mut excluded, &team_monitors, &creators, has_judge);
             if let Some(why) = &monitor_fallback {
@@ -5943,16 +5944,17 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 author_ids.extend(creator_bins.iter().cloned());
             }
             let creator_ids = CreatorIds::of(&creators, &creator_bins, roster);
-            let eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
-            let configured_x =
+            let mut eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
+            let mut configured_x =
                 without_author_binaries(&eligible_configured, &excluded, &author_ids);
             // Whether only OUTSIDE seats can judge: the run's own unbenched seats never had a
             // distinct judge (the pre-#893 "judge skipped" condition).
-            let outside_only = outside_seats_only(
+            let mut outside_only = outside_seats_only(
                 &excluded,
                 &without_author_binaries(&unbenched_run, &excluded, &author_ids),
             );
-            let roster = judge_roster(&excluded, &configured_x, &eligible_x);
+            let registry = roster;
+            let mut roster = judge_roster(&excluded, &configured_x, &eligible_x);
             // (#539) Pre-check: only run the judge when an identity-distinct seat exists.
             // Without this check, agent_validate falls back to the single default runner — a
             // self-grade when the creator is claude. Mirror the default-floor path (F-7R2-005).
@@ -6055,7 +6057,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             }
             // (rig run 1d372696) The judge runs between the seat's hand-off and the floor: without
             // a note the run showed 1.5 min with no event at all. Said on the unit's own stream.
-            let (verdict, refused) =
+            let (mut verdict, mut refused) =
                 with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
                     crate::validator::agent_validate_with_refusals(
                         &judge_criterion,
@@ -6065,6 +6067,43 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                     )
                 });
+            // A cold seat's provider was unknown to the monitor pre-check. The exhausted
+            // rotation has now observed it: re-admit only the monitors and retry once.
+            if verdict
+                .as_ref()
+                .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
+                && monitor_fallback.is_none()
+                && excluded != without_monitors
+                && creators
+                    .iter()
+                    .all(|c| without_monitors.contains(&c.as_str()))
+            {
+                excluded = without_monitors;
+                monitor_fallback =
+                    exclude_monitors(&mut excluded, &team_monitors, &creators, |_| false);
+                author_ids = author_identities(&excluded, registry);
+                author_ids.extend(creator_bins.iter().cloned());
+                eligible_x = without_author_binaries(&eligible, &excluded, &author_ids);
+                configured_x =
+                    without_author_binaries(&eligible_configured, &excluded, &author_ids);
+                outside_only = outside_seats_only(
+                    &excluded,
+                    &without_author_binaries(&unbenched_run, &excluded, &author_ids),
+                );
+                roster = judge_roster(&excluded, &configured_x, &eligible_x);
+                let (retried, refusals) =
+                    with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                        crate::validator::agent_validate_with_refusals(
+                            &judge_criterion,
+                            work_for_agent,
+                            &excluded,
+                            roster,
+                            &**runner,
+                        )
+                    });
+                verdict = retried;
+                refused.extend(refusals);
+            }
             note_refusals(&refused);
             // (crew main red 2026-10-11) An outside seat is a LAST RESORT that replaces a skipped
             // judge: when only outside seats could judge and every one of them failed as a seat
@@ -6170,6 +6209,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 )
             };
             // (crew#972) As on the pinned path: a monitor is re-admitted before a creator is.
+            let without_monitors = excluded.clone();
             monitor_fallback =
                 exclude_monitors(&mut excluded, &team_monitors, &creators, has_judge);
             if let Some(why) = &monitor_fallback {
@@ -6193,8 +6233,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 author_ids.extend(creator_bins.iter().cloned());
             }
             let creator_ids = CreatorIds::of(&creators, &creator_bins, roster);
-            let run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
-            let roster = run_x.as_slice();
+            let mut run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
+            let registry = roster;
+            let mut roster = run_x.as_slice();
             let criterion = crate::validator::default_judge_criterion(&input.unit);
             if let Some(b) = benched_judge_unavailable(
                 "default judge",
@@ -6244,7 +6285,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                      (F-7R2-005)",
                     input.unit.ord
                 );
-                let (verdict, refused) =
+                let (mut verdict, mut refused) =
                     with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
                         crate::validator::agent_validate_with_refusals(
                             &criterion,
@@ -6254,6 +6295,37 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             &**runner,
                         )
                     });
+                // As on the pinned path, a cold provider observation can undo only the
+                // monitor widening, through one retry of the same rotation.
+                if verdict
+                    .as_ref()
+                    .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
+                    && monitor_fallback.is_none()
+                    && excluded != without_monitors
+                    && creators
+                        .iter()
+                        .all(|c| without_monitors.contains(&c.as_str()))
+                {
+                    excluded = without_monitors;
+                    monitor_fallback =
+                        exclude_monitors(&mut excluded, &team_monitors, &creators, |_| false);
+                    author_ids = author_identities(&excluded, registry);
+                    author_ids.extend(creator_bins.iter().cloned());
+                    run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
+                    roster = run_x.as_slice();
+                    let (retried, refusals) =
+                        with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                            crate::validator::agent_validate_with_refusals(
+                                &criterion,
+                                work_for_agent,
+                                &excluded,
+                                roster,
+                                &**runner,
+                            )
+                        });
+                    verdict = retried;
+                    refused.extend(refusals);
+                }
                 note_refusals(&refused);
                 Some(match verdict {
                     Ok(av) => {
@@ -9311,6 +9383,131 @@ mod tests {
             why.contains("pi-j1592 called api.anthropic.com:443"),
             "{why}"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cold last-seen record must not keep the monitor out after the other judge's
+    /// approval is observed on the work's provider. Both rotations retry with the monitor.
+    #[test]
+    fn core_1593_a_cold_judge_search_readmits_the_monitor_before_holding() {
+        struct Gatewayed {
+            asked: std::sync::Mutex<Vec<String>>,
+        }
+        impl StepRunner for Gatewayed {
+            fn run_unit(&self, input: &StepInput) -> StepOutput {
+                let seat = input.unit.assigned_cli.clone().unwrap_or_default();
+                let provider = if seat.starts_with("codex-j1593-") {
+                    "chatgpt.com:443"
+                } else {
+                    "api.anthropic.com:443"
+                };
+                crate::observed_provider::record_receipt(&seat, Some(vec![provider.into()]));
+                if input.unit.session_id == "validator" {
+                    self.asked.lock().unwrap().push(seat);
+                }
+                StepOutput {
+                    run_id: input.run_id.clone(),
+                    unit_ix: input.unit_ix,
+                    attempt: input.attempt,
+                    output: "PASS\nchecked\nPASS".into(),
+                    status: StepStatus::Ok,
+                    usage: None,
+                    files: Vec::new(),
+                    tools: Vec::new(),
+                    governed: false,
+                }
+            }
+        }
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            // spawn-audit: test-only — a git fixture; reads no engine state.
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}");
+        };
+        let dir = std::env::temp_dir().join(format!("wcore-1593-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["init", "-q", "."]);
+        git(&dir, &["config", "user.email", "t@example.invalid"]);
+        git(&dir, &["config", "user.name", "t"]);
+        git(&dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("x"), "work\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "work"]);
+        let baseline = crate::worktree_guard::snapshot(&dir, &dir).unwrap();
+        for pinned in [true, false] {
+            let tag = if pinned { "pinned" } else { "default" };
+            let monitor = format!("codex-j1593-{tag}");
+            let pi = format!("pi-j1593-{tag}");
+            assert!(crate::observed_provider::last_seen(&pi).is_none());
+            assert!(crate::observed_provider::last_seen(&monitor).is_none());
+            let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do the work");
+            unit.role = crate::workflow::PhaseRole::Creator;
+            unit.assigned_cli = Some("claude".into());
+            unit.default_floor = !pinned;
+            unit.worktree_baseline = Some(baseline.clone());
+            if pinned {
+                unit.validator = Some(crate::validator::DeterministicValidator {
+                    criterion: "the work is correct".into(),
+                    script: "test -f x".into(),
+                    approved: true,
+                });
+            } else {
+                // A default re-judge reads the already observed work without re-running its floor.
+                unit.observed_providers = vec!["api.anthropic.com:443".into()];
+            }
+            unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+                output: "the work".into(),
+                attempt: 1,
+                seats: Vec::new(),
+                monitors: vec![monitor.clone()],
+                consumed: pinned,
+                at: 0,
+            });
+            let input = StepInput {
+                run_id: "r".into(),
+                unit_ix: 0,
+                attempt: 2,
+                unit,
+                workflow_id: "wf-r".into(),
+                entity_mode: EntityMode::Isolated,
+                workdir: Some(dir.clone()),
+                governance: None,
+                prior_outputs: vec![],
+                elicitation_epoch: 0,
+                process_gen: None,
+                launch_seq: 0,
+                required_skills: Vec::new(),
+            };
+            let roster = vec![
+                seat("claude", "claude -p {PROMPT}"),
+                seat(&monitor, "codex exec {PROMPT}"),
+                seat(&pi, "pi -p {PROMPT}"),
+            ];
+            let runner = Arc::new(Gatewayed {
+                asked: std::sync::Mutex::new(Vec::new()),
+            });
+            let dynr: Arc<dyn StepRunner> = runner.clone();
+            let noop: &DeltaSink = &|_: &str| {};
+            let (_, verdict, evidence) =
+                run_unit_and_judge_with_roster(&dynr, &input, None, noop, &roster, &[], &[]);
+            let asked = runner.asked.lock().unwrap().clone();
+            let verdict = verdict.expect("the monitor judges");
+            assert!(verdict.pass, "{tag}: {verdict:?} asked {asked:?}");
+            assert_eq!(verdict.judge_cli.as_deref(), Some(monitor.as_str()));
+            assert_eq!(asked, [pi, monitor]);
+            assert!(evidence.judge_skipped.is_none());
+            assert!(
+                verdict
+                    .judge_fallback
+                    .as_ref()
+                    .is_some_and(|f| f.label.contains("team-monitor fallback")),
+                "{tag}: {verdict:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
