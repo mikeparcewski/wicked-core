@@ -8,12 +8,12 @@
 use super::*;
 use crate::power::{Rigor, RigorChange};
 
-fn power_repo_root(store: &dyn GraphStore, session: &AgentSession) -> Option<std::path::PathBuf> {
+fn power_graph_key(store: &dyn GraphStore, session: &AgentSession) -> Option<String> {
     session
         .repo_ref
         .as_deref()
         .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
-        .map(|r| std::path::PathBuf::from(r.root_path))
+        .map(|r| r.graph_key)
 }
 
 fn emit_change(subscribers: &mut crate::event_log::EventSink, run_id: &str, row: RigorChange) {
@@ -129,13 +129,13 @@ pub(super) fn on_checkpoint(
             ..Default::default()
         });
     }
-    let root = power_repo_root(&*store, &session);
+    let graph_key = power_graph_key(&*store, &session);
     let scored = if report.paths.is_empty() {
         None
     } else {
         Some(crate::plan_gate::diff_score_for_run(
             &report.paths,
-            root.as_deref(),
+            graph_key.as_deref(),
             session.base_commit.as_deref(),
         ))
     };

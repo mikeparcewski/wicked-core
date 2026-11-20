@@ -58,7 +58,7 @@ pub struct DiffRescore {
 /// the same graph and the same fail-closed rule as the intent score.
 pub(crate) fn diff_score_for_run(
     paths: &[String],
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
 ) -> Scored {
     let plan = PlanSteps {
@@ -67,7 +67,7 @@ pub(crate) fn diff_score_for_run(
         touch: Some(paths.to_vec()),
         floor_override: None,
     };
-    super::intent_score_for_run(&plan, repo_root, base_commit)
+    super::intent_score_for_run(&plan, graph_key, base_commit)
 }
 
 /// (WT-C3) The re-score to hold for the next boundary, given the one already `waiting`: the
@@ -180,7 +180,7 @@ pub(crate) enum Change {
         /// intent score, unioned into `plan.accepted.touch` with `touch_source:"pa_scope"`);
         /// any other change keeps its base's touch (rev 14). `None` for a human edit.
         touch: Option<Vec<String>>,
-        /// (ASK-K2b) What the first-creator score reads: the run's repo root and base commit,
+        /// (ASK-K2b) What the first-creator score reads: the run's graph key and base commit,
         /// filled by the actor (it holds the session). `None` ⇒ no graph ⇒ fail closed at 100.
         scoring: Option<ScoreScope>,
     },
@@ -189,7 +189,7 @@ pub(crate) enum Change {
 /// (ASK-K2b) Where a first-creator change's intent score reads its graph from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct ScoreScope {
-    pub repo_root: Option<std::path::PathBuf>,
+    pub graph_key: Option<String>,
     pub base_commit: Option<String>,
 }
 
@@ -466,14 +466,14 @@ pub(crate) fn revise(
                     } else {
                         super::intent_score_for_run(
                             &for_score,
-                            scope.repo_root.as_deref(),
+                            scope.graph_key.as_deref(),
                             scope.base_commit.as_deref(),
                         )
                     };
                     events.push(super::path_scored(run_id, &pid, &scored.assessment, now)?);
                     // (§4.7 F11) A step that executes code needs a worktree: refused on a repo-less
                     // path, on the record, before anything is planned.
-                    if scope.repo_root.is_none()
+                    if scope.graph_key.is_none()
                         && surviving.iter().any(|s| {
                             catalog
                                 .iter()

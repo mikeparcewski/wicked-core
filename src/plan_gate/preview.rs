@@ -59,7 +59,7 @@ pub struct PlanPreview {
 pub(crate) fn preview_plan(
     plan: &PlanSteps,
     human_confirm: &HumanConfirm,
-    repo_root: Option<&std::path::Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
     deliver_step: Option<&PlanStep>,
     rules: &dyn super::RuleSource,
@@ -74,7 +74,7 @@ pub(crate) fn preview_plan(
     // decides the plan from the PA's answer. The preview shows that plan (the scope step first)
     // floor-filled at the baseline, and says the score is pending — never 100 as if final.
     let scoping = super::needs_pa_scope(plan);
-    let unbound = repo_root.is_none();
+    let unbound = graph_key.is_none();
     let (plan, scored) = if scoping {
         (
             super::with_scope_step(plan, unbound),
@@ -83,7 +83,7 @@ pub(crate) fn preview_plan(
     } else {
         (
             plan.clone(),
-            super::intent_score_for_run(plan, repo_root, base_commit),
+            super::intent_score_for_run(plan, graph_key, base_commit),
         )
     };
     let plan = &plan;

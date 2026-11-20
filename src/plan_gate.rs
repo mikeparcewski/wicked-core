@@ -21,7 +21,6 @@
 //! un-teamed run (no bus, `transport: none`) publishes none of them and its gate works the same.
 
 use std::collections::HashSet;
-use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -909,26 +908,26 @@ pub(crate) fn intent_score(plan: &PlanSteps, graph: Graph<'_>) -> Scored {
     }
 }
 
-/// [`intent_score`] against the run's repo graph: the code graph indexed for `repo_root`, read AT
+/// [`intent_score`] against the run's repo graph: the code graph identified by `graph_key`, read AT
 /// `base_commit` (S4's `graph_age` check). No repo, no base commit, no graph or an unreadable one
 /// is `Graph::Unavailable` with the reason, so a declared touch set fails closed at 100.
 pub(crate) fn intent_score_for_run(
     plan: &PlanSteps,
-    repo_root: Option<&Path>,
+    graph_key: Option<&str>,
     base_commit: Option<&str>,
 ) -> Scored {
     let unavailable = |why: String| intent_score(plan, Graph::Unavailable(why));
     if plan.touch.as_ref().is_none_or(|t| t.is_empty()) {
         return unavailable("no declared scope".into());
     }
-    let Some(root) = repo_root else {
+    let Some(key) = graph_key else {
         return unavailable("the run has no repo, so there is no graph to read".into());
     };
     let Some(base) = base_commit else {
         return unavailable("the run's base commit is unknown".into());
     };
-    let Some(db) = crate::code_graph::existing_code_graph(root) else {
-        return unavailable(format!("no code graph is indexed for {}", root.display()));
+    let Some(db) = crate::code_graph::existing_code_graph(key) else {
+        return unavailable(format!("no code graph is indexed for {key}"));
     };
     match wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())) {
         Ok(store) => intent_score(

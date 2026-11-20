@@ -40,7 +40,7 @@ fn recon_indexes_and_ranks_a_real_codebase() {
 
     // Index this crate's OWN src as a small real Rust codebase.
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let symbols = wicked_core::recon_repo(&src, 12).expect("recon a real repo");
+    let symbols = wicked_core::recon_repo(&src, "p11-src", 12).expect("recon a real repo");
 
     assert!(
         !symbols.is_empty(),
@@ -76,10 +76,10 @@ fn browse_and_node_detail_on_a_real_graph() {
     std::env::set_var("WICKED_ESTATE_BIN", &bin);
     point_repo_graph_root_at_scratch();
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-    let _ = wicked_core::recon_repo(&src, 5).expect("recon indexes the graph");
+    let _ = wicked_core::recon_repo(&src, "p11-src", 5).expect("recon indexes the graph");
     // The graph THE RESOLVER placed — never a re-derived spelling (this line used to pin the
     // pre-FINDING-069 `.wicked/code-graph.db`, a path nothing has written for months).
-    let graph = wicked_core::index_repo(&src).expect("index resolves the graph path");
+    let graph = wicked_core::index_repo(&src, "p11-src").expect("index resolves the graph path");
     let graph = graph.as_str();
 
     // The graph has node kinds (functions, etc.).

@@ -170,9 +170,10 @@ pub(crate) fn on_dispatch(
     session: &AgentSession,
     unit: &WorkUnit,
     repo_root: Option<&Path>,
+    graph_key: Option<&str>,
     baseline: Option<(&str, &Path)>,
 ) -> Dispatched {
-    on_dispatch_with(session, unit, repo_root, baseline, None)
+    on_dispatch_with(session, unit, repo_root, graph_key, baseline, None)
 }
 
 /// The diff score [`on_dispatch`] would compute for `session`'s QE unit `ord` on `baseline`
@@ -182,9 +183,10 @@ pub(crate) fn score_ahead(
     session: &AgentSession,
     ord: u32,
     repo_root: Option<&Path>,
+    graph_key: Option<&str>,
     baseline: Option<(&str, &Path)>,
 ) -> QeAcceptance {
-    decide(session, ord, repo_root, baseline)
+    decide(session, ord, repo_root, graph_key, baseline)
 }
 
 /// [`on_dispatch`] with a score already computed by [`score_ahead`] on the same inputs; `None`
@@ -193,6 +195,7 @@ pub(crate) fn on_dispatch_with(
     session: &AgentSession,
     unit: &WorkUnit,
     repo_root: Option<&Path>,
+    graph_key: Option<&str>,
     baseline: Option<(&str, &Path)>,
     scored: Option<QeAcceptance>,
 ) -> Dispatched {
@@ -244,7 +247,7 @@ pub(crate) fn on_dispatch_with(
     } else {
         match scored {
             Some(d) => d,
-            None => decide(session, unit.ord, repo_root, baseline),
+            None => decide(session, unit.ord, repo_root, graph_key, baseline),
         }
     };
     if decided == *current {
@@ -260,10 +263,15 @@ fn decide(
     session: &AgentSession,
     ord: u32,
     repo_root: Option<&Path>,
+    graph_key: Option<&str>,
     baseline: Option<(&str, &Path)>,
 ) -> QeAcceptance {
-    decide_with(session, ord, repo_root, baseline, |signals, root, base| {
-        match crate::code_graph::existing_code_graph(root) {
+    decide_with(
+        session,
+        ord,
+        repo_root,
+        baseline,
+        |signals, root, base| match graph_key.and_then(crate::code_graph::existing_code_graph) {
             None => rs::assess(
                 signals,
                 Graph::Unavailable(format!("no code graph is indexed for {}", root.display())),
@@ -284,8 +292,8 @@ fn decide(
                     None,
                 ),
             },
-        }
-    })
+        },
+    )
 }
 
 /// [`decide`] with the scorer injected: `score(signals, repo_root, base_commit)` reads the graph.

@@ -314,7 +314,7 @@ fn floor_graph_for(gov: &crate::workflow::GovernanceContext) -> Option<String> {
     let store = wicked_apps_core::open_store_ro(Some(&gov.db_path)).ok()?;
     let repo = crate::repo::get_repo(&store, repo_id).ok().flatten()?;
     let root = crate::code_graph::repo_graph_root_for_store(&gov.db_path)?;
-    let path = crate::code_graph::repo_graph_db_at(&root, std::path::Path::new(&repo.root_path));
+    let path = crate::code_graph::repo_graph_db_at(&root, &repo.graph_key);
     path.is_file().then(|| path.to_string_lossy().into_owned())
 }
 
@@ -752,7 +752,7 @@ mod tests {
         };
         let graph = crate::code_graph::repo_graph_db_at(
             &crate::code_graph::repo_graph_root_for_store(&db).expect("a graph root"),
-            std::path::Path::new(&entry.root_path),
+            &entry.graph_key,
         );
         std::fs::create_dir_all(graph.parent().unwrap()).unwrap();
         {

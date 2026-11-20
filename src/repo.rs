@@ -46,6 +46,10 @@ pub struct RepoEntry {
     /// Registration timestamp (unix seconds), supplied by the caller (no wall-clock in the lib).
     #[serde(default)]
     pub registered_at: i64,
+    /// Persisted graph identity, minted from the repo id at registration (core#1419).
+    /// Pre-#1419 records resolve their legacy path-derived key until boot pins it.
+    #[serde(default)]
+    pub graph_key: String,
     /// ABSOLUTE path of this repo's code graph. **Derived, never authoritative in the record.**
     ///
     /// It exists so out-of-process consumers stop re-deriving it. crew spelled
@@ -53,9 +57,8 @@ pub struct RepoEntry {
     /// spelling, and nothing failed when they disagreed — the worker just queried an empty database
     /// (FINDING-069). A field on the record they already read makes the engine the one source.
     ///
-    /// [`RepoEntry::from_node`] recomputes it from `root_path` and discards whatever was persisted, so
-    /// a record written before this field existed reads back correct, and a repo that moves does not
-    /// carry a stale path forward. Do not write to it expecting it to stick.
+    /// [`RepoEntry::from_node`] derives it from the live graph root and persisted `graph_key`,
+    /// discarding any stored path. Moving a checkout keeps the same graph identity.
     ///
     /// ONE SHAPE, decided by the resolver in `code_graph.rs` (see its ADR, core#406):
     /// `<repo-graph root>/<key>/estate.db`, where the root is `<daemon state home>/repo-graphs`
@@ -128,22 +131,36 @@ impl FromNode for RepoEntry {
         let mut entry: RepoEntry =
             serde_json::from_value(serde_json::Value::Object(node.metadata.clone()))
                 .map_err(|e| anyhow::anyhow!("node {} is not a valid RepoEntry: {e}", node.name))?;
-        let (code_graph_db, findings) = code_graph_db_and_findings(&entry.id, &entry.root_path);
+        if entry.graph_key.is_empty() {
+            entry.graph_key = crate::code_graph::legacy_repo_graph_key(Path::new(&entry.root_path));
+        } else if !crate::code_graph::is_valid_key(std::ffi::OsStr::new(&entry.graph_key)) {
+            anyhow::bail!(
+                "repo {} has an invalid graph_key: {:?}",
+                entry.id,
+                entry.graph_key
+            );
+        }
+        let (code_graph_db, findings) =
+            code_graph_db_and_findings(&entry.id, &entry.root_path, &entry.graph_key);
         entry.code_graph_db = code_graph_db;
         entry.findings = findings;
         Ok(entry)
     }
 }
 
-/// This repo's code-graph path, absolute, derived from its root through the engine's ONE resolver
+/// This repo's absolute code-graph path, derived from its persisted key through the ONE resolver
 /// (`code_graph::resolved_code_graph_db`: `<repo-graph root>/<key>/estate.db`, never in the tree —
 /// core#406), plus the checkout diagnostics that ride the record with it. The only spelling any
 /// consumer needs. `repo_id` is only for the messages (the re-onboard remedy names the real
 /// `POST /repos/<id>/onboard`).
-fn code_graph_db_and_findings(repo_id: &str, root_path: &str) -> (String, Vec<RepoFinding>) {
+fn code_graph_db_and_findings(
+    repo_id: &str,
+    root_path: &str,
+    key: &str,
+) -> (String, Vec<RepoFinding>) {
     let root = Path::new(root_path);
     let mut findings = Vec::new();
-    let code_graph_db = match crate::code_graph::resolved_code_graph_db(root) {
+    let code_graph_db = match crate::code_graph::resolved_code_graph_db(key) {
         Some(db) => db.to_string_lossy().into_owned(),
         None => {
             findings.push(RepoFinding {
@@ -195,7 +212,12 @@ fn code_graph_db_and_findings(repo_id: &str, root_path: &str) -> (String, Vec<Re
 /// [`code_graph_db_and_findings`]'s path half — what the tests compare records against.
 #[cfg(test)]
 fn code_graph_db(root_path: &str) -> String {
-    code_graph_db_and_findings("test-repo", root_path).0
+    code_graph_db_and_findings(
+        "test-repo",
+        root_path,
+        &crate::code_graph::legacy_repo_graph_key(Path::new(root_path)),
+    )
+    .0
 }
 
 /// The one-line boot notice for a registered repo that carries an in-tree graph and has NO live
@@ -314,11 +336,16 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
         .to_string_lossy()
         .into_owned();
     let id = slug(&spec.name);
-    let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path);
+    let graph_key = match get_repo(store, &id)? {
+        Some(entry) => entry.graph_key,
+        None => crate::code_graph::mint_repo_graph_key(&id),
+    };
+    let (code_graph_db, findings) = code_graph_db_and_findings(&id, &root_path, &graph_key);
     let entry = RepoEntry {
         id,
         name: spec.name,
         code_graph_db,
+        graph_key,
         findings,
         root_path,
         default_branch,
@@ -334,6 +361,43 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
     }
     put_node(store, entry.to_node())?;
     Ok(entry)
+}
+
+/// Adopt each pre-#1419 record's current legacy graph key without moving graph data.
+/// Inspect raw metadata: `from_node` fills the legacy key even before it is persisted.
+pub(crate) fn pin_graph_keys(store: &mut dyn GraphStore) -> anyhow::Result<Vec<(String, String)>> {
+    let query = SymbolQuery {
+        kinds: vec![NodeKind::Other(REPO_ENTRY.to_string())],
+        ..Default::default()
+    };
+    let mut pinned = Vec::new();
+    for mut node in store.find_symbols(&query)? {
+        if node
+            .metadata
+            .get("graph_key")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|key| !key.is_empty())
+        {
+            continue;
+        }
+        let entry = match RepoEntry::from_node(&node) {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!(
+                    "wicked-core: repo record {}: not pinned (core#1419): {e:#}",
+                    node.name
+                );
+                continue;
+            }
+        };
+        node.metadata.insert(
+            "graph_key".into(),
+            serde_json::Value::String(entry.graph_key.clone()),
+        );
+        put_node(store, node)?;
+        pinned.push((entry.id, entry.graph_key));
+    }
+    Ok(pinned)
 }
 
 /// Every registered repo on the store.
@@ -392,18 +456,18 @@ pub fn index_repo_checkout(
     repo_ref: &str,
 ) -> anyhow::Result<crate::code_graph::CheckoutIndex> {
     let _state_home = crate::code_graph::StateHomeScope::for_store(daemon_db);
-    let root = {
+    let entry = {
         let daemon = wicked_apps_core::open_store_ro(Some(daemon_db))?;
         get_repo(&daemon, repo_ref)?
             .ok_or_else(|| anyhow::anyhow!("no registered repo '{repo_ref}'"))?
-            .root_path
     };
     // Read under the launch lock (`index_checkout`): the runs actively working on this repo.
     let held_by = || -> Result<Vec<String>, String> {
         let daemon = wicked_apps_core::open_store_ro(Some(daemon_db)).map_err(|e| e.to_string())?;
         active_runs_on_repo(&daemon, repo_ref).map_err(|e| e.to_string())
     };
-    crate::code_graph::index_checkout(Path::new(&root), held_by).map_err(|e| anyhow::anyhow!(e))
+    crate::code_graph::index_checkout(Path::new(&entry.root_path), &entry.graph_key, held_by)
+        .map_err(|e| anyhow::anyhow!(e))
 }
 
 /// The runs on `repo_ref` that hold its graph at their base: planning, distributing or executing
@@ -416,17 +480,15 @@ pub(crate) fn active_runs_on_repo(
 ) -> anyhow::Result<Vec<String>> {
     use crate::domain::SessionStatus as S;
     let domain = crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID;
-    // Every registration of the SAME checkout shares its graph (the graph is keyed by the canonical
-    // root), so a run filed under an alias holds it too (codex r3).
-    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    // Runs on every registration sharing this graph hold it too, including legacy aliases.
     let repos = list_repos(store)?;
-    let root = repos
+    let key = repos
         .iter()
         .find(|r| r.id == repo_ref)
-        .map(|r| canon(&r.root_path));
+        .map(|r| &r.graph_key);
     let mut aliases: std::collections::HashSet<String> = repos
         .iter()
-        .filter(|r| root.as_ref().is_some_and(|c| canon(&r.root_path) == *c))
+        .filter(|r| key.is_some_and(|key| r.graph_key == *key))
         .map(|r| r.id.clone())
         .collect();
     aliases.insert(repo_ref.to_string());
@@ -2449,6 +2511,7 @@ mod tests {
         let e = RepoEntry {
             id: "demo".into(),
             name: "Demo".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new("/tmp/demo")),
             root_path: "/tmp/demo".into(),
             default_branch: "main".into(),
             registered_at: 42,
@@ -2473,6 +2536,7 @@ mod tests {
         let mut node = RepoEntry {
             id: "legacy".into(),
             name: "Legacy".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new("/tmp/legacy")),
             root_path: "/tmp/legacy".into(),
             default_branch: "main".into(),
             registered_at: 7,
@@ -2480,6 +2544,7 @@ mod tests {
             findings: Vec::new(),
         }
         .to_node();
+        node.metadata.remove("graph_key");
         node.metadata.remove("code_graph_db");
         node.metadata.remove("findings");
         // Also covers the stale case: a persisted value from before the repo moved.
@@ -2524,10 +2589,12 @@ mod tests {
         let in_tree = dirty.join(crate::code_graph::code_graph_rel());
         std::fs::create_dir_all(in_tree.parent().unwrap()).unwrap();
         std::fs::write(&in_tree, b"indexed in-tree by an older engine").unwrap();
-        let (db, findings) = code_graph_db_and_findings("dirty", dirty.to_str().unwrap());
+        let dirty_key = crate::code_graph::legacy_repo_graph_key(&dirty);
+        let (db, findings) =
+            code_graph_db_and_findings("dirty", dirty.to_str().unwrap(), &dirty_key);
         assert_eq!(
             db,
-            crate::code_graph::repo_graph_db_at(&root, &dirty).to_string_lossy(),
+            crate::code_graph::repo_graph_db_at(&root, &dirty_key).to_string_lossy(),
             "an in-tree graph is never adopted — the record publishes the root path"
         );
         assert_eq!(findings.len(), 1, "{findings:?}");
@@ -2555,6 +2622,7 @@ mod tests {
         let entry = RepoEntry {
             id: "dirty".into(),
             name: "Dirty".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(&dirty),
             root_path: dirty.to_string_lossy().into_owned(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -2572,7 +2640,8 @@ mod tests {
         // Once a graph exists under the root, the message flips to "live" and the notice stops.
         std::fs::create_dir_all(Path::new(&db).parent().unwrap()).unwrap();
         std::fs::write(&db, b"indexed under the state home").unwrap();
-        let (_, live_findings) = code_graph_db_and_findings("dirty", dirty.to_str().unwrap());
+        let (_, live_findings) =
+            code_graph_db_and_findings("dirty", dirty.to_str().unwrap(), &dirty_key);
         assert!(
             live_findings[0]
                 .message
@@ -2591,6 +2660,7 @@ mod tests {
         let mut node = RepoEntry {
             id: "dirty".into(),
             name: "Dirty".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(&dirty),
             root_path: dirty.to_string_lossy().into_owned(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -2606,10 +2676,12 @@ mod tests {
         // A clean checkout → the root path, no findings, and deriving pollutes nothing.
         let clean = base.join("clean");
         std::fs::create_dir_all(&clean).unwrap();
-        let (db, findings) = code_graph_db_and_findings("clean", clean.to_str().unwrap());
+        let clean_key = crate::code_graph::legacy_repo_graph_key(&clean);
+        let (db, findings) =
+            code_graph_db_and_findings("clean", clean.to_str().unwrap(), &clean_key);
         assert_eq!(
             db,
-            crate::code_graph::repo_graph_db_at(&root, &clean).to_string_lossy()
+            crate::code_graph::repo_graph_db_at(&root, &clean_key).to_string_lossy()
         );
         assert!(findings.is_empty(), "{findings:?}");
         assert!(
@@ -2620,6 +2692,7 @@ mod tests {
             boot_notice(&RepoEntry {
                 id: "clean".into(),
                 name: "Clean".into(),
+                graph_key: crate::code_graph::legacy_repo_graph_key(&clean),
                 root_path: clean.to_string_lossy().into_owned(),
                 default_branch: "main".into(),
                 registered_at: 0,
@@ -2701,7 +2774,17 @@ mod tests {
         let daemon_path = state_home.join("daemon-store.db");
         let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
         // The repo's OWN code graph: 3 arbitrary nodes (total counts all kinds, so plain nodes work).
-        let cg_path = code_graph_db(root.to_str().unwrap());
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Cov 009".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let cg_path = entry.code_graph_db.clone();
         assert!(
             !Path::new(&cg_path).starts_with(&root),
             "precondition: the graph is NOT in the working tree: {cg_path}"
@@ -2720,18 +2803,6 @@ mod tests {
                 put_node(&mut repo_store, n).unwrap();
             }
         }
-        // The daemon store: a DIFFERENT file that ends up with just the RepoEntry node (count != 3).
-        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
-        let entry = register_repo(
-            &mut daemon,
-            RepoSpec {
-                name: "Cov 009".into(),
-                root_path: root.to_str().unwrap().into(),
-                registered_at: 0,
-            },
-        )
-        .unwrap();
-
         let report =
             coverage_report_for_repo(&daemon, daemon_path.to_str().unwrap(), &entry.id).unwrap();
         assert_eq!(
@@ -2764,7 +2835,17 @@ mod tests {
         let state_home = scratch_state_home("kinds122");
         let daemon_path = state_home.join("daemon-store.db");
         let _sh = crate::code_graph::StateHomeScope::for_store(daemon_path.to_str().unwrap());
-        let cg_path = code_graph_db(root.to_str().unwrap());
+        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
+        let entry = register_repo(
+            &mut daemon,
+            RepoSpec {
+                name: "Kinds 122".into(),
+                root_path: root.to_str().unwrap().into(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let cg_path = entry.code_graph_db.clone();
         assert!(
             !Path::new(&cg_path).starts_with(&root),
             "precondition: the graph is NOT in the working tree: {cg_path}"
@@ -2784,16 +2865,6 @@ mod tests {
                 put_node(&mut repo_store, n).unwrap();
             }
         }
-        let mut daemon = wicked_apps_core::open_store(Some(daemon_path.to_str().unwrap())).unwrap();
-        let entry = register_repo(
-            &mut daemon,
-            RepoSpec {
-                name: "Kinds 122".into(),
-                root_path: root.to_str().unwrap().into(),
-                registered_at: 0,
-            },
-        )
-        .unwrap();
 
         let kinds =
             graph_kinds_for_repo(&daemon, daemon_path.to_str().unwrap(), &entry.id).unwrap();
@@ -3235,6 +3306,212 @@ mod tests {
         let _ = std::fs::remove_dir_all(&state_home);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_moved_behind_a_symlink_keeps_its_graph() {
+        let temp = scratch_state_home("a_checkout_moved_behind_a_symlink_keeps_its_graph");
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let a = temp.join("a");
+        let b = temp.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        let root = a.join("repo");
+        std::fs::rename(git_repo("graph-move"), &root).unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Moved Repo".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let db = Path::new(&entry.code_graph_db);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(db, b"symbols, references and onboarding clusters").unwrap();
+        std::fs::rename(&a, &b).unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        let reopened = get_repo(&store, &entry.id).unwrap().unwrap();
+        assert_eq!(reopened.code_graph_db, entry.code_graph_db);
+        assert!(Path::new(&reopened.code_graph_db).is_file());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_pre_1419_record_is_pinned_to_the_graph_it_already_has() {
+        let temp = scratch_state_home("a_pre_1419_record_is_pinned_to_the_graph_it_already_has");
+        let pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let a = temp.join("a");
+        let b = temp.join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        let root = a.join("repo");
+        std::fs::rename(git_repo("graph-pin"), &root).unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut node = Node::new(
+            synthetic_symbol(REPO_ENTRY, "legacy"),
+            NodeKind::Other(REPO_ENTRY.into()),
+            "legacy",
+            Language::new(SYMBOL_SCHEME),
+            Location::new("repo_entry/legacy", Span::ZERO),
+        );
+        node.metadata = serde_json::json!({
+            "id": "legacy",
+            "name": "Legacy",
+            "root_path": root.to_string_lossy(),
+            "default_branch": "main",
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        put_node(&mut store, node).unwrap();
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        let db = crate::code_graph::repo_graph_db_at(&pin.root, &key);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(&db, b"existing graph with clusters").unwrap();
+        assert_eq!(
+            pin_graph_keys(&mut store).unwrap(),
+            vec![("legacy".to_string(), key.clone())],
+        );
+        let raw = store
+            .get_node(&synthetic_symbol(REPO_ENTRY, "legacy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.metadata["graph_key"], key);
+        assert!(pin_graph_keys(&mut store).unwrap().is_empty());
+        std::fs::rename(&a, &b).unwrap();
+        std::os::unix::fs::symlink(&b, &a).unwrap();
+        let reopened = get_repo(&store, "legacy").unwrap().unwrap();
+        assert_eq!(Path::new(&reopened.code_graph_db), db.as_path());
+        assert!(Path::new(&reopened.code_graph_db).is_file());
+        assert!(pin_graph_keys(&mut store).unwrap().is_empty());
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_record_does_not_block_pinning_a_pre_1419_record() {
+        let temp =
+            scratch_state_home("a_malformed_record_does_not_block_pinning_a_pre_1419_record");
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let root = temp.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        for id in ["malformed", "legacy"] {
+            let mut node = Node::new(
+                synthetic_symbol(REPO_ENTRY, id),
+                NodeKind::Other(REPO_ENTRY.into()),
+                id,
+                Language::new(SYMBOL_SCHEME),
+                Location::new(format!("repo_entry/{id}"), Span::ZERO),
+            );
+            node.metadata = serde_json::json!({
+                "id": id,
+                "name": id,
+                "default_branch": "main",
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            if id == "legacy" {
+                node.metadata.insert(
+                    "root_path".into(),
+                    serde_json::json!(root.to_string_lossy()),
+                );
+            }
+            put_node(&mut store, node).unwrap();
+        }
+        let key = crate::code_graph::legacy_repo_graph_key(&root);
+        assert_eq!(
+            pin_graph_keys(&mut store).unwrap(),
+            vec![("legacy".to_string(), key.clone())],
+        );
+        let raw = store
+            .get_node(&synthetic_symbol(REPO_ENTRY, "legacy"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.metadata["graph_key"], key);
+        let malformed = store
+            .get_node(&synthetic_symbol(REPO_ENTRY, "malformed"))
+            .unwrap()
+            .unwrap();
+        assert!(!malformed.metadata.contains_key("root_path"));
+        assert!(!malformed.metadata.contains_key("graph_key"));
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn a_re_registration_keeps_the_graph_key() {
+        let temp = scratch_state_home("a_re_registration_keeps_the_graph_key");
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let a = git_repo("graph-repoint-a");
+        let b = git_repo("graph-repoint-b");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut spec = RepoSpec {
+            name: "Same Repo".into(),
+            root_path: a.to_string_lossy().into_owned(),
+            registered_at: 0,
+        };
+        let first = register_repo(&mut store, spec.clone()).unwrap();
+        spec.root_path = b.to_string_lossy().into_owned();
+        let second = register_repo(&mut store, spec).unwrap();
+        assert_eq!(first.graph_key, second.graph_key);
+        assert_eq!(first.code_graph_db, second.code_graph_db);
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn a_new_repo_at_a_moved_repos_old_path_gets_its_own_key() {
+        let temp = scratch_state_home("a_new_repo_at_a_moved_repos_old_path_gets_its_own_key");
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let a = git_repo("graph-reuse-a");
+        let b = git_repo("graph-reuse-b");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let mut spec = RepoSpec {
+            name: "Repo X".into(),
+            root_path: a.to_string_lossy().into_owned(),
+            registered_at: 0,
+        };
+        let first = register_repo(&mut store, spec.clone()).unwrap();
+        spec.root_path = b.to_string_lossy().into_owned();
+        let moved = register_repo(&mut store, spec.clone()).unwrap();
+        spec.name = "Repo Y".into();
+        spec.root_path = a.to_string_lossy().into_owned();
+        let newcomer = register_repo(&mut store, spec).unwrap();
+        assert_eq!(first.graph_key, moved.graph_key);
+        assert_ne!(moved.graph_key, newcomer.graph_key);
+        assert_ne!(moved.code_graph_db, newcomer.code_graph_db);
+        std::fs::remove_dir_all(a).unwrap();
+        std::fs::remove_dir_all(b).unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn a_forged_graph_key_is_refused() {
+        let temp = scratch_state_home("a_forged_graph_key_is_refused");
+        let _pin = crate::code_graph::test_support::GraphRootPin::at(&temp);
+        let root = git_repo("graph-forged");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Forged".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let mut node = entry.to_node();
+        node.metadata
+            .insert("graph_key".into(), serde_json::json!("../x"));
+        assert!(RepoEntry::from_node(&node).is_err());
+        put_node(&mut store, node).unwrap();
+        assert!(get_repo(&store, &entry.id).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(temp).unwrap();
+    }
+
     /// core#214. `register_repo` must persist an ABSOLUTE, normalised root — never the caller's
     /// as-given spelling. A relative `--path ./repo` stored verbatim resolves to nothing from the
     /// daemon's cwd, and the `code_graph_db` derived from it inherits the break.
@@ -3291,15 +3568,15 @@ mod tests {
         );
         assert_eq!(
             entry.code_graph_db,
-            crate::code_graph::resolved_code_graph_db(Path::new(&expected))
+            crate::code_graph::resolved_code_graph_db(&entry.graph_key)
                 .expect("a root resolves")
                 .to_string_lossy(),
-            "code_graph_db is the resolver's answer for the NORMALISED root (a fresh repo's \
+            "code_graph_db is the resolver's answer for the persisted graph key (a fresh repo's \
              graph lives under the state home, not the working tree)"
         );
 
         // The persisted node round-trips to the SAME paths (FromNode re-derives code_graph_db from
-        // root_path), so a consumer reading the store back never sees the as-given spelling.
+        // the persisted graph key), so a consumer reading the store sees the same graph.
         let fetched = get_repo(&store, &entry.id).unwrap().unwrap();
         assert_eq!(fetched.root_path, expected);
         assert_eq!(fetched.code_graph_db, entry.code_graph_db);
@@ -3340,19 +3617,19 @@ mod tests {
             },
         )
         .unwrap();
-        let expected = crate::code_graph::repo_graph_db_at(&graph_root, &root);
+        let expected = crate::code_graph::repo_graph_db_at(&graph_root, &entry.graph_key);
         assert_eq!(
             entry.code_graph_db,
             expected.to_string_lossy(),
             "the record publishes the ROOT path, never the in-tree file"
         );
         assert_eq!(
-            crate::code_graph::code_graph_path_for_write(&root).unwrap(),
+            crate::code_graph::code_graph_path_for_write(&entry.graph_key).unwrap(),
             expected,
             "the WRITE path (re-index) lands under the root too — the checkout is never written"
         );
         assert_eq!(
-            crate::code_graph::existing_code_graph(&root),
+            crate::code_graph::existing_code_graph(&entry.graph_key),
             None,
             "and the in-tree file is not READ as a graph either"
         );
@@ -3424,7 +3701,7 @@ mod tests {
 
         assert_eq!(
             entry.code_graph_db,
-            crate::code_graph::repo_graph_db_at(&estate_root, &root).to_string_lossy(),
+            crate::code_graph::repo_graph_db_at(&estate_root, &entry.graph_key).to_string_lossy(),
             "the record publishes the root path"
         );
         assert!(entry.findings.is_empty(), "{:?}", entry.findings);
@@ -3996,6 +4273,7 @@ mod tests {
         let repo = RepoEntry {
             id: "r".into(),
             name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
             root_path: p.to_string(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -4070,6 +4348,7 @@ mod tests {
         let repo = RepoEntry {
             id: "r".into(),
             name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
             root_path: p.to_string(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -4171,6 +4450,7 @@ mod tests {
         let repo = RepoEntry {
             id: "r".into(),
             name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
             root_path: p.to_string(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -4223,6 +4503,7 @@ mod tests {
         let repo = RepoEntry {
             id: "r".into(),
             name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
             root_path: p.to_string(),
             default_branch: "main".into(),
             registered_at: 0,
@@ -4575,6 +4856,7 @@ mod tests {
         let repo = RepoEntry {
             id: "r".into(),
             name: "r".into(),
+            graph_key: crate::code_graph::legacy_repo_graph_key(Path::new(p)),
             root_path: p.to_string(),
             default_branch: "main".into(),
             registered_at: 0,

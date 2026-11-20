@@ -1670,8 +1670,7 @@ fn t8_r3_the_preview_scores_against_the_launch_repo_graph() {
     // The repo's code graph, where the engine reads it, indexed at HEAD: `f` in src/lib.rs.
     let db = e.rig.dir.join("core.db");
     let root = crate::code_graph::repo_graph_root_for_store(db.to_str().unwrap()).unwrap();
-    let graph_db =
-        crate::code_graph::repo_graph_db_at(&root, std::path::Path::new(&entry.root_path));
+    let graph_db = crate::code_graph::repo_graph_db_at(&root, &entry.graph_key);
     std::fs::create_dir_all(graph_db.parent().unwrap()).unwrap();
     {
         let mut g = wicked_apps_core::open_store(Some(graph_db.to_str().unwrap())).unwrap();
