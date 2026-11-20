@@ -60,6 +60,8 @@ pub struct OperatorJudgment {
     /// its escalation gate (action [`crate::workflow::OPERATOR_JUDGMENT_ACTION`]): which floor
     /// result it overrode, labelled [`FLOOR_OVERRIDE_LABEL`]. `note` is then the operator's
     /// written rationale, never empty. Absent on a judge-unavailable judgment.
+    /// (core#1318) Also records a failed tool check at triage, labelled
+    /// [`TOOL_CHECK_OVERRIDE_LABEL`], without a reusable delivery-floor key.
     #[serde(
         default,
         rename = "floorOverride",
@@ -82,6 +84,11 @@ pub struct OperatorJudgment {
 /// (operator ruling 2026-10-21) The label every surface shows for a floor the operator overrode:
 /// the run, the gate and the delivery.
 pub const FLOOR_OVERRIDE_LABEL: &str = "floor overridden by operator";
+
+/// (core#1318) The check result a triage judgment overrides; it never keys a deliver floor.
+pub const TOOL_CHECK_LAYER: &str = "tool_check";
+/// (core#1318) The run and delivery receipt show exactly what the operator accepted.
+pub const TOOL_CHECK_OVERRIDE_LABEL: &str = "tool check overridden by operator";
 
 /// (operator ruling 2026-10-20) The label of the judge layer an operator's floor override also
 /// answered because no judge seat could rule ([`JudgeStandIn`]).
@@ -108,10 +115,12 @@ pub struct JudgeStandIn {
 /// override answers the deterministic repo-checks floor ONLY: every other layer of the gate still
 /// denies (deny-dominates), and QE acceptance is untouched — it stays required where the run
 /// requires it, and the delivery still needs its PASS.
+/// (core#1318) A `tool_check` record instead accepts the failed check at triage; its absent
+/// key prevents delivery from standing on it, and it also leaves QE acceptance untouched.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FloorOverride {
-    /// The floor layer that denied (`repo_checks` | `repo_checks_timeout`).
+    /// (core#1318) The layer overridden (`repo_checks` | `repo_checks_timeout` | `tool_check`).
     pub layer: String,
     /// The floor result overridden: `<run>:unit-<ord>:attempt-<n>:<layer>` — the unit's
     /// `repoChecksEvaluated` frame for that attempt (or the carried result it stood on).
@@ -122,7 +131,7 @@ pub struct FloorOverride {
     /// The worktree tree the overridden checks ran on, when the report names it.
     #[serde(default)]
     pub tree: Option<String>,
-    /// [`FLOOR_OVERRIDE_LABEL`], verbatim — the line to show as-is.
+    /// (core#1318) [`FLOOR_OVERRIDE_LABEL`] or [`TOOL_CHECK_OVERRIDE_LABEL`], verbatim.
     pub label: String,
     /// (deliver honors an override) The overridden result's exact identity — tree, base and check
     /// set ([`crate::repo_checks::FloorKey`]). The deliver phase stands on this override instead
