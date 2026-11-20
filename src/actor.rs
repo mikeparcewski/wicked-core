@@ -780,6 +780,26 @@ mod wal_checkpoint_tests {
     }
 }
 
+/// core#1653: end every live-output carry of `run_id`: the non-empty redacted tails, sorted by
+/// `(ord, attempt)`, the same scope and order as the throttle's `drain_run`.
+fn finish_run_carries(
+    carries: &mut HashMap<(String, u32, u32), crate::tool_activity::RedactStream>,
+    run_id: &str,
+) -> Vec<(u32, u32, String)> {
+    let mut keys: Vec<_> = carries
+        .keys()
+        .filter(|(rid, _, _)| rid == run_id)
+        .cloned()
+        .collect();
+    keys.sort_unstable_by_key(|(_, ord, attempt)| (*ord, *attempt));
+    keys.into_iter()
+        .filter_map(|key| {
+            let chunk = carries.remove(&key).expect("carry exists").finish();
+            (!chunk.is_empty()).then_some((key.1, key.2, chunk))
+        })
+        .collect()
+}
+
 /// Run the actor loop until `Command::Shutdown` arrives (sent automatically when the last
 /// [`crate::Core`] handle drops — see `ShutdownGuard`). NOTE: channel-close alone can never stop this
 /// loop, because the actor itself holds `self_tx` (a live sender) so workers can post results back;
@@ -935,6 +955,10 @@ pub(crate) fn run(
     // or 2KB, each capped at 2KB). Owned HERE — the single-writer thread — so workers only ever
     // send raw chunks. Drained on ApplyStepResult (the tail must not be lost) and CancelRun.
     let mut output_throttle = crate::output_throttle::UnitOutputThrottle::new();
+    // core#1653: one carry per attempt protects both streams before throttle cuts or elision.
+    // A panicked worker leaves its bounded carry until CancelRun; a result drains the whole run.
+    let mut live_redact: HashMap<(String, u32, u32), crate::tool_activity::RedactStream> =
+        HashMap::new();
     // Actor-owned workflow registry: built-ins seeded at startup, runtime defs added via
     // `Command::RegisterWorkflow`. The file overlay dir (`$WICKED_WORKFLOWS_DIR` /
     // `~/.config/wicked-core/workflows`) is loaded ONCE here so every subsequent `LaunchRun` on
@@ -2502,6 +2526,35 @@ pub(crate) fn run(
                 ack,
             } => {
                 let run_id = output.run_id.clone();
+                // core#1653: finish every carry in the same scope and order as the throttle.
+                for (ord, attempt, chunk) in finish_run_carries(&mut live_redact, &run_id) {
+                    let flushed = output_throttle.push(
+                        &run_id,
+                        ord,
+                        attempt,
+                        &chunk,
+                        std::time::Instant::now(),
+                    );
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::CliOutputDelta {
+                            session: run_id.clone(),
+                            ord,
+                            chunk,
+                        },
+                    );
+                    for text in flushed {
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::UnitOutputDelta {
+                                session: run_id.clone(),
+                                ord,
+                                attempt,
+                                text,
+                            },
+                        );
+                    }
+                }
                 // FINAL FLUSH: this worker's stream is over — emit any coalesced tail still
                 // pending in the throttle BEFORE the result folds, so the live stream never ends
                 // mid-window (and the run's throttle state cannot leak). Each tail carries the
@@ -2654,6 +2707,17 @@ pub(crate) fn run(
             Command::CancelRun { run_id, reply } => {
                 // ACP teardown: cancel epoch, signal kill handles (no-op for PTY).
                 shared_run_terminal(&run_id, &lifecycle_maps, &write_reg);
+                // core#1653: preserve the raw stream's tail even when throttled text is discarded.
+                for (ord, _, chunk) in finish_run_carries(&mut live_redact, &run_id) {
+                    emit(
+                        &mut subscribers,
+                        CoreEvent::CliOutputDelta {
+                            session: run_id.clone(),
+                            ord,
+                            chunk,
+                        },
+                    );
+                }
                 // Discard any coalesced live-output tail: the operator is discarding the run, and
                 // the throttle entry must not outlive it.
                 let _ = output_throttle.drain_run(&run_id);
@@ -2801,20 +2865,22 @@ pub(crate) fn run(
                 process_gen: _,
                 launch_seq: _,
             } => {
-                // Coalesce into the throttled UnitOutputDelta stream FIRST (borrows), then fan the
-                // raw chunk out unchanged (moves it). The raw event keeps its exclusion from the
-                // durable log; the coalesced one is what leaves the process. The chunk's IN-BAND
-                // `attempt` (stamped at the dispatch site) keys the buffer AND labels the flush —
-                // no session read, and a re-dispatch mid-window can neither merge attempts nor
-                // mislabel a superseded attempt's late chunks (PR #279 review).
-                let flushed =
-                    output_throttle.push(&run_id, ord, attempt, &chunk, std::time::Instant::now());
                 // (program DES-POWER-MODE) An orchestrator's APPROACH / DECISION lines reach the
                 // run's working document as they stream.
                 if let Some(notes) = crate::power::scan_notes(&run_id, ord, attempt, &chunk) {
                     emit(&mut subscribers, notes);
                 }
-                // The single emit point fans a worker's live output chunk out to subscribers.
+                // core#1653: only released, redacted text reaches either output stream.
+                let chunk = live_redact
+                    .entry((run_id.clone(), ord, attempt))
+                    .or_default()
+                    .push(&chunk);
+                if chunk.is_empty() {
+                    continue;
+                }
+                // The in-band attempt keys both buffers and labels every throttled flush.
+                let flushed =
+                    output_throttle.push(&run_id, ord, attempt, &chunk, std::time::Instant::now());
                 emit(
                     &mut subscribers,
                     CoreEvent::CliOutputDelta {
@@ -34632,20 +34698,21 @@ mod live_output_stream_tests {
         // scheduling-independent boundary, and the pending tail's tuple is identical whether it
         // leaves via the 500ms window (actor stalled mid-sequence) or the final drain.
         //
-        // 1. A unit's FIRST chunk streams immediately (no startup delay), verbatim.
-        send(0, "first chunk".into());
+        // Chunks pass the redacting carry first (core#1653); leave 256 bytes after each cut.
+        // 1. A unit's FIRST released chunk streams immediately, verbatim.
+        send(0, format!("first chunk {}", "z".repeat(256)));
         // 2. An over-cap chunk flushes on the SIZE boundary (2KB pending forces a flush NOW,
         //    even inside the 500ms window), emitted WHOLE as consecutive ≤2KB deltas.
-        send(0, "z".repeat(5000));
+        send(0, format!("{} {}", "z".repeat(4743), "t".repeat(256)));
         // 3. A RE-DISPATCHED attempt's first chunk: a fresh `(run, ord, attempt)` buffer — flushes
         //    immediately, labeled with ITS in-band attempt, never merged with attempt 0's buffer.
-        send(1, "rework output".into());
+        send(1, format!("rework output {}", "r".repeat(256)));
         // 4. A chunk pending when the step result arrives surfaces labeled with the CHUNK's
         //    attempt — via the ApplyStepResult drain, or via the window if CI stalled us ≥500ms —
         //    NOT the result's attempt (7): the throttle keys by the in-band attempt, so a
         //    superseded attempt's tail can never be relabeled. (The fold itself errors on the
         //    unknown run; the drain runs before it.)
-        send(0, "the tail".into());
+        send(0, " the tail".into());
         core.tx
             .send(Command::ApplyStepResult {
                 output: crate::workflow::StepOutput {
@@ -34697,12 +34764,12 @@ mod live_output_stream_tests {
             .collect();
         assert_eq!(
             unit_outputs.len(),
-            6,
+            7,
             "first-chunk, the size-boundary flush as three ≤2KB deltas, rework first-chunk, the \
-             tail — got {unit_outputs:?}"
+             tail, rework tail — got {unit_outputs:?}"
         );
         // (1) first chunk, verbatim, immediately, labeled with its in-band attempt.
-        assert_eq!(unit_outputs[0], ("live-run", 3, 0, "first chunk"));
+        assert_eq!(unit_outputs[0], ("live-run", 3, 0, "first chunk "));
         // (2) size-boundary flush, every delta capped at 2KB, still attempt 0, and nothing of the
         //     5000 bytes elided (artifact-runs-fix: the live view carries the whole text).
         let size_flush: Vec<&str> = unit_outputs[1..4].iter().map(|(_, _, _, t)| *t).collect();
@@ -34716,26 +34783,28 @@ mod live_output_stream_tests {
         }
         assert_eq!(
             size_flush.concat(),
-            "z".repeat(5000),
+            format!("{} ", "z".repeat(4999)),
             "the whole flush streams"
         );
         // (3) the re-dispatched attempt's first chunk: its own buffer, its own label — attempt 0's
         //     pending text did not leak into it.
         assert_eq!(
             unit_outputs[4],
-            ("live-run", 3, 1, "rework output"),
+            ("live-run", 3, 1, "rework output "),
             "a bumped attempt streams under its own in-band label, unmerged"
         );
         // (4) the pending tail: labeled with the CHUNK's attempt (0) — NOT the finishing result's
-        //     attempt (7) — whether the window or the ApplyStepResult drain flushed it. This is the
-        //     mislabeling fix: a superseded attempt's late output keeps its own attempt.
-        assert_eq!(
-            unit_outputs[5],
-            ("live-run", 3, 0, "the tail"),
+        //     attempt (7). The window can flush either tail before the sorted drain, so their
+        //     relative order is not pinned. A superseded attempt's output keeps its own attempt.
+        let tail = format!("{} the tail", "t".repeat(256));
+        assert!(
+            unit_outputs[5..].contains(&("live-run", 3, 0, tail.as_str())),
             "the pending tail keeps its chunk's attempt, never the result's"
         );
+        let rework_tail = "r".repeat(256);
+        assert!(unit_outputs[5..].contains(&("live-run", 3, 1, rework_tail.as_str())));
 
-        // The raw CliOutputDelta fanout is UNCHANGED alongside the throttled stream.
+        // The raw CliOutputDelta fanout carries the same released text as the throttled stream.
         let raw: Vec<&str> = collected
             .iter()
             .filter_map(|ev| match ev {
@@ -34744,8 +34813,8 @@ mod live_output_stream_tests {
             })
             .collect();
         assert!(
-            raw.contains(&"first chunk") && raw.contains(&"the tail"),
-            "raw chunks still fan out untouched next to the coalesced stream"
+            raw.contains(&"first chunk ") && raw.contains(&tail.as_str()),
+            "released chunks still fan out next to the coalesced stream"
         );
         assert!(
             raw.iter().any(|c| c.len() == 5000),
