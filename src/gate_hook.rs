@@ -8478,10 +8478,8 @@ mod tests {
             &["-n", "1,40p", "f"][..],
             &["s/a/b/", "f"],
             &["-n", "'/[0-9]/p'", "f"],
-            // A non-plain FILE operand (a Windows path, a quoted `$VAR` path) is not a script.
+            // A non-plain FILE operand without `$` or a backtick (a Windows path) is not a script.
             &["'s/a/b/'", "C:\\x\\file.rs"],
-            &["-n", "1p", "\"/srv/$X/f\""],
-            &["-n", "1p", "'f'", "\"./$X\""],
             &["p", "\"./c d\""],
             &["p", "C:\\dir\\f"],
             &["p", "\"C:\\dir\\f\""],
@@ -8524,6 +8522,8 @@ mod tests {
             // an operand.
             &["'s/a/b/'", "/outside/file", "a$x"],
             &["p", "\"a$x\""],
+            &["-n", "1p", "\"/srv/$X/f\""],
+            &["-n", "1p", "'f'", "\"./$X\""],
             &["p", "/outside/file", "\"a$@\""],
             &["p", "/outside/file", "\"q${arr[@]}\""],
             &["p", "/outside/file", "\"a`echo -i`\""],
