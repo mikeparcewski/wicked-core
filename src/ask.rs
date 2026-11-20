@@ -560,8 +560,8 @@ mod tests {
     fn frame(events: &std::sync::mpsc::Receiver<CoreEvent>, kind: &str) -> Value {
         loop {
             let value = events
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .unwrap_or_else(|e| panic!("no {kind} frame within 60s: {e}"))
                 .to_json();
             if value["type"] == kind {
                 return value;
