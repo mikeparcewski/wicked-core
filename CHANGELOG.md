@@ -44,12 +44,7 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
-- **A rule-dispute arbiter stays distinct from every author, including benched seats (core#1531).**
-  Carried disputes exclude every recorded author binary, even one equal to the original judge's key,
-  and resolve creator, author and launch exclusions against the full registry while requiring the
-  arbiter to remain in the live pool. An arbiter ballot that returns no answer now reports
-  "0 of 1 answered"; the decision-frame docs describe the single-arbiter path.
-
+- **Tests account for container-floor limits and actor ordering (core#1489).** Gate the voice hand-off test on an armable floor, check the send-back draft's held state without a render jail, flush ask events with Ping, and await shutdown subscriber disconnection directly.
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.
