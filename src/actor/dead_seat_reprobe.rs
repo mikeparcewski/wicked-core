@@ -57,13 +57,18 @@ pub(super) fn sweep(
         let runner = Arc::clone(runner);
         let self_tx = self_tx.clone();
         std::thread::spawn(move || {
-            let (_, reprobes) = crate::cli_runner::reprobe_due_benches(
-                &*runner,
-                &registry(),
-                &session.benched_seats,
-                now,
-                &|_| {},
-            );
+            // Always complete the probe so a panicking runner cannot leave the run in probing.
+            let reprobes = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let (_, reprobes) = crate::cli_runner::reprobe_due_benches(
+                    &*runner,
+                    &registry(),
+                    &session.benched_seats,
+                    now,
+                    &|_| {},
+                );
+                reprobes
+            }))
+            .unwrap_or_default();
             let _ = self_tx.send(Command::DeadSeatReprobed {
                 run_id: session.id,
                 reprobes,
@@ -101,7 +106,7 @@ pub(super) fn fold(
                 amend: None,
                 amend_scope: Default::default(),
             },
-            actor: Some(crate::power::HANDOFF_ACTOR.to_string()),
+            actor: Some(crate::power::BENCH_REPROBE_ACTOR.to_string()),
             expect: Some(GateExpect {
                 ord: Some(unit.ord),
                 plan_rev: None,
@@ -332,7 +337,7 @@ mod tests {
                     HumanDecision::Approve { amend: None, amend_scope }
                         if amend_scope == crate::workflow::AmendScope::Cursor
                 ));
-                assert_eq!(actor.as_deref(), Some(crate::power::HANDOFF_ACTOR));
+                assert_eq!(actor.as_deref(), Some("engine:bench-reprobe"));
                 assert_eq!(
                     expect,
                     Some(crate::workflow::GateExpect {
@@ -343,6 +348,39 @@ mod tests {
             }
             _ => panic!("expected ConfirmGate"),
         }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn panicking_probe_still_posts_completion_and_clears_probing() {
+        struct PanickingRunner;
+
+        impl StepRunner for PanickingRunner {
+            fn run_unit(&self, _input: &StepInput) -> StepOutput {
+                panic!("probe runner panicked");
+            }
+        }
+
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(&mut store, "panicked");
+        let (tx, rx) = channel();
+        let mut probing = HashSet::new();
+        let runner: Arc<dyn StepRunner> = Arc::new(PanickingRunner);
+        sweep(&store, &runner, registry, &tx, &mut probing, NOW).unwrap();
+        assert!(probing.contains("panicked"));
+        let (run_id, reprobes) = take_probe(&rx);
+        assert_eq!(run_id, "panicked");
+        assert!(reprobes.is_empty());
+
+        let mut subs = crate::event_log::EventSink::default();
+        fold(&mut store, &mut subs, &tx, &mut probing, &run_id, &reprobes).unwrap();
+        assert!(probing.is_empty());
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(session.benched_seats.len(), 1);
+        assert_eq!(session.benched_seats[0].strikes, 1);
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
     }
 

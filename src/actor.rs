@@ -2615,7 +2615,10 @@ pub(crate) fn run(
             } => {
                 // (program DES-POWER-MODE) A gate a person answered on a power run counts for
                 // the run's planned-vs-actual record ("did the operator only answer deliver?").
-                if actor.as_deref() != Some(crate::power::HANDOFF_ACTOR) {
+                if !matches!(
+                    actor.as_deref(),
+                    Some(crate::power::HANDOFF_ACTOR | crate::power::BENCH_REPROBE_ACTOR)
+                ) {
                     if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
                         if s.status == SessionStatus::AwaitingHuman {
                             if let Some(p) = s.power.as_mut() {
