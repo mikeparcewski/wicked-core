@@ -303,13 +303,9 @@ pub(super) fn on_checkpoint(
         (!pause_reasons.is_empty() && paused_before < 3).then(|| crate::power::PowerPause {
             at: now,
             checkpoint,
-            recommended: if signals.spread >= 2 {
-                "split".into()
-            } else if !struggle_reasons.is_empty() {
-                "switch_phased".into()
-            } else {
-                "continue_high".into()
-            },
+            recommended: crate::power::pause_recommendation(!struggle_reasons.is_empty())
+                .as_str()
+                .into(),
             reasons: pause_reasons.clone(),
         });
     let mut row = crate::power::change(

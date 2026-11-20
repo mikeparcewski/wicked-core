@@ -1722,14 +1722,33 @@ pub enum PauseDecision {
 }
 
 impl PauseDecision {
+    pub const ALL: [(&'static str, Self); 4] = [
+        ("continue_high", Self::ContinueHigh),
+        ("continue", Self::Continue),
+        ("switch_phased", Self::SwitchPhased),
+        ("stop", Self::Stop),
+    ];
+
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "continue_high" => Some(Self::ContinueHigh),
-            "continue" => Some(Self::Continue),
-            "switch_phased" => Some(Self::SwitchPhased),
-            "stop" => Some(Self::Stop),
-            _ => None,
-        }
+        Self::ALL
+            .iter()
+            .find_map(|(key, decision)| (*key == s).then_some(*decision))
+    }
+
+    pub fn as_str(self) -> &'static str {
+        Self::ALL
+            .iter()
+            .find_map(|(key, decision)| (*decision == self).then_some(*key))
+            .expect("every pause decision has a string")
+    }
+}
+
+/// Recommend a supported answer to a checkpoint pause.
+pub fn pause_recommendation(struggle: bool) -> PauseDecision {
+    if struggle {
+        PauseDecision::SwitchPhased
+    } else {
+        PauseDecision::ContinueHigh
     }
 }
 
@@ -2271,7 +2290,7 @@ pub fn orchestrate(
         if answer.pause.is_some() {
             completed("paused", Some(summary.clone()));
             emit(
-                "\n[power mode] paused at a checkpoint: waiting for the operator (split, switch \
+                "\n[power mode] paused at a checkpoint: waiting for the operator (switch \
                  to phased, continue at high rigor, or stop)\n",
             );
             let decision = wait_for_pause(&input.run_id, input.process_gen, emit);
@@ -2349,6 +2368,34 @@ pub fn orchestrate(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_pause_decision_round_trips() {
+        for (key, decision) in PauseDecision::ALL {
+            assert_eq!(PauseDecision::parse(key), Some(decision));
+            assert_eq!(decision.as_str(), key);
+        }
+    }
+
+    #[test]
+    fn pause_recommendations_are_accepted_decisions() {
+        for (struggle, expected) in [
+            (false, PauseDecision::ContinueHigh),
+            (true, PauseDecision::SwitchPhased),
+        ] {
+            let recommendation = pause_recommendation(struggle);
+            assert_eq!(recommendation, expected);
+            assert_eq!(
+                PauseDecision::parse(recommendation.as_str()),
+                Some(recommendation)
+            );
+        }
+    }
+
+    #[test]
+    fn split_is_not_a_pause_decision() {
+        assert_eq!(PauseDecision::parse("split"), None);
+    }
 
     /// (core#1486) The attempt's retry and send-back notes ride every later turn AHEAD of the task,
     /// which the continuation clips at 4,000 characters: a note appended to a long description's
