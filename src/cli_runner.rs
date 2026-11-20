@@ -581,6 +581,7 @@ fn agent_judge_with_bus(
     runner: &dyn StepRunner,
     input: &StepInput,
     exec_bus: Option<&str>,
+    wire_excluded: &[String],
 ) -> (
     anyhow::Result<crate::validator::AgentVerdict>,
     Vec<(String, String)>,
@@ -592,7 +593,13 @@ fn agent_judge_with_bus(
     };
     let mut eligible = crate::validator::distinct_judge_keys(excluded, roster);
     eligible.sort_by_key(|k| crate::observed_provider::known_to_share(k));
-    let exclusions = excluded.iter().map(|k| k.to_string()).collect::<Vec<_>>();
+    // The wire's `excluded_seats` keeps its meaning (monitors, launch exclusions, earlier seats),
+    // less any the admission re-admitted; `eligible_seats` carries the admission itself.
+    let exclusions = wire_excluded
+        .iter()
+        .filter(|k| excluded.contains(&k.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
     let verdict = bus_request_agent_verdict(
         criterion,
         work,
@@ -3898,9 +3905,18 @@ pub(crate) fn rejudge_seats(
             &without_author_binaries(&eligible_pool, ex, &ids),
         )
     };
-    exclude_monitors(&mut excluded, &monitors, &creators, has_judge);
+    let monitor_fallback = exclude_monitors(&mut excluded, &monitors, &creators, has_judge);
     let creator_fallback = exclude_creators(&mut excluded, &creators, has_judge);
     parties.retain(|(k, _)| excluded.contains(&k.as_str()));
+    // A creator that also monitored stays out as a creator once the monitors are re-admitted
+    // (xreview on #1165).
+    if monitor_fallback.is_some() {
+        for (k, why) in parties.iter_mut() {
+            if monitors.contains(k) && creators.contains(k) {
+                *why = "created the work this review reads";
+            }
+        }
+    }
     // The preferred judges (the run's own seats, bench applied), the distinct seats the bench took
     // out, and the authors' identities — as the rotation computes them.
     let preferred_for = |parties: &[(String, &'static str)], bins: &[String]| {
@@ -5898,6 +5914,19 @@ fn run_unit_and_judge_in<'scope, 'env>(
             .map(<[String]>::to_vec)
             .unwrap_or_default()
     };
+    // What the bus-path request names as excluded: the team monitors plus the launch exclusion.
+    let mut bus_excluded: Vec<String> = team_authors.clone();
+    // (crew#972, codex r1) …and every seat this unit was ever dispatched on, as on the inline path.
+    for s in input
+        .unit
+        .exclude_seats
+        .iter()
+        .chain(&input.unit.authored_by)
+    {
+        if !bus_excluded.contains(s) {
+            bus_excluded.push(s.clone());
+        }
+    }
     let mut monitors_note = if team_authors.is_empty() {
         String::new()
     } else {
@@ -6335,6 +6364,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         input,
                         exec_bus,
+                        &bus_excluded,
                     )
                 });
             // A cold seat's provider was unknown to the monitor pre-check. The exhausted
@@ -6369,6 +6399,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                             &**runner,
                             input,
                             exec_bus,
+                            &bus_excluded,
                         )
                     });
                 verdict = retried;
@@ -8016,6 +8047,7 @@ mod tests {
                 &runner,
                 &input,
                 Some(bus),
+                &[],
             )
         });
         assert!(verdict
@@ -8046,6 +8078,7 @@ mod tests {
                     &runner,
                     &input,
                     Some(bus),
+                    &[],
                 )
             });
             if pass {

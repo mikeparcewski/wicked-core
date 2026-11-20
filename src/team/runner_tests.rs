@@ -840,8 +840,11 @@ fn bus_judge_by(
     let tr = patient_runner(rig);
     let mut i = judged_input(run, floor, &wd);
     i.unit.assigned_cli = author.map(str::to_string);
+    // (core#1057) The bus judge is drawn by the same admission as the inline one: the roster must
+    // hold a seat distinct from the validator's author and the work's (codex).
+    let roster = [seat("claude"), seat("codex")];
     let (_, verdict, _) =
-        run_unit_and_judge_with_team(&r, &i, NOOP, &[], Some(&rig.bus), Some(&tr));
+        run_unit_and_judge_with_team(&r, &i, NOOP, &roster, Some(&rig.bus), Some(&tr));
     stop.store(true, Ordering::SeqCst);
     let _ = h.join();
     let _ = std::fs::remove_dir_all(&wd);
