@@ -16639,8 +16639,8 @@ mod phase_scope_tests {
             .iter()
             .find_map(|r| r.remote_write_refusal())
             .expect("the fold sees the refusal");
-        // (core#1569) Stored as the redactor's copy: the wire's redactor cuts a `-u` value.
-        assert_eq!(rec_command, "cd /wt && git push -u *** wicked/run");
+        // (core#1569) Stored as the redactor's copy; (core#1575) `git push -u origin` keeps its operand.
+        assert_eq!(rec_command, "cd /wt && git push -u origin wicked/run");
         assert!(rec_reason.contains("`git push`"), "{rec_reason}");
         assert!(recs[0].claim_id.starts_with(REMOTE_WRITE_DENY_PREFIX));
         // The claim itself is ADVISORY by the allowlist — prevention, not a violation.
