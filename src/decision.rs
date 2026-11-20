@@ -542,9 +542,10 @@ pub const RULE_COUNCIL_SIZE: usize = 3;
 pub enum DecisionFrame {
     /// The team councils' routing ballot, with the system's size and deadline settings.
     Routing,
-    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: exactly `size` seats or
-    /// none (fewer eligible = no ballot at all), the nonce-framed dispute ballot, one ABSOLUTE
-    /// `deadline` and the most bytes any ballot may hold.
+    /// (DES-RULE-CHECK-001 rev 2) One disputed steering-rule verdict: three seats for a council,
+    /// or one eligible arbiter when too few seats can sit as a council. Exactly `size` seats or
+    /// none, the nonce-framed dispute ballot, one ABSOLUTE `deadline` and the most bytes any
+    /// ballot may hold.
     Dispute {
         deadline: std::time::Instant,
         prompt_budget: usize,
@@ -617,9 +618,10 @@ pub(crate) fn convene_decision(
 }
 
 /// [`convene_decision`] in a frame: [`DecisionFrame::Routing`] is exactly it;
-/// [`DecisionFrame::Dispute`] seats exactly its `size` ([`RULE_COUNCIL_SIZE`] for a council, 1
-/// for the single arbiter of crew#972; fewer eligible voters convene nothing: a verdict with no
-/// ruling, reason `seats_benched`, and no ballot), frames every ballot and bounds the whole council
+/// [`DecisionFrame::Dispute`] seats exactly its `size`: [`RULE_COUNCIL_SIZE`] for a council, or 1
+/// for the single eligible arbiter the caller selects when too few seats can sit as a council.
+/// With fewer eligible voters than the requested `size`, it returns a verdict with no ruling,
+/// reason `seats_benched`, and no ballot. Every ballot is framed and the whole council is bounded
 /// by its absolute deadline.
 pub(crate) fn convene_decision_with(
     req: &DecisionRequest,
