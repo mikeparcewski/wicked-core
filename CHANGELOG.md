@@ -14,6 +14,87 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ## [Unreleased]
 
+- **core-ts 0.15.47** — 2026-11-20 — patch release on main 0105ea07, carrying 27 PRs since 0.15.46: #1590, #1597, #1598, #1599, #1600, #1601, #1606, #1607, #1608, #1609, #1613, #1615, #1623, #1624, #1625, #1628, #1629, #1630, #1631, #1632, #1633, #1635, #1637, #1638, #1639, #1641, #1642.
+  The entries below were written from each PR's changelog entry; the PRs that edited this file themselves (#1590, #1597, #1598, #1599, #1613) keep their entries further down.
+
+  - **A rule-dispute arbiter stays distinct from every author, including benched seats (core#1531).**
+    Carried disputes exclude every recorded author binary, even one equal to the original judge's key,
+    and resolve creator, author and launch exclusions against the full registry while requiring the
+    arbiter to remain in the live pool. An arbiter ballot that returns no answer now reports
+    "0 of 1 answered"; the decision-frame docs describe the single-arbiter path.
+
+  - **Judge independence recovers after a daemon restart and a repeat-page reset (core#1593, core#1549).**
+    When a cold judge search finds no independent provider, the pinned and default rotations retry once
+    with excluded team monitors re-admitted and disclose a monitor's verdict. A fresh repeat page keeps
+    unique attempt keys while treating its cleared provider history as known empty; legacy records and
+    launches awaiting observation still count as unobserved.
+
+  - **Provider content refusals fail the unit over to the next eligible seat (core#1492).** Recognized
+    Codex and Claude refusals with a nonzero wrapped CLI exit skip failure triage and use the existing
+    failover ladder, preserving the refused transcript without benching the seat. With no eligible
+    seat left, an attended run parks at the dead-seat gate for reassignment. The gate's failover note
+    names the refusal ("`codex` refused this content; moved to `pi`").
+
+  - **Floor disk admission waits for a slot while other floors run (core#1560).** Below the free-space
+    minimum plus 20 GiB per in-flight floor (`WICKED_FLOOR_PEAK_GB`), admission waits for a slot release
+    and periodically rechecks free space. `WICKED_FLOOR_ADMIT_WAIT_S` bounds the wait (default 900 seconds,
+    maximum 3600); at the deadline the floor is admitted anyway. Only free space below the minimum
+    (`WICKED_FLOOR_MIN_FREE_GB`) causes a disk refusal; `0` turns the guard and wait off. Cancellation
+    stops a waiting floor. Slots span retry passes and cleanup, and every release wakes waiting floors.
+
+  - **Demo review requires the survey sheet.** Record receipts now require `review/survey.png`, and review instructions report `COULD-NOT-RUN` when a required sheet is missing or `contact_sheet.py` answers `COULD-NOT-RUN`, never `PASS` or `accept`.
+
+  - Fixed: reading a run's gate no longer creates or chmods seat config directories; only the sign-in roster prepares them (core#1522).
+
+  - A floor refused for lack of disk, or a check that dies at disk-full, is now its own outcome: recorded as could_not_run with the free GiB and the minimum, not retried, and the gate says to free disk space instead of advising an OS sandbox tool (core#1611, core#1605).
+
+  - Fixed: the cold-provider monitor retry now re-admits team monitors for Evaluator units whose creators were excluded, keeping the creators excluded (core#1610).
+
+  - ### Fixed
+
+    - **Per-run governance files survive macOS temp purges (core#1430).** Decisions logs, settings, policy databases and gateway records now live under `~/.wicked/core-gov/<run>` (HOME, else USERPROFILE; empty or relative values are skipped), with a temp fallback only when no usable home exists. A run in flight across the upgrade re-arms on its next attempt (the old temp dir is not read). Gateway record writes recreate a vanished parent directory, privately. At daemon start, governance dirs older than 14 days whose run is not live are removed.
+
+  - Test flakes fixed: code_graph indexer stubs no longer hit ETXTBSY on Linux (#1561); the ask actor frame wait is a 60 s guard (#1576).
+
+  - Fixed (security): a seat no longer has write access to its repo's code-graph directory, so it cannot overwrite `estate.db` with a forged graph (core#1602). The graph is read-only for seats and is switched to DELETE journal mode when a seat launches.
+
+  - A team re-plan keeps a retained unit's repeat-page observation reset, so the next dispatch no longer reads its history as unobserved (core#1610, W4).
+
+  - Tests: governance tests write only under a temp root (`WICKED_GOV_ROOT` seam); the home lookup and the 0700 run-dir mode are now covered (core#1618, core#1619).
+
+  - Fixed: an Apps publish consent gate now lists only the answers the engine will accept, judging the QE backstop on the current worktree tree (read without writing to the repository) instead of the QE record's tree (#1534).
+
+  - A floor waiting for a disk slot now says so, with its reason and the time waited, in the run's floor note (core#1616).
+
+  - Fixed: the engine role can read events in run namespaces and a failed events read is said in the pod_not_ready diagnosis; a plain `operation timeout` container error waits instead of refusing; the pod diagnosis keeps its conditions and 5 events past the old 400-byte cap; events order by their latest occurrence (core#1529, core#1532).
+
+  - A run parked at the dead-seat gate now re-probes its due sign-in or quota bench and resumes on the seat once it answers, instead of waiting for a manual reassign or approve (core#1513).
+
+  - A steer queued while the running unit's record is unreadable is now refused with a clear error instead of reaching another step (core#1520).
+
+  - Rule check in parts: `waves` in the report now counts the serial part calls, so a 5-part batch is 5 waves of wall time, not 1; the no-omission parts test now rejects dropped duplicate lines (core#1524).
+
+  - Fixed: a bench re-probe approval of a dead-seat gate is recorded as `engine:bench-reprobe` rather than `engine:power-handoff`, and a panicking re-probe no longer stops the run from being re-probed (#1640).
+
+  - Fixed: floor admission no longer counts running floors' used disk twice, so more floors run at once on a small host (core#1617).
+
+  - **Read-only Bash pipelines can read skills with sed substitutions and transliterations (core#1494).**
+    Fully parsed stdout-only scripts no longer turn a read-root `cd` into a boundary write; writing or
+    unparsed scripts remain refused. Boundary-denial cards now name the refused path and command,
+    with secrets redacted and details capped.
+
+  **Security-review round (final).**
+  - *Bracket expressions (introduced, W16).* `field` and the `/re/` address now skip a `[...]` whole only when every sed agrees where it ends; a delimiter, backslash, newline or nested `[` inside one, or one never closed, is "may write". Both reviewer scripts (`/[/s|]/w evil1||`, `s#[#]#g;s.#w evil2.x.1`) and a `y` with a bracket are in the may-write and cd tables; `[0-9]`, `[a-z]*`, `[^ ]` stay reads. `[` and `]` are refused as delimiters.
+  - *#1634.* `collect_bash_write_targets`' sed arm now adds an unresolved write target whenever `sed_may_write` flags the script (in-place flags set aside, so an in-tree `sed -i` is unchanged). `sed -n 'w /outside/x' f`, `sed -n '1e touch /outside/x' f`, `s///w`, `-f`, and `-ni` are blocked with no `cd` (advisory block, as every unresolved write target). Red test: `a_writing_sed_is_judged_without_a_cd_and_a_reading_sed_is_not`.
+  - *Operands (found by the Windows CI job on the first push of this round).* `sed_may_write` failed closed on every non-plain word, so with the check now running without a `cd` a Windows path operand blocked a read-only sed (`sed_inplace_and_rm_creator_boundary_ir_item5`). A non-plain word is now tolerated only as a FILE operand starting with a literal alphanumeric, `/`, `.` or `_` (also inside a quote); `$x`, `` `…` ``, `{-i,f}`, `*`, `~` and a leading `-` still fail closed, as do non-plain script and option words. Known limit: `sed -n 1p "$f"` (operand starting with `$`) is blocked, because `$f` may expand to `-i`.
+  - *Redaction of the logged command (question 3).* `seat_text` is `tool_activity::redact` only: it does not cap, so the logged `obligations[1]` copy is uncapped (only the card text is capped by `refused_command_record`). Redaction is by context, not token shape: auth/secret-named headers, `NAME=value` / `--name value` where the name says secret, JSON secret keys, `-u`/`-p`/`--user`, URL userinfo, config-CLI secret words. A bare secret with no such context (`echo ghp_...`, a literal `AKIA...`, `sk-...` as a plain argument) is not redacted. Not fixed here.
+
+  **Round 3 (security review).**
+  - *Unquoted expanding operand (W16, introduced by `plain_operand_start`).* An unquoted non-plain word holding `$`, a backtick or a quote is no longer tolerated as a file operand: the shell can split it (`x=' -i'; sed 's/a/b/' f a$x`) and GNU sed reads an option after an operand. Still reads: a whole double-quoted word whose first character inside is safe (`"a$x"`), and an unquoted word whose only specials are `\`, globs and braces starting with a literal alphanumeric, `/`, `.` or `_` (Windows `C:\dir\f` included). Tests: may-write `a$x`, `a$(echo -i)`, ``a`echo -i` ``, `a'$x'b`, and the no-cd boundary case with `x=' -i'`; reads `"a$x"`, `C:\dir\f`, `a*`, `b{1,2}`.
+  - *`-l` (W4).* BSD sed's `-l` takes no argument, GNU's does; `-l` is now an unknown option (may write) instead of a cluster arm that consumed the next word as its value. `sed -n -l '/x/w evil' p` and `-nl` are in the tests.
+
+  **Round 4.** A whole double-quoted operand also word-splits when it holds `$@`, `${arr[@]}` or `${!name@}` (`set -- x -i; sed 's/a/b/' /outside/file "a$@"`), so it is now tolerated as a file operand only with no `$`, backtick or inner quote, the same rule as an unquoted word. Known limit: `"a$x"` and `"$f"` are blocked. Tests: may-write `"a$@"`, `"q${arr[@]}"`, ``"a`echo -i`"``, `"a$x"`; reads `"C:\dir\f"`, `"./c d"`.
+
 - **CI: the selftest pin moves to wicked-ci 3bd45ae (the advisory verdict now concludes, wicked-ci#76/#81).** The selftest job grants `checks: write` so the called workflow can publish its verdict check run; the advisory job still never blocks a merge.
 
 ### Added
