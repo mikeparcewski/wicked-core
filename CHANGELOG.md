@@ -44,14 +44,10 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **Tests account for container-floor limits and actor ordering (core#1489).** Gate the voice hand-off test on an armable floor, check the send-back draft's held state without a render jail, flush ask events with Ping, and await shutdown subscriber disconnection directly.
 - **Repo graph resolution refuses symlinked databases and key directories (core#1554).** Readers only
   resolve a regular file checked with `symlink_metadata`; indexing refuses a linked key directory or
   database with `PermissionDenied` naming the linked path.
-
-- **Read-only Bash pipelines can read skills with sed substitutions and transliterations (core#1494).**
-  Fully parsed stdout-only scripts no longer turn a read-root `cd` into a boundary write; writing or
-  unparsed scripts remain refused. Boundary-denial cards now name the refused path and command,
-  with secrets redacted and details capped.
 
 - **Runtime recovery preserves an evaluator's FAIL before retrying a turn (core#1538).** A failed
   process attempt with a parsed `VERDICT: FAIL` now completes before runtime recovery sees it,
