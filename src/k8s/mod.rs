@@ -486,6 +486,15 @@ pub(crate) fn boot_sweep(live: std::collections::HashSet<String>) {
                 Ok(_) => {}
                 Err(e) => eprintln!("wicked-core: the cluster boot sweep did not finish: {e}"),
             }
+            // (core#1441) Warm only an existing floor image; an arm retries a failed probe.
+            if let Ok(rt) = crate::container_floor::runtime() {
+                let tag = crate::container_floor::floor_image_tag();
+                if crate::container_floor::image_present(&rt, &tag) {
+                    if let Err((_, detail)) = cluster::ensure_pids_limited(&kube, &tag) {
+                        eprintln!("wicked-core: the boot pids probe did not pass: {detail}");
+                    }
+                }
+            }
         });
 }
 
