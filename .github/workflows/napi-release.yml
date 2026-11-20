@@ -333,21 +333,13 @@ jobs:
           echo "wicked-core-ts@$VERSION publishes under dist-tag '$TAG' (npm latest: ${LATEST:-none})"
           echo "NPM_DIST_TAG=$TAG" >> "$GITHUB_ENV"
 
-      # Publish the 5 platform packages first, then the main package (whose optionalDependencies
-      # reference them). --provenance emits a build-provenance attestation via OIDC (id-token: write);
-      # publishing is via npm trusted publishing (tokenless OIDC), matching the wicked-ci pattern.
-      - name: Publish platform packages
+      # Publish missing platform packages first, then the main package (whose optionalDependencies
+      # reference them); skip versions npm already has so partial publishes and re-runs can resume.
+      # --provenance emits a build-provenance attestation via OIDC (id-token: write); publishing is
+      # via npm trusted publishing (tokenless OIDC), matching the wicked-ci pattern.
+      - name: Publish packages resumably
         shell: bash
-        run: |
-          set -euo pipefail
-          for dir in npm/*/; do
-            echo "==> npm publish $dir"
-            npm publish "$dir" --access public --provenance --tag "$NPM_DIST_TAG"
-          done
-
-      - name: Publish main package
-        shell: bash
-        run: npm publish --access public --provenance --tag "$NPM_DIST_TAG"
+        run: python3 ../../scripts/npm-publish-resumable.py --main . npm/*/ -- --access public --provenance --tag "$NPM_DIST_TAG"
 
   # ── wait until npm serves all six packages at the tag's version (#427, moved here for core#1552) ──
   #
@@ -402,7 +394,7 @@ jobs:
             fi
             now="$(date +%s)"
             if [ "$now" -ge "$deadline" ]; then
-              echo "::error::the registry still does not serve${missing} at ${VERSION} after 15 minutes. The publish job succeeded, so this is npm's asynchronous processing, not a publish failure — re-run failed jobs (this one and the jobs after it), never the publish job (a second publish fails with EPUBLISHCONFLICT)."
+              echo "::error::the registry still does not serve${missing} at ${VERSION} after 15 minutes. The publish job succeeded, so this is npm's asynchronous processing, not a publish failure — re-run failed jobs (this one and the jobs after it); re-running the publish job is also safe because it skips packages npm already has."
               exit 1
             fi
             echo "  not yet:${missing} — attempt ${attempt}, $(( now - started ))s elapsed of 15 min; next check in 30s"
