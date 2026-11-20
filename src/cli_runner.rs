@@ -1295,12 +1295,16 @@ fn dispute_arbiter(
     exclude_seats: &[String],
     author_bins: &[&str],
     registry: &[crate::AgenticCli],
+    pool: &[crate::AgenticCli],
 ) -> Option<(crate::AgenticCli, String)> {
     use wicked_apps_core::spawn::seat_cli_key;
     if let Some(c) = candidates.first() {
         return Some((c.clone(), format!("{} (distinct from every party)", c.key)));
     }
     let judge = judge?;
+    if !pool.is_empty() && !pool.iter().any(|c| c.key == judge) {
+        return None;
+    }
     let party = |k: &str| k == judge || seat_cli_key(k) == seat_cli_key(judge);
     if creators
         .iter()
@@ -1324,7 +1328,6 @@ fn dispute_arbiter(
         .chain(
             author_bins
                 .iter()
-                .filter(|b| **b != judge)
                 .map(|b| crate::validator::normalize_identity(b)),
         )
         .collect();
@@ -1697,7 +1700,8 @@ fn settle_rule_disputes(
                     .map(String::as_str)
                     .collect::<Vec<_>>()
                     .as_slice(),
-                if pool.is_empty() { registry } else { pool },
+                registry,
+                pool,
             ) {
                 Some((seat, footing)) => (vec![seat], 1, Some(footing)),
                 None => {

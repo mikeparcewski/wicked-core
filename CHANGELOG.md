@@ -44,6 +44,12 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Fixed
 
+- **A rule-dispute arbiter stays distinct from every author, including benched seats (core#1531).**
+  Carried disputes exclude every recorded author binary, even one equal to the original judge's key,
+  and resolve creator, author and launch exclusions against the full registry while requiring the
+  arbiter to remain in the live pool. An arbiter ballot that returns no answer now reports
+  "0 of 1 answered"; the decision-frame docs describe the single-arbiter path.
+
 - **A valued global flag before a config CLI's subcommand, and an .npmrc auth key after a secret-named word, no longer
   hide the secret value (core#1580).** The tool-activity redactor now also masks `npm --userconfig ci.npmrc config set
   //registry/:_authToken V` and `aws --profile p configure set aws_secret_access_key V`: a second command head, which

@@ -2872,7 +2872,11 @@ pub fn disputed_row(row: &RuleVerdict, council: RuleCouncil) -> RuleVerdict {
         .reason
         .clone()
         .unwrap_or_else(|| "the council reached no ruling".into());
-    let answered = format!("{} of {} answered", council.returned, council.seated.max(3));
+    let seated = match council.seated {
+        0 => 3,
+        seated => seated,
+    };
+    let answered = format!("{} of {} answered", council.returned, seated);
     RuleVerdict {
         status: RuleStatus::Disputed,
         how: RuleHow::Council,
