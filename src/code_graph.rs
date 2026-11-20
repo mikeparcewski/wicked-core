@@ -582,6 +582,25 @@ pub(crate) fn code_graph_rel() -> PathBuf {
     CODE_GRAPH_DB_REL.split('/').collect()
 }
 
+/// Refuse links at the repo graph's key directory or database. A missing database is allowed
+/// so the writer can index a fresh graph; metadata errors otherwise propagate.
+fn refuse_linked_graph(db: &Path) -> std::io::Result<()> {
+    for path in db.parent().into_iter().chain(std::iter::once(db)) {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing symlinked repo graph path: {}", path.display()),
+                ));
+            }
+            Ok(_) => {}
+            Err(err) if path == db && err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
 /// A repo's code-graph path, resolved for a WRITER, with its key directory created.
 ///
 /// Separate from [`existing_code_graph`] on purpose. This one is allowed to bring the directory into
@@ -613,6 +632,7 @@ fn code_graph_path_for_write_at(repo: &Path, root: Option<&Path>) -> std::io::Re
     if let Some(parent) = graph.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    refuse_linked_graph(&graph)?;
     Ok(graph)
 }
 
@@ -629,7 +649,9 @@ pub(crate) fn existing_code_graph(repo: &Path) -> Option<PathBuf> {
 
 /// [`existing_code_graph`] with the root injected — the pure core tests drive.
 fn existing_code_graph_at(repo: &Path, root: Option<&Path>) -> Option<PathBuf> {
-    resolved_code_graph_db_at(repo, root).filter(|g| g.is_file())
+    resolved_code_graph_db_at(repo, root).filter(|g| {
+        refuse_linked_graph(g).is_ok() && std::fs::symlink_metadata(g).is_ok_and(|m| m.is_file())
+    })
 }
 
 // ── one-time migration from the estate home (core#406) ──────────────────────────────────────────
@@ -1969,6 +1991,78 @@ mod tests {
             !in_tree_code_graph_dir(&repo).exists(),
             "the working tree is NOT polluted — that is the whole point"
         );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_repo_graph_is_refused_for_read_and_write() {
+        let base = scratch("linked-repo-graph");
+        let repo = base.join("repo");
+        let root = base.join("repo-graphs");
+        std::fs::create_dir_all(&repo).unwrap();
+        let db = repo_graph_db_at(&root, &repo);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let target = base.join("other.db");
+        std::fs::write(&target, b"indexed elsewhere").unwrap();
+        std::os::unix::fs::symlink(&target, &db).unwrap();
+
+        for dangling in [false, true] {
+            if dangling {
+                std::fs::remove_file(&target).unwrap();
+            }
+            assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+            let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(err.to_string().contains(&db.display().to_string()), "{err}");
+        }
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_repo_graph_key_dir_is_refused_for_read_and_write() {
+        let base = scratch("linked-repo-graph-key");
+        let repo = base.join("repo");
+        let root = base.join("repo-graphs");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let db = repo_graph_db_at(&root, &repo);
+        let key_dir = db.parent().unwrap();
+        let target = base.join("other-key");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join(CODE_GRAPH_DB_FILE), b"indexed elsewhere").unwrap();
+        std::os::unix::fs::symlink(&target, key_dir).unwrap();
+
+        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+        let err = code_graph_path_for_write_at(&repo, Some(&root)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(
+            err.to_string().contains(&key_dir.display().to_string()),
+            "{err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_repo_graph_still_resolves_for_read_and_write() {
+        let base = scratch("plain-repo-graph");
+        let repo = base.join("repo");
+        let root = base.join("repo-graphs");
+        std::fs::create_dir_all(&repo).unwrap();
+        let db = code_graph_path_for_write_at(&repo, Some(&root)).unwrap();
+        assert_eq!(existing_code_graph_at(&repo, Some(&root)), None);
+        std::fs::write(&db, b"indexed").unwrap();
+
+        assert_eq!(existing_code_graph_at(&repo, Some(&root)), Some(db.clone()));
+        assert_eq!(
+            code_graph_path_for_write_at(&repo, Some(&root)).unwrap(),
+            db
+        );
+
         let _ = std::fs::remove_dir_all(&base);
     }
 
