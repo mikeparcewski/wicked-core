@@ -19259,6 +19259,23 @@ fn current_worktree_tree(
     .map(|s| s.tree)
 }
 
+/// The current tree for gate reads: the same snapshot as the decision path, with all newly
+/// written git objects confined to temporary storage. Unreadable trees remain fail-closed.
+pub(super) fn current_worktree_tree_readonly(
+    store: &dyn GraphStore,
+    session: &crate::domain::AgentSession,
+) -> Option<String> {
+    let wd = session.workdir.as_deref()?;
+    let repo = crate::repo::get_repo(store, session.repo_ref.as_deref()?)
+        .ok()
+        .flatten()?;
+    crate::worktree_guard::snapshot_readonly(
+        std::path::Path::new(wd),
+        std::path::Path::new(&repo.root_path),
+    )
+    .ok()
+}
+
 /// (core#782) Whether `decision` is a FLOOR FIX: an approve WITH A NOTE at a read-only phase's
 /// floor gate (never at the capped review's adjudication or a team pause).
 pub(crate) fn floor_fix_route_for(
