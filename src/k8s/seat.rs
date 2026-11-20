@@ -771,7 +771,7 @@ fn replica_git(
     tree: &Path,
     masks: &[String],
     budget: u64,
-) -> Result<Option<(String, Vec<Entry>)>, String> {
+) -> Result<Option<(String, Vec<Entry>)>, CopyInRefusal> {
     // Every git call bounded in time and output (codex b2-seat #13).
     let bounded = |dir: &Path, args: &[&str]| -> super::Called {
         let mut c = sync::git(dir);
@@ -780,11 +780,7 @@ fn replica_git(
     };
     let head = bounded(tree, &["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
     if head.code.is_none() {
-        return Err(format!(
-            "git rev-parse in {}: {}",
-            tree.display(),
-            head.err_text()
-        ));
+        return Err(format!("git rev-parse in {}: {}", tree.display(), head.err_text()).into());
     }
     if !head.ok() {
         return Ok(None);
@@ -816,7 +812,8 @@ fn replica_git(
         if size > budget {
             return Err(format!(
                 "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
-            ));
+            )
+            .into());
         }
         return Ok(Some((sha, entries)));
     }
@@ -869,7 +866,7 @@ fn rebuild_replica_git(
     branch: &Option<String>,
     masks: &[String],
     budget: u64,
-) -> Result<Vec<Entry>, String> {
+) -> Result<Vec<Entry>, CopyInRefusal> {
     let bounded = |dir: &Path, args: &[&str]| -> super::Called {
         let mut c = sync::git(dir);
         c.args(args);
@@ -901,7 +898,7 @@ fn rebuild_replica_git(
     };
     run(&["init", "-q"])?;
     let src = format!("file://{}", tree.display());
-    run(&[
+    if let Err(detail) = run(&[
         "-c",
         "protocol.file.allow=always",
         "fetch",
@@ -922,7 +919,61 @@ fn rebuild_replica_git(
             &src,
             "HEAD",
         ])
-    })?;
+    }) {
+        let promisor = bounded(tree, &["config", "--get-regexp", r"^remote\..*\.promisor$"]);
+        let remote = if promisor.ok() {
+            String::from_utf8_lossy(&promisor.stdout)
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let key = fields.next()?;
+                    if !fields.next()?.eq_ignore_ascii_case("true") {
+                        return None;
+                    }
+                    key.strip_prefix("remote.")?
+                        .strip_suffix(".promisor")
+                        .map(str::to_string)
+                })
+        } else {
+            None
+        }
+        .or_else(|| {
+            let partial = bounded(tree, &["config", "--get", "extensions.partialClone"]);
+            partial
+                .ok()
+                .then(|| String::from_utf8_lossy(&partial.stdout).trim().to_string())
+                .filter(|name| !name.is_empty())
+        });
+        if let Some(remote) = remote {
+            let mut c = sync::git(tree);
+            c.args([
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                "-n",
+                REPLICA_DEPTH,
+                sha,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1");
+            let objects = super::run_capped(c, None, GIT_CALL, 64 << 20);
+            if objects.ok() {
+                let stdout = String::from_utf8_lossy(&objects.stdout);
+                let mut missing = stdout.lines().filter_map(|line| line.strip_prefix('?'));
+                if let Some(first) = missing.next() {
+                    let count = 1 + missing.count();
+                    return Err(CopyInRefusal {
+                        why: FloorUnarmed::PartialClone,
+                        detail: format!(
+                            "the repository is a partial clone (promisor remote `{remote}`) and \
+                             {count} object(s) of its last {REPLICA_DEPTH} commits were never \
+                             fetched (first {first}); git fetch: {detail}"
+                        ),
+                    });
+                }
+            }
+        }
+        return Err(detail.into());
+    }
     match &branch {
         Some(b) => {
             run(&["update-ref", b, sha])?;
@@ -939,7 +990,7 @@ fn rebuild_replica_git(
         // pathspec is case-sensitive and glob-shaped; the mask is neither).
         let o = bounded(&tmp, &["ls-files", "-z"]);
         if !o.ok() {
-            return Err(format!("git ls-files: {}", o.err_text()));
+            return Err(format!("git ls-files: {}", o.err_text()).into());
         }
         let tracked: Vec<String> = o
             .stdout
@@ -968,7 +1019,8 @@ fn rebuild_replica_git(
     if size > budget {
         return Err(format!(
             "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
-        ));
+        )
+        .into());
     }
     let mut entries = Vec::new();
     for rel in listed {
@@ -977,7 +1029,8 @@ fn rebuild_replica_git(
             None => {
                 return Err(format!(
                     "the replica's .git could not be read whole (`{rel}` went away)"
-                ))
+                )
+                .into())
             }
         }
     }
@@ -1011,6 +1064,22 @@ pub(crate) type Tracked = HashMap<PathBuf, Option<Vec<String>>>;
 /// The encoded roots, pod plan, base commit, baseline and host tracked sets from copy-in.
 pub(crate) type CopyInStream = (Vec<u8>, Value, Option<String>, Baseline, Tracked);
 
+/// A copy-in refusal's floor reason and diagnostic detail for the daemon log.
+#[derive(Debug)]
+pub(crate) struct CopyInRefusal {
+    pub(crate) why: FloorUnarmed,
+    pub(crate) detail: String,
+}
+
+impl From<String> for CopyInRefusal {
+    fn from(detail: String) -> Self {
+        Self {
+            why: FloorUnarmed::CopyInRefused,
+            detail,
+        }
+    }
+}
+
 /// The copy-in stream of `roots` (the host's side), with its baseline and tracked sets.
 pub(crate) fn copy_in_stream(
     scope: Option<&str>,
@@ -1018,7 +1087,7 @@ pub(crate) fn copy_in_stream(
     roots: &[PlanRoot],
     with_git: bool,
     seeded: &HashSet<String>,
-) -> Result<CopyInStream, String> {
+) -> Result<CopyInStream, CopyInRefusal> {
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
     let mut base = None;
@@ -1079,7 +1148,8 @@ pub(crate) fn copy_in_stream(
                     return Err(format!(
                         "the unit's copy-in has more than {} files",
                         sync::MAX_ENTRIES
-                    ));
+                    )
+                    .into());
                 }
                 let size = if e.kind == sync::Kind::Link {
                     256
@@ -1091,7 +1161,8 @@ pub(crate) fn copy_in_stream(
                     return Err(format!(
                         "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
                         r.host.join(&e.path).display()
-                    ));
+                    )
+                    .into());
                 }
                 entries.push(e.clone());
             }
@@ -1113,14 +1184,16 @@ pub(crate) fn copy_in_stream(
                 return Err(format!(
                     "the unit's copy-in has more than {} files",
                     sync::MAX_ENTRIES
-                ));
+                )
+                .into());
             }
             budget += sync::entry_size(&r.host, p).max(p.len() as u64);
             if budget > STREAM_LIMIT {
                 return Err(format!(
                     "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
                     r.host.join(p).display()
-                ));
+                )
+                .into());
             }
             // A file that is there but cannot be read refuses the copy-in (review r5); a path
             // that is gone, or a directory (a gitlink), is simply absent.
@@ -1158,7 +1231,8 @@ pub(crate) fn copy_in_stream(
             if budget > STREAM_LIMIT {
                 return Err(format!(
                     "the unit's copy-in is larger than {STREAM_LIMIT} bytes (its .git)"
-                ));
+                )
+                .into());
             }
             {
                 let gr = format!("{replica}/.git");
@@ -1286,8 +1360,7 @@ pub(crate) fn copy_in(
     };
     // What could not be copied in is said as that (fix-k8s-chat), never `root_unresolvable`.
     let (body, plan, base, baseline, tracked) =
-        copy_in_stream(scope, tree, roots, with_git, &seeded)
-            .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
+        copy_in_stream(scope, tree, roots, with_git, &seeded).map_err(|r| (r.why, r.detail))?;
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::CopyInRefused,

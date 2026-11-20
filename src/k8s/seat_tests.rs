@@ -1940,7 +1940,7 @@ fn k8s_a_copy_in_over_its_limit_is_refused_before_it_is_read() {
         repo: false,
     };
     let e = seat::copy_in_stream(None, &host, &[r], false, &Default::default()).unwrap_err();
-    assert!(e.contains("larger than"), "{e}");
+    assert!(e.detail.contains("larger than"), "{}", e.detail);
     assert!(
         sync::read_host_entry(&host, "big.bin").is_err(),
         "a file over the stream's limit is never read whole"
@@ -4370,7 +4370,7 @@ fn k8s_a_read_only_repo_that_lost_its_git_is_refused_not_copied_whole() {
     let roots = plan_with_repo(&tree, &repo, false);
     std::fs::remove_dir_all(repo.join(".git")).unwrap();
     let e = seat::copy_in_stream(None, &tree, &roots, false, &Default::default()).unwrap_err();
-    assert!(e.contains("no longer a repository"), "{e}");
+    assert!(e.detail.contains("no longer a repository"), "{}", e.detail);
     let _ = std::fs::remove_dir_all(&host);
 }
 
@@ -4404,6 +4404,120 @@ fn k8s_a_refused_copy_in_is_reported_as_copy_in_refused() {
     assert_eq!(why, FloorUnarmed::CopyInRefused, "{e}");
     assert_eq!(why.as_str(), "copy_in_refused");
     assert!(e.contains("larger than"), "{e}");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+fn partial_clone(host: &Path) -> (PathBuf, PathBuf, PlanRoot) {
+    let source = host.join("source");
+    let part = host.join("partial");
+    std::fs::create_dir_all(&source).unwrap();
+    let git = |dir: &Path, args: &[&str]| {
+        let out = sync::git(dir)
+            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&source, &["init", "-q", "-b", "main"]);
+    for content in ["one", "two", "three"] {
+        std::fs::write(source.join("file.txt"), content).unwrap();
+        git(&source, &["add", "file.txt"]);
+        git(&source, &["commit", "-q", "-m", content]);
+    }
+    git(&source, &["config", "uploadpack.allowFilter", "true"]);
+    git(
+        host,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "clone",
+            "-q",
+            "--no-local",
+            "--filter=blob:none",
+            &format!("file://{}", source.display()),
+            part.to_str().unwrap(),
+        ],
+    );
+    let root = PlanRoot {
+        host: part.clone(),
+        mode: Mode::Tree,
+        skip: vec![".git".into()],
+        back: true,
+        files: Vec::new(),
+        masks: Vec::new(),
+        repo: false,
+    };
+    (source, part, root)
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_partial_clone_with_missing_objects_is_refused_as_partial_clone() {
+    let host = tmp("partial-clone-missing");
+    let (source, part, root) = partial_clone(&host);
+    std::fs::remove_dir_all(source).unwrap();
+    let kubectl = host.join("kubectl");
+    crate::test_env::install_stub(&kubectl, "#!/bin/sh\nexit 0\n");
+    let kube = super::Kube {
+        kubectl,
+        kubeconfig: None,
+        context: "t".into(),
+        owner: "o".into(),
+    };
+    let (why, detail) = seat::copy_in(&kube, "ns", None, &part, &[root], true).unwrap_err();
+    assert_eq!(why.as_str(), "partial_clone", "{detail}");
+    assert!(why.describe().contains("partial clone"));
+    assert!(why.describe().contains("--refetch"));
+    assert!(detail.contains("promisor remote `origin`"), "{detail}");
+    let _ = std::fs::remove_dir_all(&host);
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_partial_clone_with_its_objects_fetched_is_copied_in() {
+    let host = tmp("partial-clone-fetched");
+    let (_, part, root) = partial_clone(&host);
+    for args in [
+        &["config", "--unset", "remote.origin.partialclonefilter"][..],
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "fetch",
+            "-q",
+            "--refetch",
+            "origin",
+        ][..],
+    ] {
+        let out = sync::git(&part).args(args).output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let promisor = sync::git(&part)
+        .args(["config", "--get", "remote.origin.promisor"])
+        .output()
+        .unwrap();
+    assert!(promisor.status.success());
+    assert_eq!(String::from_utf8_lossy(&promisor.stdout).trim(), "true");
+    let head = sync::git(&part)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    assert!(head.status.success());
+    let (_, _, base, _, _) =
+        seat::copy_in_stream(None, &part, &[root], true, &Default::default()).unwrap();
+    assert_eq!(
+        base.as_deref(),
+        Some(String::from_utf8_lossy(&head.stdout).trim())
+    );
     let _ = std::fs::remove_dir_all(&host);
 }
 
