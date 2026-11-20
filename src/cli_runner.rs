@@ -6074,6 +6074,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
                 && monitor_fallback.is_none()
                 && excluded != without_monitors
+                && creators
+                    .iter()
+                    .all(|c| without_monitors.contains(&c.as_str()))
             {
                 excluded = without_monitors;
                 monitor_fallback =
@@ -6299,6 +6302,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     .is_err_and(|e| e.is::<crate::validator::NoIndependentJudge>())
                     && monitor_fallback.is_none()
                     && excluded != without_monitors
+                    && creators
+                        .iter()
+                        .all(|c| without_monitors.contains(&c.as_str()))
                 {
                     excluded = without_monitors;
                     monitor_fallback =
