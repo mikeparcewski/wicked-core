@@ -2590,34 +2590,6 @@ pub(crate) fn run(
                 launch_seq,
                 ack,
             } => {
-                // (core#1418) A result back from a hand-off its run outlived (cancelled or
-                // relaunched while its reads ran) is dropped: the relaunch reset the cursor and
-                // attempt the fold's guards compare.
-                if let fold_reads::Arrival::Outlived = fold_reads::returned(&mut evidence) {
-                    if let Some(ack_tx) = ack {
-                        let _ = ack_tx.send(());
-                    }
-                    continue;
-                }
-                // (core#1418) A result whose fold would run the unit's pinned validator (up to
-                // 120 s) or a creator floor's diff on the actor: those run on a thread first,
-                // bound to the inputs the fold would use, and the result comes back with them in
-                // its evidence (once: a result that carries them is folded as it is).
-                if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
-                    fold_reads::start(
-                        &self_tx,
-                        reads,
-                        fold_reads::Posted {
-                            output,
-                            agent_verdict,
-                            evidence,
-                            process_gen: step_gen,
-                            launch_seq,
-                            ack,
-                        },
-                    );
-                    continue;
-                }
                 let run_id = output.run_id.clone();
                 // core#1653: finish every carry in the same scope and order as the throttle.
                 for (ord, attempt, chunk) in finish_run_carries(&mut live_redact, &run_id) {
@@ -2663,6 +2635,37 @@ pub(crate) fn run(
                             text,
                         },
                     );
+                }
+                // (core#1418) The worker's stream is flushed above when its result ARRIVES, before
+                // any hand-off: its tail is never held behind the fold's reads, and a dropped
+                // result still finishes it (core#1653). A result back from a hand-off its run
+                // outlived (relaunched while its reads ran) is dropped: the relaunch reset the
+                // cursor and attempt the fold's guards compare. So is a second copy of a result
+                // whose hand-off is still out.
+                if let fold_reads::Arrival::Drop = fold_reads::returned(&output, &mut evidence) {
+                    if let Some(ack_tx) = ack {
+                        let _ = ack_tx.send(());
+                    }
+                    continue;
+                }
+                // (core#1418) A result whose fold would run the unit's pinned validator (up to
+                // 120 s) or a creator floor's diff on the actor: those run on a thread first,
+                // bound to the inputs the fold would use, and the result comes back with them in
+                // its evidence (once: a result that carries them is folded as it is).
+                if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
+                    fold_reads::start(
+                        &self_tx,
+                        reads,
+                        fold_reads::Posted {
+                            output,
+                            agent_verdict,
+                            evidence,
+                            process_gen: step_gen,
+                            launch_seq,
+                            ack,
+                        },
+                    );
+                    continue;
                 }
                 match apply_step_result(
                     &mut store,
@@ -22316,8 +22319,6 @@ pub(crate) fn cancel_run(
     // campaign::fail_fast, human Reject, governance Deny) inherit the invalidation uniformly.
     // Placed here — after the terminal early-returns — so a double-cancel does not re-advance
     // the sequence and spuriously supersede a subsequent relaunch.
-    // (core#1418) A step result out for its fold reads is this life's: it is dropped on return.
-    fold_reads::forget_run(run_id);
     if let Some(ref m) = lifecycle_maps {
         let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
         maps.tombstone_run(run_id);

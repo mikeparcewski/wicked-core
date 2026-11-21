@@ -17,8 +17,12 @@
 //! The hand-off breaks the actor's first-in, first-out order for that one result: a cancel and a
 //! relaunch of the same run id can be processed while its reads run, and the relaunch resets the
 //! cursor and attempt the fold's guards compare. So each hand-off is registered on the actor
-//! thread (`HANDED`); a cancel or a relaunch forgets the run's hand-offs ([`forget_run`]), and a
-//! result that comes back from a forgotten hand-off is dropped ([`returned`]). Reads only count
+//! thread (`HANDED`) under its run, unit and attempt; a relaunch forgets the run's hand-offs
+//! ([`forget_run`]), and a result that comes back from a forgotten hand-off is dropped
+//! ([`returned`]). (A cancel needs no forget of its own: a result that comes back to a cancelled
+//! run meets the fold's terminal guard, and only a relaunch can make the run live again.) A second
+//! copy of a result whose hand-off is still out (a duplicate delivery) is dropped too, so two
+//! validators never run in one worktree for one attempt. Reads only count
 //! when this actor handed them off: `UnitEvidence::fold_handoff` never crosses the wire, and reads
 //! that arrive without it are stripped, so the fold runs them itself.
 
@@ -38,43 +42,58 @@ use crate::workflow::{
 use crate::worktree_guard::WorktreeSnapshot;
 
 thread_local! {
-    /// The hand-offs this actor has out, by id, with their run ids. Thread-local: the actor's own
-    /// (every cancel and launch runs on the actor thread), never another actor's in the process.
-    static HANDED: RefCell<HashMap<u64, String>> = RefCell::new(HashMap::new());
+    /// The hand-offs this actor has out, by id, with the run, unit and attempt of each.
+    /// Thread-local: the actor's own (every launch runs on the actor thread), never another
+    /// actor's in the process.
+    static HANDED: RefCell<HashMap<u64, Handed>> = RefCell::new(HashMap::new());
+}
+
+/// What a hand-off was for: `(run id, unit index, attempt)`.
+type Handed = (String, usize, u32);
+
+fn handed_for(output: &StepOutput) -> Handed {
+    (output.run_id.clone(), output.unit_ix, output.attempt)
 }
 
 static NEXT_HANDOFF: AtomicU64 = AtomicU64::new(1);
 
-/// On the actor: `run_id` was cancelled or relaunched. A result still out for its reads belongs to
-/// a life of the run that is over, and is dropped when it comes back.
+/// On the actor: `run_id` is relaunched. A result still out for its reads belongs to a life of the
+/// run that is over, and is dropped when it comes back.
 pub(crate) fn forget_run(run_id: &str) {
-    HANDED.with(|h| h.borrow_mut().retain(|_, r| r != run_id));
+    HANDED.with(|h| h.borrow_mut().retain(|_, (r, _, _)| r != run_id));
 }
 
 /// What to do with a step result that arrives on the actor, before its fold.
 pub(crate) enum Arrival {
     /// Fold it (it was never handed off, or its hand-off is still this run's).
     Fold,
-    /// It comes back from a hand-off the run outlived: drop it.
-    Outlived,
+    /// Drop it (acked): it comes back from a hand-off the run outlived, or it is a second copy of
+    /// a result whose hand-off is still out.
+    Drop,
 }
 
 /// On the actor: account for a step result's hand-off. A result back from a live hand-off is
-/// folded with its reads; one from a forgotten hand-off is dropped. Reads a result carries without
-/// a hand-off of this actor are stripped, so the fold runs them itself (fail-closed).
-pub(crate) fn returned(evidence: &mut UnitEvidence) -> Arrival {
+/// folded with its reads; one from a forgotten hand-off is dropped, and so is a copy of a result
+/// whose hand-off is still out. Reads a result carries without a hand-off of this actor are
+/// stripped, so the fold runs them itself (fail-closed).
+pub(crate) fn returned(output: &StepOutput, evidence: &mut UnitEvidence) -> Arrival {
     match evidence.fold_handoff {
         Some(id) => {
             if HANDED.with(|h| h.borrow_mut().remove(&id)).is_some() {
                 Arrival::Fold
             } else {
-                Arrival::Outlived
+                Arrival::Drop
             }
         }
         None => {
             evidence.pinned_validator = None;
             evidence.creator_paths = None;
-            Arrival::Fold
+            let key = handed_for(output);
+            if HANDED.with(|h| h.borrow().values().any(|k| *k == key)) {
+                Arrival::Drop
+            } else {
+                Arrival::Fold
+            }
         }
     }
 }
@@ -164,7 +183,7 @@ pub(crate) fn plan(
 /// back to the actor with them.
 pub(crate) fn start(self_tx: &Sender<Command>, reads: Reads, posted: Posted) {
     let id = NEXT_HANDOFF.fetch_add(1, Ordering::Relaxed);
-    HANDED.with(|h| h.borrow_mut().insert(id, posted.output.run_id.clone()));
+    HANDED.with(|h| h.borrow_mut().insert(id, handed_for(&posted.output)));
     let tx = self_tx.clone();
     std::thread::spawn(move || {
         let Posted {
@@ -324,7 +343,7 @@ mod tests {
             .expect("the result comes back with the read");
         assert_eq!(read.denial, None, "the validator passed, off the actor");
         assert!(
-            matches!(returned(&mut evidence), Arrival::Fold),
+            matches!(returned(&output, &mut evidence), Arrival::Fold),
             "a result back from a live hand-off is folded"
         );
         assert!(evidence.pinned_validator.is_some(), "with its read");
@@ -348,15 +367,29 @@ mod tests {
             "the failing validator's denial comes back: {:?}",
             evidence.pinned_validator
         );
-        assert!(matches!(returned(&mut evidence), Arrival::Fold));
+        assert!(matches!(returned(&output, &mut evidence), Arrival::Fold));
 
-        // The run is cancelled or relaunched while its reads run: the result is dropped on return.
+        // A second copy of the result (a duplicate delivery) while its hand-off is out is dropped:
+        // two validators never run in one worktree for one attempt. The hand-off still folds.
+        let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
+        start(&tx, reads, posted(&output));
+        assert!(
+            matches!(
+                returned(&output, &mut UnitEvidence::default()),
+                Arrival::Drop
+            ),
+            "a copy of a result whose hand-off is out is dropped"
+        );
+        let mut evidence = back(&rx);
+        assert!(matches!(returned(&output, &mut evidence), Arrival::Fold));
+
+        // The run is relaunched while its reads run: the result is dropped on return.
         let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
         start(&tx, reads, posted(&output));
         forget_run("r-fold");
         let mut evidence = back(&rx);
         assert!(
-            matches!(returned(&mut evidence), Arrival::Outlived),
+            matches!(returned(&output, &mut evidence), Arrival::Drop),
             "a result its run outlived never folds"
         );
 
@@ -365,7 +398,7 @@ mod tests {
             pinned_validator: evidence.pinned_validator.clone(),
             ..Default::default()
         };
-        assert!(matches!(returned(&mut forged), Arrival::Fold));
+        assert!(matches!(returned(&output, &mut forged), Arrival::Fold));
         assert!(
             forged.pinned_validator.is_none(),
             "a read that was not handed off is not applied"
