@@ -349,12 +349,12 @@ pub(crate) fn run_epoch(run_id: &str) -> u64 {
 
 /// (core#1491) A seat arms only for a run that has not ended since it was last resumed: under the
 /// run's lifecycle lock (the same one `release_run` holds), so an arm retry racing the run's end
-/// can never re-create its namespace. `false`: the run ended; nothing was armed.
+/// can never re-create its namespace. `None`: the run ended; nothing was armed.
 ///
 /// (coord codex-check on #1527) …and only for the lifecycle the attempt began in (`generation`,
 /// [`lifecycle`] when it started): an end and a resume landing between a retry's last check and
 /// this admission clear the end marker, but move the generation, so the stale retry is refused.
-pub(crate) fn arming_live(run_id: &str, generation: u64) -> bool {
+pub(crate) fn admit_arm<T>(run_id: &str, generation: u64, create: impl FnOnce() -> T) -> Option<T> {
     let l = life(run_id);
     let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     let ended = ENDED
@@ -363,17 +363,18 @@ pub(crate) fn arming_live(run_id: &str, generation: u64) -> bool {
         .as_ref()
         .is_some_and(|m| m.contains_key(run_id));
     if ended || lifecycle(run_id) != generation {
-        return false;
+        return None;
     }
     l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-    true
+    // (core#1541) Namespace creation stays under the lock that release_run holds.
+    Some(create())
 }
 
 /// (core#1491) A resumed run may arm again — a NEW lifecycle: an arm attempt of the ended one
 /// (asleep in its backoff through the end and the resume) never arms in it ([`lifecycle`]).
 pub(crate) fn forget_ended(run_id: &str) {
     // The new generation FIRST, then the end marker cleared: an admission that sees the marker
-    // gone also sees the new generation ([`arming_live`]).
+    // gone also sees the new generation ([`admit_arm`]).
     *RESUMES
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -417,10 +418,11 @@ pub(crate) fn end_run(run_id: &str) -> u64 {
 
 /// The run arms (a seat or a floor is about to use its namespace): waits out a release in
 /// flight, then voids every release scheduled before now.
-pub(crate) fn arming(run_id: &str) {
+pub(crate) fn arming_with<T>(run_id: &str, create: impl FnOnce() -> T) -> T {
     let l = life(run_id);
     let _g = l.0.lock().unwrap_or_else(|p| p.into_inner());
     l.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    create()
 }
 
 /// A run reached a terminal state (B-5; called off the actor thread with every terminal
@@ -485,6 +487,15 @@ pub(crate) fn boot_sweep(live: std::collections::HashSet<String>) {
                 }
                 Ok(_) => {}
                 Err(e) => eprintln!("wicked-core: the cluster boot sweep did not finish: {e}"),
+            }
+            // (core#1441) Warm only an existing floor image; an arm retries a failed probe.
+            if let Ok(rt) = crate::container_floor::runtime() {
+                let tag = crate::container_floor::floor_image_tag();
+                if crate::container_floor::image_present(&rt, &tag) {
+                    if let Err((_, detail)) = cluster::ensure_pids_limited(&kube, &tag) {
+                        eprintln!("wicked-core: the boot pids probe did not pass: {detail}");
+                    }
+                }
             }
         });
 }

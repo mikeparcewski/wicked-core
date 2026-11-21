@@ -4368,39 +4368,7 @@ impl WrappedCliStepRunner {
                             }
                         );
                         let mut out = floor_refused(input, &cli_key, why);
-                        if why == crate::worker_sandbox::FloorUnarmed::ArgvTooLong {
-                            // The size (or the file handoff's failure) is the reason itself,
-                            // said inside the refusal's parentheses.
-                            if out.output.ends_with(')') {
-                                out.output.pop();
-                            }
-                            out.output.push_str(&format!(" — {detail})"));
-                        } else if matches!(
-                            why,
-                            crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted
-                                | crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable
-                                // (core#1491) The pod's phase, conditions and events are the
-                                // evidence: kept in the unit's output, not only the daemon log.
-                                | crate::worker_sandbox::FloorUnarmed::PodNotReady
-                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused
-                        ) && !detail.is_empty()
-                        {
-                            // core#1356: the runtime's own network error (the network's name and
-                            // cause), labelled and on the refusal's one line, so the gate can quote it.
-                            if out.output.ends_with(')') {
-                                out.output.pop();
-                            }
-                            let suffix = match why {
-                                // The pod's conditions and events need their own budget so
-                                // long runtime messages do not push the events out.
-                                crate::worker_sandbox::FloorUnarmed::PodNotReady
-                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused => {
-                                    crate::runtime_wait::diagnosis_suffix(&detail)
-                                }
-                                _ => crate::runtime_wait::network_cause_suffix(&detail),
-                            };
-                            out.output.push_str(&suffix);
-                        }
+                        out.output = refusal_with_detail(out.output, why, &detail);
                         return out;
                     }
                 }
@@ -4960,8 +4928,8 @@ impl WrappedCliStepRunner {
             // unobserved.
             let mut observed: Option<Vec<crate::observed_provider::Provider>> = None;
             if let Some(lease) = gateway_lease.take() {
-                let records = lease.release();
-                observed = crate::observed_provider::providers_of(&records);
+                let observation = lease.release();
+                observed = observation.providers;
                 let phase = gov_env
                     .as_ref()
                     .map(|g| g.phase.clone())
@@ -4969,7 +4937,7 @@ impl WrappedCliStepRunner {
                 crate::seat_gateway::write_records(
                     &crate::gate_hook::decisions_path_for_input(input)
                         .with_file_name(format!("gateway-{phase}.ndjson")),
-                    &records,
+                    &observation.records,
                 );
             }
             crate::observed_provider::record_receipt(&cli_key, observed);
@@ -7530,6 +7498,36 @@ pub(crate) fn floor_refused(
     }
 }
 
+// (core#1541) Keep arm evidence on the refusal's first line with the existing label and caps.
+fn refusal_with_detail(
+    mut out: String,
+    why: crate::worker_sandbox::FloorUnarmed,
+    detail: &str,
+) -> String {
+    use crate::worker_sandbox::FloorUnarmed;
+
+    if why == FloorUnarmed::ArgvTooLong {
+        if out.ends_with(')') {
+            out.pop();
+        }
+        out.push_str(&format!(" — {detail})"));
+    } else if why.keeps_arm_detail() && !detail.is_empty() {
+        if out.ends_with(')') {
+            out.pop();
+        }
+        let suffix = if matches!(
+            why,
+            FloorUnarmed::AddressPoolsExhausted | FloorUnarmed::SeatNetworkUnavailable
+        ) {
+            crate::runtime_wait::network_cause_suffix(detail)
+        } else {
+            crate::runtime_wait::diagnosis_suffix(detail)
+        };
+        out.push_str(&suffix);
+    }
+    out
+}
+
 /// The [`StepOutput`] for a copilot unit whose model its account may not use (or whose account
 /// is not resolved yet): nothing ran. Read as a seat failure, so the run fails over.
 pub(crate) fn seat_model_refused(input: &StepInput, cli_key: &str, why: &str) -> StepOutput {
@@ -8577,6 +8575,65 @@ mod agy_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arm_refusal_output_keeps_diagnoses_and_the_existing_network_budget() {
+        use crate::worker_sandbox::{floor_refusal_text, FloorUnarmed};
+
+        let detail = format!(
+            "phase Pending;\n conditions Ready=False; {}",
+            "é".repeat(3000)
+        );
+        for why in [
+            FloorUnarmed::NoCluster,
+            FloorUnarmed::ClusterUnreachable,
+            FloorUnarmed::ControllerMissing,
+            FloorUnarmed::AdmissionPending,
+            FloorUnarmed::ImageUnavailable,
+            FloorUnarmed::PodNotReady,
+            FloorUnarmed::PolicyRefused,
+            FloorUnarmed::ExecStreamLost,
+            FloorUnarmed::PidsUnlimited,
+            FloorUnarmed::CopyInRefused,
+            FloorUnarmed::PartialClone,
+        ] {
+            let base = floor_refusal_text("a", why);
+            let rendered = refusal_with_detail(base.clone(), why, &detail);
+            assert_eq!(
+                rendered,
+                format!(
+                    "{}{}",
+                    base.trim_end_matches(')'),
+                    crate::runtime_wait::diagnosis_suffix(&detail)
+                ),
+                "{why:?}"
+            );
+            assert_eq!(refusal_with_detail(base.clone(), why, ""), base);
+        }
+        for why in [
+            FloorUnarmed::AddressPoolsExhausted,
+            FloorUnarmed::SeatNetworkUnavailable,
+        ] {
+            let base = floor_refusal_text("a", why);
+            assert_eq!(
+                refusal_with_detail(base.clone(), why, &detail),
+                format!(
+                    "{}{}",
+                    base.trim_end_matches(')'),
+                    crate::runtime_wait::network_cause_suffix(&detail)
+                )
+            );
+        }
+        let why = FloorUnarmed::NoSeatImage;
+        let base = floor_refusal_text("a", why);
+        assert_eq!(refusal_with_detail(base.clone(), why, &detail), base);
+        let why = FloorUnarmed::ArgvTooLong;
+        let base = floor_refusal_text("a", why);
+        assert_eq!(
+            refusal_with_detail(base.clone(), why, "123 bytes"),
+            format!("{} — 123 bytes)", base.trim_end_matches(')'))
+        );
+    }
+
     /// core#1538: recovery must see an evaluator's FAIL as a completed turn, both on the first
     /// attempt and on a rerun. Otherwise a runtime blip can replace that FAIL with a later PASS.
     #[test]

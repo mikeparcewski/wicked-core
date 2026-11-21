@@ -377,7 +377,7 @@ pub(crate) fn reviewer_input(
 /// (§3.2) The seats the reviewer may run on, from the run's OWN seats only, in order. Absolute
 /// exclusions (never relaxed): off-roster, benched, launch-excluded, and a seat whose skills do
 /// not admit the reviewer. Authors (`work_authors` ∪ the unit's own `authored_by`, compared by
-/// seat INSTANCE) are relaxed only in a reduced-assurance run, labelled.
+/// seat key and observed provider, core#1540) are relaxed only in a reduced run, labelled.
 pub(crate) fn candidates(
     session: &AgentSession,
     units: &[WorkUnit],
@@ -390,6 +390,7 @@ pub(crate) fn candidates(
             authors.push(a.clone());
         }
     }
+    let providers = crate::pipeline::work_author_providers(units, unit.ord);
     let excluded = |k: &str| {
         session
             .exclude_seats
@@ -425,7 +426,9 @@ pub(crate) fn candidates(
         .filter(|k| !excluded(k))
         .filter(|k| crate::distribute::seat_admits_unit(&shape, k, invocation(k)))
         .collect();
-    let is_author = |k: &str| authors.iter().any(|a| a == k);
+    let is_author = |k: &str| {
+        crate::observed_provider::shares_identity(k, None, &authors, &providers).is_some()
+    };
     let same_cli = |k: &str| authors.iter().any(|a| a != k && seat_key(a) == seat_key(k));
     let executor = unit.assigned_cli.as_deref();
     let seat = |k: &str, basis: &str| QeReviewerSeat {

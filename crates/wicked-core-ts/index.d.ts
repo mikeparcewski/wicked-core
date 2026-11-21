@@ -217,11 +217,14 @@ export declare class Core {
    * (crew#972) Whether the seats in `clisJson` (the engine-shaped roster, as `launchRun`'s) can
    * cover an author plus an independent judge of its work, by the default gate's own pool and
    * rotation (`wicked_core::judge_coverage`): JSON `{covered, singleIdentity, authors: [{seat,
-   * judges: [{seat, seenSharing?}], notJudges: [{seat, reason, detail?}]}], benched}`. Judges are
+   * judges: [{seat, seenSharing?}], soleJudge: string | null,
+   * notJudges: [{seat, reason, detail?}]}], benched, notes: string[]}`. Judges are
    * in the gate's order; `seenSharing` names a provider the seat was seen calling that the author
    * also called (the gate tries it last and discards its approval if it calls it again), and
-   * `covered` counts only unflagged judges. Not predicted: pinned gates, monitors and the fallback
-   * ladder. `bound`: the run is bound to a repository. Reads the process's observed providers and
+   * `covered` counts only unflagged judges.
+   * (core#1594) `soleJudge` names the sole unflagged judge; `notes` names provider-sharing limits.
+   * Not predicted: pinned gates, monitors and the fallback ladder. `bound`: the run is bound to a
+   * repository. Reads the process's observed providers and
    * the floor env at call time. An addon without this static predates it; crew keys on its presence.
    */
   static judgeCoverage(clisJson: string, bound: boolean): string
@@ -1449,6 +1452,10 @@ export declare class Subscription {
  * `classification` gains `'base_red_unseparated'` (denies) and no longer produces
  * `'env_cannot_run'` / `'unclassified_red_base'`; `envCannotRun` is always `[]`; libtest ids
  * lose their `[<target>]` qualifier and `preExisting` holds the runner-native names excluded.
+ * (core#1038) Stale gate answers emit `gateAnswerRefused` once: {session, ord,
+ * expectedOrd, expectedPlanRev, reason, by}. The error reason starts `gate_changed:`;
+ * ord is the currently open row's ord (null if no row is open), and omitted expectations
+ * serialize as null. The refusal changes no gate, unit or power-run accounting.
  * Judge re-run (additive, new event): `judgeRerunRequested` {session, ord, attempt, fromAttempt,
  * seats, previousReason, by, skips} — the operator requested `rejudge` or a rule re-check:
  * attempt `attempt` re-reads attempt `fromAttempt`'s captured output with a judge drawn

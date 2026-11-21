@@ -7,6 +7,43 @@ use crate::decision::{DecisionRequest, DecisionVerdict, DecisionVote};
 use crate::rule_check::{RuleOrigin, RuleStatus};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[test]
+fn rule_council_and_arbiter_exclude_a_seat_seen_on_the_creators_provider() {
+    let provider = format!("council-provider-{}:443", uuid::Uuid::new_v4());
+    crate::observed_provider::record_receipt("opencode", Some(vec![provider.clone()]));
+    let reg = registry();
+    let providers = vec![provider];
+    let creators = vec!["claude".into()];
+    let candidates = rule_council_candidates(
+        &creators,
+        Some(&["claude".into()]),
+        &providers,
+        &[],
+        &[],
+        &[],
+        (Some("pi"), &["pi".into()]),
+        (Some("codex"), Some("codex -p {PROMPT}")),
+        None,
+        &reg,
+        false,
+    )
+    .unwrap();
+    assert!(!candidates.iter().any(|s| s.key == "opencode"));
+    assert!(dispute_arbiter(
+        &[],
+        Some("opencode"),
+        &creators,
+        &[],
+        &[],
+        &["claude"],
+        &reg,
+        &reg,
+        &providers,
+    )
+    .is_none());
+    crate::observed_provider::take_receipts();
+}
+
 /// The judge: answers every asked rule with `R1`'s word for R1 (and the others' from `rest`).
 struct Judging {
     r1: &'static str,
