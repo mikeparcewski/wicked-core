@@ -38,6 +38,7 @@ use wicked_apps_core::HardenedCommand;
 
 mod dead_seat_reprobe;
 mod dispatch_probe;
+mod fold_reads;
 pub(crate) mod gate_actions;
 mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
@@ -223,14 +224,13 @@ fn repo_code_graph_db(store: &dyn GraphStore, repo_ref: Option<&str>) -> Option<
     Some(path.to_string_lossy().into_owned())
 }
 
-thread_local! {
-    /// Project-graph refusals already reported on this actor thread. A refused binding is
-    /// re-evaluated on EVERY unit dispatch, so without this an operator whose graph was never
-    /// built reads the same paragraph once a step. Keyed on the whole message, so a binding that
-    /// later fails for a DIFFERENT reason still gets its own line.
-    static GRAPH_BIND_WARNED: std::cell::RefCell<HashSet<String>> =
-        std::cell::RefCell::new(HashSet::new());
-}
+/// Project-graph refusals already reported. A refused binding is re-evaluated on EVERY unit
+/// dispatch, so without this an operator whose graph was never built reads the same paragraph once
+/// a step. Keyed on the whole message, so a binding that later fails for a DIFFERENT reason still
+/// gets its own line. (core#1418) Process-wide, not per thread: the vouch now runs on the dispatch
+/// probe's thread, a new one each dispatch.
+static GRAPH_BIND_WARNED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
 
 /// How many distinct refusal messages the dedup set remembers before it starts over.
 ///
@@ -264,15 +264,13 @@ fn warn_bind_refused(run_id: &str, db: &str, why: &str) {
          governed workers fall back to the run repo's OWN graph, or to no estate tools at all if \
          that repo has never been indexed."
     );
-    GRAPH_BIND_WARNED.with(|w| {
-        let mut seen = w.borrow_mut();
-        if seen.len() >= GRAPH_BIND_WARN_CAP {
-            seen.clear();
-        }
-        if seen.insert(msg.clone()) {
-            eprintln!("{msg}");
-        }
-    });
+    let mut seen = GRAPH_BIND_WARNED.lock().unwrap_or_else(|p| p.into_inner());
+    if seen.len() >= GRAPH_BIND_WARN_CAP {
+        seen.clear();
+    }
+    if seen.insert(msg.clone()) {
+        eprintln!("{msg}");
+    }
 }
 
 /// Resolve `p` to a comparable absolute path: canonical when it exists, lexically absolute when it
@@ -2586,10 +2584,31 @@ pub(crate) fn run(
                 output,
                 agent_verdict,
                 evidence,
-                process_gen: _, // stale-result guard — consumed by bus consumer; ignored here
-                launch_seq: _,
+                // Stale-result guards: consumed by the bus consumer; carried here only so a result
+                // handed to the fold reads below comes back whole.
+                process_gen: step_gen,
+                launch_seq,
                 ack,
             } => {
+                // (core#1418) A result whose fold would run the unit's pinned validator (up to
+                // 120 s) or a creator floor's diff on the actor: those run on a thread first,
+                // bound to the inputs the fold would use, and the result comes back with them in
+                // its evidence (once: a result that carries them is folded as it is).
+                if let Some(reads) = fold_reads::plan(&store, &output, &evidence) {
+                    fold_reads::start(
+                        &self_tx,
+                        reads,
+                        fold_reads::Posted {
+                            output,
+                            agent_verdict,
+                            evidence,
+                            process_gen: step_gen,
+                            launch_seq,
+                            ack,
+                        },
+                    );
+                    continue;
+                }
                 let run_id = output.run_id.clone();
                 // core#1653: finish every carry in the same scope and order as the throttle.
                 for (ord, attempt, chunk) in finish_run_carries(&mut live_redact, &run_id) {
@@ -12914,6 +12933,16 @@ fn dispatch_probe_job(
     // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
     let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
+    // (core#1418) A governed, project-bound run's dispatch vouches for the project graph (it opens
+    // the graph and reads its file list): it rides the probe when the dispatch takes one (every
+    // agent unit's first attempt does, for its baseline). It starts none of its own: a probe
+    // snapshots the worktree, which costs far more than the vouch.
+    let project_graph = in_process_governance()
+        .and(session.project_graph.clone())
+        .map(|binding| dispatch_probe::ProjectGraphJob {
+            binding,
+            operational_db: GOV_DB_PATH.with(|c| c.borrow().clone()),
+        });
     let checkout_indexing =
         crate::code_graph::checkout_index_in_flight(std::path::Path::new(&repo.code_graph_db));
     if !(checkout_indexing
@@ -12938,6 +12967,7 @@ fn dispatch_probe_job(
         state_home: crate::code_graph::bound_state_home(),
         score_qe,
         requirements,
+        project_graph,
     })
 }
 
@@ -13928,11 +13958,20 @@ fn dispatch_unit_with(
             // repo's own — see `run_code_graph_db`. The operational store path comes from the
             // actor's thread-local so the FINDING-067 guard has something to compare against; this
             // closure runs on the actor thread, where it is always armed.
-            code_graph_db: run_code_graph_db(
-                store,
-                &session,
-                GOV_DB_PATH.with(|c| c.borrow().clone()).as_deref(),
-            ),
+            // (core#1418) The vouch opens the project graph and reads its file list: the dispatch
+            // probe read it off the actor, for this binding and operational store, when it ran;
+            // otherwise (no probe: a repo-less run, a retry) it is read here.
+            code_graph_db: {
+                let operational = GOV_DB_PATH.with(|c| c.borrow().clone());
+                match probe.as_ref().and_then(|p| {
+                    p.project_graph_for(session.project_graph.as_ref(), operational.as_deref())
+                }) {
+                    Some(vouched) => {
+                        vouched.or_else(|| repo_code_graph_db(store, session.repo_ref.as_deref()))
+                    }
+                    None => run_code_graph_db(store, &session, operational.as_deref()),
+                }
+            },
             // From the SESSION, so a resume/redrive re-arms exactly the boundary the launch
             // declared and validated (core#259; the read mirror is core#294) — plus THIS unit's
             // notes root (core#464): an engine-derived, per-unit widening under the temp dir, so
@@ -14599,6 +14638,8 @@ fn dispatch_unit_with(
                     worktree_clean: tool_worktree_clean,
                     tree_after_failure: None,
                     phase_scope: None,
+                    pinned_validator: None,
+                    creator_paths: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
