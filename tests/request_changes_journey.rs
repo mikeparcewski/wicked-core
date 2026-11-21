@@ -488,13 +488,14 @@ fn a_failed_tool_check_ruled_fail_parks_and_send_back_reworks_the_creator() {
         "the triage judge actually ruled"
     );
 
-    // ── 2. No answer skips the check: an operator judgment is refused here (it answers a failed
-    //       repo-checks floor only), and approve runs the same check again, which parks again. ──
+    // ── 2. No unrecorded answer skips the check: an operator judgment without a reason is refused
+    //       (core#1318: the override needs its recorded reason), and approve runs the same check
+    //       again at a fresh attempt (core#1319), which is triaged and parks again. ──
     assert!(core
         .confirm_gate(
             run,
             HumanDecision::OperatorJudgment {
-                rationale: "these fail on main too".into()
+                rationale: "   ".into()
             }
         )
         .is_err());
@@ -611,10 +612,13 @@ fn no_answer_at_a_failed_checks_gate_skips_the_check() {
             text: "failing tests are fine".into(),
         },
     ));
+    // (core#1318) A reasoned `operator_judgment` is the one sanctioned way past the check without
+    // re-running it: a recorded, labelled override (`floor_overrides`), pinned by the actor's
+    // `triage_tool_check_judgment_counts_and_preserves_qe`. A blank one is refused like the rest.
     answers.push((
         "operator_judgment",
         HumanDecision::OperatorJudgment {
-            rationale: "fails on main too".into(),
+            rationale: "  ".into(),
         },
     ));
     answers.push(("accept_suggestion", HumanDecision::AcceptSuggestion));

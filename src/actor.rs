@@ -30,6 +30,7 @@ use crate::acp_runner::{ElicitationMaps, KillHandle, WriteReg};
 use crate::command::Command;
 use crate::domain::{put_node, AgentSession, SessionStatus};
 use crate::event::CoreEvent;
+use crate::event_log::EventSink;
 use crate::terminal::{self, PtyMap};
 use crate::workflow::{PriorUnitOutput, StepInput, StepRunner};
 use crate::{pipeline, resolve_scope, EntityMode, LaunchSpec};
@@ -1125,6 +1126,11 @@ pub(crate) fn run(
         }
         Err(e) => eprintln!("wicked-core: could not pin repo graph keys (core#1419): {e:#}"),
     }
+    if let Ok(sessions) = crate::domain::all_sessions(&store) {
+        for session in &sessions {
+            lease_mapping_graph(&store, session);
+        }
+    }
     let boot_repos = crate::repo::list_repos(&store);
     // One-time repo-graph migration (core#406, `code_graph.rs` ADR): a registered repo whose graph
     // sits under the pre-#406 estate home (`~/.wicked-estate/repo-graphs/<key>`) and nowhere under
@@ -1825,7 +1831,9 @@ pub(crate) fn run(
                         archive_note: None,
                         verified_tree: None,
                         run_branch: None,
-                        base_commit: None,
+                        base_commit: crate::domain::get_session(&store, &run_id)?
+                            .filter(|s| s.repo_ref == repo_ref)
+                            .and_then(|s| s.base_commit),
                         finished_at: None,
                         // The launch bench (`distribute::launch_benched`): seats that cannot keep a
                         // per-call check on the host floor (C5), and codex on a worktree-bound run
@@ -1915,6 +1923,13 @@ pub(crate) fn run(
                             .and_then(|(_, preset)| preset.as_deref())
                             .or_else(|| selected_def.as_ref().map(|d| d.id.as_str()))
                             == Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID);
+                        // Reserve on the actor before any later launch can start its D8.
+                        if graph_required {
+                            if let Some(db) = crate::code_graph::resolved_code_graph_db(&graph_key)
+                            {
+                                crate::code_graph::lease_graph(&db, &rid, None);
+                            }
+                        }
                         // (core#1373) The tree is minted on its own thread: it carries this
                         // daemon's id all the same.
                         let daemon_owner = crate::repo::bound_daemon_owner();
@@ -1944,6 +1959,8 @@ pub(crate) fn run(
                                             &wt,
                                             &b.commit,
                                             graph_root.as_deref(),
+                                            &rid,
+                                            graph_required,
                                         );
                                         if let Err(e) = &indexed {
                                             tracing::warn!(
@@ -1952,6 +1969,16 @@ pub(crate) fn run(
                                                  a behavioural scope fails closed",
                                                 b.commit
                                             );
+                                        }
+                                        if !graph_required {
+                                            if let Ok(crate::code_graph::BaseIndex::Held(held)) =
+                                                &indexed
+                                            {
+                                                tracing::warn!(
+                                                    run_id = %rid, ?held,
+                                                    "repo graph held away from the run base; scoring fails closed"
+                                                );
+                                            }
                                         }
                                         if let Some(why) = crate::code_graph::base_index_refusal(
                                             graph_required,
@@ -1962,6 +1989,7 @@ pub(crate) fn run(
                                             // here, before the run is failed, so a relaunch of
                                             // the same id never races its removal.
                                             crate::repo::discard_minted_worktree(&root, &rid);
+                                            crate::code_graph::release_graph_lease(&rid);
                                             let _ = tx.send(Command::WorktreeFailed {
                                                 run_id: rid,
                                                 error: why,
@@ -1978,11 +2006,14 @@ pub(crate) fn run(
                                         base_commit,
                                     }
                                 }
-                                Err(e) => Command::WorktreeFailed {
-                                    run_id: rid,
-                                    error: e.to_string(),
-                                    cleaned: false,
-                                },
+                                Err(e) => {
+                                    crate::code_graph::release_graph_lease(&rid);
+                                    Command::WorktreeFailed {
+                                        run_id: rid,
+                                        error: e.to_string(),
+                                        cleaned: false,
+                                    }
+                                }
                             };
                             let _ = tx.send(cmd);
                         });
@@ -2121,6 +2152,7 @@ pub(crate) fn run(
                         // Store read failure: cannot determine terminal state safely.
                         // Clean up the worktree and emit an error so the UI learns about it.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref path) = workdir {
                             let _ = std::fs::remove_dir_all(path);
                         }
@@ -2134,6 +2166,7 @@ pub(crate) fn run(
                 };
                 if already_terminal {
                     in_flight.remove(&run_id);
+                    crate::code_graph::release_graph_lease(&run_id);
                     // Spawn cleanup off the actor thread — git worktree remove can be slow
                     // and must not stall NAPI calls waiting on the actor.
                     if let Some(ref ref_id) = repo_ref {
@@ -2169,6 +2202,7 @@ pub(crate) fn run(
                         // Store write failure — cannot persist workdir; fail the session rather
                         // than proceeding with an inconsistent store state.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref ref_id) = repo_ref {
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                                 let root = repo.root_path.clone();
@@ -2207,6 +2241,9 @@ pub(crate) fn run(
                     base_commit.as_deref(),
                     true,
                 );
+                if let Ok(Some(session)) = crate::domain::get_session(&store, &run_id) {
+                    lease_mapping_graph(&store, &session);
+                }
                 let (team_workflow, team_registry) = match team {
                     Ok(Some((_, id, reg))) => (Ok(Some(id)), Some(reg)),
                     Ok(None) => (Ok(spec.workflow.clone()), None),
@@ -2338,6 +2375,7 @@ pub(crate) fn run(
                 error,
                 cleaned,
             } => {
+                crate::code_graph::release_graph_lease(&run_id);
                 // The off-thread worktree creation failed. Mark the session Failed and surface
                 // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
                 // Guard: only update if the session is not already in a terminal state (e.g.
@@ -2688,21 +2726,6 @@ pub(crate) fn run(
                 expect,
                 reply,
             } => {
-                // (program DES-POWER-MODE) A gate a person answered on a power run counts for
-                // the run's planned-vs-actual record ("did the operator only answer deliver?").
-                if !matches!(
-                    actor.as_deref(),
-                    Some(crate::power::HANDOFF_ACTOR | crate::power::BENCH_REPROBE_ACTOR)
-                ) {
-                    if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
-                        if s.status == SessionStatus::AwaitingHuman {
-                            if let Some(p) = s.power.as_mut() {
-                                p.operator_gates = p.operator_gates.saturating_add(1);
-                                let _ = put_node(&mut store, s.to_node());
-                            }
-                        }
-                    }
-                }
                 let res = confirm_gate_expecting(
                     &mut store,
                     &mut subscribers,
@@ -2711,13 +2734,57 @@ pub(crate) fn run(
                     &mut in_flight,
                     &run_id,
                     decision,
-                    actor,
+                    actor.clone(),
                     expect,
                     &lifecycle_maps,
                     &actor_maps,
                     process_gen,
                     is_acp,
                 );
+                // (core#1038) One command-boundary event covers every stale-answer exit,
+                // including plan gates. A refusal never increments operator accounting.
+                if let Err(error) = &res {
+                    let reason = error.to_string();
+                    if reason.starts_with("gate_changed:") {
+                        let ord = crate::interaction::list_interactions(
+                            &store,
+                            Some(&run_id),
+                            Some(crate::interaction::InteractionStatus::Open),
+                        )
+                        .ok()
+                        .and_then(|rows| rows.into_iter().find_map(|row| row.ord));
+                        emit(
+                            &mut subscribers,
+                            CoreEvent::GateAnswerRefused {
+                                session: run_id.clone(),
+                                ord,
+                                expected_ord: expect.and_then(|e| e.ord),
+                                expected_plan_rev: expect.and_then(|e| e.plan_rev),
+                                reason,
+                                by: actor
+                                    .as_deref()
+                                    .map(str::trim)
+                                    .filter(|a| !a.is_empty())
+                                    .unwrap_or("operator")
+                                    .to_string(),
+                            },
+                        );
+                    }
+                }
+                // (core#1038) Count only an accepted human answer on a power run.
+                if res.is_ok()
+                    && !matches!(
+                        actor.as_deref(),
+                        Some(crate::power::HANDOFF_ACTOR | crate::power::BENCH_REPROBE_ACTOR)
+                    )
+                {
+                    if let Ok(Some(mut s)) = crate::domain::get_session(&store, &run_id) {
+                        if let Some(p) = s.power.as_mut() {
+                            p.operator_gates = p.operator_gates.saturating_add(1);
+                            let _ = put_node(&mut store, s.to_node());
+                        }
+                    }
+                }
                 if res.is_ok() && team_gate::answer_in_flight(&store, &run_id) {
                     if let Some(old) = team_replies.insert(run_id, reply) {
                         let _ = old.send(Ok(SessionStatus::AwaitingHuman));
@@ -3396,6 +3463,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -3449,6 +3517,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -5170,13 +5239,15 @@ fn ballot_dispatcher(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     container_floor: bool,
+    parent_run_id: Option<&str>,
 ) -> (Arc<dyn Dispatcher + Send + Sync>, Option<&'static str>) {
     if !container_floor {
         return (dispatcher.clone(), Some(crate::decision::BALLOTS_IN_HOST));
     }
-    match dispatcher
-        .with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(runner.clone())))
-    {
+    match dispatcher.with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(
+        runner.clone(),
+        parent_run_id,
+    ))) {
         Some(carried) => (carried, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)),
         None => (dispatcher.clone(), None),
     }
@@ -7273,19 +7344,30 @@ fn apply_step_result(
             || crate::runtime_wait::is_floor_runtime_refusal(&output.output)
             // (core#1356) The runtime answers but could not make the seat's network (its address
             // pools ran out): the host's fault too, named as what it is.
-            || crate::runtime_wait::is_floor_network_refusal(&output.output))
+            || crate::runtime_wait::is_floor_network_refusal(&output.output)
+            || crate::runtime_wait::is_floor_repository_refusal(&output.output))
     {
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         let cli = unit
             .assigned_cli
             .clone()
             .unwrap_or_else(|| "claude".to_string());
+        let repository = crate::runtime_wait::is_floor_repository_refusal(&output.output);
         let network = crate::runtime_wait::is_floor_network_refusal(&output.output);
         let pools = network
             && output
                 .output
                 .contains(crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted.as_str());
-        let why = if network {
+        let why = if repository {
+            let cause = crate::runtime_wait::floor_network_cause(&output.output)
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            format!(
+                "Unit {ord} ({cli}) did not run: the repository is a partial clone whose recent \
+                 history was never fetched{cause} — the repository's state, not seat '{cli}''s \
+                 (the seat is not benched)"
+            )
+        } else if network {
             // The runtime's own error (the network's name and cause) rides after the kind's words.
             let cause = crate::runtime_wait::floor_network_cause(&output.output)
                 .map(|c| format!(" ({c})"))
@@ -7322,7 +7404,11 @@ fn apply_step_result(
         put_node(store, unit.to_node())?;
         persist_rejected_transcript(store, &session, unit, &output.output);
         if human_present {
-            let fix = if pools {
+            let fix = if repository {
+                "Fetch the missing objects in the repository (`git config --unset \
+                 remote.<name>.partialclonefilter`, then `git fetch --refetch <name>`), or clone \
+                 it again without --filter"
+            } else if pools {
                 "Free the runtime's address pools: list its networks (`docker network ls`) and \
                  remove the unused ones (`docker network rm <name>`)"
             } else if network {
@@ -7331,10 +7417,14 @@ fn apply_step_result(
                 "Start the container runtime (Rancher Desktop, Docker Desktop, `podman machine \
                  start`, `colima start`)"
             };
+            let shared = if repository {
+                "Every seat copies the same repository, so reassigning does not fix it."
+            } else {
+                "Every seat runs in the same runtime, so reassigning does not fix it."
+            };
             let prompt = format!(
                 "{why}. {fix}, then approve to retry on the same seat (optionally amend), or \
-                 reject to stop the run. Every seat runs in the same runtime, so reassigning does \
-                 not fix it."
+                 reject to stop the run. {shared}"
             );
             pause_for_human(
                 store,
@@ -7681,6 +7771,11 @@ fn apply_step_result(
         // below on EVERY `human_confirm` (it was only ever pinned for `None`): crew derives
         // `completed` + `delivery: stranded` and the post-hoc lift is the operator's explicit act.
         let deliver_strand = crate::deliver_lift::is_deliver_unit(unit);
+        // (core#1319) An answer at a triage gate re-dispatches at a fresh attempt for the record,
+        // not as an automatic retry: that attempt keeps a first try's automatic remedies (the
+        // self-heal and the triage judge), so a check that fails again parks at triage again.
+        let first_try = output.attempt == 0
+            || crate::interaction::redispatched_by_triage(&*store, &run_id, ord, output.attempt);
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
@@ -7701,7 +7796,7 @@ fn apply_step_result(
                 // The self-heal is automatic, so it is bounded: attempt 0 only.
                 let fixed = refusal
                     .fix
-                    .filter(|_| output.attempt == 0)
+                    .filter(|_| first_try)
                     .and_then(|f| effective_invocation.as_deref().and_then(|inv| f.apply(inv)));
                 emit(
                     subscribers,
@@ -7788,7 +7883,7 @@ fn apply_step_result(
             } else if human_present
                 && seat_refusal.is_none()
                 && !content_refused
-                && output.attempt > 0
+                && !first_try
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
                 // with no seat failover for a Tool, skipping this gate would end the run.
@@ -7885,7 +7980,7 @@ fn apply_step_result(
             } else if human_present
                 && seat_refusal.is_none()
                 && !content_refused
-                && output.attempt == 0
+                && first_try
                 && !pa_timed_out
             {
                 // UNRECOGNIZED failure → agent triage (the generalization of the signature
@@ -7957,6 +8052,7 @@ fn apply_step_result(
                             &eligible_registry_roster(&run_roster_keys, &benched_keys),
                             &*runner2,
                             &ctx,
+                            Some(&run_id2),
                         )
                     }));
                     let (decision, analysis) = match result {
@@ -9307,34 +9403,28 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     }
 }
 
-/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
-/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
-/// or `None`.
-fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
-    let rule_layer = |d: &crate::domain::UnitDenial| {
-        d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
-            || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
-    };
+/// The rule ids holding or denying `unit`, in denial order, or from its last rule-check rows
+/// when the layers behind the winning denial are unknown. `Some([])` is an unnamed rule hold:
+/// it still refuses Land because there are no individual rules the person can skip.
+fn open_rule_ids(unit: &crate::domain::WorkUnit) -> Option<Vec<String>> {
     let named: Vec<&crate::domain::UnitDenial> = unit
         .denial
         .iter()
         .chain(unit.denials_behind.iter().flatten())
-        .filter(|d| rule_layer(d))
+        .filter(|d| {
+            d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+                || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+        })
         .collect();
-    if !named.is_empty() {
-        let ids: Vec<&str> = named
+    let ids = if !named.is_empty() {
+        named
             .iter()
-            .flat_map(|d| d.rule_ids.iter().map(String::as_str))
-            .collect();
-        return Some(format!(
-            "broken, unchecked or disputed ({})",
-            ids.join(", ")
-        ));
-    }
-    if unit.denials_behind.is_none() {
+            .flat_map(|d| d.rule_ids.iter().cloned())
+            .collect::<Vec<_>>()
+    } else if unit.denials_behind.is_none() {
         let rc = unit.rule_check.as_ref()?;
         // (DES-RULE-CHECK-001 rev 2, Part B, Q6) A process rule's row is reported, never open.
-        let open: Vec<&str> = rc
+        let open: Vec<String> = rc
             .rows
             .iter()
             .filter(|r| {
@@ -9346,16 +9436,32 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                         | crate::rule_check::RuleStatus::Disputed
                 ) && !r.reported_only()
             })
-            .map(|r| r.rule_id.as_str())
+            .map(|r| r.rule_id.clone())
             .collect();
-        if !open.is_empty() {
-            return Some(format!(
-                "broken, unchecked or disputed ({})",
-                open.join(", ")
-            ));
+        if open.is_empty() {
+            return None;
         }
-    }
-    None
+        open
+    } else {
+        return None;
+    };
+    let mut seen = HashSet::new();
+    let ids = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    Some(ids)
+}
+
+/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
+/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
+/// or `None`.
+fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
+    let ids = open_rule_ids(unit)?;
+    Some(format!(
+        "broken, unchecked or disputed ({})",
+        ids.join(", ")
+    ))
 }
 
 /// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
@@ -10110,6 +10216,23 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
     format!("{base}{refused}")
 }
 
+// (core#1374) Disclose a judge hold while the rule layer is still in front of it.
+fn judge_hold_behind_rules(unit: &crate::domain::WorkUnit) -> String {
+    unit.denials_behind
+        .iter()
+        .flatten()
+        .find(|d| d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
+        .map(|d| {
+            format!(
+                ". Also held behind the rules: no eligible judge seat remained — {}. Answering \
+                 the rules does not clear it: the gate then asks for your judgment of the work \
+                 or a judge re-run (`rejudge`)",
+                reason_head(&d.reason)
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn denial_gate_prompt_body(
     unit: &crate::domain::WorkUnit,
     class: &str,
@@ -10317,8 +10440,9 @@ fn denial_gate_prompt_body(
             };
             format!(
                 "Unit {ord} BROKE steering rule(s): {}. {lead} changes to send it back for \
-                 rework, approve to run the step again, or reject to cancel the run{note}",
-                reason_head(reason)
+                 rework, approve to run the step again, or reject to cancel the run{note}{}",
+                reason_head(reason),
+                judge_hold_behind_rules(unit)
             )
         }
         // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
@@ -10327,10 +10451,11 @@ fn denial_gate_prompt_body(
              work was not rejected. Re-run the rule check on the same work (action `{}`; the step \
              does not run again), confirm a waiver or skip an unchecked rule with a written \
              reason (action `{}`: labelled on the run, the gate and the delivery), approve to run the step again, request changes to send it back for \
-             rework, or reject to cancel the run{note}",
+             rework, or reject to cancel the run{note}{}",
             reason_head(reason),
             crate::rule_check::RETRY_ACTION,
             crate::rule_check::SKIP_ACTION,
+            judge_hold_behind_rules(unit),
         ),
         "judge_unavailable" => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
@@ -10537,10 +10662,11 @@ fn seats_off_authors(unit: &crate::domain::WorkUnit) -> bool {
 }
 
 /// (crew#972) The seat a Review/Test agent unit should run on instead of its assigned one, when its
-/// assigned seat AUTHORED the work it checks ([`crate::pipeline::work_authors`]): the first run
-/// seat, unbenched and in roster order, that authored nothing AND has not already worker-failed
-/// this unit. `None` when the unit is not a Review/Test agent unit, is not on an author's seat, or
-/// no such seat is left (the gate's `same_seat_evaluator` denial then escalates).
+/// assigned seat shares identity with its authors ([`crate::pipeline::work_authors`]): an
+/// unbenched, admitted seat that authored nothing and has not already worker-failed this unit.
+/// (core#1540) Provider-sharing candidates come last for a key-author; a provider-only
+/// conflict moves only to a seat sharing neither key nor provider. Otherwise the unit stays for
+/// the gate.
 ///
 /// (core#933) The worker-failed exclusion is what keeps the failover ladder bounded: without it a
 /// failover onto an EARLIER author (a seat the ladder's own creator check did not see) was moved
@@ -10563,13 +10689,24 @@ fn distinct_evaluator_seat(
     }
     let seat = unit.assigned_cli.as_ref()?;
     let authors = crate::pipeline::work_authors(units, unit.ord);
-    if !authors.contains(seat) {
+    let providers = crate::pipeline::work_author_providers(units, unit.ord);
+    let shares = |k: &str| {
+        crate::observed_provider::shares_identity(k, None, &authors, &providers).is_some()
+    };
+    if !shares(seat) {
         return None;
     }
+    // (core#1540) A provider-only conflict moves only when another seat improves independence.
+    let key_author =
+        crate::observed_provider::shares_identity(seat, Some(&[]), &authors, &[]).is_some();
     // Only a seat whose skills admit the unit (the rule distribution used); with none, the unit
     // stays and the gate decides (codex r1 on #898).
-    eligible_roster_keys(session).into_iter().find(|k| {
-        !authors.contains(k)
+    let mut candidates = eligible_roster_keys(session);
+    candidates.sort_by_key(|k| shares(k));
+    candidates.into_iter().find(|k| {
+        crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_none()
+            && (key_author || !shares(k))
+            && k != seat
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
     })
@@ -10579,8 +10716,8 @@ fn distinct_evaluator_seat(
 /// it checks, on a run whose contract enforces a distinct evaluator, is REFUSED with the seats that
 /// could take it. Before this the reassign was accepted and `dispatch_unit` silently re-seated the
 /// unit elsewhere (only an `eprintln!` said so), so the operator's choice was overridden (run
-/// 872a964f: reassigned to codex, copilot dispatched). Any other target is honoured as given: the
-/// dispatch re-seat only ever moves a unit that sits on an author's seat.
+/// 872a964f: reassigned to codex, copilot dispatched). Any target the dispatch re-seat would keep
+/// is honoured as given.
 fn refuse_author_reassign(
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
@@ -10598,15 +10735,32 @@ fn refuse_author_reassign(
         return Ok(());
     }
     let authors = crate::pipeline::work_authors(units, unit.ord);
-    if !authors.iter().any(|a| a == cli) {
-        return Ok(());
-    }
-    let open: Vec<String> = eligible_roster_keys(session)
+    let providers = crate::pipeline::work_author_providers(units, unit.ord);
+    // (core#1540) The rule the dispatch re-seat applies ([`distinct_evaluator_seat`]), so a choice
+    // it would move is refused with the seats it would take instead (core#933): a seat key of the
+    // authors always; a seat last seen calling their provider only when an independent seat exists.
+    let key_author =
+        |k: &str| crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_some();
+    let shares = |k: &str| crate::observed_provider::shares_identity(k, None, &authors, &providers);
+    let admits = |k: &String| crate::distribute::seat_admits_unit(unit, k, None);
+    let independent: Vec<String> = eligible_roster_keys(session)
         .into_iter()
-        .filter(|k| !authors.contains(k) && crate::distribute::seat_admits_unit(unit, k, None))
+        .filter(|k| shares(k).is_none() && admits(k))
         .collect();
+    let Some(why) = shares(cli).filter(|_| key_author(cli) || !independent.is_empty()) else {
+        return Ok(());
+    };
+    let mut open: Vec<String> = if key_author(cli) {
+        eligible_roster_keys(session)
+            .into_iter()
+            .filter(|k| !key_author(k) && admits(k))
+            .collect()
+    } else {
+        independent
+    };
+    open.sort_by_key(|k| shares(k).is_some());
     anyhow::bail!(
-        "cannot reassign unit {} to '{cli}': that seat authored the work this review checks \
+        "cannot reassign unit {} to '{cli}': {why} \
          (authors: {}), and this run requires a distinct evaluator — {}",
         unit.ord,
         authors.join(", "),
@@ -10689,6 +10843,7 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
@@ -10705,6 +10860,7 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
         // A run that armed again since it ended keeps its tree (codex r2): its live edits
@@ -10713,6 +10869,30 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
         }
     });
+}
+
+/// Restore a mapping's lease from its durable preset and base, including a reused worktree.
+fn lease_mapping_graph(store: &dyn GraphRead, session: &AgentSession) {
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) || session.team_plan.as_ref().and_then(|p| p.preset.as_deref())
+        != Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
+    {
+        return;
+    }
+    if let Some(repo) = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .filter(|r| !r.code_graph_db.is_empty())
+    {
+        crate::code_graph::lease_graph(
+            std::path::Path::new(&repo.code_graph_db),
+            &session.id,
+            session.base_commit.as_deref(),
+        );
+    }
 }
 
 /// The run's registered repository, when it has one that still resolves.
@@ -10732,6 +10912,7 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
     let rid = session.id.clone();
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || remove_run_floor_cache(workdir.as_deref(), &rid, epoch));
 }
 
@@ -11633,6 +11814,12 @@ fn advance_or_pause_with(
         return Ok(Progress::Paused);
     }
 
+    // (core#1369) The checkout index's holder read must see this run before dispatch tests its
+    // marker: a parked run is persisted Executing first (Planning and Distributing already hold).
+    if session.status == SessionStatus::AwaitingHuman {
+        session.status = SessionStatus::Executing;
+        put_node(store, session.to_node())?;
+    }
     dispatch_unit(
         store,
         subscribers,
@@ -12459,7 +12646,10 @@ fn dispatch_probe_job(
     // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
     let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
-    if !(baseline
+    let checkout_indexing =
+        crate::code_graph::checkout_index_in_flight(std::path::Path::new(&repo.code_graph_db));
+    if !(checkout_indexing
+        || baseline
         || new_author.is_some()
         || qe_unit
         || editor
@@ -13565,11 +13755,13 @@ fn dispatch_unit_with(
                 let words =
                     rule_instructions_words(&session.problem, &session.intent_amendments, &units);
                 crate::cli_runner::DeliveryRuleCtx {
+                    run_id: run_id.to_string(),
                     db_path: g.db_path,
                     project: session.project_id.clone(),
                     repo: session.repo_ref.clone(),
                     creators: crate::pipeline::fallback_work_authors(&units, unit.ord),
                     creator_bins: crate::pipeline::work_author_binaries(&units, unit.ord),
+                    creator_providers: crate::pipeline::work_author_providers(&units, unit.ord),
                     exclude_seats: unit.exclude_seats.clone(),
                     pool,
                     registry,
@@ -16434,7 +16626,7 @@ fn phase_boundary_denied(
 /// (F19, operator Q1=B) The gate actions whose note is the person's instruction for the job:
 /// Retry with a note (`amend`), Send back (`request_changes`) and Land with a note (`land`). A QE
 /// skip, a floor fix or an operator judgment records its own decision, not a rule instruction.
-const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
+pub(crate) const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
 /// The most of one ruling, and of all of them, a rule judge is shown (its whole instructions are
 /// cut at 8 KiB, `rule_check::instructions_of`): the problem keeps at least 2 KiB.
 const RULING_SHOWN_MAX: usize = 2 * 1024;
@@ -17105,6 +17297,8 @@ fn start_send_back(
             1,
             prompt,
         );
+        // (core#1413) The lead's re-plan belongs to the held run.
+        unit.parent_run_id = Some(rid.clone());
         unit.assigned_cli = Some(lead);
         unit.assigned_invocation = Some(invocation);
         let input = StepInput {
@@ -17733,6 +17927,216 @@ pub(crate) fn confirm_gate_as(
     )
 }
 
+// (core#1313) Preserve backend overrides, including estate's defaulted methods: all
+// answer reads and writes must use the actor's one connection and its open batch.
+mod answer_tx {
+    use wicked_estate_core::*;
+
+    pub(super) struct AnswerTx<'a> {
+        inner: &'a mut dyn GraphStore,
+        open: bool,
+    }
+
+    impl<'a> AnswerTx<'a> {
+        pub(super) fn open(inner: &'a mut dyn GraphStore) -> Result<Self> {
+            inner.begin_batch()?;
+            Ok(Self { inner, open: true })
+        }
+
+        pub(super) fn finish(&mut self) -> Result<()> {
+            if self.open {
+                self.inner.commit_batch()?;
+                self.open = false;
+            }
+            Ok(())
+        }
+    }
+
+    impl Drop for AnswerTx<'_> {
+        fn drop(&mut self) {
+            // (core#1313) There is no rollback API: retain error-path write parity without
+            // leaving a transaction open on the actor's connection.
+            let _ = self.finish();
+        }
+    }
+
+    impl GraphRead for AnswerTx<'_> {
+        fn capabilities(&self) -> StoreCapabilities {
+            self.inner.capabilities()
+        }
+        fn get_node(&self, id: &SymbolId) -> Result<Option<Node>> {
+            self.inner.get_node(id)
+        }
+        fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+            self.inner.find_symbols(query)
+        }
+        fn count_symbols(&self, query: &SymbolQuery) -> Result<usize> {
+            self.inner.count_symbols(query)
+        }
+        fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+            self.inner.find_structural_symbols(query)
+        }
+        fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
+            self.inner.neighbors(id, dir)
+        }
+        fn traverse(&self, start: &SymbolId, spec: &TraversalSpec) -> Result<Subgraph> {
+            self.inner.traverse(start, spec)
+        }
+        fn traverse_multi(&self, starts: &[SymbolId], spec: &TraversalSpec) -> Result<Subgraph> {
+            self.inner.traverse_multi(starts, spec)
+        }
+        fn all_nodes(&self) -> Result<Vec<Node>> {
+            self.inner.all_nodes()
+        }
+        fn all_edges(&self) -> Result<Vec<Edge>> {
+            self.inner.all_edges()
+        }
+        fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
+            self.inner.unresolved_refs_for_name(name)
+        }
+        fn indexed_files(&self) -> Result<Vec<String>> {
+            self.inner.indexed_files()
+        }
+        fn file_digest(&self, file: &str) -> Result<Option<String>> {
+            self.inner.file_digest(file)
+        }
+        fn file_git_sha(&self, file: &str) -> Result<Option<String>> {
+            self.inner.file_git_sha(file)
+        }
+        fn repo_info(&self) -> Result<Option<RepoInfo>> {
+            self.inner.repo_info()
+        }
+        fn edge_history(&self, file: &str) -> Result<Vec<HistoricalEdge>> {
+            self.inner.edge_history(file)
+        }
+        fn file_content(&self, file: &str) -> Result<Option<String>> {
+            self.inner.file_content(file)
+        }
+        fn file_call_refs(&self, file: &str) -> Result<Option<String>> {
+            self.inner.file_call_refs(file)
+        }
+        fn symbol_source(&self, node: &Node) -> Result<Option<String>> {
+            self.inner.symbol_source(node)
+        }
+        fn changes_since(&self, cursor: u64) -> Result<Vec<Change>> {
+            self.inner.changes_since(cursor)
+        }
+        fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
+            self.inner.node_semantics(symbol)
+        }
+        fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
+            self.inner.find_by_requirement(requirement)
+        }
+        fn annotations(&self, symbol: &SymbolId) -> Result<Vec<Annotation>> {
+            self.inner.annotations(symbol)
+        }
+        fn annotations_by_type(&self, ty: &str) -> Result<Vec<(SymbolId, Annotation)>> {
+            self.inner.annotations_by_type(ty)
+        }
+        fn annotations_stale_since(&self, cutoff: i64) -> Result<Vec<(SymbolId, Annotation)>> {
+            self.inner.annotations_stale_since(cutoff)
+        }
+        fn symbol_epoch(&self, id: &SymbolId) -> Result<Option<u64>> {
+            self.inner.symbol_epoch(id)
+        }
+        fn edge_supports(
+            &self,
+            source: &SymbolId,
+            target: &SymbolId,
+            kind: &EdgeKind,
+        ) -> Result<Vec<EdgeSupport>> {
+            self.inner.edge_supports(source, target, kind)
+        }
+        fn support_generation(&self, owner: &SupportOwner) -> Result<Option<u64>> {
+            self.inner.support_generation(owner)
+        }
+        fn support_owners(&self) -> Result<Vec<SupportOwnerState>> {
+            self.inner.support_owners()
+        }
+        fn stats(&self) -> Result<GraphStats> {
+            self.inner.stats()
+        }
+    }
+
+    impl GraphWrite for AnswerTx<'_> {
+        fn begin_batch(&mut self) -> Result<()> {
+            if self.open {
+                Ok(())
+            } else {
+                self.inner.begin_batch()
+            }
+        }
+        fn commit_batch(&mut self) -> Result<()> {
+            if self.open {
+                Ok(())
+            } else {
+                self.inner.commit_batch()
+            }
+        }
+        fn upsert_nodes(&mut self, nodes: &[Node]) -> Result<()> {
+            self.inner.upsert_nodes(nodes)
+        }
+        fn upsert_edges(&mut self, edges: &[Edge]) -> Result<()> {
+            self.inner.upsert_edges(edges)
+        }
+        fn upsert_unresolved_refs(&mut self, refs: &[UnresolvedRef]) -> Result<()> {
+            self.inner.upsert_unresolved_refs(refs)
+        }
+        fn remove_file(&mut self, file: &str) -> Result<()> {
+            self.inner.remove_file(file)
+        }
+        fn set_file_digest(&mut self, file: &str, digest: &str) -> Result<()> {
+            self.inner.set_file_digest(file, digest)
+        }
+        fn set_repo_info(&mut self, info: &RepoInfo) -> Result<()> {
+            self.inner.set_repo_info(info)
+        }
+        fn set_file_content(&mut self, file: &str, text: &str) -> Result<()> {
+            self.inner.set_file_content(file, text)
+        }
+        fn set_file_call_refs(&mut self, file: &str, refs_json: &str) -> Result<()> {
+            self.inner.set_file_call_refs(file, refs_json)
+        }
+        fn prune_dangling_edges(&mut self) -> Result<usize> {
+            self.inner.prune_dangling_edges()
+        }
+        fn log_change(&mut self, op: ChangeOp, target: &str) -> Result<()> {
+            self.inner.log_change(op, target)
+        }
+        fn set_node_semantics(
+            &mut self,
+            symbol: &SymbolId,
+            description: Option<&str>,
+            requirement: Option<&str>,
+            validation: Option<&wicked_estate_core::ValidationClaim>,
+        ) -> Result<()> {
+            self.inner
+                .set_node_semantics(symbol, description, requirement, validation)
+        }
+        fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
+            self.inner.annotate(symbol, annotation)
+        }
+        fn delete_annotations(
+            &mut self,
+            symbol: &SymbolId,
+            ty: Option<&str>,
+            key: &str,
+        ) -> Result<usize> {
+            self.inner.delete_annotations(symbol, ty, key)
+        }
+        fn replace_edge_supports(
+            &mut self,
+            owner: &SupportOwner,
+            generation: u64,
+            facts: &[SupportFact],
+        ) -> Result<SupportReplacement> {
+            self.inner.replace_edge_supports(owner, generation, facts)
+        }
+    }
+}
+
+use answer_tx::AnswerTx;
+
 /// (DES-CATALOG-002 §4.6) [`confirm_gate_as`] with what the answer EXPECTS the open gate to be
 /// ([`crate::workflow::GateExpect`]), compared here, inside the serialized decision path.
 #[allow(clippy::too_many_arguments)]
@@ -17938,6 +18342,16 @@ pub(crate) fn confirm_gate_expecting(
     .iter()
     .any(|r| r.gate_kind.as_deref() == Some(ESCALATION_GATE_KIND));
 
+    // (core#1319, core#1318) Triage leaves even a failed tool Distributed; remember
+    // the open row before resolution for its retry key and explicit operator judgment.
+    let triage_open = crate::interaction::list_interactions(
+        &*store,
+        Some(run_id),
+        Some(crate::interaction::InteractionStatus::Open),
+    )?
+    .iter()
+    .any(|r| r.gate_kind.as_deref() == Some("triage"));
+
     // (core#782) An approve WITH A NOTE at a read-only phase's floor gate is a FLOOR FIX: the
     // note goes to a seat that can write, then only the floor re-runs (`floor_fix_request`) —
     // never appended to the read-only phase, which could not act on it.
@@ -17946,7 +18360,8 @@ pub(crate) fn confirm_gate_expecting(
 
     // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
     // second read after it could refuse an answer whose row is already answered. (DES-RULE-CHECK-001
-    // S2) …and the rule skips a `skip_rules` answer lands with its re-check.
+    // S2) …and the rule skips a `skip_rules` answer lands with its re-check, or a noted Land
+    // records with the landing.
     let ArmedAnswer {
         rejudge: mut armed_rejudge,
         rule_skips: mut armed_rule_skips,
@@ -17964,104 +18379,117 @@ pub(crate) fn confirm_gate_expecting(
     // gate — `answered`, with the decision payload. This is what empties `/projects/:id/prompts`
     // the moment ANY skin answers. (The Reject arm still cancels below; the human DID answer.)
     // (DES-L1 PR-1B) The payload names the ARM (`action`) beside the legacy `approve` bool.
-    {
-        let answer = match &decision {
-            crate::workflow::HumanDecision::Approve { amend, amend_scope } => serde_json::json!({
-                "approve": true,
-                "action": if adjudication_open {
-                    "land_with_carried_items"
-                } else if floor_fix_route {
-                    "floor_fix"
-                } else {
-                    "approve"
-                },
-                "amend": amend,
-                "amend_scope": amend_scope.as_wire(),
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::RequestChanges { note } => serde_json::json!({
-                "approve": false, "action": "request_changes", "amend": note,
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::Reject => {
-                serde_json::json!({ "approve": false, "action": "reject", "amend": null })
-                    .to_string()
+    let answer = match &decision {
+        crate::workflow::HumanDecision::Approve { amend, amend_scope } => serde_json::json!({
+            "approve": true,
+            "action": if adjudication_open {
+                "land_with_carried_items"
+            } else if floor_fix_route {
+                "floor_fix"
+            } else {
+                "approve"
+            },
+            "amend": amend,
+            "amend_scope": amend_scope.as_wire(),
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::RequestChanges { note } => serde_json::json!({
+            "approve": false, "action": "request_changes", "amend": note,
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::Reject => {
+            serde_json::json!({ "approve": false, "action": "reject", "amend": null }).to_string()
+        }
+        crate::workflow::HumanDecision::EditPlan { plan, note } => serde_json::json!({
+            "approve": true, "action": "edit_plan", "amend": note, "plan": plan,
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::FloorRerun(mode) => serde_json::json!({
+            "approve": true, "action": mode.as_wire(), "amend": null,
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::AcceptSuggestion => serde_json::json!({
+            "approve": true, "action": "accept_suggestion", "amend": null,
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::Rejudge => serde_json::json!({
+            "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
+        })
+        .to_string(),
+        crate::workflow::HumanDecision::RetryQe => serde_json::json!({
+            "approve": true, "action": crate::workflow::RETRY_QE_ACTION, "amend": null,
+        })
+        .to_string(),
+        // (DES-RULE-CHECK-001 S2) The skips (id + reason) are the durable answer's record.
+        crate::workflow::HumanDecision::RecheckRules { skips } => serde_json::json!({
+            "approve": true,
+            "action": if skips.is_empty() {
+                crate::rule_check::RETRY_ACTION
+            } else {
+                crate::rule_check::SKIP_ACTION
+            },
+            "amend": (!skips.is_empty()).then(|| serde_json::json!(skips
+                .iter()
+                .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason }))
+                .collect::<Vec<_>>()).to_string()),
+        })
+        .to_string(),
+        // (operator ruling 2026-10-21) The rationale rides `amend`, so the durable prompt's
+        // answer carries WHY the floor was overridden.
+        crate::workflow::HumanDecision::OperatorJudgment { rationale } => serde_json::json!({
+            "approve": true,
+            "action": crate::workflow::OPERATOR_JUDGMENT_ACTION,
+            "amend": rationale,
+        })
+        .to_string(),
+        // (j4-gates) The reason rides `amend`, so the durable answer says WHY QE was skipped.
+        crate::workflow::HumanDecision::SkipQe { reason } => serde_json::json!({
+            "approve": true,
+            "action": crate::workflow::SKIP_QE_ACTION,
+            "amend": reason,
+        })
+        .to_string(),
+        // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
+        // WHAT was amended, not just that the gate was approved.
+        crate::workflow::HumanDecision::AmendIntent { text } => serde_json::json!({
+            "approve": true, "action": "amend_intent", "amend": text,
+        })
+        .to_string(),
+        // (core#820) The consent choice is the answer's action, so the durable record says
+        // WHICH write set was approved.
+        crate::workflow::HumanDecision::ConsentChoice { choice } => serde_json::json!({
+            "approve": true, "action": choice, "amend": null,
+        })
+        .to_string(),
+    };
+    // (core#1313) Domain helpers batch independently. Suppress those inner boundaries
+    // until the row and the state this answer arms are durable together.
+    let mut answer_store = AnswerTx::open(store)?;
+    let store = &mut answer_store;
+    let mut answer_events = EventSink::default();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    answer_events.push(event_tx);
+    let finish_answer =
+        |store: &mut AnswerTx<'_>, subscribers: &mut EventSink| -> anyhow::Result<()> {
+            store.finish()?;
+            for event in event_rx.try_iter() {
+                emit(subscribers, event);
             }
-            crate::workflow::HumanDecision::EditPlan { plan, note } => serde_json::json!({
-                "approve": true, "action": "edit_plan", "amend": note, "plan": plan,
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::FloorRerun(mode) => serde_json::json!({
-                "approve": true, "action": mode.as_wire(), "amend": null,
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::AcceptSuggestion => serde_json::json!({
-                "approve": true, "action": "accept_suggestion", "amend": null,
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::Rejudge => serde_json::json!({
-                "approve": true, "action": crate::workflow::REJUDGE_ACTION, "amend": null,
-            })
-            .to_string(),
-            crate::workflow::HumanDecision::RetryQe => serde_json::json!({
-                "approve": true, "action": crate::workflow::RETRY_QE_ACTION, "amend": null,
-            })
-            .to_string(),
-            // (DES-RULE-CHECK-001 S2) The skips (id + reason) are the durable answer's record.
-            crate::workflow::HumanDecision::RecheckRules { skips } => serde_json::json!({
-                "approve": true,
-                "action": if skips.is_empty() {
-                    crate::rule_check::RETRY_ACTION
-                } else {
-                    crate::rule_check::SKIP_ACTION
-                },
-                "amend": (!skips.is_empty()).then(|| serde_json::json!(skips
-                    .iter()
-                    .map(|(id, reason)| serde_json::json!({ "id": id, "reason": reason }))
-                    .collect::<Vec<_>>()).to_string()),
-            })
-            .to_string(),
-            // (operator ruling 2026-10-21) The rationale rides `amend`, so the durable prompt's
-            // answer carries WHY the floor was overridden.
-            crate::workflow::HumanDecision::OperatorJudgment { rationale } => serde_json::json!({
-                "approve": true,
-                "action": crate::workflow::OPERATOR_JUDGMENT_ACTION,
-                "amend": rationale,
-            })
-            .to_string(),
-            // (j4-gates) The reason rides `amend`, so the durable answer says WHY QE was skipped.
-            crate::workflow::HumanDecision::SkipQe { reason } => serde_json::json!({
-                "approve": true,
-                "action": crate::workflow::SKIP_QE_ACTION,
-                "amend": reason,
-            })
-            .to_string(),
-            // (core#555) The amendment text rides `amend` so the durable prompt's answer carries
-            // WHAT was amended, not just that the gate was approved.
-            crate::workflow::HumanDecision::AmendIntent { text } => serde_json::json!({
-                "approve": true, "action": "amend_intent", "amend": text,
-            })
-            .to_string(),
-            // (core#820) The consent choice is the answer's action, so the durable record says
-            // WHICH write set was approved.
-            crate::workflow::HumanDecision::ConsentChoice { choice } => serde_json::json!({
-                "approve": true, "action": choice, "amend": null,
-            })
-            .to_string(),
+            Ok(())
         };
-        crate::interaction::resolve_open_for_session(
-            store,
-            run_id,
-            crate::interaction::InteractionStatus::Answered,
-            Some(answer),
-            crate::interaction::now_millis(),
-        )?;
-    }
+    crate::interaction::resolve_open_for_session(
+        store,
+        run_id,
+        crate::interaction::InteractionStatus::Answered,
+        Some(answer),
+        crate::interaction::now_millis(),
+    )?;
 
     // (DES-TEAMING-002 P1) A `team_transport` pause: approve retries the missing fact through the
     // gate's `gate.decided`, continue-without-team and reject tombstone the run first — every
     // answer is acknowledged by the publisher before the run moves (the reply waits for it).
     if team_gate::transport_gate_open(&session) {
+        finish_answer(store, subscribers)?;
         let mut cx = team_gate::Ctx {
             store,
             subscribers,
@@ -18080,6 +18508,7 @@ pub(crate) fn confirm_gate_expecting(
     // gate's `gate.decided{by:"human"}` (required) first; approve then counts the unit and
     // advances — never a re-dispatch, never an attempt bump — amend reworks, reject cancels.
     if team_gate::dispute_gate_open(&session) {
+        finish_answer(store, subscribers)?;
         if !matches!(decision, crate::workflow::HumanDecision::Reject)
             && phase_boundary_denied(store, &session, run_id)?
         {
@@ -18147,6 +18576,7 @@ pub(crate) fn confirm_gate_expecting(
                 units.get(session.unit_ix),
                 &rationale,
                 adjudication_open,
+                triage_open,
                 run_id,
             )?;
             record_deliver_floor_override(
@@ -18171,7 +18601,7 @@ pub(crate) fn confirm_gate_expecting(
         crate::workflow::HumanDecision::SkipQe { reason } => {
             match answer_skip_qe(
                 store,
-                subscribers,
+                &mut answer_events,
                 self_tx,
                 &mut session,
                 run_id,
@@ -18184,6 +18614,7 @@ pub(crate) fn confirm_gate_expecting(
                     amend_scope: crate::workflow::AmendScope::Cursor,
                 },
                 SkipQePlan::UnitCounts => {
+                    finish_answer(store, subscribers)?;
                     return judge_by_operator(
                         store,
                         subscribers,
@@ -18202,6 +18633,7 @@ pub(crate) fn confirm_gate_expecting(
                     );
                 }
                 SkipQePlan::ReopenFloor => {
+                    finish_answer(store, subscribers)?;
                     in_flight.remove(run_id);
                     return Ok(SessionStatus::AwaitingHuman);
                 }
@@ -18216,8 +18648,10 @@ pub(crate) fn confirm_gate_expecting(
             units.get(session.unit_ix),
             rationale,
             adjudication_open,
+            triage_open,
             run_id,
         )?;
+        finish_answer(store, subscribers)?;
         return judge_by_operator(
             store,
             subscribers,
@@ -18237,6 +18671,7 @@ pub(crate) fn confirm_gate_expecting(
     }
     if judge_unavailable_gate && !adjudication_open && !team_unit {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
+            finish_answer(store, subscribers)?;
             return judge_by_operator(
                 store,
                 subscribers,
@@ -18258,6 +18693,7 @@ pub(crate) fn confirm_gate_expecting(
 
     if adjudication_open {
         if let crate::workflow::HumanDecision::Approve { amend, .. } = &decision {
+            finish_answer(store, subscribers)?;
             return land_with_carried_items(
                 store,
                 subscribers,
@@ -18267,6 +18703,7 @@ pub(crate) fn confirm_gate_expecting(
                 session,
                 run_id,
                 amend.clone(),
+                armed_rule_skips,
                 lifecycle_maps,
                 actor_maps,
                 process_gen,
@@ -18297,6 +18734,7 @@ pub(crate) fn confirm_gate_expecting(
         Option<Option<String>>,
     ) = match decision {
         crate::workflow::HumanDecision::Reject => {
+            finish_answer(store, subscribers)?;
             let s = cancel_run(store, subscribers, runner, self_tx, run_id, lifecycle_maps)?;
             in_flight.remove(run_id);
             return Ok(s);
@@ -18309,6 +18747,9 @@ pub(crate) fn confirm_gate_expecting(
         }
         crate::workflow::HumanDecision::Approve { amend, amend_scope } => {
             operator_retry = true;
+            qe_redo = crate::domain::session_units(store, run_id)?
+                .get(session.unit_ix)
+                .is_some_and(|u| approve_redoes_qe(&session, u));
             (amend, amend_scope, None)
         }
         crate::workflow::HumanDecision::RequestChanges { note } => {
@@ -18371,6 +18812,7 @@ pub(crate) fn confirm_gate_expecting(
             // Layer-3: governance deny-dominates at the phase boundary (crew#32 / DES-EXEC-001 §3).
             // Runs BEFORE any approval-side mutations so a Deny cancels cleanly (no partial state committed).
             if phase_boundary_denied(store, &session, run_id)? {
+                finish_answer(store, subscribers)?;
                 // Deny-dominates: Approve cannot override a policy veto (ADR-0003). Remove from
                 // in_flight only after cancel_run so a write failure leaves the map consistent.
                 let result =
@@ -18384,6 +18826,7 @@ pub(crate) fn confirm_gate_expecting(
             // (core#467) ACCEPT SUGGESTION: the evaluator's pinned edit is applied to the worktree
             // first; the creator's rework then owns it (and its floor judges the tree).
             if let Some(note) = rework {
+                finish_answer(store, subscribers)?;
                 let (note, scope) = if adopt_suggestion {
                     let units = crate::domain::session_units(store, run_id)?;
                     let cursor = units
@@ -18450,7 +18893,7 @@ pub(crate) fn confirm_gate_expecting(
                 put_node(store, cursor.to_node())?;
                 if let Some(f) = fix {
                     emit(
-                        subscribers,
+                        &mut answer_events,
                         CoreEvent::UnitReworkAmended {
                             session: run_id.to_string(),
                             ord: cursor.ord,
@@ -18475,10 +18918,21 @@ pub(crate) fn confirm_gate_expecting(
                         let from_attempt = request.attempt;
                         let seats = request.seats.clone();
                         cursor.requested_rejudge = Some(request);
+                        let skips = armed_rule_skips
+                            .iter()
+                            .cloned()
+                            .map(|s| crate::event::RerunSkip {
+                                rule_id: s.rule_id,
+                                reason: s.reason,
+                                by: s.by,
+                                evidence_key: s.evidence_key,
+                                instruction: s.instruction,
+                            })
+                            .collect();
                         cursor.rule_skips.append(&mut armed_rule_skips);
                         put_node(store, cursor.to_node())?;
                         emit(
-                            subscribers,
+                            &mut answer_events,
                             CoreEvent::JudgeRerunRequested {
                                 session: run_id.to_string(),
                                 ord,
@@ -18486,6 +18940,7 @@ pub(crate) fn confirm_gate_expecting(
                                 attempt: session.attempt.saturating_add(1),
                                 from_attempt,
                                 seats,
+                                skips,
                                 previous_reason,
                                 by: actor
                                     .as_deref()
@@ -18568,7 +19023,14 @@ pub(crate) fn confirm_gate_expecting(
                         );
                     };
                     if let Some(u) = units.get_mut(target_ix) {
-                        amend_unit(store, subscribers, run_id, u, &a, amend_scope.as_wire())?;
+                        amend_unit(
+                            store,
+                            &mut answer_events,
+                            run_id,
+                            u,
+                            &a,
+                            amend_scope.as_wire(),
+                        )?;
                     }
                 }
             }
@@ -18594,6 +19056,44 @@ pub(crate) fn confirm_gate_expecting(
                     }
                 }
             }
+            // (core#555) Record the amendment on the RUN so the run record — and the run page —
+            // can show what was withdrawn beside the original intent, with when.
+            let amended = match intent_amendment
+                .as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                // IDEMPOTENT ON THE TEXT, the run record included (codex review on #675): the
+                // skin pre-fills every gate from the durable note, so the same amendment can be
+                // offered twice. The units are deduped above; without this the run would claim
+                // two approved amendments and emit two `intentAmended` events for one decision.
+                .filter(|t| !session.intent_amendments.iter().any(|a| a.text == *t))
+            {
+                None => None,
+                Some(text) => Some(crate::domain::IntentAmendment {
+                    text: text.to_string(),
+                    ord: crate::domain::session_units(store, run_id)?
+                        .get(session.unit_ix)
+                        .map(|u| u.ord)
+                        .unwrap_or(0),
+                    at: crate::interaction::now_millis(),
+                }),
+            };
+            if let Some(a) = amended {
+                session.intent_amendments.push(a.clone());
+                put_node(store, session.to_node())?;
+                // (core#1313) The run's amendment and its units commit together; publish it
+                // even if the revision hook immediately opens another gate.
+                emit(
+                    &mut answer_events,
+                    CoreEvent::IntentAmended {
+                        session: run_id.to_string(),
+                        ord: a.ord,
+                        amendment: a.text,
+                        at: a.at,
+                    },
+                );
+            }
+            finish_answer(store, subscribers)?;
             // (DES-ASK-TEAM-CHAT-001 §3, ASK-K2a) THE revision hook (DES-TEAMING-002 §8.7 "every
             // advance goes through here"), reached from the gate too: a plan edit held while the
             // run waited at this gate — `Core::propose_plan` → `team_plan.edits`, or the PA's own
@@ -18660,50 +19160,17 @@ pub(crate) fn confirm_gate_expecting(
                     )
                 })
                 .unwrap_or(false);
-            if cursor_ran {
+            // (core#1319) A triage retry already dispatched, even while still Distributed.
+            if cursor_ran || triage_open {
                 s.attempt = s.attempt.saturating_add(1);
-            }
-            // (core#555) Record the amendment on the RUN so the run record — and the run page —
-            // can show what was withdrawn beside the original intent, with when.
-            let amended = match intent_amendment
-                .as_deref()
-                .map(str::trim)
-                .filter(|t| !t.is_empty())
-                // IDEMPOTENT ON THE TEXT, the run record included (codex review on #675): the
-                // skin pre-fills every gate from the durable note, so the same amendment can be
-                // offered twice. The units are deduped above; without this the run would claim
-                // two approved amendments and emit two `intentAmended` events for one decision.
-                .filter(|t| !s.intent_amendments.iter().any(|a| a.text == *t))
-            {
-                None => None,
-                Some(text) => Some(crate::domain::IntentAmendment {
-                    text: text.to_string(),
-                    ord: crate::domain::session_units(store, run_id)?
-                        .get(s.unit_ix)
-                        .map(|u| u.ord)
-                        .unwrap_or(0),
-                    at: crate::interaction::now_millis(),
-                }),
-            };
-            if let Some(a) = amended.clone() {
-                s.intent_amendments.push(a);
             }
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
-            // (core#555, EVT) IntentAmended — the amendment's audit record, emitted after the
-            // units and the session are durable and BEFORE `Resumed`, so no subscriber sees the
-            // run move before the text that changed its acceptance list.
-            if let Some(a) = amended {
-                emit(
-                    subscribers,
-                    CoreEvent::IntentAmended {
-                        session: run_id.to_string(),
-                        ord: a.ord,
-                        amendment: a.text,
-                        at: a.at,
-                    },
-                );
+            // (core#1319) The fresh attempt is the record's; the failure it may meet is triaged
+            // as before (a check that still fails parks at triage again, with its send-back).
+            if triage_open && !cursor_ran {
+                crate::interaction::mark_triage_redispatch(store, run_id, ord, s.attempt)?;
             }
             // F-036: a human APPROVING a gate on an ALREADY-RUN guarded unit (a `HumanConfirmIf`
             // escalation — e.g. the guard denied the evaluator for rewriting the fix) has seen the
@@ -19120,6 +19587,82 @@ fn rejudge_request(
     })
 }
 
+/// Build one person's validated skip, shared by a rule re-check and a noted Land.
+fn rule_skip(
+    cursor: &crate::domain::WorkUnit,
+    id: &str,
+    reason: &str,
+    by: Option<&str>,
+    at: i64,
+    rulings_rev: &str,
+) -> anyhow::Result<crate::rule_check::RuleSkip> {
+    let rows = cursor
+        .rule_check
+        .as_ref()
+        .map(|r| r.rows.as_slice())
+        .unwrap_or_default();
+    let by = by
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator");
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
+    if reason.trim().is_empty() {
+        anyhow::bail!("skip of rule `{id}` needs a written reason");
+    }
+    // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
+    // may waive with a reason; a broken error/critical rule is reworked.
+    let Some(row) = rows.iter().find(|r| {
+        r.rule_id == id
+            && (matches!(
+                r.status,
+                crate::rule_check::RuleStatus::Unchecked
+                    | crate::rule_check::RuleStatus::Waived
+                    | crate::rule_check::RuleStatus::Disputed
+            ) || (r.status == crate::rule_check::RuleStatus::Broken
+                && r.waivable == Some(true)))
+    }) else {
+        anyhow::bail!(
+            "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
+             of unit {} — only a rule no judge or council ruled on, or a broken rule of \
+             severity warn or info, can be skipped (a broken error or critical rule denies the \
+             gate)",
+            cursor.ord
+        );
+    };
+    let Some(evidence_key) = row.evidence_key.clone() else {
+        anyhow::bail!(
+            "rule `{id}` has no evidence key on unit {}; retry the rule check",
+            cursor.ord
+        );
+    };
+    Ok(crate::rule_check::RuleSkip {
+        rule_id: id.to_string(),
+        reason: reason.trim().to_string(),
+        by: by.to_string(),
+        at,
+        rule_key: row.rule_key.clone(),
+        evidence_key,
+        seat_attempt: Some(attempt),
+        instruction: (row.status == crate::rule_check::RuleStatus::Waived)
+            .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+        // (core#1493) The carry key of the check it answered, so the run's later steps carry
+        // it on the same evidence…
+        carry_key: cursor
+            .rule_check
+            .as_ref()
+            .and_then(|r| r.carry_keys.get(id))
+            .cloned(),
+        ord: Some(cursor.ord),
+        // …while the person's words stay at this revision.
+        rulings_rev: Some(rulings_rev.to_string()),
+    })
+}
+
 /// (DES-RULE-CHECK-001 S2) The rule re-check to arm on `run_id`'s cursor unit, with the skips it
 /// lands: refused (the gate stays open) unless the cursor unit is held `rules_unchecked`, and
 /// unless every skip names one of its UNCHECKED rules with a non-empty reason. Carries the
@@ -19174,79 +19717,21 @@ fn rules_recheck_request(
             cursor.ord
         );
     }
-    let rows = cursor
-        .rule_check
-        .as_ref()
-        .map(|r| r.rows.as_slice())
-        .unwrap_or_default();
-    let by = by
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .unwrap_or("operator")
-        .to_string();
     let at = crate::interaction::now_millis();
     let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
-    let mut landed = Vec::new();
-    for (id, reason) in skips {
-        if reason.trim().is_empty() {
-            anyhow::bail!("skip of rule `{id}` needs a written reason");
-        }
-        // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
-        // may waive with a reason; a broken error/critical rule is reworked.
-        let Some(row) = rows.iter().find(|r| {
-            &r.rule_id == id
-                && (matches!(
-                    r.status,
-                    crate::rule_check::RuleStatus::Unchecked
-                        | crate::rule_check::RuleStatus::Waived
-                        | crate::rule_check::RuleStatus::Disputed
-                ) || (r.status == crate::rule_check::RuleStatus::Broken
-                    && r.waivable == Some(true)))
-        }) else {
-            anyhow::bail!(
-                "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
-                 of unit {} — only a rule no judge or council ruled on, or a broken rule of \
-                 severity warn or info, can be skipped (a broken error or critical rule denies the \
-                 gate)",
-                cursor.ord
-            );
-        };
-        let Some(evidence_key) = row.evidence_key.clone() else {
-            anyhow::bail!(
-                "rule `{id}` has no evidence key on unit {}; retry the rule check",
-                cursor.ord
-            );
-        };
-        landed.push(crate::rule_check::RuleSkip {
-            rule_id: id.clone(),
-            reason: reason.trim().to_string(),
-            by: by.clone(),
-            at,
-            rule_key: row.rule_key.clone(),
-            evidence_key,
-            instruction: (row.status == crate::rule_check::RuleStatus::Waived)
-                .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
-            // (core#1493) The carry key of the check it answered, so the run's later steps carry
-            // it on the same evidence…
-            carry_key: cursor
-                .rule_check
-                .as_ref()
-                .and_then(|r| r.carry_keys.get(id))
-                .cloned(),
-            ord: Some(cursor.ord),
-            // …while the person's words stay at this revision.
-            rulings_rev: Some(rulings_rev.clone()),
-        });
-    }
-    let output = crate::domain::get_unit_transcript(store, &cursor.id)
-        .and_then(|t| t.output)
-        .unwrap_or_default();
     let attempt = cursor
         .requested_rejudge
         .as_ref()
         .filter(|b| b.consumed)
         .map(|b| b.attempt)
         .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
+    let landed = skips
+        .iter()
+        .map(|(id, reason)| rule_skip(cursor, id, reason, by, at, &rulings_rev))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let output = crate::domain::get_unit_transcript(store, &cursor.id)
+        .and_then(|t| t.output)
+        .unwrap_or_default();
     Ok((
         crate::domain::RequestedRejudge {
             output,
@@ -19505,6 +19990,17 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (core#1313) Refuse before the row resolves; the plain retry does not promise
+    // an eligible reviewer now (only retry_qe makes that stronger promise).
+    if matches!(decision, crate::workflow::HumanDecision::Approve { .. }) {
+        if let Some(cursor) = cursor.filter(|u| approve_redoes_qe(session, u)) {
+            if let Err(why) = crate::qe_acceptance::review::redo_offer(cursor) {
+                anyhow::bail!(
+                    "{why} — skip QE acceptance with a reason, request changes, or reject"
+                );
+            }
+        }
+    }
     // (DES-APPS-001 §9.2, K0) An Apps turn lands only on a passing review by a distinct seat:
     // the capped review's "land with carried items" would land it over the reviewer's FAIL.
     // Refused here, so the adjudication gate stays open for request changes or reject.
@@ -19545,8 +20041,8 @@ pub(crate) fn refuse_before_resolving(
     // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
     // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
     // that counts it — is refused while a steering rule of that unit is broken or unchecked,
-    // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
-    // or skipped with its reason (`retry_rules` / `skip_rules`).
+    // whichever layer named the gate. (core#1683) A noted Land can skip every open rule that
+    // `skip_rules` would take, recording the same reason on each without another review round.
     let counts_unit = match &decision {
         crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
         crate::workflow::HumanDecision::OperatorJudgment { .. }
@@ -19554,14 +20050,43 @@ pub(crate) fn refuse_before_resolving(
         _ => false,
     };
     if counts_unit {
-        if let Some(open) = cursor.and_then(rule_layers_open) {
-            anyhow::bail!(
-                "unit {cursor_ord} has steering rules {open}; this answer would count it — \
-                 request changes to rework it, re-check the rules (`{}`), skip an unchecked \
-                 rule with a reason (`{}`), or reject",
-                crate::rule_check::RETRY_ACTION,
-                crate::rule_check::SKIP_ACTION
-            );
+        if let Some((cursor, open)) = cursor.and_then(|u| rule_layers_open(u).map(|o| (u, o))) {
+            let skips = match decision {
+                crate::workflow::HumanDecision::Approve { amend: Some(a), .. }
+                    if adjudication_open && !a.trim().is_empty() =>
+                {
+                    let at = crate::interaction::now_millis();
+                    let rev =
+                        rulings_revision(&session.problem, &session.intent_amendments, &units);
+                    open_rule_ids(cursor)
+                        .filter(|ids| !ids.is_empty())
+                        .and_then(|ids| {
+                            ids.iter()
+                                .map(|id| rule_skip(cursor, id, a, actor, at, &rev))
+                                .collect::<anyhow::Result<Vec<_>>>()
+                                .ok()
+                        })
+                }
+                _ => None,
+            };
+            if let Some(skips) = skips {
+                armed.rule_skips = skips;
+            } else {
+                let land_hint = if adjudication_open
+                    && matches!(decision, crate::workflow::HumanDecision::Approve { .. })
+                {
+                    "; Land with your reason skips the open rules when all can be skipped"
+                } else {
+                    ""
+                };
+                anyhow::bail!(
+                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                     rule with a reason (`{}`), or reject{land_hint}",
+                    crate::rule_check::RETRY_ACTION,
+                    crate::rule_check::SKIP_ACTION
+                );
+            }
         }
     }
     match &decision {
@@ -19652,7 +20177,21 @@ pub(crate) fn refuse_before_resolving(
         // floor: refused HERE, before the row resolves, unless it applies — the gate stays
         // open and re-answerable otherwise.
         crate::workflow::HumanDecision::OperatorJudgment { rationale } => {
-            floor_override_for(session, cursor, rationale, adjudication_open, run_id)?;
+            let triage_open = crate::interaction::list_interactions(
+                store,
+                Some(run_id),
+                Some(crate::interaction::InteractionStatus::Open),
+            )?
+            .iter()
+            .any(|r| r.gate_kind.as_deref() == Some("triage"));
+            floor_override_for(
+                session,
+                cursor,
+                rationale,
+                adjudication_open,
+                triage_open,
+                run_id,
+            )?;
         }
         // (j4-gates) A QE skip: refused HERE, before the row resolves, unless it applies.
         crate::workflow::HumanDecision::SkipQe { reason } => {
@@ -19692,10 +20231,21 @@ pub(crate) fn refuse_before_resolving(
     Ok(armed)
 }
 
+/// (core#1313) An ordinary approve that re-runs the run's QE unit spends the same
+/// per-tree redo budget as retry_qe; judging the work itself spends no retry.
+fn approve_redoes_qe(session: &AgentSession, cursor: &crate::domain::WorkUnit) -> bool {
+    cursor.status == crate::domain::UnitStatus::Rejected
+        && cursor.member_step.is_none()
+        && crate::qe_acceptance::review::non_verdict(cursor).is_some()
+        && crate::qe_acceptance::review::applies(cursor)
+        && !approve_is_operator_judgment(session, cursor)
+}
+
 /// (operator ruling 2026-10-11) Whether the operator's plain approve at `u`'s gate IS the judgment:
 /// the unit was denied because no judge could rule (`judge_unavailable`), or no QE reviewer could
 /// judge its evidence. (DES-APPS-001 §9.3, K0) Never the QE layer of an Apps publish: there the
 /// operator standing in for the QE reviewer would be a QE skip, so the approve is a retry.
+/// A stored veto behind that hold also requires a retry: the seat must re-ask every layer.
 pub(crate) fn approve_is_operator_judgment(
     session: &crate::domain::AgentSession,
     u: &crate::domain::WorkUnit,
@@ -19707,6 +20257,12 @@ pub(crate) fn approve_is_operator_judgment(
         && u.denial.as_ref().is_some_and(|d| {
             d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
                 || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+        })
+        && u.denials_behind.as_deref().is_none_or(|behind| {
+            behind.iter().all(|d| {
+                pipeline::judge_absent_behind_floor(d)
+                    || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+            })
         })
 }
 
@@ -20000,11 +20556,14 @@ struct FloorOverrideGrant {
 /// no-verdict hold ([`pipeline::judge_absent_behind_floor`]), which the same judgment then answers as the
 /// judge (the grant's `judge_absent`). The override answers the floor, and that judge hold, only:
 /// deny-dominates holds for every other layer.
+/// (core#1318) Also answers a triage gate of a failed Test-stage tool check, with an
+/// unkeyed `tool_check` grant; delivery cannot reuse it and QE acceptance is untouched.
 fn floor_override_for(
     session: &crate::domain::AgentSession,
     cursor: Option<&crate::domain::WorkUnit>,
     rationale: &str,
     adjudication_open: bool,
+    triage_open: bool,
     run_id: &str,
 ) -> anyhow::Result<FloorOverrideGrant> {
     let action = crate::workflow::OPERATOR_JUDGMENT_ACTION;
@@ -20027,6 +20586,34 @@ fn floor_override_for(
         );
     }
     let u = cursor.ok_or_else(|| anyhow::anyhow!("run {run_id} has no unit at its cursor"))?;
+    // (core#1318) Triage is the failed check's gate. This existing override record
+    // counts the check, but has no tree/key that delivery could stand on later.
+    if triage_open
+        && session.status == SessionStatus::AwaitingHuman
+        && u.status != crate::domain::UnitStatus::Done
+        && u.tool_cmd.is_some()
+        && u.stage == crate::domain::StageKind::Test
+        && !crate::deliver_lift::is_deliver_unit(u)
+        && u.member_step.is_none()
+    {
+        let layer = crate::assurance::TOOL_CHECK_LAYER;
+        let attempt = session.attempt;
+        return Ok(FloorOverrideGrant {
+            floor: crate::assurance::FloorOverride {
+                layer: layer.to_string(),
+                result_id: format!("{run_id}:unit-{}:attempt-{attempt}:{layer}", u.ord),
+                ord: u.ord,
+                attempt,
+                tree: None,
+                label: crate::assurance::TOOL_CHECK_OVERRIDE_LABEL.to_string(),
+                key: None,
+                carried_from: None,
+                failing: None,
+                fingerprint: None,
+            },
+            judge_absent: Vec::new(),
+        });
+    }
     let source = u.denial.as_ref().map(|d| d.source.as_str());
     let paused_on_unit = session.status == SessionStatus::AwaitingHuman
         && u.status == crate::domain::UnitStatus::Rejected;
@@ -20283,6 +20870,11 @@ fn judge_by_operator(
         floor_override,
         judge_stand_in: None,
     };
+    let floor_label = judgment
+        .floor_override
+        .as_ref()
+        .map(|f| f.label.clone())
+        .unwrap_or_else(|| crate::assurance::FLOOR_OVERRIDE_LABEL.to_string());
     let mut receipt = u.assurance.clone().unwrap_or_else(|| {
         crate::assurance::AssuranceReceipt::for_run(&session.assurance, attempt)
     });
@@ -20301,11 +20893,11 @@ fn judge_by_operator(
     let floor_label = if judge_stand_in.is_some() {
         format!(
             "{}; {}",
-            crate::assurance::FLOOR_OVERRIDE_LABEL,
+            floor_label,
             crate::assurance::JUDGE_STAND_IN_LABEL
         )
     } else {
-        crate::assurance::FLOOR_OVERRIDE_LABEL.to_string()
+        floor_label
     };
     u.operator_rulings.push(crate::domain::OperatorRuling {
         action: if overrides_floor {
@@ -20432,10 +21024,7 @@ fn judge_by_operator(
     s.status = SessionStatus::Executing;
     crate::domain::put_nodes(store, &[u.to_node(), s.to_node()])?;
     if overrides_floor {
-        eprintln!(
-            "wicked-core: unit {ord} of run {run_id}: {floor_label} (`{by}`) at its floor_failed \
-             gate"
-        );
+        eprintln!("wicked-core: unit {ord} of run {run_id}: {floor_label} (`{by}`) at its gate");
     } else {
         eprintln!(
             "wicked-core: unit {ord} of run {run_id} judged by operator `{by}` at its \
@@ -20522,6 +21111,7 @@ fn land_with_carried_items(
     session: crate::domain::AgentSession,
     run_id: &str,
     amend: Option<String>,
+    rule_skips: Vec<crate::rule_check::RuleSkip>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -20543,6 +21133,7 @@ fn land_with_carried_items(
     let attempt = u.last_attempt.unwrap_or(0);
     let verdict = u.denial_reason.clone().unwrap_or_default();
     u.carried_items = crate::review_context::carried_items(&verdict);
+    u.rule_skips.extend(rule_skips);
     if let Some(r) = u.review_rounds.iter_mut().find(|r| r.attempt == attempt) {
         r.outcome = Some(crate::review_context::REVIEW_LANDED.to_string());
     }
@@ -27318,6 +27909,23 @@ mod request_changes_tests {
     }
 
     #[test]
+    fn approve_is_not_operator_judgment_with_a_standing_governance_veto() {
+        let run_id = format!("op-judge-standing-veto-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let mut unit = crate::domain::session_units(&store, &run_id).unwrap()[3].clone();
+        assert!(approve_is_operator_judgment(&session, &unit));
+        unit.denials_behind = Some(vec![UnitDenial::new("input_governance", "policy denied")]);
+        assert!(
+            !approve_is_operator_judgment(&session, &unit),
+            "plain approve must retry every layer when governance still vetoes"
+        );
+    }
+
+    #[test]
     fn approve_at_judge_unavailable_is_the_operators_judgment_and_the_run_proceeds_labelled() {
         let run_id = format!("op-judge-{}", std::process::id());
         let mut store = open_store(Some(":memory:")).unwrap();
@@ -29492,6 +30100,7 @@ mod request_changes_tests {
             }
             _ => unreachable!(),
         }
+        assert_eq!(evs[at].to_json()["skips"], serde_json::json!([]));
         let resumed = evs
             .iter()
             .position(|e| matches!(e, CoreEvent::Resumed { .. }))
@@ -29746,6 +30355,78 @@ mod request_changes_tests {
     }
 
     #[test]
+    fn rule_hold_prompt_discloses_a_judge_hold_behind_it() {
+        let mut unit = WorkUnit::pending("u", "s", 1, "review");
+        for class in ["rules_unchecked", CLASS_RULE_BROKEN] {
+            unit.denial = Some(UnitDenial::new(class, "R1 needs a call"));
+            unit.denials_behind = Some(Vec::new());
+            let prompt = denial_gate_prompt_body(&unit, class, "R1 needs a call", None, "");
+            assert!(!prompt.contains("no eligible judge seat remained"));
+            unit.denials_behind = Some(vec![UnitDenial::new(
+                "judge_unavailable",
+                "only the creator is signed in\nfull details",
+            )]);
+            let prompt = denial_gate_prompt_body(&unit, class, "R1 needs a call", None, "");
+            assert!(
+                prompt.contains("no eligible judge seat remained"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("only the creator is signed in"), "{prompt}");
+            assert!(
+                prompt.contains("Answering the rules does not clear it"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("(`rejudge`)"), "{prompt}");
+            assert!(!prompt.contains("full details"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn rules_recheck_event_names_the_skips_and_the_reviewed_seat_attempt() {
+        let run_id = "rules-recheck-skips";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, run_id);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::RecheckRules {
+                skips: vec![("R1".into(), "the fixture is binary".into())],
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let events = drain(&erx);
+        let event = events
+            .iter()
+            .find(|e| matches!(e, CoreEvent::JudgeRerunRequested { .. }))
+            .unwrap()
+            .to_json();
+        assert_eq!(event["skips"][0]["ruleId"], "R1");
+        assert_eq!(event["skips"][0]["reason"], "the fixture is binary");
+        assert_eq!(event["skips"][0]["by"], "coordinator-agent");
+        assert_eq!(event["skips"][0]["evidenceKey"], "ek-R1");
+        assert!(event["skips"][0]["instruction"].is_null());
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let unit = &units[2];
+        assert_eq!(unit.rule_skips[0].seat_attempt, Some(2));
+        assert_eq!(unit.requested_rejudge.as_ref().unwrap().attempt, 2);
+    }
+
+    #[test]
     fn both_rejudge_arming_paths_preserve_the_reviewed_team_record() {
         for rules in [false, true] {
             let run_id = format!("rejudge-team-{rules}");
@@ -29939,6 +30620,144 @@ mod request_changes_tests {
                 );
             }
         }
+    }
+
+    fn seed_adjudication_rule(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        status: crate::rule_check::RuleStatus,
+    ) {
+        fold_verify_after_send_backs(store, subs, run_id, 2, THIRD_FAIL);
+        assert_eq!(
+            open_gate_kind(store, run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                rule_id: "R1".into(),
+                status,
+                how: crate::rule_check::RuleHow::Judge,
+                reason: "environment blocked the check".into(),
+                rule_key: "k".into(),
+                evidence_key: Some("ek-R1".into()),
+                origin: Some(crate::rule_check::RuleOrigin::Judge),
+                waivable: None,
+                ..Default::default()
+            }],
+            carry_keys: [("R1".to_string(), "ck".to_string())].into(),
+            ..Default::default()
+        };
+        units[3].denials_behind = Some(vec![report.hold().or_else(|| report.denial()).unwrap()]);
+        units[3].rule_check = Some(report);
+        put_node(store, units[3].to_node()).unwrap();
+    }
+
+    fn assert_noted_land_skips_adjudication_rule(status: crate::rule_check::RuleStatus) {
+        let run_id = format!("adj-skip-{status:?}-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(&mut store, &mut subs, &run_id, status);
+        for amend in [None, Some("  ".into())] {
+            let err = gate(
+                &mut store,
+                &mut subs,
+                &run_id,
+                HumanDecision::Approve {
+                    amend,
+                    amend_scope: AmendScope::Cursor,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("steering rules") && err.contains("R1"),
+                "{err}"
+            );
+            assert_eq!(
+                open_gate_kind(&store, &run_id).as_deref(),
+                Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            assert!(units[3].rule_skips.is_empty());
+        }
+        let out = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("  env block, carried  ".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .expect("a noted Land skips the held rule without another review");
+        assert_eq!(out, SessionStatus::Completed);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let unit = &units[3];
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(unit.rule_skips.len(), 1);
+        let skip = &unit.rule_skips[0];
+        assert_eq!(skip.rule_id, "R1");
+        assert_eq!(skip.reason, "env block, carried");
+        assert_eq!(skip.by, "operator");
+        assert_eq!(skip.rule_key, "k");
+        assert_eq!(skip.evidence_key, "ek-R1");
+        assert_eq!(skip.seat_attempt, unit.last_attempt);
+        assert_eq!(skip.carry_key.as_deref(), Some("ck"));
+        assert_eq!(skip.ord, Some(unit.ord));
+        assert!(skip.rulings_rev.is_some());
+        assert!(skip.instruction.is_none());
+        assert!(
+            unit.requested_rejudge.is_none(),
+            "Land does not arm a re-check"
+        );
+    }
+
+    #[test]
+    fn a_noted_land_skips_a_disputed_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Disputed);
+    }
+
+    #[test]
+    fn a_noted_land_skips_an_unchecked_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Unchecked);
+    }
+
+    #[test]
+    fn a_noted_land_refuses_a_broken_error_rule_at_adjudication() {
+        let run_id = format!("adj-broken-error-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(
+            &mut store,
+            &mut subs,
+            &run_id,
+            crate::rule_check::RuleStatus::Broken,
+        );
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("env block, carried".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steering rules") && err.contains("R1"),
+            "{err}"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Rejected);
+        assert!(units[3].rule_skips.is_empty());
+        assert!(units[3].operator_rulings.is_empty());
+        assert_eq!(
+            open_gate_kind(&store, &run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
     }
 
     /// (DES-RULE-CHECK-001 rev 2 Part B, operator Q2) Rule against rule: the person's confirm of the
@@ -31064,6 +31883,614 @@ mod request_changes_tests {
         }
     }
 
+    mod answer_commit_store {
+        use wicked_estate_core::*;
+
+        pub(super) struct CommitStore<'a> {
+            pub inner: &'a mut dyn GraphStore,
+            pub run_id: &'a str,
+            pub commits: Vec<(bool, usize, bool)>,
+        }
+
+        impl GraphRead for CommitStore<'_> {
+            fn capabilities(&self) -> StoreCapabilities {
+                self.inner.capabilities()
+            }
+            fn get_node(&self, id: &SymbolId) -> Result<Option<Node>> {
+                self.inner.get_node(id)
+            }
+            fn find_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                self.inner.find_symbols(query)
+            }
+            fn count_symbols(&self, query: &SymbolQuery) -> Result<usize> {
+                self.inner.count_symbols(query)
+            }
+            fn find_structural_symbols(&self, query: &SymbolQuery) -> Result<Vec<Node>> {
+                self.inner.find_structural_symbols(query)
+            }
+            fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
+                self.inner.neighbors(id, dir)
+            }
+            fn traverse(&self, start: &SymbolId, spec: &TraversalSpec) -> Result<Subgraph> {
+                self.inner.traverse(start, spec)
+            }
+            fn traverse_multi(
+                &self,
+                starts: &[SymbolId],
+                spec: &TraversalSpec,
+            ) -> Result<Subgraph> {
+                self.inner.traverse_multi(starts, spec)
+            }
+            fn all_nodes(&self) -> Result<Vec<Node>> {
+                self.inner.all_nodes()
+            }
+            fn all_edges(&self) -> Result<Vec<Edge>> {
+                self.inner.all_edges()
+            }
+            fn unresolved_refs_for_name(&self, name: &str) -> Result<Vec<UnresolvedRef>> {
+                self.inner.unresolved_refs_for_name(name)
+            }
+            fn indexed_files(&self) -> Result<Vec<String>> {
+                self.inner.indexed_files()
+            }
+            fn file_digest(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_digest(file)
+            }
+            fn file_git_sha(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_git_sha(file)
+            }
+            fn repo_info(&self) -> Result<Option<RepoInfo>> {
+                self.inner.repo_info()
+            }
+            fn edge_history(&self, file: &str) -> Result<Vec<HistoricalEdge>> {
+                self.inner.edge_history(file)
+            }
+            fn file_content(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_content(file)
+            }
+            fn file_call_refs(&self, file: &str) -> Result<Option<String>> {
+                self.inner.file_call_refs(file)
+            }
+            fn symbol_source(&self, node: &Node) -> Result<Option<String>> {
+                self.inner.symbol_source(node)
+            }
+            fn changes_since(&self, cursor: u64) -> Result<Vec<Change>> {
+                self.inner.changes_since(cursor)
+            }
+            fn node_semantics(&self, symbol: &SymbolId) -> Result<Option<NodeSemantics>> {
+                self.inner.node_semantics(symbol)
+            }
+            fn find_by_requirement(&self, requirement: &str) -> Result<Vec<Node>> {
+                self.inner.find_by_requirement(requirement)
+            }
+            fn annotations(&self, symbol: &SymbolId) -> Result<Vec<Annotation>> {
+                self.inner.annotations(symbol)
+            }
+            fn annotations_by_type(&self, ty: &str) -> Result<Vec<(SymbolId, Annotation)>> {
+                self.inner.annotations_by_type(ty)
+            }
+            fn annotations_stale_since(&self, cutoff: i64) -> Result<Vec<(SymbolId, Annotation)>> {
+                self.inner.annotations_stale_since(cutoff)
+            }
+            fn symbol_epoch(&self, id: &SymbolId) -> Result<Option<u64>> {
+                self.inner.symbol_epoch(id)
+            }
+            fn edge_supports(
+                &self,
+                source: &SymbolId,
+                target: &SymbolId,
+                kind: &EdgeKind,
+            ) -> Result<Vec<EdgeSupport>> {
+                self.inner.edge_supports(source, target, kind)
+            }
+            fn support_generation(&self, owner: &SupportOwner) -> Result<Option<u64>> {
+                self.inner.support_generation(owner)
+            }
+            fn support_owners(&self) -> Result<Vec<SupportOwnerState>> {
+                self.inner.support_owners()
+            }
+            fn stats(&self) -> Result<GraphStats> {
+                self.inner.stats()
+            }
+        }
+
+        impl GraphWrite for CommitStore<'_> {
+            fn begin_batch(&mut self) -> Result<()> {
+                self.inner.begin_batch()
+            }
+            fn commit_batch(&mut self) -> Result<()> {
+                self.inner.commit_batch()?;
+                let rows = crate::interaction::list_interactions(
+                    self.inner,
+                    Some(self.run_id),
+                    Some(crate::interaction::InteractionStatus::Answered),
+                )
+                .unwrap();
+                let units = crate::domain::session_units(self.inner, self.run_id).unwrap();
+                self.commits.push((
+                    !rows.is_empty(),
+                    units[3].qe_redos.len(),
+                    units[3].qe_review.is_none(),
+                ));
+                Ok(())
+            }
+            fn upsert_nodes(&mut self, nodes: &[Node]) -> Result<()> {
+                self.inner.upsert_nodes(nodes)
+            }
+            fn upsert_edges(&mut self, edges: &[Edge]) -> Result<()> {
+                self.inner.upsert_edges(edges)
+            }
+            fn upsert_unresolved_refs(&mut self, refs: &[UnresolvedRef]) -> Result<()> {
+                self.inner.upsert_unresolved_refs(refs)
+            }
+            fn remove_file(&mut self, file: &str) -> Result<()> {
+                self.inner.remove_file(file)
+            }
+            fn set_file_digest(&mut self, file: &str, digest: &str) -> Result<()> {
+                self.inner.set_file_digest(file, digest)
+            }
+            fn set_repo_info(&mut self, info: &RepoInfo) -> Result<()> {
+                self.inner.set_repo_info(info)
+            }
+            fn set_file_content(&mut self, file: &str, text: &str) -> Result<()> {
+                self.inner.set_file_content(file, text)
+            }
+            fn set_file_call_refs(&mut self, file: &str, refs_json: &str) -> Result<()> {
+                self.inner.set_file_call_refs(file, refs_json)
+            }
+            fn prune_dangling_edges(&mut self) -> Result<usize> {
+                self.inner.prune_dangling_edges()
+            }
+            fn log_change(&mut self, op: ChangeOp, target: &str) -> Result<()> {
+                self.inner.log_change(op, target)
+            }
+            fn set_node_semantics(
+                &mut self,
+                symbol: &SymbolId,
+                description: Option<&str>,
+                requirement: Option<&str>,
+                validation: Option<&wicked_estate_core::ValidationClaim>,
+            ) -> Result<()> {
+                self.inner
+                    .set_node_semantics(symbol, description, requirement, validation)
+            }
+            fn annotate(&mut self, symbol: &SymbolId, annotation: Annotation) -> Result<()> {
+                self.inner.annotate(symbol, annotation)
+            }
+            fn delete_annotations(
+                &mut self,
+                symbol: &SymbolId,
+                ty: Option<&str>,
+                key: &str,
+            ) -> Result<usize> {
+                self.inner.delete_annotations(symbol, ty, key)
+            }
+            fn replace_edge_supports(
+                &mut self,
+                owner: &SupportOwner,
+                generation: u64,
+                facts: &[SupportFact],
+            ) -> Result<SupportReplacement> {
+                self.inner.replace_edge_supports(owner, generation, facts)
+            }
+        }
+    }
+
+    /// (core#1313) The first answer commit contains the row AND its redo state; nested
+    /// domain batches must not expose an answered row before the redo is reserved.
+    #[test]
+    fn retry_qe_commits_the_answer_and_redo_together() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "answer-one-commit";
+        seed_judge_unavailable_verify(&mut store, run_id);
+        require_qe(&mut store, run_id);
+        park_qe_gate(
+            &mut store,
+            run_id,
+            qe_inconclusive(),
+            qe_record(
+                crate::qe_acceptance::review::OUTCOME_INCONCLUSIVE,
+                Some("FAIL"),
+            ),
+            true,
+        );
+        qe_on_codex(&mut store, run_id);
+        let mut counted = answer_commit_store::CommitStore {
+            inner: &mut store,
+            run_id,
+            commits: Vec::new(),
+        };
+        answer(&mut counted, run_id, HumanDecision::RetryQe)
+            .0
+            .unwrap();
+        assert_eq!(counted.commits.first(), Some(&(true, 1, true)));
+    }
+
+    fn park_invalid_qe_gate(store: &mut dyn GraphStore, run_id: &str) {
+        let record = qe_record(crate::qe_acceptance::review::OUTCOME_INVALID, None);
+        let denial = crate::qe_acceptance::review::denial(&record).unwrap();
+        park_qe_gate(store, run_id, denial, record, false);
+    }
+
+    /// (core#1313) An approve that re-runs QE reserves the same per-tree budget, even
+    /// without an eligible isolated reviewer; explicit retry_qe still checks candidates.
+    #[test]
+    fn plain_approve_reserves_one_qe_redo() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "approve-qe-redo";
+        seed_judge_unavailable_verify(&mut store, run_id);
+        require_qe(&mut store, run_id);
+        park_invalid_qe_gate(&mut store, run_id);
+        answer(
+            &mut store,
+            run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+        )
+        .0
+        .unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        assert_eq!(units[3].qe_redos.len(), 1);
+        assert!(units[3].qe_review.is_none());
+        park_invalid_qe_gate(&mut store, run_id);
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        assert_eq!(crate::qe_acceptance::review::redo_offer(&units[3]), Ok(0));
+    }
+
+    /// (core#1313) The cap applies before resolving the row, including an approve with a note.
+    #[test]
+    fn plain_approve_at_a_spent_qe_budget_leaves_the_gate_open() {
+        for amend in [None, Some("try again".to_string())] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run_id = "approve-qe-cap";
+            seed_judge_unavailable_verify(&mut store, run_id);
+            require_qe(&mut store, run_id);
+            park_invalid_qe_gate(&mut store, run_id);
+            let mut units = crate::domain::session_units(&store, run_id).unwrap();
+            for _ in 0..2 {
+                let redo = crate::qe_acceptance::review::redo_record(&units[3], "mike", 1).unwrap();
+                units[3].qe_redos.push(redo);
+            }
+            put_node(&mut store, units[3].to_node()).unwrap();
+            let before = serde_json::to_value(&units[3]).unwrap();
+            let (r, _) = answer(
+                &mut store,
+                run_id,
+                HumanDecision::Approve {
+                    amend,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+            );
+            let why = r.unwrap_err().to_string();
+            assert!(why.contains("already redone 2 times"), "{why}");
+            assert!(
+                why.contains("skip QE")
+                    && why.contains("request changes")
+                    && why.contains("reject"),
+                "{why}"
+            );
+            let listed = gate_actions::gate_actions(&store, run_id).unwrap().unwrap();
+            assert!(action(&listed, "approve").is_none());
+            assert!(action(&listed, "reassign").is_none());
+            assert_eq!(
+                crate::interaction::list_interactions(
+                    &store,
+                    Some(run_id),
+                    Some(crate::interaction::InteractionStatus::Open),
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            assert_eq!(
+                crate::domain::get_session(&store, run_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                SessionStatus::AwaitingHuman
+            );
+            let units = crate::domain::session_units(&store, run_id).unwrap();
+            assert_eq!(serde_json::to_value(&units[3]).unwrap(), before);
+        }
+    }
+
+    fn seed_triage_check(store: &mut dyn GraphStore, run_id: &str) {
+        seed_bug_with_deliver(store, run_id);
+        require_qe(store, run_id);
+        let mut s = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        s.unit_ix = 3;
+        s.attempt = 7;
+        put_node(store, s.to_node()).unwrap();
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let u = &mut units[3];
+        u.status = UnitStatus::Distributed;
+        u.last_attempt = Some(7);
+        u.stage = crate::domain::StageKind::Test;
+        u.tool_cmd = Some(vec!["false".into()]);
+        put_node(store, u.to_node()).unwrap();
+        open_row(store, run_id, 4, "triage");
+    }
+
+    /// (core#1319) Triage retries must mint a fresh dispatch key even while Distributed.
+    #[test]
+    fn triage_approve_dispatches_a_fresh_attempt() {
+        for tool in [true, false] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run_id = "triage-attempt";
+            seed_triage_check(&mut store, run_id);
+            let mut units = crate::domain::session_units(&store, run_id).unwrap();
+            if !tool {
+                units[3].tool_cmd = None;
+            }
+            units[3].worktree_baseline = Some(crate::worktree_guard::WorktreeSnapshot {
+                head: "h-a".into(),
+                head_ref: None,
+                tree: "tree-a".into(),
+                taken_at_ms: 1,
+                git_dir: None,
+            });
+            put_node(&mut store, units[3].to_node()).unwrap();
+            let (r, events) = answer(
+                &mut store,
+                run_id,
+                HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+            );
+            r.unwrap();
+            let session = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+            assert_eq!(session.attempt, 8);
+            let units = crate::domain::session_units(&store, run_id).unwrap();
+            assert!(units[3].worktree_baseline.is_some());
+            assert!(events.iter().any(|e| matches!(
+                e,
+                CoreEvent::UnitDispatched {
+                    ord: 4,
+                    attempt: 8,
+                    ..
+                }
+            )));
+            // The fresh attempt is still a first try for triage; an automatic retry past it is not.
+            assert!(crate::interaction::redispatched_by_triage(
+                &store, run_id, 4, 8
+            ));
+            assert!(!crate::interaction::redispatched_by_triage(
+                &store, run_id, 4, 9
+            ));
+        }
+    }
+
+    /// (core#1318) The existing judgment record counts a failed check and reaches delivery,
+    /// with a tool-specific label and no QE decision or reusable deliver-floor key.
+    #[test]
+    fn triage_tool_check_judgment_counts_and_preserves_qe() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = "triage-judgment";
+        seed_triage_check(&mut store, run_id);
+        let qe = crate::domain::get_session(&store, run_id)
+            .unwrap()
+            .unwrap()
+            .assurance
+            .qe;
+        let mut units = crate::domain::session_units(&store, run_id).unwrap();
+        units[3].qe_review = Some(qe_record(
+            crate::qe_acceptance::review::OUTCOME_UNAVAILABLE,
+            None,
+        ));
+        put_node(&mut store, units[3].to_node()).unwrap();
+        let (r, events) = operator_judgment(
+            &mut store,
+            run_id,
+            "known flaky check; inspected the output",
+        );
+        r.unwrap();
+        let s = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Done);
+        assert_eq!(s.assurance.qe, qe);
+        assert_eq!(s.assurance.floor_overrides.len(), 1);
+        let judgment = &s.assurance.floor_overrides[0];
+        assert_eq!(
+            units[3].assurance.as_ref().unwrap().operator_judges,
+            vec![judgment.clone()]
+        );
+        let f = judgment.floor_override.as_ref().unwrap();
+        assert_eq!(f.layer, "tool_check");
+        assert_eq!(f.label, "tool check overridden by operator");
+        assert_eq!((f.ord, f.attempt), (4, 7));
+        assert_eq!(f.result_id, format!("{run_id}:unit-4:attempt-7:tool_check"));
+        assert!(
+            f.key.is_none()
+                && f.tree.is_none()
+                && f.carried_from.is_none()
+                && f.failing.is_none()
+                && f.fingerprint.is_none()
+        );
+        assert!(units[3]
+            .operator_rulings
+            .last()
+            .unwrap()
+            .text
+            .contains(&f.label));
+        assert!(judgment.judge_stand_in.is_none());
+        assert_eq!(
+            crate::deliver_lift::delivery_receipt(&s, &units).operator_judges,
+            vec![judgment.clone()]
+        );
+        assert!(!events
+            .iter()
+            .any(|e| matches!(e, CoreEvent::QeAcceptanceDecided { .. })));
+    }
+
+    /// (core#1318) Rationale, gate, stage and ownership restrictions leave refusals re-answerable.
+    #[test]
+    fn triage_tool_judgment_refuses_blank_notes_and_non_checks() {
+        for case in [
+            "blank", "install", "agent", "member", "done", "deliver", "failure",
+        ] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run_id = "triage-refusal";
+            seed_triage_check(&mut store, run_id);
+            let mut units = crate::domain::session_units(&store, run_id).unwrap();
+            match case {
+                "install" => units[3].stage = crate::domain::StageKind::Build,
+                "agent" => units[3].tool_cmd = None,
+                "done" => units[3].status = UnitStatus::Done,
+                "deliver" => {
+                    let mut session = crate::domain::get_session(&store, run_id).unwrap().unwrap();
+                    session.unit_ix = 4;
+                    put_node(&mut store, session.to_node()).unwrap();
+                    units[4].tool_cmd = Some(vec!["false".into()]);
+                    units[4].stage = crate::domain::StageKind::Test;
+                    units[4].status = UnitStatus::Distributed;
+                    put_node(&mut store, units[4].to_node()).unwrap();
+                }
+                "failure" => {
+                    crate::interaction::resolve_open_for_session(
+                        &mut store,
+                        run_id,
+                        crate::interaction::InteractionStatus::Answered,
+                        None,
+                        2,
+                    )
+                    .unwrap();
+                    open_row(&mut store, run_id, 4, "failure");
+                }
+                "member" => {
+                    units[3].member_step = Some(crate::domain::MemberStepState {
+                        member: "codex".into(),
+                        ..Default::default()
+                    });
+                }
+                _ => {}
+            }
+            put_node(&mut store, units[3].to_node()).unwrap();
+            let rationale = if case == "blank" { "  " } else { "inspected" };
+            let (r, _) = operator_judgment(&mut store, run_id, rationale);
+            let why = r.expect_err(case).to_string();
+            if case == "blank" {
+                assert!(why.contains("rationale"), "{why}");
+            }
+            assert_eq!(
+                crate::interaction::list_interactions(
+                    &store,
+                    Some(run_id),
+                    Some(crate::interaction::InteractionStatus::Open),
+                )
+                .unwrap()
+                .len(),
+                1,
+                "{case}"
+            );
+            assert_eq!(
+                crate::domain::get_session(&store, run_id)
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                SessionStatus::AwaitingHuman
+            );
+        }
+        // (core#1318) The valid control proves these are restrictions on an available action.
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_triage_check(&mut store, "triage-valid-control");
+        operator_judgment(&mut store, "triage-valid-control", "inspected")
+            .0
+            .unwrap();
+    }
+
+    /// (core#1038) A stale non-plan answer emits once at the command boundary and
+    /// changes neither the gate, unit, session nor power-run accounting.
+    #[test]
+    fn stale_escalation_answer_is_refused_once_without_changing_state() {
+        struct NoCouncil;
+        impl Dispatcher for NoCouncil {
+            fn dispatch(
+                &self,
+                _cli: &crate::AgenticCli,
+                _task: &wicked_council::CouncilTask,
+            ) -> Option<wicked_council::types::Vote> {
+                None
+            }
+        }
+        let run_id = format!("stale-answer-{}", uuid::Uuid::new_v4());
+        let dir = std::env::temp_dir().join(&run_id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("estate.db");
+        let (session_before, unit_before) = {
+            let mut store = open_store(Some(db.to_str().unwrap())).unwrap();
+            seed_bug_with_deliver(&mut store, &run_id);
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.unit_ix = 1;
+            session.power = Some(crate::power::PowerState::launched(true, 0));
+            put_node(&mut store, session.to_node()).unwrap();
+            open_row(&mut store, &run_id, 2, "escalation");
+            let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+            units[1].status = UnitStatus::Rejected;
+            units[1].denial = Some(UnitDenial::new("worker_failure", "failed step"));
+            units[1].denial_reason = Some("failed step".into());
+            put_node(&mut store, units[1].to_node()).unwrap();
+            (
+                serde_json::to_value(&session).unwrap(),
+                serde_json::to_value(&units[1]).unwrap(),
+            )
+        };
+        let core = crate::Core::spawn_with_engine(
+            db.to_str().unwrap().to_string(),
+            Arc::new(NoCouncil),
+            Arc::new(NoopRunner),
+        );
+        let events = core.subscribe();
+        let result = core.confirm_gate_expecting(
+            &run_id,
+            HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::Cursor,
+            },
+            Some("mike".into()),
+            Some(crate::workflow::GateExpect {
+                ord: Some(1),
+                plan_rev: None,
+            }),
+        );
+        let why = result.unwrap_err().to_string();
+        assert!(why.starts_with("gate_changed:"), "{why}");
+        let store = wicked_apps_core::open_store_ro(Some(db.to_str().unwrap())).unwrap();
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        assert_eq!(serde_json::to_value(&session).unwrap(), session_before);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(serde_json::to_value(&units[1]).unwrap(), unit_before);
+        let rows = crate::interaction::list_interactions(
+            &store,
+            Some(&run_id),
+            Some(crate::interaction::InteractionStatus::Open),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ord, Some(2));
+        let refused: Vec<_> = events
+            .try_iter()
+            .filter(|e| e.to_json()["type"] == "gateAnswerRefused")
+            .collect();
+        assert_eq!(refused.len(), 1);
+        let j = refused[0].to_json();
+        assert_eq!(j["session"], run_id);
+        assert_eq!(j["ord"], 2);
+        assert_eq!(j["expectedOrd"], 1);
+        assert!(j["expectedPlanRev"].is_null());
+        assert_eq!(j["reason"], why);
+        assert_eq!(j["by"], "mike");
+        drop(store);
+        drop(core);
+    }
+
     /// (crew#1554) On a power run, a QE step whose fresh evidence could not be bound (no reviewer
     /// ran) opens its gate and the hand-off answers it with `retry_qe` — never a `request_changes`
     /// rewind to the build. A record whose reviewer ran (its verdict could not be bound) keeps the
@@ -31766,6 +33193,14 @@ mod request_changes_tests {
         assert_eq!(judgment.note, crate::NoteRule::Required);
     }
 
+    /// (core#1318) The action list and accepted answers share the rationale requirement.
+    #[test]
+    fn gate_actions_triage_tool_check() {
+        let listed = listed_is_accepted("triage-tool-check", &seed_triage_check);
+        let judgment = action(&listed, crate::workflow::OPERATOR_JUDGMENT_ACTION).unwrap();
+        assert_eq!(judgment.note, crate::NoteRule::Required);
+    }
+
     /// (review r2) The QE shapes HERMETIC: the work is built and QE-executed on `codex`, so the one
     /// seat a QE redo can draw is `claude`, which every skills source admits (the live plugin cache
     /// hands non-Claude seats nothing; CI has no cache). The golden list is then the same anywhere.
@@ -31952,8 +33387,8 @@ mod request_changes_tests {
         assert!(action(&listed, crate::workflow::RETRY_QE_ACTION).is_none());
     }
 
-    /// (studio#1155) A capped review whose rule is held: land is NOT listed until the rule is
-    /// settled; the rule actions are.
+    /// (core#1683) A capped review whose rule is held lists Land with a required skip reason,
+    /// alongside the existing rule actions.
     #[test]
     fn gate_actions_review_adjudication_with_a_held_rule() {
         let seed = |store: &mut dyn GraphStore, run_id: &str| {
@@ -31979,7 +33414,11 @@ mod request_changes_tests {
             put_node(store, units[3].to_node()).unwrap();
         };
         let listed = listed_is_accepted("adj-rules", &seed);
-        assert!(action(&listed, "approve").is_none(), "{listed:#?}");
+        let land = action(&listed, "approve").expect("a noted Land skips the held rule");
+        assert_eq!(land.intent, "land_with_carried_items");
+        assert_eq!(land.note, crate::NoteRule::Required);
+        assert_eq!(land.note_intent.as_deref(), Some("skip_rules"));
+        assert_eq!(land.rules, ["R1"]);
         assert!(action(&listed, crate::rule_check::RETRY_ACTION).is_some());
         assert_eq!(
             action(&listed, crate::rule_check::SKIP_ACTION)
@@ -41368,6 +42807,113 @@ mod work_author_tests {
         );
     }
 
+    #[test]
+    fn semantic_dispatch_moves_off_the_earlier_reports_seat() {
+        let s = session(&["claude", "codex", "pi"], &[]);
+        let mut diff = unit(1, StageKind::Recon, "claude", &[]);
+        diff.catalog = Some("understand".into());
+        diff.worktree_guarded = true;
+        let mut review = unit(2, StageKind::Review, "codex", &[]);
+        review.catalog = Some("critique".into());
+        review.rubric = Some("cited-findings".into());
+        let mut semantic = review.clone();
+        semantic.ord = 3;
+        let units = [diff, review, semantic.clone()];
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &semantic).as_deref(),
+            Some("pi")
+        );
+    }
+
+    #[test]
+    fn evaluator_dispatch_tries_a_seat_not_seen_on_the_authors_provider_first() {
+        let s = session(&["codex", "claude", "pi"], &[]);
+        let mut build = unit(1, StageKind::Build, "codex", &[]);
+        let provider = format!("actor-identity-{}:443", uuid::Uuid::new_v4());
+        build.observed_providers = vec![provider.clone()];
+        crate::observed_provider::record_receipt("claude", Some(vec![provider]));
+        let review = unit(2, StageKind::Review, "claude", &[]);
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[build, review.clone()], &review).as_deref(),
+            Some("pi")
+        );
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn provider_only_reseating_requires_a_nonsharing_candidate() {
+        // (core#1540) Changing keys gains nothing when both seats share the author's provider.
+        let provider = format!("reseat-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, "reseat-author", &[]);
+        build.observed_providers = vec![provider.clone()];
+        for seat in ["reseat-sharing", "reseat-other-sharing"] {
+            crate::observed_provider::record_receipt(seat, Some(vec![provider.clone()]));
+        }
+        let review = unit(2, StageKind::Review, "reseat-sharing", &[]);
+        let units = [build, review.clone()];
+        let mut s = session(
+            &["reseat-author", "reseat-other-sharing", "reseat-sharing"],
+            &[],
+        );
+        assert_eq!(distinct_evaluator_seat(&s, &units, &review), None);
+
+        let mut on_author = review.clone();
+        on_author.assigned_cli = Some("reseat-author".into());
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &on_author).as_deref(),
+            Some("reseat-other-sharing"),
+            "a key-author can still improve to a key-distinct, provider-sharing seat"
+        );
+
+        s.clis.push("reseat-independent".into());
+        for assigned in [&review, &on_author] {
+            assert_eq!(
+                distinct_evaluator_seat(&s, &units, assigned).as_deref(),
+                Some("reseat-independent")
+            );
+        }
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn operator_reassign_follows_the_dispatch_reseat_rule() {
+        // (core#1540) A choice the dispatch re-seat would move is refused, naming its seats.
+        let provider = format!("reassign-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, "reassign-author", &[]);
+        build.observed_providers = vec![provider.clone()];
+        crate::observed_provider::record_receipt("reassign-sharing", Some(vec![provider]));
+        let review = unit(2, StageKind::Review, "reassign-other", &[]);
+        let units = [build, review];
+        let s = session(
+            &["reassign-author", "reassign-sharing", "reassign-other"],
+            &[],
+        );
+        let msg = refuse_author_reassign(&s, &units, 1, "reassign-sharing")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("reassign it to one of: reassign-other"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("one of: reassign-other, reassign-sharing"),
+            "{msg}"
+        );
+        let msg = refuse_author_reassign(&s, &units, 1, "reassign-author")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("reassign it to one of: reassign-other, reassign-sharing"),
+            "{msg}"
+        );
+        assert!(refuse_author_reassign(&s, &units, 1, "reassign-author#2").is_err());
+        assert!(refuse_author_reassign(&s, &units, 1, "reassign-other").is_ok());
+        // With no independent seat the re-seat keeps a provider-only conflict: so does this.
+        let two = session(&["reassign-author", "reassign-sharing"], &[]);
+        assert!(refuse_author_reassign(&two, &units, 1, "reassign-sharing").is_ok());
+        crate::observed_provider::take_receipts();
+    }
+
     /// No distinct seat left (the rest benched): the unit stays, and its gate's
     /// `same_seat_evaluator` denial is the explicit escalation — never a silent reuse.
     #[test]
@@ -41659,10 +43205,10 @@ mod council_ballot_tests {
         let real: Arc<dyn Dispatcher + Send + Sync> =
             Arc::new(wicked_council::dispatch::RealDispatcher::default());
         let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
-        let (host, at) = ballot_dispatcher(&real, &runner, false);
+        let (host, at) = ballot_dispatcher(&real, &runner, false, None);
         assert!(Arc::ptr_eq(&host, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_HOST));
-        let (carried, at) = ballot_dispatcher(&real, &runner, true);
+        let (carried, at) = ballot_dispatcher(&real, &runner, true, None);
         assert!(!Arc::ptr_eq(&carried, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER));
     }
@@ -41716,6 +43262,7 @@ mod carried_skip_tests {
             carry_key: Some("ck".into()),
             ord: Some(3),
             rulings_rev: Some(rulings_revision(problem, &[], &units)),
+            seat_attempt: None,
         });
         units[0] = u3.clone();
         let ids = |v: Vec<crate::rule_check::RuleSkip>| -> Vec<String> {

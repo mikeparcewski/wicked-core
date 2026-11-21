@@ -1385,15 +1385,15 @@ pub(crate) fn apply_and_finish_unit(
             .find(|u| u.ord == ord)
             .and_then(|u| u.phase_id().map(str::to_string))
     };
+    let mut creator_paths = None;
     let checks_denial: Option<(&'static str, String)> = match &evidence.repo_checks {
         Some(report) => {
             unit.repo_checks = Some(report.clone());
             let verify_floor = unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
-            let (changed, changed_truncated) = if verify_floor {
-                (Vec::new(), false)
-            } else {
-                creator_changed_paths(unit, workdir.as_deref(), report)
-            };
+            if !verify_floor {
+                creator_paths = creator_changed_paths(unit, workdir.as_deref(), report);
+            }
+            let (changed, changed_truncated) = creator_paths.clone().unwrap_or_default();
             emit(CoreEvent::RepoChecksEvaluated {
                 session: session_id.to_string(),
                 ord: unit.ord,
@@ -1592,6 +1592,12 @@ pub(crate) fn apply_and_finish_unit(
         }
         None => None,
     };
+    unit.changed_code = changed_code(
+        unit.changed_code,
+        evidence.tree_changed,
+        creator_paths.as_ref().map(|(paths, _)| paths.as_slice()),
+        creator_paths.as_ref().is_some_and(|(_, cut)| *cut),
+    );
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before the
     // denials are moved into the deny-dominance fold below, so `GateEvaluated` can carry the
     // depth. Both deterministic instruments count: the pinned validator and the repo checks.
@@ -1858,21 +1864,14 @@ pub(crate) fn apply_and_finish_unit(
     // evaluator, under the dead-seat class (reassign it to a distinct seat, or relaunch reduced).
     let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
         let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
-        evaluator_relation(&units, unit)
-            .filter(|rel| rel.on_builder_seat)
-            .and_then(|_| unit.assigned_cli.clone())
-            .map(|seat| {
-                crate::domain::UnitDenial::new(
-                    DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
-                    format!(
-                        "unit {} checks work built on `{seat}` and ran on that same seat; the run \
-                         requires a distinct evaluator ({}) — reassign it to a distinct signed-in \
-                         seat and approve to re-run, or relaunch with reduced assurance",
-                        unit.ord,
-                        crate::assurance::DISTINCT_EVALUATOR
-                    ),
-                )
-            })
+        // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
+        evaluator_relation(
+            &units,
+            unit,
+            evidence.observed_providers.as_deref().or(Some(&[])),
+        )
+        .filter(|rel| rel.on_builder_seat)
+        .map(|rel| rel.denial(unit))
     } else {
         None
     };
@@ -1913,7 +1912,19 @@ pub(crate) fn apply_and_finish_unit(
     // The FIRST layer that denied names the gate; (operator ruling 2026-10-21) every layer
     // after it is kept too (`WorkUnit::denials_behind`), so an answer that overrides ONE layer —
     // the operator's judgment over a failed repo-checks floor — can see the rest still deny.
-    let mut layers = [
+    let prior_fold = PriorFold {
+        behind: prior_denials_behind,
+        tree: prior_floor_tree,
+    };
+    let fold_refresh = FoldRefresh {
+        floor_carried,
+        tree: evidence.repo_checks.as_ref().and_then(|r| r.tree.clone()),
+        judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
+        qe: evidence.qe_review.is_some(),
+        seat: seat_ran,
+        rules: evidence.rule_check.is_some(),
+    };
+    let vetoes = [
         guard_denial.map(|r| crate::domain::UnitDenial::new("worktree_guard", r)),
         same_seat_denial,
         det_denial.map(|r| crate::domain::UnitDenial::new("pinned_validator", r)),
@@ -1927,6 +1938,8 @@ pub(crate) fn apply_and_finish_unit(
         rule_broken,
         evaluator_denial,
         hook_denial,
+    ];
+    let holds = [
         // (operator ruling 2026-10-11, codex r1 on #907) A judge that could not rule wins only when
         // NO other layer denied — the operator's judgment at its gate then answers the one open
         // question, never a governance veto hidden behind it. (core#969, codex r1) That holds for
@@ -1940,9 +1953,30 @@ pub(crate) fn apply_and_finish_unit(
         judge_hold,
         unavailable.map(|(source, r)| crate::domain::UnitDenial::new(source, r)),
         qe_unavailable,
-    ]
-    .into_iter()
-    .flatten();
+    ];
+    // #1062: an earlier, unrefreshed layer decides approval too, not just the record written
+    // after a denial. Fresh words replace their layer's old word, even when it has new details.
+    let (standing_holds, standing_vetoes): (Vec<_>, Vec<_>) =
+        standing_denials(&prior_fold, &fold_refresh)
+            .into_iter()
+            .filter(|d| {
+                !vetoes
+                    .iter()
+                    .chain(holds.iter())
+                    .flatten()
+                    .any(|f| f.source == d.source)
+            })
+            .partition(|d| {
+                judge_absent_behind_floor(d)
+                    || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+                    || crate::qe_acceptance::review::could_not_judge(d)
+            });
+    let mut layers = vetoes
+        .into_iter()
+        .flatten()
+        .chain(standing_vetoes)
+        .chain(holds.into_iter().flatten())
+        .chain(standing_holds);
     let validator_denial = layers.next();
     // (xreview r7) The winner as the layers ranked it, kept: output governance can replace it in
     // `apply_unit`'s outcome, and the record must still hold it.
@@ -2038,21 +2072,7 @@ pub(crate) fn apply_and_finish_unit(
     unit.denials_behind = if outcome.approved {
         Some(Vec::new())
     } else {
-        denials_behind_after_fold(
-            fresh_denials,
-            PriorFold {
-                behind: prior_denials_behind,
-                tree: prior_floor_tree,
-            },
-            FoldRefresh {
-                floor_carried,
-                tree: evidence.repo_checks.as_ref().and_then(|r| r.tree.clone()),
-                judge: agent_verdict.is_some() || evidence.judge_skipped.is_some(),
-                qe: evidence.qe_review.is_some(),
-                seat: seat_ran,
-                rules: evidence.rule_check.is_some(),
-            },
-        )
+        denials_behind_after_fold(fresh_denials, prior_fold, fold_refresh)
     };
     unit.status = if outcome.approved {
         UnitStatus::Done
@@ -2258,6 +2278,8 @@ pub(crate) fn apply_and_finish_unit(
         &assurance,
         attempt,
         GateFacts {
+            // (core#1540) An unobserved attempt proves only its seat key at the gate.
+            own_observed: evidence.observed_providers.as_deref().or(Some(&[])),
             pinned: unit.validator.as_ref().filter(|v| v.approved).map(|_| {
                 if workdir.is_some() && det_reached_verdict {
                     Ok(())
@@ -2561,32 +2583,56 @@ pub(crate) fn disclose_hook_record_in(
     }
 }
 
+// (core#1316) A complete path list can establish no code; a code path always establishes code.
+fn changed_code(
+    prior: Option<bool>,
+    tree_changed: Option<bool>,
+    paths: Option<&[crate::worktree_guard::ChangedPath]>,
+    truncated: bool,
+) -> Option<bool> {
+    if prior == Some(true)
+        || paths.is_some_and(|paths| {
+            paths.iter().any(|p| {
+                crate::rule_check::is_source_path(&p.path)
+                    || crate::rule_check::is_test_path(&p.path)
+            })
+        })
+    {
+        Some(true)
+    } else if tree_changed == Some(false) || (paths.is_some() && !truncated) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// (TR-W1b, DES-trigger-registry §4.4 row 4) The paths a creator unit changed, for its floor's
 /// `repoChecksEvaluated`: the unit's dispatch baseline tree against the tree its checks ran on
 /// (`RepoChecksReport::tree`), through the baseline's pinned git dir, capped at
-/// [`crate::worktree_guard::CHANGED_PATHS_CAP`] (`true` = cut). Empty when either tree is unknown,
-/// the trees are equal, or the diff fails (logged): a consumer reads "no paths", never a guess.
+/// [`crate::worktree_guard::CHANGED_PATHS_CAP`] (`true` = cut). (core#1316) `None` when either
+/// tree is unknown or the diff fails (logged): the event then reads "no paths", never a guess, and
+/// [`changed_code`] stays unknown.
 fn creator_changed_paths(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&str>,
     report: &crate::repo_checks::RepoChecksReport,
-) -> (Vec<crate::worktree_guard::ChangedPath>, bool) {
+) -> Option<(Vec<crate::worktree_guard::ChangedPath>, bool)> {
     let (Some(wd), Some(baseline), Some(after)) = (
         workdir,
         unit.worktree_baseline.as_ref(),
         report.tree.as_deref(),
     ) else {
-        return (Vec::new(), false);
+        return None;
     };
     match crate::worktree_guard::changed_since(std::path::Path::new(wd), baseline, after) {
-        Ok(changed) => crate::worktree_guard::capped(changed),
+        Ok(changed) => Some(crate::worktree_guard::capped(changed)),
         Err(e) => {
             eprintln!(
                 "wicked-core: unit {}: the changed paths of its creator floor could not be \
                  listed: {e}",
                 unit.ord
             );
-            (Vec::new(), false)
+            None
         }
     }
 }
@@ -2858,11 +2904,44 @@ fn denials_behind_after_fold(
     prior: PriorFold,
     now: FoldRefresh,
 ) -> Option<Vec<crate::domain::UnitDenial>> {
+    // No record of what denied before: unless every layer was asked again, the record
+    // remains unknown (and cannot authorize an override), as it did before standing ranking.
+    if now.same_tree_as(&prior) && prior.behind.is_none() && !(now.judge && now.qe && now.seat) {
+        return None;
+    }
+    let mut out = fresh;
+    for d in standing_denials(&prior, &now) {
+        if !out.iter().any(|f| f.source == d.source) {
+            out.push(d);
+        }
+    }
+    Some(out)
+}
+
+impl FoldRefresh {
+    fn same_tree_as(&self, prior: &PriorFold) -> bool {
+        // A floor fix or a check rewriting files asked no other layer about the new tree.
+        // Preserve those denials until the unit's own seat runs again, as for the fold record.
+        !self.seat
+            || self.floor_carried
+            || self.tree.is_none()
+            || prior.tree.is_none()
+            || self.tree == prior.tree
+    }
+}
+
+/// Earlier non-floor denials this attempt did not refresh over the same work. Unknown history
+/// supplies no invented denials; the fold record separately preserves its unknown state.
+fn standing_denials(prior: &PriorFold, now: &FoldRefresh) -> Vec<crate::domain::UnitDenial> {
+    if !now.same_tree_as(prior) {
+        return Vec::new();
+    }
     let judge_layer =
         |s: &str| s == "agent_validator" || s == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE;
     let qe_layer = |s: &str| {
         s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEW
             || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_REVIEWER_UNAVAILABLE
+            || s == crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE
     };
     let floor = |s: &str| {
         s == crate::repo_checks::DENIAL_SOURCE || s == crate::repo_checks::DENIAL_SOURCE_TIMEOUT
@@ -2883,32 +2962,13 @@ fn denials_behind_after_fold(
             now.seat
         }
     };
-    let every_layer_refreshed = now.judge && now.qe && now.seat;
-    // A changed tree is new work only when the seat itself made it (xreview r7): a floor fix's
-    // seat or a check that rewrote files asked no other layer about the new tree.
-    let same_tree = !now.seat
-        || now.floor_carried
-        || now.tree.is_none()
-        || prior.tree.is_none()
-        || now.tree == prior.tree;
-    if !same_tree {
-        return Some(fresh);
-    }
-    let mut out = fresh;
-    let earlier = match prior.behind {
-        Some(behind) => behind,
-        // No record of what denied before (a unit persisted before the record existed — a new
-        // unit starts known-empty): unless this fold asked every layer again, it cannot know
-        // either, whatever its tree (xreview r6: a guarded step's report carries none).
-        None if !every_layer_refreshed => return None,
-        None => Vec::new(),
-    };
-    for d in earlier {
-        if !floor(&d.source) && !refreshed(&d.source) && !out.contains(&d) {
-            out.push(d);
-        }
-    }
-    Some(out)
+    prior
+        .behind
+        .iter()
+        .flatten()
+        .filter(|d| !floor(&d.source) && !refreshed(&d.source))
+        .cloned()
+        .collect()
 }
 
 fn agent_verdict_denial(
@@ -3020,12 +3080,33 @@ struct EvaluatorRelation {
     creator: Option<String>,
     /// Whether the unit's own seat is one of its builders' seats.
     on_builder_seat: bool,
+    conflict: Option<String>,
+}
+
+impl EvaluatorRelation {
+    fn denial(&self, unit: &crate::domain::WorkUnit) -> crate::domain::UnitDenial {
+        crate::domain::UnitDenial::new(
+            DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
+            format!(
+                "unit {} ran on `{}`, {}; the run requires a distinct evaluator ({}) — \
+                 reassign it to a distinct signed-in seat and approve to re-run, or relaunch \
+                 with reduced assurance",
+                unit.ord,
+                unit.assigned_cli.as_deref().unwrap_or("unknown"),
+                self.conflict
+                    .as_deref()
+                    .unwrap_or("the seat that authored the work"),
+                crate::assurance::DISTINCT_EVALUATOR
+            ),
+        )
+    }
 }
 
 /// `None` for a unit that is not a Review/Test agent unit or has no builder before it.
 fn evaluator_relation(
     units: &[crate::domain::WorkUnit],
     unit: &crate::domain::WorkUnit,
+    own_observed: Option<&[crate::observed_provider::Provider]>,
 ) -> Option<EvaluatorRelation> {
     use crate::domain::StageKind;
     if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
@@ -3042,16 +3123,18 @@ fn evaluator_relation(
         return None;
     }
     let authors = work_authors(units, unit.ord);
+    let providers = work_author_providers(units, unit.ord);
+    let conflict = unit.assigned_cli.as_deref().and_then(|seat| {
+        crate::observed_provider::shares_identity(seat, own_observed, &authors, &providers)
+    });
     Some(EvaluatorRelation {
         creator: builders
             .iter()
             .max_by_key(|u| u.ord)
             .and_then(|c| c.assigned_cli.clone())
             .or_else(|| gatherers.last().cloned()),
-        on_builder_seat: unit
-            .assigned_cli
-            .as_ref()
-            .is_some_and(|e| authors.iter().any(|a| a == e)),
+        on_builder_seat: conflict.is_some(),
+        conflict,
     })
 }
 
@@ -3145,6 +3228,25 @@ pub(crate) fn work_authors(units: &[crate::domain::WorkUnit], ord: u32) -> Vec<S
     out
 }
 
+/// (core#1540) The providers of exactly the units counted by `work_authors`.
+pub(crate) fn work_author_providers(
+    units: &[crate::domain::WorkUnit],
+    ord: u32,
+) -> Vec<crate::observed_provider::Provider> {
+    let checker = units.iter().find(|u| u.ord == ord);
+    let mut out = Vec::new();
+    for u in units.iter().filter(|u| {
+        (u.ord < ord && authors_work(u)) || checker.is_some_and(|c| report_author_unit(u, c))
+    }) {
+        for p in &u.observed_providers {
+            if !out.contains(p) {
+                out.push(p.clone());
+            }
+        }
+    }
+    out
+}
+
 /// (DES-CATALOG-002 §5.1) A report's gatherer: an agent unit of the catalog `understand` entry,
 /// read step or not — except the PA's scope step, which states what the plan will touch and
 /// gathers no finding.
@@ -3155,21 +3257,14 @@ pub(crate) fn is_report_gatherer(u: &crate::domain::WorkUnit) -> bool {
 }
 
 /// (DES-CATALOG-002 §5.1) The seats that gathered what a cited-findings (or fidelity-to-source)
-/// unit rechecks: every earlier agent unit of the catalog `understand` entry — its current seat and
-/// every seat it was dispatched on — whether or not it is a read step. Empty for a unit whose
-/// rubric does not exclude gatherers.
+/// unit rechecks: earlier `understand` units and report steps (core#1366), including their prior
+/// seats, whether or not they are read steps. Empty when the rubric does not exclude gatherers.
 pub(crate) fn report_gatherer_seats(
     units: &[crate::domain::WorkUnit],
     checker: &crate::domain::WorkUnit,
 ) -> Vec<String> {
-    if !crate::rubric::excludes_gatherers(checker.rubric.as_deref()) {
-        return Vec::new();
-    }
     let mut out: Vec<String> = Vec::new();
-    for u in units
-        .iter()
-        .filter(|u| u.ord < checker.ord && is_report_gatherer(u))
-    {
+    for u in units.iter().filter(|u| report_author_unit(u, checker)) {
         for s in u
             .assigned_cli
             .iter()
@@ -3182,6 +3277,14 @@ pub(crate) fn report_gatherer_seats(
         }
     }
     out
+}
+
+// (core#1366) Earlier reports author the findings a later report rechecks too.
+fn report_author_unit(u: &crate::domain::WorkUnit, checker: &crate::domain::WorkUnit) -> bool {
+    u.ord < checker.ord
+        && crate::rubric::excludes_gatherers(checker.rubric.as_deref())
+        && (is_report_gatherer(u)
+            || (u.tool_cmd.is_none() && crate::rubric::excludes_gatherers(u.rubric.as_deref())))
 }
 
 /// (operator ruling 2026-10-14, the fallback judge) The BINARIES every author of the work a unit at
@@ -3485,6 +3588,7 @@ pub(crate) fn operator_waiver(r: &crate::repo_checks::RepoChecksReport) -> Optio
 
 /// What the fold observed, for [`gate_receipt`].
 struct GateFacts<'a> {
+    own_observed: Option<&'a [crate::observed_provider::Provider]>,
     /// `None`: no pinned validator; `Some(Ok)`: it reached a verdict; `Some(Err)`: it reached none.
     pinned: Option<Result<(), String>>,
     /// `None`: the floor did not apply; `Some(Ok)`: checks executed; `Some(Err((reason, detail)))`.
@@ -3539,7 +3643,7 @@ fn gate_receipt(
     let seat = unit.assigned_cli.clone();
     // The evaluator≠creator relation exactly as distribution draws it ([`evaluator_relation`]).
     let units = crate::domain::session_units(store, session_id).unwrap_or_default();
-    match evaluator_relation(&units, unit) {
+    match evaluator_relation(&units, unit, f.own_observed) {
         Some(rel) => {
             r.creator = rel.creator;
             r.evaluator = seat.clone();
@@ -3551,7 +3655,10 @@ fn gate_receipt(
                     } else {
                         a::SKIP_NO_DISTINCT_SEAT
                     },
-                    Some(format!("evaluated on a seat that built the work, `{e}`")),
+                    Some(format!(
+                        "evaluated on `{e}`, {}",
+                        rel.conflict.unwrap_or_default()
+                    )),
                 ),
                 (Some(_), false) => r.ran(a::DISTINCT_EVALUATOR),
                 (None, _) => {}
@@ -5753,6 +5860,133 @@ mod judge_bench_tests {
         assert!(!approved, "no record of what denied behind it: fail-closed");
     }
 
+    /// #1062: an extend re-run asks the checks and judge again, but never the executor's
+    /// input governance. Its earlier veto must decide the fold even when every fresh layer passes.
+    #[test]
+    fn a_passing_extend_fold_still_rejects_a_standing_governance_denial() {
+        let sid = "extend-standing-governance";
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let Planned {
+            mut units,
+            workflow_id,
+            cli_keys,
+            ..
+        } = plan_and_distribute(
+            &mut store,
+            &[cli("a"), cli("b")],
+            "Do step one.",
+            EntityMode::Shared,
+            sid,
+            crate::domain::HumanConfirm::None,
+            false,
+            None,
+            None,
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            &mut |_| {},
+            None,
+            false,
+            false,
+            Vec::new(),
+            None,
+            true,
+            &crate::assurance::QeOverride::Auto,
+        )
+        .expect("plan");
+        units[0].repo_checks_floor = true;
+        let output = crate::workflow::stub_output(&units[0]);
+        let report = |passed: bool| {
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "skipped": [], "passed": passed,
+                "sandbox_level": "sandboxed", "tree": "same-tree",
+                "checks": [{"name": "test", "argv": ["npm", "test"], "source": "t",
+                    "exit_code": if passed { Some(0) } else { None },
+                    "timed_out": !passed, "duration_ms": 1,
+                    "stdout_tail": "", "stderr_tail": ""}]
+            }))
+            .unwrap()
+        };
+        let judge = crate::validator::AgentVerdict {
+            pass: true,
+            reasoning: "PASS".into(),
+            judge_cli: Some("b".into()),
+            judge_distinct: Some(true),
+            seat_failure: None,
+            judge_fallback: None,
+        };
+        let first = apply_and_finish_unit(
+            &mut store,
+            &mut units[0],
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            0,
+            true, // A governed turn with no hook proof: a real input-governance denial.
+            true,
+            &cli_keys,
+            Some(&judge),
+            &crate::workflow::UnitEvidence {
+                repo_checks: Some(report(false)),
+                ..Default::default()
+            },
+            &mut |_| {},
+            None,
+        )
+        .expect("first fold");
+        assert!(!first.approved);
+        assert_eq!(
+            first.denial.unwrap().source,
+            crate::repo_checks::DENIAL_SOURCE_TIMEOUT
+        );
+        let mut unit = crate::domain::session_units(&store, sid).unwrap().remove(0);
+        assert!(unit
+            .denials_behind
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|d| d.source == "input_governance"));
+        unit.repo_checks.as_mut().unwrap().requested_rerun = Some(crate::repo_checks::FloorRerun {
+            mode: crate::repo_checks::FloorRerunMode::Extend,
+            waive: Vec::new(),
+            output: output.clone(),
+            fix: None,
+        });
+        put_node(&mut store, unit.to_node()).unwrap();
+        let second = apply_and_finish_unit(
+            &mut store,
+            &mut unit,
+            &output,
+            &workflow_id,
+            EntityMode::Shared,
+            sid,
+            1,
+            false, // No executor seat and no fresh input-governance log.
+            false,
+            &cli_keys,
+            Some(&judge),
+            &crate::workflow::UnitEvidence {
+                repo_checks: Some(report(true)),
+                ..Default::default()
+            },
+            &mut |_| {},
+            None,
+        )
+        .expect("extend fold");
+        assert!(
+            !second.approved,
+            "passing checks cannot clear an unrefreshed veto"
+        );
+        assert_eq!(second.denial.unwrap().source, "input_governance");
+        let persisted = crate::domain::session_units(&store, sid).unwrap().remove(0);
+        assert_eq!(persisted.status, UnitStatus::Rejected);
+        assert_eq!(persisted.denial.unwrap().source, "input_governance");
+        assert!(persisted.repo_checks.unwrap().requested_rerun.is_none());
+    }
+
     /// (rig run ea73afc0) A creator attempt's fold with a fresh FAILED floor report: `reply` is the
     /// seat's answer and `tree_changed` what the engine measured. Returns the unit's denial reason.
     fn fold_retry_answer(sid: &str, reply: &str, tree_changed: Option<bool>) -> Option<String> {
@@ -6398,7 +6632,8 @@ mod member_read_step_tests {
         let units = [triage.clone(), fix, verify.clone()];
         assert_eq!(super::work_authors(&units, 3), vec!["claude".to_string()]);
         assert!(!super::fallback_work_authors(&units, 3).contains(&"codex".to_string()));
-        let rel = super::evaluator_relation(&units, &verify).expect("a builder precedes it");
+        let rel =
+            super::evaluator_relation(&units, &verify, Some(&[])).expect("a builder precedes it");
         assert!(
             !rel.on_builder_seat,
             "codex authored nothing the test checks"
@@ -6469,7 +6704,8 @@ mod guarded_read_step_tests {
         );
         let units = [build.clone(), arch.clone(), test.clone()];
         assert_eq!(super::work_authors(&units, 8), vec!["claude".to_string()]);
-        let rel = super::evaluator_relation(&units, &test).expect("a builder precedes it");
+        let rel =
+            super::evaluator_relation(&units, &test, Some(&[])).expect("a builder precedes it");
         assert!(!rel.on_builder_seat, "codex built nothing the test checks");
         assert_eq!(rel.creator.as_deref(), Some("claude"));
         assert!(!super::fallback_work_authors(&units, 8).contains(&"codex".to_string()));
@@ -6608,14 +6844,142 @@ mod guarded_read_step_tests {
         check.rubric = Some("cited-findings".into());
         check.assigned_cli = Some("a".into());
         let units = [gather.clone(), check.clone()];
-        let rel = super::evaluator_relation(&units, &units[1]).expect("a relation");
+        let rel = super::evaluator_relation(&units, &units[1], Some(&[])).expect("a relation");
         assert!(rel.on_builder_seat);
         let mut got = super::work_authors(&units, check.ord);
         got.sort();
         assert_eq!(got, ["a", "z"]);
         check.rubric = None;
         let units = [gather, check];
-        assert!(super::evaluator_relation(&units, &units[1]).is_none());
+        assert!(super::evaluator_relation(&units, &units[1], Some(&[])).is_none());
+    }
+
+    #[test]
+    fn semantic_counts_the_earlier_review_as_a_report_author() {
+        let mut diff = unit(1, StageKind::Recon, PhaseRole::Neutral, "claude");
+        diff.catalog = Some("understand".into());
+        diff.worktree_guarded = true;
+        diff.observed_providers = vec!["gatherer:443".into()];
+        let mut review = unit(2, StageKind::Review, PhaseRole::Evaluator, "codex");
+        review.catalog = Some("critique".into());
+        review.rubric = Some("cited-findings".into());
+        review.observed_providers = vec!["report:443".into()];
+        review.authored_by = vec!["earlier-review-seat".into()];
+        review.gathered_by = vec!["earlier-report-seat".into()];
+        let mut semantic = review.clone();
+        semantic.ord = 3;
+        semantic.authored_by.clear();
+        semantic.gathered_by.clear();
+        let units = [diff, review, semantic];
+        let authors = super::work_authors(&units, 3);
+        assert_eq!(
+            super::work_author_providers(&units, 3),
+            vec!["gatherer:443", "report:443"]
+        );
+        for author in [
+            "claude",
+            "codex",
+            "earlier-review-seat",
+            "earlier-report-seat",
+        ] {
+            assert!(authors.iter().any(|a| a == author), "{author}: {authors:?}");
+        }
+        assert!(
+            super::evaluator_relation(&units, &units[2], Some(&[]))
+                .unwrap()
+                .on_builder_seat
+        );
+    }
+
+    #[test]
+    fn an_unobserved_evaluator_is_not_denied_on_last_seen_at_the_gate() {
+        use wicked_apps_core::ToNode;
+
+        // (core#1540) An earlier launch sharing the author provider is only a seat-selection hint.
+        let provider = format!("gate-fact-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "gate-fact-author");
+        build.observed_providers = vec![provider.clone()];
+        let review = unit(
+            2,
+            StageKind::Review,
+            PhaseRole::Evaluator,
+            "gate-fact-reviewer",
+        );
+        let units = [build, review.clone()];
+        crate::observed_provider::record_receipt(
+            "gate-fact-reviewer",
+            Some(vec![provider.clone()]),
+        );
+        crate::observed_provider::record_receipt("gate-fact-reviewer", None);
+        let evidence = crate::workflow::UnitEvidence::default();
+        assert!(
+            super::evaluator_relation(&units, &review, None)
+                .unwrap()
+                .on_builder_seat
+        );
+        let gate_observed = evidence.observed_providers.as_deref().or(Some(&[]));
+        let rel = super::evaluator_relation(&units, &review, gate_observed).unwrap();
+        assert!(!rel.on_builder_seat);
+        assert!(rel.conflict.is_none());
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        crate::domain::put_nodes(&mut store, &[units[0].to_node(), review.to_node()]).unwrap();
+        let receipt = super::gate_receipt(
+            &store,
+            "r",
+            &review,
+            &crate::assurance::RunAssurance::default(),
+            1,
+            super::GateFacts {
+                own_observed: gate_observed,
+                pinned: None,
+                checks: None,
+                checks_waived: None,
+                judge: None,
+                judge_skipped: None,
+                rules: None,
+                eval_ran: false,
+                eval_error: None,
+                tree: None,
+            },
+        );
+        assert!(receipt
+            .ran
+            .iter()
+            .any(|i| i == crate::assurance::DISTINCT_EVALUATOR));
+        assert!(!receipt
+            .skipped
+            .iter()
+            .any(|s| s.instrument == crate::assurance::DISTINCT_EVALUATOR));
+        let observed = [provider];
+        assert!(
+            super::evaluator_relation(&units, &review, Some(&observed))
+                .unwrap()
+                .on_builder_seat
+        );
+        let mut on_author = review;
+        on_author.assigned_cli = Some("gate-fact-author".into());
+        assert!(
+            super::evaluator_relation(&units, &on_author, gate_observed)
+                .unwrap()
+                .on_builder_seat
+        );
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn evaluator_on_another_key_calling_the_authors_provider_is_not_distinct() {
+        let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "codex");
+        build.observed_providers = vec!["chatgpt.com:443".into()];
+        let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "claude");
+        let units = [build, review.clone()];
+        let observed = vec!["chatgpt.com:443".into()];
+        assert_eq!(super::work_author_providers(&units, 2), observed);
+        let rel = super::evaluator_relation(&units, &review, Some(&observed)).unwrap();
+        assert!(rel.on_builder_seat);
+        let denial = rel.denial(&review);
+        assert_eq!(denial.source, super::DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
+        assert!(denial.reason.contains("observed calling `chatgpt.com:443`"));
+        assert!(denial.reason.contains("`codex`"));
     }
 }
 
@@ -6773,6 +7137,26 @@ mod denials_behind_tests {
             refresh(true, "t1", false, false),
         );
         assert_eq!(out, None);
+    }
+
+    /// #1062: a fresh QE word replaces a could-not-judge hold even when no executor seat ran.
+    #[test]
+    fn a_fresh_qe_review_clears_an_earlier_inconclusive_hold() {
+        let out = denials_behind_after_fold(
+            Vec::new(),
+            prior(
+                Some(vec![d(
+                    crate::qe_acceptance::review::DENIAL_SOURCE_QE_INCONCLUSIVE,
+                )]),
+                "repo_checks",
+                "t1",
+            ),
+            FoldRefresh {
+                qe: true,
+                ..floor_only("t1")
+            },
+        );
+        assert_eq!(sources(&out), Some(vec![]));
     }
 
     /// A changed tree is new work: only this fold's own layers count.
@@ -7128,5 +7512,57 @@ mod standing_first_tests {
         assert_eq!(standing_first(None, Some(refusal("a"))), Some(refusal("a")));
         assert_eq!(standing_first(Some(refusal("a")), None), Some(refusal("a")));
         assert_eq!(standing_first(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod changed_code_tests {
+    use super::changed_code;
+    use crate::worktree_guard::ChangedPath;
+
+    #[test]
+    fn stamp_tracks_code_non_code_unknown_and_sticky_code_changes() {
+        let source = [ChangedPath {
+            status: "M".into(),
+            path: "src/lib.rs".into(),
+        }];
+        let tests = [ChangedPath {
+            status: "A".into(),
+            path: "tests/check.rs".into(),
+        }];
+        let docs = [ChangedPath {
+            status: "M".into(),
+            path: "README.md".into(),
+        }];
+        assert_eq!(
+            changed_code(None, Some(true), Some(&source), false),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&tests), true),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&docs), false),
+            Some(false)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&[]), false),
+            Some(false)
+        );
+        assert_eq!(changed_code(None, Some(false), None, false), Some(false));
+        assert_eq!(changed_code(None, Some(true), Some(&docs), true), None);
+        assert_eq!(changed_code(None, Some(true), None, false), None);
+        assert_eq!(changed_code(None, None, None, false), None);
+        assert_eq!(changed_code(Some(false), None, None, false), None);
+        assert_eq!(
+            changed_code(Some(false), Some(true), Some(&source), false),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(Some(true), Some(false), Some(&docs), false),
+            Some(true)
+        );
+        assert_eq!(changed_code(Some(true), None, None, false), Some(true));
     }
 }

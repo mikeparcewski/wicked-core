@@ -31,6 +31,87 @@ fn seat(key: &str) -> crate::AgenticCli {
     }
 }
 
+#[test]
+fn rule_judges_try_the_seat_not_seen_on_the_creators_provider_first() {
+    let provider = format!("rule-order-{}:443", uuid::Uuid::new_v4());
+    crate::observed_provider::record_receipt("claude", Some(vec![provider.clone()]));
+    let pool = vec![seat("claude"), seat("codex")];
+    let (seats, why) = rule_judge_seats(
+        &["pi".into()],
+        Some(&["pi".into()]),
+        &[provider],
+        &[],
+        &[],
+        &[],
+        &pool,
+        &pool,
+        false,
+    );
+    assert!(why.is_none());
+    assert_eq!(seats, ["codex", "claude"]);
+    crate::observed_provider::take_receipts();
+}
+
+#[test]
+fn observed_shared_rule_approvals_fail_but_broken_findings_stand() {
+    struct Shared;
+    impl StepRunner for Shared {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            crate::observed_provider::record_receipt("codex", Some(vec!["rule-shared:443".into()]));
+            let nonce = crate::rule_check::tests::nonce_of(&input.unit.description);
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: 0,
+                attempt: 0,
+                output: format!(
+                    "BEGIN VERDICTS {nonce}\nRULE R1: KEPT — src/a.rs:2 typed signature\n\
+                     RULE R2: BROKEN — src/a.rs:2 no test\nEND VERDICTS {nonce}"
+                ),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let (repo, base, db) = fixture("provider-answers");
+    let input = review_input(&repo, &base, &db);
+    {
+        use wicked_apps_core::ToNode;
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut build = crate::domain::WorkUnit::pending("s:build", "s", 1, "build");
+        build.stage = crate::domain::StageKind::Build;
+        build.assigned_cli = Some("claude".into());
+        build.observed_providers = vec!["rule-shared:443".into()];
+        crate::domain::put_node(&mut store, build.to_node()).unwrap();
+    }
+    let pool = vec![seat("claude"), seat("codex")];
+    let report = run_rule_check(
+        &input,
+        &["claude".into()],
+        Some(&["claude".into()]),
+        &pool,
+        &pool,
+        None,
+        &Shared,
+        &|_| {},
+    )
+    .unwrap();
+    let r1 = report.rows.iter().find(|r| r.rule_id == "R1").unwrap();
+    let r2 = report.rows.iter().find(|r| r.rule_id == "R2").unwrap();
+    assert_eq!(
+        r1.status,
+        crate::rule_check::RuleStatus::Unchecked,
+        "{r1:?}"
+    );
+    assert!(
+        r1.reason.contains("observed calling the work's provider"),
+        "{r1:?}"
+    );
+    assert_eq!(r2.status, crate::rule_check::RuleStatus::Broken, "{r2:?}");
+}
+
 /// Answers R1 KEPT on any seat; records who was asked what.
 struct Recording(Mutex<Vec<(String, String)>>);
 
@@ -704,11 +785,13 @@ fn the_deliver_step_checks_a_deferred_rule_against_the_published_text() {
     let out = repo.join("pr-text.md");
     let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
     let ctx = |deferred: Vec<String>| DeliveryRuleCtx {
+        run_id: "delivery-run".into(),
         db_path: db.clone(),
         project: None,
         repo: None,
         creators: vec!["claude".into()],
         creator_bins: Some(Vec::new()),
+        creator_providers: Vec::new(),
         exclude_seats: Vec::new(),
         pool: vec![seat("claude"), seat("codex")],
         registry: vec![seat("claude"), seat("codex")],
@@ -771,11 +854,13 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
     let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
     let ctx = |db_path: String, deferred: Vec<String>, skips: Vec<crate::rule_check::RuleSkip>| {
         DeliveryRuleCtx {
+            run_id: "delivery-unchecked-run".into(),
             db_path,
             project: None,
             repo: None,
             creators: vec!["claude".into()],
             creator_bins: Some(Vec::new()),
+            creator_providers: Vec::new(),
             exclude_seats: Vec::new(),
             pool: vec![seat("claude"), seat("codex")],
             registry: vec![seat("claude"), seat("codex")],
@@ -803,6 +888,7 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     };
     let deferred = vec!["learn-linked-issue".to_string(), "retired-rule".to_string()];
     let held =
@@ -1035,6 +1121,7 @@ fn an_operator_ruling_reaches_the_judge_re_judges_the_cache_and_waives_only_on_c
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
     let confirmed = judge_with(&input, &judge);
     let row = r2(&confirmed);
@@ -1491,6 +1578,7 @@ fn confirm(input: &mut StepInput, report: &crate::rule_check::RuleCheckReport, i
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
 }
 
@@ -1627,11 +1715,12 @@ fn the_creator_record_set_is_every_done_code_writing_step_before_the_gate() {
             u.executes_code = code;
             u
         };
-        put_creator_record(
-            &mut store,
-            &unit(1, PhaseRole::Creator, true),
-            "build record",
-        );
+        let mut build = unit(1, PhaseRole::Creator, true);
+        build.changed_code = Some(true);
+        put_creator_record(&mut store, &build, "build record");
+        let mut docs = unit(0, PhaseRole::Creator, true);
+        docs.changed_code = Some(false);
+        put_creator_record(&mut store, &docs, "documentation only");
         put_creator_record(
             &mut store,
             &unit(2, PhaseRole::Neutral, true),
@@ -2472,6 +2561,7 @@ fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
     let again = judge(&input, None);
     let row = again.rows.iter().find(|r| r.rule_id == "R2").unwrap();

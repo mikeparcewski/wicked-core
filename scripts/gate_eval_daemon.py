@@ -93,6 +93,10 @@ def _handle(payload: dict) -> "tuple[bool, str, str | None]":
     named reason and NO model call, naming no judge (core treats that as a DENY)."""
     if _judge_excluded(payload):
         return False, _refusal(payload), None
+    # (core#1057) Core already admitted this rotation against the run's roster and bench.
+    eligible = payload.get("eligible_seats") or []
+    if eligible and JUDGE_CLI not in eligible:
+        return False, f"gate-eval daemon: {JUDGE_CLI} is outside eligible_seats {eligible}", None
     pass_, reasoning = _evaluate(payload.get("criterion", ""), payload.get("work", ""))
     return pass_, reasoning, JUDGE_CLI
 

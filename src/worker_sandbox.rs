@@ -554,9 +554,9 @@ impl FloorUnarmed {
                  store the cluster shares"
             }
             FloorUnarmed::PodNotReady => {
-                "pod_not_ready: the seat's pod was created but did not become ready in time (a \
-                 slow node under load, no refusal on record); the arm was retried with a backoff \
-                 (its phase, conditions and last events follow)"
+                "pod_not_ready: the seat's pod did not become ready by the arm's deadline, with no \
+                 refusal on record (a slow node under load); its evidence follows (whether a pod \
+                 was made, its phase, conditions, last events, and any earlier attempts)"
             }
             FloorUnarmed::PolicyRefused => {
                 "policy_refused: the cluster refused the seat's pod or a policy it needs (its error \
@@ -584,6 +584,41 @@ impl FloorUnarmed {
                  `git fetch --refetch <name>` (<name> is the remote marked promisor, usually \
                  origin), or clone it again without --filter, then retry"
             }
+        }
+    }
+
+    /// (core#1541) Arm evidence kept in the refusal, beyond the class's static description.
+    pub(crate) fn keeps_arm_detail(self) -> bool {
+        match self {
+            FloorUnarmed::AddressPoolsExhausted
+            | FloorUnarmed::SeatNetworkUnavailable
+            | FloorUnarmed::NoCluster
+            | FloorUnarmed::ClusterUnreachable
+            | FloorUnarmed::ControllerMissing
+            | FloorUnarmed::AdmissionPending
+            | FloorUnarmed::ImageUnavailable
+            | FloorUnarmed::PodNotReady
+            | FloorUnarmed::PolicyRefused
+            | FloorUnarmed::ExecStreamLost
+            | FloorUnarmed::PidsUnlimited
+            | FloorUnarmed::CopyInRefused
+            | FloorUnarmed::PartialClone => true,
+            FloorUnarmed::NotAWorktree
+            | FloorUnarmed::SeatArmsItsOwn
+            | FloorUnarmed::NoLauncher
+            | FloorUnarmed::CannotArm
+            | FloorUnarmed::RootUnresolvable
+            | FloorUnarmed::NoContainerRuntime
+            | FloorUnarmed::ContainerRuntimeDown
+            | FloorUnarmed::NoSeatImage
+            | FloorUnarmed::ContainerUnsupportedHost
+            | FloorUnarmed::GateHookUnreachable
+            | FloorUnarmed::HostOnlyCarrier
+            | FloorUnarmed::GatewayUnavailable
+            | FloorUnarmed::UnverifiedHookImage
+            | FloorUnarmed::AgentSignedOut
+            | FloorUnarmed::NeedsContainerFloor
+            | FloorUnarmed::ArgvTooLong => false,
         }
     }
 
@@ -1857,6 +1892,60 @@ esac
         // Every other refusal keeps its floor wording.
         let other = floor_refusal_text("agy", FloorUnarmed::NoSeatImage);
         assert!(other.starts_with("(seat 'agy' could not run"), "{other}");
+    }
+
+    #[test]
+    fn every_k8s_arm_class_keeps_its_detail() {
+        for why in [
+            FloorUnarmed::NoCluster,
+            FloorUnarmed::ClusterUnreachable,
+            FloorUnarmed::ControllerMissing,
+            FloorUnarmed::AdmissionPending,
+            FloorUnarmed::ImageUnavailable,
+            FloorUnarmed::PodNotReady,
+            FloorUnarmed::PolicyRefused,
+            FloorUnarmed::ExecStreamLost,
+            FloorUnarmed::PidsUnlimited,
+            FloorUnarmed::CopyInRefused,
+            FloorUnarmed::PartialClone,
+            FloorUnarmed::AddressPoolsExhausted,
+            FloorUnarmed::SeatNetworkUnavailable,
+        ] {
+            assert!(why.keeps_arm_detail(), "{why:?}");
+        }
+        for why in [
+            FloorUnarmed::NotAWorktree,
+            FloorUnarmed::SeatArmsItsOwn,
+            FloorUnarmed::NoLauncher,
+            FloorUnarmed::CannotArm,
+            FloorUnarmed::RootUnresolvable,
+            FloorUnarmed::NoContainerRuntime,
+            FloorUnarmed::ContainerRuntimeDown,
+            FloorUnarmed::NoSeatImage,
+            FloorUnarmed::ContainerUnsupportedHost,
+            FloorUnarmed::GateHookUnreachable,
+            FloorUnarmed::HostOnlyCarrier,
+            FloorUnarmed::GatewayUnavailable,
+            FloorUnarmed::UnverifiedHookImage,
+            FloorUnarmed::AgentSignedOut,
+            FloorUnarmed::NeedsContainerFloor,
+            FloorUnarmed::ArgvTooLong,
+        ] {
+            assert!(!why.keeps_arm_detail(), "{why:?}");
+        }
+    }
+
+    #[test]
+    fn pod_not_ready_describes_evidence_without_claiming_creation_or_retry() {
+        let text = FloorUnarmed::PodNotReady.describe();
+        assert!(
+            text.contains("did not become ready by the arm's deadline"),
+            "{text}"
+        );
+        assert!(text.contains("whether a pod was made"), "{text}");
+        assert!(text.contains("any earlier attempts"), "{text}");
+        assert!(!text.contains("was created"), "{text}");
+        assert!(!text.contains("the arm was retried"), "{text}");
     }
 
     #[cfg(unix)]

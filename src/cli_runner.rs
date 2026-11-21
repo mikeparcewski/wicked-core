@@ -113,7 +113,7 @@ const GATE_EVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(18
 /// Payload published to the bus when the gate needs an agent verdict.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct GateEvalRequest {
-    /// Deterministic per-(run, unit, attempt) key used to match the response.
+    /// (core#1540) Deterministic per attempt and admitted rotation, including monitor retries.
     eval_id: String,
     criterion: String,
     work: String,
@@ -135,6 +135,9 @@ struct GateEvalRequest {
     /// an un-teamed unit), so an old payload reads as `[]`.
     #[serde(default)]
     excluded_seats: Vec<String>,
+    /// (core#1057) The admitted rotation, including roster and bench exclusions.
+    #[serde(default)]
+    eligible_seats: Vec<String>,
 }
 
 /// Payload the governed evaluator daemon publishes back.
@@ -166,6 +169,10 @@ pub(crate) const JUDGE_UNNAMED_DENY: &str =
 /// (core#625) The DENY for a response judged by the work author (instance or cli key).
 pub(crate) const CREATOR_JUDGE_DENY: &str =
     "gate eval bus-path DENY (fail-closed): the evaluator judged as the work author";
+
+/// (core#1057) The responder must use the rotation core admitted.
+pub(crate) const JUDGE_INELIGIBLE_DENY: &str =
+    "gate eval bus-path DENY (fail-closed): evaluator judge is outside eligible_seats";
 
 /// The `wicked.task.dispatched` payload. Carries what the `cli-runner` needs to reconstruct the
 /// [`StepInput`] the in-process worker would have run — so it reuses the same [`StepRunner`] with
@@ -419,6 +426,7 @@ fn bus_request_agent_verdict(
     bus_db_path: &str,
     work_author: Option<&str>,
     excluded_seats: &[String],
+    eligible_seats: &[String],
 ) -> crate::validator::AgentVerdict {
     // Fail-closed helper: any error on the bus path is a governance deny, never a silent pass.
     macro_rules! bus_deny {
@@ -448,11 +456,14 @@ fn bus_request_agent_verdict(
         )),
     };
 
+    // (core#1540) A monitor retry has a new admission and must get its own response.
+    let admission = serde_json::json!([eligible_seats, excluded_seats]).to_string();
     let eval_id = deterministic_key(&[
         "gate-eval",
         run_id,
         &unit_ix.to_string(),
         &attempt.to_string(),
+        &admission,
     ]);
 
     let request = GateEvalRequest {
@@ -464,6 +475,7 @@ fn bus_request_agent_verdict(
         attempt,
         work_author: Some(author.to_string()),
         excluded_seats: excluded_seats.to_vec(),
+        eligible_seats: eligible_seats.to_vec(),
     };
     let payload = match serde_json::to_value(&request) {
         Ok(p) => p,
@@ -519,11 +531,14 @@ fn bus_request_agent_verdict(
                         Some(j) if crate::team::runner::is_excluded(j, &author_set) => {
                             bus_deny!(CREATOR_JUDGE_DENY.to_string())
                         }
+                        Some(j) if !eligible_seats.iter().any(|k| k == j) => {
+                            bus_deny!(JUDGE_INELIGIBLE_DENY.to_string())
+                        }
                         Some(_) => {}
                     }
                     return crate::validator::AgentVerdict {
                         judge_cli: resp.judge_cli,
-                        judge_distinct: None,
+                        judge_distinct: Some(true),
                         seat_failure: None,
                         judge_fallback: None,
                         pass: resp.pass,
@@ -556,6 +571,71 @@ fn bus_request_agent_verdict(
              Ensure the governed evaluator daemon is running and subscribed to '{GATE_EVAL_REQUESTED}'."
         ),
     }
+}
+
+// (core#1540) Admission precedes this one transport choice, including monitor retries.
+#[allow(clippy::too_many_arguments)]
+fn agent_judge_with_bus(
+    criterion: &str,
+    work: &str,
+    excluded: &[&str],
+    roster: &[crate::AgenticCli],
+    runner: &dyn StepRunner,
+    input: &StepInput,
+    exec_bus: Option<&str>,
+    wire_excluded: &[String],
+) -> (
+    anyhow::Result<crate::validator::AgentVerdict>,
+    Vec<(String, String)>,
+) {
+    let Some(bus) = gate_eval_bus_db(exec_bus) else {
+        // (core#1413) The judge serves the run whose unit it gates.
+        return crate::validator::agent_validate_with_refusals(
+            criterion,
+            work,
+            excluded,
+            roster,
+            runner,
+            Some(&input.run_id),
+        );
+    };
+    let mut eligible = crate::validator::distinct_judge_keys(excluded, roster);
+    eligible.sort_by_key(|k| crate::observed_provider::known_to_share(k));
+    // The wire's `excluded_seats` keeps its meaning (monitors, launch exclusions, earlier seats),
+    // less any the admission re-admitted; `eligible_seats` carries the admission itself.
+    let exclusions = wire_excluded
+        .iter()
+        .filter(|k| excluded.contains(&k.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let verdict = bus_request_agent_verdict(
+        criterion,
+        work,
+        &input.run_id,
+        input.unit_ix,
+        input.attempt,
+        &bus,
+        input.unit.assigned_cli.as_deref(),
+        &exclusions,
+        &eligible,
+    );
+    if let Some(seat) = verdict.judge_cli.as_deref().filter(|_| verdict.pass) {
+        if crate::observed_provider::known_to_share(seat)
+            || crate::observed_provider::observation_required()
+        {
+            return (
+                Err(crate::validator::NoIndependentJudge {
+                    seats: vec![seat.into()],
+                    work: crate::observed_provider::work_providers(),
+                    seen: vec![format!("{seat}: bus launch unobserved")],
+                    ..Default::default()
+                }
+                .into()),
+                Vec::new(),
+            );
+        }
+    }
+    (Ok(verdict), Vec::new())
 }
 
 // ── The shared execute+judge core (reused by BOTH the in-process worker AND the cli-runner) ──────────
@@ -796,16 +876,29 @@ pub(crate) fn rule_check_applies(input: &StepInput, output: &StepOutput) -> bool
 struct SeatRuleJudge<'a> {
     seats: &'a [crate::AgenticCli],
     runner: &'a dyn StepRunner,
+    parent_run_id: Option<&'a str>,
+    creator_providers: &'a [crate::observed_provider::Provider],
 }
 
 impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
     fn ask(&self, seat: &str, prompt: &str) -> crate::rule_check::JudgeAnswer {
         match self.seats.iter().find(|c| c.key == seat) {
-            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner),
+            Some(c) => crate::validator::run_rule_judge(prompt, c, self.runner, self.parent_run_id),
             None => {
                 crate::rule_check::JudgeAnswer::SeatFailed(format!("`{seat}` is not on the roster"))
             }
         }
+    }
+
+    fn approval_failure(&self, seat: &str) -> Option<String> {
+        let observed = crate::observed_provider::observed_this_thread(seat);
+        crate::observed_provider::shares_identity(
+            seat,
+            Some(&observed),
+            &[],
+            self.creator_providers,
+        )
+        .map(|why| format!("observed calling the work's provider: {why}"))
     }
 }
 
@@ -816,6 +909,7 @@ impl crate::rule_check::RuleJudge for SeatRuleJudge<'_> {
 fn rule_judge_seats(
     creators: &[String],
     creator_bins: Option<&[String]>,
+    creator_providers: &[crate::observed_provider::Provider],
     exclude_seats: &[String],
     authored_by: &[String],
     authored_binaries: &[String],
@@ -853,22 +947,32 @@ fn rule_judge_seats(
             // (DES-RULE-CHECK-001 rev 2, A.3) A launch-excluded seat is excluded by identity too:
             // an alias of it running the same binary is the same seat.
             ids.extend(excluded_identities(exclude_seats, registry));
-            let excluded: Vec<&str> = creators
+            let excluded: Vec<String> = creators
                 .iter()
                 .chain(exclude_seats)
                 .chain(authored_by)
-                .map(String::as_str)
+                .cloned()
                 .collect();
-            let keys: Vec<String> = pool
+            let mut keys: Vec<String> = pool
                 .iter()
                 .filter(|c| {
-                    !excluded.contains(&c.key.as_str())
+                    crate::observed_provider::shares_identity(&c.key, Some(&[]), &excluded, &[])
+                        .is_none()
                         && !c.headless_invocation.trim().is_empty()
                         && c.seat_eligible_for_work
                         && record_identities(c).iter().all(|i| !ids.contains(i))
                 })
                 .map(|c| c.key.clone())
                 .collect();
+            keys.sort_by_key(|seat| {
+                crate::observed_provider::shares_identity(
+                    seat,
+                    None,
+                    creators,
+                    creator_providers,
+                )
+                .is_some()
+            });
             let why = keys.is_empty().then(|| {
                 if creators.is_empty() {
                     "no signed-in judge seat on the run's roster".to_string()
@@ -1138,6 +1242,7 @@ pub(crate) fn rule_council_seats(
     let seats = rule_council_candidates(
         creators,
         creator_bins,
+        &[],
         exclude_seats,
         authored_by,
         authored_binaries,
@@ -1159,6 +1264,7 @@ pub(crate) fn rule_council_seats(
 fn rule_council_candidates(
     creators: &[String],
     creator_bins: Option<&[String]>,
+    creator_providers: &[crate::observed_provider::Provider],
     exclude_seats: &[String],
     authored_by: &[String],
     authored_binaries: &[String],
@@ -1269,7 +1375,7 @@ fn rule_council_candidates(
         keys.push(k);
         keys.push(wicked_apps_core::spawn::seat_cli_key(k));
     }
-    let seats: Vec<crate::AgenticCli> = registry
+    let mut seats: Vec<crate::AgenticCli> = registry
         .iter()
         .filter(|c| {
             c.enabled_for_council
@@ -1280,6 +1386,11 @@ fn rule_council_candidates(
         })
         .cloned()
         .collect();
+    // (core#1288) A seen-sharing seat cannot sit as an independent council member.
+    seats.retain(|c| {
+        crate::observed_provider::shares_identity(&c.key, None, creators, creator_providers)
+            .is_none()
+    });
     Ok(seats)
 }
 
@@ -1298,12 +1409,17 @@ fn dispute_arbiter(
     author_bins: &[&str],
     registry: &[crate::AgenticCli],
     pool: &[crate::AgenticCli],
+    creator_providers: &[crate::observed_provider::Provider],
 ) -> Option<(crate::AgenticCli, String)> {
     use wicked_apps_core::spawn::seat_cli_key;
     if let Some(c) = candidates.first() {
         return Some((c.clone(), format!("{} (distinct from every party)", c.key)));
     }
     let judge = judge?;
+    if crate::observed_provider::shares_identity(judge, None, creators, creator_providers).is_some()
+    {
+        return None;
+    }
     if !pool.is_empty() && !pool.iter().any(|c| c.key == judge) {
         return None;
     }
@@ -1504,6 +1620,7 @@ fn settle_rule_disputes(
     instructions: Option<&str>,
     creators: &[String],
     creator_bins: Option<&[String]>,
+    creator_providers: &[crate::observed_provider::Provider],
     registry: &[crate::AgenticCli],
     pool: &[crate::AgenticCli],
     council: Option<&CouncilCtx<'_>>,
@@ -1599,6 +1716,7 @@ fn settle_rule_disputes(
         let candidates = rule_council_candidates(
             creators,
             creator_bins,
+            creator_providers,
             &input.unit.exclude_seats,
             &input.unit.authored_by,
             &input.unit.authored_binaries,
@@ -1704,6 +1822,7 @@ fn settle_rule_disputes(
                     .as_slice(),
                 registry,
                 pool,
+                creator_providers,
             ) {
                 Some((seat, footing)) => (vec![seat], 1, Some(footing)),
                 None => {
@@ -1857,11 +1976,13 @@ fn settle_rule_disputes(
 /// (SWAP 6) What the deliver step's rule check needs, resolved on the actor thread (it holds the
 /// store): the rule store, the run's facts, the judge pool and the creators to keep out of it.
 pub(crate) struct DeliveryRuleCtx {
+    pub run_id: String,
     pub db_path: String,
     pub project: Option<String>,
     pub repo: Option<String>,
     pub creators: Vec<String>,
     pub creator_bins: Option<Vec<String>>,
+    pub creator_providers: Vec<crate::observed_provider::Provider>,
     pub exclude_seats: Vec<String>,
     pub pool: Vec<crate::AgenticCli>,
     pub registry: Vec<crate::AgenticCli>,
@@ -1940,6 +2061,7 @@ pub(crate) fn delivery_rule_check(
     let (seats, no_seat) = rule_judge_seats(
         &ctx.creators,
         ctx.creator_bins.as_deref(),
+        &ctx.creator_providers,
         &ctx.exclude_seats,
         &[],
         &[],
@@ -1952,9 +2074,13 @@ pub(crate) fn delivery_rule_check(
     let judge = SeatRuleJudge {
         seats: &ctx.pool,
         runner: &*ctx.runner,
+        parent_run_id: Some(&ctx.run_id),
+        creator_providers: &ctx.creator_providers,
     };
     let report = crate::rule_check::check(
         &crate::rule_check::CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &rules,
             facts: &facts,
             change: &change,
@@ -2341,12 +2467,20 @@ fn run_rule_check_with(
     let no_agent_creator = creators.is_empty()
         && no_agent_code
         && no_agent_creator_of(&gov.db_path, &input.run_id, &input.unit);
+    let creator_providers = run_units_strict(&gov.db_path, &input.run_id)
+        .map(|mut units| {
+            units.retain(|u| u.ord != input.unit.ord);
+            units.push(input.unit.clone());
+            crate::pipeline::work_author_providers(&units, input.unit.ord)
+        })
+        .unwrap_or_default();
     // Evaluator ≠ creator, no fallback: a seat is a judge only when neither its key nor any
     // binary it may execute (quote-aware, `record_identities`) is a creator's — the creators'
     // registry records and every binary they actually ran.
     let (seats, no_seat) = rule_judge_seats(
         creators,
         creator_bins,
+        &creator_providers,
         &input.unit.exclude_seats,
         &input.unit.authored_by,
         &input.unit.authored_binaries,
@@ -2428,9 +2562,18 @@ fn run_rule_check_with(
             }
         ),
     );
+    let rulings: Vec<crate::domain::OperatorRuling> = input
+        .unit
+        .operator_rulings
+        .iter()
+        .filter(|r| crate::actor::RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str()))
+        .cloned()
+        .collect();
     let judge = SeatRuleJudge {
         seats: pool,
         runner,
+        parent_run_id: Some(&input.run_id),
+        creator_providers: &creator_providers,
     };
     let mut report = with_floor_heartbeat(
         emit_delta,
@@ -2439,6 +2582,15 @@ fn run_rule_check_with(
         || {
             crate::rule_check::check(
                 &crate::rule_check::CheckInput {
+                    seat_attempt: Some(
+                        input
+                            .unit
+                            .requested_rejudge
+                            .as_ref()
+                            .map(|r| r.attempt)
+                            .unwrap_or(input.attempt),
+                    ),
+                    rulings: &rulings,
                     rules: &rules,
                     facts: &facts,
                     change: &change,
@@ -2484,6 +2636,7 @@ fn run_rule_check_with(
             Some(instructions.as_str()).filter(|t| !t.is_empty()),
             creators,
             creator_bins,
+            &creator_providers,
             registry,
             st.council_pool,
             st.council,
@@ -2903,8 +3056,9 @@ fn launch_preset(db_path: &str, run_id: &str) -> Option<Option<String>> {
 
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the
 /// approved output of EVERY agent step that writes code (a creator, or an `executes_code` phase)
-/// done before `ord`,
-/// read from the run's store READ-ONLY (as the rules are). A step with no approved output is kept
+/// done before `ord`.
+/// (core#1316) Steps known to have changed no code are excluded; old, unknown records stay.
+/// Read from the run's store READ-ONLY (as the rules are). A step with no approved output is kept
 /// with an empty record (codex r1: it recorded nothing, which the check decides; it is never left
 /// out). `Err` when the store or a record cannot be read.
 fn creator_records(
@@ -2924,6 +3078,7 @@ fn creator_records(
             && u.tool_cmd.is_none()
             && (u.role == crate::workflow::PhaseRole::Creator || u.executes_code)
             && u.status == crate::domain::UnitStatus::Done
+            && u.changed_code != Some(false)
     }) {
         let node = store
             .get_node(&wicked_apps_core::synthetic_symbol(
@@ -3033,6 +3188,7 @@ pub(crate) fn reprobe_due_benches(
     bench: &[crate::domain::BenchedSeat],
     now: i64,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> (
     Vec<crate::domain::BenchedSeat>,
     Vec<crate::seat_bench::BenchReprobe>,
@@ -3047,7 +3203,7 @@ pub(crate) fn reprobe_due_benches(
                 .iter()
                 .find(|c| c.key == b.cli)
                 .or_else(|| registry.iter().find(|c| c.key == key))?;
-            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner);
+            let answer = crate::validator::reprobe_seat(&b.cli, seat, runner, parent_run_id);
             let r = crate::seat_bench::reprobe_outcome(
                 b,
                 answer.as_deref().map_err(String::as_str),
@@ -3641,6 +3797,11 @@ pub(crate) fn rejudge_seats(
     registry: &[crate::AgenticCli],
 ) -> (Vec<String>, Vec<crate::MissingJudgeSeat>) {
     use crate::team::runner::seat_key;
+    let observed = crate::observed_provider::Observed {
+        providers: unit.observed_providers.clone(),
+        complete: !unit.providers_unobserved && !unit.observed_providers.is_empty(),
+    };
+    let _judging = crate::observed_provider::JudgingWork::of(&observed);
     // (PRODUCT-WORKS J4) A seat whose QUOTA bench has fallen due is a candidate: the re-judge's
     // attempt re-probes it before its judge reads the bench, and seats it when it answers.
     let bench = crate::domain::ungoverned_bench(&crate::seat_bench::without_due(
@@ -3711,7 +3872,7 @@ pub(crate) fn rejudge_seats(
             "monitored this step for the team, so it never grades its own findings",
         );
     }
-    let mut base_len = parties.len();
+    let base_len = parties.len();
     // (core#954) An evaluator unit's judge excludes the work's creators — and the binaries they
     // ran — unless that leaves no preferred seat; then the rotation re-admits them.
     let evaluator = unit.role == crate::workflow::PhaseRole::Evaluator;
@@ -3720,7 +3881,7 @@ pub(crate) fn rejudge_seats(
             party(&mut parties, a, "created the work this review reads");
         }
     }
-    let creator_bins: Vec<String> = if evaluator && parties.len() > base_len {
+    let creator_bins: Vec<String> = if evaluator && !work_authors.is_empty() {
         author_binaries.map(<[String]>::to_vec).unwrap_or_default()
     } else {
         Vec::new()
@@ -3735,6 +3896,60 @@ pub(crate) fn rejudge_seats(
         .filter(|c| !benched.iter().any(|b| b == &c.key))
         .cloned()
         .collect();
+    // (core#1540) Readiness uses the gate's admission rules, before reading availability.
+    let baseline = parties[..monitors_from]
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect::<Vec<_>>();
+    let monitors = parties[monitors_from..base_len]
+        .iter()
+        .map(|(p, _)| p.clone())
+        .collect::<Vec<_>>();
+    let creators = if evaluator {
+        work_authors
+            .iter()
+            .flat_map(|k| [k.clone(), seat_key(k).to_string()])
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let mut excluded = baseline.iter().map(String::as_str).collect::<Vec<_>>();
+    if pinned {
+        readmit_validator_author(
+            &mut excluded,
+            unit,
+            &work_author,
+            roster,
+            observed.known(),
+            &|ex| {
+                let ids = author_identities(ex, roster);
+                crate::validator::distinct_judge_available(
+                    ex,
+                    &without_author_binaries(&unbenched, ex, &ids),
+                )
+            },
+        );
+    }
+    let has_judge = |ex: &[&str]| {
+        let mut ids = author_identities(ex, roster);
+        ids.extend(creator_bins.iter().cloned());
+        crate::validator::independent_judge_available(
+            ex,
+            &without_author_binaries(&eligible_pool, ex, &ids),
+        )
+    };
+    let monitor_fallback = exclude_monitors(&mut excluded, &monitors, &creators, has_judge);
+    let creator_fallback = exclude_creators(&mut excluded, &creators, has_judge);
+    parties.retain(|(k, _)| excluded.contains(&k.as_str()));
+    // A creator that also monitored stays out as a creator once the monitors are re-admitted
+    // (xreview on #1165).
+    if monitor_fallback.is_some() {
+        for (k, why) in parties.iter_mut() {
+            if monitors.contains(k) && creators.contains(k) {
+                *why = "created the work this review reads";
+            }
+        }
+    }
     // The preferred judges (the run's own seats, bench applied), the distinct seats the bench took
     // out, and the authors' identities — as the rotation computes them.
     let preferred_for = |parties: &[(String, &'static str)], bins: &[String]| {
@@ -3754,30 +3969,12 @@ pub(crate) fn rejudge_seats(
         .collect();
         (preferred, lost, ids)
     };
-    let (mut preferred, mut lost, mut ids) = preferred_for(&parties, &creator_bins);
-    // (crew#972) As the rotation does ([`exclude_monitors`]): with no judge distinct from the
-    // monitors and the creators, the monitors are re-admitted first.
-    if preferred.is_empty() && base_len > monitors_from {
-        parties.drain(monitors_from..base_len);
-        base_len = monitors_from;
-        // A creator that also monitored was deduplicated into the monitor slice: it stays out as a
-        // creator, with its binaries (xreview on #1165).
-        let mut bins = creator_bins.clone();
-        if evaluator {
-            let before = parties.len();
-            for a in work_authors {
-                party(&mut parties, a, "created the work this review reads");
-            }
-            if parties.len() > before && bins.is_empty() {
-                bins = author_binaries.map(<[String]>::to_vec).unwrap_or_default();
-            }
-        }
-        (preferred, lost, ids) = preferred_for(&parties, &bins);
-    }
-    if preferred.is_empty() && parties.len() > base_len {
-        parties.truncate(base_len);
-        (preferred, lost, ids) = preferred_for(&parties, &[]);
-    }
+    let bins = if creator_fallback.is_none() {
+        creator_bins.as_slice()
+    } else {
+        &[]
+    };
+    let (mut preferred, lost, ids) = preferred_for(&parties, bins);
     // A FALLBACK judge stands in when the preferred ones are benched or fail as seats — never when
     // no distinct seat ever existed (the judge is skipped), and never when an author's binary is
     // unknown (`fallback_ids` in the rotation: no seat can be shown distinct from it).
@@ -3803,6 +4000,7 @@ pub(crate) fn rejudge_seats(
         }
         _ => Vec::new(),
     };
+    preferred.sort_by_key(|s| crate::observed_provider::known_to_share(s));
     let mut seats = preferred;
     seats.extend(fallback);
     let missing = run_roster
@@ -4531,6 +4729,7 @@ fn fallback_judge(
     runner: &dyn StepRunner,
     note_refusals: &RefusalSink<'_>,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> FallbackJudge {
     if candidates.is_empty() {
         return FallbackJudge::NoCandidate;
@@ -4576,6 +4775,7 @@ fn fallback_judge(
             excluded,
             std::slice::from_ref(seat),
             runner,
+            parent_run_id,
         );
         note_refusals(&refused);
         match verdict {
@@ -4662,6 +4862,7 @@ fn judge_error_or_fallback(
     runner: &dyn StepRunner,
     note_refusals: &RefusalSink<'_>,
     emit_delta: &DeltaSink,
+    parent_run_id: Option<&str>,
 ) -> crate::validator::AgentVerdict {
     // (core#1543) The rotation ran out of INDEPENDENT judges: the ladder continues the same search
     // over the fallback seats; only when it runs out too does the gate hold.
@@ -4712,6 +4913,7 @@ fn judge_error_or_fallback(
         runner,
         note_refusals,
         emit_delta,
+        parent_run_id,
     );
     // The hold names the rotation's own same-provider approvals too, not only the ladder's.
     let preferred_refusals = match &independent {
@@ -5332,9 +5534,17 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // the fix the operator's note asks for — the phase itself does not run again. The rest of
     // this thread then runs on the fixed tree: the guard re-baselined on it (the fix is not the
     // phase's own mutation; anything after it still is), the fixing seat excluded from any judge.
+    crate::observed_provider::take_receipts();
     let fixed: Option<(StepInput, StepOutput)> = floor_rerun
         .and_then(|r| r.fix.as_ref())
         .map(|fix| run_floor_fix(runner, input, fix, emit_delta));
+    // (core#1546) Consume the fixer's receipts before the unit's own launch boundary.
+    let fix_observed = floor_rerun.and_then(|r| r.fix.as_ref()).map(|fix| {
+        crate::observed_provider::observed_for(
+            &crate::observed_provider::take_receipts(),
+            &fix.seat,
+        )
+    });
     let input = fixed.as_ref().map(|(i, _)| i).unwrap_or(input);
     // (rejudge) The operator RE-ARMED the judge at this unit's `judge_unavailable` gate: the seat
     // does NOT run again — the output its reviewed attempt captured is handed to the judge, drawn
@@ -5424,10 +5634,25 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // completed its work. It folds as a completed turn, so a FAIL is judged as a FAIL — the gate, or
     // a send-back — and is never failed over to another seat that might say PASS.
     // (core#1543) The providers the unit's own launch was observed calling.
-    let work_observed = crate::observed_provider::observed_for(
-        &crate::observed_provider::take_receipts(),
-        input.unit.assigned_cli.as_deref().unwrap_or("claude"),
-    );
+    let mut work_observed = if floor_rerun.is_some() || rejudge.is_some() {
+        crate::observed_provider::Observed {
+            providers: input.unit.observed_providers.clone(),
+            complete: !input.unit.providers_unobserved && !input.unit.observed_providers.is_empty(),
+        }
+    } else {
+        crate::observed_provider::observed_for(
+            &crate::observed_provider::take_receipts(),
+            input.unit.assigned_cli.as_deref().unwrap_or("claude"),
+        )
+    };
+    if let Some(fix) = fix_observed {
+        work_observed.complete &= fix.complete;
+        for p in fix.providers {
+            if !work_observed.providers.contains(&p) {
+                work_observed.providers.push(p);
+            }
+        }
+    }
     // …and every provider this unit's earlier folded launches were seen calling: a judge sharing
     // any of them is not independent of the work either (codex confirmation on the re-land).
     let work_history = {
@@ -5511,7 +5736,23 @@ fn run_unit_and_judge_in<'scope, 'env>(
         bound_agent && (tree_changed != Some(false) || unfloored_tree || floor_rerun.is_some());
     // (rejudge) The DEFAULT judge re-runs on a re-judge even though the tree is the one its floor
     // already judged — the judge is what the operator asked for; the checks are not re-run.
-    let default_judge_applies = default_floor_applies || (bound_agent && rejudge.is_some());
+    // (core#1366) Read-only reports require their rubric judge even with no tree change.
+    // (core#1366) Retain the resolved rubric for the criterion without a second lookup.
+    let report_rubric: Option<&'static crate::rubric::Rubric> = input
+        .unit
+        .rubric
+        .as_deref()
+        .and_then(crate::rubric::rubric)
+        .filter(|r| r.recheck_excludes_gatherers);
+    let report_judge = report_rubric.is_some()
+        && output.status == StepStatus::Ok
+        && !member_reviewing
+        && input.unit.tool_cmd.is_none()
+        && input.unit.role == crate::workflow::PhaseRole::Evaluator
+        && input.workdir.is_some()
+        && !input.unit.validator.as_ref().is_some_and(|v| v.approved);
+    let default_judge_applies =
+        default_floor_applies || (bound_agent && rejudge.is_some()) || report_judge;
     // An OPERATOR RETRY of this unit's escalation gate armed ONE re-run of its floor
     // (`RepoChecksReport::recheck`): the checks run on the tree as it stands even when this
     // attempt left it unchanged — the single exception to the core#544 carry-forward, so a flaky
@@ -5784,6 +6025,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             fallback.bench,
             crate::seat_bench::now_ms(),
             emit_delta,
+            Some(&input.run_id),
         )
     } else {
         (fallback.bench.to_vec(), Vec::new())
@@ -5894,13 +6136,17 @@ fn run_unit_and_judge_in<'scope, 'env>(
             }
         }
     };
-    let work_owned = select_work_for_agent(
-        input.unit.role,
-        &input.unit.required_deliverables,
-        input.workdir.as_deref(),
-        agent_review_target,
-        &output.output,
-    );
+    let work_owned = if report_judge {
+        std::borrow::Cow::Borrowed(output.output.as_str())
+    } else {
+        select_work_for_agent(
+            input.unit.role,
+            &input.unit.required_deliverables,
+            input.workdir.as_deref(),
+            agent_review_target,
+            &output.output,
+        )
+    };
     // Judge-visible worktree evidence (core#280): computed only when a judge will actually run —
     // same conditions as the `agent_verdict` block below — so ordinary units pay no git spawns.
     let will_judge = output.status == StepStatus::Ok
@@ -5945,8 +6191,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     crate::observed_provider::take_receipts();
     let _judging = crate::observed_provider::JudgingWork::of(&work_history);
     let agent_verdict = if output.status == StepStatus::Ok && input.workdir.is_some() {
-        // (#539) Labeled block so the bus path and the distinct-judge pre-check can both exit
-        // early without a closure (closures cannot mutate `judge_skipped`).
+        // (core#1540) Both transports reach the pinned path's admission and disclosures.
         let pinned: Option<crate::validator::AgentVerdict> = 'pinned: {
             let Some(v) = input.unit.validator.as_ref().filter(|v| v.approved) else {
                 break 'pinned None;
@@ -5957,34 +6202,6 @@ fn run_unit_and_judge_in<'scope, 'env>(
             // run (the repository's own target when the person set or lowered it).
             let judge_criterion =
                 crate::domain_extraction::pinned_judge_criterion_for(v, input.governance.as_ref());
-            // BUS PATH: only over a bus exec mediation ARMED for this unit (`gate_eval_bus_db`; never
-            // process env — DES-TEAMING-002 T0), publish a gate-evaluation request and
-            // wait for the governed evaluator daemon to respond (no subprocess, no dangerous flags,
-            // no TTY). On timeout or any error the function returns a hard DENY (fail-closed
-            // governance — a timeout must never silently approve a gate by falling back to
-            // deterministic-only).
-            if let Some(bus_path) = gate_eval_bus_db(exec_bus) {
-                // Carry the work author so the evaluator daemon can enforce evaluator≠creator on
-                // the bus path (same guarantee the inline path enforces via excluded[] at ~499).
-                let work_author = input.unit.assigned_cli.as_deref();
-                // The daemon does not report which seat judged: `judge_cli` stays `None` on
-                // this path (core#431) — an honest unknown, never a guessed seat.
-                break 'pinned Some(bus_request_agent_verdict(
-                    &judge_criterion,
-                    work_for_agent,
-                    &input.run_id,
-                    input.unit_ix,
-                    input.attempt,
-                    &bus_path,
-                    work_author,
-                    &bus_excluded,
-                ));
-            }
-            // INLINE PATH (legacy — no bus): spawn a governed council seat subprocess.
-            // GAP B + C1: run the agent judge under a council seat whose identity is DISTINCT from
-            // BOTH the deterministic validator's author (`DETERMINISTIC_VALIDATOR_SEAT`) AND the
-            // WORK's own author (the unit's `assigned_cli`, falling back to the deterministic author
-            // when unassigned). Excluding the work author is what stops a self-grade.
             let work_author = input
                 .unit
                 .assigned_cli
@@ -6011,8 +6228,9 @@ fn run_unit_and_judge_in<'scope, 'env>(
             // if its own launch is observed calling another provider (verified below).
             let has_any_judge = |ex: &[&str]| {
                 let ids = author_identities(ex, roster);
-                let all = without_author_binaries(&eligible, ex, &ids);
-                let configured = without_author_binaries(&eligible_configured, ex, &ids);
+                // (core#1540) Admission precedes availability, including a quota-benched author.
+                let all = without_author_binaries(&unbenched, ex, &ids);
+                let configured = without_author_binaries(&unbenched_run, ex, &ids);
                 crate::validator::distinct_judge_available(ex, judge_roster(ex, &configured, &all))
             };
             validator_fallback = readmit_validator_author(
@@ -6116,6 +6334,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
@@ -6177,12 +6396,15 @@ fn run_unit_and_judge_in<'scope, 'env>(
             // a note the run showed 1.5 min with no event at all. Said on the unit's own stream.
             let (mut verdict, mut refused) =
                 with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
-                    crate::validator::agent_validate_with_refusals(
+                    agent_judge_with_bus(
                         &judge_criterion,
                         work_for_agent,
                         &excluded,
                         roster,
                         &**runner,
+                        input,
+                        exec_bus,
+                        &bus_excluded,
                     )
                 });
             // A cold seat's provider was unknown to the monitor pre-check. The exhausted
@@ -6209,12 +6431,15 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 roster = judge_roster(&excluded, &configured_x, &eligible_x);
                 let (retried, refusals) =
                     with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
-                        crate::validator::agent_validate_with_refusals(
+                        agent_judge_with_bus(
                             &judge_criterion,
                             work_for_agent,
                             &excluded,
                             roster,
                             &**runner,
+                            input,
+                            exec_bus,
+                            &bus_excluded,
                         )
                     });
                 verdict = retried;
@@ -6297,6 +6522,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                     &**runner,
                     &note_refusals,
                     emit_delta,
+                    Some(&input.run_id),
                 ),
             })
         };
@@ -6352,7 +6578,11 @@ fn run_unit_and_judge_in<'scope, 'env>(
             let mut run_x = without_author_binaries(&eligible_run, &excluded, &author_ids);
             let registry = roster;
             let mut roster = run_x.as_slice();
-            let criterion = crate::validator::default_judge_criterion(&input.unit);
+            let criterion = if let Some(rubric) = report_rubric.filter(|_| report_judge) {
+                crate::rubric::expand(input.unit.instructions.as_deref(), rubric)
+            } else {
+                crate::validator::default_judge_criterion(&input.unit)
+            };
             if let Some(b) = benched_judge_unavailable(
                 "default judge",
                 &excluded,
@@ -6385,6 +6615,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                     None => FallbackJudge::NoCandidate,
                 };
@@ -6396,19 +6627,21 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 ))
             } else if crate::validator::distinct_judge_available(&excluded, roster) {
                 eprintln!(
-                    "wicked-core: unit {} changed the worktree tree with no pinned validator — \
+                    "wicked-core: unit {} requires a judge with no pinned validator — \
                      convening the default judge (evaluator ≠ creator '{work_author}') \
                      (F-7R2-005)",
                     input.unit.ord
                 );
                 let (mut verdict, mut refused) =
                     with_floor_heartbeat(emit_delta, JUDGE_NOTE, FLOOR_HEARTBEAT_EVERY, || {
+                        // (core#1057, DES-TEAMING-002 T0) Only pinned judges use the exec bus.
                         crate::validator::agent_validate_with_refusals(
                             &criterion,
                             work_for_agent,
                             &excluded,
                             roster,
                             &**runner,
+                            Some(&input.run_id),
                         )
                     });
                 // As on the pinned path, a cold provider observation can undo only the
@@ -6435,6 +6668,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                                 &excluded,
                                 roster,
                                 &**runner,
+                                Some(&input.run_id),
                             )
                         });
                     verdict = retried;
@@ -6483,6 +6717,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                         &**runner,
                         &note_refusals,
                         emit_delta,
+                        Some(&input.run_id),
                     ),
                 })
             } else {
@@ -7673,6 +7908,475 @@ fn run_task_completed_poller(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn report_input(workdir: &std::path::Path) -> StepInput {
+        let mut unit = crate::domain::WorkUnit::pending("r:report", "r", 3, "check the report");
+        unit.assigned_cli = Some("codex".into());
+        unit.stage = crate::domain::StageKind::Review;
+        unit.role = crate::workflow::PhaseRole::Evaluator;
+        unit.catalog = Some("critique".into());
+        unit.rubric = Some("cited-findings".into());
+        unit.instructions = Some("Check the citations in this report".into());
+        unit.worktree_guarded = true;
+        StepInput {
+            base_commit: None,
+            run_id: "r".into(),
+            unit_ix: 2,
+            attempt: 1,
+            unit,
+            workflow_id: "review-change".into(),
+            entity_mode: EntityMode::Isolated,
+            workdir: Some(workdir.to_path_buf()),
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        }
+    }
+
+    #[derive(Default)]
+    struct ReportRunner(std::sync::Mutex<Vec<StepInput>>);
+
+    struct ObservingReportRunner {
+        inner: ReportRunner,
+        providers: Vec<(String, Vec<String>)>,
+    }
+
+    impl StepRunner for ObservingReportRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            if let Some((seat, providers)) = self
+                .providers
+                .iter()
+                .find(|(seat, _)| input.unit.assigned_cli.as_ref() == Some(seat))
+            {
+                crate::observed_provider::record_receipt(seat, Some(providers.clone()));
+            }
+            self.inner.run_unit(input)
+        }
+    }
+
+    fn with_bus_responder<T>(
+        judge: &str,
+        pass: bool,
+        run: impl FnOnce(&str) -> T,
+    ) -> (T, Vec<GateEvalRequest>) {
+        let dir = std::env::temp_dir().join(format!("core-bus-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bus.db").to_string_lossy().into_owned();
+        let db = BusDb::open(&path).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let responder_stop = stop.clone();
+        let judge = judge.to_string();
+        let responder = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            let mut floor = 0;
+            while !responder_stop.load(Ordering::SeqCst) {
+                for ev in db.poll(GATE_EVAL_REQUESTED, floor, 20).unwrap() {
+                    floor = ev.event_id;
+                    let request: GateEvalRequest = serde_json::from_value(ev.payload).unwrap();
+                    db.emit(&BusEmit::new(
+                        GATE_EVAL_RESPONDED,
+                        "test",
+                        "test.gate",
+                        serde_json::json!({
+                            "eval_id": request.eval_id, "pass": pass,
+                            "reasoning": "bus judgment", "judge_cli": judge,
+                        }),
+                    ))
+                    .unwrap();
+                    requests.push(request);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            requests
+        });
+        let result = run(&path);
+        stop.store(true, Ordering::SeqCst);
+        let requests = responder.join().unwrap();
+        let _ = std::fs::remove_dir_all(dir);
+        (result, requests)
+    }
+
+    #[test]
+    fn bus_admission_matches_readiness_and_discloses_the_readmitted_validator_author() {
+        let dir = std::env::temp_dir();
+        let mut input = report_input(&dir);
+        input.unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "report is supported".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        input.unit.observed_providers = vec!["bus-admission-work:443".into()];
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let run = vec!["claude".to_string(), "codex".to_string()];
+        let (ready, _) = rejudge_seats(
+            &input.unit,
+            &roster,
+            &run,
+            &[],
+            &[],
+            Some(&[]),
+            &[],
+            &roster,
+        );
+        let runner: Arc<dyn StepRunner> = Arc::new(ObservingReportRunner {
+            inner: ReportRunner::default(),
+            providers: vec![("codex".into(), input.unit.observed_providers.clone())],
+        });
+        let ((_, verdict, evidence), requests) = with_bus_responder("claude", false, |bus| {
+            run_unit_and_judge_on(
+                &runner,
+                &input,
+                None,
+                &|_| {},
+                &roster,
+                &run,
+                &[],
+                JudgeFallbackCtx::default(),
+                Some(bus),
+                None,
+            )
+        });
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].eligible_seats, vec!["claude"]);
+        assert_eq!(ready.first(), requests[0].eligible_seats.first());
+        assert!(evidence.judge_skipped.is_none());
+        let verdict = verdict.unwrap();
+        assert!(!verdict.pass);
+        let disclosure = verdict.judge_fallback.unwrap().label;
+        assert!(disclosure.contains("validator's author"), "{disclosure}");
+        assert!(
+            disclosure.contains("a denial, which stands without that check"),
+            "{disclosure}"
+        );
+    }
+
+    #[test]
+    fn bus_rejects_a_response_outside_the_admitted_rotation() {
+        let (verdict, _) = with_bus_responder("outside", true, |bus| {
+            bus_request_agent_verdict(
+                "criterion",
+                "work",
+                "bus-outside",
+                1,
+                0,
+                bus,
+                Some("author"),
+                &[],
+                &["eligible".into()],
+            )
+        });
+        assert!(!verdict.pass);
+        assert_eq!(verdict.reasoning, JUDGE_INELIGIBLE_DENY);
+    }
+
+    #[test]
+    fn bus_approval_cannot_supply_required_observation() {
+        let work = crate::observed_provider::Observed {
+            providers: vec!["bus-required-work:443".into()],
+            complete: true,
+        };
+        let judging = crate::observed_provider::JudgingWork::of(&work);
+        judging.require_observed();
+        let dir = std::env::temp_dir();
+        let input = report_input(&dir);
+        let runner = ReportRunner::default();
+        let roster = [seat("pi", "pi -p {PROMPT}")];
+        let ((verdict, _), _) = with_bus_responder("pi", true, |bus| {
+            agent_judge_with_bus(
+                "criterion",
+                "work",
+                &["codex"],
+                &roster,
+                &runner,
+                &input,
+                Some(bus),
+                &[],
+            )
+        });
+        assert!(verdict
+            .unwrap_err()
+            .is::<crate::validator::NoIndependentJudge>());
+    }
+
+    #[test]
+    fn bus_shared_provider_approval_is_not_independent_and_a_denial_stands() {
+        let provider = format!("bus-shared-{}:443", uuid::Uuid::new_v4());
+        let work = crate::observed_provider::Observed {
+            providers: vec![provider.clone()],
+            complete: true,
+        };
+        let _judging = crate::observed_provider::JudgingWork::of(&work);
+        crate::observed_provider::record_receipt("bus-sharing-judge", Some(vec![provider]));
+        crate::observed_provider::take_receipts();
+        let input = report_input(&std::env::temp_dir());
+        let runner = ReportRunner::default();
+        let roster = [seat("bus-sharing-judge", "pi -p {PROMPT}")];
+        for pass in [true, false] {
+            let ((verdict, _), _) = with_bus_responder("bus-sharing-judge", pass, |bus| {
+                agent_judge_with_bus(
+                    "criterion",
+                    "work",
+                    &["codex"],
+                    &roster,
+                    &runner,
+                    &input,
+                    Some(bus),
+                    &[],
+                )
+            });
+            if pass {
+                assert!(verdict
+                    .unwrap_err()
+                    .is::<crate::validator::NoIndependentJudge>());
+            } else {
+                assert!(!verdict.unwrap().pass);
+            }
+        }
+    }
+
+    #[test]
+    fn quota_benched_validator_author_stays_admitted_and_holds_as_a_seat_failure() {
+        let mut input = report_input(&std::env::temp_dir());
+        input.unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "report is supported".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let run = vec!["claude".to_string(), "codex".to_string()];
+        let bench = vec![crate::domain::BenchedSeat {
+            cli: "claude".into(),
+            reason: "quota_exhausted".into(),
+            source: "judge".into(),
+            governed_only: false,
+            benched_until: None,
+            strikes: 1,
+            replaced: None,
+        }];
+        let runner: Arc<dyn StepRunner> = Arc::new(ObservingReportRunner {
+            inner: ReportRunner::default(),
+            providers: vec![("codex".into(), vec!["benched-author-work:443".into()])],
+        });
+        let (_, verdict, evidence) = run_unit_and_judge_with_fallback(
+            &runner,
+            &input,
+            &|_| {},
+            &roster,
+            &run,
+            &bench,
+            &[],
+            &[],
+        );
+        assert!(evidence.judge_skipped.is_none());
+        let verdict = verdict.unwrap();
+        assert!(verdict.seat_failure.is_some(), "{verdict:?}");
+        assert!(verdict.reasoning.contains("quota_exhausted"), "{verdict:?}");
+    }
+
+    #[test]
+    fn rejudge_reuses_only_complete_persisted_provider_history_for_readmission() {
+        let mut input = report_input(&std::env::temp_dir());
+        input.unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "report is supported".into(),
+            script: "true".into(),
+            approved: true,
+        });
+        input.unit.observed_providers = vec!["rejudge-work:443".into()];
+        input.unit.requested_rejudge = Some(crate::domain::RequestedRejudge {
+            output: "persisted report".into(),
+            attempt: 1,
+            seats: vec!["claude".into()],
+            monitors: Vec::new(),
+            team: None,
+            consumed: false,
+            at: 0,
+        });
+        let roster = [
+            seat("claude", "claude -p {PROMPT}"),
+            seat("codex", "codex {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(ObservingReportRunner {
+            inner: ReportRunner::default(),
+            providers: vec![("claude".into(), vec!["rejudge-judge:443".into()])],
+        });
+        let (_, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, &|_| {}, &roster, &[], &[]);
+        assert!(verdict.unwrap().pass);
+        assert!(evidence.judge_skipped.is_none());
+        assert_eq!(
+            evidence.observed_providers,
+            Some(vec!["rejudge-work:443".into()])
+        );
+        input.unit.providers_unobserved = true;
+        let (_, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, &|_| {}, &roster, &[], &[]);
+        assert!(verdict.is_none());
+        assert!(evidence.judge_skipped.is_some());
+    }
+
+    #[test]
+    fn floor_fix_provider_is_part_of_the_work_the_judge_must_not_share() {
+        let mut input = report_input(&std::env::temp_dir());
+        input.unit.observed_providers = vec!["floor-original:443".into()];
+        let mut report: crate::repo_checks::RepoChecksReport =
+            serde_json::from_value(serde_json::json!({
+                "detected": [], "checks": [], "skipped": [], "passed": false,
+                "sandbox_level": "none"
+            }))
+            .unwrap();
+        report.requested_rerun = Some(crate::repo_checks::FloorRerun {
+            mode: crate::repo_checks::FloorRerunMode::FloorFix,
+            waive: Vec::new(),
+            output: "persisted report".into(),
+            fix: Some(crate::repo_checks::FloorFix {
+                note: "fix it".into(),
+                seat: "pi".into(),
+            }),
+        });
+        input.unit.repo_checks = Some(report);
+        let roster = [
+            seat("codex", "codex {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+            seat("claude", "claude -p {PROMPT}"),
+        ];
+        let runner: Arc<dyn StepRunner> = Arc::new(ObservingReportRunner {
+            inner: ReportRunner::default(),
+            providers: vec![
+                ("pi".into(), vec!["floor-fixer:443".into()]),
+                ("claude".into(), vec!["floor-fixer:443".into()]),
+            ],
+        });
+        let (_, verdict, _) =
+            run_unit_and_judge_with_roster(&runner, &input, None, &|_| {}, &roster, &[], &[]);
+        let verdict = verdict.unwrap();
+        assert!(
+            !verdict.pass && verdict.seat_failure.is_some(),
+            "{verdict:?}"
+        );
+    }
+
+    impl StepRunner for ReportRunner {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            self.0.lock().unwrap().push(input.clone());
+            StepOutput {
+                run_id: input.run_id.clone(),
+                unit_ix: input.unit_ix,
+                attempt: input.attempt,
+                output: if input.unit.session_id == "validator" {
+                    "PASS\nThe citations support the report.\nPASS"
+                } else {
+                    "OWN REPORT: cited findings"
+                }
+                .into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+
+    #[test]
+    fn a_guarded_report_gets_a_judge_of_its_own_output_or_an_explicit_skip() {
+        let dir = std::env::temp_dir().join(format!("core-report-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // (core#1366) The report's guarded tree is unchanged by its turn.
+        for args in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "base",
+            ],
+        ] {
+            let out = std::process::Command::new("git")
+                .hardened()
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+        }
+        let mut input = report_input(&dir);
+        input.unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&dir, &dir).unwrap());
+        let roster = [
+            seat("codex", "codex exec {PROMPT}"),
+            seat("pi", "pi -p {PROMPT}"),
+        ];
+        let rec = Arc::new(ReportRunner::default());
+        let runner: Arc<dyn StepRunner> = rec.clone();
+        // (core#1366) The report's default judge stays local even when an exec bus is supplied.
+        let ((_, verdict, evidence), requests) = with_bus_responder("pi", true, |bus| {
+            run_unit_and_judge_on(
+                &runner,
+                &input,
+                Some("OTHER REPORT"),
+                &|_| {},
+                &roster,
+                &[],
+                &[],
+                JudgeFallbackCtx::default(),
+                Some(bus),
+                None,
+            )
+        });
+        assert!(
+            requests.is_empty(),
+            "the default judge must not request a bus responder"
+        );
+        assert_eq!(verdict.unwrap().judge_cli.as_deref(), Some("pi"));
+        assert!(evidence.judge_skipped.is_none());
+        assert!(
+            evidence.repo_checks.is_none(),
+            "report judging arms no floor"
+        );
+        assert!(matches!(
+            evidence.worktree_guard,
+            Some(crate::worktree_guard::WorktreeGuardOutcome::Clean { .. })
+        ));
+        let calls = rec.0.lock().unwrap();
+        let judge = calls
+            .iter()
+            .find(|i| i.unit.session_id == "validator")
+            .unwrap();
+        assert!(judge
+            .unit
+            .description
+            .contains("OWN REPORT: cited findings"));
+        assert!(!judge.unit.description.contains("OTHER REPORT"));
+        assert!(judge.unit.description.contains(
+            &crate::rubric::rubric("cited-findings")
+                .unwrap()
+                .instructions
+        ));
+        assert!(judge
+            .unit
+            .description
+            .contains("Check the citations in this report"));
+        drop(calls);
+        let (_, verdict, evidence) =
+            run_unit_and_judge_with_roster(&runner, &input, None, &|_| {}, &roster[..1], &[], &[]);
+        assert!(verdict.is_none());
+        assert!(evidence.judge_skipped.is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// core#282 — the review target handed to an Evaluator's worker is BOUNDED with head+TAIL
     /// elision. An under-cap target passes through untouched; an oversized one keeps its opening
@@ -9628,8 +10332,30 @@ mod tests {
             });
             let dynr: Arc<dyn StepRunner> = runner.clone();
             let noop: &DeltaSink = &|_: &str| {};
-            let (_, verdict, evidence) =
-                run_unit_and_judge_with_roster(&dynr, &input, None, noop, &roster, &[], &[]);
+            // (core#1366) Both default calls run with a bus present, the monitor retry included.
+            let (_, verdict, evidence) = if pinned {
+                run_unit_and_judge_with_roster(&dynr, &input, None, noop, &roster, &[], &[])
+            } else {
+                let (result, requests) = with_bus_responder(&monitor, true, |bus| {
+                    run_unit_and_judge_on(
+                        &dynr,
+                        &input,
+                        None,
+                        noop,
+                        &roster,
+                        &[],
+                        &[],
+                        JudgeFallbackCtx::default(),
+                        Some(bus),
+                        None,
+                    )
+                });
+                assert!(
+                    requests.is_empty(),
+                    "the default monitor retry must stay local"
+                );
+                result
+            };
             let asked = runner.asked.lock().unwrap().clone();
             let verdict = verdict.expect("the monitor judges");
             assert!(verdict.pass, "{tag}: {verdict:?} asked {asked:?}");
@@ -10713,6 +11439,7 @@ mod tests {
             &Gw,
             &noop_refusals,
             noop,
+            None,
         ) {
             FallbackJudge::Answered(av) => {
                 assert_eq!(av.judge_cli.as_deref(), Some("agy"), "{av:?}");
@@ -10735,6 +11462,7 @@ mod tests {
                 &Gw,
                 &noop_refusals,
                 noop,
+                None,
             ),
             FallbackJudge::Failed(_)
         ));
@@ -10809,6 +11537,7 @@ mod tests {
             &runner,
             &noop_refusals,
             noop,
+            None,
         );
         assert!(!v.pass && v.judge_cli.is_none(), "{v:?}");
         assert!(
@@ -11388,6 +12117,7 @@ mod tests {
             attempt: 0,
             work_author: Some("claude".into()),
             excluded_seats: Vec::new(),
+            eligible_seats: Vec::new(),
         };
         let json = serde_json::to_value(&req).unwrap();
 
@@ -11437,6 +12167,7 @@ mod tests {
             attempt: 0,
             work_author: Some("agy".into()),
             excluded_seats: Vec::new(),
+            eligible_seats: Vec::new(),
         };
         let v = serde_json::to_value(&with_author).unwrap();
         assert_eq!(
@@ -11454,6 +12185,7 @@ mod tests {
             attempt: 0,
             work_author: None,
             excluded_seats: Vec::new(),
+            eligible_seats: Vec::new(),
         };
         let v2 = serde_json::to_value(&without_author).unwrap();
         assert!(

@@ -1154,26 +1154,16 @@ fn enforce_evaluator_distinct(
     // The MODELS behind those seats — `{claude}` for builders on `claude#1` and `claude#2` alike.
     let builder_models: std::collections::HashSet<&str> =
         builder_clis.iter().map(|k| model_of(k)).collect();
-    // (DES-CATALOG-002 §5.1, report-author provenance) A unit whose rubric excludes gatherers
-    // (cited findings, fidelity to source) is also kept off the seats of the plan's earlier agent
-    // `understand` units, read steps included: the gatherer never rechecks its own findings.
-    let gatherers: Vec<std::collections::HashSet<String>> = units
+    // (core#1366) Report authors follow each earlier report's final seating.
+    let mut seated_units: Vec<WorkUnit> = units
         .iter()
-        .map(|u| {
-            if !crate::rubric::excludes_gatherers(u.rubric.as_deref()) {
-                return std::collections::HashSet::new();
-            }
-            units
-                .iter()
-                .zip(dists.iter())
-                .filter(|(g, _)| g.ord < u.ord && crate::pipeline::is_report_gatherer(g))
-                .map(|(_, d)| d.assigned_cli.clone())
-                .collect()
+        .zip(dists.iter())
+        .map(|(u, d)| {
+            let mut seated = u.clone();
+            seated.assigned_cli = Some(d.assigned_cli.clone());
+            seated
         })
         .collect();
-    if builder_clis.is_empty() && gatherers.iter().all(|g| g.is_empty()) {
-        return (same_seat, Vec::new()); // nothing built ⇒ nothing to be distinct from
-    }
     // Warn when every roster seat is a builder CLI so operators can detect degraded separation.
     // `find` below will return `None` for every Review/Test unit in this configuration, leaving
     // them on their original (builder) CLI with no routing change — silently, unless we speak up.
@@ -1193,15 +1183,16 @@ fn enforce_evaluator_distinct(
             );
         }
     }
-    for (((u, d), candidates), gathered) in units
+    for (ix, ((u, d), candidates)) in units
         .iter()
         .zip(dists.iter_mut())
         .zip(candidates.iter())
-        .zip(gatherers.iter())
+        .enumerate()
     {
         if u.tool_cmd.is_some() {
             continue; // Tool phases have no CLI to distinct
         }
+        let gathered = crate::pipeline::report_gatherer_seats(&seated_units, u);
         let forbidden = |k: &String| builder_clis.contains(k) || gathered.contains(k);
         if matches!(u.stage, StageKind::Review | StageKind::Test) && forbidden(&d.assigned_cli) {
             let admits = |k: &String| match candidates {
@@ -1234,6 +1225,7 @@ fn enforce_evaluator_distinct(
                 None => same_seat.push(u.ord),
             }
         }
+        seated_units[ix].assigned_cli = Some(d.assigned_cli.clone());
     }
     // (core#591) The disclosure pass, over the FINAL seats — it must see where each review/test
     // unit actually landed, whether routing put it there or the reassignment above did. A unit
@@ -1249,7 +1241,11 @@ fn enforce_evaluator_distinct(
     let same_cli_instance: Vec<u32> = units
         .iter()
         .zip(dists.iter())
-        .zip(gatherers.iter())
+        .zip(
+            units
+                .iter()
+                .map(|u| crate::pipeline::report_gatherer_seats(&seated_units, u)),
+        )
         .filter(|((u, d), gathered)| {
             let model = model_of(&d.assigned_cli);
             u.tool_cmd.is_none()
@@ -3610,6 +3606,41 @@ mod tests {
             None,
         );
         assert_eq!(same, vec![2]);
+    }
+
+    #[test]
+    fn semantic_is_seated_off_the_reports_final_seat_and_two_seats_disclose() {
+        let [gather, review] = gather_and_check(Some(crate::rubric::CITED_FINDINGS));
+        let mut semantic = review.clone();
+        semantic.ord = 3;
+        let units = [gather, review, semantic];
+        for keys in [
+            vec!["a".into(), "b".into(), "c".into()],
+            vec!["a".into(), "b".into()],
+        ] {
+            let clis = keys.iter().map(|k: &String| seat(k)).collect::<Vec<_>>();
+            let mut dists = [
+                routed_dist("a", "run-a {PROMPT}"),
+                routed_dist("a", "run-a {PROMPT}"),
+                routed_dist("b", "run-b {PROMPT}"),
+            ];
+            let (same, _) = enforce_evaluator_distinct(
+                &units,
+                &mut dists,
+                &keys,
+                &clis,
+                &[None, None, None],
+                false,
+                None,
+            );
+            assert_eq!(dists[1].assigned_cli, "b");
+            if keys.len() == 3 {
+                assert_eq!(dists[2].assigned_cli, "c");
+                assert!(same.is_empty());
+            } else {
+                assert_eq!(same, [3]);
+            }
+        }
     }
 }
 

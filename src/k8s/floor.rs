@@ -54,10 +54,12 @@ impl Place {
                 true,
             ),
         };
-        if !owned {
-            super::arming(&run);
-        }
-        let ns = cluster::ensure_run(&kube, &run, &render::RunBudget::default(), "20Gi")?;
+        let create = || cluster::ensure_run(&kube, &run, &render::RunBudget::default(), "20Gi");
+        let ns = if owned {
+            create()
+        } else {
+            super::arming_with(&run, create)
+        }?;
         Ok(Place {
             kube,
             ns,

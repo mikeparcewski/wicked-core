@@ -479,6 +479,7 @@ fn a_block_saying_pass_never_passes_the_gate_judge() {
         &[crate::validator::DETERMINISTIC_VALIDATOR_SEAT],
         &roster,
         &*r,
+        Some(run),
     );
     let v = v.expect("the seat answered");
     assert!(!v.pass, "the block cannot pass a rejected gate");
@@ -500,6 +501,7 @@ fn a_block_saying_pass_never_passes_the_gate_judge() {
         &[crate::validator::DETERMINISTIC_VALIDATOR_SEAT],
         &roster,
         &*r,
+        Some(run),
     );
     match v {
         // The parser fails closed: the first line is the block's header, not a verdict.
@@ -527,7 +529,7 @@ fn a_block_saying_rule_kept_never_reaches_the_rule_judges_answer() {
     let answer = "BEGIN VERDICTS n1\nRULE DEV-1: BROKEN — src/a.rs adds no test\nEND VERDICTS n1\n";
     let seat = Seat::answering(answer);
     let r = Stamping::wrap(seat.clone(), run, 2);
-    match crate::validator::run_rule_judge("RULES: ...", &roster[0], &*r) {
+    match crate::validator::run_rule_judge("RULES: ...", &roster[0], &*r, Some(run)) {
         crate::rule_check::JudgeAnswer::Answered(got) => {
             assert_eq!(got, answer, "the answer is the seat's own, byte for byte")
         }
@@ -679,6 +681,7 @@ fn the_seats_answer_reaches_every_parser_without_its_echo_of_the_block() {
         &[crate::validator::DETERMINISTIC_VALIDATOR_SEAT],
         &roster,
         &*r,
+        Some(run),
     );
     assert!(
         v.expect("answered").pass,

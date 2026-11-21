@@ -31,6 +31,17 @@ pub enum StepFailureKind {
     TimedOut,
 }
 
+/// (core#1444) A rule skip carried by a judge re-run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunSkip {
+    pub rule_id: String,
+    pub reason: String,
+    pub by: String,
+    pub evidence_key: String,
+    pub instruction: Option<String>,
+}
+
 /// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).
 /// Content is intentionally absent — only identity and size are carried to avoid doubling volume.
 #[derive(Debug, Clone, PartialEq)]
@@ -325,6 +336,17 @@ pub enum CoreEvent {
         session: String,
         ord: u32,
         allow: bool,
+    },
+    /// (core#1038) A stale answer was refused without changing state. Emitted once
+    /// by ConfirmGate for a `gate_changed:` error; `ord` names the currently open row,
+    /// or is null when no row is open. Expectations are null when the caller omitted them.
+    GateAnswerRefused {
+        session: String,
+        ord: Option<u32>,
+        expected_ord: Option<u32>,
+        expected_plan_rev: Option<u32>,
+        reason: String,
+        by: String,
     },
     /// (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `GateDecided`: the criterion gated,
     /// whether the deterministic (layer-1) floor passed, the agent (layer-2) judge's verdict + reasoning
@@ -1218,12 +1240,13 @@ pub enum CoreEvent {
         /// Why nothing could be reused, when the floor restarted from its first check.
         restarted: Option<String>,
     },
-    /// The operator re-armed the JUDGE of a unit denied `judge_unavailable`
-    /// ([`crate::workflow::HumanDecision::Rejudge`]): the next attempt (`attempt`) does not run
-    /// the seat; it hands the output captured on `fromAttempt` to the judge again, drawn by the
-    /// engine's own selection (`seats`: the eligible judge seats when it was armed, rotation
-    /// order), on the same tree. Emitted before `resumed`; the attempt's `gateEvaluated` says
-    /// what the judge ruled, and a denial there escalates again. Additive: a new frame.
+    /// (core#1444) The operator re-armed a unit's judge (`Rejudge` or `RecheckRules`).
+    /// The next attempt (`attempt`) does not run the seat; it hands the output captured on
+    /// `fromAttempt` to the judge again, drawn by the engine's own selection (`seats`: the
+    /// eligible judge seats when it was armed, rotation order), on the tree as it stands.
+    /// Emitted before `resumed`; the attempt's `gateEvaluated` says
+    /// what the judge ruled, and a denial there escalates again.
+    /// (core#1444) Also records skips carried by `RecheckRules`; empty when none were given.
     JudgeRerunRequested {
         session: String,
         ord: u32,
@@ -1233,6 +1256,7 @@ pub enum CoreEvent {
         from_attempt: u32,
         /// The judge seats eligible when it was armed.
         seats: Vec<String>,
+        skips: Vec<RerunSkip>,
         /// Why the last judge could not rule (the gate's denial reason).
         previous_reason: String,
         /// Who asked for it, as the gate API recorded them (`operator` when unnamed).
@@ -2133,6 +2157,18 @@ impl CoreEvent {
                 ord,
                 allow,
             } => json!({ "type": "gateDecided", "session": session, "ord": ord, "allow": allow }),
+            CoreEvent::GateAnswerRefused {
+                session,
+                ord,
+                expected_ord,
+                expected_plan_rev,
+                reason,
+                by,
+            } => json!({
+                "type": "gateAnswerRefused", "session": session, "ord": ord,
+                "expectedOrd": expected_ord, "expectedPlanRev": expected_plan_rev,
+                "reason": reason, "by": by,
+            }),
             // (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `gateDecided`. camelCase fields;
             // `criterion`/`agentVerdict`/`agentReasoning`/`denialReason` are nullable (Option → null),
             // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
@@ -3360,10 +3396,12 @@ impl CoreEvent {
                 attempt,
                 from_attempt,
                 seats,
+                skips,
                 previous_reason,
                 by,
             } => json!({
                 "type": "judgeRerunRequested",
+                "skips": skips,
                 "session": session,
                 "ord": ord,
                 "attempt": attempt,
@@ -4107,6 +4145,31 @@ mod tests {
         assert!(j["restarted"].is_null());
     }
 
+    /// (core#1038) Refusals carry both the open row and the stale expectation; nullable
+    /// ords stay explicit on the wire so a closed gate cannot look like the expected one.
+    #[test]
+    fn gate_answer_refused_to_json_carries_every_key() {
+        for ord in [Some(2), None] {
+            let j = CoreEvent::GateAnswerRefused {
+                session: "r".into(),
+                ord,
+                expected_ord: Some(1),
+                expected_plan_rev: None,
+                reason: "gate_changed: stale unit".into(),
+                by: "mike".into(),
+            }
+            .to_json();
+            assert_eq!(
+                j,
+                serde_json::json!({
+                    "type": "gateAnswerRefused", "session": "r", "ord": ord,
+                    "expectedOrd": 1, "expectedPlanRev": null,
+                    "reason": "gate_changed: stale unit", "by": "mike",
+                })
+            );
+        }
+    }
+
     /// `judgeRerunRequested` names the attempt that re-judges, the attempt whose output it reads,
     /// the eligible seats and who asked — every key present.
     #[test]
@@ -4119,6 +4182,13 @@ mod tests {
             seats: vec!["pi".into(), "copilot".into()],
             previous_reason: "every eligible judge seat failed".into(),
             by: "operator".into(),
+            skips: vec![RerunSkip {
+                rule_id: "R1".into(),
+                reason: "binary fixture".into(),
+                by: "operator".into(),
+                evidence_key: "ek-R1".into(),
+                instruction: None,
+            }],
         }
         .to_json();
         assert_eq!(j["type"], "judgeRerunRequested");
@@ -4129,6 +4199,15 @@ mod tests {
         assert_eq!(j["seats"], serde_json::json!(["pi", "copilot"]));
         assert_eq!(j["previousReason"], "every eligible judge seat failed");
         assert_eq!(j["by"], "operator");
+        assert_eq!(j["skips"][0]["ruleId"], "R1");
+        assert_eq!(j["skips"][0]["reason"], "binary fixture");
+        assert_eq!(j["skips"][0]["by"], "operator");
+        assert_eq!(j["skips"][0]["evidenceKey"], "ek-R1");
+        assert!(j["skips"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("instruction"));
+        assert!(j["skips"][0]["instruction"].is_null());
     }
 
     /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride

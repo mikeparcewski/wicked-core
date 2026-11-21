@@ -216,10 +216,15 @@ const HAND_AUTHORED = `${BEGIN}
  * \`classification\` gains \`'base_red_unseparated'\` (denies) and no longer produces
  * \`'env_cannot_run'\` / \`'unclassified_red_base'\`; \`envCannotRun\` is always \`[]\`; libtest ids
  * lose their \`[<target>]\` qualifier and \`preExisting\` holds the runner-native names excluded.
+ * (core#1038) Stale gate answers emit \`gateAnswerRefused\` once: {session, ord,
+ * expectedOrd, expectedPlanRev, reason, by}. The error reason starts \`gate_changed:\`;
+ * ord is the currently open row's ord (null if no row is open), and omitted expectations
+ * serialize as null. The refusal changes no gate, unit or power-run accounting.
  * Judge re-run (additive, new event): \`judgeRerunRequested\` {session, ord, attempt, fromAttempt,
- * seats, previousReason, by} — the operator answered a \`judge_unavailable\` gate with action
- * \`rejudge\`: attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
- * from \`seats\` (the eligible judge seats when it was armed); the seat does not run again.
+ * seats, previousReason, by, skips} — the operator requested \`rejudge\` or a rule re-check:
+ * attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
+ * from \`seats\`; the seat does not run again. \`skips\` is [] when none were given; each skip
+ * carries ruleId, reason, by, evidenceKey and instruction (null for a plain skip).
  */
 export interface CoreEventJson {
   type: string

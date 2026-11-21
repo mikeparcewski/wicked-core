@@ -319,8 +319,9 @@ fn two_seats_complete_a_bug_run_and_a_self_grade_never_passes() {
     assert!(judged.contains(&"claude".to_string()) && judged.contains(&"codex".to_string()));
 
     // The attacker's roster: the fix is independent, but codex's VERIFY launch is observed calling
-    // claude's provider. Claude is re-admitted by name and judges it; its launch calls the verify
-    // launch's own provider, so the search moves past its approval, runs out, and the verify gate holds.
+    // claude's provider. (core#1540) That launch is the work's author by identity, so the verify
+    // gate holds as a same-seat evaluator, naming the provider; its judge (claude, re-admitted by
+    // name) is still asked, and its approval is passed over as not independent.
     let (evs, judged) = launch(
         claude_codex,
         Some(("codex", "verify", "api.anthropic.com:443")),
@@ -332,14 +333,14 @@ fn two_seats_complete_a_bug_run_and_a_self_grade_never_passes() {
         .find(|(_, j, _, _)| j.as_deref() == Some("codex"))
         .map(|(o, ..)| o + 1);
     assert!(
-        held.iter().any(|(c, s)| c == "judge_unavailable"
-            && s.contains("no judge independent of the work: claude approved")),
-        "the self-grade is discarded and held: {held:?}"
+        held.iter().any(|(c, s)| c == "dead_seat"
+            && s.contains("ran on `codex`, observed calling `api.anthropic.com:443`")),
+        "the self-grade is held: {held:?}"
     );
     assert!(
         evs.iter().any(
             |e| matches!(e, CoreEvent::GateEscalated { session, ord, condition, .. }
-            if session == "alias" && condition == "judge_unavailable" && Some(*ord) == verify_ord)
+            if session == "alias" && condition == "dead_seat" && Some(*ord) == verify_ord)
         ),
         "it is the VERIFY gate that holds (after the fix gate passed): {held:?}"
     );

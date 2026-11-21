@@ -3870,6 +3870,7 @@ mod rule_state_tests {
             carry_key: None,
             ord: None,
             rulings_rev: None,
+            seat_attempt: None,
         }];
         old.rule_councils = 4;
         // (F19) The person's gate ruling, which the rule judge reads as their instruction.

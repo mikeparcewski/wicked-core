@@ -56,6 +56,7 @@ pub const BALLOTS_IN_HOST: &str = "host";
 /// MCP channel, no repository (`workdir: None`), and the ballot prompt goes through byte-exact.
 pub(crate) struct SeatBallots {
     runner: Arc<dyn crate::workflow::StepRunner>,
+    parent_run_id: Option<String>,
 }
 
 impl std::fmt::Debug for SeatBallots {
@@ -65,8 +66,14 @@ impl std::fmt::Debug for SeatBallots {
 }
 
 impl SeatBallots {
-    pub(crate) fn new(runner: Arc<dyn crate::workflow::StepRunner>) -> Self {
-        SeatBallots { runner }
+    pub(crate) fn new(
+        runner: Arc<dyn crate::workflow::StepRunner>,
+        parent_run_id: Option<&str>,
+    ) -> Self {
+        SeatBallots {
+            runner,
+            parent_run_id: parent_run_id.map(str::to_string),
+        }
     }
 }
 
@@ -123,6 +130,8 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
             1,
             prompt,
         );
+        // (core#1413) Ballots keep their own session and the council's asking run.
+        unit.parent_run_id = self.parent_run_id.clone();
         unit.assigned_cli = Some(cli.key.clone());
         unit.assigned_invocation = Some(cli.headless_invocation.clone());
         let input = crate::workflow::StepInput {
@@ -1853,11 +1862,16 @@ mod tests {
         delay: std::time::Duration,
         runs: AtomicUsize,
         cancels: AtomicUsize,
+        parents: std::sync::Mutex<Vec<Option<String>>>,
     }
 
     impl crate::workflow::StepRunner for SlowSeat {
         fn run_unit(&self, i: &crate::workflow::StepInput) -> crate::workflow::StepOutput {
             self.runs.fetch_add(1, Ordering::SeqCst);
+            self.parents
+                .lock()
+                .unwrap()
+                .push(i.unit.parent_run_id.clone());
             std::thread::sleep(self.delay);
             crate::workflow::StepOutput {
                 run_id: i.run_id.clone(),
@@ -1881,6 +1895,7 @@ mod tests {
             delay: std::time::Duration::from_millis(delay_ms),
             runs: AtomicUsize::new(0),
             cancels: AtomicUsize::new(0),
+            parents: Default::default(),
         })
     }
 
@@ -1890,7 +1905,7 @@ mod tests {
     fn a_seat_ballot_is_cancelled_only_when_it_outlives_its_budget() {
         use wicked_council::types::{BallotCarrier, SeatFailureKind};
         let quick = slow(0);
-        let carrier = SeatBallots::new(quick.clone());
+        let carrier = SeatBallots::new(quick.clone(), None);
         let run = carrier
             .run_ballot(
                 &seat("pi"),
@@ -1905,7 +1920,7 @@ mod tests {
         assert_eq!(quick.cancels.load(Ordering::SeqCst), 0);
 
         let late = slow(1500);
-        let carrier = SeatBallots::new(late.clone());
+        let carrier = SeatBallots::new(late.clone(), None);
         let f = carrier
             .run_ballot(
                 &seat("pi"),
@@ -1920,13 +1935,35 @@ mod tests {
         assert_eq!(late.cancels.load(Ordering::SeqCst), 1);
     }
 
+    // (core#1413) The council's asking run reaches every carried ballot.
+    #[test]
+    fn a_seat_ballot_carries_the_parent_run_id() {
+        use wicked_council::types::BallotCarrier;
+        let runner = slow(0);
+        for parent in [Some("asking-run"), None] {
+            SeatBallots::new(runner.clone(), parent)
+                .run_ballot(
+                    &seat("pi"),
+                    "parent-ballot",
+                    "ballot",
+                    std::time::Duration::from_secs(5),
+                    None,
+                )
+                .expect("the seat answered");
+        }
+        assert_eq!(
+            *runner.parents.lock().unwrap(),
+            vec![Some("asking-run".to_string()), None]
+        );
+    }
+
     /// codex council-r1: the seat carrier hands the prompt on the command line, so a seat that
     /// reads it another way is refused by name before anything runs.
     #[test]
     fn a_seat_ballot_refuses_a_seat_that_does_not_read_its_prompt_from_argv() {
         use wicked_council::types::{BallotCarrier, InputMode, SeatFailureKind};
         let runner = slow(0);
-        let carrier = SeatBallots::new(runner.clone());
+        let carrier = SeatBallots::new(runner.clone(), None);
         for mode in [InputMode::Stdin, InputMode::AtFile, InputMode::PtySession] {
             let mut s = seat("pi");
             s.input_mode = mode;

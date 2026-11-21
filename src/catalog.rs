@@ -1928,6 +1928,149 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         );
     }
 
+    /// #1320: fixing one old failure cannot pay for a new failure in the same file.
+    #[cfg(unix)]
+    #[test]
+    fn qe_verify_rejects_equal_count_failure_substitution() {
+        use wicked_apps_core::spawn::HardenedCommand;
+        // spawn-audit: hardened probe for the real node:test fixture's harness.
+        if !std::process::Command::new("node")
+            .hardened()
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let setup = r#"set -e
+git init -q -b main src && cd src
+git config user.email t@example.invalid && git config user.name t && git config commit.gpgsign false
+printf '{"scripts":{"test":"node --test"}}\n' > package.json
+mkdir -p test tests
+cat > test/m.test.js <<'JS'
+const test=require('node:test');const assert=require('node:assert');
+test('add',()=>assert.equal(1+2,3));
+test('red-1',()=>assert.equal(1,2));
+test('red-2',()=>assert.equal(2,3));
+JS
+git add -A && git commit -qm base
+git rev-parse HEAD > ../base.txt
+cat > test/m.test.js <<'JS'
+const test=require('node:test');const assert=require('node:assert');
+test('add',()=>assert.equal(1+2,4));
+test('red-1',()=>assert.equal(1,1));
+test('red-2',()=>assert.equal(2,3));
+test('new passing test',()=>assert.equal(3,3));
+JS
+echo '# plan' > tests/PLAN-add.md
+"#;
+        let text = qe_verify_identity_fixture("substitution", setup, false);
+        assert!(text.contains("failed=1 not_executed=0"), "{text}");
+        assert!(text.contains("checks_failed=1 failed_on_base=0"), "{text}");
+        assert!(text.contains("head_failure_ids=\"add|red-2\""), "{text}");
+    }
+
+    /// #1320: vitest collection failures have identities too. Exercise both comparisons,
+    /// including a suite-only substitution, and fail closed when the runner prints no ids.
+    #[cfg(unix)]
+    #[test]
+    fn qe_verify_vitest_collection_failures_require_the_same_identities() {
+        for (case, head_id, suite_only, want_ok) in [
+            ("same", "tests/broken.test.ts", false, true),
+            ("new-collection", "tests/new.test.ts", false, false),
+            ("suite-new-collection", "tests/new.test.ts", true, false),
+            ("unreadable", "", false, false),
+        ] {
+            let setup = format!(
+                r#"set -e
+git init -q -b main src && cd src
+git config user.email t@example.invalid && git config user.name t && git config commit.gpgsign false
+printf '{{"devDependencies":{{"vitest":"*"}}}}\n' > package.json
+printf 'node_modules/\n' > .gitignore
+mkdir -p tests node_modules/.bin
+echo '// base' > tests/broken.test.ts
+git add -A && git commit -qm base
+git rev-parse HEAD > ../base.txt
+echo '// head' >> tests/broken.test.ts
+echo '# plan' > tests/PLAN-broken.md
+cat > node_modules/.bin/vitest <<'SH'
+#!/bin/bash
+if grep -q head tests/broken.test.ts; then
+  echo ' Tests  1 failed | 2 passed (3)'
+  id='{head_id}'
+  if [ '{suite_only}' = true ] && [ "$#" -gt 1 ]; then id=tests/broken.test.ts; fi
+else
+  echo ' Tests  1 failed | 1 passed (2)'
+  id=tests/broken.test.ts
+fi
+[ -z "$id" ] || echo " FAIL  $id [ $PWD/$id ]"
+exit 1
+SH
+chmod +x node_modules/.bin/vitest
+"#
+            );
+            let text = qe_verify_identity_fixture(case, &setup, want_ok);
+            assert!(
+                text.contains("base_failure_ids=\"tests/broken.test.ts\""),
+                "{text}"
+            );
+            if want_ok {
+                assert!(text.contains("checks_failed=0 failed_on_base=1"), "{text}");
+            } else if suite_only {
+                assert!(text.contains("checks_failed=1 failed_on_base=1"), "{text}");
+            } else {
+                assert!(text.contains("failed=1 not_executed=0"), "{text}");
+                assert!(text.contains("checks_failed=1 failed_on_base=0"), "{text}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn qe_verify_identity_fixture(case: &str, setup: &str, want_ok: bool) -> String {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let root =
+            std::env::temp_dir().join(format!("wicked-qe-identity-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // spawn-audit: hardened fixture build, entirely in a throwaway repository.
+        let made = std::process::Command::new("bash")
+            .hardened()
+            .args(["-c", setup])
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{case}: fixture: {made:?}");
+        let base = std::fs::read_to_string(root.join("base.txt")).unwrap();
+        let def = composed("qe-author-tests");
+        let PhaseExecutor::Tool { cmd } = &def
+            .phases
+            .iter()
+            .find(|p| p.id == "verify")
+            .unwrap()
+            .executor
+        else {
+            panic!("verify is a Tool step");
+        };
+        // spawn-audit: hardened invocation of the shipped verify Tool script.
+        let out = std::process::Command::new("bash")
+            .hardened()
+            .args(["-c", cmd.last().unwrap()])
+            .current_dir(root.join("src"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("TMPDIR", &root)
+            .env("WICKED_RUN_BASE", base.trim())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(out.status.success(), want_ok, "{case}: {text}");
+        text
+    }
+
     /// M6: the built-in `domain-extraction` composes to the def the shipped JSON describes (the C1
     /// mapping pins every field; this names the ones the run depends on). coverage carries the
     /// coverage validator's pin from its catalog entry, so no installed copy can drift

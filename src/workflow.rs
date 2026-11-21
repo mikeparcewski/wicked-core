@@ -639,7 +639,8 @@ pub const REJUDGE_ACTION: &str = "rejudge";
 pub const RETRY_QE_ACTION: &str = "retry_qe";
 
 /// The wire token of [`HumanDecision::OperatorJudgment`]. Its rationale rides the gate body's
-/// `amend`, like `amend_intent`'s text.
+/// `amend`, like `amend_intent`'s text. (core#1318) Overrides `repo_checks`,
+/// `repo_checks_timeout`, or a failed check's `tool_check` layer at its triage gate.
 pub const OPERATOR_JUDGMENT_ACTION: &str = "operator_judgment";
 
 /// (core#555) The sentence an approved intent amendment rides into every later unit's prompt. It

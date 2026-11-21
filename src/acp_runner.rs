@@ -1931,11 +1931,19 @@ impl crate::team::MonitorHost for RunnerHost {
         let (seat, parent) = seat;
         // (program context-block-core) A member reviews for the run it joined: its turn carries
         // that run's context block, framed for an evaluator.
-        let runner = match parent {
-            Some(parent) => crate::run_context::Stamping::wrap(runner, &parent, 0),
+        let runner = match parent.as_deref() {
+            Some(parent) => crate::run_context::Stamping::wrap(runner, parent, 0),
             None => runner,
         };
-        let out = member_turn(runner, &seat, &run_id, &prompt, budget, view_dir.as_deref());
+        let out = member_turn(
+            runner,
+            &seat,
+            &run_id,
+            &prompt,
+            budget,
+            view_dir.as_deref(),
+            parent.as_deref(),
+        );
         // The view goes with the turn (`MemberView`'s drop), after its seat has stopped.
         drop(prepared);
         let mut book = self.book();
@@ -2180,6 +2188,7 @@ pub(crate) fn member_turn(
     prompt: &str,
     budget: Duration,
     view: Option<&std::path::Path>,
+    parent_run_id: Option<&str>,
 ) -> Result<String, String> {
     use crate::workflow::StepStatus;
     let invocation = member_invocation(seat)?;
@@ -2190,6 +2199,8 @@ pub(crate) fn member_turn(
         1,
         prompt,
     );
+    // (core#1413) A member's one-shot turn serves the run it joined.
+    unit.parent_run_id = parent_run_id.map(str::to_string);
     unit.assigned_cli = Some(seat.to_string());
     unit.assigned_invocation = Some(invocation);
     unit.read_view = view.map(std::path::Path::to_path_buf);
@@ -3565,6 +3576,7 @@ mod tests {
             base_skill_ref: None,
             id: "u-gov".to_string(),
             session_id: "run-gov".to_string(),
+            parent_run_id: None,
             ord: 1,
             description: "a governed unit".to_string(),
             stage: Default::default(),
@@ -3647,6 +3659,7 @@ mod tests {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            changed_code: None,
             rule_carried_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,
@@ -4848,6 +4861,7 @@ acp_input_governance = true
             "review this",
             Duration::from_secs(5),
             None,
+            Some("r"),
         )
         .expect("the member answered");
         assert_eq!(a, "FINDING {}\nDONE");
@@ -4858,6 +4872,7 @@ acp_input_governance = true
             "and this",
             Duration::from_secs(5),
             None,
+            Some("r"),
         )
         .unwrap();
         let seen = runner.seen.lock().unwrap();
@@ -4869,6 +4884,7 @@ acp_input_governance = true
             crate::execute_wrapped::runs_in_seat(i),
             "it follows the seat floor"
         );
+        assert_eq!(i.unit.parent_run_id.as_deref(), Some("r"));
         assert_eq!(i.unit.assigned_cli.as_deref(), Some("claude"));
         assert!(i.unit.assigned_invocation.is_some());
         assert_eq!(
@@ -4904,6 +4920,7 @@ acp_input_governance = true
             "p",
             Duration::from_millis(50),
             None,
+            None,
         )
         .unwrap_err();
         assert!(e.contains("exceeded"), "{e}");
@@ -4918,14 +4935,32 @@ acp_input_governance = true
             "Error: You have exceeded your monthly quota",
             Duration::ZERO,
         );
-        let e = member_turn(refused, "claude", "k", "p", Duration::from_secs(5), None).unwrap_err();
+        let e = member_turn(
+            refused,
+            "claude",
+            "k",
+            "p",
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("refused"), "{e}");
         let failed = member_runner(
             crate::workflow::StepStatus::Failed,
             "floor not armed",
             Duration::ZERO,
         );
-        let e = member_turn(failed, "claude", "k", "p", Duration::from_secs(5), None).unwrap_err();
+        let e = member_turn(
+            failed,
+            "claude",
+            "k",
+            "p",
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(e.contains("floor not armed"), "{e}");
         let e = member_turn(
             member_runner(crate::workflow::StepStatus::Ok, "x", Duration::ZERO),
@@ -4933,6 +4968,7 @@ acp_input_governance = true
             "k",
             "p",
             Duration::from_secs(5),
+            None,
             None,
         )
         .unwrap_err();

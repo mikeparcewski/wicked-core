@@ -52,7 +52,9 @@ pub struct GateAction {
     pub intent: String,
     pub note: NoteRule,
     /// Set only when a note changes what the answer does: an approve with a note at a read-only
-    /// phase's floor gate is a `floor_fix` (the note goes to a seat that can write).
+    /// phase's floor gate is a `floor_fix` (the note goes to a seat that can write). A required
+    /// note on an adjudication's approve is `skip_rules`: Land records it as the skip reason for
+    /// every open rule named in [`GateAction::rules`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note_intent: Option<String>,
     /// `reassign`: the seats the engine would re-seat the gated unit on now, roster order.
@@ -62,7 +64,8 @@ pub struct GateAction {
     /// signed back in — and said so), roster order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub benched_seats: Vec<String>,
-    /// `skip_rules`: the rule ids a skip may name (each with its own reason).
+    /// `skip_rules`: the rule ids a skip may name (each with its own reason). An adjudication's
+    /// approve with `note_intent: "skip_rules"` skips all these open ids with the Land note.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<String>,
     /// A plan gate's answer names the held plan revision it answers (`planRev`).
@@ -341,6 +344,14 @@ fn answer_actions(
             // A team dispute's approve WITH a note is its send-back (`answer_dispute_gate`:
             // `DisputeAmended` reworks the step), never a continue.
             a.note_intent = Some("send_back".to_string());
+        } else if adjudication_open && note == NoteRule::Required {
+            if let Some(ids) = cursor
+                .and_then(super::open_rule_ids)
+                .filter(|ids| !ids.is_empty())
+            {
+                a.note_intent = Some("skip_rules".to_string());
+                a.rules = ids;
+            }
         }
         actions.push(a);
     }

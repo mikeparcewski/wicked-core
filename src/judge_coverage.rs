@@ -58,6 +58,8 @@ pub struct AuthorCoverage {
     pub seat: String,
     /// The judges in the order the runtime rotation tries them.
     pub judges: Vec<Judge>,
+    /// (core#1594) Exactly one judge has not been seen sharing the author's provider.
+    pub sole_judge: Option<String>,
     /// Every other seat of the run, with why it does not judge this author's work.
     pub not_judges: Vec<NotJudge>,
 }
@@ -74,6 +76,8 @@ pub struct JudgeCoverage {
     pub authors: Vec<AuthorCoverage>,
     /// The seats the run would start with benched, with the bench's words.
     pub benched: Vec<NotJudge>,
+    /// (core#1594) Provider-sharing observations the launcher can say before launching.
+    pub notes: Vec<String>,
 }
 
 /// See the module doc. `clis`: the launch roster (as `launchRun`'s `clisJson`); `bound`: the run is
@@ -170,6 +174,13 @@ pub(crate) fn judge_coverage_in(
                 .collect();
             AuthorCoverage {
                 seat: author.key.clone(),
+                sole_judge: {
+                    let mut independent = judges.iter().filter(|j| j.seen_sharing.is_none());
+                    independent
+                        .next()
+                        .filter(|_| independent.next().is_none())
+                        .map(|j| j.seat.clone())
+                },
                 judges,
                 not_judges,
             }
@@ -181,11 +192,49 @@ pub(crate) fn judge_coverage_in(
         .filter(|c| authors.iter().any(|a| a.seat == c.key))
         .map(crate::validator::seat_identity)
         .collect();
+    let notes = authors
+        .iter()
+        .filter_map(|a| {
+            let sharing = a
+                .judges
+                .iter()
+                .filter_map(|j| {
+                    j.seen_sharing.as_ref().map(|p| {
+                        format!(
+                            "{} was seen calling {p}, the provider {} calls",
+                            j.seat, a.seat,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            if sharing.is_empty() {
+                return None;
+            }
+            let consequence = match &a.sole_judge {
+                Some(seat) => format!("only {seat} can judge {}'s work", a.seat),
+                None if a.judges.iter().all(|j| j.seen_sharing.is_some()) => {
+                    format!("no seat can judge {}'s work independently", a.seat)
+                }
+                None => format!(
+                    "{} can judge {}'s work independently",
+                    a.judges
+                        .iter()
+                        .filter(|j| j.seen_sharing.is_none())
+                        .map(|j| j.seat.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" and "),
+                    a.seat,
+                ),
+            };
+            Some(format!("{}, so {consequence}.", sharing.join("; ")))
+        })
+        .collect();
     JudgeCoverage {
         covered: authors
             .iter()
             .any(|a| a.judges.iter().any(|j| j.seen_sharing.is_none())),
         single_identity: identities.len() == 1,
+        notes,
         benched: bench
             .iter()
             .map(|b| NotJudge {
@@ -264,6 +313,33 @@ mod tests {
             claude.judges[1].seen_sharing.as_deref(),
             Some("api.anthropic.com:443")
         );
+        assert_eq!(claude.sole_judge.as_deref(), Some("jcu1-codex"));
+        assert!(
+            cov.notes.iter().any(|n| {
+                n.contains("jcu1-pi was seen calling api.anthropic.com:443")
+                    && n.contains("only jcu1-codex can judge jcu1-claude's work")
+            }),
+            "{:?}",
+            cov.notes
+        );
+    }
+
+    #[test]
+    fn coverage_names_when_every_judge_was_seen_sharing() {
+        let clis = [
+            seat("jcu3-author", "claude {PROMPT}"),
+            seat("jcu3-judge", "pi {PROMPT}"),
+        ];
+        for cli in &clis {
+            record_receipt(&cli.key, Some(vec!["coverage-shared:443".into()]));
+        }
+        take_receipts();
+        let cov = on_container_floor(|| judge_coverage_in(&clis, &clis, false));
+        assert_eq!(cov.authors[0].sole_judge, None);
+        assert!(cov
+            .notes
+            .iter()
+            .any(|n| { n.contains("no seat can judge jcu3-author's work independently") }));
     }
 
     #[test]

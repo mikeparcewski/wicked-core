@@ -2846,6 +2846,8 @@ type CancelToken = std::sync::Arc<std::sync::atomic::AtomicBool>;
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct WrappedWorkerKey {
     run_id: String,
+    // (core#1278) The run that asked for this internal session.
+    parent: Option<String>,
     epoch: u64,
     launch_seq: u64,
 }
@@ -2864,6 +2866,22 @@ struct WrappedCancelRegistry {
     ended: std::collections::HashMap<String, u64>,
     /// (C5) The engine is shutting down: every registration from here on is born cancelled.
     shutdown: bool,
+}
+
+impl WrappedCancelRegistry {
+    // (core#1278) Token registration and runtime recovery share the cancellation fence.
+    fn launch_cancelled(&self, key: &WrappedWorkerKey) -> bool {
+        self.shutdown
+            || self.reassigned.contains(key)
+            || self
+                .ended
+                .get(&key.run_id)
+                .is_some_and(|&bound| key.launch_seq <= bound)
+            || key
+                .parent
+                .as_ref()
+                .is_some_and(|parent| self.ended.get(parent) == Some(&u64::MAX))
+    }
 }
 
 /// Per-unit wall-clock timeout. Default 2 h — agentic CLIs doing real multi-file extraction
@@ -2932,6 +2950,7 @@ impl WrappedCliStepRunner {
     fn worker_key(input: &StepInput) -> WrappedWorkerKey {
         WrappedWorkerKey {
             run_id: input.run_id.clone(),
+            parent: input.unit.parent_run_id.clone(),
             epoch: input.elicitation_epoch,
             launch_seq: input.launch_seq,
         }
@@ -2943,11 +2962,7 @@ impl WrappedCliStepRunner {
         let key = Self::worker_key(input);
         let token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        let ended = guard
-            .ended
-            .get(&key.run_id)
-            .is_some_and(|&bound| key.launch_seq <= bound);
-        if ended || guard.shutdown || guard.reassigned.contains(&key) {
+        if guard.launch_cancelled(&key) {
             token.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         guard.tokens.entry(key).or_default().push(token.clone());
@@ -2990,7 +3005,8 @@ impl WrappedCliStepRunner {
     /// included. Idempotent; a token with no live child is a no-op.
     /// (C5, codex c5-r2) Engine shutdown: cancel EVERY wrapped worker — internal judge calls
     /// (`validator-*` / `triage-*`, epoch 0) included, which no run lifecycle names — and make any
-    /// later registration born cancelled.
+    /// later registration born cancelled. (core#1278) A run's own end reaches the internal calls
+    /// it asked for through their parent ([`Self::cancel_run_workers`]).
     pub(crate) fn cancel_all_workers(&self) {
         let tokens: Vec<CancelToken> = {
             let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
@@ -3011,7 +3027,7 @@ impl WrappedCliStepRunner {
             let keys: Vec<WrappedWorkerKey> = guard
                 .tokens
                 .keys()
-                .filter(|key| key.run_id == run_id)
+                .filter(|key| key.run_id == run_id || key.parent.as_deref() == Some(run_id))
                 .cloned()
                 .collect();
             let tokens: Vec<CancelToken> = keys
@@ -3033,6 +3049,7 @@ impl WrappedCliStepRunner {
     pub(crate) fn cancel_reassigned_worker(&self, run_id: &str, epoch: u64, launch_seq: u64) {
         let key = WrappedWorkerKey {
             run_id: run_id.to_string(),
+            parent: None,
             epoch,
             launch_seq,
         };
@@ -3087,12 +3104,7 @@ impl WrappedCliStepRunner {
     fn launch_cancelled(&self, input: &StepInput) -> bool {
         let key = Self::worker_key(input);
         let guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        guard.shutdown
-            || guard.reassigned.contains(&key)
-            || guard
-                .ended
-                .get(&key.run_id)
-                .is_some_and(|&bound| key.launch_seq <= bound)
+        guard.launch_cancelled(&key)
     }
 
     /// (PRODUCT-WORKS J4) [`Self::exec`], riding out a container runtime blip: a governed
@@ -4368,39 +4380,7 @@ impl WrappedCliStepRunner {
                             }
                         );
                         let mut out = floor_refused(input, &cli_key, why);
-                        if why == crate::worker_sandbox::FloorUnarmed::ArgvTooLong {
-                            // The size (or the file handoff's failure) is the reason itself,
-                            // said inside the refusal's parentheses.
-                            if out.output.ends_with(')') {
-                                out.output.pop();
-                            }
-                            out.output.push_str(&format!(" — {detail})"));
-                        } else if matches!(
-                            why,
-                            crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted
-                                | crate::worker_sandbox::FloorUnarmed::SeatNetworkUnavailable
-                                // (core#1491) The pod's phase, conditions and events are the
-                                // evidence: kept in the unit's output, not only the daemon log.
-                                | crate::worker_sandbox::FloorUnarmed::PodNotReady
-                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused
-                        ) && !detail.is_empty()
-                        {
-                            // core#1356: the runtime's own network error (the network's name and
-                            // cause), labelled and on the refusal's one line, so the gate can quote it.
-                            if out.output.ends_with(')') {
-                                out.output.pop();
-                            }
-                            let suffix = match why {
-                                // The pod's conditions and events need their own budget so
-                                // long runtime messages do not push the events out.
-                                crate::worker_sandbox::FloorUnarmed::PodNotReady
-                                | crate::worker_sandbox::FloorUnarmed::PolicyRefused => {
-                                    crate::runtime_wait::diagnosis_suffix(&detail)
-                                }
-                                _ => crate::runtime_wait::network_cause_suffix(&detail),
-                            };
-                            out.output.push_str(&suffix);
-                        }
+                        out.output = refusal_with_detail(out.output, why, &detail);
                         return out;
                     }
                 }
@@ -4960,8 +4940,8 @@ impl WrappedCliStepRunner {
             // unobserved.
             let mut observed: Option<Vec<crate::observed_provider::Provider>> = None;
             if let Some(lease) = gateway_lease.take() {
-                let records = lease.release();
-                observed = crate::observed_provider::providers_of(&records);
+                let observation = lease.release();
+                observed = observation.providers;
                 let phase = gov_env
                     .as_ref()
                     .map(|g| g.phase.clone())
@@ -4969,7 +4949,7 @@ impl WrappedCliStepRunner {
                 crate::seat_gateway::write_records(
                     &crate::gate_hook::decisions_path_for_input(input)
                         .with_file_name(format!("gateway-{phase}.ndjson")),
-                    &records,
+                    &observation.records,
                 );
             }
             crate::observed_provider::record_receipt(&cli_key, observed);
@@ -7530,6 +7510,36 @@ pub(crate) fn floor_refused(
     }
 }
 
+// (core#1541) Keep arm evidence on the refusal's first line with the existing label and caps.
+fn refusal_with_detail(
+    mut out: String,
+    why: crate::worker_sandbox::FloorUnarmed,
+    detail: &str,
+) -> String {
+    use crate::worker_sandbox::FloorUnarmed;
+
+    if why == FloorUnarmed::ArgvTooLong {
+        if out.ends_with(')') {
+            out.pop();
+        }
+        out.push_str(&format!(" — {detail})"));
+    } else if why.keeps_arm_detail() && !detail.is_empty() {
+        if out.ends_with(')') {
+            out.pop();
+        }
+        let suffix = if matches!(
+            why,
+            FloorUnarmed::AddressPoolsExhausted | FloorUnarmed::SeatNetworkUnavailable
+        ) {
+            crate::runtime_wait::network_cause_suffix(detail)
+        } else {
+            crate::runtime_wait::diagnosis_suffix(detail)
+        };
+        out.push_str(&suffix);
+    }
+    out
+}
+
 /// The [`StepOutput`] for a copilot unit whose model its account may not use (or whose account
 /// is not resolved yet): nothing ran. Read as a seat failure, so the run fails over.
 pub(crate) fn seat_model_refused(input: &StepInput, cli_key: &str, why: &str) -> StepOutput {
@@ -8577,6 +8587,65 @@ mod agy_tests;
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn arm_refusal_output_keeps_diagnoses_and_the_existing_network_budget() {
+        use crate::worker_sandbox::{floor_refusal_text, FloorUnarmed};
+
+        let detail = format!(
+            "phase Pending;\n conditions Ready=False; {}",
+            "é".repeat(3000)
+        );
+        for why in [
+            FloorUnarmed::NoCluster,
+            FloorUnarmed::ClusterUnreachable,
+            FloorUnarmed::ControllerMissing,
+            FloorUnarmed::AdmissionPending,
+            FloorUnarmed::ImageUnavailable,
+            FloorUnarmed::PodNotReady,
+            FloorUnarmed::PolicyRefused,
+            FloorUnarmed::ExecStreamLost,
+            FloorUnarmed::PidsUnlimited,
+            FloorUnarmed::CopyInRefused,
+            FloorUnarmed::PartialClone,
+        ] {
+            let base = floor_refusal_text("a", why);
+            let rendered = refusal_with_detail(base.clone(), why, &detail);
+            assert_eq!(
+                rendered,
+                format!(
+                    "{}{}",
+                    base.trim_end_matches(')'),
+                    crate::runtime_wait::diagnosis_suffix(&detail)
+                ),
+                "{why:?}"
+            );
+            assert_eq!(refusal_with_detail(base.clone(), why, ""), base);
+        }
+        for why in [
+            FloorUnarmed::AddressPoolsExhausted,
+            FloorUnarmed::SeatNetworkUnavailable,
+        ] {
+            let base = floor_refusal_text("a", why);
+            assert_eq!(
+                refusal_with_detail(base.clone(), why, &detail),
+                format!(
+                    "{}{}",
+                    base.trim_end_matches(')'),
+                    crate::runtime_wait::network_cause_suffix(&detail)
+                )
+            );
+        }
+        let why = FloorUnarmed::NoSeatImage;
+        let base = floor_refusal_text("a", why);
+        assert_eq!(refusal_with_detail(base.clone(), why, &detail), base);
+        let why = FloorUnarmed::ArgvTooLong;
+        let base = floor_refusal_text("a", why);
+        assert_eq!(
+            refusal_with_detail(base.clone(), why, "123 bytes"),
+            format!("{} — 123 bytes)", base.trim_end_matches(')'))
+        );
+    }
+
     /// core#1538: recovery must see an evaluator's FAIL as a completed turn, both on the first
     /// attempt and on a rerun. Otherwise a runtime blip can replace that FAIL with a later PASS.
     #[test]
@@ -9774,6 +9843,69 @@ mod tests {
         assert!(late.load(std::sync::atomic::Ordering::Relaxed));
     }
 
+    // (core#1278) Judge sessions have their own launch identity and the asking run's parent.
+    fn parented_judge_input() -> StepInput {
+        let mut unit = WorkUnit::pending("validator-agent", "validator", 1, "judge");
+        unit.parent_run_id = Some("parent-run".to_string());
+        StepInput {
+            base_commit: None,
+            run_id: "validator-child".to_string(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "wf-validator".to_string(),
+            entity_mode: crate::scope::EntityMode::Isolated,
+            workdir: None,
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_parent_run_cancel_reaches_its_judge_but_another_run_does_not() {
+        let runner = WrappedCliStepRunner::default();
+        let input = parented_judge_input();
+        let token = runner.register_token(&input);
+        runner.cancel_run_workers("other-parent-run");
+        assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!runner.launch_cancelled(&input));
+        runner.cancel_run_workers("parent-run");
+        assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(runner.launch_cancelled(&input));
+        runner.unregister_token(&input, &token);
+    }
+
+    #[test]
+    fn a_judge_registered_after_its_parent_ended_is_born_cancelled() {
+        let runner = WrappedCliStepRunner::default();
+        runner.cancel_run_workers("parent-run");
+        let input = parented_judge_input();
+        let token = runner.register_token(&input);
+        assert!(token.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(runner.launch_cancelled(&input));
+        runner.unregister_token(&input, &token);
+    }
+
+    #[test]
+    fn a_judge_registered_after_its_parent_reopens_is_admitted() {
+        let runner = WrappedCliStepRunner::default();
+        runner.cancel_run_workers("parent-run");
+        let input = parented_judge_input();
+        let ended_token = runner.register_token(&input);
+        assert!(ended_token.load(std::sync::atomic::Ordering::Relaxed));
+        runner.reopen_run_sessions("parent-run", 3);
+        let token = runner.register_token(&input);
+        assert!(!token.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!runner.launch_cancelled(&input));
+        assert!(ended_token.load(std::sync::atomic::Ordering::Relaxed));
+        runner.unregister_token(&input, &ended_token);
+        runner.unregister_token(&input, &token);
+    }
+
     /// The design's pre-spawn guard: a token born cancelled (reassign won the
     /// dispatch-to-registration race) must stop `run_bounded` from EVER spawning the child, not
     /// merely kill it a poll tick later. A fixture that would create a marker file on start lets
@@ -10478,6 +10610,7 @@ mod tests {
         let carried = wicked_council::dispatch::RealDispatcher::default()
             .with_ballot_carrier(std::sync::Arc::new(crate::decision::SeatBallots::new(
                 runner.clone(),
+                None,
             )))
             .unwrap();
         let task = wicked_council::CouncilTask {

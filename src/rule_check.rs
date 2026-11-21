@@ -335,6 +335,8 @@ pub struct RuleVerdict {
 /// severity) and evidence are the ones it was skipped on. At delivery it answers the rule as it is whatever
 /// the re-composed text (codex r2), except a skip given on a row with no evidence
 /// ([`no_evidence_key`]), which answers only such rows (e2e-1105 F4c).
+/// (core#1374, core#1345) On its own unit it also answers the same seat output, or the same
+/// change-only carry key through a retry unless a later instruction names the rule again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuleSkip {
@@ -349,6 +351,9 @@ pub struct RuleSkip {
     /// The evidence key of the unchecked row it answered: a changed diff is checked again (at
     /// delivery, see the struct doc: re-composed text is not, unless the key is the no-evidence one).
     pub evidence_key: String,
+    /// (core#1374) The seat attempt whose output the person saw when skipping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat_attempt: Option<u32>,
     /// When it confirms a WAIVER: the person's instruction the rule was waived by, quoted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction: Option<String>,
@@ -1183,6 +1188,11 @@ pub enum JudgeAnswer {
 /// ([`crate::validator::run_rule_judge`]); tests inject a fake.
 pub trait RuleJudge: Sync {
     fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer;
+
+    /// (core#1288) A launch may disqualify approving answers while its BROKEN findings stand.
+    fn approval_failure(&self, _seat: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The rules a check reads, the evidence, and the seats it may draw.
@@ -1196,6 +1206,10 @@ pub struct CheckInput<'a> {
     /// The unit's last report: its rows are the cache.
     pub prior: Option<&'a RuleCheckReport>,
     pub skips: &'a [RuleSkip],
+    /// (core#1374) The seat attempt whose captured output this check judges.
+    pub seat_attempt: Option<u32>,
+    /// (core#1345) This unit's rulings on the person's instructions.
+    pub rulings: &'a [crate::domain::OperatorRuling],
     /// The distinct judge seats, in rotation order.
     pub seats: &'a [String],
     /// Why no seat was drawn, when `seats` is empty.
@@ -2417,8 +2431,8 @@ fn named_records(cite: &str) -> BTreeSet<usize> {
 /// The engine's match facts as the judge (and a council) is told them beside the rule.
 pub fn match_note(m: &wicked_governance::RuleMatch, stage: CheckStage) -> String {
     if stage == CheckStage::Delivery {
-        return "  Engine: applies — the review deferred it to this delivery; judge it on the pull \
-                request text\n"
+        return "  Engine: deferred here by the review — the rule's own words decide whether it \
+                applies to this pull request; judge it on the pull request text\n"
             .to_string();
     }
     format!(
@@ -3350,30 +3364,57 @@ pub fn check(
             }
             _ => digest(&[if is_machine { &machine_key } else { &judge_key }, &note]),
         };
-        // A skip answers exactly the unchecked row it was given on: the same rule content and the
-        // same evidence.
-        if let Some(s) = input
-            .skips
-            .iter()
-            .rev()
-            // At delivery the text is re-composed on a retry (it carries the run's own record), so
-            // a skip there answers the rule as it is, whatever the text (codex r2) — except a skip
-            // given when there was NO text to judge (e2e-1105 F4c): text the check can read is
-            // judged, and a broken verdict on it denies.
-            .find(|s| {
-                s.rule_id == rule.id
-                    && s.rule_key == rk
-                    && (s.evidence_key == ek
-                        || (input.stage == CheckStage::Delivery
-                            && s.evidence_key != no_evidence_key()))
-            })
-        {
+        let change_only = !is_machine
+            && !matches!(
+                pack,
+                Some(PackKind::Process(_)) | Some(PackKind::WorkWithRecord)
+            );
+        // (core#1345) The rule's own match is part of both own and carried skips' evidence.
+        let rule_carry = carry_key
+            .as_ref()
+            .map(|k| digest(&[k, &match_note(m, input.stage)]));
+        if let Some(rc) = &rule_carry {
+            carry_keys.insert(rule.id.clone(), rc.clone());
+        }
+        // (core#1374) Own skips also answer a re-check of the same seat's output.
+        // (core#1345) A retry keeps a change-only skip unless the person rules on that rule again.
+        if let Some((s, context)) = input.skips.iter().rev().find_map(|s| {
+            if s.rule_id != rule.id || s.rule_key != rk {
+                return None;
+            }
+            let context = if s.evidence_key == ek
+                || (input.stage == CheckStage::Delivery && s.evidence_key != no_evidence_key())
+            {
+                ""
+            } else if input.seat_attempt.is_some() && s.seat_attempt == input.seat_attempt {
+                " on this re-check (nothing ran since)"
+            } else if change_only
+                && rule_carry.is_some()
+                && s.carry_key == rule_carry
+                && !input.rulings.iter().any(|r| {
+                    r.at > s.at
+                        && crate::actor::RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str())
+                        && r.text
+                            .split(|c: char| {
+                                !c.is_ascii_alphanumeric() && !matches!(c, '_' | '.' | '-')
+                            })
+                            // A sentence's full stop is no part of the id.
+                            .any(|word| word.trim_end_matches('.').eq_ignore_ascii_case(&rule.id))
+                })
+            {
+                ", kept through the retry (the change, the checks and the facts are the ones \
+                 it was given on)"
+            } else {
+                return None;
+            };
+            Some((s, context))
+        }) {
             let why = match s.instruction.as_deref() {
                 Some(i) => format!(
                     "waived by instruction ({i}), confirmed by {}: {}",
                     s.by, s.reason
                 ),
-                None => format!("skipped by {}: {}", s.by, s.reason),
+                None => format!("skipped by {}{context}: {}", s.by, s.reason),
             };
             rows.insert(
                 rule.id.clone(),
@@ -3390,19 +3431,6 @@ pub fn check(
         // later step adds, which the person never saw (codex on #1516).
         // (codex on #1516) …nor a machine obligation, whose base-test run is evidence a later
         // step may first be able to obtain.
-        let change_only = !is_machine
-            && !matches!(
-                pack,
-                Some(PackKind::Process(_)) | Some(PackKind::WorkWithRecord)
-            );
-        // (codex on #1516) …and the rule's own derived match (its source reference can make it
-        // "applies here" with no other change): part of this rule's carry key.
-        let rule_carry = carry_key
-            .as_ref()
-            .map(|k| digest(&[k, &match_note(m, input.stage)]));
-        if let Some(rc) = &rule_carry {
-            carry_keys.insert(rule.id.clone(), rc.clone());
-        }
         if let Some(s) = (change_only && rule_carry.is_some())
             .then(|| {
                 input.carried.iter().rev().find(|s| {
@@ -4416,8 +4444,16 @@ fn run_pool(
                         let mut a = answered.lock().unwrap();
                         let mut w = why.lock().unwrap();
                         let mut l = left.lock().unwrap();
+                        let approval_failure = judge.approval_failure(&seat);
                         for (j, id) in ids.iter().enumerate() {
                             let miss = match parsed.answers.get(*id) {
+                                Some(ans)
+                                    if ans.status != RuleStatus::Broken
+                                        && approval_failure.is_some() =>
+                                {
+                                    pool.dead.lock().unwrap().insert(seat.clone());
+                                    Miss::Unsure(approval_failure.clone().unwrap())
+                                }
                                 // (codex r2) At delivery a KEPT quotes the published text.
                                 Some(ans)
                                     if input.stage == CheckStage::Delivery
