@@ -858,7 +858,7 @@ pub(crate) mod tests {
 
     #[test]
     fn fold_refuses_non_directory_root_without_erasing_links() {
-        for kind in [b'0', b'1', b'2', b'3', b'6'] {
+        for kind in *b"01236" {
             let bytes = image_tar(&[("./", kind, b"", "floor")]);
             let mut paths = BTreeMap::from([(PathBuf::from("/floor"), true)]);
             assert!(fold_layer(bytes.as_slice(), &mut paths, &mut 0).is_err());
