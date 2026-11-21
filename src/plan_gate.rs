@@ -165,6 +165,9 @@ pub struct TeamPlanState {
     /// this run decides fills its floor without them ([`crate::plan::FloorInput::power_absorbs`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub power_absorbs: Vec<String>,
+    /// Intake QE phases bind every later plan revision, like held obligations (core#1178).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub qe_phases: Vec<String>,
     /// (DES-CATALOG-002 §2.4, §11 Lane A) A plan-gate SEND-BACK in progress: the person sent the
     /// held rev back with a note and the lead is re-planning. While it is set the held rev is not
     /// approvable (every answer is refused `gate_changed`), no plan gate opens and nothing
@@ -1087,6 +1090,7 @@ pub(crate) fn decide(
             requires_evaluator: prior.requires_evaluator,
             requires_qe: prior.requires_qe,
             power_absorbs: &prior.power_absorbs,
+            qe_phases: &prior.qe_phases,
         },
     ) {
         Ok(f) => f,

@@ -731,14 +731,14 @@ pub const DROPPED_AT_LAUNCH: [&str; 3] = ["understand", "test_plan", "design"];
 
 /// A power launch's plan: the authored plan without its [`DROPPED_AT_LAUNCH`] steps, with every
 /// `depends_on` that named a dropped step re-pointed at what that step depended on. A plan that
-/// would keep no step at all is returned unchanged (nothing for an orchestrator to build).
+/// has no build step is returned unchanged: no orchestrator would absorb the dropped work.
 pub fn launch_plan(plan: &crate::plan::PlanSteps) -> crate::plan::PlanSteps {
     let dropped: Vec<&crate::plan::PlanStep> = plan
         .steps
         .iter()
         .filter(|s| DROPPED_AT_LAUNCH.contains(&s.catalog.as_str()))
         .collect();
-    if dropped.len() == plan.steps.len() || dropped.is_empty() {
+    if !plan.steps.iter().any(|s| s.catalog == "build") || dropped.is_empty() {
         return plan.clone();
     }
     // A dropped step's own dependencies, resolved through chains of dropped steps.
@@ -1010,15 +1010,16 @@ pub const CHECKPOINT_PREFIX: &str = "CHECKPOINT:";
 /// The line an orchestrator ends its last turn with.
 pub const HANDOFF_PREFIX: &str = "HANDOFF:";
 
-/// How a turn ended, from its output (the LAST marker line wins; none = a checkpoint).
+/// How a turn ended, from its output (the LAST marker line wins).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TurnEnd {
     Checkpoint(String),
     Handoff(String),
+    Unmarked,
 }
 
 pub fn turn_end(output: &str) -> TurnEnd {
-    let mut end = TurnEnd::Checkpoint(String::new());
+    let mut end = TurnEnd::Unmarked;
     for line in output.lines().map(str::trim) {
         let line = line.trim_start_matches(['*', '`', '>', ' ']);
         if let Some(rest) = line.strip_prefix(HANDOFF_PREFIX) {
@@ -1668,8 +1669,19 @@ pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
 /// restates the task as authored plus this attempt's [`attempt_notes`], never older rounds' notes.
 pub fn authored_task(unit: &crate::domain::WorkUnit) -> String {
     let mut task = unit.description.clone();
-    for r in unit.operator_rulings.iter().filter(|r| r.action == "amend") {
-        task = task.replace(&format!(" (operator amendment: {})", r.text), "");
+    // Strip appended history only; note text can itself contain another segment (core#1520).
+    let segments: Vec<String> = unit
+        .operator_rulings
+        .iter()
+        .filter(|r| r.action == "amend")
+        .map(|r| format!(" (operator amendment: {})", r.text))
+        .collect();
+    while let Some(segment) = segments
+        .iter()
+        .filter(|s| task.ends_with(s.as_str()))
+        .max_by_key(|s| s.len())
+    {
+        task.truncate(task.len() - segment.len());
     }
     task
 }
@@ -2178,7 +2190,12 @@ pub fn orchestrate(
                         continue;
                     };
                     last_tick = std::time::Instant::now();
-                    let report = measure(&w, start.as_deref(), trigger, turn, 0, "");
+                    let failed = crate::tool_activity::failed_tests(
+                        &probe.run_id,
+                        probe.unit.ord,
+                        probe.attempt,
+                    );
+                    let report = measure(&w, start.as_deref(), trigger, turn, failed, "");
                     let _ = send_checkpoint(&tx, &probe, report, false);
                 }
             })
@@ -2257,6 +2274,13 @@ pub fn orchestrate(
         let (handoff, summary) = match &end {
             TurnEnd::Handoff(s) => (true, s.clone()),
             TurnEnd::Checkpoint(s) => (false, s.clone()),
+            // Missing protocol must not buy another full turn (core#1178).
+            TurnEnd::Unmarked => (
+                true,
+                "the turn ended with no CHECKPOINT or HANDOFF line; \
+                 the engine read it as the hand-off"
+                    .to_string(),
+            ),
         };
         let last = turn >= max;
         let trigger = if handoff || last {
@@ -2266,7 +2290,14 @@ pub fn orchestrate(
         };
         let answer = wd
             .as_deref()
-            .map(|w| measure(w, start.as_deref(), trigger, turn, 0, &summary))
+            .map(|w| {
+                let failed = crate::tool_activity::failed_tests(
+                    &input.run_id,
+                    input.unit.ord,
+                    input.attempt,
+                );
+                measure(w, start.as_deref(), trigger, turn, failed, &summary)
+            })
             .and_then(|r| send_checkpoint(&tx, &turn_input, r, true))
             .unwrap_or_default();
         let mut answer = answer;
@@ -2596,6 +2627,55 @@ mod tests {
         assert!(e.to_string().contains("at most 4096"), "{e}");
     }
 
+    /// (core#1255) every preset keeps a deliverable-producing step for its evaluator to judge.
+    #[test]
+    fn power_presets_keep_the_work_the_handoff_evaluates() {
+        let work = |s: &crate::plan::PlanStep| {
+            !HANDOFF_TYPES.contains(&s.catalog.as_str())
+                || crate::catalog::catalog_entry(&s.catalog)
+                    .is_some_and(|e| e.role == crate::workflow::PhaseRole::Creator)
+        };
+        for (name, steps) in crate::catalog::builtin_presets() {
+            let plan = crate::plan::PlanSteps {
+                steps,
+                ..Default::default()
+            };
+            let launched = launch_plan(&plan);
+            if plan.steps.iter().any(work) {
+                assert!(
+                    launched.steps.iter().any(work),
+                    "preset {name} lost its work: {launched:?}"
+                );
+            }
+            match name {
+                "test-analysis" => assert!(launched.steps.iter().any(|s| s.id == "analyze")),
+                "validate-docs" => assert!(launched.steps.iter().any(|s| s.id == "claims")),
+                "docs" | "test-plan" => {
+                    assert!(!launched.steps.iter().any(|s| s.catalog == "understand"));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// (core#1520) nested note segments and authored mid-sentence text survive suffix stripping.
+    #[test]
+    fn authored_task_strips_only_the_longest_amendment_suffix() {
+        let authored = "keep (operator amendment: A) in the middle";
+        let mut unit = crate::domain::WorkUnit::pending("r:fix", "r", 0, authored);
+        for text in ["A", "B (operator amendment: A)"] {
+            unit.description
+                .push_str(&format!(" (operator amendment: {text})"));
+            unit.operator_rulings.push(crate::domain::OperatorRuling {
+                action: "amend".into(),
+                text: text.into(),
+                attempt: 1,
+                at: 1,
+            });
+        }
+        assert_eq!(authored_task(&unit), authored);
+    }
+
     #[test]
     fn a_power_launch_drops_the_pre_build_phases_and_repoints_their_dependents() {
         let bug = crate::catalog::builtin_presets()
@@ -2654,6 +2734,7 @@ mod tests {
                     requires_evaluator: true,
                     requires_qe: false,
                     power_absorbs: absorbs,
+                    qe_phases: &[],
                 },
             )
             .unwrap()
@@ -3027,8 +3108,9 @@ mod tests {
         assert!(notes_event("r1", 3, 1, 2, "claude", Vec::new()).is_none());
     }
 
+    /// (core#1178) a missing turn marker is explicit, so the loop can hand off immediately.
     #[test]
-    fn a_turn_ends_on_its_last_marker_and_defaults_to_a_checkpoint() {
+    fn a_turn_ends_on_its_last_marker_or_is_unmarked() {
         assert_eq!(
             turn_end("work\nCHECKPOINT: commit 1\nmore\n**HANDOFF: done**"),
             TurnEnd::Handoff("done".into())
@@ -3037,7 +3119,7 @@ mod tests {
             turn_end("HANDOFF: early\nCHECKPOINT: then more"),
             TurnEnd::Checkpoint("then more".into())
         );
-        assert_eq!(turn_end("no marker"), TurnEnd::Checkpoint(String::new()));
+        assert_eq!(turn_end("no marker"), TurnEnd::Unmarked);
     }
 
     #[test]
@@ -3100,6 +3182,7 @@ mod tests {
         assert!(spread_grew(&zero, 2));
     }
 
+    /// (core#1178) three failed test results name the struggle the checkpoint reports.
     #[test]
     fn struggle_crosses_its_line_on_failures_reverts_or_twice_the_estimate() {
         let s = |f, r, e, est| Struggle {
@@ -3111,7 +3194,10 @@ mod tests {
             score: 0,
         };
         assert!(struggle_score(&s(0, 0, 10, Some(30))).1.is_empty());
-        assert_eq!(struggle_score(&s(3, 0, 10, None)).1.len(), 1);
+        assert_eq!(
+            struggle_score(&s(3, 0, 10, None)).1,
+            ["3 failed test runs".to_string()]
+        );
         assert_eq!(struggle_score(&s(0, 2, 10, None)).1.len(), 1);
         assert_eq!(struggle_score(&s(0, 0, 61, Some(30))).1.len(), 1);
         assert!(struggle_score(&s(5, 3, 200, Some(30))).0 <= 100);

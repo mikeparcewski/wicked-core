@@ -123,9 +123,31 @@ fn shown() -> &'static Budget {
     S.get_or_init(Default::default)
 }
 
+// Count real test results across turns of an attempt, never interrupted calls (core#1178).
+type FailedTests = std::sync::Mutex<HashMap<(String, u32, u32), u32>>;
+
+fn attempt_failures() -> &'static FailedTests {
+    static S: std::sync::OnceLock<FailedTests> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default)
+}
+
+/// Failed test results seen in this unit attempt's tool streams (core#1178).
+pub fn failed_tests(run_id: &str, ord: u32, attempt: u32) -> u32 {
+    attempt_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(run_id.to_string(), ord, attempt))
+        .copied()
+        .unwrap_or(0)
+}
+
 /// Forget a run's call budget (its end).
 pub fn forget_run(run_id: &str) {
     crate::skill_use::forget_run(run_id);
+    attempt_failures()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|(r, _, _), _| r != run_id);
     shown()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -323,6 +345,17 @@ impl ToolActivitySink {
         let Some(o) = self.open.remove(id) else {
             return;
         };
+        if o.kind == "test" && !ok {
+            let mut failures = attempt_failures().lock().unwrap_or_else(|p| p.into_inner());
+            let n = failures
+                .entry((self.run_id.clone(), self.ord, self.attempt))
+                .or_default();
+            *n = n.saturating_add(1);
+        }
+        self.finish_frame(id, o, ok);
+    }
+
+    fn finish_frame(&self, id: &str, o: Open, ok: bool) {
         let ms = o.at.elapsed().as_millis() as u64;
         self.send(self.frame(
             id,
@@ -341,7 +374,9 @@ impl ToolActivitySink {
         let mut ids: Vec<String> = self.open.keys().cloned().collect();
         ids.sort();
         for id in ids {
-            self.finished(&id, false);
+            if let Some(o) = self.open.remove(&id) {
+                self.finish_frame(&id, o, false);
+            }
         }
         flush_usage(&self.usage, &self.tx, now_ms(), true);
     }
@@ -1591,6 +1626,43 @@ mod tests {
         assert_eq!(seen[0]["target"], "npx vitest run tests/x.test.ts");
         assert_eq!(seen[1]["state"], "finished");
         assert_eq!(seen[1]["ok"], false);
+    }
+
+    /// (core#1178) only completed failing test calls count, across every turn of an attempt.
+    #[test]
+    fn failed_tests_count_results_across_turns_but_not_stream_close() {
+        use crate::execute_wrapped::{ClaudeStreamJson, OutputAdapter};
+        let run = "failed-tests-results";
+        forget_run(run);
+        for (command, error, want) in [
+            ("npm test", false, 0),
+            ("git status", true, 0),
+            ("npm test", true, 1),
+            ("npm test", true, 2),
+        ] {
+            let (s, _) = sink("/w/repo", run);
+            let mut a = ClaudeStreamJson::with_activity(Some(s));
+            a.on_line(
+                &json!({"type": "assistant", "message": {"role": "assistant",
+                    "content": [{"type": "tool_use", "id": "t", "name": "Bash",
+                        "input": {"command": command}}]}})
+                .to_string(),
+            );
+            a.on_line(
+                &json!({"type": "user", "message": {"role": "user",
+                    "content": [{"type": "tool_result", "tool_use_id": "t",
+                        "is_error": error}]}})
+                .to_string(),
+            );
+            assert_eq!(failed_tests(run, 3, 0), want);
+        }
+        let (mut s, _) = sink("/w/repo", run);
+        s.started("open", "Bash", &json!({"command": "npm test"}));
+        s.close();
+        assert_eq!(failed_tests(run, 3, 0), 2);
+        assert_eq!(failed_tests(run, 3, 1), 0, "attempts are isolated");
+        forget_run(run);
+        assert_eq!(failed_tests(run, 3, 0), 0);
     }
 
     #[test]
