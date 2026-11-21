@@ -1473,6 +1473,26 @@ impl TreeLock {
     }
 }
 
+/// (core#1435) Whether `run_id`'s tree is taken or queued for: a reap or removal of an earlier life
+/// of the same run id is still going, so a mint now would wait for it.
+pub(crate) fn tree_busy(repo_root: &str, run_id: &str) -> bool {
+    let (held, _) = tree_locks();
+    held.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .contains_key(&tree_key(repo_root, run_id))
+}
+
+/// (core#1435) Block until nothing holds or waits for `run_id`'s tree (see [`tree_busy`]). For a
+/// thread of its own, never the actor.
+pub(crate) fn wait_tree_idle(repo_root: &str, run_id: &str) {
+    let key = tree_key(repo_root, run_id);
+    let (held, freed) = tree_locks();
+    let mut map = held.lock().unwrap_or_else(|p| p.into_inner());
+    while map.contains_key(&key) {
+        map = freed.wait(map).unwrap_or_else(|p| p.into_inner());
+    }
+}
+
 /// (tests) Hold `run_id`'s tree lock, as a removal still going would.
 #[cfg(test)]
 pub(crate) fn hold_tree_for_test(repo_root: &str, run_id: &str) -> impl Drop {

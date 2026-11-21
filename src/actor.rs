@@ -3428,6 +3428,26 @@ pub(crate) fn run(
                     emit_run_error(&mut subscribers, &run_id, e);
                 }
             }
+            Command::CampaignTick { campaign } => {
+                // (core#1435) A node that waited for its tree's earlier reap launches now.
+                let seams = campaign_seams(
+                    &runner,
+                    &self_tx,
+                    &registry,
+                    process_gen,
+                    &lifecycle_maps,
+                    &qe_host,
+                );
+                if let Err(e) = crate::campaign::tick(
+                    &mut store,
+                    &mut subscribers,
+                    &mut in_flight,
+                    &seams,
+                    &campaign,
+                ) {
+                    eprintln!("wicked-core: campaign {campaign}: a deferred dispatch failed: {e}");
+                }
+            }
             Command::CampaignNodeAwaiting { run_id, prompt } => {
                 // Deferred: a node's Run hit a HITL gate → free its slot + let independent work run.
                 let seams = campaign_seams(
