@@ -1385,15 +1385,15 @@ pub(crate) fn apply_and_finish_unit(
             .find(|u| u.ord == ord)
             .and_then(|u| u.phase_id().map(str::to_string))
     };
+    let mut creator_paths = None;
     let checks_denial: Option<(&'static str, String)> = match &evidence.repo_checks {
         Some(report) => {
             unit.repo_checks = Some(report.clone());
             let verify_floor = unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
-            let (changed, changed_truncated) = if verify_floor {
-                (Vec::new(), false)
-            } else {
-                creator_changed_paths(unit, workdir.as_deref(), report)
-            };
+            if !verify_floor {
+                creator_paths = creator_changed_paths(unit, workdir.as_deref(), report);
+            }
+            let (changed, changed_truncated) = creator_paths.clone().unwrap_or_default();
             emit(CoreEvent::RepoChecksEvaluated {
                 session: session_id.to_string(),
                 ord: unit.ord,
@@ -1592,6 +1592,12 @@ pub(crate) fn apply_and_finish_unit(
         }
         None => None,
     };
+    unit.changed_code = changed_code(
+        unit.changed_code,
+        evidence.tree_changed,
+        creator_paths.as_ref().map(|(paths, _)| paths.as_slice()),
+        creator_paths.as_ref().is_some_and(|(_, cut)| *cut),
+    );
     // (DES-STUDIO-COCKPIT-001 §3 B1) Capture the layer-1 (deterministic) pass NOW, before the
     // denials are moved into the deny-dominance fold below, so `GateEvaluated` can carry the
     // depth. Both deterministic instruments count: the pinned validator and the repo checks.
@@ -2561,32 +2567,56 @@ pub(crate) fn disclose_hook_record_in(
     }
 }
 
+// (core#1316) A complete path list can establish no code; a code path always establishes code.
+fn changed_code(
+    prior: Option<bool>,
+    tree_changed: Option<bool>,
+    paths: Option<&[crate::worktree_guard::ChangedPath]>,
+    truncated: bool,
+) -> Option<bool> {
+    if prior == Some(true)
+        || paths.is_some_and(|paths| {
+            paths.iter().any(|p| {
+                crate::rule_check::is_source_path(&p.path)
+                    || crate::rule_check::is_test_path(&p.path)
+            })
+        })
+    {
+        Some(true)
+    } else if tree_changed == Some(false) || (paths.is_some() && !truncated) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 /// (TR-W1b, DES-trigger-registry §4.4 row 4) The paths a creator unit changed, for its floor's
 /// `repoChecksEvaluated`: the unit's dispatch baseline tree against the tree its checks ran on
 /// (`RepoChecksReport::tree`), through the baseline's pinned git dir, capped at
-/// [`crate::worktree_guard::CHANGED_PATHS_CAP`] (`true` = cut). Empty when either tree is unknown,
-/// the trees are equal, or the diff fails (logged): a consumer reads "no paths", never a guess.
+/// [`crate::worktree_guard::CHANGED_PATHS_CAP`] (`true` = cut). (core#1316) `None` when either
+/// tree is unknown or the diff fails (logged): the event then reads "no paths", never a guess, and
+/// [`changed_code`] stays unknown.
 fn creator_changed_paths(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&str>,
     report: &crate::repo_checks::RepoChecksReport,
-) -> (Vec<crate::worktree_guard::ChangedPath>, bool) {
+) -> Option<(Vec<crate::worktree_guard::ChangedPath>, bool)> {
     let (Some(wd), Some(baseline), Some(after)) = (
         workdir,
         unit.worktree_baseline.as_ref(),
         report.tree.as_deref(),
     ) else {
-        return (Vec::new(), false);
+        return None;
     };
     match crate::worktree_guard::changed_since(std::path::Path::new(wd), baseline, after) {
-        Ok(changed) => crate::worktree_guard::capped(changed),
+        Ok(changed) => Some(crate::worktree_guard::capped(changed)),
         Err(e) => {
             eprintln!(
                 "wicked-core: unit {}: the changed paths of its creator floor could not be \
                  listed: {e}",
                 unit.ord
             );
-            (Vec::new(), false)
+            None
         }
     }
 }
@@ -7128,5 +7158,57 @@ mod standing_first_tests {
         assert_eq!(standing_first(None, Some(refusal("a"))), Some(refusal("a")));
         assert_eq!(standing_first(Some(refusal("a")), None), Some(refusal("a")));
         assert_eq!(standing_first(None, None), None);
+    }
+}
+
+#[cfg(test)]
+mod changed_code_tests {
+    use super::changed_code;
+    use crate::worktree_guard::ChangedPath;
+
+    #[test]
+    fn stamp_tracks_code_non_code_unknown_and_sticky_code_changes() {
+        let source = [ChangedPath {
+            status: "M".into(),
+            path: "src/lib.rs".into(),
+        }];
+        let tests = [ChangedPath {
+            status: "A".into(),
+            path: "tests/check.rs".into(),
+        }];
+        let docs = [ChangedPath {
+            status: "M".into(),
+            path: "README.md".into(),
+        }];
+        assert_eq!(
+            changed_code(None, Some(true), Some(&source), false),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&tests), true),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&docs), false),
+            Some(false)
+        );
+        assert_eq!(
+            changed_code(None, Some(true), Some(&[]), false),
+            Some(false)
+        );
+        assert_eq!(changed_code(None, Some(false), None, false), Some(false));
+        assert_eq!(changed_code(None, Some(true), Some(&docs), true), None);
+        assert_eq!(changed_code(None, Some(true), None, false), None);
+        assert_eq!(changed_code(None, None, None, false), None);
+        assert_eq!(changed_code(Some(false), None, None, false), None);
+        assert_eq!(
+            changed_code(Some(false), Some(true), Some(&source), false),
+            Some(true)
+        );
+        assert_eq!(
+            changed_code(Some(true), Some(false), Some(&docs), false),
+            Some(true)
+        );
+        assert_eq!(changed_code(Some(true), None, None, false), Some(true));
     }
 }

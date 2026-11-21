@@ -69,6 +69,16 @@ pub(crate) fn is_floor_network_refusal(output: &str) -> bool {
         .any(|k| first.contains(&format!("its seat container did not arm — {}", k.as_str())))
 }
 
+/// (core#1667) A partial clone is the shared repository's refusal, read on the first line only.
+pub(crate) fn is_floor_repository_refusal(output: &str) -> bool {
+    let first = output.trim_start().lines().next().unwrap_or("");
+    first.starts_with("(seat '")
+        && first.contains(&format!(
+            "its seat container did not arm — {}",
+            crate::worker_sandbox::FloorUnarmed::PartialClone.as_str()
+        ))
+}
+
 /// How a floor network refusal labels the runtime's own error it carries (core#1356).
 const NETWORK_CAUSE_LABEL: &str = " — runtime error: ";
 /// The most of that error the refusal and the gate carry.
@@ -604,6 +614,27 @@ mod tests {
         assert!(!is_floor_runtime_refusal(
             "(cli `claude` exited 1) Not logged in"
         ));
+    }
+
+    #[test]
+    fn only_the_floors_first_line_partial_clone_refusal_is_a_repository_fault() {
+        use crate::worker_sandbox::{floor_refusal_text, FloorUnarmed};
+
+        let text = floor_refusal_text("a", FloorUnarmed::PartialClone);
+        assert!(is_floor_repository_refusal(&text));
+        let detailed = format!(
+            "{}{}",
+            text.trim_end_matches(')'),
+            diagnosis_suffix("promisor remote origin lacks recent objects")
+        );
+        assert!(is_floor_repository_refusal(&detailed));
+        assert!(!is_floor_repository_refusal(&format!(
+            "worker transcript\n{detailed}"
+        )));
+        assert!(!is_floor_repository_refusal(&floor_refusal_text(
+            "a",
+            FloorUnarmed::CopyInRefused,
+        )));
     }
 
     /// core#1356: a seat network the answering runtime could not create is the host's fault

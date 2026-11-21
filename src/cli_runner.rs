@@ -1953,6 +1953,8 @@ pub(crate) fn delivery_rule_check(
     };
     let report = crate::rule_check::check(
         &crate::rule_check::CheckInput {
+            seat_attempt: None,
+            rulings: &[],
             rules: &rules,
             facts: &facts,
             change: &change,
@@ -2426,6 +2428,13 @@ fn run_rule_check_with(
             }
         ),
     );
+    let rulings: Vec<crate::domain::OperatorRuling> = input
+        .unit
+        .operator_rulings
+        .iter()
+        .filter(|r| crate::actor::RULE_INSTRUCTION_ACTIONS.contains(&r.action.as_str()))
+        .cloned()
+        .collect();
     let judge = SeatRuleJudge {
         seats: pool,
         runner,
@@ -2437,6 +2446,15 @@ fn run_rule_check_with(
         || {
             crate::rule_check::check(
                 &crate::rule_check::CheckInput {
+                    seat_attempt: Some(
+                        input
+                            .unit
+                            .requested_rejudge
+                            .as_ref()
+                            .map(|r| r.attempt)
+                            .unwrap_or(input.attempt),
+                    ),
+                    rulings: &rulings,
                     rules: &rules,
                     facts: &facts,
                     change: &change,
@@ -2901,8 +2919,9 @@ fn launch_preset(db_path: &str, run_id: &str) -> Option<Option<String>> {
 
 /// (DES-RULE-CHECK-001 rev 2, Part B, B.2) The records POL-2101's record clause is judged on: the
 /// approved output of EVERY agent step that writes code (a creator, or an `executes_code` phase)
-/// done before `ord`,
-/// read from the run's store READ-ONLY (as the rules are). A step with no approved output is kept
+/// done before `ord`.
+/// (core#1316) Steps known to have changed no code are excluded; old, unknown records stay.
+/// Read from the run's store READ-ONLY (as the rules are). A step with no approved output is kept
 /// with an empty record (codex r1: it recorded nothing, which the check decides; it is never left
 /// out). `Err` when the store or a record cannot be read.
 fn creator_records(
@@ -2922,6 +2941,7 @@ fn creator_records(
             && u.tool_cmd.is_none()
             && (u.role == crate::workflow::PhaseRole::Creator || u.executes_code)
             && u.status == crate::domain::UnitStatus::Done
+            && u.changed_code != Some(false)
     }) {
         let node = store
             .get_node(&wicked_apps_core::synthetic_symbol(

@@ -802,6 +802,7 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     };
     let deferred = vec!["learn-linked-issue".to_string(), "retired-rule".to_string()];
     let held =
@@ -1034,6 +1035,7 @@ fn an_operator_ruling_reaches_the_judge_re_judges_the_cache_and_waives_only_on_c
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
     let confirmed = judge_with(&input, &judge);
     let row = r2(&confirmed);
@@ -1490,6 +1492,7 @@ fn confirm(input: &mut StepInput, report: &crate::rule_check::RuleCheckReport, i
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
 }
 
@@ -1626,11 +1629,12 @@ fn the_creator_record_set_is_every_done_code_writing_step_before_the_gate() {
             u.executes_code = code;
             u
         };
-        put_creator_record(
-            &mut store,
-            &unit(1, PhaseRole::Creator, true),
-            "build record",
-        );
+        let mut build = unit(1, PhaseRole::Creator, true);
+        build.changed_code = Some(true);
+        put_creator_record(&mut store, &build, "build record");
+        let mut docs = unit(0, PhaseRole::Creator, true);
+        docs.changed_code = Some(false);
+        put_creator_record(&mut store, &docs, "documentation only");
         put_creator_record(
             &mut store,
             &unit(2, PhaseRole::Neutral, true),
@@ -2471,6 +2475,7 @@ fn a_skip_lands_on_a_rejudge_that_reuses_the_floor_result_of_the_same_tree() {
         carry_key: None,
         ord: None,
         rulings_rev: None,
+        seat_attempt: None,
     }];
     let again = judge(&input, None);
     let row = again.rows.iter().find(|r| r.rule_id == "R2").unwrap();

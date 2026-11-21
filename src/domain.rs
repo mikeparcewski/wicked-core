@@ -1642,6 +1642,9 @@ pub struct WorkUnit {
     /// action `skip_rules`); each applies while the rule's evidence is the one it was given on.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rule_skips: Vec<crate::rule_check::RuleSkip>,
+    /// (core#1316) Code changed against the dispatch baseline; once true, stays true.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changed_code: Option<bool>,
     /// (core#1493) The person's skips at the run's OTHER units, stamped at dispatch on a review
     /// unit: a later step carries one only on the exact evidence it was given on
     /// ([`crate::rule_check::CheckInput::carried`]).
@@ -2016,6 +2019,7 @@ impl WorkUnit {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            changed_code: None,
             rule_carried_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,

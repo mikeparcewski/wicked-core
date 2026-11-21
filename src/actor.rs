@@ -7273,19 +7273,30 @@ fn apply_step_result(
             || crate::runtime_wait::is_floor_runtime_refusal(&output.output)
             // (core#1356) The runtime answers but could not make the seat's network (its address
             // pools ran out): the host's fault too, named as what it is.
-            || crate::runtime_wait::is_floor_network_refusal(&output.output))
+            || crate::runtime_wait::is_floor_network_refusal(&output.output)
+            || crate::runtime_wait::is_floor_repository_refusal(&output.output))
     {
         let human_present = !matches!(session.human_confirm, crate::domain::HumanConfirm::None);
         let cli = unit
             .assigned_cli
             .clone()
             .unwrap_or_else(|| "claude".to_string());
+        let repository = crate::runtime_wait::is_floor_repository_refusal(&output.output);
         let network = crate::runtime_wait::is_floor_network_refusal(&output.output);
         let pools = network
             && output
                 .output
                 .contains(crate::worker_sandbox::FloorUnarmed::AddressPoolsExhausted.as_str());
-        let why = if network {
+        let why = if repository {
+            let cause = crate::runtime_wait::floor_network_cause(&output.output)
+                .map(|c| format!(" ({c})"))
+                .unwrap_or_default();
+            format!(
+                "Unit {ord} ({cli}) did not run: the repository is a partial clone whose recent \
+                 history was never fetched{cause} — the repository's state, not seat '{cli}''s \
+                 (the seat is not benched)"
+            )
+        } else if network {
             // The runtime's own error (the network's name and cause) rides after the kind's words.
             let cause = crate::runtime_wait::floor_network_cause(&output.output)
                 .map(|c| format!(" ({c})"))
@@ -7322,7 +7333,11 @@ fn apply_step_result(
         put_node(store, unit.to_node())?;
         persist_rejected_transcript(store, &session, unit, &output.output);
         if human_present {
-            let fix = if pools {
+            let fix = if repository {
+                "Fetch the missing objects in the repository (`git config --unset \
+                 remote.<name>.partialclonefilter`, then `git fetch --refetch <name>`), or clone \
+                 it again without --filter"
+            } else if pools {
                 "Free the runtime's address pools: list its networks (`docker network ls`) and \
                  remove the unused ones (`docker network rm <name>`)"
             } else if network {
@@ -7331,10 +7346,14 @@ fn apply_step_result(
                 "Start the container runtime (Rancher Desktop, Docker Desktop, `podman machine \
                  start`, `colima start`)"
             };
+            let shared = if repository {
+                "Every seat copies the same repository, so reassigning does not fix it."
+            } else {
+                "Every seat runs in the same runtime, so reassigning does not fix it."
+            };
             let prompt = format!(
                 "{why}. {fix}, then approve to retry on the same seat (optionally amend), or \
-                 reject to stop the run. Every seat runs in the same runtime, so reassigning does \
-                 not fix it."
+                 reject to stop the run. {shared}"
             );
             pause_for_human(
                 store,
@@ -10060,6 +10079,23 @@ pub(crate) fn failover_note(unit: &crate::domain::WorkUnit, has_result: bool) ->
     format!("{base}{refused}")
 }
 
+// (core#1374) Disclose a judge hold while the rule layer is still in front of it.
+fn judge_hold_behind_rules(unit: &crate::domain::WorkUnit) -> String {
+    unit.denials_behind
+        .iter()
+        .flatten()
+        .find(|d| d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE)
+        .map(|d| {
+            format!(
+                ". Also held behind the rules: no eligible judge seat remained — {}. Answering \
+                 the rules does not clear it: the gate then asks for your judgment of the work \
+                 or a judge re-run (`rejudge`)",
+                reason_head(&d.reason)
+            )
+        })
+        .unwrap_or_default()
+}
+
 fn denial_gate_prompt_body(
     unit: &crate::domain::WorkUnit,
     class: &str,
@@ -10267,8 +10303,9 @@ fn denial_gate_prompt_body(
             };
             format!(
                 "Unit {ord} BROKE steering rule(s): {}. {lead} changes to send it back for \
-                 rework, approve to run the step again, or reject to cancel the run{note}",
-                reason_head(reason)
+                 rework, approve to run the step again, or reject to cancel the run{note}{}",
+                reason_head(reason),
+                judge_hold_behind_rules(unit)
             )
         }
         // (DES-RULE-CHECK-001 S2) Steering rules no judge ruled on hold the gate.
@@ -10277,10 +10314,11 @@ fn denial_gate_prompt_body(
              work was not rejected. Re-run the rule check on the same work (action `{}`; the step \
              does not run again), confirm a waiver or skip an unchecked rule with a written \
              reason (action `{}`: labelled on the run, the gate and the delivery), approve to run the step again, request changes to send it back for \
-             rework, or reject to cancel the run{note}",
+             rework, or reject to cancel the run{note}{}",
             reason_head(reason),
             crate::rule_check::RETRY_ACTION,
             crate::rule_check::SKIP_ACTION,
+            judge_hold_behind_rules(unit),
         ),
         "judge_unavailable" => format!(
             "Unit {ord} could not be judged — no eligible judge seat remained: {}. The work was \
@@ -16326,7 +16364,7 @@ fn phase_boundary_denied(
 /// (F19, operator Q1=B) The gate actions whose note is the person's instruction for the job:
 /// Retry with a note (`amend`), Send back (`request_changes`) and Land with a note (`land`). A QE
 /// skip, a floor fix or an operator judgment records its own decision, not a rule instruction.
-const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
+pub(crate) const RULE_INSTRUCTION_ACTIONS: &[&str] = &["amend", "request_changes", "land"];
 /// The most of one ruling, and of all of them, a rule judge is shown (its whole instructions are
 /// cut at 8 KiB, `rule_check::instructions_of`): the problem keeps at least 2 KiB.
 const RULING_SHOWN_MAX: usize = 2 * 1024;
@@ -18365,6 +18403,17 @@ pub(crate) fn confirm_gate_expecting(
                         let from_attempt = request.attempt;
                         let seats = request.seats.clone();
                         cursor.requested_rejudge = Some(request);
+                        let skips = armed_rule_skips
+                            .iter()
+                            .cloned()
+                            .map(|s| crate::event::RerunSkip {
+                                rule_id: s.rule_id,
+                                reason: s.reason,
+                                by: s.by,
+                                evidence_key: s.evidence_key,
+                                instruction: s.instruction,
+                            })
+                            .collect();
                         cursor.rule_skips.append(&mut armed_rule_skips);
                         put_node(store, cursor.to_node())?;
                         emit(
@@ -18376,6 +18425,7 @@ pub(crate) fn confirm_gate_expecting(
                                 attempt: session.attempt.saturating_add(1),
                                 from_attempt,
                                 seats,
+                                skips,
                                 previous_reason,
                                 by: actor
                                     .as_deref()
@@ -19076,6 +19126,12 @@ fn rules_recheck_request(
         .to_string();
     let at = crate::interaction::now_millis();
     let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
     let mut landed = Vec::new();
     for (id, reason) in skips {
         if reason.trim().is_empty() {
@@ -19114,6 +19170,7 @@ fn rules_recheck_request(
             at,
             rule_key: row.rule_key.clone(),
             evidence_key,
+            seat_attempt: Some(attempt),
             instruction: (row.status == crate::rule_check::RuleStatus::Waived)
                 .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
             // (core#1493) The carry key of the check it answered, so the run's later steps carry
@@ -19131,12 +19188,6 @@ fn rules_recheck_request(
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
         .and_then(|t| t.output)
         .unwrap_or_default();
-    let attempt = cursor
-        .requested_rejudge
-        .as_ref()
-        .filter(|b| b.consumed)
-        .map(|b| b.attempt)
-        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
     Ok((
         crate::domain::RequestedRejudge {
             output,
@@ -29382,6 +29433,7 @@ mod request_changes_tests {
             }
             _ => unreachable!(),
         }
+        assert_eq!(evs[at].to_json()["skips"], serde_json::json!([]));
         let resumed = evs
             .iter()
             .position(|e| matches!(e, CoreEvent::Resumed { .. }))
@@ -29633,6 +29685,78 @@ mod request_changes_tests {
             uuid::Uuid::nil(),
             false,
         )
+    }
+
+    #[test]
+    fn rule_hold_prompt_discloses_a_judge_hold_behind_it() {
+        let mut unit = WorkUnit::pending("u", "s", 1, "review");
+        for class in ["rules_unchecked", CLASS_RULE_BROKEN] {
+            unit.denial = Some(UnitDenial::new(class, "R1 needs a call"));
+            unit.denials_behind = Some(Vec::new());
+            let prompt = denial_gate_prompt_body(&unit, class, "R1 needs a call", None, "");
+            assert!(!prompt.contains("no eligible judge seat remained"));
+            unit.denials_behind = Some(vec![UnitDenial::new(
+                "judge_unavailable",
+                "only the creator is signed in\nfull details",
+            )]);
+            let prompt = denial_gate_prompt_body(&unit, class, "R1 needs a call", None, "");
+            assert!(
+                prompt.contains("no eligible judge seat remained"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("only the creator is signed in"), "{prompt}");
+            assert!(
+                prompt.contains("Answering the rules does not clear it"),
+                "{prompt}"
+            );
+            assert!(prompt.contains("(`rejudge`)"), "{prompt}");
+            assert!(!prompt.contains("full details"), "{prompt}");
+        }
+    }
+
+    #[test]
+    fn rules_recheck_event_names_the_skips_and_the_reviewed_seat_attempt() {
+        let run_id = "rules-recheck-skips";
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rules_unchecked(&mut store, run_id);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut in_flight = HashSet::new();
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        confirm_gate_as(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut in_flight,
+            run_id,
+            HumanDecision::RecheckRules {
+                skips: vec![("R1".into(), "the fixture is binary".into())],
+            },
+            Some("coordinator-agent".into()),
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let events = drain(&erx);
+        let event = events
+            .iter()
+            .find(|e| matches!(e, CoreEvent::JudgeRerunRequested { .. }))
+            .unwrap()
+            .to_json();
+        assert_eq!(event["skips"][0]["ruleId"], "R1");
+        assert_eq!(event["skips"][0]["reason"], "the fixture is binary");
+        assert_eq!(event["skips"][0]["by"], "coordinator-agent");
+        assert_eq!(event["skips"][0]["evidenceKey"], "ek-R1");
+        assert!(event["skips"][0]["instruction"].is_null());
+        let units = crate::domain::session_units(&store, run_id).unwrap();
+        let unit = &units[2];
+        assert_eq!(unit.rule_skips[0].seat_attempt, Some(2));
+        assert_eq!(unit.requested_rejudge.as_ref().unwrap().attempt, 2);
     }
 
     #[test]
@@ -41478,6 +41602,7 @@ mod carried_skip_tests {
             carry_key: Some("ck".into()),
             ord: Some(3),
             rulings_rev: Some(rulings_revision(problem, &[], &units)),
+            seat_attempt: None,
         });
         units[0] = u3.clone();
         let ids = |v: Vec<crate::rule_check::RuleSkip>| -> Vec<String> {

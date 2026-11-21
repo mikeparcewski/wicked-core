@@ -2011,6 +2011,11 @@ pub(crate) fn with_history(err: String, seen: &[String]) -> String {
     }
 }
 
+/// (core#1541) API failures carry the last pod diagnosis before the guard reaps it.
+pub(crate) fn api_error_message(err: &str, diagnosis: &str, seen: &[String]) -> String {
+    with_history(format!("{err} ({diagnosis})"), seen)
+}
+
 /// Bound each condition, container state, history entry and event message without splitting a
 /// character. Long runtime messages must leave room for the rest of the pod's evidence.
 fn diagnosis_message(message: &str) -> String {
@@ -2151,7 +2156,7 @@ pub(crate) const ARM_RETRY_BACKOFF: [Duration; 2] =
 
 /// (core#1491) Run `arm` again after each backoff while it fails as `pod_not_ready` (a slow node:
 /// waiting can help) and `stop` does not say the run ended; any other result is final. The last
-/// failure says how many arms were tried.
+/// failure says how many arms were tried and keeps the earlier diagnoses.
 pub(crate) fn retry_arm<T>(
     backoff: &[Duration],
     sleep: &dyn Fn(Duration),
@@ -2159,6 +2164,7 @@ pub(crate) fn retry_arm<T>(
     mut arm: impl FnMut() -> Result<T, (FloorUnarmed, String)>,
 ) -> Result<T, (FloorUnarmed, String)> {
     let mut tries = 0usize;
+    let mut earlier = Vec::new();
     loop {
         match arm() {
             Err((why @ FloorUnarmed::PodNotReady, msg)) if tries < backoff.len() && !stop() => {
@@ -2172,16 +2178,33 @@ pub(crate) fn retry_arm<T>(
                 if stop() {
                     return Err((
                         why,
-                        format!("{msg} (the run ended during the arm's backoff)"),
+                        format!(
+                            "{} (the run ended during the arm's backoff)",
+                            with_arm_attempts(&msg, &earlier)
+                        ),
                     ));
                 }
+                earlier.push(msg.chars().take(1000).collect());
             }
-            Err((why, msg)) if tries > 0 => {
-                return Err((why, format!("{msg} (after {} arm attempts)", tries + 1)))
-            }
+            Err((why, msg)) if tries > 0 => return Err((why, with_arm_attempts(&msg, &earlier))),
             other => return other,
         }
     }
+}
+
+// (core#1541) The final diagnosis comes first; earlier attempts have bounded messages.
+fn with_arm_attempts(last: &str, earlier: &[String]) -> String {
+    if earlier.is_empty() {
+        return last.to_string();
+    }
+    let attempts = earlier.len() + 1;
+    let history = earlier
+        .iter()
+        .enumerate()
+        .map(|(i, msg)| format!("attempt {}: {msg}", i + 1))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!("{last} (after {attempts} arm attempts; earlier: {history})")
 }
 
 /// A Sandbox the controller could not make a pod for: why, from its status (pure).
@@ -2326,14 +2349,16 @@ pub(crate) fn arm(
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
-    if !super::arming_live(s.run_id, s.generation) {
-        return Err((
+    super::admit_arm(s.run_id, s.generation, || {
+        cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
+    })
+    .ok_or_else(|| {
+        (
             FloorUnarmed::PodNotReady,
-            "the run ended before its seat could arm".into(),
-        ));
-    }
-    cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
-        .map_err(|e| (classify_apply(&e), e))?;
+            "the run ended before its seat could arm".to_string(),
+        )
+    })?
+    .map_err(|e| (classify_apply(&e), e))?;
     super::clock::mark("namespace");
     // The sync pod is inspected and replaced under the namespace's arm lock (codex r2): two
     // arms never delete each other's replacement.
@@ -2456,34 +2481,38 @@ pub(crate) fn arm(
     let start = Instant::now();
     // Every container state any poll saw, for the diagnosis (coord codex-check on #1527).
     let mut seen: Vec<String> = Vec::new();
+    let mut last: Option<Value> = None;
+    // (core#1491) The pod's phase, conditions and last events, read before the reap.
+    let diagnose = |pod: Option<&Value>, seen: &[String]| {
+        let events = kube.call(
+            Some(&ns),
+            &[
+                "get",
+                "events",
+                "--field-selector",
+                &format!("involvedObject.name={sandbox}"),
+                "-o",
+                "json",
+            ],
+            None,
+            Duration::from_secs(15),
+        );
+        pod_diagnosis_with_events(pod, &events, 5, seen)
+    };
     loop {
-        let pod = kube
-            .get_json(Some(&ns), "pod", &sandbox)
-            .map_err(|e| (FloorUnarmed::ClusterUnreachable, with_history(e, &seen)))?;
+        let pod = kube.get_json(Some(&ns), "pod", &sandbox).map_err(|e| {
+            (
+                FloorUnarmed::ClusterUnreachable,
+                api_error_message(&e, &diagnose(last.as_ref(), &[]), &seen),
+            )
+        })?;
         if let Some(p) = pod.as_ref() {
             note_states(&mut seen, p);
         }
-        // (core#1491) The pod's phase, conditions and last events, read before the reap.
-        let diagnose = |pod: Option<&Value>| {
-            let events = kube.call(
-                Some(&ns),
-                &[
-                    "get",
-                    "events",
-                    "--field-selector",
-                    &format!("involvedObject.name={sandbox}"),
-                    "-o",
-                    "json",
-                ],
-                None,
-                Duration::from_secs(15),
-            );
-            pod_diagnosis_with_events(pod, &events, 5, &seen)
-        };
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
-                let msg = format!("{msg} ({})", diagnose(pod.as_ref()));
+                let msg = format!("{msg} ({})", diagnose(pod.as_ref(), &seen));
                 reap(&id);
                 return Err((why, msg));
             }
@@ -2495,24 +2524,29 @@ pub(crate) fn arm(
             let why = match kube.get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox) {
                 Err(e) => (
                     FloorUnarmed::ClusterUnreachable,
-                    with_history(
-                        format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                    api_error_message(
+                        &format!("the seat's Sandbox could not be read at the arm's deadline: {e}"),
+                        &diagnose(pod.as_ref(), &[]),
                         &seen,
                     ),
                 ),
                 Ok(sb) => match sb.as_ref().and_then(sandbox_refusal) {
-                    Some((why, msg)) => (why, format!("{msg} ({})", diagnose(pod.as_ref()))),
+                    Some((why, msg)) => (why, format!("{msg} ({})", diagnose(pod.as_ref(), &seen))),
                     None => (
                         FloorUnarmed::PodNotReady,
                         format!(
                             "the seat pod {sandbox} was not ready in {POD_START:?}: {}",
-                            diagnose(pod.as_ref())
+                            diagnose(pod.as_ref(), &seen)
                         ),
                     ),
                 },
             };
             reap(&id);
             return Err(why);
+        }
+        // (core#1541) The last snapshot read, for a later API error's diagnosis.
+        if pod.is_some() {
+            last = pod;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
