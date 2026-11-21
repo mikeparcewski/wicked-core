@@ -770,8 +770,8 @@ pub enum PlanRefusal {
     ToolCommandChanged { step: String, catalog: String },
     /// The step replaces `instructions` its entry already carries.
     InstructionsChanged { step: String, catalog: String },
-    /// The step replaces the `skill_ref` its entry already carries (a `security_review` step
-    /// cannot run a non-security skill).
+    /// The step replaces the `skill_ref` its entry already carries, outside the closed
+    /// [`crate::catalog::SECURITY_REVIEW_SKILLS`] list allowed for `security_review`.
     SkillRefChanged { step: String, catalog: String },
     /// The step replaces the non-empty `allowed_skills` its entry already carries.
     AllowedSkillsChanged { step: String, catalog: String },
@@ -968,7 +968,7 @@ impl std::fmt::Display for PlanRefusal {
             PlanRefusal::SkillRefChanged { step, catalog } => write!(
                 f,
                 "{r}: step {step} replaces {catalog}'s skill_ref — a step may set a skill only on \
-                 an entry that has none"
+                 an entry that has none, or choose an allowed security specialist for security_review"
             ),
             PlanRefusal::AllowedSkillsChanged { step, catalog } => write!(
                 f,
@@ -1404,7 +1404,7 @@ fn apply_step(
             (None, false) => {}
         }
     }
-    // instructions, skill_ref — SetIfUnset.
+    // instructions, skill_ref — SetIfUnset, with a closed security-specialist choice below.
     if let Some(text) = &step.instructions {
         match &entry.instructions {
             Some(own) if own != text => {
@@ -1415,6 +1415,11 @@ fn apply_step(
     }
     if let Some(skill) = &step.skill_ref {
         match &entry.skill_ref {
+            _ if step.catalog == "security_review"
+                && crate::catalog::SECURITY_REVIEW_SKILLS.contains(&skill.as_str()) =>
+            {
+                phase.skill_ref = Some(skill.clone());
+            }
             Some(own) if own != skill => {
                 return refuse(|step, catalog| PlanRefusal::SkillRefChanged { step, catalog });
             }
@@ -2010,6 +2015,13 @@ pub fn floor_fill(
         }
     }
     // §8.5: no floor phase before a floor phase that precedes it in catalog order.
+    // wicked-core#1682: review and security_review share a rank; neither reads the other's output.
+    let same_review_rank = |a: &str, b: &str| {
+        matches!(
+            (a, b),
+            ("review", "security_review") | ("security_review", "review")
+        )
+    };
     // Under a QE contract, `test` steps are placed by the QE rule (after the last tree change),
     // not by catalog order — on the fill that adds one and on every later revision, where an
     // earlier test may already be done before newer work (codex r3, r4). They are left out of
@@ -2021,7 +2033,12 @@ pub fn floor_fill(
     };
     for (k, ty) in floor.iter().enumerate() {
         let Some(at) = first(ty) else { continue };
-        if floor[..k].iter().filter_map(first).any(|pred| pred > at) {
+        if floor[..k]
+            .iter()
+            .filter(|pred| !same_review_rank(pred, ty))
+            .filter_map(first)
+            .any(|pred| pred > at)
+        {
             return Err(PlanRefusal::FloorReordered {
                 step: steps[at].id.clone(),
                 catalog: ty.clone(),
@@ -3293,6 +3310,39 @@ mod tests {
                     "/literal".to_string()
                 ][..]
             )
+        );
+    }
+
+    #[test]
+    fn a_security_review_keeps_the_platform_security_specialist() {
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "build"},
+            {"catalog": "security_review", "id": "security",
+             "skill_ref": "wicked-garden-platform-security-engineer"}
+        ]}))
+        .unwrap();
+        let def = compose(crate::catalog::catalog(), &plan).expect("security specialist composes");
+        let security = def.phases.iter().find(|p| p.id == "security").unwrap();
+        assert_eq!(
+            security.skill_ref.as_deref(),
+            Some("wicked-garden-platform-security-engineer")
+        );
+    }
+
+    #[test]
+    fn a_security_review_refuses_a_non_security_skill() {
+        let plan: PlanSteps = serde_json::from_value(serde_json::json!({"steps": [
+            {"catalog": "build", "id": "build"},
+            {"catalog": "security_review", "id": "security",
+             "skill_ref": "wicked-garden-engineering"}
+        ]}))
+        .unwrap();
+        assert_eq!(
+            compose(crate::catalog::catalog(), &plan).unwrap_err(),
+            PlanRefusal::SkillRefChanged {
+                step: "security".into(),
+                catalog: "security_review".into(),
+            }
         );
     }
 
@@ -4871,6 +4921,37 @@ mod tests {
             ]}));
             let r = fill(&p, 30, &AUTO, None).unwrap_err();
             assert_eq!(r.reason(), "floor_reordered", "{r}");
+        }
+
+        #[test]
+        fn a_top_band_plan_keeps_security_review_before_review() {
+            let p = plan(json!({"steps": [
+                {"catalog": "build", "id": "build"},
+                {"catalog": "security_review", "id": "sec"},
+                {"catalog": "review", "id": "rev"}
+            ]}));
+            let f = fill(&p, 100, &AUTO, None).expect("the two reviews share a rank");
+            assert_eq!(
+                phase_ids(&f),
+                ["test_plan", "design", "architecture", "build", "sec", "rev"]
+            );
+        }
+
+        // Review-before-build is covered by t2_a_floor_phase_before_its_predecessor_is_refused.
+        #[test]
+        fn a_security_review_before_build_is_still_floor_reordered() {
+            let p = plan(json!({"steps": [
+                {"catalog": "security_review", "id": "sec"},
+                {"catalog": "build", "id": "build"},
+                {"catalog": "review", "id": "rev"}
+            ]}));
+            assert_eq!(
+                fill(&p, 100, &AUTO, None).unwrap_err(),
+                PlanRefusal::FloorReordered {
+                    step: "sec".into(),
+                    catalog: "security_review".into(),
+                }
+            );
         }
 
         /// §8.5 floor override: refused in auto mode, recorded in manual mode.

@@ -37,9 +37,15 @@ use crate::workflow::{
     GateCond, GateSpec, GateType, PhaseDef, PhaseExecutor, PhaseRole, StepOwner,
 };
 
-/// The garden QE security specialist `security_review` runs (DES-TEAMING-002 Q6, fixed in C1): the
-/// frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
+/// The default garden QE security specialist `security_review` runs (DES-TEAMING-002 Q6, fixed in
+/// C1): the frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
 pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer";
+/// The skills a `security_review` step may run: the catalog's own and the platform specialist
+/// the app presets use.
+pub const SECURITY_REVIEW_SKILLS: &[&str] = &[
+    SECURITY_REVIEW_SKILL,
+    "wicked-garden-platform-security-engineer",
+];
 /// The skill domain-extraction's coverage judge runs (`domain_coverage`, X-MIG M6): the one skill
 /// under which a self-verifying evaluator's code run is report-writing, not code work
 /// ([`crate::plan`]'s `code_work_step`).
@@ -1188,10 +1194,10 @@ fn apps_preset(json: &str, name: &str) -> Vec<PlanStep> {
 /// `mcp-server` (M12, DES-W7-M12 on core#649): the def's nine phases as data
 /// (`src/presets/mcp-server.json`, pinned to its mapping by a test). scope, source-discovery →
 /// `understand`; design → `design`; build → `build`; test → `test` (the bold cell: role neutral →
-/// evaluator); security-review and observability-review → `review`, each keeping its specialist
-/// skill and its raised gate (`review` leaves the skill unset; the catalog's `security_review` fixes
-/// its own, so the MCP review is a `review` and a high band's floor adds the generic one beside
-/// it); install-plan and install → `run` with their Tool commands, install gated `consent_before`.
+/// evaluator); security-review → `security_review`, keeping the platform specialist, and
+/// observability-review → `review`, keeping its observability specialist. Both keep their raised
+/// gates and satisfy the high band's two review slots (wicked-core#1682); install-plan and install →
+/// `run` with their Tool commands, install gated `consent_before`.
 /// Phase ids are kept: crew keys delivery on `install-plan` / `install`.
 fn mcp_server_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
@@ -1207,9 +1213,10 @@ fn mcp_server_preset() -> Vec<PlanStep> {
 /// editor conformance cases on the host (DES-EDITOR-CONFORMANCE-HOST, e2e F18: no seat has a headless
 /// browser); test → `test`, which cites that record, judges the editor's behaviour and is
 /// the run's QE phase (`qe_acceptance` required, as for every app-change preset); security-review →
-/// `review` keeping the platform specialist; install-plan and install → `run` with their Tool
-/// commands, install gated `consent_before`. The ids `install-plan` / `install` are the ones a
-/// delivering run's deliver goes before ([`crate::plan_gate`]).
+/// `security_review` keeping the platform specialist (wicked-core#1682: the band may add a generic
+/// `review`); install-plan and install → `run` with their Tool commands, install gated
+/// `consent_before`. The ids `install-plan` / `install` are the ones a delivering run's deliver goes
+/// before ([`crate::plan_gate`]).
 fn editor_plugin_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
         serde_json::from_str(include_str!("presets/editor-plugin.json"))
@@ -1612,6 +1619,76 @@ fn entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_presets_keep_one_authored_security_review_at_the_top_band() {
+        use crate::plan::{floor_fill, AddedBy, FloorInput, PlanSteps};
+
+        for (name, security_id) in [
+            ("mcp-server", "security-review"),
+            ("editor-plugin", "security-review"),
+            ("scaffold", "security"),
+        ] {
+            let plan = PlanSteps {
+                steps: builtin_preset(name).unwrap(),
+                ..PlanSteps::default()
+            };
+            let filled = floor_fill(
+                catalog(),
+                &plan,
+                FloorInput {
+                    score: 100,
+                    destructive: false,
+                    human_confirm: &crate::domain::HumanConfirm::None,
+                    deliver: None,
+                    obligations: &[],
+                    ran: &[],
+                    requires_evaluator: true,
+                    requires_qe: true,
+                    power_absorbs: &[],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} floor fills: {e}"));
+            let security: Vec<_> = filled
+                .steps
+                .steps
+                .iter()
+                .filter(|s| s.catalog == "security_review")
+                .collect();
+            assert_eq!(security.len(), 1, "{name}: exactly one security review");
+            assert_eq!(
+                security[0].id, security_id,
+                "{name}: keep the preset's step"
+            );
+            assert_eq!(security[0].added_by, Some(AddedBy::Plan), "{name}");
+            assert!(security[0].floor_reason.is_none(), "{name}");
+            assert_eq!(
+                security[0].skill_ref.as_deref(),
+                Some("wicked-garden-platform-security-engineer"),
+                "{name}"
+            );
+            let reviews = filled
+                .def
+                .phases
+                .iter()
+                .filter(|p| p.kind == StageKind::Review)
+                .count();
+            assert_eq!(
+                reviews, 2,
+                "{name}: security plus a generic or observability review"
+            );
+            assert_eq!(
+                filled
+                    .steps
+                    .steps
+                    .iter()
+                    .filter(|s| s.catalog == "review")
+                    .count(),
+                1,
+                "{name}: the generic review floor is also satisfied"
+            );
+        }
+    }
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]

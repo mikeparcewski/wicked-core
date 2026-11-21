@@ -51,7 +51,7 @@
    ]
   },
   {
-   "catalog": "review",
+   "catalog": "security_review",
    "id": "security-review",
    "gate": {
     "human_confirm": {
