@@ -5177,3 +5177,34 @@ fn own_skip_retry_does_not_carry_a_process_rule() {
     );
     assert_ne!(again.rows[0].status, RuleStatus::Skipped);
 }
+
+/// wicked-core#1701 (coord review on core#1706): a license/readme/changelog stem is prose only bare
+/// or with a prose extension, and an image is never prose (the floor and POL-2101 share this).
+#[test]
+fn prose_needs_a_prose_extension_and_excludes_images() {
+    for code in [
+        "src/changelog.ts",
+        "license.py",
+        "tests/readme.test.js",
+        "tests/__screenshots__/home.png",
+        "docs/shot.jpg",
+        "docs/guide.mdx",
+    ] {
+        assert_eq!(prose_paths(&[code]), None, "{code}");
+        assert_eq!(
+            prose_paths(&["README.md", code]),
+            None,
+            "README.md + {code}"
+        );
+    }
+    for prose in [
+        "LICENSE",
+        "CHANGELOG.md",
+        "LICENSE.txt",
+        "docs/README.adoc",
+        "docs/arch.rst",
+        "docs/test-plans/math-js.md",
+    ] {
+        assert!(prose_paths(&[prose]).is_some(), "{prose}");
+    }
+}

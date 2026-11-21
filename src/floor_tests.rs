@@ -2614,6 +2614,35 @@ fn prose_and_source_on_a_red_base_still_need_separation() {
     let _ = std::fs::remove_dir_all(&repo);
 }
 
+/// wicked-core#1701 (coord review on core#1706): code named like prose, and an image baseline,
+/// keep the red-base hold: `src/changelog.ts` is code, and a changed screenshot baseline can be
+/// what the failing check compares against.
+#[cfg(unix)]
+#[test]
+fn a_prose_named_source_file_or_an_image_on_a_red_base_still_needs_separation() {
+    for (label, path) in [
+        ("1701-changelog-ts", "src/changelog.ts"),
+        ("1701-png", "tests/__screenshots__/home.png"),
+    ] {
+        let _load = seam::pin(0.5, 4);
+        let _off = seam::exclude(false);
+        let (repo, ctx, _) = red_base(label);
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "export const v = 2;\n").unwrap();
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        assert_eq!(
+            c.decision.as_ref().unwrap().outcome,
+            OUTCOME_BASE_RED_UNSEPARATED,
+            "{path}: {c:?}"
+        );
+        assert!(!report.passed && c.denies(), "{path}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
 /// wicked-core#1701: a precise excluded run proves a new failure, even for a markdown change.
 #[cfg(unix)]
 #[test]

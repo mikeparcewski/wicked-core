@@ -1029,26 +1029,30 @@ fn no_source_code(change: &Change) -> Option<String> {
     )
 }
 
-/// (core#1381) Why POL-2101 has no subject, when every changed file is prose or an image: markdown
-/// (never MDX), reStructuredText, an image, or a license/readme/changelog. Stricter than
-/// [`no_source_code`] on purpose (review on #1426): a `.txt` may be a build include or a
-/// requirements file and a lockfile is a dependency change, so those reach the judges.
+/// (core#1381) Why POL-2101 has no subject, when every changed file is prose: markdown (never
+/// MDX), reStructuredText, or a license/readme/changelog with no extension or a prose one.
+/// Stricter than [`no_source_code`] on purpose (review on #1426): a `.txt` may be a build include
+/// or a requirements file and a lockfile is a dependency change, so those reach the judges.
 fn docs_only(change: &Change) -> Option<String> {
     let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
     prose_paths(&changed).map(|paths| format!("the change touches no source code ({paths})"))
 }
 
 /// wicked-core#1701: the prose predicate and bounded path list shared with the repo-checks floor.
+/// A license/readme/changelog counts only bare or with a prose extension: `src/changelog.ts` or
+/// `readme.test.js` is code. Images are not prose: a changed visual-regression baseline can be
+/// what a check compares against (coord review on core#1706).
 pub(crate) fn prose_paths(changed: &[&str]) -> Option<String> {
     let prose = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
-        let stem = name.split('.').next().unwrap_or(&name).to_string();
+        let (stem, ext) = match name.split_once('.') {
+            Some((stem, ext)) => (stem, Some(ext)),
+            None => (name.as_str(), None),
+        };
         (language_of(p).is_some_and(|l| l == "markdown") && !name.ends_with(".mdx"))
-            || [".rst", ".png", ".jpg", ".jpeg", ".gif"]
-                .iter()
-                .any(|e| name.ends_with(e))
-            || matches!(stem.as_str(), "license" | "changelog" | "readme")
-                && !name.ends_with(".mdx")
+            || name.ends_with(".rst")
+            || matches!(stem, "license" | "changelog" | "readme")
+                && ext.is_none_or(|e| matches!(e, "md" | "txt" | "rst" | "adoc"))
     };
     (!changed.is_empty() && changed.iter().all(|p| prose(p))).then(|| list_paths(changed))
 }
@@ -3342,7 +3346,7 @@ pub fn check(
             );
             continue;
         }
-        // (core#1381) …and a change that touches no source code (docs, text, images only) uses
+        // (core#1381) …and a change that touches no source code (docs and text only) uses
         // and rebuilds no capability of a stack: not applicable, by that fact, with no judge asked.
         if pack == Some(PackKind::WorkWithRecord) {
             if let Some(why) = docs_only(input.change) {
