@@ -289,6 +289,25 @@ fn session_detail_answers_one_run_off_the_actor() {
     drop(core);
     let _ = std::fs::remove_dir_all(&dir);
 
+    // The actor's own answer (`Command::Project`, for a store with no read model) is the same
+    // per-run fold, over the actor's store.
+    let (dir, db) = temp_db("one-actor");
+    seed(&db);
+    let store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+    let one = crate::actor::project_view(&store, "run-a")
+        .unwrap()
+        .expect("a run the store holds");
+    assert_eq!(one.session.id, "run-a");
+    assert_eq!(
+        one.units.iter().map(|u| u.ord).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(crate::actor::project_view(&store, "no-such-run")
+        .unwrap()
+        .is_none());
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+
     let mem = crate::Core::spawn_with_engine(
         ":memory:",
         Arc::new(NoCouncil),
@@ -296,7 +315,7 @@ fn session_detail_answers_one_run_off_the_actor() {
     );
     assert!(
         mem.session_detail("run-a").unwrap().is_none(),
-        "an in-memory core answers through the actor"
+        "an in-memory core answers through the actor (Command::Project)"
     );
 }
 
