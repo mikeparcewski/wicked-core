@@ -64,6 +64,15 @@ pub struct Skipped {
     pub why: String,
 }
 
+/// What an editor asks to do, for the person's information before granting it in Plugins.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanAsk {
+    pub editor: String,
+    pub permission: String,
+    #[serde(default)]
+    pub why: String,
+}
+
 /// The parsed dry-run plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WritePlan {
@@ -71,6 +80,21 @@ pub struct WritePlan {
     pub choices: Vec<PlanChoice>,
     #[serde(default)]
     pub skipped: Vec<Skipped>,
+    /// (crew#1424) What each editor asks to do. Read leniently: a malformed row is dropped, never the
+    /// whole plan (the choices still offer the install).
+    #[serde(default, deserialize_with = "lenient_asks")]
+    pub asks: Vec<PlanAsk>,
+}
+
+fn lenient_asks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<PlanAsk>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_array()
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| serde_json::from_value::<PlanAsk>(r.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// What a consent pause offers: the plan's choices, from which unit, or why there is none.
@@ -104,7 +128,7 @@ impl WritePlan {
 /// short token (`[A-Za-z0-9_-]`, ≤ 32) and ids must be distinct, or the plan is refused: an id
 /// rides an environment variable and an answer token.
 pub fn parse_plan(output: &str) -> Option<WritePlan> {
-    let plan = output.lines().rev().find_map(|line| {
+    let mut plan = output.lines().rev().find_map(|line| {
         let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
         if v.get("dry_run").and_then(|d| d.as_bool()) != Some(true) {
             return None;
@@ -123,6 +147,14 @@ pub fn parse_plan(output: &str) -> Option<WritePlan> {
     ids.dedup();
     if ids.len() != plan.choices.len() || !plan.choices.iter().all(|c| ok_id(&c.id)) {
         return None;
+    }
+    plan.asks
+        .retain(|ask| !ask.editor.is_empty() && !ask.permission.is_empty());
+    plan.asks.truncate(64);
+    for ask in &mut plan.asks {
+        ask.editor = ask.editor.chars().take(200).collect();
+        ask.permission = ask.permission.chars().take(200).collect();
+        ask.why = ask.why.chars().take(300).collect();
     }
     Some(plan)
 }
@@ -196,7 +228,8 @@ pub fn offer_sentence(offer: &ConsentOffer, home: Option<&str>) -> String {
 
 /// The event fields an offer adds to `awaitingHuman`: `choices` (the answer tokens, `reject` last),
 /// `recommended` (the default's index), `choiceLabels`, `writeTargets` (per token, `reject` → `[]`),
-/// `writePlanOrd`, `writeTargetsSkipped`; or only `writeTargetsMissing` when there is no plan.
+/// `writePlanOrd`, `writeTargetsSkipped`, `consentAsks` (when non-empty); or only
+/// `writeTargetsMissing` when there is no plan.
 pub fn event_fields(offer: &ConsentOffer) -> serde_json::Map<String, serde_json::Value> {
     use serde_json::json;
     let mut m = serde_json::Map::new();
@@ -248,6 +281,9 @@ pub fn event_fields(offer: &ConsentOffer) -> serde_json::Map<String, serde_json:
     if !plan.skipped.is_empty() {
         m.insert("writeTargetsSkipped".into(), json!(plan.skipped));
     }
+    if !plan.asks.is_empty() {
+        m.insert("consentAsks".into(), json!(plan.asks));
+    }
     m
 }
 
@@ -262,6 +298,7 @@ mod tests {
         let out = format!("building…\n{PLAN}\n[stderr] npm notice\n");
         let plan = parse_plan(&out).expect("a plan");
         assert_eq!(plan.choices.len(), 2);
+        assert!(plan.asks.is_empty(), "older plans need no asks field");
         assert_eq!(plan.default_choice().unwrap().id, "worker");
         assert_eq!(
             plan.choice_for_token("consent:operator").unwrap().label,
@@ -305,6 +342,7 @@ mod tests {
         );
         assert_eq!(f["writeTargets"]["reject"], serde_json::json!([]));
         assert_eq!(f["writePlanOrd"], serde_json::json!(9));
+        assert!(!f.contains_key("consentAsks"));
         assert!(!f.contains_key("writeTargetsMissing"));
 
         let none = ConsentOffer {
@@ -315,5 +353,71 @@ mod tests {
         assert!(offer_sentence(&none, None).contains("The write targets were not listed"));
         let f = event_fields(&none);
         assert!(f.contains_key("writeTargetsMissing") && !f.contains_key("choices"));
+    }
+
+    #[test]
+    fn the_event_carries_editor_asks_in_plan_order() {
+        let mut plan: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        plan["asks"] = serde_json::json!([
+            {"editor": "garden", "permission": "read files", "why": "find project context"},
+            {"editor": "crew", "permission": "run commands"}
+        ]);
+        let offer = ConsentOffer {
+            plan_ord: Some(9),
+            plan: Some(parse_plan(&plan.to_string()).expect("a plan with asks")),
+            missing: None,
+        };
+        assert_eq!(
+            event_fields(&offer)["consentAsks"],
+            serde_json::json!([
+                {"editor": "garden", "permission": "read files", "why": "find project context"},
+                {"editor": "crew", "permission": "run commands", "why": ""}
+            ])
+        );
+    }
+
+    #[test]
+    fn asks_drop_empty_rows_and_bound_strings_and_row_count() {
+        let mut plan: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        let mut asks = vec![
+            serde_json::json!({"editor": "", "permission": "read"}),
+            serde_json::json!({"editor": "garden", "permission": ""}),
+            serde_json::json!({
+                "editor": "é".repeat(201),
+                "permission": "🔐".repeat(201),
+                "why": "界".repeat(301)
+            }),
+        ];
+        asks.extend(
+            (0..64).map(
+                |i| serde_json::json!({"editor": format!("editor-{i}"), "permission": "read"}),
+            ),
+        );
+        plan["asks"] = serde_json::json!(asks);
+        let plan = parse_plan(&plan.to_string()).expect("a bounded plan");
+        assert_eq!(plan.asks.len(), 64);
+        assert_eq!(plan.asks[0].editor, "é".repeat(200));
+        assert_eq!(plan.asks[0].permission, "🔐".repeat(200));
+        assert_eq!(plan.asks[0].why, "界".repeat(300));
+        assert_eq!(plan.asks[1].editor, "editor-0");
+        assert_eq!(plan.asks[63].editor, "editor-62");
+    }
+
+    #[test]
+    fn a_malformed_ask_drops_that_row_never_the_plan() {
+        let mut plan: serde_json::Value = serde_json::from_str(PLAN).unwrap();
+        plan["asks"] = serde_json::json!([
+            {"editor": 5, "permission": "read"},
+            {"editor": "garden"},
+            "not a row",
+            {"editor": "garden", "permission": "artifact.write", "why": "saves edits"}
+        ]);
+        let parsed = parse_plan(&plan.to_string()).expect("the plan still parses");
+        assert_eq!(parsed.choices.len(), 2);
+        assert_eq!(parsed.asks.len(), 1);
+        assert_eq!(parsed.asks[0].permission, "artifact.write");
+        plan["asks"] = serde_json::json!({"not": "a list"});
+        let parsed = parse_plan(&plan.to_string()).expect("a non-list asks is ignored");
+        assert!(parsed.asks.is_empty());
     }
 }

@@ -1409,7 +1409,10 @@ export declare class Subscription {
  * dry-run plan carries `choices` (`'consent:<id>'` per plan choice, then `'reject'`), `recommended`
  * (the default, program-owned choice), `choiceLabels` and `writeTargets` (both keyed by choice
  * token; each target `{path, what, cli?, operatorOwned}`, `reject` → `[]`), `writePlanOrd` and,
- * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`). With no plan it carries only
+ * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`) and `consentAsks`
+ * (`{editor, permission, why}[]`). Each is present only when the plan names any; `consentAsks`
+ * describes what each editor in the pack asks to do, for the person's information. The grants
+ * are given later in Plugins. With no plan it carries only
  * `writeTargetsMissing` (why nothing is listed). Answer with `action: 'consent:<id>'`, approve
  * (= the default) or reject.
  * core#762 / core#418 (additive, new events): `acpTurnSettled` {session, ord, attempt, cliKey,
