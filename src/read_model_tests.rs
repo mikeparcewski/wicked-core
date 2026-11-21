@@ -306,6 +306,27 @@ fn session_detail_answers_one_run_off_the_actor() {
         .unwrap()
         .is_none());
     drop(store);
+    // A session node that does not decode is no run, as the list skips it: `None`, not an error
+    // (an error drops the read connection and sends every poll to the actor).
+    {
+        let mut store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+        let mut bad = wicked_apps_core::Node::new(
+            wicked_apps_core::synthetic_symbol(wicked_apps_core::AGENT_SESSION, "run-bad"),
+            wicked_apps_core::NodeKind::Other(wicked_apps_core::AGENT_SESSION.to_string()),
+            "run-bad".to_string(),
+            wicked_apps_core::Language::new(wicked_apps_core::SYMBOL_SCHEME),
+            wicked_apps_core::Location::new("agent_session/run-bad", wicked_apps_core::Span::ZERO),
+        );
+        bad.metadata
+            .insert("status".into(), serde_json::json!({"not": "a status"}));
+        crate::domain::put_nodes(&mut store, &[bad]).unwrap();
+        assert!(
+            crate::actor::project_view(&store, "run-bad")
+                .expect("an undecodable session is no error")
+                .is_none(),
+            "an undecodable session is no run"
+        );
+    }
     let _ = std::fs::remove_dir_all(&dir);
 
     let mem = crate::Core::spawn_with_engine(

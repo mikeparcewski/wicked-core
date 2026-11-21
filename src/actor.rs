@@ -22827,7 +22827,18 @@ pub(crate) fn project_view(
     store: &impl GraphRead,
     run_id: &str,
 ) -> anyhow::Result<Option<crate::SessionView>> {
-    let Some(session) = crate::domain::get_session(store, run_id)? else {
+    use wicked_apps_core::FromNode;
+    let Some(node) = store.get_node(&wicked_apps_core::synthetic_symbol(
+        wicked_apps_core::AGENT_SESSION,
+        run_id,
+    ))?
+    else {
+        return Ok(None);
+    };
+    // A session node that does not decode is no run here, as the list skips it
+    // (`domain::all_sessions`). An error would drop the read connection on every poll and send
+    // each one to the actor (coord review of #1733).
+    let Ok(session) = crate::domain::AgentSession::from_node(&node) else {
         return Ok(None);
     };
     let units = crate::domain::session_units(store, run_id)?;
