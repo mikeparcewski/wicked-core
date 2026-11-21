@@ -5256,6 +5256,58 @@ pub(crate) fn floor_min_free_gib() -> u64 {
         .unwrap_or(15)
 }
 
+/// (core#1731) The free space, in GiB, under which a RUNNING check is stopped so the host keeps a
+/// reserve: `WICKED_FLOOR_STOP_FREE_GB`, else 5, never above the admission minimum
+/// ([`floor_min_free_gib`]). `0` (or a minimum of `0`) turns the watch off.
+pub(crate) fn floor_stop_free_gib() -> u64 {
+    std::env::var("WICKED_FLOOR_STOP_FREE_GB")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5u64)
+        .min(floor_min_free_gib())
+}
+
+/// (core#1731) How often a running check re-reads the volume's free space.
+const DISK_WATCH_EVERY: Duration = Duration::from_millis(500);
+
+/// (core#1731) Why a running check must stop for lack of disk (an ENVIRONMENT failure, never a
+/// check failure), or `None`: `free` bytes against the stop line. Unknown free space never stops.
+fn disk_watch(check: &RepoCheck, free: Option<u64>, stop_gib: u64) -> Option<String> {
+    let free = free?;
+    let stop = stop_gib.saturating_mul(1 << 30);
+    (stop > 0 && free < stop).then(|| {
+        format!(
+            "{ENVIRONMENT_REFUSAL_PREFIX} the disk was nearly full during `{}` ({:.1} GiB free on \
+             the check cache's volume, under the floor's stop line of {stop_gib} GiB; \
+             WICKED_FLOOR_STOP_FREE_GB): the floor stopped the check so the host keeps its \
+             reserve. Free disk space, then retry; not a failure of the change",
+            check.name,
+            free as f64 / (1u64 << 30) as f64
+        )
+    })
+}
+
+/// (core#1731) The free bytes the running-check watch reads: [`free_bytes`]. Test builds read
+/// `TEST_WATCH_FREE_BYTES` instead, apart from admission's reading, so a fixture that needs a
+/// check to run to its end at low admission-free space still does.
+#[cfg(not(test))]
+fn watch_free_bytes(path: &Path) -> Option<u64> {
+    free_bytes(path)
+}
+
+#[cfg(test)]
+fn watch_free_bytes(_path: &Path) -> Option<u64> {
+    let v = TEST_WATCH_FREE_BYTES.with(std::cell::Cell::get);
+    (v != u64::MAX - 1).then_some(v)
+}
+
+// (core#1731) Test seam: the free space a running check's disk watch reads in test builds, per
+// test thread (plenty by default; `u64::MAX - 1` = unreadable).
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TEST_WATCH_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
 /// (core#1560) The GiB of headroom per in-flight floor: `WICKED_FLOOR_PEAK_GB`, else 20.
 /// `0` disables the disk-slot wait, not the per-repository serialization (core#1604).
 fn floor_peak_gib() -> u64 {
@@ -11452,6 +11504,11 @@ pub(crate) fn run_one_with(
     };
     // A stopped check keeps the stop as its reason, whatever its container reports after.
     let mut stopped = false;
+    // (core#1731) Admission read free space once; a build can then fill the host's disk. The
+    // running check re-reads the cache volume and stops under the stop line, as for a cancel.
+    let watch_root = check_cache_root().ok();
+    let stop_gib = floor_stop_free_gib();
+    let mut watched: Option<Instant> = None;
     let status = loop {
         if let Some(reason) = scratch.stop.as_ref().and_then(FloorStop::reason) {
             crate::validator::kill_child_tree(&mut child);
@@ -11459,6 +11516,18 @@ pub(crate) fn run_one_with(
             result.spawn_error = Some(floor_stop_text(reason).into());
             stopped = true;
             break None;
+        }
+        if stop_gib > 0 && watched.is_none_or(|at| at.elapsed() >= DISK_WATCH_EVERY) {
+            watched = Some(Instant::now());
+            let free = watch_root.as_deref().and_then(watch_free_bytes);
+            if let Some(why) = disk_watch(check, free, stop_gib) {
+                crate::validator::kill_child_tree(&mut child);
+                crate::validator::reap_bounded(&mut child);
+                eprintln!("wicked-core: repo checks floor — {why}");
+                result.spawn_error = Some(why);
+                stopped = true;
+                break None;
+            }
         }
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
@@ -11557,7 +11626,8 @@ pub(crate) fn run_one_with(
     // (`validator::launcher_failure`) reads the first stderr line (of the one merged stream when
     // stderr was merged); a hit is `could_not_run` (denies, fail-closed, attribution honest).
     // Never applied to a passing exit or a timeout.
-    if !result.timed_out && result.exit_code != Some(0) {
+    // A stopped check keeps its stop as the cause: its output's first line is not a launcher's.
+    if !stopped && !result.timed_out && result.exit_code != Some(0) {
         let first_err = if exec.merge { &stdout } else { &stderr };
         let first = first_err.lines().next().unwrap_or("");
         let launcher = if container.is_some() {

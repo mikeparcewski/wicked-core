@@ -6301,6 +6301,112 @@ fn core_1605_disk_filling_during_a_check_is_terminal_and_preserves_evidence() {
     }
 }
 
+/// core#1731: admission read free space once, then a build could fill the host's disk. A running
+/// check is stopped when the volume falls under the stop line, as an environment refusal that
+/// names the free figure; the rest of the floor does not retry it.
+#[cfg(unix)]
+#[test]
+fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let _load = seam::pin(8.0, 4);
+    struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
+            TEST_WATCH_FREE_BYTES.with(|c| c.set(u64::MAX));
+            for (key, value) in &self.0 {
+                match value {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+    let _restore = Restore(
+        [
+            (UNSANDBOXED_OPT_IN_ENV, "1"),
+            (crate::checks_container::RUNNER_ENV, "sandbox"),
+            ("WICKED_FLOOR_MIN_FREE_GB", "15"),
+            ("WICKED_FLOOR_STOP_FREE_GB", "5"),
+        ]
+        .into_iter()
+        .map(|(key, value)| {
+            let prior = std::env::var_os(key);
+            std::env::set_var(key, value);
+            (key, prior)
+        })
+        .collect(),
+    );
+    // The stop line never exceeds the admission minimum, and either at 0 turns the watch off.
+    assert_eq!(floor_stop_free_gib(), 5);
+    std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", "3");
+    assert_eq!(floor_stop_free_gib(), 3);
+    std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", "0");
+    assert_eq!(floor_stop_free_gib(), 0);
+    std::env::set_var("WICKED_FLOOR_MIN_FREE_GB", "15");
+    std::env::set_var("WICKED_FLOOR_STOP_FREE_GB", "0");
+    assert_eq!(floor_stop_free_gib(), 0);
+    std::env::set_var("WICKED_FLOOR_STOP_FREE_GB", "5");
+
+    let wt = scratch("disk-watch");
+    std::fs::create_dir_all(wt.join("node_modules")).unwrap();
+    std::fs::write(wt.join(".gitignore"), "node_modules/\nattempts\n").unwrap();
+    std::fs::write(
+        wt.join("package.json"),
+        serde_json::json!({"scripts": {"test": "echo run >> attempts; sleep 60"}}).to_string(),
+    )
+    .unwrap();
+    let base = git_repo_with_commit(&wt);
+    let ctx = FloorContext {
+        base_head: Some(base),
+        git_dir: Some(wt.join(".git")),
+        ..FloorContext::default()
+    };
+    // Admission sees plenty; once the check is spawned its build "fills" the volume to 1 GiB.
+    TEST_FREE_BYTES.with(|c| c.set(40 << 30));
+    TEST_WATCH_FREE_BYTES.with(|c| c.set(40 << 30));
+    seam::before_spawn(|| TEST_WATCH_FREE_BYTES.with(|c| c.set(1 << 30)));
+    let started = Instant::now();
+    let report = run_floor(&wt, &ctx);
+    let elapsed = started.elapsed();
+    let check = report
+        .checks
+        .iter()
+        .find(|c| c.name == "test")
+        .expect("test ran");
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "the check was stopped, not left to run: {elapsed:?} {check:?}"
+    );
+    assert!(!check.timed_out, "{check:?}");
+    assert_eq!(check.outcome(), "could_not_run", "{check:?}");
+    assert!(check.environment_failure(), "{check:?}");
+    let cause = check.spawn_error.as_deref().expect("recorded disk cause");
+    assert!(
+        cause.contains("1.0 GiB free")
+            && cause.contains("stop line of 5 GiB")
+            && cause.contains("`test`")
+            && cause.contains("not a failure of the change"),
+        "{cause}"
+    );
+    let decision = check.decision.as_ref().expect("decided");
+    assert_eq!(decision.outcome, OUTCOME_COULD_NOT_RUN, "{check:?}");
+    assert!(
+        check.retry.is_none() && check.reruns.is_empty(),
+        "{check:?}"
+    );
+    assert!(check.base.is_none(), "{check:?}");
+    assert!(!report.passed, "{report:?}");
+    assert!(
+        report.denial_reason().contains(cause),
+        "{}",
+        report.denial_reason()
+    );
+    let _ = std::fs::remove_dir_all(&wt);
+}
+
 /// A stopped journal remains reusable and names the actual interruption.
 #[cfg(unix)]
 #[test]
