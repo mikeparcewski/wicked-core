@@ -118,7 +118,9 @@ pub(crate) fn ensure_loaded(
     if node.store == ImageStore::Shared {
         return Ok(());
     }
-    static LOADED: Mutex<Option<HashSet<(Vec<String>, String, String)>>> = Mutex::new(None);
+    // (kube head, node uid, image id) of every load done.
+    type Loaded = HashSet<(Vec<String>, String, String)>;
+    static LOADED: Mutex<Option<Loaded>> = Mutex::new(None);
     let refuse = |e: String| {
         (
             FloorUnarmed::ImageUnavailable,

@@ -3793,7 +3793,7 @@ esac
                 trusted_git_dir: None,
             };
             for _ in 0..2 {
-                let (why, detail) = arm_noting(
+                let Err((why, detail)) = arm_noting(
                     &inp,
                     &["claude".into()],
                     &format!("run-{scenario}"),
@@ -3804,9 +3804,9 @@ esac
                     Some(&gateway),
                     &mut |_, _| {},
                     &mut |_| Ok(()),
-                )
-                .err()
-                .expect("stub refuses submission");
+                ) else {
+                    panic!("stub refuses submission");
+                };
                 if scenario == "unknown" || scenario == "failed-load" {
                     assert_eq!(why, FloorUnarmed::ImageUnavailable, "{scenario}: {detail}");
                     assert!(
