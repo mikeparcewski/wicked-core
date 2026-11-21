@@ -1142,18 +1142,58 @@ fn sign_in_refusal_frame(text: &str) -> bool {
         })
 }
 
-/// (core#1479) `line` with the wrapped runner's exit marker (`(cli `claude` exited 1) `) and any
-/// [`ERROR_LABELS`] stripped from its front: what the CLI itself led its line with.
-fn refusal_line_head(line: &str) -> &str {
-    let mut s = line.trim_start();
+/// (core#1612) A content refusal in the CLI's own error frame, inside the caller's tail.
+/// Codex's refusal sentence must lead after runner/error labels. Claude's variable model name
+/// requires a substring match, but only after its own leading `API Error:` label. Quoted source,
+/// Markdown bullets and prose about refusals do not lead either frame.
+/// ASCII-case-insensitive; a content refusal concerns this unit, not the seat's run-wide health.
+pub fn content_refusal_frame(tail: &str) -> bool {
+    const CODEX: &[&str] = &[
+        "this request has been flagged for possible cybersecurity risk.",
+        "this content was flagged for possible biological risk.",
+        "this request was blocked due to a misalignment policy violation.",
+        "this content was flagged for possible cybersecurity risk",
+    ];
+    const CLAUDE: &[&str] = &[
+        "safeguards flagged this message",
+        "can't help with this. start a new session to continue",
+        "appears to violate our usage policy",
+    ];
+    tail.lines().any(|line| {
+        let head = refusal_line_head(line).as_bytes();
+        CODEX
+            .iter()
+            .any(|p| head.len() >= p.len() && head[..p.len()].eq_ignore_ascii_case(p.as_bytes()))
+            || {
+                let framed = wrapped_line_head(line);
+                let label = b"api error:";
+                framed.len() >= label.len()
+                    && framed.as_bytes()[..label.len()].eq_ignore_ascii_case(label)
+                    && CLAUDE
+                        .iter()
+                        .any(|p| contains_ignore_ascii_case(&framed[label.len()..], p))
+            }
+    })
+}
+
+/// A line after the wrapped runner's exit marker, shared by the refusal frame readers.
+fn wrapped_line_head(line: &str) -> &str {
+    let s = line.trim_start();
     if let Some(rest) = s.strip_prefix("(cli `") {
         if let Some((_, after)) = rest
             .split_once("` exited ")
             .and_then(|(_, r)| r.split_once(')'))
         {
-            s = after.trim_start();
+            return after.trim_start();
         }
     }
+    s
+}
+
+/// (core#1479) `line` with the wrapped runner's exit marker (`(cli `claude` exited 1) `) and any
+/// [`ERROR_LABELS`] stripped from its front: what the CLI itself led its line with.
+fn refusal_line_head(line: &str) -> &str {
+    let mut s = wrapped_line_head(line);
     loop {
         let before = s.len();
         for label in ERROR_LABELS {

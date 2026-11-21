@@ -5333,6 +5333,43 @@ fn carried_team(
     Some(snapshot)
 }
 
+/// Classify one failed judge transcript exactly as the rotation does, without recording a bench.
+/// The fold owns bench policy; a quota refusal carries the provider's reset time when present.
+pub(crate) fn judge_refusal(
+    seat: &str,
+    out: &str,
+) -> Option<(&'static str, crate::workflow::JudgeRefusal)> {
+    use wicked_council::types::SeatFailureReason;
+
+    // (r2-N2) Exit evidence for the generic quota rule: the runner's own marker.
+    let exited_nonzero = crate::execute_wrapped::wrapped_exit_code(out).is_some_and(|c| c != 0);
+    let (verb, token) = SeatFailureReason::classify_refusal(out, exited_nonzero)
+        .or_else(|| {
+            crate::execute_wrapped::spawn_failure_detail(out)
+                .and_then(SeatFailureReason::classify_spawn_detail)
+        })
+        .map(|r| (r.verb(), r.as_str()))
+        // (core#772) A judge that exited clean and printed nothing has its own bench token.
+        .or_else(|| {
+            (out == crate::validator::JUDGE_EMPTY_ANSWER).then_some((
+                "answered nothing",
+                crate::validator::JUDGE_EMPTY_ANSWER_REASON,
+            ))
+        })?;
+    // (PRODUCT-WORKS J4) Lift a quota bench at the provider's reset instead of the backoff.
+    let reset_at = (token == SeatFailureReason::QuotaExhausted.as_str())
+        .then(|| crate::seat_bench::provider_reset_at(out, crate::seat_bench::now_ms()))
+        .flatten();
+    Some((
+        verb,
+        crate::workflow::JudgeRefusal {
+            seat: seat.to_string(),
+            reason: token.to_string(),
+            reset_at,
+        },
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_unit_and_judge_in<'scope, 'env>(
     scope: &'scope std::thread::Scope<'scope, 'env>,
@@ -6093,45 +6130,16 @@ fn run_unit_and_judge_in<'scope, 'env>(
     let judge_refusals: std::cell::RefCell<Vec<crate::workflow::JudgeRefusal>> =
         std::cell::RefCell::new(Vec::new());
     let note_refusals = |refused: &[(String, String)]| {
-        use wicked_council::types::SeatFailureReason;
         for (seat, out) in refused {
-            // (r2-N2) Exit evidence for the generic quota rule: the runner's own marker.
-            let exited_nonzero =
-                crate::execute_wrapped::wrapped_exit_code(out).is_some_and(|c| c != 0);
-            let reason = SeatFailureReason::classify_refusal(out, exited_nonzero)
-                .or_else(|| {
-                    crate::execute_wrapped::spawn_failure_detail(out)
-                        .and_then(SeatFailureReason::classify_spawn_detail)
-                })
-                .map(|r| (r.verb(), r.as_str()))
-                // (core#772) A judge that exited clean and printed nothing: benched under its
-                // own token (the fold benches a token it does not know as written).
-                .or_else(|| {
-                    (out == crate::validator::JUDGE_EMPTY_ANSWER).then_some((
-                        "answered nothing",
-                        crate::validator::JUDGE_EMPTY_ANSWER_REASON,
-                    ))
-                });
-            if let Some((verb, token)) = reason {
+            if let Some((verb, refusal)) = judge_refusal(seat, out) {
                 let mut v = judge_refusals.borrow_mut();
                 if !v.iter().any(|r| &r.seat == seat) {
                     eprintln!(
                         "wicked-core: judge seat '{seat}' {} on unit {} ({}); reported for the \
                          run's bench (F-7R2-006 / review RT-1 / F-7R3-001)",
-                        verb, input.unit.ord, token
+                        verb, input.unit.ord, refusal.reason
                     );
-                    // (PRODUCT-WORKS J4) A quota refusal that states when the provider resets
-                    // lifts the bench then, instead of after the backoff.
-                    let reset_at = (token == SeatFailureReason::QuotaExhausted.as_str())
-                        .then(|| {
-                            crate::seat_bench::provider_reset_at(out, crate::seat_bench::now_ms())
-                        })
-                        .flatten();
-                    v.push(crate::workflow::JudgeRefusal {
-                        seat: seat.clone(),
-                        reason: token.to_string(),
-                        reset_at,
-                    });
+                    v.push(refusal);
                 }
             }
         }

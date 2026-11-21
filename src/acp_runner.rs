@@ -1491,8 +1491,9 @@ pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
 }
 
 /// Whether a wrapped CLI refused this unit's content (core#1492). Require the runner's own
-/// nonzero-exit marker and a narrow provider signature in the last 2 KiB: earlier output may
-/// discuss refusals as subject matter. This is unit-specific, not a reason to bench the seat.
+/// nonzero-exit marker and the CLI's own refusal frame in the last 2 KiB: output may discuss
+/// refusal signatures as subject matter (core#1612). This is unit-specific, not a reason to bench
+/// the seat.
 pub(crate) fn is_content_refusal(output: &str) -> bool {
     if !crate::execute_wrapped::wrapped_exit_code(output).is_some_and(|code| code != 0) {
         return false;
@@ -1501,10 +1502,7 @@ pub(crate) fn is_content_refusal(output: &str) -> bool {
     while !output.is_char_boundary(start) {
         start += 1;
     }
-    let tail = output[start..].to_ascii_lowercase();
-    tail.contains("flagged for possible cybersecurity risk")
-        || (tail.contains("appears to violate our usage policy")
-            && tail.contains("unable to respond to this request"))
+    wicked_council::types::content_refusal_frame(&output[start..])
 }
 
 // ── ACP input governance ──────────────────────────────────────────────────────

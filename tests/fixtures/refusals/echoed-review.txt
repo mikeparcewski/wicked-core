@@ -1,0 +1,9 @@
+Review of src/acp_runner.rs:
+    tail.contains("flagged for possible cybersecurity risk")
+        || (tail.contains("appears to violate our usage policy")
+            && tail.contains("unable to respond to this request"))
+- This request has been flagged for possible cybersecurity risk.
+"API Error: Claude's safeguards flagged this message."
+The old fixture says "This content was flagged for possible cybersecurity risk".
+The review quotes API Error: Claude can't help with this. Start a new session to continue.
+fatal: failed to write review output: No space left on device

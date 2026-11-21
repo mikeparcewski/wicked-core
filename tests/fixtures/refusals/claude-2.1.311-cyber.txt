@@ -1,0 +1,1 @@
+API Error: This model's safeguards flagged this message. Our intentionally broad safeguards allow us to deliver more capabilities faster, but can sometimes flag legitimate cybersecurity work. Learn more: https://support.claude.com/en/articles/14604842-real-time-cyber-safeguards-on-claude
