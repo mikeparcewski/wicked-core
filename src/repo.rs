@@ -533,8 +533,12 @@ pub(crate) fn active_runs_on_repo(
 /// wire, absent from the persisted build label, and never an input to the gate),
 /// "build": { generation, coverage: <the label the listed build persisted, or null> } or null,
 /// "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" | "not_product" |
-/// "unindexed" } } } or null }` — `rows` is the engine's verdict on each listed requirement that
-/// recorded its code unit, decided in the same pass as `coverage` (req-reconcile 2026-11-01), so each
+/// "unindexed" } } } or null,
+/// "satisfied_by": { <domain>: { <REQ-NNN>: [{ symbol, name, file, kind, confidence }] } } or null }`
+/// — `satisfied_by` lists each requirement's live code links, sorted by symbol, with an empty list
+/// when no target remains, and is null until built. `rows` is the engine's verdict on each listed
+/// requirement that recorded its code unit, decided in the same pass as `coverage` (req-reconcile
+/// 2026-11-01), so each
 /// counted row gets the verdict the count used. With the build not behind the store, the rows with
 /// `real` and no `uncounted` number exactly `coverage.real`; behind it, units mapped since the build
 /// have no row yet. A requirement from a build before `code_symbol` has no entry (no claim either way);
@@ -555,7 +559,8 @@ pub fn requirements_graph_for_repo(
     // state, not an error. (A store that exists but cannot be read still errors below.)
     if !repo.code_graph_db.is_empty() && !Path::new(&repo.code_graph_db).exists() {
         return Ok(serde_json::json!({
-            "graph": null, "coverage": null, "build": null, "rows": null, "code": null,
+            "graph": null, "coverage": null, "build": null, "rows": null,
+            "satisfied_by": null, "code": null,
             "target": null,
         }));
     }
@@ -578,7 +583,7 @@ pub fn requirements_graph_for_repo(
     let loaded = wicked_governance::load_domain_graph_with_units(&repo_store)?;
     let units = loaded
         .as_ref()
-        .map(|(_, _, u)| u.clone())
+        .map(|(_, _, u, _)| u.clone())
         .unwrap_or_default();
     let (report, rows, weighted_milli) =
         wicked_governance::recompute_front_half_coverage_for_rows(&repo_store, &units)?;
@@ -592,12 +597,12 @@ pub fn requirements_graph_for_repo(
             serde_json::json!(wicked_governance::weighted_pct(&report, weighted_milli)),
         );
     }
-    let (graph, build, rows) = match loaded {
-        Some((mut graph, build, _)) => {
+    let (graph, build, rows, links) = match loaded {
+        Some((mut graph, build, _, links)) => {
             wicked_governance::label_domain_graph(&mut graph, &coverage)?;
-            (Some(graph), Some(build), Some(rows))
+            (Some(graph), Some(build), Some(rows), Some(links))
         }
-        None => (None, None, None),
+        None => (None, None, None, None),
     };
     // P1/P3 (operator rulings 2026-11-06): how old the code behind the listed build is, counted
     // against the REGISTERED checkout (never the graph's recorded root, which a run's worktree index
@@ -619,7 +624,8 @@ pub fn requirements_graph_for_repo(
     let code = built_from.map(|(commit, basis)| code_drift(&repo.root_path, &commit, basis));
     let target = serde_json::json!({ "repo": repo_target, "daemon": daemon_target.ok() });
     Ok(serde_json::json!({
-        "graph": graph, "coverage": coverage_read, "build": build, "rows": rows, "code": code,
+        "graph": graph, "coverage": coverage_read, "build": build, "rows": rows,
+        "satisfied_by": links, "code": code,
         "target": target,
     }))
 }
@@ -2902,6 +2908,7 @@ mod tests {
                 migration_mode: "functional".into(),
                 source: Some("estate-graph".into()),
                 coverage: None,
+                product_only: None,
                 business_domains: Vec::new(),
             },
             domains: Default::default(),
@@ -3218,12 +3225,19 @@ mod tests {
         assert_eq!(
             unbuilt,
             serde_json::json!({
-                "graph": null, "coverage": null, "build": null, "rows": null, "code": null,
+                "graph": null, "coverage": null, "build": null, "rows": null,
+                "satisfied_by": null, "code": null,
                 "target": null,
             })
         );
 
         std::fs::create_dir_all(Path::new(&entry.code_graph_db).parent().unwrap()).unwrap();
+        {
+            let _repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
+        }
+        let indexed_unbuilt = requirements_graph_for_repo(&daemon, db, &entry.id).unwrap();
+        assert!(indexed_unbuilt.get("satisfied_by").unwrap().is_null());
+        assert!(indexed_unbuilt["rows"].is_null());
         {
             let mut repo_store = wicked_apps_core::open_store(Some(&entry.code_graph_db)).unwrap();
             let model = wicked_governance::DomainModel {
@@ -3232,6 +3246,7 @@ mod tests {
                     migration_mode: "functional".into(),
                     source: Some("estate-graph".into()),
                     coverage: None,
+                    product_only: None,
                     business_domains: Vec::new(),
                 },
                 domains: Default::default(),
@@ -3249,6 +3264,11 @@ mod tests {
             built["rows"],
             serde_json::json!({}),
             "a built graph gives a verdict on each listed row: none here"
+        );
+        assert_eq!(
+            built.get("satisfied_by").expect("beside rows"),
+            &serde_json::json!({}),
+            "an empty build has an empty link map"
         );
         assert_eq!(
             built["build"],
@@ -3276,6 +3296,7 @@ mod tests {
                     migration_mode: "functional".into(),
                     source: Some("estate-graph".into()),
                     coverage: Some(built_at),
+                    product_only: None,
                     business_domains: Vec::new(),
                 },
                 domains: Default::default(),
