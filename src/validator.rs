@@ -1386,9 +1386,10 @@ pub(crate) fn kill_child_tree(child: &mut std::process::Child) {
 /// Collect a child that the run's STOP predicate has condemned, without defeating the SIGTERM
 /// window the ACTOR thread is driving (core#576).
 ///
-/// `grace` is `Some(d)` for the stop reasons the actor escalates for — `cancel_run` and
-/// `ReassignUnit` both call [`kill_pgroup_graceful`] (SIGTERM → ~500 ms → SIGKILL) on the pgid this
-/// child registered. Killing here in the same instant is what made that window unobservable: the
+/// `grace` is `Some(d)` for the stop reasons the engine escalates for — `ReassignUnit` calls
+/// [`kill_pgroup_graceful`] (SIGTERM → ~500 ms → SIGKILL) on the pgid this child registered, and
+/// `cancel_run` sends the same SIGTERM on the actor and runs the same escalation on its cleanup
+/// thread (core#1409). Killing here in the same instant is what made that window unobservable: the
 /// worker polls every 50 ms and its `kill_child_tree` is an immediate `killpg(pgid, SIGKILL)`, so a
 /// child that flushes buffers or stops its own subprocesses on SIGTERM was killed mid-cleanup. With
 /// a grace the worker POLLS for the leader to exit instead, letting the actor's SIGTERM land first.
@@ -1424,9 +1425,11 @@ pub(crate) fn kill_after_stop(child: &mut std::process::Child, grace: Option<Dur
 /// if the group was confirmed dead (via SIGTERM or SIGKILL within the poll budget), `false` if it was
 /// already dead (ESRCH) or if the group survived SIGKILL within the confirmation budget. The background
 /// thread that owns the `Child` handle remains responsible for `wait()` / reaping; double-signalling an
-/// already-dead group is harmless. Called by `cancel_run` and `ReassignUnit` BEFORE emitting
-/// `RunCancelled` / `UnitReassigned` so the wire never asserts cancellation while tool children live
-/// (AC2 / core#500).
+/// already-dead group is harmless. Called by `ReassignUnit` BEFORE emitting `UnitReassigned`, so
+/// the replacement never dispatches while the old child lives. `cancel_run` does NOT call it since
+/// core#1409: it signals the SIGTERM before the `Cancelled` write (AC2 / core#500) with
+/// [`signal_pgroup_term`] and leaves the escalation to its cleanup thread
+/// ([`escalate_groups_after_term`]), so `runCancelled` may precede the group's death.
 ///
 /// The return value reports DEATH, never its CAUSE (core#576): this function holds no `Child` handle
 /// and cannot see a status, only whether `killpg(pgid, 0)` still succeeds. Since core#576 the worker
@@ -1447,30 +1450,65 @@ pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
     if term_rc != 0 {
         return false;
     }
-    // Poll up to 500 ms in 20 ms ticks for the group to die after SIGTERM.
+    escalate_groups_after_term(&[pgid])
+}
+
+/// (core#1409) A cancel's kill, the actor's half only: SIGTERM the group NOW, before the cancel is
+/// written (AC2 of core#500 needs the kill signalled before the write, not its reaping). The grace
+/// wait and the SIGKILL escalation ([`escalate_groups_after_term`]) run on the cancel's cleanup
+/// thread, BEFORE its worktree reap: the actor never sleeps through a group's grace (a group that
+/// ignores SIGTERM held every run's reads and gate answers for 700 ms per group before), and the
+/// tree is never inspected or removed while a signalled child may still write to it.
+///
+/// Returns the group id when the SIGTERM reached a live group (what
+/// `runCancelled.toolChildrenKilled` counts), `None` for a bogus pgid (0, 1) or a group already
+/// gone (ESRCH). The worker thread that owns the `Child` still collects it ([`kill_after_stop`]).
+#[cfg(unix)]
+pub(crate) fn signal_pgroup_term(pgid: u32) -> Option<i32> {
+    // The same bounds guard as `kill_pgroup_graceful`: 0 is our own group, 1 is init.
+    if pgid <= 1 {
+        return None;
+    }
+    let pgid = pgid as i32;
+    (unsafe { sig::killpg(pgid, sig::SIGTERM) } == 0).then_some(pgid)
+}
+
+/// After a SIGTERM to every group in `pgids` (sent together): wait up to ~500 ms for them to die,
+/// SIGKILL the survivors, and confirm within ~200 ms. One window for all of them, so a cancel of
+/// many groups waits no longer than a cancel of one, and no group id is polled longer than the
+/// synchronous kill polled it. `true` = every group is confirmed dead.
+#[cfg(unix)]
+pub(crate) fn escalate_groups_after_term(pgids: &[i32]) -> bool {
+    let alive = |pgid: &i32| unsafe { sig::killpg(*pgid, 0) } == 0;
+    // Poll up to 500 ms in 20 ms ticks for the groups to die after SIGTERM.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut left: Vec<i32> = pgids.to_vec();
     while std::time::Instant::now() < deadline {
-        if unsafe { sig::killpg(pgid, 0) } != 0 {
-            // CONFIRMED DEAD, cause unknown (core#576): all this observes is that the group is
-            // gone within the SIGTERM window. It may have honoured the SIGTERM, it may have been
-            // exiting anyway, or another thread may have killed it. Do not report a cause here —
-            // the return value means "dead", not "died gracefully".
+        // CONFIRMED DEAD, cause unknown (core#576): all this observes is that a group is gone
+        // within the SIGTERM window. It may have honoured the SIGTERM, it may have been exiting
+        // anyway, or another thread may have killed it. The result means "dead", not "died
+        // gracefully".
+        left.retain(alive);
+        if left.is_empty() {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     // Force-kill anything that survived SIGTERM.
-    unsafe { sig::killpg(pgid, sig::SIGKILL) };
+    for pgid in &left {
+        unsafe { sig::killpg(*pgid, sig::SIGKILL) };
+    }
     // Confirm the SIGKILL landed — the kernel dequeues it asynchronously. Poll up to 200 ms so
-    // callers can trust "returned true" means "group is dead, not just signalled".
+    // callers can trust "returned true" means "every group is dead, not just signalled".
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
     while std::time::Instant::now() < deadline {
-        if unsafe { sig::killpg(pgid, 0) } != 0 {
+        left.retain(alive);
+        if left.is_empty() {
             return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
-    // Group survived SIGKILL within the budget — do not count it as reaped.
+    // A group survived SIGKILL within the budget — do not count it as reaped.
     false
 }
 
