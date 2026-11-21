@@ -1272,7 +1272,9 @@ fn a_name_failing_in_one_binary_and_passing_in_another_cannot_be_separated() {
         git_dir: Some(repo.join(".git")),
         ..FloorContext::default()
     };
-    std::fs::write(repo.join("README.md"), "head\n").unwrap();
+    // wicked-core#1701: a prose-only head would pass as the base's failure; a non-prose file the
+    // crate does not compile keeps the head's run unchanged and the change judged.
+    std::fs::write(repo.join("src/unused.rs"), "// head\n").unwrap();
     let report = run_floor(&repo, &ctx);
     if report.sandbox_error.is_some() {
         return;

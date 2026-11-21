@@ -11326,7 +11326,9 @@ mod tests {
             write: vec![std::fs::canonicalize(&wt).unwrap()],
             read: vec![],
         };
-        let command = format!("cd '{}' && npm test", outside.display());
+        // A write-capable program after the `cd` (an opaque interpreter, no resolvable write
+        // target): only the `cd` destination is judged, so the refusal names that directory.
+        let command = format!("cd '{}' && node build.js", outside.display());
         let (reason, fatal) = boundary_denial_with(
             &roots,
             &wt,
