@@ -2558,6 +2558,33 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
             .any(|s| s.catalog == "deliver" || s.catalog == "build"));
     }
 
+    /// Research and independent re-fetches share the governed web source (core#1362).
+    #[test]
+    fn learn_research_and_review_use_only_the_web_source() {
+        let steps = builtin_preset("learn").unwrap();
+        for id in ["research", "review"] {
+            let text = steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .instructions
+                .as_deref()
+                .unwrap();
+            assert!(text.contains("web source"), "{id}: {text}");
+            assert!(text.contains("scripts/mcp/shim.py"), "{id}: {text}");
+            assert!(!text.contains("curl"), "{id}: {text}");
+            assert!(!text.contains("own web tools"), "{id}: {text}");
+            if id == "research" {
+                assert!(text.contains("not listed"));
+                assert!(text.contains("none of its calls answers"));
+                assert!(text.contains("research: no web access"));
+                assert!(text.contains("not fetched and continue"));
+            } else {
+                assert!(text.contains("could not"));
+            }
+        }
+    }
+
     /// (CS3) The sourced report's check keeps off every seat that gathered or synthesized it: both
     /// `understand` steps are report gatherers (neither is the PA's `scope`), so under the
     /// fidelity-to-source rubric every gather member's seat and the synthesize seat are authors of

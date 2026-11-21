@@ -47,11 +47,10 @@ use crate::workflow::{DeltaSink, StepInput, StepOutput, StepRunner, StepStatus, 
 
 struct PtySession {
     terminal_id: String,
-    /// Whether the session was opened for a NO-CODE phase (read-only posture, F-036). A session
-    /// serves only turns of its own posture: a creator's write-posture session is never reused by
-    /// an `executes_code: false` phase — it could background a write past the guard's final
-    /// snapshot — and a read-only session is never handed to a code phase that must write.
-    no_code: bool,
+    /// The posture this session opened with. Reuse requires an exact match so a tool-less turn
+    /// cannot inherit a read-only session's tools (core#1257), and a fenced phase cannot inherit
+    /// a creator's writes or background processes (F-036).
+    posture: crate::write_posture::WritePosture,
     /// argv[0] of the command this session was opened with (core#656). A reused session's
     /// governance decision reads THIS, not the current unit's invocation: the PTY that will run
     /// the turn is the one already open, whatever the unit's template says.
@@ -205,6 +204,18 @@ impl PersistentStepRunner {
                 lever.describe()
             );
         }
+        if crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some())
+            == crate::write_posture::WritePosture::ToolLess
+        {
+            // PTYs always run on the host; a prior session's tools cannot carry into an
+            // answer-only turn, and only verified tool-disabling seats can open (core#1257).
+            crate::execute_wrapped::apply_tool_less_posture(
+                &mut argv,
+                Vec::new(),
+                is_claude,
+                false,
+            )?;
+        }
         Ok(argv)
     }
 }
@@ -354,17 +365,16 @@ impl PersistentStepRunner {
         // opens a fresh read-only one; a code phase reaching a read-only session likewise.
         // F-4R2-004: derived from the unit's ROLE and the run's tree — a fenced unit (read-only or
         // deliverable-roots) never shares a session with a write-posture one.
-        let wants_no_code =
-            crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some())
-                .fences_writes();
+        let posture = crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
+        let wants_no_code = posture.fences_writes();
         let existing_id = {
             let guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
             guard
                 .get(&run_id)
-                .map(|s| (s.terminal_id.clone(), s.no_code, s.binary.clone()))
+                .map(|s| (s.terminal_id.clone(), s.posture, s.binary.clone()))
         };
         let existing_id = match existing_id {
-            Some((tid, no_code, binary)) if no_code == wants_no_code => {
+            Some((tid, opened_posture, binary)) if opened_posture == posture => {
                 // core#656: the open PTY runs `binary`, whatever this unit's template names. A
                 // governed unit never writes into a claude PTY on this carrier.
                 if governed && binary_is_claude(&binary) {
@@ -427,7 +437,7 @@ impl PersistentStepRunner {
                     let mut guard = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
                     let entry = guard.entry(run_id.clone()).or_insert(PtySession {
                         terminal_id: tid.clone(),
-                        no_code: wants_no_code,
+                        posture,
                         binary,
                     });
                     (entry.terminal_id.clone(), entry.binary.clone())
@@ -801,6 +811,25 @@ mod tests {
     use crate::scope::EntityMode;
     use crate::workflow::{GateSpec, PhaseRole};
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// An answer-only PTY must use a tool-disabling lever on its host floor (core#1257).
+    #[test]
+    fn answer_only_sessions_disable_tools_or_refuse_before_open() {
+        let mut unit = make_unit("answer", "/opt/bin/codex exec");
+        unit.answer_only = true;
+        let input = make_input("answer-only", 0, unit);
+        assert!(PersistentStepRunner::session_argv("/opt/bin/codex exec", &input).is_err());
+        for (invocation, flag) in [
+            ("/opt/bin/pi", "--no-tools"),
+            ("/opt/bin/claude -p", "--tools"),
+        ] {
+            let argv = PersistentStepRunner::session_argv(invocation, &input).unwrap();
+            assert!(argv.iter().any(|a| a == flag));
+            if flag == "--tools" {
+                assert!(argv.windows(2).any(|w| w[0] == flag && w[1].is_empty()));
+            }
+        }
+    }
 
     static DB_COUNTER: AtomicU64 = AtomicU64::new(0);
 
