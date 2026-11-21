@@ -105,6 +105,8 @@ impl OutputAdapter for Passthrough {
 pub(crate) struct ClaudeStreamJson {
     /// Whether any assistant text delta was emitted this run — gates the terminal `result` fallback.
     emitted_text: bool,
+    /// The last assistant text block emitted, so a failed turn's `result` is not repeated.
+    last_text: Option<String>,
     /// Live per-tool frames for the unit (`toolActivity`), when its actor is reachable.
     pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
     /// Each assistant message's usage so far (`message.id` → fresh + cache input, output), summed
@@ -277,8 +279,9 @@ impl OutputAdapter for ClaudeStreamJson {
                     }
                     _ => {}
                 }
-                if !out.text.is_empty() {
+                if let Some(t) = out.text.last() {
                     self.emitted_text = true;
+                    self.last_text = Some(t.clone());
                 }
             }
             // The terminal result carries the run totals + cost directly (B3).
@@ -315,12 +318,19 @@ impl OutputAdapter for ClaudeStreamJson {
                 }
                 // (S3b) FALLBACK: no assistant text streamed this run ⇒ the final answer lives only in the
                 // result envelope. Emit `result.result` as text so `StepOutput.output` is non-empty.
-                if !self.emitted_text {
-                    if let Some(answer) = v.get("result").and_then(|r| r.as_str()) {
-                        if !answer.is_empty() {
-                            out.text.push(answer.to_string());
-                            self.emitted_text = true;
-                        }
+                // (core#1612) A FAILED turn's result says why it stopped (claude's `API Error:`
+                // refusal, a sign-in or quota error): it reaches the output after earlier assistant
+                // text too, unless that text already ended with it.
+                let failed = v.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+                if let Some(answer) = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .filter(|a| !a.is_empty())
+                {
+                    if !self.emitted_text || (failed && self.last_text.as_deref() != Some(answer)) {
+                        out.text.push(answer.to_string());
+                        self.emitted_text = true;
+                        self.last_text = Some(answer.to_string());
                     }
                 }
             }

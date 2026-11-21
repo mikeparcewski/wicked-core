@@ -36042,6 +36042,7 @@ mod seat_failover_tests {
             include_str!("../tests/fixtures/refusals/claude-2.1.311-safeguards.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cyber.txt"),
             include_str!("../tests/fixtures/refusals/claude-2.1.311-cant-help.txt"),
+            include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt"),
         ] {
             assert!(is_content_refusal(&format!(
                 "(cli `claude` exited 1) {claude}"
@@ -36060,6 +36061,10 @@ mod seat_failover_tests {
             "This content was flagged for possible biological risk.",
             "This request was blocked due to a misalignment policy violation.",
             "This content was flagged for possible cybersecurity risk",
+            // The server's own wording passes through codex; its opening is codex's frame.
+            "This request has been flagged for possible cybersecurity risk. If this seems wrong, \
+             try rephrasing your request.",
+            "This content has been flagged for possible misuse and was not processed",
         ] {
             let sentence = sentence.to_ascii_uppercase();
             assert!(is_content_refusal(&format!(
@@ -36089,9 +36094,14 @@ mod seat_failover_tests {
                 "(cli `claude` exited 1) {echo}"
             )));
         }
+        // A failed unit keeps stdout THEN stderr: a stdout refusal behind a chatty stderr is still
+        // read (16 KiB window), and one pushed out of the window is not.
+        let stderr_noise = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(stderr_noise.len() > 4096);
+        assert!(is_content_refusal(&format!("{codex}\n{stderr_noise}")));
         assert!(!is_content_refusal(&format!(
             "{codex}\n{}",
-            "x".repeat(4096)
+            "x".repeat(crate::acp_runner::CONTENT_REFUSAL_TAIL_BYTES + 1)
         )));
         assert!(!is_content_refusal(
             "(cli `codex` exited 1) unrelated failure"
@@ -36100,8 +36110,51 @@ mod seat_failover_tests {
         assert!(is_content_refusal(&format!(
             "(cli `codex` exited 1) {}\nThis request has been flagged for possible \
              cybersecurity risk.",
-            "界".repeat(1024)
+            "界".repeat(6000)
         )));
+    }
+
+    /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier
+    /// through `ClaudeStreamJson`, whether claude sends the `API Error:` text as an assistant event
+    /// or only in its failed `result` (red on main for the second: the result was dropped once
+    /// text had streamed, and 2.1.311's wording was not matched).
+    #[test]
+    fn a_claude_stream_json_refusal_after_earlier_text_reaches_the_classifier() {
+        use crate::acp_runner::is_content_refusal;
+        use crate::execute_wrapped::{ClaudeStreamJson, OutputAdapter};
+
+        let session = include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt").trim();
+        let stream = include_str!("../tests/fixtures/refusals/claude-2.1.311-refusal.stream.jsonl");
+        let run = |lines: Vec<&str>| {
+            let mut adapter = ClaudeStreamJson::default();
+            let mut text = Vec::new();
+            for line in lines {
+                text.extend(adapter.on_line(line).text);
+            }
+            text.extend(adapter.finish().text);
+            format!("(cli `claude` exited 1) {}", text.join("\n"))
+        };
+        // The API error as an assistant event, then the failed result: the refusal once.
+        let both = run(stream.lines().collect());
+        assert!(
+            both.contains("reading the parser's decompression limits"),
+            "{both}"
+        );
+        assert_eq!(both.matches(session).count(), 1, "{both}");
+        assert!(is_content_refusal(&both), "{both}");
+        // Only the failed result carries it (no assistant event for the error).
+        let result_only = run(stream
+            .lines()
+            .filter(|l| !l.contains("msg_fixture_2"))
+            .collect());
+        assert!(result_only.ends_with(session), "{result_only}");
+        assert!(is_content_refusal(&result_only), "{result_only}");
+        // A successful result after text is still not repeated.
+        let ok = run(vec![
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done (summary)"}"#,
+        ]);
+        assert_eq!(ok, "(cli `claude` exited 1) done");
     }
 
     /// A resume of a worker-failed run must NOT re-dispatch the seat that failed the unit

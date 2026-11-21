@@ -13,6 +13,17 @@ real account, which the tests must never need.
   name.
 - `claude-2.1.311-cyber.txt`: the cyber-category refusal (`API Error: This model's safeguards
   flagged this message. Our intentionally broad safeguards ...`).
+- `claude-2.1.311-session.txt`: the template that names the session
+  (`API Error: <model>'s safeguards flagged this session (...). You may be seeing this for the first
+  time: ... Claude Code can't respond to your last message with <model>.`). 2.1.311 assembles it at
+  runtime: its `w6o` builds `` `${e}'s safeguards flagged ${Eb}${s}. ${h(e)}` `` with
+  `Eb="this session"`, `h` is the category's first-time note (`wc.cyber` here), and the refusal
+  handler appends `` `${He} can't respond to your last message with ${b}.` ``. That is why no literal
+  "flagged this session" string is in the binary.
+- `claude-2.1.311-refusal.stream.jsonl`: the same refusal in `--output-format stream-json`,
+  after earlier assistant text: an assistant event carrying the `API Error:` text, then a
+  `result` with `is_error: true`. The test also drops the assistant error event, so the
+  refusal arrives only in the failed result.
 - `claude-2.1.311-cant-help.txt`: the refusal with no model name (`API Error: Claude can't help
   with this. Start a new session to continue.`).
 - `echoed-review.txt`: a failed review that quotes every signature as subject matter (source
