@@ -35102,6 +35102,140 @@ mod deliverable_floor_tests {
         (session, unit)
     }
 
+    /// core#1724 (J6, train 11): a domain map's extract seat stated 79 of its page's 500
+    /// worklist units ("for subsequent pages"); its file conformed, so the page passed whole and
+    /// the map's minimum came hours later. A rules file that conforms but covers only part of the
+    /// worklist is asked for again ONCE, automatically, with the count; still partial after that
+    /// round, the page goes on with its count disclosed.
+    #[test]
+    fn core_1724_a_partial_page_is_asked_for_again_once_then_goes_on_disclosed() {
+        let wd = tmp("page-partial");
+        std::fs::create_dir_all(wd.join(".wicked/domain")).unwrap();
+        std::fs::write(
+            wd.join(crate::domain_extraction::WORKLIST_REL),
+            r#"{"units":[{"symbol_id":"a#"},{"symbol_id":"b#"},{"symbol_id":"c#"},{"symbol_id":"d#"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wd.join(crate::domain_extraction::RULES_REL),
+            r#"{"schema":"wicked-garden/domain-rules@1","seat":"pi","rules":[
+                {"symbol_id":"a#","statement":"A refund needs a receipt.","confidence":0.9},
+                {"symbol_id":"b#","statement":"","confidence":0.5}]}"#,
+        )
+        .unwrap();
+        let run_id = format!("page-partial-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            Some(wd.to_string_lossy().into_owned()),
+            Vec::new(),
+            vec![crate::domain_extraction::RULES_REL.to_string()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+
+        let (session, unit) = fold(&mut store, &mut subs, &run_id);
+        assert_eq!(
+            unit.status,
+            UnitStatus::Distributed,
+            "a partial page is asked for again, never passed: {:?}",
+            unit.denial_reason
+        );
+        assert_eq!(
+            (session.status, session.attempt),
+            (SessionStatus::Executing, 1)
+        );
+        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
+        let amendment = evs
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::UnitReworkAmended {
+                    amendment, scope, ..
+                } if scope == "page_incomplete" => Some(amendment.clone()),
+                _ => None,
+            })
+            .expect("unitReworkAmended{page_incomplete}");
+        assert!(
+            amendment.contains("states 2 of the 4 worklist units")
+                && amendment.contains("`c#`")
+                && amendment.contains("`d#`"),
+            "{amendment}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::StepFailed { detail, failure_kind, .. }
+                    if *failure_kind == crate::event::StepFailureKind::SubstanceRejected
+                        && detail.contains("2 of the 4")
+            )),
+            "{evs:?}"
+        );
+
+        // Still partial after the round: one round only, and the page goes on, disclosed.
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+        assert_ne!(
+            unit.status,
+            UnitStatus::Distributed,
+            "no second automatic round"
+        );
+        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
+            "{evs:?}"
+        );
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                CoreEvent::UnitOutputDelta { text, .. } if text.contains("stated 2 of 4 worklist units")
+            )),
+            "{evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
+    /// core#1724: a page whose every worklist unit is stated (an empty statement counts) passes
+    /// with no automatic round.
+    #[test]
+    fn core_1724_a_whole_page_passes_with_no_round() {
+        let wd = tmp("page-whole");
+        std::fs::create_dir_all(wd.join(".wicked/domain")).unwrap();
+        std::fs::write(
+            wd.join(crate::domain_extraction::WORKLIST_REL),
+            r#"{"units":[{"symbol_id":"a#"},{"symbol_id":"b#"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            wd.join(crate::domain_extraction::RULES_REL),
+            r#"{"rules":[{"symbol_id":"a#","statement":"A refund needs a receipt."},
+                {"symbol_id":"b#","statement":""}]}"#,
+        )
+        .unwrap();
+        let run_id = format!("page-whole-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed(
+            &mut store,
+            &run_id,
+            Some(wd.to_string_lossy().into_owned()),
+            Vec::new(),
+            vec![crate::domain_extraction::RULES_REL.to_string()],
+        );
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let (_session, unit) = fold(&mut store, &mut subs, &run_id);
+        assert_eq!(unit.status, UnitStatus::Done, "{:?}", unit.denial_reason);
+        let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, CoreEvent::UnitReworkAmended { .. })),
+            "{evs:?}"
+        );
+        let _ = std::fs::remove_dir_all(&wd);
+    }
+
     #[test]
     fn a_previous_pass_deliverable_is_rejected_as_stale() {
         let wd = tmp("pass-stale");
@@ -35905,6 +36039,165 @@ mod seat_failover_tests {
         let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
         let units = crate::domain::session_units(store, run_id).unwrap();
         (applied, session, units)
+    }
+
+    /// [`fold_failed`], with every event the fold emitted.
+    fn fold_failed_capturing(
+        store: &mut dyn GraphStore,
+        run_id: &str,
+        failure_text: &str,
+    ) -> (StepApplied, AgentSession, Vec<WorkUnit>, Vec<CoreEvent>) {
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let (esub, erx) = channel();
+        subs.push(esub);
+        let live = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let out = StepOutput {
+            run_id: run_id.into(),
+            unit_ix: live.unit_ix,
+            attempt: live.attempt,
+            output: failure_text.into(),
+            status: StepStatus::Failed,
+            usage: None,
+            files: Vec::new(),
+            tools: Vec::new(),
+            governed: true,
+        };
+        let applied = apply_step_result(
+            store,
+            &mut subs,
+            &runner,
+            &tx,
+            out,
+            None,
+            crate::workflow::UnitEvidence::default(),
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        let session = crate::domain::get_session(store, run_id).unwrap().unwrap();
+        let units = crate::domain::session_units(store, run_id).unwrap();
+        let events = std::iter::from_fn(|| erx.try_recv().ok()).collect();
+        (applied, session, units, events)
+    }
+
+    /// core#1722: a failover's `stepFailed` names its cause — the runner's frame and the seat's
+    /// last words — after the counts (crew's seat-health reads the `seat '…' failed (…); failing
+    /// over to '…'` shape). It used to say only "failed (worker error)".
+    #[test]
+    fn core_1722_a_failover_names_its_cause_in_the_event() {
+        let run_id = format!("failover-cause-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["agy", "claude"],
+            SessionStatus::Executing,
+            0,
+        );
+        seed_unit(
+            &mut store,
+            &run_id,
+            1,
+            "u1",
+            "agy",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let (applied, _session, units, events) = fold_failed_capturing(
+            &mut store,
+            &run_id,
+            "(cli `agy` exited 1) started the turn\nError: segmentation fault in the agent runtime",
+        );
+        assert!(matches!(applied, StepApplied::Continuing));
+        assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"));
+        let detail = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::StepFailed { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("the failover's stepFailed");
+        assert!(
+            detail.starts_with("seat 'agy' failed (worker error); failing over to 'claude'"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("cause: (cli `agy` exited 1)")
+                && detail.contains("segmentation fault in the agent runtime"),
+            "the event names the cause: {detail}"
+        );
+    }
+
+    /// core#1722 (J6 run d32f3b9a): a result the ENGINE lost after the seat ran (the seat pod's
+    /// settlement failed) is not the seat's failure: no failover, so the unit keeps its seat and
+    /// the review keeps a distinct seat; a retried attempt opens the operator's gate with the
+    /// cause in the event instead.
+    #[test]
+    fn core_1722_a_result_the_engine_lost_after_the_seat_ran_is_not_failed_over() {
+        let run_id = format!("lost-result-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_session(
+            &mut store,
+            &run_id,
+            &["claude", "codex", "pi"],
+            SessionStatus::Executing,
+            0,
+        );
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.human_confirm = HumanConfirm::All;
+        session.attempt = 3;
+        put_node(&mut store, session.to_node()).unwrap();
+        seed_unit(
+            &mut store,
+            &run_id,
+            3,
+            "extract",
+            "claude",
+            PhaseRole::Creator,
+            &[],
+            UnitStatus::Distributed,
+        );
+        let lost = crate::execute_wrapped::settle_failure_output(
+            "claude",
+            &format!(
+                "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
+                crate::execute_wrapped::SETTLE_FAILED
+            ),
+            "All 500 units on this page's worklist now have an entry, and `--check-rules` \
+             exited 0: 500 conform.",
+        );
+        let (applied, session, units, events) = fold_failed_capturing(&mut store, &run_id, &lost);
+        assert_eq!(
+            units[0].assigned_cli.as_deref(),
+            Some("claude"),
+            "no failover: the seat did not fail"
+        );
+        assert!(
+            units[0].worker_failed_clis.is_empty(),
+            "{:?}",
+            units[0].worker_failed_clis
+        );
+        assert!(matches!(applied, StepApplied::Paused));
+        assert_eq!(session.status, SessionStatus::AwaitingHuman);
+        let detail = events
+            .iter()
+            .find_map(|e| match e {
+                CoreEvent::StepFailed { detail, .. } => Some(detail.clone()),
+                _ => None,
+            })
+            .expect("stepFailed");
+        assert!(
+            detail.contains("rc file is missing") && !detail.contains("failing over"),
+            "the cause is in the event: {detail}"
+        );
     }
 
     /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run
