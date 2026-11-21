@@ -3930,6 +3930,8 @@ fn interrupted_journal(
         .collect();
     let rec = JournalRecord {
         floor_policy: FLOOR_POLICY_VERSION,
+        daemon: "previous-daemon".into(),
+        stopped: None,
         key: FloorKey::of(tree, ctx, &report.detected),
         exclude: exclusion_enabled(),
         posture: String::new(),
@@ -3979,6 +3981,7 @@ fn a_floor_a_restart_interrupted_resumes_running_only_the_unfinished_checks() {
         resumed.resumed,
         Some(FloorResume {
             from_attempt: 8,
+            cause: "the daemon restarted".into(),
             reused: vec!["lint".to_string()],
             restarted: None
         })
@@ -4430,6 +4433,8 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
         .collect();
     let rec = JournalRecord {
         floor_policy: FLOOR_POLICY_VERSION,
+        daemon: floor_daemon_id().into(),
+        stopped: None,
         key: key.clone(),
         exclude: true,
         posture: String::new(),
@@ -5066,6 +5071,8 @@ fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
         .unwrap();
     let record = JournalRecord {
         floor_policy: FLOOR_POLICY_VERSION,
+        daemon: floor_daemon_id().into(),
+        stopped: None,
         key: FloorKey::of(&r.tree, &ctx, &first.detected),
         exclude: exclusion_enabled(),
         posture: String::new(),
@@ -5155,6 +5162,8 @@ fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
     let check = detected.iter().find(|c| c.name == "e2e").unwrap();
     let record = JournalRecord {
         floor_policy: FLOOR_POLICY_VERSION,
+        daemon: floor_daemon_id().into(),
+        stopped: None,
         key: FloorKey::of(&r.tree, &ctx, &detected),
         exclude: exclusion_enabled(),
         posture: String::new(),
@@ -5407,6 +5416,8 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
     let check = first.detected.iter().find(|c| c.name == "lint").unwrap();
     let record = JournalRecord {
         floor_policy: FLOOR_POLICY_VERSION,
+        daemon: floor_daemon_id().into(),
+        stopped: None,
         key: FloorKey::of(&r.tree, &ctx, &first.detected),
         exclude: exclusion_enabled(),
         posture: String::new(),
@@ -5615,63 +5626,145 @@ fn a_creator_floor_runs_the_engines_affected_set_and_records_it() {
     let _ = std::fs::remove_dir_all(&graph_dir);
 }
 
-/// (core#1482) A cancelled run's running check is killed at its next poll (its whole process group),
-/// reported as not having run, and a resume clears the cancel.
+/// A stop observed during preparation must prevent the check from spawning.
+#[cfg(unix)]
+#[test]
+fn core_c6_stop_before_spawn_creates_no_marker() {
+    let wt = scratch("c6-before-spawn");
+    let mut checks = CheckScratch::prepare(&wt).unwrap();
+    checks.stop = Some(FloorStop::new(|| {
+        // If the pre-spawn guard regresses, give the child time to write its marker before
+        // the poll's stop can kill it. A quick post-spawn kill must not satisfy this test.
+        std::thread::sleep(Duration::from_millis(100));
+        Some("cancelled")
+    }));
+    let check = c6_shell("touch spawned");
+    let r = run_one(&wt, &check, &c6_sandbox(), &checks, Tree::Head);
+    assert!(!wt.join("spawned").exists());
+    assert_eq!(r.spawn_error.as_deref(), Some("the run was cancelled"));
+    drop(checks);
+    std::fs::remove_dir_all(wt).unwrap();
+}
+
+#[cfg(unix)]
+fn c6_shell(script: &str) -> RepoCheck {
+    RepoCheck {
+        name: "test".into(),
+        argv: s(&["sh", "-c", script]),
+        source: "test".into(),
+        timeout_s: Some(10),
+        dir: String::new(),
+    }
+}
+
+#[cfg(unix)]
+fn c6_sandbox() -> WorkerSandbox {
+    WorkerSandbox {
+        wrapper: Vec::new(),
+        level: crate::validator::SandboxLevel::BestEffort,
+        downgrade_reason: Some("test".into()),
+    }
+}
+
+/// A stopped floor skips the remaining checks before reuse or another spawn.
+#[cfg(unix)]
+#[test]
+fn core_c6_stop_between_checks_skips_the_next_check() {
+    let wt = scratch("c6-between-checks");
+    std::fs::create_dir_all(wt.join(".wicked")).unwrap();
+    std::fs::write(
+        wt.join(".wicked/checks.json"),
+        r#"{"lint":["sh","-c","touch stop"],"test":["sh","-c","touch spawned"]}"#,
+    )
+    .unwrap();
+    // The first check flips the stop. Whether its own poll sees it before its exit or not,
+    // the next check is never started.
+    let marker = wt.join("stop");
+    let stop = FloorStop::new(move || marker.exists().then_some("superseded"));
+    let mut scratch = CheckScratch::prepare(&wt).unwrap();
+    scratch.stop = Some(stop.clone());
+    let ctx = FloorContext {
+        stop: Some(stop),
+        ..Default::default()
+    };
+    let (report, _) = run_detected(
+        &wt,
+        &c6_sandbox(),
+        "best_effort",
+        None,
+        &ctx,
+        &scratch,
+        None,
+        None,
+        None,
+        None,
+    );
+    let report = stopped_by_cancel(report, ctx.stop.as_ref());
+    assert!(!wt.join("spawned").exists(), "{report:?}");
+    assert_eq!(report.checks.len(), 1, "{report:?}");
+    assert_eq!(report.skipped, vec!["test"]);
+    assert_eq!(report.outcome(), "not_run");
+    drop(scratch);
+    std::fs::remove_dir_all(wt).unwrap();
+}
+
+/// The whole process group dies: the background child's heartbeat stops growing.
 #[cfg(unix)]
 #[test]
 fn core_1482_a_cancelled_runs_check_is_killed() {
     let wt = scratch("cancel-floor");
-    let run = format!("cancel-floor-{}", std::process::id());
-    let checks = CheckScratch::prepare_for(&wt, Some(&run)).unwrap();
-    let none = crate::validator::WorkerSandbox {
-        wrapper: Vec::new(),
-        level: crate::validator::SandboxLevel::BestEffort,
-        downgrade_reason: Some("test".into()),
-    };
-    let long = RepoCheck {
-        name: "test".into(),
-        argv: s(&["sh", "-c", "sleep 60"]),
-        source: "test".into(),
-        timeout_s: Some(120),
-        dir: String::new(),
-    };
-    let r2 = run.clone();
-    let canceller = std::thread::spawn(move || {
-        std::thread::sleep(Duration::from_millis(400));
-        cancel_floor(&r2);
-    });
-    let started = std::time::Instant::now();
-    let r = run_one(&wt, &long, &none, &checks, Tree::Head);
-    canceller.join().unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(20),
-        "{:?}",
-        started.elapsed()
-    );
-    assert_eq!(
-        r.spawn_error.as_deref(),
-        Some("the run was cancelled"),
-        "{r:?}"
-    );
-    assert!(floor_cancelled(Some(&run)));
-    // (codex confirmation on #1530, SILENT-OK) The floor it ran in is the run's cancellation,
-    // `not_run`, never a failed or a passed floor.
-    let passing = guarded_report_stub(&wt);
-    assert_eq!(passing.outcome(), "passed");
-    let r = stopped_by_cancel(passing, Some(&run));
-    assert_eq!(r.outcome(), "not_run", "{r:?}");
-    assert!(r
-        .sandbox_error
-        .as_deref()
-        .is_some_and(|e| e.contains("cancelled")));
-    clear_floor_cancel(&run);
-    assert!(!floor_cancelled(Some(&run)));
-    assert_eq!(
-        stopped_by_cancel(guarded_report_stub(&wt), Some(&run)).outcome(),
-        "passed"
-    );
+    let mut checks = CheckScratch::prepare(&wt).unwrap();
+    let heartbeat = wt.join("heartbeat");
+    let marker = heartbeat.clone();
+    checks.stop = Some(FloorStop::new(move || {
+        marker.exists().then_some("cancelled")
+    }));
+    let long = c6_shell("(while :; do echo x >> heartbeat; sleep 0.05; done) & wait");
+    let started = Instant::now();
+    let r = run_one(&wt, &long, &c6_sandbox(), &checks, Tree::Head);
+    assert!(started.elapsed() < Duration::from_secs(20));
+    assert_eq!(r.spawn_error.as_deref(), Some("the run was cancelled"));
+    let bytes = std::fs::metadata(&heartbeat).unwrap().len();
+    assert!(bytes > 0, "the descendant actually ran");
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(std::fs::metadata(&heartbeat).unwrap().len(), bytes);
+    let report = stopped_by_cancel(guarded_report_stub(&wt), checks.stop.as_ref());
+    assert_eq!(report.outcome(), "not_run");
     drop(checks);
-    let _ = std::fs::remove_dir_all(&wt);
+    std::fs::remove_dir_all(wt).unwrap();
+}
+
+/// Even an already-exited child has no accepted verdict after a stop.
+#[cfg(unix)]
+#[test]
+fn core_c6_exit_after_stop_is_not_accepted() {
+    let wt = scratch("c6-exit-stop");
+    let mut checks = CheckScratch::prepare(&wt).unwrap();
+    let marker = wt.join("exited");
+    let polls = std::sync::atomic::AtomicUsize::new(0);
+    checks.stop = Some(FloorStop::new(move || {
+        if polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return None; // pre-spawn
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while !marker.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        Some("cancelled")
+    }));
+    let r = run_one(
+        &wt,
+        &c6_shell("touch exited; exit 0"),
+        &c6_sandbox(),
+        &checks,
+        Tree::Head,
+    );
+    assert!(wt.join("exited").exists());
+    assert_eq!(r.exit_code, None);
+    assert_eq!(r.spawn_error.as_deref(), Some("the run was cancelled"));
+    drop(checks);
+    std::fs::remove_dir_all(wt).unwrap();
 }
 
 /// (core#1482) The disk guard: under the minimum free space the floor refuses to start, as an
@@ -6013,4 +6106,129 @@ fn core_1605_disk_filling_during_a_check_is_terminal_and_preserves_evidence() {
         assert!(!plenty.passed, "{plenty:?}");
         let _ = std::fs::remove_dir_all(&wt);
     }
+}
+
+/// A stopped journal remains reusable and names the actual interruption.
+#[cfg(unix)]
+#[test]
+fn core_c6_journal_names_reassign_and_restart() {
+    for (reason, other_daemon, expected) in [
+        (
+            Some("superseded"),
+            false,
+            "a newer launch superseded attempt 4",
+        ),
+        (Some("cancelled"), false, "the run was cancelled"),
+        (Some("shutdown"), false, "the daemon restarted"),
+        (None, true, "the daemon restarted"),
+        (None, false, "it ended before it finished"),
+    ] {
+        let mut open = journal_offering("c6-cause", &[("lint", vec![])]);
+        let path = open.path.clone();
+        let logs = path.parent().unwrap().to_path_buf();
+        let key = open.record.key.clone();
+        // The offered finished check is retained by the interrupted floor.
+        open.record.checks = open.prior.clone();
+        open.record.attempt = 4;
+        if other_daemon {
+            open.record.daemon = "another-daemon".into();
+        }
+        open.persist();
+        if let Some(reason) = reason {
+            let _ = open.finish(Some(reason));
+            assert!(path.exists(), "stopped floors keep their journal");
+        }
+        let j = FloorJournal {
+            ord: 2,
+            attempt: 6,
+            tree: key.tree.clone(),
+            phase: None,
+        };
+        let mut next = OpenJournal::open(&logs, &j, key, true, String::new());
+        let check = c6_shell("true");
+        let lint = RepoCheck {
+            name: "lint".into(),
+            ..check
+        };
+        assert!(next.reuse(&lint, &logs).is_some());
+        let resume = next.resume.as_ref().unwrap();
+        assert_eq!(resume.cause, expected);
+        assert!(resume.note().contains(expected), "{}", resume.note());
+        let _ = next.finish(None);
+        assert!(!path.exists(), "a completed floor removes its journal");
+        std::fs::remove_dir_all(logs).unwrap();
+    }
+}
+
+#[test]
+fn core_c6_abandoned_base_asides_are_reclaimed_on_drop_and_prepare() {
+    let base = scratch("c6-asides");
+    let cache = base.join("cache");
+    let wt = base.join("repo");
+    std::fs::create_dir_all(&wt).unwrap();
+    let checks = CheckScratch::prepare_in(&cache, &wt, None, u64::MAX).unwrap();
+    let target = checks.root().join("cargo-target");
+    let aside = target.join(".base-drop-abandoned");
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::write(aside.join("old"), "bytes").unwrap();
+    std::fs::write(target.join("base/current"), "bytes").unwrap();
+    drop(checks);
+    assert!(!aside.exists());
+    assert!(!target.join("base").exists());
+    std::fs::create_dir_all(&aside).unwrap();
+    std::fs::write(aside.join("old"), "bytes").unwrap();
+    let checks = CheckScratch::prepare_in(&cache, &wt, None, u64::MAX).unwrap();
+    assert!(
+        !aside.exists(),
+        "reclaimed before admission can read free space"
+    );
+    drop(checks);
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn core_c6_volume_space_reads_available_bytes() {
+    let space = volume_space(&std::env::temp_dir()).expect("the temp volume is readable");
+    assert!(space.total >= space.free && space.free > 0, "{space:?}");
+}
+
+#[cfg(windows)]
+#[test]
+fn core_c6_directory_junction_is_removed_without_following_it() {
+    let base = scratch("c6-junction");
+    let outside = base.join("outside");
+    let leaf = base.join("leaf");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::create_dir_all(&leaf).unwrap();
+    std::fs::write(outside.join("keep"), "safe").unwrap();
+    let link = leaf.join("cargo-target");
+    // spawn-audit: hardened — mklink /J builds the junction under test in a scratch dir.
+    let status = std::process::Command::new("cmd")
+        .hardened()
+        .args(["/C", "mklink", "/J"])
+        .arg(&link)
+        .arg(&outside)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let held = HeldDir::open(&leaf).unwrap();
+    assert_eq!(held.remove_tree("cargo-target"), Ok(true));
+    assert!(std::fs::symlink_metadata(link).is_err());
+    assert_eq!(
+        std::fs::read_to_string(outside.join("keep")).unwrap(),
+        "safe"
+    );
+    std::fs::remove_dir_all(base).unwrap();
+}
+
+/// (coord review of #1713) A resumed report written before the cause was recorded still names one.
+#[test]
+fn core_c6_a_resume_without_a_recorded_cause_reads_as_a_restart() {
+    let r: FloorResume =
+        serde_json::from_value(serde_json::json!({ "fromAttempt": 3, "reused": ["lint"] }))
+            .unwrap();
+    assert_eq!(r.cause, "the daemon restarted");
+    assert!(r.note().contains("the daemon restarted"), "{}", r.note());
+    assert!(!r.note().contains("()"), "{}", r.note());
 }

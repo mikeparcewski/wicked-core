@@ -13744,7 +13744,11 @@ fn dispatch_unit_with(
         // core#431 (F-3R2-013): the deliver phase's LIFT context — the run's worktree and the
         // registered repo it was linked from — resolved HERE (the actor holds the store), applied
         // off-thread below before the push runs. `None` for every other tool unit.
-        let lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
+        let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
+        let mut lift_ctx = crate::deliver_lift::lift_context(store, &session, unit);
+        if let Some(ctx) = lift_ctx.as_mut() {
+            ctx.stop = floor_stop.clone();
+        }
         // (SWAP 6) The deliver step's rule check: the rules deferred to delivery, judged against
         // the pull request's text once the delivery wrote it. Resolved here (the actor holds the
         // store); `None` for every other tool unit or a run with no file-backed rule store.
@@ -13907,11 +13911,8 @@ fn dispatch_unit_with(
         // `advance_launch_seq` in `ReassignUnit`, `set_shutdown_flag`. The tombstone is NOT retired
         // after cancel; it persists until `begin_launch` on relaunch. The word the child observes
         // is therefore always `cancelled` on an operator cancel. Consumers key on ORDER, never the word.
-        let maps_for_child = elicitation_maps.clone();
-        // Separate arc for the registration callbacks so `stop` can move `maps_for_child`
-        // independently (core#500 / AC2).
+        // The child registry uses the same lifecycle maps as the stop predicate (core#500 / AC2).
         let maps_for_reg = elicitation_maps.clone();
-        let run_for_child = run_id.to_string();
         let run_for_reg = run_id.to_string();
         let my_seq = launch_seq;
         // (DES-APPS-001 §9.2, K0; CS6) A crew Tool unit — every Tool of an Apps run (`wicked-crew
@@ -13930,18 +13931,10 @@ fn dispatch_unit_with(
                 Some((t, b, env)) => (Some(t), Some(b), env),
                 None => (None, None, Vec::new()),
             };
-            let stop = move || -> Option<&'static str> {
-                let m = maps_for_child.as_ref()?;
-                let g = m.lock().unwrap_or_else(|p| p.into_inner());
-                if g.is_run_cancelled(&run_for_child) {
-                    Some(STOP_CANCELLED)
-                } else if my_seq > 0 && g.current_launch_seq(&run_for_child) != my_seq {
-                    Some(STOP_SUPERSEDED)
-                } else if g.shutdown_flag() {
-                    Some(STOP_SHUTDOWN)
-                } else {
-                    None
-                }
+            let stop = || {
+                floor_stop
+                    .as_ref()
+                    .and_then(crate::repo_checks::FloorStop::reason)
             };
             // core#500 / AC2: register/deregister the child pgid so the actor thread can kill it
             // synchronously before emitting RunCancelled / UnitReassigned.
@@ -14383,6 +14376,7 @@ fn dispatch_unit_with(
     // thread that owns the team link; the worker publishes `step.claimed`/`step.completed` and
     // waits for the fold through it.
     let team_runner = team_gate::team_runner();
+    let floor_stop = launch_stop(elicitation_maps, run_id, launch_seq);
     std::thread::spawn(move || {
         let run_id = input.run_id.clone();
         let ord = input.unit.ord;
@@ -14427,6 +14421,7 @@ fn dispatch_unit_with(
                 council: &crate::cli_runner::ActorDisputeCouncil { tx: tx.clone() },
                 lock_path: &crate::cli_runner::HostCouncilLock::host_path(),
             }),
+            floor_stop,
         );
         let _ = tx.send(Command::ApplyStepResult {
             output,
@@ -16070,6 +16065,31 @@ fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
         }
     }
     buf
+}
+
+/// (core#1533, core#1542) A launch's stop: its run was cancelled (`"cancelled"`), a newer launch of
+/// the run superseded it — a reassign, a cancel or a resume (`"superseded"`) — or the engine is
+/// shutting down (`"shutdown"`). The tool child and every floor of the launch read it, whichever
+/// runner carries the launch. `None` without lifecycle maps.
+pub(crate) fn launch_stop(
+    maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
+    run_id: &str,
+    seq: u64,
+) -> Option<crate::repo_checks::FloorStop> {
+    let maps = maps.as_ref()?.clone();
+    let run_id = run_id.to_string();
+    Some(crate::repo_checks::FloorStop::new(move || {
+        let g = maps.lock().unwrap_or_else(|p| p.into_inner());
+        if g.is_run_cancelled(&run_id) {
+            Some(STOP_CANCELLED)
+        } else if seq > 0 && g.current_launch_seq(&run_id) != seq {
+            Some(STOP_SUPERSEDED)
+        } else if g.shutdown_flag() {
+            Some(STOP_SHUTDOWN)
+        } else {
+            None
+        }
+    }))
 }
 
 /// The three words the tool child's `stop()` predicate reports — the run's launch identity was
@@ -43876,5 +43896,47 @@ mod upstream_agents_tests {
         }
         .vars();
         assert!(!env.iter().any(|(k, _)| k == UPSTREAM_AGENTS_ENV));
+    }
+}
+
+#[cfg(test)]
+mod floor_launch_tests {
+    use super::*;
+
+    #[test]
+    fn core_c6_launch_stop_tracks_cancel_reassign_and_shutdown() {
+        let maps = Arc::new(std::sync::Mutex::new(ElicitationMaps::new()));
+        let seq = maps.lock().unwrap().begin_launch("floor", false);
+        let old = launch_stop(&Some(maps.clone()), "floor", seq).unwrap();
+        assert_eq!(old.reason(), None);
+        maps.lock().unwrap().tombstone_run("floor");
+        assert_eq!(old.reason(), Some("cancelled"));
+        let seq = maps.lock().unwrap().begin_launch("floor", false);
+        let current = launch_stop(&Some(maps.clone()), "floor", seq).unwrap();
+        assert_eq!(current.reason(), None);
+        let seq = maps.lock().unwrap().advance_launch_seq("floor");
+        assert_eq!(current.reason(), Some("superseded"));
+        let new = launch_stop(&Some(maps.clone()), "floor", seq).unwrap();
+        assert_eq!(new.reason(), None);
+        maps.lock().unwrap().set_shutdown_flag();
+        assert_eq!(new.reason(), Some("shutdown"));
+        assert!(launch_stop(&None, "floor", 0).is_none());
+    }
+
+    #[test]
+    fn core_c6_resume_never_revives_the_old_lifecycles_floor() {
+        let maps = Arc::new(std::sync::Mutex::new(ElicitationMaps::new()));
+        let seq = maps.lock().unwrap().begin_launch("floor-resume", false);
+        let stop = launch_stop(&Some(maps.clone()), "floor-resume", seq).unwrap();
+        maps.lock().unwrap().tombstone_run("floor-resume");
+        assert_eq!(stop.reason(), Some("cancelled"));
+        let seq = maps.lock().unwrap().begin_launch("floor-resume", false);
+        assert_eq!(stop.reason(), Some("superseded"));
+        assert_eq!(
+            launch_stop(&Some(maps), "floor-resume", seq)
+                .unwrap()
+                .reason(),
+            None
+        );
     }
 }

@@ -1364,6 +1364,7 @@ pub(crate) fn lift_onto_remote_default(worktree: &Path, repo_root: &Path) -> Lif
 /// The deliver unit's lift context: the run's worktree and the registered repo it was linked
 /// from. `None` for every unit that is not the bound run's deliver phase.
 pub(crate) struct LiftContext {
+    pub stop: Option<crate::repo_checks::FloorStop>,
     pub worktree: PathBuf,
     pub repo_root: PathBuf,
     /// The tree id the run last VERIFIED (the verify unit's guard after-tree once its checks
@@ -1517,6 +1518,7 @@ pub(crate) fn lift_context(
     let repo = crate::repo::get_repo(store, repo_ref).ok().flatten()?;
     let units = crate::domain::session_units(store, &session.id).unwrap_or_default();
     Some(LiftContext {
+        stop: None,
         worktree,
         repo_root: PathBuf::from(repo.root_path),
         verified_tree: session.verified_tree.clone(),
@@ -1804,6 +1806,7 @@ pub(crate) fn lift_and_reverify(
     let base_head = verified_base.clone().or_else(|| ctx.base_commit.clone());
     let floor_ctx = crate::repo_checks::FloorContext {
         stage: crate::repo_checks::FloorStage::Verify,
+        stop: ctx.stop.clone(),
         force_install: !drift.is_empty(),
         base_head,
         git_dir: pinned_git_dir(&ctx.worktree, &ctx.repo_root).ok(),
@@ -3547,6 +3550,7 @@ mod tests {
 
     fn ctx_for(clone: &Path, wt: &Path, verified_tree: Option<String>) -> LiftContext {
         LiftContext {
+            stop: None,
             worktree: wt.to_path_buf(),
             repo_root: clone.to_path_buf(),
             verified_tree,
@@ -3709,6 +3713,7 @@ mod tests {
         let git_dir = pinned_git_dir(&wt, &clone).unwrap();
         let verify_ctx = crate::repo_checks::FloorContext {
             stage: crate::repo_checks::FloorStage::Verify,
+            stop: None,
             force_install: false,
             base_head: Some(base.clone()),
             git_dir: Some(git_dir.clone()),

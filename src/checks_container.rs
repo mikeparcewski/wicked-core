@@ -529,6 +529,41 @@ pub(crate) fn retire_target_claims(leaf: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// (core#1542) The run's last floor out of `leaf` deletes the leaf's BASE target claim: the base
+/// pass is over and its results are in the run's log store, while the head claim stays warm for
+/// the next floor's incremental build. Called under the leaf's EXCLUSIVE lock, so no floor of the
+/// run mounts the claim meanwhile; the deletion waits until the claim is gone, so a later floor
+/// never re-applies a claim that is still terminating. A leaf with no base claim registered (a
+/// host floor) has nothing to do. A failure keeps the claim registered: it goes with the leaf or
+/// the run's namespace, as before.
+pub(crate) fn retire_base_target_claim(leaf: &Path) -> Result<(), String> {
+    let name = target_volume(leaf, Tree::Base);
+    let (kube, namespace) = {
+        let registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(claim) = registry
+            .as_ref()
+            .and_then(|r| r.get(leaf))
+            .and_then(|record| record.claims.iter().find(|c| c.name == name))
+        else {
+            return Ok(());
+        };
+        (claim.kube.clone(), claim.namespace.clone())
+    };
+    kube.delete_owned(Some(&namespace), "pvc", &name, true)?;
+    let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(registry) = registry.as_mut() {
+        if let Some(record) = registry.get_mut(leaf) {
+            record
+                .claims
+                .retain(|c| !(c.name == name && c.namespace == namespace));
+            if record.claims.is_empty() {
+                registry.remove(leaf);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn leaf_key(leaf: &Path) -> String {
     key16(&[leaf.to_string_lossy().as_bytes()])
 }
