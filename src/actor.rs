@@ -7711,6 +7711,11 @@ fn apply_step_result(
         // below on EVERY `human_confirm` (it was only ever pinned for `None`): crew derives
         // `completed` + `delivery: stranded` and the post-hoc lift is the operator's explicit act.
         let deliver_strand = crate::deliver_lift::is_deliver_unit(unit);
+        // (core#1319) An answer at a triage gate re-dispatches at a fresh attempt for the record,
+        // not as an automatic retry: that attempt keeps a first try's automatic remedies (the
+        // self-heal and the triage judge), so a check that fails again parks at triage again.
+        let first_try = output.attempt == 0
+            || crate::interaction::redispatched_by_triage(&*store, &run_id, ord, output.attempt);
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
@@ -7731,7 +7736,7 @@ fn apply_step_result(
                 // The self-heal is automatic, so it is bounded: attempt 0 only.
                 let fixed = refusal
                     .fix
-                    .filter(|_| output.attempt == 0)
+                    .filter(|_| first_try)
                     .and_then(|f| effective_invocation.as_deref().and_then(|inv| f.apply(inv)));
                 emit(
                     subscribers,
@@ -7818,7 +7823,7 @@ fn apply_step_result(
             } else if human_present
                 && seat_refusal.is_none()
                 && !content_refused
-                && output.attempt > 0
+                && !first_try
                 // (e2e F30, codex r4) A Tool's output is its command's (a test log can say "timed
                 // out" or "connection"), never a seat's: the seat classifier does not apply, and
                 // with no seat failover for a Tool, skipping this gate would end the run.
@@ -7915,7 +7920,7 @@ fn apply_step_result(
             } else if human_present
                 && seat_refusal.is_none()
                 && !content_refused
-                && output.attempt == 0
+                && first_try
                 && !pa_timed_out
             {
                 // UNRECOGNIZED failure → agent triage (the generalization of the signature
@@ -18879,6 +18884,11 @@ pub(crate) fn confirm_gate_expecting(
             put_node(store, s.to_node())?;
             let units = crate::domain::session_units(store, run_id)?;
             let ord = units.get(s.unit_ix).map(|u| u.ord).unwrap_or(0);
+            // (core#1319) The fresh attempt is the record's; the failure it may meet is triaged
+            // as before (a check that still fails parks at triage again, with its send-back).
+            if triage_open && !cursor_ran {
+                crate::interaction::mark_triage_redispatch(store, run_id, ord, s.attempt)?;
+            }
             // F-036: a human APPROVING a gate on an ALREADY-RUN guarded unit (a `HumanConfirmIf`
             // escalation — e.g. the guard denied the evaluator for rewriting the fix) has seen the
             // denial name every path and chosen to continue: the re-dispatch re-baselines on the
@@ -31676,6 +31686,13 @@ mod request_changes_tests {
                     ..
                 }
             )));
+            // The fresh attempt is still a first try for triage; an automatic retry past it is not.
+            assert!(crate::interaction::redispatched_by_triage(
+                &store, run_id, 4, 8
+            ));
+            assert!(!crate::interaction::redispatched_by_triage(
+                &store, run_id, 4, 9
+            ));
         }
     }
 
