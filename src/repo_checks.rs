@@ -1334,11 +1334,12 @@ struct JournalEntry {
     name: String,
     argv: Vec<String>,
     run: CheckRun,
-    /// (core#1152) The run ran on a guarded clean checkout of the key's tree, never the live
-    /// worktree (where an untracked or ignored file could have steered it, core#417): a resumed
-    /// creator floor may publish it for verify. Absent (an older journal) = not known, never.
+    /// (core#1152) Set when the run ran on a guarded clean checkout of the key's tree, never the
+    /// live worktree (where an untracked or ignored file could have steered it, core#417): the
+    /// boundary it ran under ([`CheckScratch::posture_level`]). A resumed creator floor under the
+    /// same boundary may publish it for verify. Absent (an older journal) = not known, never.
     #[serde(default)]
-    guarded: bool,
+    guarded_under: Option<String>,
 }
 
 /// An open floor journal ([`FloorJournal`]): the record this floor writes, and what it may reuse
@@ -1429,8 +1430,8 @@ impl OpenJournal {
     /// in the store: a check that timed out, could not start or could not run is run again. The
     /// `install` check always runs again: its receipt is not its output (`node_modules`, a venv),
     /// and a guarded floor runs on a fresh checkout that has none of it (xreview).
-    /// The second value is the entry's [`JournalEntry::guarded`].
-    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<(CheckRun, bool)> {
+    /// The second value is the entry's [`JournalEntry::guarded_under`].
+    fn reuse(&mut self, check: &RepoCheck, logs: &Path) -> Option<(CheckRun, Option<String>)> {
         if is_provisioning(&check.name) {
             return None;
         }
@@ -1439,7 +1440,7 @@ impl OpenJournal {
             .iter()
             .position(|e| e.dir == check.dir && e.name == check.name && e.argv == check.argv)?;
         let entry = self.prior.remove(at);
-        let (run, guarded) = (entry.run, entry.guarded);
+        let (run, guarded) = (entry.run, entry.guarded_under);
         finished_whole(&run, logs).then(|| {
             if let Some(r) = self.resume.as_mut() {
                 r.reused.push(check.name.clone());
@@ -1450,14 +1451,14 @@ impl OpenJournal {
 
     /// Record a finished check (written through at once: the process may die before the next).
     /// `untouched` answers whether the checkout still holds exactly the journal's tree; a check
-    /// that changed it spoils the journal (its pass ran on other content: xreview P1). `guarded`:
-    /// the run ran on a guarded clean checkout ([`JournalEntry::guarded`]).
+    /// that changed it spoils the journal (its pass ran on other content: xreview P1).
+    /// `guarded_under`: [`JournalEntry::guarded_under`].
     fn record(
         &mut self,
         check: &RepoCheck,
         run: &CheckRun,
         untouched: Option<&dyn Fn() -> bool>,
-        guarded: bool,
+        guarded_under: Option<String>,
     ) {
         if self.spoiled {
             return;
@@ -1473,7 +1474,7 @@ impl OpenJournal {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: run.clone(),
-            guarded,
+            guarded_under,
         });
         self.persist();
     }
@@ -6306,6 +6307,8 @@ fn run_detected(
     // took from an interrupted floor's journal that ran them on a guarded clean checkout: never
     // one that may have run in the live worktree (xreview r1).
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
+    // (core#1152) The boundary this floor's runs are journaled and published under.
+    let posture_level = scratch.posture_level(&sandbox_level);
     for check in detected.iter() {
         if ctx.stop.as_ref().and_then(FloorStop::reason).is_some()
             || failed
@@ -6321,7 +6324,7 @@ fn run_detected(
             failed = run.denies();
             // A verify floor's reuse: never a creator record's entry.
             if let Some(j) = journal.as_mut() {
-                j.record(check, &run, untouched, false);
+                j.record(check, &run, untouched, None);
             }
             checks.push(run);
             continue;
@@ -6342,13 +6345,17 @@ fn run_detected(
             if again.is_none() {
                 again = seed.as_ref().and_then(|s| s.set_aside_by(check, &run));
             }
+            // (core#1152) A resumed creator floor publishes what the interrupted floor ran on a
+            // guarded clean checkout of this tree under this floor's boundary, beside what it
+            // runs itself, so its record covers the set; an entry that may have run in the live
+            // worktree, or under another boundary, stays out.
+            let publishable = ctx.stage == FloorStage::Creator
+                && untouched.is_some()
+                && guarded.as_deref() == Some(posture_level.as_str());
             if let Some(j) = journal.as_mut() {
                 j.record(check, &run, untouched, guarded);
             }
-            // (core#1152) A resumed creator floor publishes what the interrupted floor ran on a
-            // guarded clean checkout of this tree, beside what it runs itself, so its record
-            // covers the set; an entry that may have run in the live worktree stays out.
-            if ctx.stage == FloorStage::Creator && guarded && untouched.is_some() {
+            if publishable {
                 ran_here.push(CreatorEntry {
                     dir: check.dir.clone(),
                     name: check.name.clone(),
@@ -6678,7 +6685,12 @@ fn run_detected(
             s.fresh.push(check.name.clone());
         }
         if let Some(j) = journal.as_mut() {
-            j.record(check, &run, untouched, untouched.is_some());
+            j.record(
+                check,
+                &run,
+                untouched,
+                untouched.is_some().then(|| posture_level.clone()),
+            );
         }
         if ctx.stage == FloorStage::Creator {
             ran_here.push(CreatorEntry {
@@ -6761,7 +6773,7 @@ fn run_detected(
                     ord: j.ord,
                     attempt: j.attempt,
                     phase: j.phase.clone(),
-                    sandbox_level: scratch.posture_level(&sandbox_level),
+                    sandbox_level: posture_level,
                     exclude,
                     checks: ran_here,
                 },

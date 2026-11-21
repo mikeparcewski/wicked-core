@@ -4119,7 +4119,7 @@ fn interrupted_journal(
                 .find(|r| r.name == c.name)
                 .unwrap()
                 .clone(),
-            guarded: false,
+            guarded_under: None,
         })
         .collect();
     let rec = JournalRecord {
@@ -4622,7 +4622,7 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
                 name: name.to_string(),
                 argv: run.argv.clone(),
                 run,
-                guarded: false,
+                guarded_under: None,
             }
         })
         .collect();
@@ -4867,10 +4867,15 @@ impl Core1144 {
 
     /// A floor of `stage` on a clean checkout of the tree.
     fn guarded(&self, stage: FloorStage, base: &str, ord: u32, phase: &str) -> RepoChecksReport {
+        self.guarded_ctx(&self.ctx(stage, base), ord, phase)
+    }
+
+    /// [`Self::guarded`] with a caller's context (a stop, say).
+    fn guarded_ctx(&self, ctx: &FloorContext, ord: u32, phase: &str) -> RepoChecksReport {
         // The run id keeps parallel tests' checkouts apart (the checkout nonce is a clock read).
         let label = format!("{}-{ord}-{phase}", self.run_id);
         let checkout = checkout_guarded_tree(&self.wt, &self.git_dir, &self.tree, &label).unwrap();
-        checkout.run_floor_journaled(&self.ctx(stage, base), None, &self.journal(ord, phase))
+        checkout.run_floor_journaled(ctx, None, &self.journal(ord, phase))
     }
 
     fn logs(&self) -> PathBuf {
@@ -5277,7 +5282,7 @@ fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: test_run.clone(),
-            guarded: false,
+            guarded_under: None,
         }],
     };
     std::fs::write(
@@ -5369,7 +5374,7 @@ fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: red_e2e.clone(),
-            guarded: false,
+            guarded_under: None,
         }],
     };
     std::fs::write(
@@ -5589,19 +5594,19 @@ fn core_1144_a_floor_that_changed_its_checkout_leaves_no_record() {
 #[cfg(unix)]
 #[test]
 fn core_1144_a_journal_resumed_check_is_never_published() {
-    journal_resumed_publication("core-1144-resumed", false);
+    journal_resumed_unpublished("core-1144-resumed", None);
 }
 
-/// (core#1152 DONE 2) A resumed creator floor publishes what the interrupted floor ran on a guarded
-/// clean checkout of the same tree, beside what it ran itself: verify reuses both.
+/// (core#1152, xreview on #1734) Nor is one a guarded floor ran under ANOTHER boundary (say the
+/// unsandboxed opt-in, before a sandbox became available): verify runs it again.
 #[cfg(unix)]
 #[test]
-fn core_1152_a_resumed_creator_floor_publishes_its_guarded_journal_checks() {
-    journal_resumed_publication("core-1152-resumed", true);
+fn core_1152_a_journal_check_from_another_boundary_is_never_published() {
+    journal_resumed_unpublished("core-1152-boundary", Some("another-boundary"));
 }
 
 #[cfg(unix)]
-fn journal_resumed_publication(tag: &str, guarded: bool) {
+fn journal_resumed_unpublished(tag: &str, guarded_under: Option<&str>) {
     let _env = crate::test_env::ENV_LOCK
         .read()
         .unwrap_or_else(|p| p.into_inner());
@@ -5615,8 +5620,8 @@ fn journal_resumed_publication(tag: &str, guarded: bool) {
         eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
         return;
     }
-    // An interrupted floor's journal holding `lint`: unguarded, as a live-worktree floor would
-    // leave it, or guarded, as a clean-checkout floor leaves it.
+    // An interrupted floor's journal holding `lint`, as a live-worktree floor (or a guarded floor
+    // under another boundary) would leave it.
     let ctx = r.ctx(FloorStage::Creator, &r.base);
     let lint = first
         .checks
@@ -5638,7 +5643,7 @@ fn journal_resumed_publication(tag: &str, guarded: bool) {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: lint.clone(),
-            guarded,
+            guarded_under: guarded_under.map(str::to_string),
         }],
     };
     std::fs::write(
@@ -5653,21 +5658,109 @@ fn journal_resumed_publication(tag: &str, guarded: bool) {
         "{resumed:#?}"
     );
     let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
-    if guarded {
-        assert_eq!(
-            verify.reused_from.as_ref().map(|x| x.reused.clone()),
-            Some(vec!["lint".to_string(), "test".to_string()]),
-            "the guarded journal entry is published beside the fresh run: {verify:#?}"
-        );
-        assert_eq!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
-    } else {
-        assert_eq!(
-            verify.reused_from.as_ref().map(|x| x.reused.clone()),
-            Some(vec!["test".to_string()]),
-            "only the check the clean-checkout floor ran is reused: {verify:#?}"
-        );
-        assert_ne!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
+    assert_eq!(
+        verify.reused_from.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["test".to_string()]),
+        "only the check the clean-checkout floor ran is reused: {verify:#?}"
+    );
+    assert_ne!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
+/// (core#1152 DONE 2) Through the production journal: a guarded creator floor superseded once
+/// `lint` is journaled records it with its boundary; a resumed floor superseded again keeps that
+/// provenance when it journals `lint` once more; the floor that finishes publishes `lint` (from the
+/// journal) beside `test` (its own), and verify reuses both.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_resumed_creator_floor_publishes_its_guarded_journal_checks() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let n = Core1144::NONCE;
+    let r = Core1144::new(
+        "core-1152-resumed",
+        serde_json::json!({"typecheck": false, "lint": n, "test": n}),
+    );
+    let journal = journal_path(&r.logs(), 4);
+    let read = {
+        let journal = journal.clone();
+        move || -> Option<JournalRecord> {
+            serde_json::from_str(&std::fs::read_to_string(&journal).ok()?).ok()
+        }
+    };
+    // Superseded as soon as THIS floor's journal (not yet stopped) holds `lint`: before `test`.
+    let superseded_after_lint = || {
+        let read = read.clone();
+        let mut ctx = r.ctx(FloorStage::Creator, &r.base);
+        ctx.stop = Some(FloorStop::new(move || {
+            read()
+                .filter(|rec| rec.stopped.is_none())
+                .is_some_and(|rec| rec.checks.iter().any(|e| e.name == "lint"))
+                .then_some("superseded")
+        }));
+        r.guarded_ctx(&ctx, 4, "fix")
+    };
+    let first = superseded_after_lint();
+    if first.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
     }
+    assert!(
+        first.skipped.contains(&"test".to_string())
+            && !first.checks.iter().any(|c| c.name == "test"),
+        "superseded before `test`: {first:#?}"
+    );
+    let level = |rec: &JournalRecord| {
+        rec.checks
+            .iter()
+            .find(|e| e.name == "lint")
+            .and_then(|e| e.guarded_under.clone())
+    };
+    let interrupted = read().expect("the superseded floor left its journal");
+    assert_eq!(interrupted.stopped.as_deref(), Some("superseded"));
+    let boundary = level(&interrupted).expect("a guarded run records its boundary");
+    assert!(!boundary.is_empty());
+
+    let second = superseded_after_lint();
+    assert_eq!(
+        second.resumed.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["lint".to_string()]),
+        "{second:#?}"
+    );
+    let again = read().expect("the second superseded floor left its journal");
+    assert_eq!(
+        level(&again).as_deref(),
+        Some(boundary.as_str()),
+        "{again:?}"
+    );
+
+    let resumed = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    assert_eq!(
+        resumed.resumed.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["lint".to_string()]),
+        "{resumed:#?}"
+    );
+    assert!(resumed.passed, "{resumed:#?}");
+    let raw = std::fs::read_to_string(creator_record_path(&r.logs(), &r.tree, &r.base))
+        .expect("the resumed creator floor published its record");
+    let record: CreatorFloorRecord = serde_json::from_str(&raw).unwrap();
+    assert_eq!(record.sandbox_level, boundary);
+    assert_eq!(
+        record
+            .checks
+            .iter()
+            .map(|e| e.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["lint", "test"]
+    );
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert_eq!(
+        verify.reused_from.as_ref().map(|x| x.reused.clone()),
+        Some(vec!["lint".to_string(), "test".to_string()]),
+        "the guarded journal entry is published beside the fresh run: {verify:#?}"
+    );
+    assert_eq!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
