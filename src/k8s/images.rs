@@ -96,12 +96,15 @@ impl ImageStore {
 /// A private, uniquely-created directory. All archives disappear on success and refusal.
 pub(crate) fn archive_dir() -> Result<RemoveOnDrop, String> {
     let dir = std::env::temp_dir().join(format!("wicked-image-{}", uuid::Uuid::new_v4().simple()));
-    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    {
+    let builder = {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
-    }
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700);
+        b
+    };
+    #[cfg(not(unix))]
+    let builder = std::fs::DirBuilder::new();
     builder
         .create(&dir)
         .map_err(|e| format!("cannot create image archive directory: {e}"))?;
