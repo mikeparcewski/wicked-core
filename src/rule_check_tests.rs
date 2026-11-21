@@ -65,6 +65,9 @@ struct Fake {
     stop: bool,
     /// (F20) A seat's own answer for a rule, over `verdicts`.
     by_seat: BTreeMap<(String, String), String>,
+    /// (core#1746) The prompt reaches the seat as one process argument, read back the way the
+    /// container floor reads it (`Command::get_args`, `k8s::seat::finalize`): what the seat sees.
+    argv: bool,
 }
 
 impl Fake {
@@ -82,6 +85,7 @@ impl Fake {
             echo: false,
             stop: false,
             by_seat: BTreeMap::new(),
+            argv: false,
         }
     }
 }
@@ -89,6 +93,13 @@ impl Fake {
 impl RuleJudge for Fake {
     fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        let received;
+        let prompt = if self.argv {
+            received = seat_received(prompt);
+            received.as_str()
+        } else {
+            prompt
+        };
         self.prompts
             .lock()
             .unwrap()
@@ -102,6 +113,12 @@ impl RuleJudge for Fake {
         std::thread::sleep(self.latency);
         if self.echo {
             return JudgeAnswer::Answered(prompt.to_string());
+        }
+        if !prompt.contains("BEGIN VERDICTS ") {
+            // What a seat does with a task that is not the engine's prompt: it answers it.
+            return JudgeAnswer::Answered(format!(
+                "I received only `{prompt}`. What should I check?"
+            ));
         }
         let nonce = nonce_of(prompt);
         let asked = asked_ids(prompt);
@@ -118,6 +135,17 @@ impl RuleJudge for Fake {
         out.push_str(&format!("END VERDICTS {nonce}\n"));
         JudgeAnswer::Answered(out)
     }
+}
+
+/// (core#1746) What a seat receives when `prompt` is its one argument: the argv the container floor
+/// rebuilds from the launch `Command` (`k8s::seat::finalize` reads `get_args`).
+fn seat_received(prompt: &str) -> String {
+    let mut c = std::process::Command::new("codex");
+    c.arg(prompt);
+    c.get_args()
+        .next()
+        .map(|a| a.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// A machine whose base run answers `out`, counting its runs.
@@ -5206,5 +5234,55 @@ fn prose_needs_a_prose_extension_and_excludes_images() {
         "docs/test-plans/math-js.md",
     ] {
         assert!(prose_paths(&[prose]).is_some(), "{prose}");
+    }
+}
+
+/// (core#1746) A change holding a binary file (an untracked `__pycache__/*.pyc`, diffed `--text`)
+/// carries NUL bytes. A NUL cannot ride a process argument: the container floor rebuilds the seat's
+/// argv from the launch `Command`, which holds such an argument as the literal `<string-with-nul>`,
+/// so the judge was asked nothing and answered without the verdict block, batch and alone. Every
+/// prompt the check hands a seat arrives whole, and the rule is judged.
+const BINARY_DIFF: &str = "diff --git a/scripts/bump.py b/scripts/bump.py\n--- a/scripts/bump.py\n\
+     +++ b/scripts/bump.py\n@@ -1 +1 @@\n-import re\n+import tomllib\n\
+     diff --git a/scripts/__pycache__/bump.cpython-313.pyc b/scripts/__pycache__/bump.cpython-313.pyc\n\
+     new file mode 100644\n--- /dev/null\n+++ b/scripts/__pycache__/bump.cpython-313.pyc\n\
+     @@ -0,0 +1 @@\n+\u{f3}\r\n\u{0}\u{0}\u{0}\u{0}c\u{0}\u{0}after-the-nul tomllib\n";
+
+#[test]
+fn a_binary_file_in_the_change_reaches_the_judge_whole_and_the_rule_is_judged() {
+    let paths = [
+        "scripts/bump.py",
+        "scripts/__pycache__/bump.cpython-313.pyc",
+    ];
+    let c = change_of(BINARY_DIFF, &paths);
+    let rules = [rule(
+        "STACK-1",
+        "Use what the chosen stack already provides before writing your own.",
+    )];
+    let mut judge = Fake::new(&[("STACK-1", "KEPT — scripts/bump.py uses the stdlib tomllib")]);
+    judge.argv = true;
+    let r = run_on(&rules, &c, &judge, &NoMachine, None, &[]);
+    let row = r.rows.iter().find(|x| x.rule_id == "STACK-1").unwrap();
+    assert_eq!(
+        row.status,
+        RuleStatus::Kept,
+        "judged, not unchecked: {}",
+        row.reason
+    );
+    assert!(
+        !row.reason.contains("without the verdict block"),
+        "{}",
+        row.reason
+    );
+    let prompts = judge.prompts.lock().unwrap();
+    assert!(!prompts.is_empty());
+    for (_, p) in prompts.iter() {
+        assert!(!p.contains('\0'), "no seat argument holds a NUL");
+        assert!(p.contains("BEGIN VERDICTS "), "the frame arrived: {p:.80}");
+        assert!(
+            p.contains("+++ b/scripts/__pycache__/bump.cpython-313.pyc")
+                && p.contains("after-the-nul tomllib"),
+            "the binary hunk stays in the evidence, past its NULs"
+        );
     }
 }
