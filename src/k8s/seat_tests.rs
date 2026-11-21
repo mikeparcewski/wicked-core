@@ -3972,6 +3972,28 @@ fn k8s_a_kept_link_cannot_be_made_to_escape_by_changing_what_it_passes() {
     let _ = std::fs::remove_dir_all(&host);
 }
 
+#[test]
+fn pr_c2_ignored_host_links_are_checked_before_any_write() {
+    let host = tmp("ignored-retained");
+    std::fs::create_dir(host.join("a")).unwrap();
+    std::fs::write(host.join(".gitignore"), "b\n").unwrap();
+    std::os::unix::fs::symlink("a/..", host.join("b")).unwrap();
+    let writes = [entry(Kind::Link, "a", b".")];
+    let err = seat::check_retained_links(&host, &[], &writes, &[], &[]).unwrap_err();
+    assert!(err.contains("`b`"), "{err}");
+    assert!(host.join("a").is_dir());
+    assert_eq!(
+        std::fs::read_link(host.join("b")).unwrap(),
+        Path::new("a/..")
+    );
+    // A replaced link does not survive; a link already escaping is left alone.
+    seat::check_retained_links(&host, &[], &writes, &["b".into()], &[]).unwrap();
+    std::fs::remove_file(host.join("b")).unwrap();
+    std::os::unix::fs::symlink("../outside", host.join("b")).unwrap();
+    seat::check_retained_links(&host, &[], &writes, &[], &[]).unwrap();
+    std::fs::remove_dir_all(host).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn k8s_a_host_link_under_another_spelling_is_still_followed() {
@@ -5730,4 +5752,76 @@ fn an_api_error_keeps_the_last_pod_diagnosis_and_wait_history() {
         msg.contains("seen during the wait: container seat waiting CreateContainerError"),
         "{msg}"
     );
+}
+
+#[test]
+fn pr_c2_dependency_pack_prunes_before_sizing_or_validating() {
+    let replica = tmp("deps-pack");
+    let tree = replica.join("w");
+    std::fs::create_dir_all(tree.join("pkg/Node_Modules")).unwrap();
+    std::fs::create_dir_all(tree.join("node_modules")).unwrap();
+    std::fs::write(tree.join("source.rs"), "legitimate edit").unwrap();
+    std::fs::File::create(tree.join("node_modules/huge"))
+        .unwrap()
+        .set_len(sync::MAX_STREAM + 1)
+        .unwrap();
+    std::os::unix::fs::symlink("../../../../outside", tree.join("pkg/Node_Modules/link")).unwrap();
+    let want = PlanRoot {
+        host: PathBuf::from("/work/tree"),
+        mode: Mode::Tree,
+        skip: vec![],
+        back: true,
+        files: vec![],
+        masks: vec![],
+        repo: false,
+    };
+    let refs = [("w".into(), &want)];
+    let plan = seat::pack_plan(&refs, Some(&want.host)).to_string();
+    let out = codec(
+        &replica,
+        &["pack", &plan],
+        br#"{"w":["node_modules/huge","source.rs"]}"#,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let roots = sync::decode(&mut out.stdout.as_slice(), sync::MAX_STREAM).unwrap();
+    let entries = sync::check_entries(&roots[0], &[]).unwrap();
+    assert_eq!(
+        entries,
+        vec![entry(Kind::File, "source.rs", b"legitimate edit")]
+    );
+    std::fs::remove_dir_all(replica).unwrap();
+}
+
+#[test]
+fn pr_c2_dependency_mount_destination_is_a_directory_before_sandbox_creation() {
+    let replica = tmp("deps-destination");
+    let tree = replica.join("w");
+    std::fs::create_dir(&tree).unwrap();
+    std::fs::write(tree.join("node_modules"), "ignored old file").unwrap();
+    let out = codec(&replica, &["deps", "w"], b"");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(tree.join("node_modules").is_dir());
+    std::fs::write(tree.join("node_modules/kept"), "warm").unwrap();
+    assert!(codec(&replica, &["deps", "w"], b"").status.success());
+    assert!(tree.join("node_modules/kept").is_file());
+    std::fs::remove_dir_all(tree.join("node_modules")).unwrap();
+    let outside = replica.join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::fs::write(outside.join("kept"), "safe").unwrap();
+    std::os::unix::fs::symlink(&outside, tree.join("node_modules")).unwrap();
+    assert!(codec(&replica, &["deps", "w"], b"").status.success());
+    assert!(!std::fs::symlink_metadata(tree.join("node_modules"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert!(outside.join("kept").is_file());
+    std::fs::remove_dir_all(replica).unwrap();
 }

@@ -1176,8 +1176,7 @@ pub(crate) fn run(
     }
     // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
     // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
-    // skips it (liveness unknown). The same live set protects governance directories during the
-    // one-time retention sweep below.
+    // skips it (liveness unknown). Governance directories keep the worktree retention set.
     match crate::domain::all_sessions(&store) {
         Ok(sessions) => {
             let (live, _) = partition_sessions_for_reap(&sessions);
@@ -1191,7 +1190,13 @@ pub(crate) fn run(
                 crate::gate_hook::GOV_DIR_RETENTION,
                 std::time::SystemTime::now(),
             );
-            crate::k8s::boot_sweep(live);
+            crate::k8s::boot_sweep(
+                sessions
+                    .iter()
+                    .filter(|s| crate::k8s::cluster_status_live(s.status))
+                    .map(|s| s.id.clone())
+                    .collect(),
+            );
         }
         Err(e) => {
             eprintln!("wicked-core: skipping the cluster and governance boot sweeps: cannot read sessions ({e})")

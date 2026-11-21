@@ -697,7 +697,64 @@ pub(crate) fn ensure_run(
         replica_size,
     );
     docs.push(exec_role_binding(&ns, &kube.owner));
+    // `create` distinguishes our new namespace atomically from a pre-existing one. Its reply
+    // supplies the UID; rollback can never delete a replacement with the same name.
+    let body = serde_json::to_vec(&docs[0]).map_err(|e| e.to_string())?;
+    let created = kube.call(
+        None,
+        &["create", "-f", "-", "-o", "json"],
+        Some(&body),
+        super::CALL_TIMEOUT,
+    );
+    let uid = if created.ok() {
+        let obj: Value = serde_json::from_slice(&created.stdout).map_err(|e| e.to_string())?;
+        Some(
+            obj.pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .ok_or("the created namespace has no UID")?
+                .to_string(),
+        )
+    } else if created.err_text().contains("AlreadyExists") {
+        None
+    } else {
+        return Err(created.err_text());
+    };
+    struct Rollback<'a> {
+        kube: &'a Kube,
+        namespace: &'a str,
+        uid: Option<String>,
+    }
+    impl Drop for Rollback<'_> {
+        fn drop(&mut self) {
+            if let Some(uid) = self.uid.take() {
+                let body = json!({"apiVersion": "v1", "kind": "DeleteOptions",
+                    "preconditions": {"uid": uid}})
+                .to_string();
+                let url = format!("/api/v1/namespaces/{}", self.namespace);
+                let r = self.kube.call(
+                    None,
+                    &["delete", "--raw", &url, "-f", "-"],
+                    Some(body.as_bytes()),
+                    super::CALL_TIMEOUT,
+                );
+                if !r.ok() {
+                    eprintln!(
+                        "wicked-core: namespace/{} rollback failed: {}",
+                        self.namespace,
+                        r.err_text()
+                    );
+                }
+            }
+        }
+    }
+    let mut rollback = Rollback {
+        kube,
+        namespace: &ns,
+        uid,
+    };
     kube.apply(&docs)?;
+    rollback.uid = None;
+    drop(rollback);
     Ok(ns)
 }
 
@@ -904,6 +961,13 @@ pub(crate) fn sweep(
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
+                // Leftover session scopes are pruned; a failure is reported and never stops the
+                // sweep of the other namespaces.
+                if ns == run_namespace_name(&kube.owner, super::SESSIONS_RUN) {
+                    if let Err(e) = super::seat::sweep_session_scopes(kube, &ns) {
+                        eprintln!("wicked-core: session scopes in {ns} not swept: {e}");
+                    }
+                }
             }
         }
     }
@@ -1037,4 +1101,43 @@ pub(crate) fn ensure_pids_limited(
     })?;
     *cache = Some((key, std::time::Instant::now(), n));
     Ok(n)
+}
+
+#[cfg(all(test, unix))]
+mod pr_c2_tests {
+    use super::*;
+
+    #[test]
+    fn partial_namespace_apply_rolls_back_only_the_uid_this_call_created() {
+        for existing in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("namespace-rollback-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let kubectl = dir.join("kubectl");
+            let create = if existing {
+                "echo AlreadyExists >&2; exit 1"
+            } else {
+                "echo '{\"metadata\":{\"uid\":\"created-uid\",\"resourceVersion\":\"1\"}}'; exit 0"
+            };
+            crate::test_env::install_stub(&kubectl, &format!(
+                "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' create '*) cat >'{0}/namespace'; {create};;\n*' apply '*) cat >'{0}/docs'; echo 'policy refused' >&2; exit 1;;\n*' delete --raw '*) cat >'{0}/delete'; exit 0;;\n*) exit 9;;\nesac\n",
+                dir.display()
+            ));
+            let kube = Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "me".into(),
+            };
+            let err = ensure_run(&kube, "run", &RunBudget::default(), "20Gi").unwrap_err();
+            assert!(err.contains("policy refused"), "{err}");
+            assert_eq!(dir.join("delete").exists(), !existing);
+            if !existing {
+                let delete: Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("delete")).unwrap()).unwrap();
+                assert_eq!(delete["preconditions"]["uid"], "created-uid");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }
