@@ -1497,10 +1497,11 @@ pub(crate) fn apply(
 /// - `pack <plan>`: the roots of the plan (JSON `[[replica, mode, [skip...]], ...]`) as a stream on
 ///   stdout: `tree` = what git lists, `plain` = every file and link. Stdin supplies the host
 ///   copy-in tracked sets as JSON `{replica: [paths]}`; absent roots have no repository.
+/// - `stamps <paths>`: the keys of stamped repository roots still present in the replica.
 /// - `bundle <tree> <base>`: the commits on the tree's HEAD since `base`, as a git bundle on
 ///   stdout (empty output = none).
 pub(crate) const POD_CODEC: &str = r#"
-import errno, json, os, shutil, stat, struct, subprocess, sys, tempfile
+import errno, hashlib, json, os, shutil, stat, struct, subprocess, sys, tempfile
 R = os.environ.get("WICKED_SYNC_ROOT", "/replica")
 # Every git call runs under Landlock (codex b2-seat #1, b2-sync #1/#2): the `.git` it reads is
 # the seat's, and the sync pod mounts every scope of the namespace, so git (and anything a
@@ -1764,6 +1765,55 @@ def emit(out, rootfd, rel, leave=None):
         elif stat.S_ISDIR(st.st_mode): return
         else: put(out, b"o", rel, b"")
     finally: os.close(fd)
+# (core#1463) Stamps belong to the replica, outside every seat-mounted root.
+def stamp_name(rep): return hashlib.sha256(rep.encode()).hexdigest()
+def read_stamps():
+    fd = openroot(".wicked-stamps", False)
+    if fd is None: return {}
+    result = {}
+    try:
+        for name in os.listdir(fd):
+            try:
+                h = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                with os.fdopen(h) as f:
+                    if not stat.S_ISREG(os.fstat(f.fileno()).st_mode): continue
+                    value = f.read(65537)
+                if len(value) > 65536: continue
+                rep, key = value.split("\n")
+                comps(rep)
+                if name == stamp_name(rep) and key: result[rep] = key
+            except (OSError, ValueError): continue
+    finally: os.close(fd)
+    return result
+def stamps(paths):
+    have = read_stamps(); result = {}
+    for rep in paths:
+        if rep not in have: continue
+        fd = openroot(rep, False)
+        if fd is not None:
+            os.close(fd); result[rep] = have[rep]
+    print(json.dumps(result))
+def invalidate_stamps(rep):
+    have = read_stamps()
+    if not have: return
+    fd = openroot(".wicked-stamps", False)
+    try:
+        for path in have:
+            if under(path, rep) or under(rep, path):
+                try: os.unlink(stamp_name(path), dir_fd=fd)
+                except FileNotFoundError: pass
+    finally: os.close(fd)
+def write_stamp(rep, key):
+    if not isinstance(key, str) or not key or "\n" in key: die("bad stamp key")
+    fd = openroot(".wicked-stamps", True)
+    name = stamp_name(rep); tmp = name + ".tmp"
+    try:
+        try: os.unlink(tmp, dir_fd=fd)
+        except FileNotFoundError: pass
+        h = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(h, "w") as f: f.write(rep + "\n" + key)
+        os.rename(tmp, name, src_dir_fd=fd, dst_dir_fd=fd)
+    finally: os.close(fd)
 def unpack(plan):
     f = sys.stdin.buffer; cur = None; rootfd = None; wrote = set(); mode = None
     def finish():
@@ -1795,6 +1845,7 @@ def unpack(plan):
                 b = os.path.basename(r)
                 os.rename(b + SEEDING, b, src_dir_fd=pfd, dst_dir_fd=pfd)
             finally: os.close(pfd)
+            if plan[r][3] is not None: write_stamp(r, plan[r][3])
             return
         if m in ("tree", "plain"):
             repos = []
@@ -1819,12 +1870,16 @@ def unpack(plan):
                 except FileNotFoundError: pass
                 finally: os.close(fd)
         os.close(rootfd)
-    plan = {p[0]: (p[1], p[2], p[3] if len(p) > 3 else []) for p in plan}
+        if plan[r][3] is not None: write_stamp(r, plan[r][3])
+    plan = {p[0]: (p[1], p[2], p[3] if len(p) > 3 else [],
+                   p[4] if len(p) > 4 else None) for p in plan}
     for k, p, d in entries(f):
         if k == b"R":
             finish(); cur = None; wrote = set(); m = d.decode()
             if p not in plan or plan[p][0] != m: die("root not in plan: " + p)
+            if under(p, ".wicked-stamps"): die("root in the stamp store: " + p)
             skip = plan[p][1]
+            invalidate_stamps(p)
             if m == "git":
                 pfd = openroot(os.path.dirname(p), True) if "/" in p else os.open(R, os.O_RDONLY)
                 try:
@@ -1978,6 +2033,7 @@ op = sys.argv[1]
 # (a cut stream, a kill) is a client that may have left this codec running.
 try:
     if op == "unpack": unpack(json.loads(sys.argv[2]))
+    elif op == "stamps": stamps(json.loads(sys.argv[2]))
     elif op == "pack": pack(json.loads(sys.argv[2]), json.load(sys.stdin))
     elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
     else: die("unknown op")
