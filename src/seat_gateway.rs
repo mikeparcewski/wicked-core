@@ -2127,21 +2127,35 @@ pub(crate) fn redact_check(line: &str) -> bool {
 }
 
 /// Parse request-scoped JSON lines for a unit id or its metadata name (`unit-<id>`). Unscoped,
-/// malformed and credential-bearing lines are dropped; unauthenticated `none` is a separate unit.
+/// malformed and unsafe envelopes are dropped; unsafe payloads keep only the envelope (core#1546).
 pub(crate) fn parse_records(log: &str, unit_key_name_or_unit: &str) -> Vec<GatewayRecord> {
     log.lines()
         .filter_map(|line| {
-            if !redact_check(line) {
-                return None;
-            }
             let v: Value = serde_json::from_str(line).ok()?;
-            // Decode JSON escapes before checking again: a key with \u0073 must not evade redaction.
-            if !redact_check(&v.to_string()) || v["scope"].as_str()? != "request" {
+            if v["scope"].as_str()? != "request" {
                 return None;
             }
             let unit = v["wicked_unit"].as_str().unwrap_or("none");
             if unit != unit_key_name_or_unit && format!("unit-{unit}") != unit_key_name_or_unit {
                 return None;
+            }
+            let mut record = GatewayRecord {
+                status: u16::try_from(v["http.status"].as_u64()?).ok()?,
+                unit: unit.into(),
+                run: v["wicked_run"].as_str().unwrap_or("none").into(),
+                endpoint: v["endpoint"].as_str().map(str::to_string),
+                model: None,
+                tools: Vec::new(),
+                input_tokens: None,
+                output_tokens: None,
+                text: Vec::new(),
+            };
+            if !redact_check(&serde_json::to_string(&record).ok()?) {
+                return None;
+            }
+            // Check raw and decoded payloads; retain only the safe envelope on failure (core#1546).
+            if !redact_check(line) || !redact_check(&v.to_string()) {
+                return Some(record);
             }
             let strings = |field: &str| -> Vec<String> {
                 match &v[field] {
@@ -2154,30 +2168,25 @@ pub(crate) fn parse_records(log: &str, unit_key_name_or_unit: &str) -> Vec<Gatew
                     _ => Vec::new(),
                 }
             };
-            Some(GatewayRecord {
-                status: u16::try_from(v["http.status"].as_u64()?).ok()?,
-                unit: unit.into(),
-                run: v["wicked_run"].as_str().unwrap_or("none").into(),
-                endpoint: v["endpoint"].as_str().map(str::to_string),
-                model: v["llm_model"]
-                    .as_str()
-                    .or_else(|| v["gen_ai.request.model"].as_str())
-                    .map(str::to_string),
-                tools: v["llm_tools"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|tool| tool["name"].as_str())
-                    .map(str::to_string)
-                    .collect(),
-                input_tokens: v["llm_in"]
-                    .as_u64()
-                    .or_else(|| v["gen_ai.usage.input_tokens"].as_u64()),
-                output_tokens: v["llm_out"]
-                    .as_u64()
-                    .or_else(|| v["gen_ai.usage.output_tokens"].as_u64()),
-                text: strings("llm_text"),
-            })
+            record.model = v["llm_model"]
+                .as_str()
+                .or_else(|| v["gen_ai.request.model"].as_str())
+                .map(str::to_string);
+            record.tools = v["llm_tools"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|tool| tool["name"].as_str())
+                .map(str::to_string)
+                .collect();
+            record.input_tokens = v["llm_in"]
+                .as_u64()
+                .or_else(|| v["gen_ai.usage.input_tokens"].as_u64());
+            record.output_tokens = v["llm_out"]
+                .as_u64()
+                .or_else(|| v["gen_ai.usage.output_tokens"].as_u64());
+            record.text = strings("llm_text");
+            Some(record)
         })
         .collect()
 }
@@ -3852,7 +3861,60 @@ mod tests {
     }
 
     #[test]
-    fn credential_bearing_lines_are_dropped_even_with_json_escapes() {
+    fn redacted_payload_keeps_only_the_observation_envelope_1546() {
+        let mut line: Value = serde_json::from_str(ACCESS_LOG.lines().next().unwrap()).unwrap();
+        line["llm_text"] = json!(["leaked sk-secret"]);
+        assert_eq!(
+            parse_records(&line.to_string(), "1"),
+            vec![GatewayRecord {
+                status: 200,
+                unit: "1".into(),
+                run: "run-a".into(),
+                endpoint: Some("gw1-stub:8080".into()),
+                model: None,
+                tools: vec![],
+                input_tokens: None,
+                output_tokens: None,
+                text: vec![],
+            }]
+        );
+    }
+
+    #[test]
+    fn redacted_payload_never_retains_payload_or_an_unsafe_envelope_1546() {
+        let clean = ACCESS_LOG.lines().next().unwrap();
+        for field in ["llm_text", "llm_model", "llm_tools", "unused"] {
+            let mut line: Value = serde_json::from_str(clean).unwrap();
+            line[field] = match field {
+                "llm_text" => json!(["safe text", "sk-secret"]),
+                "llm_tools" => json!([{"name": "Bash", "arguments": {"command": "sk-secret"}}]),
+                _ => json!("sk-secret"),
+            };
+            let records = parse_records(&line.to_string(), "1");
+            assert_eq!(records.len(), 1, "{field}");
+            let record = &records[0];
+            assert_eq!(record.endpoint.as_deref(), Some("gw1-stub:8080"));
+            assert_eq!(record.model, None);
+            assert!(record.tools.is_empty());
+            assert_eq!(record.input_tokens, None);
+            assert_eq!(record.output_tokens, None);
+            assert!(record.text.is_empty());
+            assert!(parse_records(&line.to_string(), "another-unit").is_empty());
+            line["scope"] = json!("startup");
+            assert!(parse_records(&line.to_string(), "1").is_empty());
+        }
+        for field in ["wicked_unit", "wicked_run", "endpoint"] {
+            let mut line: Value = serde_json::from_str(clean).unwrap();
+            line[field] = json!("wk-secret");
+            let unit = line["wicked_unit"].as_str().unwrap();
+            assert!(parse_records(&line.to_string(), unit).is_empty(), "{field}");
+            let escaped = line.to_string().replace("wk-secret", "\\u0077k-secret");
+            assert!(parse_records(&escaped, unit).is_empty(), "escaped {field}");
+        }
+    }
+
+    #[test]
+    fn credential_bearing_payload_is_redacted_even_with_json_escapes() {
         let clean = ACCESS_LOG.lines().next().unwrap();
         assert!(redact_check(clean));
         for key in [
@@ -3863,16 +3925,23 @@ mod tests {
             line["llm_text"] = json!([format!("leaked {key}")]);
             let raw = line.to_string();
             assert!(!redact_check(&raw));
-            assert!(parse_records(&format!("{raw}\n{clean}"), "1").len() == 1);
+            let records = parse_records(&format!("{raw}\n{clean}"), "1");
+            assert_eq!(records.len(), 2);
+            assert!(records[0].text.is_empty());
+            assert_eq!(records[0].model, None);
+            assert_eq!(records[1], parse_records(clean, "1")[0]);
         }
         let mut line: Value = serde_json::from_str(clean).unwrap();
         line["llm_text"] = json!(["sk-secret"]);
         let escaped = line.to_string().replace("sk-secret", "\\u0073k-secret");
         assert!(redact_check(&escaped), "the raw bytes have no key prefix");
+        let records = parse_records(&escaped, "1");
+        assert_eq!(records.len(), 1, "the safe envelope is kept");
         assert!(
-            parse_records(&escaped, "1").is_empty(),
+            records[0].text.is_empty(),
             "the decoded value is also checked"
         );
+        assert_eq!(records[0].model, None);
     }
 
     #[test]

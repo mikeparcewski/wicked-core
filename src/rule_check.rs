@@ -1188,6 +1188,11 @@ pub enum JudgeAnswer {
 /// ([`crate::validator::run_rule_judge`]); tests inject a fake.
 pub trait RuleJudge: Sync {
     fn ask(&self, seat: &str, prompt: &str) -> JudgeAnswer;
+
+    /// (core#1288) A launch may disqualify approving answers while its BROKEN findings stand.
+    fn approval_failure(&self, _seat: &str) -> Option<String> {
+        None
+    }
 }
 
 /// The rules a check reads, the evidence, and the seats it may draw.
@@ -4439,8 +4444,16 @@ fn run_pool(
                         let mut a = answered.lock().unwrap();
                         let mut w = why.lock().unwrap();
                         let mut l = left.lock().unwrap();
+                        let approval_failure = judge.approval_failure(&seat);
                         for (j, id) in ids.iter().enumerate() {
                             let miss = match parsed.answers.get(*id) {
+                                Some(ans)
+                                    if ans.status != RuleStatus::Broken
+                                        && approval_failure.is_some() =>
+                                {
+                                    pool.dead.lock().unwrap().insert(seat.clone());
+                                    Miss::Unsure(approval_failure.clone().unwrap())
+                                }
                                 // (codex r2) At delivery a KEPT quotes the published text.
                                 Some(ans)
                                     if input.stage == CheckStage::Delivery
