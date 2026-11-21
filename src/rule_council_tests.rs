@@ -526,6 +526,8 @@ fn an_earlier_gates_council_ruling_is_reused_only_on_equal_keys() {
         let f = job_facts(&[], None, None, change);
         check(
             &CheckInput {
+                seat_attempt: None,
+                rulings: &[],
                 rules: &rules,
                 facts: &f,
                 change,

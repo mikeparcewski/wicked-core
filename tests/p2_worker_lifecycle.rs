@@ -161,6 +161,7 @@ mod tests {
             rule_steps: Vec::new(),
             rule_check: None,
             rule_skips: Vec::new(),
+            changed_code: None,
             rule_carried_skips: Vec::new(),
             rule_councils: 0,
             editor_conformance: None,

@@ -771,7 +771,7 @@ fn replica_git(
     tree: &Path,
     masks: &[String],
     budget: u64,
-) -> Result<Option<(String, Vec<Entry>)>, String> {
+) -> Result<Option<(String, Vec<Entry>)>, CopyInRefusal> {
     // Every git call bounded in time and output (codex b2-seat #13).
     let bounded = |dir: &Path, args: &[&str]| -> super::Called {
         let mut c = sync::git(dir);
@@ -780,11 +780,7 @@ fn replica_git(
     };
     let head = bounded(tree, &["rev-parse", "--verify", "-q", "HEAD^{commit}"]);
     if head.code.is_none() {
-        return Err(format!(
-            "git rev-parse in {}: {}",
-            tree.display(),
-            head.err_text()
-        ));
+        return Err(format!("git rev-parse in {}: {}", tree.display(), head.err_text()).into());
     }
     if !head.ok() {
         return Ok(None);
@@ -816,7 +812,8 @@ fn replica_git(
         if size > budget {
             return Err(format!(
                 "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
-            ));
+            )
+            .into());
         }
         return Ok(Some((sha, entries)));
     }
@@ -869,7 +866,7 @@ fn rebuild_replica_git(
     branch: &Option<String>,
     masks: &[String],
     budget: u64,
-) -> Result<Vec<Entry>, String> {
+) -> Result<Vec<Entry>, CopyInRefusal> {
     let bounded = |dir: &Path, args: &[&str]| -> super::Called {
         let mut c = sync::git(dir);
         c.args(args);
@@ -901,7 +898,7 @@ fn rebuild_replica_git(
     };
     run(&["init", "-q"])?;
     let src = format!("file://{}", tree.display());
-    run(&[
+    if let Err(detail) = run(&[
         "-c",
         "protocol.file.allow=always",
         "fetch",
@@ -922,7 +919,61 @@ fn rebuild_replica_git(
             &src,
             "HEAD",
         ])
-    })?;
+    }) {
+        let promisor = bounded(tree, &["config", "--get-regexp", r"^remote\..*\.promisor$"]);
+        let remote = if promisor.ok() {
+            String::from_utf8_lossy(&promisor.stdout)
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let key = fields.next()?;
+                    if !fields.next()?.eq_ignore_ascii_case("true") {
+                        return None;
+                    }
+                    key.strip_prefix("remote.")?
+                        .strip_suffix(".promisor")
+                        .map(str::to_string)
+                })
+        } else {
+            None
+        }
+        .or_else(|| {
+            let partial = bounded(tree, &["config", "--get", "extensions.partialClone"]);
+            partial
+                .ok()
+                .then(|| String::from_utf8_lossy(&partial.stdout).trim().to_string())
+                .filter(|name| !name.is_empty())
+        });
+        if let Some(remote) = remote {
+            let mut c = sync::git(tree);
+            c.args([
+                "rev-list",
+                "--objects",
+                "--missing=print",
+                "-n",
+                REPLICA_DEPTH,
+                sha,
+            ])
+            .env("GIT_NO_LAZY_FETCH", "1");
+            let objects = super::run_capped(c, None, GIT_CALL, 64 << 20);
+            if objects.ok() {
+                let stdout = String::from_utf8_lossy(&objects.stdout);
+                let mut missing = stdout.lines().filter_map(|line| line.strip_prefix('?'));
+                if let Some(first) = missing.next() {
+                    let count = 1 + missing.count();
+                    return Err(CopyInRefusal {
+                        why: FloorUnarmed::PartialClone,
+                        detail: format!(
+                            "the repository is a partial clone (promisor remote `{remote}`) and \
+                             {count} object(s) of its last {REPLICA_DEPTH} commits were never \
+                             fetched (first {first}); git fetch: {detail}"
+                        ),
+                    });
+                }
+            }
+        }
+        return Err(detail.into());
+    }
     match &branch {
         Some(b) => {
             run(&["update-ref", b, sha])?;
@@ -939,7 +990,7 @@ fn rebuild_replica_git(
         // pathspec is case-sensitive and glob-shaped; the mask is neither).
         let o = bounded(&tmp, &["ls-files", "-z"]);
         if !o.ok() {
-            return Err(format!("git ls-files: {}", o.err_text()));
+            return Err(format!("git ls-files: {}", o.err_text()).into());
         }
         let tracked: Vec<String> = o
             .stdout
@@ -968,7 +1019,8 @@ fn rebuild_replica_git(
     if size > budget {
         return Err(format!(
             "the replica's .git ({size} bytes) is over the copy-in's remaining {budget} bytes"
-        ));
+        )
+        .into());
     }
     let mut entries = Vec::new();
     for rel in listed {
@@ -977,7 +1029,8 @@ fn rebuild_replica_git(
             None => {
                 return Err(format!(
                     "the replica's .git could not be read whole (`{rel}` went away)"
-                ))
+                )
+                .into())
             }
         }
     }
@@ -1005,11 +1058,27 @@ pub(crate) fn head_branch(tree: &Path) -> Result<Option<String>, String> {
 /// write-back applies only what the seat changed against it (review r1).
 pub(crate) type Baseline = HashMap<PathBuf, HashMap<String, [u8; 32]>>;
 
-/// The host index at copy-in for every tree root; `None` records a repository-free tree.
+/// (core#1535 item 1) The host index for trees and written-back plain roots; `None` means no repo.
 pub(crate) type Tracked = HashMap<PathBuf, Option<Vec<String>>>;
 
 /// The encoded roots, pod plan, base commit, baseline and host tracked sets from copy-in.
 pub(crate) type CopyInStream = (Vec<u8>, Value, Option<String>, Baseline, Tracked);
+
+/// A copy-in refusal's floor reason and diagnostic detail for the daemon log.
+#[derive(Debug)]
+pub(crate) struct CopyInRefusal {
+    pub(crate) why: FloorUnarmed,
+    pub(crate) detail: String,
+}
+
+impl From<String> for CopyInRefusal {
+    fn from(detail: String) -> Self {
+        Self {
+            why: FloorUnarmed::CopyInRefused,
+            detail,
+        }
+    }
+}
 
 /// The copy-in stream of `roots` (the host's side), with its baseline and tracked sets.
 pub(crate) fn copy_in_stream(
@@ -1018,7 +1087,7 @@ pub(crate) fn copy_in_stream(
     roots: &[PlanRoot],
     with_git: bool,
     seeded: &HashSet<String>,
-) -> Result<CopyInStream, String> {
+) -> Result<CopyInStream, CopyInRefusal> {
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
     let mut base = None;
@@ -1034,7 +1103,7 @@ pub(crate) fn copy_in_stream(
     for r in roots {
         let t_root = Instant::now();
         let replica = replica_of(scope, &r.host)?;
-        if r.mode == Mode::Tree {
+        if r.mode == Mode::Tree || (r.mode == Mode::Plain && r.back) {
             tracked.insert(r.host.clone(), sync::host_tracked(&r.host)?);
         }
         if r.mode == Mode::Seed {
@@ -1079,7 +1148,8 @@ pub(crate) fn copy_in_stream(
                     return Err(format!(
                         "the unit's copy-in has more than {} files",
                         sync::MAX_ENTRIES
-                    ));
+                    )
+                    .into());
                 }
                 let size = if e.kind == sync::Kind::Link {
                     256
@@ -1091,7 +1161,8 @@ pub(crate) fn copy_in_stream(
                     return Err(format!(
                         "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
                         r.host.join(&e.path).display()
-                    ));
+                    )
+                    .into());
                 }
                 entries.push(e.clone());
             }
@@ -1113,14 +1184,16 @@ pub(crate) fn copy_in_stream(
                 return Err(format!(
                     "the unit's copy-in has more than {} files",
                     sync::MAX_ENTRIES
-                ));
+                )
+                .into());
             }
             budget += sync::entry_size(&r.host, p).max(p.len() as u64);
             if budget > STREAM_LIMIT {
                 return Err(format!(
                     "the unit's copy-in is larger than {STREAM_LIMIT} bytes (at {})",
                     r.host.join(p).display()
-                ));
+                )
+                .into());
             }
             // A file that is there but cannot be read refuses the copy-in (review r5); a path
             // that is gone, or a directory (a gitlink), is simply absent.
@@ -1158,7 +1231,8 @@ pub(crate) fn copy_in_stream(
             if budget > STREAM_LIMIT {
                 return Err(format!(
                     "the unit's copy-in is larger than {STREAM_LIMIT} bytes (its .git)"
-                ));
+                )
+                .into());
             }
             {
                 let gr = format!("{replica}/.git");
@@ -1286,8 +1360,7 @@ pub(crate) fn copy_in(
     };
     // What could not be copied in is said as that (fix-k8s-chat), never `root_unresolvable`.
     let (body, plan, base, baseline, tracked) =
-        copy_in_stream(scope, tree, roots, with_git, &seeded)
-            .map_err(|e| (FloorUnarmed::CopyInRefused, e))?;
+        copy_in_stream(scope, tree, roots, with_git, &seeded).map_err(|r| (r.why, r.detail))?;
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::CopyInRefused,
@@ -2593,7 +2666,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             .map_err(|_| "the copy-in tracked sets are poisoned")?;
         let mut host_tracked = HashMap::new();
         for (replica, root) in &refs {
-            if root.mode == Mode::Tree {
+            if root.mode == Mode::Tree || (root.mode == Mode::Plain && root.back) {
                 let snapshot = tracked.get(&root.host).ok_or_else(|| {
                     format!(
                         "the copy-in tracked set for {} is missing",
@@ -2640,8 +2713,6 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             return Err("the write-back's roots are out of order".into());
         }
         let left_out = sync::take_skipped(got)
-            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
-        sync::refuse_unsafe_skips(&want.host, want.mode, &left_out)
             .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
         warnings.extend(left_out.iter().map(|s| s.describe(&want.host)));
         let empty = HashMap::new();
@@ -2707,6 +2778,16 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         }
         _ => None,
     };
+    // (core#1535 item 2) Check once, with the fetched tip, before HEAD checks or host changes.
+    for (want, _, left_out, _) in &checked {
+        let incoming = if want.mode == Mode::Tree && want.host == seat.tree {
+            commits.as_ref().map(|(new, _)| new.as_str())
+        } else {
+            None
+        };
+        sync::refuse_unsafe_skips(&want.host, want.mode, left_out, incoming)
+            .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
+    }
     // The host's HEAD must still be the base the commits fast-forward (review r2), checked
     // before any file changes.
     if let (Some(_), Some(base)) = (&commits, &seat.base) {
@@ -2723,9 +2804,10 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
     for (want, entries, left_out, skips) in checked {
         let base = baseline.get(&want.host).cloned().unwrap_or_default();
+        let aliased = kept_by_alias(&base, &entries, &skips);
         let mut retained = retained_links(&entries, &base);
         retained.extend(
-            left_out_links(&want.host, &left_out).map_err(|e| {
+            left_out_links(&want.host, &left_out, &aliased).map_err(|e| {
                 format!("the write-back of {} was refused: {e}", want.host.display())
             })?,
         );
@@ -2733,9 +2815,8 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
             deletes.retain(|d| !in_node_modules(d));
         }
-        // The pod's `ls-files -c -o --exclude-standard` lists every tracked file, ignored or
-        // not, so a tracked path it does not list was deleted (codex b2-seat #10). Only an
-        // untracked one the host's ignore rules now match is no deletion (the safe side).
+        // (core#1535 item 4) The pod lists the host's tracked set too: an absent tracked path
+        // was deleted. An untracked one the host's ignore rules match is no deletion.
         if want.mode == Mode::Tree && !deletes.is_empty() {
             deletes = tree_deletions(&want.host, deletes)?;
         }
@@ -3046,6 +3127,26 @@ pub(crate) fn apply_roots(plans: &[RootPlan<'_>]) -> Result<(), String> {
     Ok(())
 }
 
+fn alias_keeps(path: &str, sent: &HashSet<&str>, skips: &sync::SkipSet) -> bool {
+    !skips.covers(path) && !sent.contains(path) && skips.may_alias(path)
+}
+
+/// (core#1535 item 3) Baseline paths kept only because a skip may alias them, sorted.
+pub(crate) fn kept_by_alias(
+    base: &HashMap<String, [u8; 32]>,
+    entries: &[Entry],
+    skips: &sync::SkipSet,
+) -> Vec<String> {
+    let sent: HashSet<&str> = entries.iter().map(|e| e.path.as_str()).collect();
+    let mut kept: Vec<String> = base
+        .keys()
+        .filter(|p| alias_keeps(p, &sent, skips))
+        .cloned()
+        .collect();
+    kept.sort();
+    kept
+}
+
 /// (core#1498) [`delta`], with every path the pod left out kept as the host has it: never written
 /// (the pod sent none of it) and never a deletion.
 pub(crate) fn delta_keeping(
@@ -3071,7 +3172,7 @@ pub(crate) fn delta_keeping(
         if i.is_multiple_of(4096) && cancelled() {
             return Err("the unit was cancelled during write-back; nothing came back".into());
         }
-        if !skips.covers(p) && (sent.contains(p.as_str()) || !skips.may_alias(p)) {
+        if !skips.covers(p) && !alias_keeps(p, &sent, skips) {
             kept.insert(p.clone(), *d);
         }
     }
@@ -3086,6 +3187,7 @@ pub(crate) fn delta_keeping(
 pub(crate) fn left_out_links(
     host: &Path,
     left_out: &[sync::Skipped],
+    aliased: &[String],
 ) -> Result<Vec<Entry>, String> {
     let mut out = Vec::new();
     let mut push_link = |rel: String| -> Result<(), String> {
@@ -3120,6 +3222,10 @@ pub(crate) fn left_out_links(
                 push_link(format!("{}/{rel}", s.path))?;
             }
         }
+    }
+    // (core#1535 item 3) Folded keeps retain host links outside the skip's exact spelling.
+    for rel in aliased {
+        push_link(rel.clone())?;
     }
     Ok(out)
 }

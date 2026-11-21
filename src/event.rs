@@ -31,6 +31,17 @@ pub enum StepFailureKind {
     TimedOut,
 }
 
+/// (core#1444) A rule skip carried by a judge re-run.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RerunSkip {
+    pub rule_id: String,
+    pub reason: String,
+    pub by: String,
+    pub evidence_key: String,
+    pub instruction: Option<String>,
+}
+
 /// One prior unit whose output was injected into a receiving unit's ACP context (EVT-007).
 /// Content is intentionally absent — only identity and size are carried to avoid doubling volume.
 #[derive(Debug, Clone, PartialEq)]
@@ -1218,12 +1229,13 @@ pub enum CoreEvent {
         /// Why nothing could be reused, when the floor restarted from its first check.
         restarted: Option<String>,
     },
-    /// The operator re-armed the JUDGE of a unit denied `judge_unavailable`
-    /// ([`crate::workflow::HumanDecision::Rejudge`]): the next attempt (`attempt`) does not run
-    /// the seat; it hands the output captured on `fromAttempt` to the judge again, drawn by the
-    /// engine's own selection (`seats`: the eligible judge seats when it was armed, rotation
-    /// order), on the same tree. Emitted before `resumed`; the attempt's `gateEvaluated` says
-    /// what the judge ruled, and a denial there escalates again. Additive: a new frame.
+    /// (core#1444) The operator re-armed a unit's judge (`Rejudge` or `RecheckRules`).
+    /// The next attempt (`attempt`) does not run the seat; it hands the output captured on
+    /// `fromAttempt` to the judge again, drawn by the engine's own selection (`seats`: the
+    /// eligible judge seats when it was armed, rotation order), on the tree as it stands.
+    /// Emitted before `resumed`; the attempt's `gateEvaluated` says
+    /// what the judge ruled, and a denial there escalates again.
+    /// (core#1444) Also records skips carried by `RecheckRules`; empty when none were given.
     JudgeRerunRequested {
         session: String,
         ord: u32,
@@ -1233,6 +1245,7 @@ pub enum CoreEvent {
         from_attempt: u32,
         /// The judge seats eligible when it was armed.
         seats: Vec<String>,
+        skips: Vec<RerunSkip>,
         /// Why the last judge could not rule (the gate's denial reason).
         previous_reason: String,
         /// Who asked for it, as the gate API recorded them (`operator` when unnamed).
@@ -3360,10 +3373,12 @@ impl CoreEvent {
                 attempt,
                 from_attempt,
                 seats,
+                skips,
                 previous_reason,
                 by,
             } => json!({
                 "type": "judgeRerunRequested",
+                "skips": skips,
                 "session": session,
                 "ord": ord,
                 "attempt": attempt,
@@ -4119,6 +4134,13 @@ mod tests {
             seats: vec!["pi".into(), "copilot".into()],
             previous_reason: "every eligible judge seat failed".into(),
             by: "operator".into(),
+            skips: vec![RerunSkip {
+                rule_id: "R1".into(),
+                reason: "binary fixture".into(),
+                by: "operator".into(),
+                evidence_key: "ek-R1".into(),
+                instruction: None,
+            }],
         }
         .to_json();
         assert_eq!(j["type"], "judgeRerunRequested");
@@ -4129,6 +4151,15 @@ mod tests {
         assert_eq!(j["seats"], serde_json::json!(["pi", "copilot"]));
         assert_eq!(j["previousReason"], "every eligible judge seat failed");
         assert_eq!(j["by"], "operator");
+        assert_eq!(j["skips"][0]["ruleId"], "R1");
+        assert_eq!(j["skips"][0]["reason"], "binary fixture");
+        assert_eq!(j["skips"][0]["by"], "operator");
+        assert_eq!(j["skips"][0]["evidenceKey"], "ek-R1");
+        assert!(j["skips"][0]
+            .as_object()
+            .unwrap()
+            .contains_key("instruction"));
+        assert!(j["skips"][0]["instruction"].is_null());
     }
 
     /// core#431 (F-3R2-007): `gateEvaluated` names the judge — `judgeCli` + `judgeDistinct` ride

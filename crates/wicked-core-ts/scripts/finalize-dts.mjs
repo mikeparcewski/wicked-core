@@ -217,9 +217,10 @@ const HAND_AUTHORED = `${BEGIN}
  * \`'env_cannot_run'\` / \`'unclassified_red_base'\`; \`envCannotRun\` is always \`[]\`; libtest ids
  * lose their \`[<target>]\` qualifier and \`preExisting\` holds the runner-native names excluded.
  * Judge re-run (additive, new event): \`judgeRerunRequested\` {session, ord, attempt, fromAttempt,
- * seats, previousReason, by} — the operator answered a \`judge_unavailable\` gate with action
- * \`rejudge\`: attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
- * from \`seats\` (the eligible judge seats when it was armed); the seat does not run again.
+ * seats, previousReason, by, skips} — the operator requested \`rejudge\` or a rule re-check:
+ * attempt \`attempt\` re-reads attempt \`fromAttempt\`'s captured output with a judge drawn
+ * from \`seats\`; the seat does not run again. \`skips\` is [] when none were given; each skip
+ * carries ruleId, reason, by, evidenceKey and instruction (null for a plain skip).
  */
 export interface CoreEventJson {
   type: string
