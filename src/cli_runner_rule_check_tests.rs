@@ -133,6 +133,7 @@ fn review_input(repo: &std::path::Path, base: &str, db: &str) -> StepInput {
     unit.assigned_cli = Some("codex".into());
     unit.run_base_commit = Some(base.to_string());
     StepInput {
+        base_commit: None,
         run_id: "s".into(),
         unit_ix: 1,
         attempt: 0,

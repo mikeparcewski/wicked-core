@@ -62,6 +62,7 @@ fn input(run: &str, ord: u32, attempt: u32, stamp: Option<UnitTeamSnapshot>) -> 
     unit.team_run = stamp.is_some();
     unit.team = stamp;
     StepInput {
+        base_commit: None,
         run_id: run.into(),
         unit_ix: ord as usize,
         attempt,

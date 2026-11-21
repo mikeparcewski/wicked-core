@@ -9599,6 +9599,7 @@ mod tests {
         unit.assigned_cli = Some("sh".to_string());
         unit.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "reassign-wrapped".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9653,6 +9654,7 @@ mod tests {
     fn reassign_cancellation_is_epoch_and_launch_sequence_scoped() {
         let runner = WrappedCliStepRunner::default();
         let make_input = |epoch, launch_seq| StepInput {
+            base_commit: None,
             run_id: "same-run".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9698,6 +9700,7 @@ mod tests {
     fn a_launch_registering_after_its_run_ended_is_born_cancelled_until_a_resume() {
         let runner = WrappedCliStepRunner::default();
         let make = |launch_seq| StepInput {
+            base_commit: None,
             run_id: "ended-run".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9748,6 +9751,7 @@ mod tests {
     fn shutdown_cancels_every_wrapped_worker_and_later_registrations() {
         let runner = WrappedCliStepRunner::default();
         let judge = StepInput {
+            base_commit: None,
             run_id: "validator-abc".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9903,6 +9907,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: "run-unenf".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -10082,6 +10087,7 @@ mod tests {
         u.assigned_cli = Some("pi".to_string());
         u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cf-noruntime".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -10185,6 +10191,7 @@ mod tests {
             u.assigned_cli = Some("pi".to_string());
             u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
             StepInput {
+                base_commit: None,
                 run_id: run_id.to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -10415,6 +10422,7 @@ mod tests {
         unit.assigned_cli = Some("ballot-seat".to_string());
         unit.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: format!("council-streams-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -10522,6 +10530,7 @@ mod tests {
         let run_id = format!("run-ig1c2-{}", std::process::id());
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -10717,6 +10726,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wicked-ig1c2-cdx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -10777,6 +10787,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: "run-nogov".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11101,6 +11112,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("armtest-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -11350,6 +11362,7 @@ mod tests {
             let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
             u.assigned_cli = Some("claude".to_string());
             StepInput {
+                base_commit: None,
                 run_id: "run-bc79".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -11478,6 +11491,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-envstrip".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11524,6 +11538,7 @@ mod tests {
             u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
             u.qe_ledger_root = qe_root.map(|p| p.to_string_lossy().into_owned());
             let input = StepInput {
+                base_commit: None,
                 run_id: "run-qe-ledger".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -11583,6 +11598,7 @@ mod tests {
         );
         u.notes_root = Some(dir.join("notes").to_string_lossy().into_owned());
         let input = StepInput {
+            base_commit: None,
             run_id: "run-928".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11674,6 +11690,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cfg-strip".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11743,6 +11760,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-claude-md-wrapped".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11833,6 +11851,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cfg-worker-home".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11949,6 +11968,7 @@ mod tests {
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let run_id = format!("run-653-wrapped-{}", std::process::id());
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -12029,6 +12049,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("{} {{PROMPT}}", codex.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-codex-seat-root".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12102,6 +12123,7 @@ mod tests {
         u.assigned_cli = Some("claude#2".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-claude2-cfg-home".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12705,6 +12727,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-posture".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13116,6 +13139,7 @@ mod tests {
         u.assigned_cli = Some("sh".to_string());
         u.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-quiesce".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13210,6 +13234,7 @@ mod tests {
         u.assigned_cli = Some("copilot".to_string());
         u.assigned_invocation = Some(format!("{copilot} -p {{PROMPT}}"));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-660-copilot".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13302,6 +13327,7 @@ mod tests {
                 stamp(&mut u, &run, 2);
             }
             let input = StepInput {
+                base_commit: None,
                 run_id: run.clone(),
                 unit_ix: 1,
                 attempt: 0,
@@ -13386,6 +13412,7 @@ mod tests {
         u.assigned_invocation = Some(format!("{codex} exec {{PROMPT}}"));
         u.worktree_guarded = true; // the def said `executes_code: false`
         let input = StepInput {
+            base_commit: None,
             run_id: "run-ro-posture".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13484,6 +13511,7 @@ mod tests {
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         u.worktree_guarded = true;
         let input = StepInput {
+            base_commit: None,
             run_id: "run-ro-refuse".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13557,6 +13585,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cap".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13619,6 +13648,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-scratch".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13713,6 +13743,7 @@ mod tests {
             let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
             u.assigned_cli = Some("claude".to_string());
             let input = StepInput {
+                base_commit: None,
                 run_id: run_id.to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -13983,6 +14014,7 @@ mod tests {
         let mut creator = WorkUnit::pending("s:build", "s", 1, "add SSO login");
         creator.role = PhaseRole::Creator;
         let input = StepInput {
+            base_commit: None,
             run_id: "s".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14178,6 +14210,7 @@ mod tests {
         u.role = crate::workflow::PhaseRole::Evaluator;
         let author = std::env::temp_dir().join("ev-753").join("author");
         let input = StepInput {
+            base_commit: None,
             run_id: "s".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -14278,6 +14311,7 @@ mod tests {
                 }
                 evaluators.push(format!("{}/{}", def.id, u.phase_id().unwrap_or("?")));
                 let input = StepInput {
+                    base_commit: None,
                     run_id: "s".into(),
                     unit_ix: ix,
                     attempt: 0,
@@ -14388,6 +14422,7 @@ mod tests {
             .find(|u| u.role == PhaseRole::Creator)
             .expect("bug.fix is the def's creator");
         let input = |unit: WorkUnit| StepInput {
+            base_commit: None,
             run_id: "s".into(),
             unit_ix: 2,
             attempt: 0,
@@ -14613,6 +14648,7 @@ mod tests {
         let mut unit = WorkUnit::pending("s:fix", "s", 3, "fix the API");
         unit.role = crate::workflow::PhaseRole::Creator;
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-base".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -14699,6 +14735,7 @@ mod tests {
 
         let unit = WorkUnit::pending("s:build", "s", 1, "fix the API");
         let mut input = StepInput {
+            base_commit: None,
             run_id: "layout-seam".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15084,6 +15121,7 @@ mod tests {
         }
 
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-line".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15156,6 +15194,7 @@ mod tests {
     #[test]
     fn pty_unit_prompt_refuses_an_embedded_newline() {
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-newline".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15211,6 +15250,7 @@ mod tests {
         });
         unit.qe_floor_note = Some(format!("FLOORNOTE {}", "x".repeat(900)));
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-qe-note".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -17185,6 +17225,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("skillsroot-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -17382,6 +17423,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("sf1019-{}", uuid::Uuid::new_v4().simple()),
             unit_ix: 0,
             attempt: 0,
@@ -18109,6 +18151,7 @@ mod tests {
             }
             u.assigned_invocation = Some(format!("{} {tail}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-login-{seat}-{}-{read_only}", tail.len()),
                 unit_ix: 0,
                 attempt: 0,
@@ -18293,6 +18336,7 @@ mod tests {
             u.skill_ref = skill.map(str::to_string);
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-levers-{seat}"),
                 unit_ix: 0,
                 attempt: 0,
@@ -18544,6 +18588,7 @@ mod tests {
             u.skill_ref = Some("wicked-garden-domain".to_string());
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             StepInput {
+                base_commit: None,
                 run_id: "run-opencode".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -18627,6 +18672,7 @@ mod tests {
             u.assigned_cli = Some("opencode".to_string());
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             StepInput {
+                base_commit: None,
                 run_id: "run-opencode-mcp".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -18815,6 +18861,7 @@ headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
             u.skill_ref = Some("wicked-garden-domain".to_string());
             u.assigned_cli = Some("skills-seat".to_string());
             StepInput {
+                base_commit: None,
                 run_id: "run-skills".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -18965,6 +19012,7 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
         u.skill_ref = Some("wicked-garden-domain".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-refuse".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -19090,6 +19138,7 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
             u.skill_ref = skill.map(str::to_string);
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-hatch-{tag}"),
                 unit_ix: 0,
                 attempt: 0,
@@ -19595,6 +19644,7 @@ mod ask_config_tests {
             apps: None,
         };
         let mut input = StepInput {
+            base_commit: None,
             run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),
             unit_ix: 0,
             attempt: 0,

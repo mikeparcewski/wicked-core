@@ -1663,6 +1663,12 @@ pub struct WorkUnit {
     /// send-back resets the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
+    /// Earliest deliverable timestamp for the current repeat pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_started_ms: Option<i64>,
+    /// Allowed run-relative paths: directory prefixes end in `/`, files match exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_set: Vec<String>,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1927,6 +1933,8 @@ impl WorkUnit {
     ) -> Self {
         let description = description.into();
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             id: id.into(),
             session_id: session_id.into(),
             ord,

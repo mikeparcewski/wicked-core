@@ -36,6 +36,7 @@ pub(crate) fn block(version: u64, sections: Vec<ContextSection>) -> RunContext {
 
 fn input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
+        base_commit: None,
         run_id: run_id.into(),
         unit_ix: 0,
         attempt: 0,

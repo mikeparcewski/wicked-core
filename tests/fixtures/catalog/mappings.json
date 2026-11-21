@@ -284,7 +284,10 @@
     "depends_on": [
      "extract-prepare"
     ],
-    "skill_ref": "wicked-garden-domain-extractor"
+    "skill_ref": "wicked-garden-domain-extractor",
+    "required_deliverables": [
+     ".wicked/domain/rules.json"
+    ]
    },
    {
     "catalog": "critique",

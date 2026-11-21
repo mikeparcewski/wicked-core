@@ -187,6 +187,8 @@ struct DispatchedTask {
     entity_mode: EntityMode,
     /// The run's worktree (the wrapped-CLI runner's cwd). `None` ⇒ the runner's default cwd.
     workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_commit: Option<String>,
     /// The unit — with its validator's SCRIPT blanked (finding #7); carries description, validator
     /// criterion, role, skill scope… everything the off-actor runner + agent judge legitimately need.
     unit: crate::domain::WorkUnit,
@@ -5046,6 +5048,7 @@ fn run_unit_and_judge_on(
     // (core#1390) The fold's tree reads, here on the worker thread for every worker path (in-process
     // and bus-mediated) and every way the unit ended — an early return included — so the fold runs
     // no git on the actor.
+    evidence.write_set = crate::worktree_guard::write_set_for_unit(input);
     let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
     evidence.worktree_clean = worktree_clean;
     evidence.tree_after_failure = tree_after_failure;
@@ -6705,6 +6708,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .map(|r| r.seat.clone())
         .collect();
     let evidence = crate::workflow::UnitEvidence {
+        write_set: None,
         observed_providers: work_observed.known().map(<[String]>::to_vec),
         worktree_guard,
         repo_checks,
@@ -6812,6 +6816,7 @@ pub(crate) fn try_publish_dispatched(
             launch_seq: input.launch_seq,
             is_acp,
             required_skills: input.required_skills.clone(),
+            base_commit: input.base_commit.clone(),
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -7454,6 +7459,7 @@ fn run_cli_runner(
                     process_gen: task.process_gen,
                     launch_seq: task.launch_seq,
                     required_skills: task.required_skills.clone(),
+                    base_commit: task.base_commit.clone(),
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does.
@@ -7880,6 +7886,7 @@ mod tests {
         let expected_pin = crate::validator_vault::pin(&validator);
         unit.validator = Some(validator);
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -7942,6 +7949,7 @@ mod tests {
 
         let unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do it");
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -8099,6 +8107,7 @@ mod tests {
         unit.worktree_guarded = true;
         unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 0,
@@ -8202,6 +8211,7 @@ mod tests {
             let mut unit = crate::domain::WorkUnit::pending("r:build", "r", 4, "build");
             unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 3,
                 attempt: 0,
@@ -8297,6 +8307,7 @@ mod tests {
             });
             unit.exclude_seats = exclude.iter().map(|s| s.to_string()).collect();
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -8385,6 +8396,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -8474,6 +8486,7 @@ mod tests {
                 .unwrap(),
             );
             StepInput {
+                base_commit: None,
                 run_id: "r-1155".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -8580,6 +8593,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -8711,6 +8725,7 @@ mod tests {
             at: 0,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 3,
@@ -8925,6 +8940,7 @@ mod tests {
             .unwrap(),
         );
         let mut input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 3,
@@ -9064,6 +9080,7 @@ mod tests {
         unit.run_base_commit = Some(base);
         unit.worktree_baseline = Some(baseline);
         let input = StepInput {
+            base_commit: None,
             run_id: format!("early-floor-{}", std::process::id()),
             unit_ix: 1,
             attempt: 0,
@@ -9119,6 +9136,7 @@ mod tests {
         let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "build");
         unit.assigned_cli = Some("claude".into());
         let mut input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -9299,6 +9317,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -9426,6 +9445,7 @@ mod tests {
             at: 0,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 2,
@@ -9583,6 +9603,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 2,
@@ -9711,6 +9732,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 1,
                 attempt: 2,
@@ -9867,6 +9889,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 1,
                 attempt: 2,
@@ -9999,6 +10022,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -10487,6 +10511,7 @@ mod tests {
                 unit.default_floor = true;
                 unit.worktree_baseline = Some(baseline.clone());
                 let input = StepInput {
+                    base_commit: None,
                     run_id: "r".into(),
                     unit_ix: 0,
                     attempt: 0,
@@ -10580,6 +10605,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11153,6 +11179,7 @@ mod tests {
         unit.default_floor = true;
 
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11236,6 +11263,7 @@ mod tests {
         // Roster: claude (excluded as validator author), pi (excluded as creator), empty (unusable).
         // All three excluded/unusable → no distinct seat → pinned skips.
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11444,6 +11472,7 @@ mod tests {
         // fields to simulate a pre-DES-002 payload arriving from an older sender.
         let unit = crate::domain::WorkUnit::pending("t7a:u1", "t7a", 1, "do it");
         let input = StepInput {
+            base_commit: None,
             run_id: "t7a-run".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11844,6 +11873,7 @@ mod tests {
         let unit_a =
             crate::domain::WorkUnit::pending("run-t38a:u1", "run-t38a", 1, "degraded-mode test");
         let input_a = StepInput {
+            base_commit: None,
             run_id: "run-t38a".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11945,6 +11975,7 @@ mod tests {
         let unit_b =
             crate::domain::WorkUnit::pending("run-t38b:u1", "run-t38b", 1, "degraded-mode test");
         let input_b = StepInput {
+            base_commit: None,
             run_id: "run-t38b".into(),
             unit_ix: 0,
             attempt: 0,
@@ -12120,6 +12151,7 @@ mod tests {
             ..red
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 1,
@@ -12229,6 +12261,7 @@ mod tests {
             git_dir: None,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 1,
@@ -12366,6 +12399,7 @@ mod tests {
             unit.default_floor = true;
             unit.worktree_baseline = Some(crate::worktree_guard::snapshot(wt, &repo).unwrap());
             StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -12667,6 +12701,7 @@ mod tests {
         unit.default_floor = true;
         unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -13394,6 +13429,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -13473,6 +13509,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "ua".into(),
             unit_ix: 0,
             attempt: 0,
@@ -13561,6 +13598,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "xr".into(),
             unit_ix: 0,
             attempt: 0,
@@ -13713,6 +13751,7 @@ mod t5_bus_worker_tests {
             at: 0,
         });
         StepInput {
+            base_commit: None,
             run_id: run.into(),
             unit_ix: 0,
             attempt: 2,
@@ -13917,6 +13956,7 @@ mod t5_bus_worker_tests {
         stamp.stream_floor = Some(floor);
         unit.team = Some(stamp);
         let input = StepInput {
+            base_commit: None,
             run_id: run.into(),
             unit_ix: 0,
             attempt: 0,
@@ -14118,6 +14158,7 @@ mod judge_fallback_tests {
             approved: true,
         });
         StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 4,
             attempt: 0,

@@ -311,6 +311,7 @@ pub fn plan_from_def(def: &WorkflowDef, intent: &str, session_id: &str) -> Vec<W
             let code_creator =
                 phase.executes_code && phase.role == crate::workflow::PhaseRole::Creator;
             unit.default_floor = !is_tool && (!later_verifies || code_creator);
+            unit.write_set = phase.write_set.clone();
             // F-039 — the REPO CHECKS floor marker: the def's code-VERIFYING step, i.e. a
             // `verified_evidence` agent phase with an `executes_code` Creator before it. The engine
             // runs the repository's own checks in the worktree after the seat's work and folds the
@@ -1196,6 +1197,7 @@ pub fn compose(
             catalog: s.catalog.clone(),
         });
     }
+    let maps_only = plan.maps_only_in(catalog);
     let mut phases = Vec::with_capacity(plan.steps.len());
     for (i, step) in plan.steps.iter().enumerate() {
         let Some(entry) = catalog.iter().find(|e| e.id == step.catalog) else {
@@ -1206,6 +1208,16 @@ pub fn compose(
         };
         let mut phase = apply_step(entry, step)?;
         phase.catalog = Some(entry.id.clone());
+        phase.write_set = if maps_only
+            && !matches!(&phase.executor, crate::workflow::PhaseExecutor::Tool { .. })
+        {
+            crate::domain_extraction::MAPPING_WRITE_SET
+                .iter()
+                .map(|p| p.to_string())
+                .collect()
+        } else {
+            Vec::new()
+        };
         let (before, after) = (&plan.steps[..i], &plan.steps[i + 1..]);
         if step.depends_on.is_none()
             && entry.role == crate::workflow::PhaseRole::Evaluator
@@ -2146,6 +2158,49 @@ mod tests {
     #[test]
     fn decimal_point_does_not_split() {
         assert_eq!(plan_units("Upgrade to version 3.5 now", "s").len(), 1);
+    }
+
+    #[test]
+    fn mapping_agent_units_carry_the_q17_write_set() {
+        let mut plan = PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..PlanSteps::default()
+        };
+        let catalog = crate::catalog::catalog();
+        let filled = floor_fill(
+            catalog,
+            &plan,
+            FloorInput {
+                score: 45,
+                destructive: false,
+                human_confirm: &crate::domain::HumanConfirm::None,
+                deliver: None,
+                obligations: &[],
+                ran: &[],
+                requires_evaluator: false,
+                requires_qe: false,
+                power_absorbs: &[],
+            },
+        )
+        .unwrap();
+        let units = plan_from_def(&filled.def, "map", "mapping");
+        for unit in &units {
+            if unit.tool_cmd.is_none() {
+                assert_eq!(unit.write_set, [".wicked/domain/", "coverage-report.json"]);
+            } else {
+                assert!(unit.write_set.is_empty());
+            }
+        }
+        plan.steps.push(PlanStep {
+            catalog: "build".into(),
+            id: "fix".into(),
+            depends_on: Some(vec!["domain-graph".into()]),
+            ..PlanStep::default()
+        });
+        let def = compose(catalog, &plan).unwrap();
+        assert!(plan_from_def(&def, "build", "ordinary")
+            .iter()
+            .all(|u| u.write_set.is_empty()));
     }
 
     // ---- plan_from_def: the data-driven planner (Law 2) ----

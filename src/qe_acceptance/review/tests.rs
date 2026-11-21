@@ -645,6 +645,7 @@ impl StepRunner for Scripted {
 
 fn input_for(unit: WorkUnit) -> StepInput {
     StepInput {
+        base_commit: None,
         run_id: RUN.into(),
         unit_ix: 2,
         attempt: 1,

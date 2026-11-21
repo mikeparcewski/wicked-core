@@ -8567,6 +8567,47 @@ fn apply_step_result(
         }));
     }
 
+    if !unit.write_set.is_empty() {
+        let why = match evidence.write_set.as_ref() {
+            Some(report) => report.denial_reason(),
+            None => Some("write-set check could not run: no write-set evidence".to_string()),
+        };
+        if let Some(why) = why {
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new("write_set", why.clone()));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -8605,6 +8646,15 @@ fn apply_step_result(
                 Some(ms) => crate::path_policy::LaunchClock::At(ms),
                 None => crate::path_policy::LaunchClock::Undatable,
             },
+        };
+        let launch = match (launch, unit.pass_started_ms) {
+            (crate::path_policy::LaunchClock::At(run), Some(pass)) => {
+                crate::path_policy::LaunchClock::At(run.max(pass))
+            }
+            (crate::path_policy::LaunchClock::Unrecorded, Some(pass)) => {
+                crate::path_policy::LaunchClock::At(pass)
+            }
+            (clock, _) => clock,
         };
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
@@ -13402,6 +13452,7 @@ fn dispatch_unit_with(
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
+        base_commit: session.base_commit.clone(),
         // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
         // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
         // The repo-local graph is resolved HERE (the actor thread holds the store; the worker does not)
@@ -13639,6 +13690,7 @@ fn dispatch_unit_with(
                         )
                     }),
                     evidence_root: session.evidence_root.clone(),
+                    upstream_agents: upstream_agents(&unit, &units),
                     base_commit: session.base_commit.clone(),
                     tree_from: session.workdir.clone().zip(
                         session
@@ -14062,6 +14114,7 @@ fn dispatch_unit_with(
                 // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
                 // here so the fold persists it on the unit and names the floor on the gate.
                 evidence: Box::new(crate::workflow::UnitEvidence {
+                    write_set: None,
                     // A Tool unit launches no seat: nothing to observe.
                     observed_providers: None,
                     worktree_guard: None,
@@ -15341,6 +15394,7 @@ mod crew_tool_channel_tests {
 /// (`tree_from` = the worktree and its registered repository root; absent or unsnapshottable ⇒
 /// the variable is not set, never set empty). The walkthrough recorder declares its own set.
 struct ToolRunEnv {
+    upstream_agents: Vec<(String, String)>,
     run_id: String,
     ord: u32,
     /// (core#820) The choice approved at this unit's consent gate, handed on as
@@ -15360,6 +15414,49 @@ struct ToolRunEnv {
 
 /// (e2e F30) The variable a generic Tool unit reads the run's base commit from.
 pub(crate) const RUN_BASE_ENV: &str = "WICKED_RUN_BASE";
+pub(crate) const UPSTREAM_AGENTS_ENV: &str = "WICKED_UPSTREAM_AGENTS";
+
+fn upstream_agents(
+    unit: &crate::domain::WorkUnit,
+    units: &[crate::domain::WorkUnit],
+) -> Vec<(String, String)> {
+    let mut pending = unit.depends_on.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(step) = pending.pop() {
+        if seen.insert(step.clone()) {
+            if let Some(upstream) = units.iter().find(|u| u.phase_id() == Some(step.as_str())) {
+                pending.extend(upstream.depends_on.iter().cloned());
+            }
+        }
+    }
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    let mut ordered: Vec<_> = units
+        .iter()
+        .filter(|u| {
+            u.tool_cmd.is_none()
+                && u.status == crate::domain::UnitStatus::Done
+                && u.phase_id().is_some_and(|s| seen.contains(s))
+        })
+        .collect();
+    ordered.sort_by_key(|u| u.ord);
+    ordered
+        .into_iter()
+        .filter_map(|u| {
+            let step = u.phase_id()?;
+            let agent = u
+                .assigned_cli
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("claude");
+            (valid(step) && valid(agent)).then(|| (step.to_string(), agent.to_string()))
+        })
+        .collect()
+}
 
 impl ToolRunEnv {
     fn vars(&self) -> Vec<(String, String)> {
@@ -15367,6 +15464,16 @@ impl ToolRunEnv {
             ("WICKED_RUN_ID".to_string(), self.run_id.clone()),
             ("WICKED_RUN_UNIT".to_string(), self.ord.to_string()),
         ];
+        if !self.upstream_agents.is_empty() {
+            env.push((
+                UPSTREAM_AGENTS_ENV.to_string(),
+                self.upstream_agents
+                    .iter()
+                    .map(|(step, agent)| format!("{step}={agent}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
         if let Some(choice) = &self.consent_choice {
             env.push((
                 crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
@@ -15686,6 +15793,7 @@ fn run_tool_cmd_jailed(
             p
         }
     };
+    proc.env_remove(UPSTREAM_AGENTS_ENV);
     for (k, v) in extra_env {
         proc.env(k, v);
     }
@@ -17000,6 +17108,7 @@ fn start_send_back(
         unit.assigned_cli = Some(lead);
         unit.assigned_invocation = Some(invocation);
         let input = StepInput {
+            base_commit: None,
             run_id: one_shot.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -17222,6 +17331,7 @@ fn units_are(
                 && u.catalog == p.catalog
                 && u.executes_code == p.executes_code
                 && u.required_deliverables == p.required_deliverables
+                && u.write_set == p.write_set
                 && u.skill_ref == p.skill_ref
                 && u.tool_cmd == p.tool_cmd
                 && u.rubric == p.rubric
@@ -32886,12 +32996,29 @@ mod deliverable_floor_tests {
         subs: &mut crate::event_log::EventSink,
         run_id: &str,
     ) -> (AgentSession, WorkUnit) {
+        fold_with_evidence(
+            store,
+            subs,
+            run_id,
+            crate::workflow::UnitEvidence::default(),
+        )
+    }
+
+    fn fold_with_evidence(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (AgentSession, WorkUnit) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let out = StepOutput {
             run_id: run_id.into(),
             unit_ix: 0,
-            attempt: 0,
+            attempt: crate::domain::get_session(store, run_id)
+                .unwrap()
+                .unwrap()
+                .attempt,
             output: prose(),
             status: StepStatus::Ok,
             usage: None,
@@ -32906,7 +33033,7 @@ mod deliverable_floor_tests {
             &tx,
             out,
             None,
-            crate::workflow::UnitEvidence::default(),
+            evidence,
             "",
             &None,
             &None,
@@ -32919,6 +33046,114 @@ mod deliverable_floor_tests {
             .unwrap()
             .remove(0);
         (session, unit)
+    }
+
+    #[test]
+    fn a_previous_pass_deliverable_is_rejected_as_stale() {
+        let wd = tmp("pass-stale");
+        std::fs::write(wd.join("rules.json"), "{}").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(wd.join("rules.json"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run = "pass-stale";
+        seed(
+            &mut store,
+            run,
+            Some(wd.to_string_lossy().into_owned()),
+            vec![],
+            vec!["rules.json".into()],
+        );
+        let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+        unit.status = UnitStatus::Done;
+        unit.last_attempt = Some(0);
+        unit.assigned_cli = Some("claude".into());
+        put_node(&mut store, unit.to_node()).unwrap();
+        let mut next = WorkUnit::pending(format!("{run}:next"), run, 2, "next");
+        next.status = UnitStatus::Done;
+        next.tool_cmd = Some(vec!["true".into()]);
+        next.repeat_from = Some("u1".into());
+        put_node(&mut store, next.to_node()).unwrap();
+        let mut session = crate::domain::get_session(&store, run).unwrap().unwrap();
+        session.unit_ix = 1;
+        session.clis = vec!["claude".into()];
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        assert!(repeat_gate::after_pass(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut session,
+            1,
+            r#"wicked-repeat {"next":"continue","line":"page 2"}"#,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap()
+        .is_some());
+        let (_, unit) = fold(&mut store, &mut subs, run);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(unit.denial.as_ref().unwrap().source, "deliverables");
+        assert!(unit.denial_reason.unwrap().contains("(stale:"));
+        let _ = std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn write_set_evidence_rejects_outside_paths_and_unavailable_checks() {
+        for report in [
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec!["src/x.rs".into()],
+                error: None,
+            }),
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec![],
+                error: Some("snapshot failed".into()),
+            }),
+            None,
+        ] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run = "write-set-denied";
+            seed(&mut store, run, None, vec![], vec![]);
+            let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+            unit.write_set = vec![".wicked/domain/".into(), "coverage-report.json".into()];
+            put_node(&mut store, unit.to_node()).unwrap();
+            let expected = match &report {
+                Some(r) if r.error.is_some() => "snapshot failed",
+                Some(_) => "src/x.rs",
+                None => "no write-set evidence",
+            };
+            let mut subs = crate::event_log::EventSink::default();
+            let (tx, rx) = channel();
+            subs.push(tx);
+            let (session, unit) = fold_with_evidence(
+                &mut store,
+                &mut subs,
+                run,
+                crate::workflow::UnitEvidence {
+                    write_set: report,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(unit.status, UnitStatus::Rejected);
+            assert_eq!(unit.denial.as_ref().unwrap().source, "write_set");
+            assert!(unit.denial_reason.unwrap().contains(expected));
+            assert_eq!(session.status, SessionStatus::AwaitingHuman);
+            assert!(rx.try_iter().any(|e| matches!(
+                e,
+                CoreEvent::StepFailed {
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                    ..
+                }
+            )));
+        }
     }
 
     /// THE REPRODUCTION (§1). A unit declares `required_deliverables` and reports Ok having
@@ -33009,6 +33244,7 @@ mod deliverable_floor_tests {
         // `sandbox_root`, the fold starts checking a directory no worker ever wrote to and the
         // floor fails every unbound run that honestly produced its deliverable.
         let probe = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -40909,6 +41145,7 @@ mod consent_plan_tests {
             run_id: run_id.into(),
             ord: 2,
             consent_choice: unit.consent_choice.clone(),
+            upstream_agents: Vec::new(),
             repeat: None,
             evidence_root: None,
             tree_from: None,
@@ -41666,5 +41903,75 @@ mod git_identity_missing_tests {
         let resolved = identity_missing_in(&repo);
         let _ = std::fs::remove_dir_all(&repo);
         assert!(resolved.is_empty(), "{resolved:?}");
+    }
+}
+
+#[cfg(test)]
+mod upstream_agents_tests {
+    use super::*;
+
+    #[test]
+    fn extract_apply_env_uses_done_transitive_agents_current_assignment() {
+        let plan = crate::plan::PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..Default::default()
+        };
+        let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "map", "upstream");
+        for u in &mut units {
+            u.status = crate::domain::UnitStatus::Done;
+            u.assigned_cli = Some("claude".into());
+            if u.phase_id() == Some("extract") {
+                u.assigned_cli = Some(" codex ".into());
+            }
+        }
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        let env = ToolRunEnv {
+            run_id: "upstream".into(),
+            ord: apply.ord,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(apply, &units),
+        }
+        .vars();
+        let pairs = &env
+            .iter()
+            .find(|(k, _)| k == UPSTREAM_AGENTS_ENV)
+            .unwrap()
+            .1;
+        assert!(pairs.split(',').any(|p| p == "extract=codex"), "{pairs}");
+        assert!(pairs.find("extract=codex") < pairs.find("critique=claude"));
+        units
+            .iter_mut()
+            .find(|u| u.phase_id() == Some("extract"))
+            .unwrap()
+            .assigned_cli = Some("bad,seat".into());
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        assert!(!upstream_agents(apply, &units)
+            .iter()
+            .any(|(s, _)| s == "extract"));
+
+        let unit = crate::domain::WorkUnit::pending("empty:tool", "empty", 1, "tool");
+        let env = ToolRunEnv {
+            run_id: "empty".into(),
+            ord: 1,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(&unit, &[]),
+        }
+        .vars();
+        assert!(!env.iter().any(|(k, _)| k == UPSTREAM_AGENTS_ENV));
     }
 }
