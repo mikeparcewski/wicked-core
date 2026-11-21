@@ -825,6 +825,7 @@ mod tests {
             base_skill_ref: None,
             id: "u-test".to_string(),
             session_id: "sess-test".to_string(),
+            parent_run_id: None,
             ord: 1,
             description: description.to_string(),
             stage: StageKind::Build,

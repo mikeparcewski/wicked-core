@@ -78,6 +78,7 @@ mod tests {
             base_skill_ref: None,
             id: format!("u-test-{ord}"),
             session_id: "sess-p2wl".to_string(),
+            parent_run_id: None,
             ord,
             description: description.to_string(),
             stage: StageKind::Build,

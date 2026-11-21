@@ -1129,6 +1129,9 @@ pub struct WorkUnit {
     pub id: String,
     /// The owning session id.
     pub session_id: String,
+    /// (core#1413) The asking run, only on engine-internal session units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
     /// 1-based order in the plan.
     pub ord: u32,
     /// The unit's description (becomes the gate's governance `work` context).
@@ -1932,6 +1935,7 @@ impl WorkUnit {
         WorkUnit {
             id: id.into(),
             session_id: session_id.into(),
+            parent_run_id: None,
             ord,
             stage: StageKind::classify(&description),
             description,
@@ -2853,6 +2857,22 @@ mod tests {
             u, back,
             "WorkUnit must survive a node round-trip losslessly"
         );
+    }
+
+    // (core#1413) Ordinary and legacy units keep the same wire shape.
+    #[test]
+    fn parent_run_id_is_optional_and_only_serializes_when_set() {
+        let unit = WorkUnit::pending("r:u1", "r", 1, "work");
+        assert_eq!(unit.parent_run_id, None);
+        let node = unit.to_node();
+        assert!(!node.metadata.contains_key("parent_run_id"));
+        assert_eq!(WorkUnit::from_node(&node).unwrap().parent_run_id, None);
+
+        let mut judge = WorkUnit::pending("validator-agent", "validator", 1, "judge");
+        judge.parent_run_id = Some("r".to_string());
+        let wire = serde_json::to_value(&judge).unwrap();
+        assert_eq!(wire["parent_run_id"], "r");
+        assert_eq!(serde_json::from_value::<WorkUnit>(wire).unwrap(), judge);
     }
 
     /// crew#311 / core#297 §2 back-compat: `executes_code` round-trips when set, serializes to
