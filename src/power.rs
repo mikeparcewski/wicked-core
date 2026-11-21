@@ -1668,7 +1668,6 @@ pub fn attempt_notes(unit: &crate::domain::WorkUnit) -> Vec<String> {
 /// appended to it (` (operator amendment: <text>)`, exact text from its rulings): the continuation
 /// restates the task as authored plus this attempt's [`attempt_notes`], never older rounds' notes.
 pub fn authored_task(unit: &crate::domain::WorkUnit) -> String {
-    let mut task = unit.description.clone();
     // Strip appended history only; note text can itself contain another segment (core#1520).
     let segments: Vec<String> = unit
         .operator_rulings
@@ -1676,14 +1675,25 @@ pub fn authored_task(unit: &crate::domain::WorkUnit) -> String {
         .filter(|r| r.action == "amend")
         .map(|r| format!(" (operator amendment: {})", r.text))
         .collect();
-    while let Some(segment) = segments
-        .iter()
-        .filter(|s| task.ends_with(s.as_str()))
-        .max_by_key(|s| s.len())
-    {
-        task.truncate(task.len() - segment.len());
+    let strip = |text: &str| {
+        let mut task = text.to_string();
+        while let Some(segment) = segments
+            .iter()
+            .filter(|s| task.ends_with(s.as_str()))
+            .max_by_key(|s| s.len())
+        {
+            task.truncate(task.len() - segment.len());
+        }
+        task
+    };
+    // Notes given after the last send-back, then the send-back's marker (`apply_rework_marker`
+    // keeps it as the last segment it writes): the notes before it are stripped under it, and the
+    // marker stays (core#1520, coord r1 on #1710).
+    let task = strip(&unit.description);
+    match task.rfind(crate::actor::REWORK_MARKER_PREFIX) {
+        Some(ix) => format!("{}{}", strip(&task[..ix]), &task[ix..]),
+        None => task,
     }
-    task
 }
 
 /// (core#1486) The block every turn of the attempt carries for its [`attempt_notes`].
@@ -2656,6 +2666,36 @@ mod tests {
                 _ => {}
             }
         }
+    }
+
+    /// (core#1520, coord r1 on #1710) a send-back marker after the notes does not shield them: the
+    /// notes before the marker and after it are stripped, the marker stays.
+    #[test]
+    fn authored_task_strips_notes_around_a_send_back_marker() {
+        let mut unit = crate::domain::WorkUnit::pending("r:fix", "r", 0, "do the fix");
+        for text in ["steer one", "steer two"] {
+            unit.operator_rulings.push(crate::domain::OperatorRuling {
+                action: "amend".into(),
+                text: text.into(),
+                attempt: 1,
+                at: 1,
+            });
+        }
+        let marker = " (requested changes r2: the review failed)";
+        unit.description = format!("do the fix (operator amendment: steer one){marker}");
+        assert_eq!(authored_task(&unit), format!("do the fix{marker}"));
+        unit.description
+            .push_str(" (operator amendment: steer two)");
+        assert_eq!(authored_task(&unit), format!("do the fix{marker}"));
+        assert_eq!(
+            crate::actor::apply_rework_marker(
+                "do the fix (operator amendment: steer one)",
+                2,
+                "the review failed"
+            ),
+            format!("do the fix (operator amendment: steer one){marker}"),
+            "the marker shape this test strips around"
+        );
     }
 
     /// (core#1520) nested note segments and authored mid-sentence text survive suffix stripping.

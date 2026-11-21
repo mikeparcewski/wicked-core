@@ -9204,7 +9204,7 @@ pub(crate) fn redrive_attempt(
 /// `PTY_PROMPT_LIMIT`, so the marker REPLACES its predecessor instead of growing per round; the
 /// full findings ride `unitReworkAmended.amendment` and the seat's prior-context block.
 pub(crate) const REWORK_MARKER_MAX: usize = 160;
-const REWORK_MARKER_PREFIX: &str = " (requested changes r";
+pub(crate) const REWORK_MARKER_PREFIX: &str = " (requested changes r";
 
 /// `description` with ` (requested changes r<round>: <head>)` as its LAST segment — a prior
 /// marker (from an earlier round) is replaced, whitespace in `head` is collapsed, and the marker

@@ -1797,8 +1797,14 @@ pub fn floor_fill(
     // Intake phases use the same floor, without a fabricated rule id (core#1178).
     let mut qe_floor = Vec::new();
     if creator {
+        // The band's own rule (`floor_types`): no security review on a plan with no code work,
+        // which `floor_fill` would refuse (coord r1 on #1710).
+        let code_run = plan.steps.iter().any(|s| code_work_step(catalog, s));
         for ty in input.qe_phases {
-            if QE_PLAN_PHASES.contains(&ty.as_str()) && !floor.contains(ty) {
+            if QE_PLAN_PHASES.contains(&ty.as_str())
+                && (code_run || ty != "security_review")
+                && !floor.contains(ty)
+            {
                 floor.push(ty.clone());
                 qe_floor.push(ty.clone());
             }
@@ -5551,6 +5557,34 @@ mod tests {
                 "provenance_supplied"
             );
         }
+    }
+
+    /// (core#1178, coord r1 on #1710) an intake QE plan naming `security_review` on a plan with no
+    /// code work adds no security review, so the plan is not refused.
+    #[test]
+    fn intake_qe_security_review_skips_a_plan_with_no_code_work() {
+        let plan = rubric_plan(serde_json::json!({
+            "steps": [{"catalog": "produce", "id": "draft"}]
+        }));
+        let phases = vec!["security_review".to_string()];
+        let filled = floor_fill(
+            crate::catalog::catalog(),
+            &plan,
+            FloorInput {
+                score: 0,
+                destructive: false,
+                human_confirm: &crate::domain::HumanConfirm::None,
+                deliver: None,
+                obligations: &[],
+                ran: &[],
+                requires_evaluator: false,
+                requires_qe: false,
+                power_absorbs: &[],
+                qe_phases: &phases,
+            },
+        )
+        .expect("a produce-only plan is not refused");
+        assert!(!filled.floor.contains(&"security_review".to_string()));
     }
 
     /// (core#1178) known intake QE phases join the floor without inventing testing rules.
