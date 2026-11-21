@@ -1549,6 +1549,9 @@ pub(crate) fn run(
                     // (core#1390) A probe of an earlier, ended life of this run id is never
                     // this launch's.
                     dispatch_probe::forget(&run_id);
+                    // (core#1418) Nor is a step result of that life still out for its fold reads:
+                    // it would fold into this one (the relaunch resets the cursor and attempt).
+                    fold_reads::forget_run(&run_id);
                     let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
                     // Extra write roots (core#259) are judged in the sync fast path like the
                     // project/preflight checks above: an invalid root is a synchronous Err with
@@ -5643,7 +5646,8 @@ pub(crate) fn launch_run_inner(
         }
     }
     // (core#1418) A step result of an earlier life of this id still out for its fold reads never
-    // folds into this one.
+    // folds into this one. (The campaign's node launch; the interactive `LaunchRun` arm forgets in
+    // its fast path.)
     fold_reads::forget_run(&run_id);
     // FRESH (re-)launch: clear any prior TERMINAL run's per-run governance dir so a stale Deny from that
     // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner

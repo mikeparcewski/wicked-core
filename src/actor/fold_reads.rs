@@ -405,4 +405,37 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&wd);
     }
+
+    /// (coord review of #1739, F3) Both launch entry points forget an earlier life's hand-offs:
+    /// the interactive `LaunchRun` fast path (pinned end to end by `tests/fold_reads_handoff.rs`)
+    /// and `launch_run_inner`, the campaign's node launch. A launch that skipped it would let the
+    /// earlier life's result fold into the new one.
+    #[test]
+    fn both_launch_paths_forget_an_earlier_lifes_hand_offs() {
+        let src = include_str!("../actor.rs");
+        // Built by concatenation so this test cannot satisfy itself out of its own text.
+        let call = concat!("fold_reads::", "forget_run(&run_id);");
+        let arm = src
+            .find("Command::LaunchRun { spec, reply } => {")
+            .expect("the LaunchRun arm");
+        let arm_end = src[arm..]
+            .find("Command::ContinueLaunch {")
+            .map(|e| arm + e)
+            .unwrap_or(src.len());
+        assert!(
+            src[arm..arm_end].contains(call),
+            "the interactive launch no longer forgets an earlier life's hand-offs"
+        );
+        let inner = src
+            .find("pub(crate) fn launch_run_inner(")
+            .expect("launch_run_inner");
+        let inner_end = src[inner + 1..]
+            .find("\npub(crate) fn ")
+            .map(|e| inner + 1 + e)
+            .unwrap_or(src.len());
+        assert!(
+            src[inner..inner_end].contains(call),
+            "launch_run_inner (a campaign node launch) no longer forgets an earlier life's hand-offs"
+        );
+    }
 }
