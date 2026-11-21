@@ -7754,7 +7754,9 @@ fn run_cli_runner(
                     // rule check cannot establish creators, so it convenes no council (a dispute
                     // holds) — fail-closed.
                     None,
-                    None,
+                    // The floor stops on this task's launch identity, read from the actor's maps
+                    // exactly as an in-process worker's floor is (core#1533).
+                    crate::actor::launch_stop(&lifecycle_maps, &task.run_id, task.launch_seq),
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),

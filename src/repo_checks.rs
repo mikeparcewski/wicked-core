@@ -501,7 +501,7 @@ impl FloorStop {
 
 fn floor_stop_text(reason: &str) -> &'static str {
     match reason {
-        "superseded" => "a reassign superseded this attempt",
+        "superseded" => "a newer launch superseded this attempt",
         "shutdown" => "the engine shut down",
         _ => "the run was cancelled",
     }
@@ -994,8 +994,9 @@ pub(crate) fn is_provisioning(name: &str) -> bool {
 pub struct FloorResume {
     /// The attempt whose floor was interrupted.
     pub from_attempt: u32,
-    /// Why the earlier floor was interrupted.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Why the earlier floor was interrupted. A report written before the cause was recorded
+    /// reads as the only cause there was then: a daemon restart.
+    #[serde(default = "restart_cause", skip_serializing_if = "String::is_empty")]
     pub cause: String,
     /// The checks reused from it (finished there on the same tree, base and check set), in run order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1003,6 +1004,11 @@ pub struct FloorResume {
     /// Set when nothing could be reused and the floor ran from its first check: why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restarted: Option<String>,
+}
+
+/// The interruption cause a report without one stands for (core#1151).
+fn restart_cause() -> String {
+    "the daemon restarted".into()
 }
 
 impl FloorResume {
@@ -1372,10 +1378,12 @@ impl OpenJournal {
                     None
                 };
                 let cause = match rec.stopped.as_deref() {
-                    Some("superseded") => format!("a reassign superseded attempt {}", rec.attempt),
+                    Some("superseded") => {
+                        format!("a newer launch superseded attempt {}", rec.attempt)
+                    }
                     Some("cancelled") => "the run was cancelled".into(),
-                    Some("shutdown") => "the daemon restarted".into(),
-                    _ if rec.daemon != floor_daemon_id() => "the daemon restarted".into(),
+                    Some("shutdown") => restart_cause(),
+                    _ if rec.daemon != floor_daemon_id() => restart_cause(),
                     _ => "it ended before it finished".into(),
                 };
                 let resume = FloorResume {
@@ -3649,6 +3657,10 @@ impl Drop for CheckScratch {
 /// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
 /// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
 /// the lock is released before the slow removal, so the run's next floor never waits on it.
+/// (core#1542) A container floor's base target claim is deleted UNDER that lock, waiting until it is
+/// gone (normally about a second: no pod mounts it any more; bounded at 180 s): released first, the
+/// run's next floor could re-apply the claim while it is still terminating and start a pod on a
+/// claim that then disappears. Meanwhile the next floor waits at its shared lease.
 /// Returns whether the base output is gone.
 fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
     let aside = format!(".base-drop-{}", random_tmp_name());

@@ -16067,8 +16067,11 @@ fn drain_capped(r: Option<impl std::io::Read>) -> Vec<u8> {
     buf
 }
 
-/// The actor's launch identity survives cancellation, reassign and resumed lifecycles.
-fn launch_stop(
+/// (core#1533, core#1542) A launch's stop: its run was cancelled (`"cancelled"`), a newer launch of
+/// the run superseded it — a reassign, a cancel or a resume (`"superseded"`) — or the engine is
+/// shutting down (`"shutdown"`). The tool child and every floor of the launch read it, whichever
+/// runner carries the launch. `None` without lifecycle maps.
+pub(crate) fn launch_stop(
     maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     run_id: &str,
     seq: u64,

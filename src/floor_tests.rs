@@ -6113,7 +6113,11 @@ fn core_1605_disk_filling_during_a_check_is_terminal_and_preserves_evidence() {
 #[test]
 fn core_c6_journal_names_reassign_and_restart() {
     for (reason, other_daemon, expected) in [
-        (Some("superseded"), false, "a reassign superseded attempt 4"),
+        (
+            Some("superseded"),
+            false,
+            "a newer launch superseded attempt 4",
+        ),
         (Some("cancelled"), false, "the run was cancelled"),
         (Some("shutdown"), false, "the daemon restarted"),
         (None, true, "the daemon restarted"),
@@ -6216,4 +6220,15 @@ fn core_c6_directory_junction_is_removed_without_following_it() {
         "safe"
     );
     std::fs::remove_dir_all(base).unwrap();
+}
+
+/// (coord review of #1713) A resumed report written before the cause was recorded still names one.
+#[test]
+fn core_c6_a_resume_without_a_recorded_cause_reads_as_a_restart() {
+    let r: FloorResume =
+        serde_json::from_value(serde_json::json!({ "fromAttempt": 3, "reused": ["lint"] }))
+            .unwrap();
+    assert_eq!(r.cause, "the daemon restarted");
+    assert!(r.note().contains("the daemon restarted"), "{}", r.note());
+    assert!(!r.note().contains("()"), "{}", r.note());
 }
