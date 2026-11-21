@@ -13,8 +13,19 @@
 //! (a run that ended, a superseded attempt, a moved cursor) runs on the result that comes back, so
 //! a read that took long is applied only to the run it was read for. A result is handed off at most
 //! once: one that carries a read is folded as it is.
+//!
+//! The hand-off breaks the actor's first-in, first-out order for that one result: a cancel and a
+//! relaunch of the same run id can be processed while its reads run, and the relaunch resets the
+//! cursor and attempt the fold's guards compare. So each hand-off is registered on the actor
+//! thread (`HANDED`); a cancel or a relaunch forgets the run's hand-offs ([`forget_run`]), and a
+//! result that comes back from a forgotten hand-off is dropped ([`returned`]). Reads only count
+//! when this actor handed them off: `UnitEvidence::fold_handoff` never crosses the wire, and reads
+//! that arrive without it are stripped, so the fold runs them itself.
 
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 
 use wicked_apps_core::GraphStore;
@@ -25,6 +36,48 @@ use crate::workflow::{
     CreatorPathsRead, PinnedValidatorRead, StepOutput, StepStatus, UnitEvidence,
 };
 use crate::worktree_guard::WorktreeSnapshot;
+
+thread_local! {
+    /// The hand-offs this actor has out, by id, with their run ids. Thread-local: the actor's own
+    /// (every cancel and launch runs on the actor thread), never another actor's in the process.
+    static HANDED: RefCell<HashMap<u64, String>> = RefCell::new(HashMap::new());
+}
+
+static NEXT_HANDOFF: AtomicU64 = AtomicU64::new(1);
+
+/// On the actor: `run_id` was cancelled or relaunched. A result still out for its reads belongs to
+/// a life of the run that is over, and is dropped when it comes back.
+pub(crate) fn forget_run(run_id: &str) {
+    HANDED.with(|h| h.borrow_mut().retain(|_, r| r != run_id));
+}
+
+/// What to do with a step result that arrives on the actor, before its fold.
+pub(crate) enum Arrival {
+    /// Fold it (it was never handed off, or its hand-off is still this run's).
+    Fold,
+    /// It comes back from a hand-off the run outlived: drop it.
+    Outlived,
+}
+
+/// On the actor: account for a step result's hand-off. A result back from a live hand-off is
+/// folded with its reads; one from a forgotten hand-off is dropped. Reads a result carries without
+/// a hand-off of this actor are stripped, so the fold runs them itself (fail-closed).
+pub(crate) fn returned(evidence: &mut UnitEvidence) -> Arrival {
+    match evidence.fold_handoff {
+        Some(id) => {
+            if HANDED.with(|h| h.borrow_mut().remove(&id)).is_some() {
+                Arrival::Fold
+            } else {
+                Arrival::Outlived
+            }
+        }
+        None => {
+            evidence.pinned_validator = None;
+            evidence.creator_paths = None;
+            Arrival::Fold
+        }
+    }
+}
 
 /// The step result as the worker posted it, carried to the reads' thread and posted back.
 pub(crate) struct Posted {
@@ -55,6 +108,7 @@ pub(crate) fn plan(
     evidence: &UnitEvidence,
 ) -> Option<Reads> {
     if !matches!(output.status, StepStatus::Ok)
+        || evidence.fold_handoff.is_some()
         || evidence.pinned_validator.is_some()
         || evidence.creator_paths.is_some()
     {
@@ -106,8 +160,11 @@ pub(crate) fn plan(
     })
 }
 
-/// Run `reads` on a thread of their own and post `posted` back to the actor with them.
+/// On the actor: register the hand-off, then run `reads` on a thread of their own and post `posted`
+/// back to the actor with them.
 pub(crate) fn start(self_tx: &Sender<Command>, reads: Reads, posted: Posted) {
+    let id = NEXT_HANDOFF.fetch_add(1, Ordering::Relaxed);
+    HANDED.with(|h| h.borrow_mut().insert(id, posted.output.run_id.clone()));
     let tx = self_tx.clone();
     std::thread::spawn(move || {
         let Posted {
@@ -154,6 +211,7 @@ pub(crate) fn start(self_tx: &Sender<Command>, reads: Reads, posted: Posted) {
                 paths,
             });
         }
+        evidence.fold_handoff = Some(id);
         let _ = tx.send(Command::ApplyStepResult {
             output,
             agent_verdict,
@@ -237,32 +295,81 @@ mod tests {
         };
         assert!(plan(&store, &superseded, &UnitEvidence::default()).is_none());
 
-        let (tx, rx) = std::sync::mpsc::channel();
-        start(
-            &tx,
-            reads,
-            Posted {
-                output,
-                agent_verdict: None,
-                evidence: Box::default(),
-                process_gen: None,
-                launch_seq: 0,
-                ack: None,
-            },
-        );
-        match rx.recv_timeout(Duration::from_secs(120)) {
-            Ok(Command::ApplyStepResult {
-                output, evidence, ..
-            }) => {
-                assert_eq!(output.run_id, "r-fold");
-                let read = evidence
-                    .pinned_validator
-                    .expect("the result comes back with the read");
-                assert_eq!(read.denial, None, "the validator passed, off the actor");
+        let posted = |output: &StepOutput| Posted {
+            output: output.clone(),
+            agent_verdict: None,
+            evidence: Box::default(),
+            process_gen: None,
+            launch_seq: 0,
+            ack: None,
+        };
+        let back = |rx: &std::sync::mpsc::Receiver<Command>| -> Box<UnitEvidence> {
+            match rx.recv_timeout(Duration::from_secs(120)) {
+                Ok(Command::ApplyStepResult {
+                    output, evidence, ..
+                }) => {
+                    assert_eq!(output.run_id, "r-fold");
+                    evidence
+                }
+                Ok(_) => panic!("only the result is posted back"),
+                Err(e) => panic!("the result is posted back: {e}"),
             }
-            Ok(_) => panic!("only the result is posted back"),
-            Err(e) => panic!("the result is posted back: {e}"),
-        }
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        start(&tx, reads, posted(&output));
+        let mut evidence = back(&rx);
+        let read = evidence
+            .pinned_validator
+            .clone()
+            .expect("the result comes back with the read");
+        assert_eq!(read.denial, None, "the validator passed, off the actor");
+        assert!(
+            matches!(returned(&mut evidence), Arrival::Fold),
+            "a result back from a live hand-off is folded"
+        );
+        assert!(evidence.pinned_validator.is_some(), "with its read");
+
+        // A failing validator's denial comes back on the result (fail-closed off the actor too).
+        unit.validator = Some(crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "exit 1".into(),
+            approved: true,
+        });
+        put_nodes(&mut store, &[unit.to_node()]).unwrap();
+        let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
+        start(&tx, reads, posted(&output));
+        let mut evidence = back(&rx);
+        assert!(
+            evidence
+                .pinned_validator
+                .as_ref()
+                .and_then(|r| r.denial.as_deref())
+                .is_some_and(|d| d.starts_with("pinned validator failed")),
+            "the failing validator's denial comes back: {:?}",
+            evidence.pinned_validator
+        );
+        assert!(matches!(returned(&mut evidence), Arrival::Fold));
+
+        // The run is cancelled or relaunched while its reads run: the result is dropped on return.
+        let reads = plan(&store, &output, &UnitEvidence::default()).expect("planned again");
+        start(&tx, reads, posted(&output));
+        forget_run("r-fold");
+        let mut evidence = back(&rx);
+        assert!(
+            matches!(returned(&mut evidence), Arrival::Outlived),
+            "a result its run outlived never folds"
+        );
+
+        // Reads this actor did not hand off are stripped: the fold runs them itself.
+        let mut forged = UnitEvidence {
+            pinned_validator: evidence.pinned_validator.clone(),
+            ..Default::default()
+        };
+        assert!(matches!(returned(&mut forged), Arrival::Fold));
+        assert!(
+            forged.pinned_validator.is_none(),
+            "a read that was not handed off is not applied"
+        );
         let _ = std::fs::remove_dir_all(&wd);
     }
 }

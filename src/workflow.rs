@@ -446,6 +446,10 @@ pub struct UnitEvidence {
     /// not read off the actor; the fold then diffs itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub creator_paths: Option<CreatorPathsRead>,
+    /// (core#1418) Which hand-off of the actor (`actor::fold_reads`) made the two reads above. Never on the wire: a read the actor did not hand off itself is not applied,
+    /// and a hand-off the run outlived (cancelled or relaunched since) is dropped.
+    #[serde(skip)]
+    pub fold_handoff: Option<u64>,
 }
 
 /// (core#1418) A pinned validator's re-verify, run off the actor ([`UnitEvidence::pinned_validator`])

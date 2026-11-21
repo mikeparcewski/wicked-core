@@ -2583,13 +2583,22 @@ pub(crate) fn run(
             Command::ApplyStepResult {
                 output,
                 agent_verdict,
-                evidence,
+                mut evidence,
                 // Stale-result guards: consumed by the bus consumer; carried here only so a result
                 // handed to the fold reads below comes back whole.
                 process_gen: step_gen,
                 launch_seq,
                 ack,
             } => {
+                // (core#1418) A result back from a hand-off its run outlived (cancelled or
+                // relaunched while its reads ran) is dropped: the relaunch reset the cursor and
+                // attempt the fold's guards compare.
+                if let fold_reads::Arrival::Outlived = fold_reads::returned(&mut evidence) {
+                    if let Some(ack_tx) = ack {
+                        let _ = ack_tx.send(());
+                    }
+                    continue;
+                }
                 // (core#1418) A result whose fold would run the unit's pinned validator (up to
                 // 120 s) or a creator floor's diff on the actor: those run on a thread first,
                 // bound to the inputs the fold would use, and the result comes back with them in
@@ -5630,6 +5639,9 @@ pub(crate) fn launch_run_inner(
             return Err(RunExists(run_id, format!("{:?}", existing.status)).into());
         }
     }
+    // (core#1418) A step result of an earlier life of this id still out for its fold reads never
+    // folds into this one.
+    fold_reads::forget_run(&run_id);
     // FRESH (re-)launch: clear any prior TERMINAL run's per-run governance dir so a stale Deny from that
     // run can't spuriously fail this one (decisions_path_for is never otherwise truncated). resume_run_inner
     // / redrive do NOT clear — they continue the same run's log. A brand-new id has no dir (harmless no-op).
@@ -14640,6 +14652,7 @@ fn dispatch_unit_with(
                     phase_scope: None,
                     pinned_validator: None,
                     creator_paths: None,
+                    fold_handoff: None,
                 }),
                 process_gen: None, // tool-cmd path — not bus-dispatched
                 // The arm ignores it (a killed child's `Cancelled` result is Stale at the terminal
@@ -22303,6 +22316,8 @@ pub(crate) fn cancel_run(
     // campaign::fail_fast, human Reject, governance Deny) inherit the invalidation uniformly.
     // Placed here — after the terminal early-returns — so a double-cancel does not re-advance
     // the sequence and spuriously supersede a subsequent relaunch.
+    // (core#1418) A step result out for its fold reads is this life's: it is dropped on return.
+    fold_reads::forget_run(run_id);
     if let Some(ref m) = lifecycle_maps {
         let mut maps = m.lock().unwrap_or_else(|p| p.into_inner());
         maps.tombstone_run(run_id);
