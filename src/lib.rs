@@ -786,7 +786,22 @@ pub struct Core {
     /// (DES-TEAMING-002 T6) The team supervisor on the bus, when this core runs one
     /// (`spawn_with_acp_sessions` with a bus): stopped when the last handle drops.
     _team_supervisor: Option<Arc<crate::team::supervisor::SupervisorHandle>>,
+    /// (core#1305) Disconnects once the actor thread has returned (its store connection is closed
+    /// by then); see [`Core::actor_exit_for_test`]. Nothing outside tests reads it.
+    _actor_exit: ActorExit,
     _shutdown: Arc<ShutdownGuard>,
+}
+
+/// The receiving end of [`actor_exit_signal`], taken once by a test.
+type ActorExit = Arc<std::sync::Mutex<Option<Receiver<()>>>>;
+
+/// (core#1305) A sender the actor thread holds until `actor::run` has returned, and the receiver
+/// that disconnects then. A test that reopens a store waits on it rather than sleeping: the actor's
+/// teardown (bus bridge join, bounded exec joins) outlasted a 300 ms sleep on Windows, and the reopen
+/// met `database is locked`.
+fn actor_exit_signal() -> (Sender<()>, ActorExit) {
+    let (tx, rx) = channel();
+    (tx, Arc::new(std::sync::Mutex::new(Some(rx))))
 }
 
 /// Arm the launch bridge for a `Core` about to spawn, when `WICKED_BUS_DB` names a bus
@@ -964,7 +979,10 @@ impl Core {
         let stats = Arc::new(actor_stats::ActorStats::starting());
         let stats_actor = stats.clone();
         let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
+        let (actor_exited, actor_exit) = actor_exit_signal();
         std::thread::spawn(move || {
+            // Dropped after `actor::run` returns, i.e. after its store connection closed (core#1305).
+            let _exited = actor_exited;
             actor::run(
                 bus_bridge_actor,
                 path,
@@ -996,6 +1014,7 @@ impl Core {
             qe_host,
             team: team_cfg,
             _team_supervisor: None,
+            _actor_exit: actor_exit,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -1053,7 +1072,10 @@ impl Core {
         let stats_actor = stats.clone();
         let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
         let publishes = matches!(team_link, crate::team::publish::TeamLink::Publisher { .. });
+        let (actor_exited, actor_exit) = actor_exit_signal();
         std::thread::spawn(move || {
+            // Dropped after `actor::run` returns, i.e. after its store connection closed (core#1305).
+            let _exited = actor_exited;
             actor::run(
                 bus_bridge_actor,
                 path,
@@ -1112,6 +1134,7 @@ impl Core {
             qe_host,
             team: team_cfg,
             _team_supervisor: supervisor,
+            _actor_exit: actor_exit,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         };
         (core, runner)
@@ -1154,7 +1177,10 @@ impl Core {
         let stats = Arc::new(actor_stats::ActorStats::starting());
         let stats_actor = stats.clone();
         let reads = Arc::new(read_model::ReadModel::for_store(&log_path, stats.clone()));
+        let (actor_exited, actor_exit) = actor_exit_signal();
         std::thread::spawn(move || {
+            // Dropped after `actor::run` returns, i.e. after its store connection closed (core#1305).
+            let _exited = actor_exited;
             actor::run(
                 bus_bridge_actor,
                 path,
@@ -1186,6 +1212,7 @@ impl Core {
             qe_host,
             team: team_cfg,
             _team_supervisor: None,
+            _actor_exit: actor_exit,
             _shutdown: Arc::new(ShutdownGuard { tx }),
         }
     }
@@ -2093,6 +2120,18 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// TEST-ONLY (core#1305): a receiver that disconnects once this core's actor thread has
+    /// returned, so its store connection is closed. Take it before the last handle drops; a
+    /// second call panics.
+    #[cfg(test)]
+    pub(crate) fn actor_exit_for_test(&self) -> Receiver<()> {
+        self._actor_exit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+            .expect("the actor-exit receiver is taken once")
     }
 
     /// TEST-ONLY (core#1390): send the actor `Shutdown` while this handle lives on.
