@@ -896,6 +896,7 @@ mod tests {
             providers_unobserved: false,
             observation_pending: false,
             observation_reset: false,
+            provider_shared_seats: Vec::new(),
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,
