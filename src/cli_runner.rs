@@ -3488,6 +3488,36 @@ fn with_floor_heartbeat<R>(
     })
 }
 
+/// (core#1217) The engine's reads of the tree between the seat's last turn and the floor: a git
+/// snapshot of a large worktree on a loaded host took 4-5 min there with no event. Work that runs
+/// longer than `after` says so on the run's stream, then once a minute, so the wait is named.
+const PRE_FLOOR_NOTE: &str = "floor: reading the tree the seat left before the checks start";
+const PRE_FLOOR_NOTE_AFTER: Duration = Duration::from_secs(20);
+
+fn pre_floor_noted<R>(emit: &DeltaSink, after: Duration, work: impl FnOnce() -> R) -> R {
+    std::thread::scope(|s| {
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        s.spawn(move || {
+            let t0 = std::time::Instant::now();
+            let mut wait = after;
+            // As the heartbeat: tick ONLY on a timeout; a panicking `work` drops `done_tx`.
+            while matches!(
+                done_rx.recv_timeout(wait),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                engine_note(
+                    emit,
+                    &format!("{PRE_FLOOR_NOTE} — {} s", t0.elapsed().as_secs()),
+                );
+                wait = Duration::from_secs(60);
+            }
+        });
+        let r = work();
+        let _ = done_tx.send(());
+        r
+    })
+}
+
 /// The roster-injectable core of [`run_unit_and_judge`] — split out ONLY so the seat-selection (C1) is
 /// unit-testable with a fabricated roster and no live registry. Production always passes the live
 /// [`crate::registry_roster`].
@@ -5737,47 +5767,51 @@ fn run_unit_and_judge_in<'scope, 'env>(
         && input.unit.default_floor
         && input.workdir.is_some()
         && !crate::worktree_guard::applies_to(&input.unit);
-    let tree_changed: Option<bool> = if bound_agent {
-        let wd = input.workdir.as_deref().expect("bound");
-        match input.unit.worktree_baseline.as_ref() {
-            Some(baseline) => match crate::worktree_guard::tree_changed_since(wd, baseline) {
-                Ok(changed) => Some(changed),
-                Err(e) => {
-                    eprintln!(
-                        "wicked-core: unit {} — could not compare the worktree against its \
+    let tree_changed: Option<bool> = pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
+        if bound_agent {
+            let wd = input.workdir.as_deref().expect("bound");
+            match input.unit.worktree_baseline.as_ref() {
+                Some(baseline) => match crate::worktree_guard::tree_changed_since(wd, baseline) {
+                    Ok(changed) => Some(changed),
+                    Err(e) => {
+                        eprintln!(
+                            "wicked-core: unit {} — could not compare the worktree against its \
                          dispatch baseline ({e}); treating the tree as CHANGED so the default \
                          repo-checks floor runs (fail-closed, F-7R2-005)",
+                            input.unit.ord
+                        );
+                        Some(true)
+                    }
+                },
+                None => {
+                    eprintln!(
+                        "wicked-core: unit {} carries no dispatch baseline; treating the tree as \
+                     CHANGED so the default repo-checks floor runs (fail-closed, F-7R2-005)",
                         input.unit.ord
                     );
                     Some(true)
                 }
-            },
-            None => {
-                eprintln!(
-                    "wicked-core: unit {} carries no dispatch baseline; treating the tree as \
-                     CHANGED so the default repo-checks floor runs (fail-closed, F-7R2-005)",
-                    input.unit.ord
-                );
-                Some(true)
             }
+        } else {
+            None
         }
-    } else {
-        None
-    };
+    });
     // (core#544) The tree id as it stands now: the floor's report records the tree it ran
     // ON, so a rework that leaves the tree identical to the one the unit's last floor judged
     // carries that verdict forward (the fold), while a tree no floor of this unit has judged —
     // an operator's hand edit between attempts — runs the checks even though this attempt
     // changed nothing.
-    let current_tree: Option<String> = bound_agent
-        .then(|| {
-            let wd = input.workdir.as_deref()?;
-            let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
-            crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
-                .map(|s| s.tree)
-                .ok()
-        })
-        .flatten();
+    let current_tree: Option<String> = pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
+        bound_agent
+            .then(|| {
+                let wd = input.workdir.as_deref()?;
+                let git_dir = input.unit.worktree_baseline.as_ref()?.git_dir.as_deref()?;
+                crate::worktree_guard::snapshot_through(wd, std::path::Path::new(git_dir))
+                    .map(|s| s.tree)
+                    .ok()
+            })
+            .flatten()
+    });
     let unfloored_tree =
         input.unit.repo_checks.as_ref().is_some_and(|r| {
             current_tree.is_none() || r.tree.as_deref() != current_tree.as_deref()
@@ -5826,25 +5860,29 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // its own account and never reaches the gate this feeds. (power-speed-2) Taken before the QE
     // reviewer and the team's final pass, which run alongside the floor: neither may write the
     // tree, and the final comparison below still catches one that did.
-    let guard_first_look = if output.status == StepStatus::Ok && !member_reviewing {
-        crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
-    } else {
-        None
-    };
+    let guard_first_look = pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
+        if output.status == StepStatus::Ok && !member_reviewing {
+            crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
+        } else {
+            None
+        }
+    });
     // F-039 REPO CHECKS FLOOR: whether it runs, and on what ([`FloorPlan`]).
     let floor_plan = if member_reviewing {
         None
     } else {
-        floor_plan(
-            input,
-            &output,
-            floor_rerun,
-            guard_first_look.as_ref(),
-            current_tree.as_deref(),
-            default_floor_applies,
-            recheck_armed,
-            stop.clone(),
-        )
+        pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
+            floor_plan(
+                input,
+                &output,
+                floor_rerun,
+                guard_first_look.as_ref(),
+                current_tree.as_deref(),
+                default_floor_applies,
+                recheck_armed,
+                stop.clone(),
+            )
+        })
     };
     // (power-speed-2) A floor that runs on a CLEAN CHECKOUT of a known tree starts now, on its own
     // thread, while the QE reviewer, the team's final pass and the judge do their work: the
@@ -14036,6 +14074,36 @@ mod floor_heartbeat_tests {
                 .any(|l| l.contains("; now `test` on the base (pass 2 of `test`)")),
             "{lines:?}"
         );
+    }
+
+    /// core#1217: the engine's tree reads before the floor name a long wait (after `after`, then
+    /// once a minute) and say nothing when they are quick; the work's result passes through.
+    #[test]
+    fn core_1217_a_slow_pre_floor_read_is_named_and_a_quick_one_is_silent() {
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
+        let t0 = Instant::now();
+        let sink = recording_sink(&seen, t0);
+        let r = pre_floor_noted(&sink, Duration::from_millis(100), || {
+            std::thread::sleep(Duration::from_millis(600));
+            7
+        });
+        assert_eq!(r, 7);
+        let slow = seen.lock().unwrap().clone();
+        assert_eq!(
+            slow.len(),
+            1,
+            "one note after `after`, the next a minute on: {slow:?}"
+        );
+        assert!(
+            slow[0].1.starts_with(&format!("\n{PRE_FLOOR_NOTE} — ")) && slow[0].1.ends_with(" s\n"),
+            "{slow:?}"
+        );
+        assert!(slow[0].0 >= Duration::from_millis(100), "{slow:?}");
+        seen.lock().unwrap().clear();
+        let r = pre_floor_noted(&sink, PRE_FLOOR_NOTE_AFTER, || "quick");
+        assert_eq!(r, "quick");
+        assert!(seen.lock().unwrap().is_empty(), "a quick read says nothing");
+        assert!(t0.elapsed() < Duration::from_secs(5), "no wait for `after`");
     }
 
     /// Work that returns at once emits exactly the start heartbeat, and the call returns

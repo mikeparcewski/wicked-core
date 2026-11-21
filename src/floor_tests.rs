@@ -4119,6 +4119,7 @@ fn interrupted_journal(
                 .find(|r| r.name == c.name)
                 .unwrap()
                 .clone(),
+            guarded: false,
         })
         .collect();
     let rec = JournalRecord {
@@ -4621,6 +4622,7 @@ fn journal_offering(tag: &str, entries: &[(&str, Vec<crate::floor_log::LogRef>)]
                 name: name.to_string(),
                 argv: run.argv.clone(),
                 run,
+                guarded: false,
             }
         })
         .collect();
@@ -5275,6 +5277,7 @@ fn core_1152_the_rerun_never_re_reads_the_checks_from_the_checkout() {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: test_run.clone(),
+            guarded: false,
         }],
     };
     std::fs::write(
@@ -5366,6 +5369,7 @@ fn core_1152_a_journal_restored_failure_after_reuse_runs_the_floor_again() {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: red_e2e.clone(),
+            guarded: false,
         }],
     };
     std::fs::write(
@@ -5579,18 +5583,31 @@ fn core_1144_a_floor_that_changed_its_checkout_leaves_no_record() {
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
-/// (core#1144, xreview r1) A check a creator floor took from an interrupted floor's journal (which
-/// may have run in the live worktree) is never published for verify: only what this clean-checkout
-/// floor ran itself is.
+/// (core#1144, xreview r1) A check a creator floor took from an interrupted floor's journal that
+/// may have run in the live worktree (an unguarded or older entry) is never published for verify:
+/// only what a clean-checkout floor ran is.
 #[cfg(unix)]
 #[test]
 fn core_1144_a_journal_resumed_check_is_never_published() {
+    journal_resumed_publication("core-1144-resumed", false);
+}
+
+/// (core#1152 DONE 2) A resumed creator floor publishes what the interrupted floor ran on a guarded
+/// clean checkout of the same tree, beside what it ran itself: verify reuses both.
+#[cfg(unix)]
+#[test]
+fn core_1152_a_resumed_creator_floor_publishes_its_guarded_journal_checks() {
+    journal_resumed_publication("core-1152-resumed", true);
+}
+
+#[cfg(unix)]
+fn journal_resumed_publication(tag: &str, guarded: bool) {
     let _env = crate::test_env::ENV_LOCK
         .read()
         .unwrap_or_else(|p| p.into_inner());
     let n = Core1144::NONCE;
     let r = Core1144::new(
-        "core-1144-resumed",
+        tag,
         serde_json::json!({"typecheck": false, "lint": n, "test": n}),
     );
     let first = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
@@ -5598,7 +5615,8 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
         eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
         return;
     }
-    // An interrupted floor's journal holding `lint` (as a live-worktree floor would leave it).
+    // An interrupted floor's journal holding `lint`: unguarded, as a live-worktree floor would
+    // leave it, or guarded, as a clean-checkout floor leaves it.
     let ctx = r.ctx(FloorStage::Creator, &r.base);
     let lint = first
         .checks
@@ -5620,6 +5638,7 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
             name: check.name.clone(),
             argv: check.argv.clone(),
             run: lint.clone(),
+            guarded,
         }],
     };
     std::fs::write(
@@ -5634,12 +5653,21 @@ fn core_1144_a_journal_resumed_check_is_never_published() {
         "{resumed:#?}"
     );
     let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
-    assert_eq!(
-        verify.reused_from.as_ref().map(|x| x.reused.clone()),
-        Some(vec!["test".to_string()]),
-        "only the check the clean-checkout floor ran is reused: {verify:#?}"
-    );
-    assert_ne!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
+    if guarded {
+        assert_eq!(
+            verify.reused_from.as_ref().map(|x| x.reused.clone()),
+            Some(vec!["lint".to_string(), "test".to_string()]),
+            "the guarded journal entry is published beside the fresh run: {verify:#?}"
+        );
+        assert_eq!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
+    } else {
+        assert_eq!(
+            verify.reused_from.as_ref().map(|x| x.reused.clone()),
+            Some(vec!["test".to_string()]),
+            "only the check the clean-checkout floor ran is reused: {verify:#?}"
+        );
+        assert_ne!(stdout_of(&verify, "lint"), stdout_of(&first, "lint"));
+    }
     let _ = std::fs::remove_dir_all(&r.wt);
 }
 
