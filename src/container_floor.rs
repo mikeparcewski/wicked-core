@@ -2138,7 +2138,7 @@ impl std::fmt::Debug for ArmedContainer {
 const REVOKE_ATTEMPTS: usize = 3;
 
 /// A full launch nonce keeps overlapping executions distinct (core#1546).
-fn gateway_unit(run: &str, ord: u32) -> String {
+pub(crate) fn gateway_unit(run: &str, ord: u32) -> String {
     format!("{run}#{ord}@{}", uuid::Uuid::new_v4().simple())
 }
 
@@ -2376,6 +2376,17 @@ fn carry_prompt_in_file_at(
     argv: &mut Vec<String>,
     mounts: &mut Vec<Mount>,
 ) -> Result<Option<CarriedPrompt>, String> {
+    carry_prompt_scoped(base, cli, prompt, argv, mounts, None)
+}
+
+fn carry_prompt_scoped(
+    base: &Path,
+    cli: &str,
+    prompt: &str,
+    argv: &mut Vec<String>,
+    mounts: &mut Vec<Mount>,
+    scope: Option<&str>,
+) -> Result<Option<CarriedPrompt>, String> {
     let base = crate::worker_sandbox::canon_lenient(base).unwrap_or_else(|| base.to_path_buf());
     let store = base.join(".wicked-prompts");
     // The store must lie outside everything this seat mounts: under a bind (a worker home
@@ -2395,7 +2406,11 @@ fn carry_prompt_in_file_at(
             m.display()
         ));
     }
-    let dir = store.join(uuid::Uuid::new_v4().simple().to_string());
+    let dir = store.join(
+        scope
+            .map(str::to_string)
+            .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string()),
+    );
     let guard = RemoveOnDrop(dir.clone());
     let file = dir.join("prompt.md");
     write_private_file(&file, prompt.as_bytes())
@@ -2456,7 +2471,12 @@ fn carry_prompt_in_file_at(
         return Ok(None); // the argv does not carry the prompt: nothing to hand over (dir removed)
     }
     mounts.push(Mount::Bind {
-        path: file.clone(),
+        // A directory subPath sees the new prompt inode after each fresh copy-in.
+        path: if scope.is_some() {
+            file.parent().expect("prompt directory").to_path_buf()
+        } else {
+            file.clone()
+        },
         rw: false,
     });
     Ok(Some(CarriedPrompt { file, _dir: guard }))
@@ -2476,6 +2496,8 @@ pub(crate) fn arm_noting(
     gateway_dir: Option<&Path>,
     on_built: &mut dyn FnMut(&str, Duration),
     before_copy: &mut dyn FnMut(&MountView) -> Result<(), String>,
+    warm: Option<std::sync::Arc<crate::k8s::seat::WarmCheckout>>,
+    timeout: Duration,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
     let wsl = is_wsl(
         Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists(),
@@ -2553,8 +2575,15 @@ pub(crate) fn arm_noting(
         .map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     // core#1228: a prompt too long for one exec argument rides a private read-only file.
     let prompt_file = match prompt.filter(|p| p.len() > PROMPT_ARGV_MAX) {
-        Some(p) => carry_prompt_in_file(cli, p, &mut argv, &mut mounts)
-            .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
+        Some(p) => match &warm {
+            Some(c) => {
+                let base = wicked_apps_core::spawn::worker_home_base()
+                    .map_err(|e| (FloorUnarmed::ArgvTooLong, e.to_string()))?;
+                carry_prompt_scoped(&base, cli, p, &mut argv, &mut mounts, Some(&c.scope()))
+            }
+            None => carry_prompt_in_file(cli, p, &mut argv, &mut mounts),
+        }
+        .map_err(|e| (FloorUnarmed::ArgvTooLong, e))?,
         None => None,
     };
     let working_set: Vec<PathBuf> = std::iter::once(spec.tree.clone())
@@ -2616,6 +2645,13 @@ pub(crate) fn arm_noting(
     check_seat_image(&facts, &dests).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     let image =
         pin_seat_image(&rt, &image, &facts.id).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    // A warm judge pod is reused only for the same pinned seat image and floor image.
+    let floor_id = image_id(&rt, &floor_image).ok_or_else(|| {
+        (
+            FloorUnarmed::NoSeatImage,
+            format!("floor image {floor_image} vanished"),
+        )
+    })?;
     crate::k8s::clock::mark("image_inspect");
     // The pids probe loads the floor image itself; seat::arm loads the seat, floor and sync
     // images before any of its pods (one load point per pod-creating path).
@@ -2723,7 +2759,7 @@ pub(crate) fn arm_noting(
         .tree
         .canonicalize()
         .unwrap_or_else(|_| spec.tree.clone());
-    let read_only_view = inp.read_only;
+    let read_only_view = inp.read_only || warm.is_some();
     let mut land_mounts = mounts.clone();
     if read_only_view {
         land_mounts.retain(|m| m.dst() != tree.as_path());
@@ -2780,9 +2816,13 @@ pub(crate) fn arm_noting(
         seed_base: seed_base.as_deref(),
         memory: &k8s_memory(memory_from(memory.as_deref())),
         gateway_ip: gateway_ip.as_deref(),
-        // The engine's own ceiling for a turn (`WICKED_UNIT_TIMEOUT_SECS`; a unit's budget only
-        // lowers it): the pod outlives no turn the engine would still wait for (review r4).
-        deadline: crate::workflow::unit_timeout_ceiling(),
+        // Warm checkout needs enough physical lifetime for this call's actual timeout;
+        // cold pods retain their existing ceiling and deadline.
+        deadline: if warm.is_some() {
+            timeout
+        } else {
+            crate::workflow::unit_timeout_ceiling()
+        },
         role,
         deps: deps.as_deref(),
     };
@@ -2797,8 +2837,18 @@ pub(crate) fn arm_noting(
         &|| {
             crate::k8s::run_ended_since(run_id, before)
                 || crate::k8s::lifecycle(run_id) != generation
+                || warm.as_ref().is_some_and(|c| !c.live())
         },
-        || crate::k8s::seat::arm(&kube, &arm_spec, landrun.clone()),
+        || match &warm {
+            Some(c) => crate::k8s::seat::arm_warm(
+                &kube,
+                &arm_spec,
+                landrun.clone(),
+                Some(c.clone()),
+                Some((&facts.id, &floor_id)),
+            ),
+            None => crate::k8s::seat::arm(&kube, &arm_spec, landrun.clone()),
+        },
     )?;
     // The gate hook judges this unit as a pod seat's (B17).
     let mut env = env;
@@ -4025,6 +4075,8 @@ esac
                     Some(&gateway),
                     &mut |_, _| {},
                     &mut |_| Ok(()),
+                    None,
+                    crate::workflow::unit_timeout_ceiling(),
                 ) else {
                     panic!("stub refuses submission");
                 };
@@ -4234,6 +4286,8 @@ esac
             Some(&gateway),
             &mut |_, _| {},
             &mut before_copy,
+            None,
+            crate::workflow::unit_timeout_ceiling(),
         );
         match out {
             Err((why, detail)) => {
@@ -6551,6 +6605,40 @@ mod long_prompt_tests {
         let p = "Judge the coverage step. ".repeat(11_000);
         assert!(p.len() > 256 * 1024);
         p
+    }
+
+    #[test]
+    fn warm_long_prompts_keep_a_stable_directory_mount_with_fresh_contents() {
+        let root = base();
+        let mut prior = None;
+        for prompt in ["first batch", "second batch"] {
+            let mut argv = vec!["codex".into(), "exec".into(), prompt.into()];
+            let mut mounts = Vec::new();
+            let carried = carry_prompt_scoped(
+                &root,
+                "codex",
+                prompt,
+                &mut argv,
+                &mut mounts,
+                Some("warm-key"),
+            )
+            .unwrap()
+            .unwrap();
+            let [Mount::Bind { path, rw: false }] = mounts.as_slice() else {
+                panic!("expected a read-only prompt directory");
+            };
+            assert!(path.is_dir());
+            assert_eq!(
+                std::fs::read_to_string(path.join("prompt.md")).unwrap(),
+                prompt
+            );
+            if let Some(prior) = &prior {
+                assert_eq!(path, prior);
+            }
+            prior = Some(path.clone());
+            drop(carried);
+        }
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

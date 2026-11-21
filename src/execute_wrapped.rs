@@ -3281,8 +3281,25 @@ impl Drop for OneShotScratch {
 impl WrappedCliStepRunner {
     /// Run one unit's CLI, streaming stdout lines through `emit` as they arrive.
     fn exec(&self, input: &StepInput, emit: &DeltaSink) -> StepOutput {
-        let one_shot_scratch =
-            is_engine_internal(&input.unit).then(|| OneShotScratch::new(&input.run_id));
+        // Acquire before touching stable host paths; retain through gateway release.
+        let warm = match warm_judge_key(input)
+            .map(crate::k8s::seat::checkout_warm)
+            .transpose()
+        {
+            Ok(warm) => warm.flatten(),
+            Err(why) => return posture_refusal(input, &why),
+        };
+        let sandbox = warm
+            .as_ref()
+            .map(|w| sandbox_root(&w.scope()))
+            .unwrap_or_else(|| sandbox_for(input));
+        if let Some(warm) = &warm {
+            if let Err(why) = warm.fresh_dir(&sandbox) {
+                return posture_refusal(input, &why);
+            }
+        }
+        let one_shot_scratch = (is_engine_internal(&input.unit) && warm.is_none())
+            .then(|| OneShotScratch::new(&input.run_id));
         let cli_key = input
             .unit
             .assigned_cli
@@ -3354,11 +3371,23 @@ impl WrappedCliStepRunner {
                     g.note_root(&c);
                 }
             }
+            let stable = warm.as_ref().map(|w| w.scope());
+            if let (
+                Some(warm),
+                Some(run),
+                wicked_apps_core::spawn::SeatConfig::Isolated {
+                    root: Some(root), ..
+                },
+            ) = (&warm, stable.as_deref(), &c)
+            {
+                warm.fresh_dir(&crate::container_floor::container_run_dir(root, run))
+                    .map_err(anyhow::Error::msg)?;
+            }
             let c = config_for_container_launch(
                 c,
                 runs_in_seat(input),
                 crate::container_floor::container_mode(),
-                &input.run_id,
+                stable.as_deref().unwrap_or(&input.run_id),
                 posture.label(),
             )?;
             c.ensure_dirs().map(|()| c)
@@ -3500,7 +3529,7 @@ impl WrappedCliStepRunner {
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
                 codex_checks_instruction(
-                    &input.workdir.clone().unwrap_or_else(|| sandbox_for(input)),
+                    input.workdir.as_deref().unwrap_or(&sandbox),
                     &ctx.check_scratch,
                     input.unit.notes_root.as_deref()
                 )
@@ -3595,7 +3624,7 @@ impl WrappedCliStepRunner {
             );
         // Run in the worktree if the run targets a repo; else a per-run temp sandbox (never the
         // orchestrator's own cwd).
-        let cwd = input.workdir.clone().unwrap_or_else(|| sandbox_for(input));
+        let cwd = input.workdir.clone().unwrap_or(sandbox);
         // (DES-TEAMING-002 §8.8) A team member turn's read-only repository view: honoured on a
         // member turn only, and only in a seat container, where the mount itself is read-only
         // (`container_floor::add_read_view`). Anywhere else the turn is refused, never run with
@@ -3791,7 +3820,7 @@ impl WrappedCliStepRunner {
             match crate::mcp_isolation::seat_mcp_pin_flags_with_ask(
                 wicked_apps_core::spawn::SeatCli::from_binary(&binary),
                 seat_config.root(),
-                Some(&input.workdir.clone().unwrap_or_else(|| sandbox_for(input))),
+                Some(&cwd),
                 ask_enabled,
             ) {
                 Ok((pins, enabled)) => {
@@ -4292,6 +4321,8 @@ impl WrappedCliStepRunner {
                     gateway_dir.as_deref(),
                     &mut on_built,
                     &mut before_copy,
+                    warm.clone(),
+                    crate::workflow::effective_timeout(self.timeout, input.unit.budget_secs),
                 );
                 if let Some((phases, total_ms)) = crate::k8s::clock::take() {
                     self.emit_event(crate::event::CoreEvent::SeatArmTimed {
@@ -5496,7 +5527,31 @@ pub(crate) fn redirect_scratch_into_boundary(cmd: &mut Command, cwd: &Path) {
     }
 }
 
-/// A per-run temp sandbox for repo-less runs (so a real CLI never edits the orchestrator's own tree).
+/// Rule-check and agent-gate judges share a trust domain, keyed by parent and exact seat.
+fn warm_judge_key(input: &StepInput) -> Option<crate::k8s::seat::WarmKey> {
+    if !crate::container_floor::container_mode()
+        || !input.run_id.starts_with("validator-")
+        || input.unit.session_id != "validator"
+        || input.unit.id != "validator-agent"
+        || input.governance.is_some()
+        || input.workdir.is_some()
+    {
+        return None;
+    }
+    let parent = input
+        .unit
+        .parent_run_id
+        .as_deref()
+        .filter(|p| !p.is_empty())?;
+    let seat = input
+        .unit
+        .assigned_cli
+        .as_deref()
+        .filter(|s| !s.is_empty())?;
+    Some(crate::k8s::seat::WarmKey::new(parent, seat))
+}
+
+/// A per-run temp sandbox for repo-less runs (so a real CLI never edits the orchestrator's tree).
 pub(crate) fn sandbox_for(input: &StepInput) -> PathBuf {
     sandbox_root(&input.run_id)
 }
@@ -10051,6 +10106,76 @@ mod tests {
             launch_seq: 0,
             required_skills: Vec::new(),
         }
+    }
+
+    #[test]
+    fn only_parented_validator_judges_get_a_stable_warm_identity() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            Path::new("container"),
+        );
+        // The ordinary agent-gate judge shares the rule-check judge's identity and trust domain.
+        let mut input = parented_judge_input();
+        input.unit.assigned_cli = Some("codex#2".into());
+        let key = warm_judge_key(&input).unwrap();
+        let sandbox = sandbox_for(&input);
+        input.run_id = "validator-another-fresh-call".into();
+        assert_eq!(key, warm_judge_key(&input).unwrap());
+        assert_ne!(
+            sandbox,
+            sandbox_for(&input),
+            "cold sandboxes use the call id"
+        );
+        input.unit.assigned_cli = Some("codex#3".into());
+        assert_ne!(key, warm_judge_key(&input).unwrap());
+        for seat in [None, Some(String::new())] {
+            input.unit.assigned_cli = seat;
+            assert!(warm_judge_key(&input).is_none());
+        }
+        input.unit.assigned_cli = Some("codex#2".into());
+        for parent in [None, Some(String::new())] {
+            input.unit.parent_run_id = parent;
+            assert!(warm_judge_key(&input).is_none());
+        }
+        input.unit.parent_run_id = Some("parent-run".into());
+        input.unit.id = crate::validator::REPROBE_UNIT.into();
+        assert!(warm_judge_key(&input).is_none());
+        input.unit.id = "validator-agent".into();
+        for session in ["council", "triage", "member", "send-back", "seat-reprobe"] {
+            input.unit.session_id = session.into();
+            assert!(warm_judge_key(&input).is_none());
+        }
+        input.unit.session_id = "validator".into();
+        for prefix in [
+            "council-",
+            "triage-",
+            "member-",
+            "send-back-",
+            "seat-reprobe-",
+        ] {
+            input.run_id = format!("{prefix}call");
+            assert!(warm_judge_key(&input).is_none());
+        }
+        input.run_id = "validator-call".into();
+        input.workdir = Some(PathBuf::from("repo"));
+        assert!(warm_judge_key(&input).is_none());
+        input.workdir = None;
+        input.governance = Some(crate::workflow::GovernanceContext {
+            human_confirm: Default::default(),
+            db_path: "estate.db".into(),
+            code_graph_db: None,
+            extra_write_roots: Vec::new(),
+            extra_read_roots: Vec::new(),
+            project_id: None,
+            repo_id: None,
+            apps: None,
+        });
+        assert!(warm_judge_key(&input).is_none());
+        input.governance = None;
+        assert!(warm_judge_key(&input).is_some());
+        let _host = VarGuard::set(crate::container_floor::SEAT_FLOOR_ENV, Path::new("host"));
+        assert!(warm_judge_key(&input).is_none());
     }
 
     #[test]
