@@ -1059,7 +1059,7 @@ const SEAT_BUILDERS: &[(&str, &str, usize, &str)] = &[
 
 /// Production source of `rel` with every test-only item (`#[cfg(test)]`, `#[cfg(all(test, …))]`)
 /// removed, module or function.
-fn production(rel: &str) -> Vec<String> {
+pub(crate) fn production(rel: &str) -> Vec<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("src")
         .join(rel);
@@ -1081,6 +1081,13 @@ fn production(rel: &str) -> Vec<String> {
             // line at its indent, any other item at the first line at its indent ending in `;`
             // (braces inside strings and char literals cannot fool either).
             let indent = &lines[j][..lines[j].len() - lines[j].trim_start().len()];
+            // A test helper's signature can span lines; start at its body, not the next
+            // production function's semicolon (e.g. skills_snapshot::resolve_in).
+            if lines[j].contains("fn ") {
+                while j + 1 < lines.len() && !lines[j].trim_end().ends_with(['{', ';', '}']) {
+                    j += 1;
+                }
+            }
             let block = lines[j].trim_end().ends_with('{');
             let ends = |l: &str| {
                 let l = l.trim_end();
