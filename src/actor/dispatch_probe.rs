@@ -177,6 +177,7 @@ pub(crate) fn start(self_tx: &Sender<Command>, job: ProbeJob) {
                 let _ = release.recv();
             }
         }
+        crate::code_graph::wait_checkout_index(Path::new(&job.repo.code_graph_db));
         let (unit_id, attempt, status, cursor) = (
             job.unit.id.clone(),
             job.attempt,

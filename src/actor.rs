@@ -1125,6 +1125,11 @@ pub(crate) fn run(
         }
         Err(e) => eprintln!("wicked-core: could not pin repo graph keys (core#1419): {e:#}"),
     }
+    if let Ok(sessions) = crate::domain::all_sessions(&store) {
+        for session in &sessions {
+            lease_mapping_graph(&store, session);
+        }
+    }
     let boot_repos = crate::repo::list_repos(&store);
     // One-time repo-graph migration (core#406, `code_graph.rs` ADR): a registered repo whose graph
     // sits under the pre-#406 estate home (`~/.wicked-estate/repo-graphs/<key>`) and nowhere under
@@ -1825,7 +1830,9 @@ pub(crate) fn run(
                         archive_note: None,
                         verified_tree: None,
                         run_branch: None,
-                        base_commit: None,
+                        base_commit: crate::domain::get_session(&store, &run_id)?
+                            .filter(|s| s.repo_ref == repo_ref)
+                            .and_then(|s| s.base_commit),
                         finished_at: None,
                         // The launch bench (`distribute::launch_benched`): seats that cannot keep a
                         // per-call check on the host floor (C5), and codex on a worktree-bound run
@@ -1915,6 +1922,13 @@ pub(crate) fn run(
                             .and_then(|(_, preset)| preset.as_deref())
                             .or_else(|| selected_def.as_ref().map(|d| d.id.as_str()))
                             == Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID);
+                        // Reserve on the actor before any later launch can start its D8.
+                        if graph_required {
+                            if let Some(db) = crate::code_graph::resolved_code_graph_db(&graph_key)
+                            {
+                                crate::code_graph::lease_graph(&db, &rid, None);
+                            }
+                        }
                         // (core#1373) The tree is minted on its own thread: it carries this
                         // daemon's id all the same.
                         let daemon_owner = crate::repo::bound_daemon_owner();
@@ -1944,6 +1958,8 @@ pub(crate) fn run(
                                             &wt,
                                             &b.commit,
                                             graph_root.as_deref(),
+                                            &rid,
+                                            graph_required,
                                         );
                                         if let Err(e) = &indexed {
                                             tracing::warn!(
@@ -1952,6 +1968,16 @@ pub(crate) fn run(
                                                  a behavioural scope fails closed",
                                                 b.commit
                                             );
+                                        }
+                                        if !graph_required {
+                                            if let Ok(crate::code_graph::BaseIndex::Held(held)) =
+                                                &indexed
+                                            {
+                                                tracing::warn!(
+                                                    run_id = %rid, ?held,
+                                                    "repo graph held away from the run base; scoring fails closed"
+                                                );
+                                            }
                                         }
                                         if let Some(why) = crate::code_graph::base_index_refusal(
                                             graph_required,
@@ -1962,6 +1988,7 @@ pub(crate) fn run(
                                             // here, before the run is failed, so a relaunch of
                                             // the same id never races its removal.
                                             crate::repo::discard_minted_worktree(&root, &rid);
+                                            crate::code_graph::release_graph_lease(&rid);
                                             let _ = tx.send(Command::WorktreeFailed {
                                                 run_id: rid,
                                                 error: why,
@@ -1978,11 +2005,14 @@ pub(crate) fn run(
                                         base_commit,
                                     }
                                 }
-                                Err(e) => Command::WorktreeFailed {
-                                    run_id: rid,
-                                    error: e.to_string(),
-                                    cleaned: false,
-                                },
+                                Err(e) => {
+                                    crate::code_graph::release_graph_lease(&rid);
+                                    Command::WorktreeFailed {
+                                        run_id: rid,
+                                        error: e.to_string(),
+                                        cleaned: false,
+                                    }
+                                }
                             };
                             let _ = tx.send(cmd);
                         });
@@ -2121,6 +2151,7 @@ pub(crate) fn run(
                         // Store read failure: cannot determine terminal state safely.
                         // Clean up the worktree and emit an error so the UI learns about it.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref path) = workdir {
                             let _ = std::fs::remove_dir_all(path);
                         }
@@ -2134,6 +2165,7 @@ pub(crate) fn run(
                 };
                 if already_terminal {
                     in_flight.remove(&run_id);
+                    crate::code_graph::release_graph_lease(&run_id);
                     // Spawn cleanup off the actor thread — git worktree remove can be slow
                     // and must not stall NAPI calls waiting on the actor.
                     if let Some(ref ref_id) = repo_ref {
@@ -2169,6 +2201,7 @@ pub(crate) fn run(
                         // Store write failure — cannot persist workdir; fail the session rather
                         // than proceeding with an inconsistent store state.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref ref_id) = repo_ref {
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                                 let root = repo.root_path.clone();
@@ -2207,6 +2240,9 @@ pub(crate) fn run(
                     base_commit.as_deref(),
                     true,
                 );
+                if let Ok(Some(session)) = crate::domain::get_session(&store, &run_id) {
+                    lease_mapping_graph(&store, &session);
+                }
                 let (team_workflow, team_registry) = match team {
                     Ok(Some((_, id, reg))) => (Ok(Some(id)), Some(reg)),
                     Ok(None) => (Ok(spec.workflow.clone()), None),
@@ -2338,6 +2374,7 @@ pub(crate) fn run(
                 error,
                 cleaned,
             } => {
+                crate::code_graph::release_graph_lease(&run_id);
                 // The off-thread worktree creation failed. Mark the session Failed and surface
                 // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
                 // Guard: only update if the session is not already in a terminal state (e.g.
@@ -10658,6 +10695,7 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
@@ -10674,6 +10712,7 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
         // A run that armed again since it ended keeps its tree (codex r2): its live edits
@@ -10682,6 +10721,30 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
         }
     });
+}
+
+/// Restore a mapping's lease from its durable preset and base, including a reused worktree.
+fn lease_mapping_graph(store: &dyn GraphRead, session: &AgentSession) {
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) || session.team_plan.as_ref().and_then(|p| p.preset.as_deref())
+        != Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
+    {
+        return;
+    }
+    if let Some(repo) = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .filter(|r| !r.code_graph_db.is_empty())
+    {
+        crate::code_graph::lease_graph(
+            std::path::Path::new(&repo.code_graph_db),
+            &session.id,
+            session.base_commit.as_deref(),
+        );
+    }
 }
 
 /// The run's registered repository, when it has one that still resolves.
@@ -10701,6 +10764,7 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
     let rid = session.id.clone();
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || remove_run_floor_cache(workdir.as_deref(), &rid, epoch));
 }
 
@@ -11602,6 +11666,12 @@ fn advance_or_pause_with(
         return Ok(Progress::Paused);
     }
 
+    // (core#1369) The checkout index's holder read must see this run before dispatch tests its
+    // marker: a parked run is persisted Executing first (Planning and Distributing already hold).
+    if session.status == SessionStatus::AwaitingHuman {
+        session.status = SessionStatus::Executing;
+        put_node(store, session.to_node())?;
+    }
     dispatch_unit(
         store,
         subscribers,
@@ -12428,7 +12498,10 @@ fn dispatch_probe_job(
     // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
     let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
-    if !(baseline
+    let checkout_indexing =
+        crate::code_graph::checkout_index_in_flight(std::path::Path::new(&repo.code_graph_db));
+    if !(checkout_indexing
+        || baseline
         || new_author.is_some()
         || qe_unit
         || editor
