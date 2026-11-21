@@ -1974,8 +1974,10 @@ esac
 
     #[cfg(unix)]
     fn process_running(pid: u32) -> bool {
+        use wicked_apps_core::HardenedCommand;
         // ps also distinguishes orphaned zombies on systems whose init reaps slowly.
         let result = std::process::Command::new("ps")
+            .hardened()
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
             .unwrap();
