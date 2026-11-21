@@ -153,6 +153,10 @@ mod steering_packs;
 mod team;
 mod terminal;
 mod validator;
+/// (core#1068) Test support: a test that needs a loopback listener or a PTY skips loudly inside
+/// the seat sandbox, and fails as before anywhere else (CI included).
+#[doc(hidden)]
+pub mod test_sandbox;
 /// Test support for integration tests: whether the engine's sandbox cannot be applied because this
 /// process is already inside one (see `validator::nested_sandbox`).
 #[doc(hidden)]

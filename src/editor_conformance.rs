@@ -767,6 +767,12 @@ mod tests {
     /// daemon variables set and `WICKED_LIVE_EDITOR_PACK_TREE` naming a tree with one scaffolded editor pack.
     #[test]
     fn the_real_harness_passes_in_the_serve_jail_when_asked() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "the_real_harness_passes_in_the_serve_jail_when_asked",
+        ) {
+            return;
+        }
         let Some(garden) = std::env::var_os("WICKED_LIVE_EDITOR_CONFORMANCE") else {
             return;
         };

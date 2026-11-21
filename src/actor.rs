@@ -15218,6 +15218,12 @@ mod draft_render_live {
     #[test]
     #[ignore = "needs WICKED_TEST_HEADLESS_SHELL and WICKED_TEST_GARDEN_ROOT"]
     fn a_two_page_draft_is_measured_in_the_jail_and_reaches_no_listener() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_two_page_draft_is_measured_in_the_jail_and_reaches_no_listener",
+        ) {
+            return;
+        }
         let (Some(shell), Some(garden)) = (
             std::env::var_os("WICKED_TEST_HEADLESS_SHELL"),
             std::env::var_os("WICKED_TEST_GARDEN_ROOT"),
