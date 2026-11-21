@@ -1646,6 +1646,7 @@ mod tests {
                     requires_evaluator: true,
                     requires_qe: true,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .unwrap_or_else(|e| panic!("{name} floor fills: {e}"));
@@ -2765,6 +2766,7 @@ chmod +x node_modules/.bin/vitest
                     requires_evaluator: true,
                     requires_qe: true,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .unwrap_or_else(|e| panic!("{name}: {e}"));
@@ -3039,6 +3041,7 @@ chmod +x node_modules/.bin/vitest
                 requires_evaluator: true,
                 requires_qe: true,
                 power_absorbs: &[],
+                qe_phases: &[],
             },
         )
         .expect("floor fill");

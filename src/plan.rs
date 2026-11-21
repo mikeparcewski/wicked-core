@@ -1515,7 +1515,14 @@ pub struct FloorInput<'a> {
     /// orchestrator's approach at hand-off). Removed from the BAND floor only: a held rule that
     /// requires one still adds it. Empty on every phased run.
     pub power_absorbs: &'a [String],
+    /// Catalog types required by the intake QE plan; a type outside [`QE_PLAN_PHASES`] is model
+    /// output the floor ignores (core#1178).
+    pub qe_phases: &'a [String],
 }
+
+/// (core#1178) The phases an intake QE plan may add to the floor: gated checks of the change,
+/// never a creator, a tool or `deliver` (its `mandatoryPhases` is model output).
+pub const QE_PLAN_PHASES: [&str; 4] = ["architecture", "security_review", "review", "test"];
 
 /// (core#934) The floor reason of the evaluator step a run's assurance contract adds.
 pub const CONTRACT_EVALUATOR_REASON: &str =
@@ -1787,6 +1794,22 @@ pub fn floor_fill(
     }
     let mut floor = band_floor.clone();
     floor.extend(policy_floor.iter().map(|(t, _)| t.clone()));
+    // Intake phases use the same floor, without a fabricated rule id (core#1178).
+    let mut qe_floor = Vec::new();
+    if creator {
+        // The band's own rule (`floor_types`): no security review on a plan with no code work,
+        // which `floor_fill` would refuse (coord r1 on #1710).
+        let code_run = plan.steps.iter().any(|s| code_work_step(catalog, s));
+        for ty in input.qe_phases {
+            if QE_PLAN_PHASES.contains(&ty.as_str())
+                && (code_run || ty != "security_review")
+                && !floor.contains(ty)
+            {
+                floor.push(ty.clone());
+                qe_floor.push(ty.clone());
+            }
+        }
+    }
     // wicked-core#1338: a mapping plan delivers nothing, decided on the plan the floor leaves: the
     // floor's `deliver` goes only while the floor adds no creator to it (codex r2: a floor-added
     // `build` or `produce` is work to hand over).
@@ -1933,6 +1956,7 @@ pub fn floor_fill(
             None if contract_floor.as_deref() == Some(ty.as_str()) => {
                 CONTRACT_EVALUATOR_REASON.to_string()
             }
+            None if qe_floor.contains(ty) => "the intake QE plan requires it".to_string(),
             None => format!("band {} requires {ty}", row.band),
         };
         steps.insert(
@@ -2197,6 +2221,7 @@ mod tests {
                 requires_evaluator: false,
                 requires_qe: false,
                 power_absorbs: &[],
+                qe_phases: &[],
             },
         )
         .unwrap();
@@ -3559,6 +3584,7 @@ mod tests {
                     requires_evaluator: false,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
         }
@@ -3616,6 +3642,7 @@ mod tests {
                     requires_evaluator,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
         }
@@ -3731,6 +3758,7 @@ mod tests {
                     requires_evaluator: true,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .expect("the band's review still reviews the plan");
@@ -3784,6 +3812,7 @@ mod tests {
                     requires_evaluator: true,
                     requires_qe,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
         }
@@ -4420,6 +4449,7 @@ mod tests {
                     requires_evaluator: false,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .expect_err("refused");
@@ -4446,6 +4476,7 @@ mod tests {
                     requires_evaluator: false,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .expect("a code plan keeps its security_review");
@@ -4784,6 +4815,7 @@ mod tests {
                     requires_evaluator: false,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
             .unwrap();
@@ -5210,6 +5242,7 @@ mod tests {
                     requires_evaluator: false,
                     requires_qe: false,
                     power_absorbs: &[],
+                    qe_phases: &[],
                 },
             )
         }
@@ -5526,6 +5559,82 @@ mod tests {
         }
     }
 
+    /// (core#1178, coord r1 on #1710) an intake QE plan naming `security_review` on a plan with no
+    /// code work adds no security review, so the plan is not refused.
+    #[test]
+    fn intake_qe_security_review_skips_a_plan_with_no_code_work() {
+        let plan = rubric_plan(serde_json::json!({
+            "steps": [{"catalog": "produce", "id": "draft"}]
+        }));
+        let phases = vec!["security_review".to_string()];
+        let filled = floor_fill(
+            crate::catalog::catalog(),
+            &plan,
+            FloorInput {
+                score: 0,
+                destructive: false,
+                human_confirm: &crate::domain::HumanConfirm::None,
+                deliver: None,
+                obligations: &[],
+                ran: &[],
+                requires_evaluator: false,
+                requires_qe: false,
+                power_absorbs: &[],
+                qe_phases: &phases,
+            },
+        )
+        .expect("a produce-only plan is not refused");
+        assert!(!filled.floor.contains(&"security_review".to_string()));
+    }
+
+    /// (core#1178) known intake QE phases join the floor without inventing testing rules.
+    #[test]
+    fn intake_qe_phases_fill_the_creator_floor() {
+        let plan = rubric_plan(serde_json::json!({
+            "steps": [{"catalog": "build", "id": "build"}]
+        }));
+        let phases = vec![
+            "architecture".to_string(),
+            "unknown-model-phase".to_string(),
+            "deliver".to_string(),
+            "architecture".to_string(),
+        ];
+        let input = || FloorInput {
+            score: 0,
+            destructive: false,
+            human_confirm: &crate::domain::HumanConfirm::None,
+            deliver: None,
+            obligations: &[],
+            ran: &[],
+            requires_evaluator: false,
+            requires_qe: false,
+            power_absorbs: &[],
+            qe_phases: &phases,
+        };
+        let filled = floor_fill(crate::catalog::catalog(), &plan, input()).unwrap();
+        let steps: Vec<_> = filled
+            .steps
+            .steps
+            .iter()
+            .filter(|s| s.catalog == "architecture")
+            .collect();
+        assert_eq!(steps.len(), 1);
+        assert_eq!(
+            steps[0].floor_reason.as_deref(),
+            Some("the intake QE plan requires it")
+        );
+        assert_eq!(steps[0].floor_rule, None);
+        assert!(filled.policy_floor.is_empty());
+        assert!(!filled.floor.contains(&"unknown-model-phase".to_string()));
+        // A real catalog id outside the closed list is ignored too (no deliver without a command).
+        assert!(!filled.floor.contains(&"deliver".to_string()));
+        let read_only = rubric_plan(serde_json::json!({
+            "steps": [{"catalog": "understand", "id": "read"}]
+        }));
+        let filled = floor_fill(crate::catalog::catalog(), &read_only, input()).unwrap();
+        assert!(!filled.floor.contains(&"architecture".to_string()));
+    }
+
     fn rubric_plan(v: serde_json::Value) -> PlanSteps {
         serde_json::from_value(v).expect("a plan")
     }
@@ -5544,6 +5653,7 @@ mod tests {
                 requires_evaluator: false,
                 requires_qe,
                 power_absorbs: &[],
+                qe_phases: &[],
             },
         )
         .expect("the plan fills")

@@ -662,3 +662,401 @@ fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
         Some("review" | "critique" | "security_review" | "test")
     )
 }
+
+/// (core#1520) turn 1 hears only this attempt's notes; persisted amendment history stays intact.
+#[test]
+fn a_redispatched_build_briefs_only_the_current_attempts_notes() {
+    use wicked_apps_core::ToNode;
+
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let session: crate::domain::AgentSession = serde_json::from_value(json!({
+        "id": "notes", "workflow_id": "wf", "problem": "fix it",
+        "entity_mode": crate::EntityMode::Shared, "clis": ["a"],
+        "status": SessionStatus::Executing, "attempt": 3,
+        "power": crate::power::PowerState::launched(true, 0)
+    }))
+    .unwrap();
+    let mut unit = crate::domain::WorkUnit::pending("notes:fix", "notes", 0, "authored task");
+    unit.catalog = Some("build".into());
+    unit.role = crate::workflow::PhaseRole::Creator;
+    unit.last_attempt = Some(3);
+    unit.assigned_cli = Some("a".into());
+    unit.description
+        .push_str(" (operator amendment: round one)");
+    unit.description
+        .push_str(" (operator amendment: round two)");
+    for (attempt, text) in [(1, "round one"), (2, "round two")] {
+        unit.operator_rulings.push(crate::domain::OperatorRuling {
+            action: "amend".into(),
+            text: text.into(),
+            attempt,
+            at: 1,
+        });
+    }
+    crate::domain::put_node(&mut store, unit.to_node()).unwrap();
+    let mut sink = crate::event_log::EventSink::default();
+    let sent =
+        crate::actor::power_dispatch(&mut store, &mut sink, &session, unit.clone(), false).unwrap();
+    assert!(
+        sent.description.starts_with("authored task\n"),
+        "{}",
+        sent.description
+    );
+    assert!(
+        !sent.description.contains("round one"),
+        "{}",
+        sent.description
+    );
+    assert_eq!(sent.description.matches("round two").count(), 1);
+    assert_eq!(
+        crate::domain::session_units(&store, "notes").unwrap()[0].description,
+        unit.description
+    );
+    crate::power::forget_run("notes");
+}
+
+/// (core#1520) a repeated note at a later attempt emits history; replay at that attempt is silent.
+#[test]
+fn a_repeated_note_emits_an_amendment_for_each_attempt() {
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let mut sink = crate::event_log::EventSink::default();
+    let (tx, rx) = std::sync::mpsc::channel();
+    sink.push(tx);
+    let mut unit = crate::domain::WorkUnit::pending("repeat:fix", "repeat", 0, "fix it");
+    for attempt in [1, 2, 2] {
+        unit.last_attempt = Some(attempt);
+        crate::actor::amend_unit(
+            &mut store,
+            &mut sink,
+            "repeat",
+            &mut unit,
+            "keep heading",
+            "creator",
+        )
+        .unwrap();
+    }
+    let events: Vec<_> = rx
+        .try_iter()
+        .filter_map(|ev| match ev {
+            CoreEvent::UnitReworkAmended {
+                amendment,
+                updated_description,
+                scope,
+                ..
+            } => Some((amendment, updated_description, scope)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[0], events[1]);
+    assert_eq!(events[1].2, "creator");
+    assert_eq!(
+        unit.description
+            .matches(" (operator amendment: keep heading)")
+            .count(),
+        1
+    );
+    assert_eq!(unit.operator_rulings[0].attempt, 2);
+}
+
+/// (core#1178) an unmarked first turn hands off once and its checkpoint counts failed tests.
+#[test]
+fn an_unmarked_turn_hands_off_once_with_its_failed_test_count() {
+    let w = Worker::scripted(|i, _| match i.unit.id.rsplit(':').next().unwrap_or("") {
+        "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
+        "fix" => {
+            let mut sink = crate::tool_activity::ToolActivitySink::new(
+                &i.run_id,
+                i.unit.ord,
+                i.attempt,
+                i.workdir.as_deref().unwrap(),
+                Box::new(|_| {}),
+            );
+            sink.started("test", "Bash", &json!({"command": "npm test"}));
+            sink.finished("test", false);
+            turn("The work is done.", None)
+        }
+        _ => hold(),
+    });
+    let e = engine("unmarked-turn", w.clone());
+    let (path, _) = git_repo(&e.rig.dir);
+    let repo = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "unmarked".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    launch_power(&e, "unmarked", &repo.id);
+    wait_for("the first turn to finish", || {
+        view(&e, "unmarked")
+            .session
+            .power
+            .as_ref()
+            .is_some_and(|p| p.turn_log.first().is_some_and(|t| t.ended_at.is_some()))
+    });
+    let p = view(&e, "unmarked").session.power.unwrap();
+    assert_eq!(p.turn_log[0].outcome.as_deref(), Some("handoff"));
+    assert_eq!(
+        p.turn_log[0].summary.as_deref(),
+        Some(
+            "the turn ended with no CHECKPOINT or HANDOFF line; \
+             the engine read it as the hand-off"
+        )
+    );
+    assert_eq!(
+        e.worker
+            .calls()
+            .iter()
+            .filter(|c| c.2 == "unmarked:fix")
+            .count(),
+        1
+    );
+    let checkpoint = p
+        .history
+        .iter()
+        .find(|r| r.trigger == "pre_handoff")
+        .unwrap();
+    assert_eq!(checkpoint.signals.as_ref().unwrap().struggle.failed_runs, 1);
+    release_all(&w);
+}
+
+/// (core#1178) scope's RIGOR phases become durable floor steps even below their band.
+#[test]
+fn the_intake_qe_plan_adds_architecture_to_a_light_plan() {
+    let w = Worker::scripted(|i, _| match i.unit.id.rsplit(':').next().unwrap_or("") {
+        "pa-scope" => turn(
+            &pa_output(
+                "SCOPE {\"touch\":[\"README.md\"]}\n\
+                 RIGOR {\"mandatoryPhases\":[{\"phase\":\"architecture\",\"why\":\"boundary\"}]}",
+            ),
+            None,
+        ),
+        _ => hold(),
+    });
+    let e = engine("intake-architecture", w.clone());
+    let (path, _) = git_repo(&e.rig.dir);
+    let repo = e
+        .core
+        .register_repo(crate::RepoSpec {
+            name: "intake-architecture".into(),
+            root_path: path.to_string_lossy().into_owned(),
+            registered_at: 0,
+        })
+        .unwrap();
+    launch_power(&e, "architecture", &repo.id);
+    wait_for("the scoped plan", || {
+        view(&e, "architecture")
+            .session
+            .power
+            .as_ref()
+            .is_some_and(|p| p.plan.is_some())
+    });
+    let v = view(&e, "architecture");
+    let state = v.session.team_plan.unwrap();
+    let restored: crate::plan_gate::TeamPlanState =
+        serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+    assert_eq!(restored.qe_phases, ["architecture".to_string()]);
+    assert_eq!(
+        state.max_score, 0,
+        "the docs band has no architecture phase"
+    );
+    let accepted = state.accepted.unwrap();
+    let step = accepted
+        .steps
+        .steps
+        .iter()
+        .find(|s| s.catalog == "architecture")
+        .expect("the QE phase joins the plan");
+    assert_eq!(
+        step.floor_reason.as_deref(),
+        Some("the intake QE plan requires it")
+    );
+    assert!(step.floor_rule.is_none());
+    assert!(accepted.rules.is_empty());
+    assert_eq!(state.qe_phases, ["architecture".to_string()]);
+    release_all(&w);
+}
+
+/// (core#1475) a real ledger-backed QE denial survives the power escalation and build rewind.
+#[test]
+fn a_qe_failure_sends_its_ledger_findings_back_to_the_build() {
+    use wicked_apps_core::ToNode;
+
+    let review = crate::qe_acceptance::review::tests::review_with_ledger_reason(
+        "FAIL",
+        Some("IMPLEMENTATION_BUG — X"),
+    );
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let mut power = crate::power::PowerState::launched(true, 0);
+    power.orchestrator.ord = Some(1);
+    let mut session: crate::domain::AgentSession = serde_json::from_value(json!({
+        "id": "qe-reason", "workflow_id": "wf", "problem": "fix it",
+        "entity_mode": crate::EntityMode::Shared, "clis": ["a", "b"],
+        "status": SessionStatus::Executing, "unit_ix": 1, "power": power
+    }))
+    .unwrap();
+    crate::domain::put_node(&mut store, session.to_node()).unwrap();
+    let mut build = crate::domain::WorkUnit::pending("qe-reason:fix", "qe-reason", 1, "fix it");
+    build.role = crate::workflow::PhaseRole::Creator;
+    build.assigned_cli = Some("a".into());
+    build.status = crate::domain::UnitStatus::Done;
+    build.last_attempt = Some(0);
+    crate::domain::put_node(&mut store, build.to_node()).unwrap();
+    let mut qe = crate::domain::WorkUnit::pending("qe-reason:qe", "qe-reason", 2, "check it");
+    qe.role = crate::workflow::PhaseRole::Evaluator;
+    qe.catalog = Some("test".into());
+    qe.assigned_cli = Some("b".into());
+    qe.status = crate::domain::UnitStatus::Rejected;
+    qe.last_attempt = Some(0);
+    qe.denial = crate::qe_acceptance::review::denial(&review);
+    qe.denial_reason = qe.denial.as_ref().map(|d| d.reason.clone());
+    qe.qe_review = Some(review);
+    crate::domain::put_node(&mut store, qe.to_node()).unwrap();
+    let mut sink = crate::event_log::EventSink::default();
+    let (events, seen) = std::sync::mpsc::channel();
+    sink.push(events);
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::actor::escalate_denied_unit(
+        &mut store,
+        &mut sink,
+        &tx,
+        &mut session,
+        &qe,
+        0,
+        false,
+        true,
+        false,
+        "",
+    )
+    .unwrap();
+    let (decision, actor) = rx
+        .try_iter()
+        .find_map(|cmd| match cmd {
+            Command::ConfirmGate {
+                decision, actor, ..
+            } => Some((decision, actor)),
+            _ => None,
+        })
+        .expect("power answers the escalation");
+    assert_eq!(actor.as_deref(), Some(crate::power::HANDOFF_ACTOR));
+    assert!(matches!(decision, HumanDecision::RequestChanges { .. }));
+    let runner: Arc<dyn StepRunner> = Worker::scripted(|_, _| turn("HANDOFF: done", None));
+    crate::actor::confirm_gate_as(
+        &mut store,
+        &mut sink,
+        &runner,
+        &tx,
+        &mut std::collections::HashSet::new(),
+        "qe-reason",
+        decision,
+        actor,
+        &None,
+        &None,
+        uuid::Uuid::nil(),
+        false,
+    )
+    .unwrap();
+    let units = crate::domain::session_units(&store, "qe-reason").unwrap();
+    assert!(units[0]
+        .rework_amendment
+        .as_deref()
+        .unwrap()
+        .contains("IMPLEMENTATION_BUG — X"));
+    assert!(seen.try_iter().any(|ev| matches!(
+        ev,
+        CoreEvent::UnitReworkAmended { amendment, .. }
+            if amendment.contains("IMPLEMENTATION_BUG — X")
+    )));
+}
+
+/// (core#1585) boot supersedes the parked run's dead attempt without dispatching past its gate.
+#[test]
+fn boot_supersedes_dispatched_attempts_of_live_parked_runs() {
+    use crate::domain::UnitStatus::{Distributed, Done, Pending};
+    use wicked_apps_core::ToNode;
+
+    for (status, in_flight, unit_status, last_attempt, bumped) in [
+        (
+            SessionStatus::AwaitingHuman,
+            false,
+            Distributed,
+            Some(4),
+            true,
+        ),
+        (SessionStatus::Planning, false, Distributed, Some(4), true),
+        (
+            SessionStatus::Distributing,
+            false,
+            Distributed,
+            Some(4),
+            true,
+        ),
+        (
+            SessionStatus::AwaitingHuman,
+            true,
+            Distributed,
+            Some(4),
+            false,
+        ),
+        (SessionStatus::AwaitingHuman, false, Pending, Some(4), false),
+        (SessionStatus::AwaitingHuman, false, Done, Some(4), false),
+        (
+            SessionStatus::AwaitingHuman,
+            false,
+            Distributed,
+            None,
+            false,
+        ),
+        (SessionStatus::Failed, false, Distributed, Some(4), false),
+        (SessionStatus::Completed, false, Distributed, Some(4), false),
+        (SessionStatus::Cancelled, false, Distributed, Some(4), false),
+    ] {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let session: crate::domain::AgentSession = serde_json::from_value(json!({
+            "id": "parked", "workflow_id": "wf", "problem": "fix it",
+            "entity_mode": crate::EntityMode::Shared, "clis": ["a"],
+            "status": status, "attempt": 4
+        }))
+        .unwrap();
+        crate::domain::put_node(&mut store, session.to_node()).unwrap();
+        let mut unit = crate::domain::WorkUnit::pending("parked:fix", "parked", 1, "fix it");
+        unit.status = unit_status;
+        unit.last_attempt = last_attempt;
+        crate::domain::put_node(&mut store, unit.to_node()).unwrap();
+        let w = Worker::scripted(|_, _| turn("unexpected dispatch", None));
+        let runner: Arc<dyn StepRunner> = w.clone();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut sink = crate::event_log::EventSink::default();
+        let mut flying = std::collections::HashSet::new();
+        if in_flight {
+            flying.insert("parked".to_string());
+        }
+        crate::actor::redrive_executing_sessions(
+            &mut store,
+            &mut sink,
+            &runner,
+            &tx,
+            &mut flying,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        );
+        let after = crate::domain::get_session(&store, "parked")
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.status, status);
+        assert_eq!(
+            after.attempt,
+            if bumped { 5 } else { 4 },
+            "{status:?}, {in_flight}, {unit_status:?}, {last_attempt:?}"
+        );
+        assert!(w.calls().is_empty(), "boot must leave the gate held");
+        assert_eq!(
+            crate::domain::session_units(&store, "parked").unwrap()[0],
+            unit
+        );
+    }
+}

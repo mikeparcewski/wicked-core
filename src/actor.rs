@@ -6333,11 +6333,31 @@ fn redrive_executing_sessions(
             return;
         }
     };
-    for s in sessions {
-        if s.status != SessionStatus::Executing || in_flight.contains(&s.id) {
+    for mut s in sessions {
+        if in_flight.contains(&s.id) {
             continue;
         }
-        let mut s = s;
+        // Boot reconciliation may park a dispatched run at a transport gate. Supersede its
+        // dead attempt before predecessor results arrive, without dispatching (core#1585).
+        if matches!(
+            s.status,
+            SessionStatus::Planning | SessionStatus::Distributing | SessionStatus::AwaitingHuman
+        ) {
+            let units = crate::domain::session_units(store, &s.id).unwrap_or_default();
+            let cursor = units.get(s.unit_ix);
+            if cursor.is_some_and(|u| {
+                u.status == crate::domain::UnitStatus::Distributed && u.last_attempt.is_some()
+            }) {
+                s.attempt = redrive_attempt(false, s.attempt, cursor);
+                if let Err(e) = put_node(store, s.to_node()) {
+                    emit_run_error(subscribers, &s.id, e);
+                }
+            }
+            continue;
+        }
+        if s.status != SessionStatus::Executing {
+            continue;
+        }
         // (core#1581) A stale pause (a run an older engine switched to phased mid-turn kept it)
         // holds nothing: it is cleared, and the run redrives as before with no pause card.
         if let Err(e) = power_gate::drop_stale_pause(store, &mut s) {
@@ -9192,7 +9212,7 @@ pub(crate) fn redrive_attempt(
 /// `PTY_PROMPT_LIMIT`, so the marker REPLACES its predecessor instead of growing per round; the
 /// full findings ride `unitReworkAmended.amendment` and the seat's prior-context block.
 pub(crate) const REWORK_MARKER_MAX: usize = 160;
-const REWORK_MARKER_PREFIX: &str = " (requested changes r";
+pub(crate) const REWORK_MARKER_PREFIX: &str = " (requested changes r";
 
 /// `description` with ` (requested changes r<round>: <head>)` as its LAST segment — a prior
 /// marker (from an earlier round) is replaced, whitespace in `head` is collapsed, and the marker
@@ -12453,9 +12473,9 @@ fn power_dispatch(
             }
             let power = s.power.as_ref().unwrap_or(power);
             let round = power.handoff.as_ref().map_or(1, |h| h.round.max(1));
-            // (core#1486) The task as authored: older rounds' amendment segments are dropped from
-            // what later turns restate; this round's notes ride their own block.
+            // Brief every turn from the authored task and this attempt's notes (core#1520).
             let task = crate::power::authored_task(&unit);
+            unit.description = task.clone();
             // (core#1216) The person's voice rides THIS brief only: the PA's scope step, the
             // hand-off's reviewers, judges and QE are dispatched without it.
             unit.description.push_str(&crate::power::orchestrator_brief(
@@ -17115,11 +17135,6 @@ fn amend_unit(
     }
     if let Some(i) = recorded.filter(|_| moved) {
         u.operator_rulings[i].attempt = attempt;
-    }
-    if in_text && moved {
-        // Nothing new to announce: the words and the record were already there.
-        put_node(store, u.to_node())?;
-        return Ok(());
     }
     let on_record = recorded.is_some();
     if !in_text {
@@ -39837,6 +39852,7 @@ mod prior_context_tests {
                 requires_evaluator: false,
                 requires_qe: false,
                 power_absorbs: &[],
+                qe_phases: &[],
             },
         )
         .unwrap();

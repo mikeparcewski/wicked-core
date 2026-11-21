@@ -790,6 +790,7 @@ fn a_creator_less_accepted_plan_has_an_empty_floor_at_any_recorded_band() {
                 requires_evaluator: false,
                 requires_qe: false,
                 power_absorbs: &[],
+                qe_phases: &[],
             },
         )
         .unwrap();
