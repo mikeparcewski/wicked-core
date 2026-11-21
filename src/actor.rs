@@ -30047,11 +30047,21 @@ mod request_changes_tests {
             .unwrap()
             .unwrap();
         session.status = SessionStatus::Executing;
+        // Run 290a7fee was attended: the operator answered its gates.
+        session.human_confirm = HumanConfirm::All;
         put_node(&mut store, session.to_node()).unwrap();
+        // The orchestration workflow the fold updates (as `pre_distribute` registers it).
+        let phases: Vec<(String, &str)> = ["triage", "reproduce", "fix", "verify", "deliver"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("wf-{run_id}:unit-{}", i + 1), *p))
+            .collect();
+        wicked_orchestration::register_workflow(&mut store, format!("wf-{run_id}"), "p", &phases)
+            .unwrap();
         let mut units = crate::domain::session_units(&store, &run_id).unwrap();
         assert!(!units
             .iter()
-            .any(|u| { u.status == UnitStatus::Done && u.assigned_cli.as_deref() == Some("pi") }));
+            .any(|u| u.status == UnitStatus::Done && u.assigned_cli.as_deref() == Some("pi")));
         units[2].status = UnitStatus::Distributed;
         units[2].denial = None;
         units[2].denial_reason = None;
@@ -30094,7 +30104,22 @@ mod request_changes_tests {
             false,
         )
         .unwrap();
-        assert!(matches!(applied, StepApplied::Paused));
+        // The fold benched pi for the run, under the quota cause, from its own transcript.
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            session.benched_seats.iter().any(|b| b.cli == "pi"
+                && b.source == "judge"
+                && b.reason.starts_with("quota_exhausted")),
+            "{:?}",
+            session.benched_seats
+        );
+        assert!(
+            matches!(applied, StepApplied::Paused),
+            "{:?}",
+            session.status
+        );
         let r = rejudge_readiness(&store, &run_id).unwrap();
         assert!(r.applies, "the fold leaves a judge_unavailable gate: {r:?}");
         assert!(!r.eligible.iter().any(|seat| seat == "pi"), "{r:?}");
