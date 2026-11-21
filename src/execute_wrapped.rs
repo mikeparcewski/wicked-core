@@ -7096,8 +7096,40 @@ pub(crate) fn apply_tool_less_posture(
     Ok(())
 }
 
-/// Remove inherited daemon variables except the fixed process/network base. Explicit launch
-/// settings survive, including config homes, gate variables, MCP and the gateway (core#1257).
+/// Provider and sign-in variables a host claude or pi seat reads to reach its model: API keys,
+/// base URLs, custom headers, the claude config dir and `CLAUDE_CODE_*` switches, Bedrock (AWS)
+/// and Vertex (Google) routing, and pi's own settings. A tooled turn inherits them from the
+/// daemon, so a tool-less turn keeps them too: it must reach the same model the same way
+/// (core#1257, coord review r1). Only claude and pi run tool-less on the host floor.
+/// `GH_TOKEN`/`GITHUB_TOKEN` are not here: they are the daemon's repository credential, and pi's
+/// Copilot route reads `COPILOT_GITHUB_TOKEN` or its own login file.
+const TOOL_LESS_PROVIDER_PREFIXES: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "AWS_",
+    "CLOUD_ML_",
+    "VERTEX_REGION_",
+    "GOOGLE_",
+    "GCLOUD_",
+    "GEMINI_",
+    "OPENAI_",
+    "AZURE_OPENAI_",
+    "OPENROUTER_",
+    "GROQ_",
+    "XAI_",
+    "MISTRAL_",
+    "CEREBRAS_",
+    "DEEPSEEK_",
+    "ZAI_",
+    "MINIMAX_",
+    "AI_GATEWAY_",
+    "COPILOT_",
+    "PI_",
+];
+
+/// Remove inherited daemon variables except the fixed process/network base and the provider
+/// variables ([`TOOL_LESS_PROVIDER_PREFIXES`]). Explicit launch settings survive, including
+/// config homes, gate variables, MCP and the gateway (core#1257).
 fn scrub_tool_less_env(
     cmd: &mut Command,
     inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -7115,6 +7147,9 @@ fn scrub_tool_less_env(
         let normalized = env_key(&key);
         let base = normalized.to_str().is_some_and(|name| {
             name.starts_with("LC_")
+                || TOOL_LESS_PROVIDER_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
                 || matches!(
                     name,
                     "PATH"
@@ -13100,6 +13135,69 @@ mod tests {
             assert_eq!(
                 env.get(std::ffi::OsStr::new(key)),
                 Some(&Some(std::ffi::OsStr::new(value)))
+            );
+        }
+    }
+
+    /// A tool-less turn reaches its model exactly as a tooled one does (core#1257, coord review
+    /// r1): a tooled host turn inherits the daemon env untouched, so every provider and sign-in
+    /// variable it would see stays inherited here. Daemon secrets that are not a provider route
+    /// still go.
+    #[test]
+    fn tool_less_env_keeps_the_provider_env_a_tooled_turn_sees() {
+        use std::ffi::OsString;
+        let provider = [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "CLOUD_ML_REGION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "GEMINI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "PI_CODING_AGENT_DIR",
+        ];
+        let daemon_secrets = ["PGPASSWORD", "DATABASE_URL", "GH_TOKEN", "GITHUB_TOKEN"];
+        let inherited = provider
+            .into_iter()
+            .chain(daemon_secrets)
+            .map(|k| (OsString::from(k), OsString::from("inherited")));
+        // spawn-audit: test-only — never spawned; the tooled command is the comparison baseline.
+        let tooled = Command::new("unused");
+        // spawn-audit: test-only — never spawned; the scrub is judged on its `get_envs` alone.
+        let mut tool_less = Command::new("unused");
+        scrub_tool_less_env(&mut tool_less, inherited);
+        let removed = |cmd: &Command| {
+            cmd.get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_os_string())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let tooled_removed = removed(&tooled);
+        let tool_less_removed = removed(&tool_less);
+        for key in provider {
+            assert_eq!(
+                tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                tooled_removed.contains(std::ffi::OsStr::new(key)),
+                "{key}: a tool-less turn must see the provider env a tooled turn sees"
+            );
+            assert!(
+                !tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                "{key} was scrubbed"
+            );
+        }
+        for key in daemon_secrets {
+            assert!(
+                tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                "{key} is a daemon secret and must not reach a tool-less seat"
             );
         }
     }
