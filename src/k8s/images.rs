@@ -95,17 +95,63 @@ impl ImageStore {
 
 /// A private, uniquely-created directory. All archives disappear on success and refusal.
 pub(crate) fn archive_dir() -> Result<RemoveOnDrop, String> {
-    let dir = std::env::temp_dir().join(format!("wicked-image-{}", uuid::Uuid::new_v4().simple()));
+    // Keep multi-GiB exports off tmpfs when a daemon/worker state home is available.
+    let home = super::engine_home();
+    // Only the engine's own home is swept: the temp fallback may be shared by other processes.
+    let sweep = home.is_some();
+    let base = home
+        .map(|home| home.join("image-archives"))
+        .unwrap_or_else(|| std::env::temp_dir().join("wicked-image-archives"));
+    static SWEPT: Mutex<Option<HashSet<std::path::PathBuf>>> = Mutex::new(None);
+    let mut swept = SWEPT.lock().map_err(|_| "image archive lock is poisoned")?;
+    let swept = swept.get_or_insert_with(HashSet::new);
+    let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
-    let builder = {
+    {
         use std::os::unix::fs::DirBuilderExt;
-        let mut b = std::fs::DirBuilder::new();
-        b.mode(0o700);
-        b
-    };
-    #[cfg(not(unix))]
-    let builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+    }
     builder
+        .recursive(true)
+        .create(&base)
+        .map_err(|e| format!("cannot create image archive base directory: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot make image archive directory private: {e}"))?;
+    }
+    if sweep && !swept.contains(&base) {
+        for entry in std::fs::read_dir(&base)
+            .map_err(|e| format!("cannot list stale image archives: {e}"))?
+        {
+            let entry = entry.map_err(|e| format!("cannot read stale image archive entry: {e}"))?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with("wicked-image-")
+            {
+                continue;
+            }
+            let result = entry.file_type().and_then(|kind| {
+                if kind.is_dir() {
+                    std::fs::remove_dir_all(entry.path())
+                } else {
+                    std::fs::remove_file(entry.path())
+                }
+            });
+            if let Err(e) = result {
+                eprintln!(
+                    "wicked-core: cannot remove stale archive {}: {e}",
+                    entry.path().display()
+                );
+            }
+        }
+        swept.insert(base.clone());
+    }
+    let dir = base.join(format!("wicked-image-{}", uuid::Uuid::new_v4().simple()));
+    builder
+        .recursive(false)
         .create(&dir)
         .map_err(|e| format!("cannot create image archive directory: {e}"))?;
     Ok(RemoveOnDrop(dir))
@@ -221,6 +267,46 @@ pub(crate) fn start_fix(kube: &Kube) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn archives_use_engine_home_and_sweep_only_stale_image_entries_once() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<std::path::PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = super::super::swap_engine_home_for_test(self.0.take());
+            }
+        }
+        let _restore = Restore(super::super::swap_engine_home_for_test(None));
+        let home = std::env::temp_dir().join(format!("archive-home-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = RemoveOnDrop(home.clone());
+        super::super::note_engine_home(&home);
+        let base = home.join("image-archives");
+        std::fs::create_dir_all(base.join("wicked-image-old")).unwrap();
+        std::fs::write(base.join("wicked-image-old/file"), b"leftover").unwrap();
+        std::fs::write(base.join("wicked-image-file"), b"leftover").unwrap();
+        std::fs::write(base.join("keep"), b"keep").unwrap();
+        let first = archive_dir().unwrap();
+        assert_eq!(first.0.parent(), Some(base.as_path()));
+        assert!(!base.join("wicked-image-old").exists());
+        assert!(!base.join("wicked-image-file").exists());
+        assert!(base.join("keep").exists());
+        let second = archive_dir().unwrap();
+        assert!(first.0.is_dir() && second.0.is_dir());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for path in [&base, &first.0] {
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o700
+                );
+            }
+        }
+    }
 
     #[test]
     fn node_store_classification_is_explicit() {
@@ -339,6 +425,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn kind_loads_once_per_node_and_image_and_cleans_the_archive() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (_dir, kube, rt, node, log) = fixture(
             ImageStore::Kind {
                 cluster: "c".into(),
@@ -384,6 +473,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn failed_kind_load_refuses_with_the_command_and_fix_and_is_retried() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (_dir, kube, rt, node, log) = fixture(
             ImageStore::Kind {
                 cluster: "c".into(),
@@ -410,6 +502,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn k3s_import_uses_the_kubelet_namespace_and_names_the_socket_fix() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (_dir, kube, rt, node, log) = fixture(ImageStore::K3s, true);
         let (why, text) = ensure_loaded(&kube, &rt, &node, &["seat:x"]).unwrap_err();
         assert_eq!(why, FloorUnarmed::ImageUnavailable);

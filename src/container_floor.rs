@@ -828,7 +828,7 @@ pub(crate) fn ensure_floor_image(rt: &Runtime) -> Result<String, String> {
 
 /// What the engine learned about one seat image (by image id): the paths in its root filesystem
 /// that are symbolic links, and whether it declares volumes.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ImageFacts {
     /// The image id the facts are about: the seat runs THIS id, never a tag that could move
     /// between the inspection and the run.
@@ -840,9 +840,42 @@ pub(crate) struct ImageFacts {
     pub(crate) healthcheck: bool,
 }
 
+fn seat_facts_path(id: &str) -> Option<PathBuf> {
+    let home = crate::k8s::engine_home()?;
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    Some(home.join("seat-image-facts").join(format!("{hex}.json")))
+}
+
+fn read_seat_facts(path: &Path, id: &str) -> Option<ImageFacts> {
+    use std::io::Read;
+    const FACTS_SIZE_CAP: u64 = 64 * 1024 * 1024;
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > FACTS_SIZE_CAP {
+        return None;
+    }
+    let facts: ImageFacts = serde_json::from_reader(file.take(FACTS_SIZE_CAP)).ok()?;
+    (facts.id == id).then_some(facts)
+}
+
+fn write_seat_facts(path: &Path, facts: &ImageFacts) -> Result<(), String> {
+    let dir = path.parent().ok_or("seat image facts path has no parent")?;
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let bytes = serde_json::to_vec(facts).map_err(|e| e.to_string())?;
+    // Shared writer creates a unique 0600 file, syncs it, and renames it over the destination.
+    crate::acp_runner::write_atomic(dir, path, &bytes).map_err(|e| e.to_string())
+}
+
 /// Read an image export as data, without starting any container. Memoized per image id.
 pub(crate) fn inspect_seat_image(rt: &Runtime, image: &str) -> Result<ImageFacts, String> {
     static SEEN: Mutex<Option<std::collections::HashMap<String, ImageFacts>>> = Mutex::new(None);
+    inspect_seat_image_cached(rt, image, &SEEN)
+}
+
+fn inspect_seat_image_cached(
+    rt: &Runtime,
+    image: &str,
+    seen: &Mutex<Option<std::collections::HashMap<String, ImageFacts>>>,
+) -> Result<ImageFacts, String> {
     let mut c = rt.cmd();
     c.args([
         "image",
@@ -861,8 +894,19 @@ pub(crate) fn inspect_seat_image(rt: &Runtime, image: &str) -> Result<ImageFacts
         .and_then(|(id, c)| Some((valid_image_id(id)?, c)))
         .ok_or_else(|| format!("could not inspect seat image {image}"))?;
     let id = id.as_str();
-    if let Some(f) = SEEN.lock().ok().and_then(|m| m.as_ref()?.get(id).cloned()) {
+    if let Some(f) = seen.lock().ok().and_then(|m| m.as_ref()?.get(id).cloned()) {
         return Ok(f);
+    }
+    let facts_path = seat_facts_path(id);
+    if let Some(facts) = facts_path
+        .as_deref()
+        .and_then(|path| read_seat_facts(path, id))
+    {
+        if let Ok(mut m) = seen.lock() {
+            m.get_or_insert_with(Default::default)
+                .insert(id.to_string(), facts.clone());
+        }
+        return Ok(facts);
     }
     let config: serde_json::Value = serde_json::from_str(config)
         .map_err(|e| format!("could not read seat image config: {e}"))?;
@@ -893,7 +937,15 @@ pub(crate) fn inspect_seat_image(rt: &Runtime, image: &str) -> Result<ImageFacts
         volumes,
         healthcheck,
     };
-    if let Ok(mut m) = SEEN.lock() {
+    if let Some(path) = facts_path {
+        if let Err(e) = write_seat_facts(&path, &facts) {
+            eprintln!(
+                "wicked-core: cannot cache seat image facts at {}: {e}",
+                path.display()
+            );
+        }
+    }
+    if let Ok(mut m) = seen.lock() {
         m.get_or_insert_with(Default::default)
             .insert(id.to_string(), facts.clone());
     }
@@ -995,7 +1047,44 @@ pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<Stri
             result.err_text()
         ));
     }
+    cleanup_seat_image_pins(rt, repo, &pinned);
     Ok(pinned)
+}
+
+fn cleanup_seat_image_pins(rt: &Runtime, repo: &str, pinned: &str) {
+    let mut list = rt.cmd();
+    list.args(["image", "ls", "--format", "{{.Repository}}:{{.Tag}}", repo]);
+    let result = crate::k8s::run_bounded(list, None, rt.bound(PROBE_TIMEOUT));
+    if !result.ok() {
+        eprintln!(
+            "wicked-core: cannot list older seat image pins: {}",
+            result.err_text()
+        );
+        return;
+    }
+    for tag in String::from_utf8_lossy(&result.stdout).lines() {
+        let Some((tag_repo, suffix)) = tag.rsplit_once(":id-") else {
+            continue;
+        };
+        if tag_repo != repo
+            || tag == pinned
+            || suffix.len() != 64
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        let mut remove = rt.cmd();
+        remove.args(["image", "rm", tag]);
+        let result = crate::k8s::run_bounded(remove, None, rt.bound(PROBE_TIMEOUT));
+        if !result.ok() {
+            eprintln!(
+                "wicked-core: cannot remove older seat image pin {tag}: {}",
+                result.err_text()
+            );
+        }
+    }
 }
 
 /// Injectable WSL facts keep platform detection testable without a Windows host.
@@ -3539,6 +3628,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn seat_archive_inspection_reads_legacy_and_gzip_oci_without_running() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         use std::io::Write;
         for oci in [false, true] {
             let mut layer = image_tar(&[("floor", b'2', b"", "elsewhere")]);
@@ -3563,6 +3655,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn seat_archive_folds_whiteouts_opaque_directories_and_link_replacements() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let base = image_tar(&[
             ("gone", b'2', b"", "elsewhere"),
             ("opaque/old", b'2', b"", "elsewhere"),
@@ -3591,6 +3686,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn seat_archive_refuses_a_different_config_digest_and_unsupported_compression() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (_dir, rt, _, _) = archived_seat(vec![image_tar(&[])], false, true);
         assert!(inspect_seat_image(&rt, "seat:build")
             .unwrap_err()
@@ -3603,6 +3701,9 @@ mod tests {
 
     #[test]
     fn a_failed_or_unreadable_seat_export_produces_no_facts() {
+        let _env = crate::test_env::ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
         let (_dir, rt, _, _) = archived_seat(vec![image_tar(&[])], false, false);
         let archive = rt.cli.parent().unwrap().join("image.tar");
         std::fs::write(&archive, b"unreadable image archive").unwrap();
@@ -3639,6 +3740,104 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn seat_facts_survive_a_fresh_memory_cache_and_rewrite_invalid_files() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let prior = crate::k8s::swap_engine_home_for_test(None);
+        struct Restore(Option<PathBuf>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = crate::k8s::swap_engine_home_for_test(self.0.take());
+            }
+        }
+        let _restore = Restore(prior);
+        let (dir, rt, id, log) = archived_seat(vec![image_tar(&[])], false, false);
+        crate::k8s::note_engine_home(&dir.0);
+        let first = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+        let path = dir
+            .0
+            .join("seat-image-facts")
+            .join(format!("{}.json", &id[7..]));
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        std::fs::write(&log, "").unwrap();
+        let next = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+        assert_eq!(next, first);
+        assert!(!std::fs::read_to_string(&log).unwrap().contains("save "));
+        for invalid in [
+            b"not json".to_vec(),
+            serde_json::to_vec(&serde_json::json!({
+                "id": format!("sha256:{}", "0".repeat(64)),
+                "symlinks": [], "volumes": [], "healthcheck": false
+            }))
+            .unwrap(),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            std::fs::write(&log, "").unwrap();
+            let facts = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+            assert_eq!(facts, first);
+            assert!(std::fs::read_to_string(&log).unwrap().contains("save "));
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["id"], id);
+        }
+    }
+
+    #[test]
+    fn pin_removes_only_older_exact_id_tags_and_cleanup_failure_is_nonfatal() {
+        for fail in [false, true] {
+            let (dir, rt, id, log) = archived_seat(vec![], false, false);
+            let repo = "registry:5000/team/seat";
+            let pinned = format!("{repo}:id-{}", &id[7..]);
+            let old = format!("{repo}:id-{}", "a".repeat(64));
+            let older = format!("{repo}:id-{}", "d".repeat(64));
+            let tags = format!(
+                "{old}\n{pinned}\n{older}\n{repo}:stable\n{repo}:id-short\n\
+                 {repo}:id-{}\nother/seat:id-{}\n{repo}:id-{}extra",
+                "A".repeat(64),
+                "b".repeat(64),
+                "c".repeat(64)
+            );
+            std::fs::write(dir.0.join("tags"), tags).unwrap();
+            let script = format!(
+                "#!/bin/sh\necho \"$*\" >> '{}'\n\
+                 case \"$1 $2\" in\n\
+                 'tag '*) exit 0;;\n\
+                 'image ls') cat '{}' ;;\n\
+                 'image rm') exit {};;\n*) exit 98;;\nesac\n",
+                log.display(),
+                dir.0.join("tags").display(),
+                if fail { 3 } else { 0 }
+            );
+            crate::test_env::install_stub(&rt.cli, &script);
+            assert_eq!(
+                pin_seat_image(&rt, &format!("{repo}:build"), &id).unwrap(),
+                pinned
+            );
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let removals: Vec<_> = calls
+                .lines()
+                .filter(|l| l.starts_with("image rm "))
+                .collect();
+            assert_eq!(
+                removals,
+                [format!("image rm {old}"), format!("image rm {older}")]
+            );
+            assert!(calls.contains(&format!(
+                "image ls --format {{{{.Repository}}}}:{{{{.Tag}}}} {repo}"
+            )));
+        }
     }
 
     #[test]

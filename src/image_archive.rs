@@ -293,6 +293,53 @@ impl<R: Read> TarReader<R> {
     }
 }
 
+fn check_link_ancestors(paths: &BTreeMap<PathBuf, bool>, path: &Path) -> Result<(), String> {
+    if let Some(link) = path
+        .ancestors()
+        .skip(1)
+        .find(|ancestor| paths.get(*ancestor) == Some(&true))
+    {
+        return Err(format!(
+            "seat image entry {} traverses link {}",
+            path.display(),
+            link.display()
+        ));
+    }
+    Ok(())
+}
+
+fn fold_entry(
+    paths: &mut BTreeMap<PathBuf, bool>,
+    path: &Path,
+    kind: u8,
+    target: Option<&Path>,
+) -> Result<(), String> {
+    check_link_ancestors(paths, path)?;
+    if path == Path::new("/") && kind != b'5' {
+        return Err("seat image has a non-directory root entry".into());
+    }
+    // A hard link copies the target's inode kind at this point in the layer fold.
+    let link = if let Some(target) = target {
+        check_link_ancestors(paths, target)?;
+        *paths.get(target).ok_or_else(|| {
+            format!(
+                "seat image has an unresolved hard link {} -> {}",
+                path.display(),
+                target.display()
+            )
+        })?
+    } else {
+        kind == b'2'
+    };
+    if kind == b'5' {
+        paths.remove(path);
+    } else {
+        remove_image_subtree(paths, path, false);
+    }
+    paths.insert(path.to_path_buf(), link);
+    Ok(())
+}
+
 fn fold_layer<R: Read>(
     reader: R,
     paths: &mut BTreeMap<PathBuf, bool>,
@@ -301,8 +348,14 @@ fn fold_layer<R: Read>(
     let mut tar = TarReader::new(reader);
     let mut entries = Vec::new();
     let mut removals = Vec::new();
+    // Validate in archive order too: whiteouts cannot conceal traversal through a lower link,
+    // and a link introduced before a whiteout or an entry in this layer must also refuse.
+    let mut observed = paths.clone();
     while let Some(entry) = tar.next(count)? {
         let path = image_path(&entry.path)?;
+        let absolute = PathBuf::from(format!("/{path}"));
+        check_link_ancestors(paths, &absolute)?;
+        check_link_ancestors(&observed, &absolute)?;
         let (parent, leaf) = path.rsplit_once('/').unwrap_or(("", &path));
         let parent = PathBuf::from(format!("/{parent}"));
         if leaf == ".wh..wh..opq" {
@@ -321,7 +374,8 @@ fn fold_layer<R: Read>(
             } else {
                 None
             };
-            entries.push((PathBuf::from(format!("/{path}")), entry.kind, target));
+            fold_entry(&mut observed, &absolute, entry.kind, target.as_deref())?;
+            entries.push((absolute, entry.kind, target));
         }
     }
     tar.finish()?;
@@ -330,27 +384,113 @@ fn fold_layer<R: Read>(
         remove_image_subtree(paths, &path, children_only);
     }
     for (path, kind, target) in entries {
-        // A hard link copies the target's inode kind at this point in the layer fold.
-        // An unresolved target cannot prove a non-link destination, so refuse it.
-        let link = if let Some(target) = target {
-            *paths.get(&target).ok_or_else(|| {
-                format!(
-                    "seat image has an unresolved hard link {} -> {}",
-                    path.display(),
-                    target.display()
-                )
-            })?
-        } else {
-            kind == b'2'
-        };
-        if kind == b'5' {
-            paths.remove(&path);
-        } else {
-            remove_image_subtree(paths, &path, false);
-        }
-        paths.insert(path, link);
+        fold_entry(paths, &path, kind, target.as_deref())?;
     }
     Ok(())
+}
+
+/// Only small JSON metadata blobs are read into memory; missing platform blobs are normal.
+fn archive_json(
+    archive: &Path,
+    blobs: &std::collections::HashMap<String, (u64, u64)>,
+    name: &str,
+) -> Option<serde_json::Value> {
+    let &(offset, size) = blobs.get(name)?;
+    if size > MANIFEST_SIZE_CAP {
+        return None;
+    }
+    let mut file = std::fs::File::open(archive).ok()?;
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(size).read_to_end(&mut bytes).ok()?;
+    if bytes.len() as u64 != size {
+        return None;
+    }
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn digest_blob(digest: &str) -> Option<String> {
+    let hex = digest.strip_prefix("sha256:")?;
+    (hex.len() == 64
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+    .then(|| format!("blobs/sha256/{hex}"))
+}
+
+fn image_manifest(value: &serde_json::Value) -> bool {
+    matches!(
+        value["mediaType"].as_str(),
+        Some("application/vnd.oci.image.manifest.v1+json")
+            | Some("application/vnd.docker.distribution.manifest.v2+json")
+    )
+}
+
+fn inspected_config_matches(
+    archive: &Path,
+    blobs: &std::collections::HashMap<String, (u64, u64)>,
+    id: &str,
+    config: &str,
+) -> bool {
+    if !blobs.contains_key(config) {
+        return false;
+    }
+    let hex = id.strip_prefix("sha256:").unwrap_or(id);
+    let name = config.rsplit('/').next().unwrap_or("");
+    if name == hex || name == format!("{hex}.json") {
+        return true;
+    }
+    let Some(blob) =
+        digest_blob(&format!("sha256:{hex}")).and_then(|path| archive_json(archive, blobs, &path))
+    else {
+        return false;
+    };
+    let matches_config = |manifest: &serde_json::Value| {
+        image_manifest(manifest)
+            && manifest["config"]["digest"]
+                .as_str()
+                .and_then(digest_blob)
+                .is_some_and(|path| path == config)
+    };
+    if image_manifest(&blob) {
+        return matches_config(&blob);
+    }
+    if !matches!(
+        blob["mediaType"].as_str(),
+        Some("application/vnd.oci.image.index.v1+json")
+            | Some("application/vnd.docker.distribution.manifest.list.v2+json")
+    ) {
+        return false;
+    }
+    let Some(manifests) = blob["manifests"].as_array() else {
+        return false;
+    };
+    let mut matches = 0;
+    for descriptor in manifests {
+        if descriptor["annotations"]["vnd.docker.reference.type"] == "attestation-manifest" {
+            continue;
+        }
+        let Some(path) = descriptor["digest"].as_str().and_then(digest_blob) else {
+            return false;
+        };
+        if !blobs.contains_key(&path) {
+            continue;
+        }
+        let Some(manifest) = archive_json(archive, blobs, &path) else {
+            return false;
+        };
+        // No recursive index resolution, including a present nested index beside a valid arm.
+        if !image_manifest(&manifest) {
+            return false;
+        }
+        if matches_config(&manifest) {
+            matches += 1;
+            if matches > 1 {
+                return false;
+            }
+        }
+    }
+    matches == 1
 }
 
 pub(crate) fn archive_symlinks(archive: &Path, id: &str) -> Result<BTreeSet<PathBuf>, String> {
@@ -418,9 +558,7 @@ pub(crate) fn archive_symlinks(archive: &Path, id: &str) -> Result<BTreeSet<Path
                 .as_str()
                 .ok_or("seat image manifest has no config digest")?,
         )?;
-        let hex = id.strip_prefix("sha256:").unwrap_or(id);
-        let name = config.rsplit('/').next().unwrap_or("");
-        if (name != hex && name != format!("{hex}.json")) || !blobs.contains_key(&config) {
+        if !inspected_config_matches(archive, &blobs, id, &config) {
             return Err(format!(
                 "seat image config digest does not match inspected id {id}"
             ));
@@ -703,6 +841,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn fold_refuses_entries_and_whiteouts_below_parent_links() {
+        for name in ["x/home/seat/hidden", "x/.wh.home", "x/.wh..wh..opq"] {
+            let base = image_tar(&[("x", b'2', b"", "/")]);
+            let top = image_tar(&[(name, b'0', b"", "")]);
+            let mut paths = BTreeMap::new();
+            fold_layer(base.as_slice(), &mut paths, &mut 0).unwrap();
+            assert!(
+                fold_layer(top.as_slice(), &mut paths, &mut 0).is_err(),
+                "{name}"
+            );
+            let same = image_tar(&[("x", b'2', b"", "/"), (name, b'0', b"", "")]);
+            assert!(fold_layer(same.as_slice(), &mut BTreeMap::new(), &mut 0).is_err());
+        }
+    }
+
+    #[test]
+    fn fold_refuses_non_directory_root_without_erasing_links() {
+        for kind in [b'0', b'1', b'2', b'3', b'6'] {
+            let bytes = image_tar(&[("./", kind, b"", "floor")]);
+            let mut paths = BTreeMap::from([(PathBuf::from("/floor"), true)]);
+            assert!(fold_layer(bytes.as_slice(), &mut paths, &mut 0).is_err());
+            assert_eq!(paths.get(Path::new("/floor")), Some(&true));
+        }
+    }
+
+    #[test]
+    fn fold_accepts_deep_paths_below_real_directories() {
+        let bytes = image_tar(&[
+            ("./", b'5', b"", ""),
+            ("x", b'5', b"", ""),
+            ("x/home", b'5', b"", ""),
+            ("x/home/seat/visible", b'2', b"", "/elsewhere"),
+        ]);
+        let mut paths = BTreeMap::new();
+        fold_layer(bytes.as_slice(), &mut paths, &mut 0).unwrap();
+        assert_eq!(paths.get(Path::new("/x/home/seat/visible")), Some(&true));
+    }
+
+    #[test]
     fn hard_links_copy_the_target_kind_and_unknown_types_are_not_links() {
         let bytes = image_tar(&[
             ("link", b'2', b"", "elsewhere"),
@@ -771,6 +948,123 @@ mod archive_tests {
             ("abc.json", b'0', b"{}", ""),
             ("layer", b'0', layer, ""),
         ])
+    }
+
+    fn oci_image(index: bool, configs: &[&str], attestation: bool, docker: bool) -> ArchiveFile {
+        let config = "a".repeat(64);
+        let manifest_type = if docker {
+            "application/vnd.docker.distribution.manifest.v2+json"
+        } else {
+            "application/vnd.oci.image.manifest.v1+json"
+        };
+        let index_type = if docker {
+            "application/vnd.docker.distribution.manifest.list.v2+json"
+        } else {
+            "application/vnd.oci.image.index.v1+json"
+        };
+        let mut blobs = vec![
+            (
+                "oci-layout".into(),
+                br#"{"imageLayoutVersion":"1.0.0"}"#.to_vec(),
+            ),
+            (
+                "manifest.json".into(),
+                serde_json::to_vec(&serde_json::json!([{
+                    "Config": format!("blobs/sha256/{config}"), "Layers": []
+                }]))
+                .unwrap(),
+            ),
+            (format!("blobs/sha256/{config}"), b"{}".to_vec()),
+        ];
+        // Desktop saves other platforms' descriptors without their blobs, and may include
+        // attestation blobs. Even an attestation naming our config must never count as an arm.
+        let mut descriptors = vec![serde_json::json!({
+            "mediaType": manifest_type, "digest": format!("sha256:{}", "f".repeat(64))
+        })];
+        for hex in ["d".repeat(64), "e".repeat(64)] {
+            descriptors.push(serde_json::json!({
+                "mediaType": manifest_type, "digest": format!("sha256:{hex}"),
+                "platform": {"os": "unknown", "architecture": "unknown"},
+                "annotations": {"vnd.docker.reference.type": "attestation-manifest"}
+            }));
+        }
+        blobs.push((
+            format!("blobs/sha256/{}", "d".repeat(64)),
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2, "mediaType": manifest_type,
+                "config": {"digest": format!("sha256:{config}")}
+            }))
+            .unwrap(),
+        ));
+        for (i, cfg) in configs.iter().enumerate() {
+            let hex = format!("{:064x}", i + 1);
+            let mut descriptor = serde_json::json!({
+                "mediaType": manifest_type, "digest": format!("sha256:{hex}")
+            });
+            if attestation {
+                descriptor["annotations"] = serde_json::json!({
+                    "vnd.docker.reference.type": "attestation-manifest"
+                });
+                descriptor["platform"] = serde_json::json!({
+                    "os": "unknown", "architecture": "unknown"
+                });
+            }
+            descriptors.push(descriptor);
+            blobs.push((
+                format!("blobs/sha256/{hex}"),
+                serde_json::to_vec(&serde_json::json!({
+                    "schemaVersion": 2, "mediaType": manifest_type,
+                    "config": {"digest": format!("sha256:{}", cfg.repeat(64))}
+                }))
+                .unwrap(),
+            ));
+        }
+        if index {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 2, "mediaType": index_type, "manifests": descriptors
+            }))
+            .unwrap();
+            blobs.push((format!("blobs/sha256/{}", "b".repeat(64)), bytes.clone()));
+            blobs.push(("index.json".into(), bytes));
+        }
+        let entries: Vec<_> = blobs
+            .iter()
+            .map(|(name, data)| (name.as_str(), b'0', data.as_slice(), ""))
+            .collect();
+        ArchiveFile::new(&image_tar(&entries))
+    }
+
+    #[test]
+    fn oci_index_id_accepts_one_present_image_and_skips_absent_platforms() {
+        for docker in [false, true] {
+            let archive = oci_image(true, &["a"], false, docker);
+            let id = format!("sha256:{}", "b".repeat(64));
+            assert!(archive_symlinks(&archive.0, &id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn oci_manifest_id_accepts_its_config() {
+        for docker in [false, true] {
+            let archive = oci_image(false, &["a"], false, docker);
+            let id = format!("sha256:{:064x}", 1);
+            assert!(archive_symlinks(&archive.0, &id).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn oci_index_refuses_other_configs_multiple_matches_and_attestations_only() {
+        for (configs, attestation) in [
+            (vec!["c"], false),
+            (vec!["a", "a"], false),
+            (vec!["a"], true),
+        ] {
+            let archive = oci_image(true, &configs, attestation, false);
+            let id = format!("sha256:{}", "b".repeat(64));
+            assert!(archive_symlinks(&archive.0, &id)
+                .unwrap_err()
+                .contains("config digest does not match"));
+        }
     }
 
     #[test]

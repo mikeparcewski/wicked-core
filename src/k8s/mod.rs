@@ -288,6 +288,14 @@ pub(crate) fn forget_engine_home_for_test() {
     }
 }
 
+/// Swap only the explicitly noted home, preserving the absence of one in test guards.
+/// Callers hold ENV_LOCK for the lifetime of the override.
+#[cfg(test)]
+pub(crate) fn swap_engine_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
+    let mut current = ENGINE_HOME.lock().unwrap_or_else(|p| p.into_inner());
+    std::mem::replace(&mut *current, home)
+}
+
 /// The daemon's operational home as noted by its actor, else the worker home base (a floor run
 /// outside a daemon).
 pub(crate) fn engine_home() -> Option<PathBuf> {
