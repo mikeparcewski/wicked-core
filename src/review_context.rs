@@ -434,6 +434,43 @@ pub(crate) const DEFERRAL_RULE: &str = "- DEFERRED = the item's evidence can exi
      never fails the unit; the deliver gate lists it for the operator to check on the opened \
      pull request.\n";
 
+/// core#1206: the checklist lines for the team findings the creator's worker DEFERRED to the
+/// hand-off review, in ledger order: `rule on deferred team finding <id> [HIGH] at <path>:<line> —
+/// its claim is in [team findings — unit N]`. The id is engine-minted and the severity a closed
+/// enum; the path is one line, capped, with control characters dropped. The claim and the
+/// worker's reason are never copied into the brief (they stay in the fenced advisory block).
+fn deferred_team_findings(creator: Option<&WorkUnit>) -> Vec<String> {
+    let Some(creator) = creator else {
+        return Vec::new();
+    };
+    let Some(ledger) = creator.team.as_ref().and_then(|t| t.ledger.as_ref()) else {
+        return Vec::new();
+    };
+    ledger
+        .findings
+        .iter()
+        .filter(|f| f.status == crate::team::FindingStatus::Deferred)
+        .map(|f| {
+            let path: String = f
+                .finding
+                .path
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(200)
+                .collect();
+            format!(
+                "rule on deferred team finding {} [{}] at {}:{} — its claim is in [team findings \
+                 — unit {}]",
+                f.finding.finding_id,
+                f.finding.severity.as_str().to_ascii_uppercase(),
+                path,
+                f.final_line.unwrap_or(f.finding.line),
+                creator.ord
+            )
+        })
+        .collect()
+}
+
 /// The evaluator's brief, as `(ord, label, text)` context blocks in the order they are handed:
 /// `[review checklist — unit N]` always; `[prior verdicts — unit N]` when the unit returned a
 /// NOT-PASS verdict before; `[operator rulings — unit N]` when a human note amended it or the
@@ -484,6 +521,25 @@ pub(crate) fn evaluator_brief(
                 c.push_str(&format!("  - {it} (number it after your own items)\n"));
             } else {
                 c.push_str(&format!("  {}. {it}\n", items.len() + i + 1));
+            }
+        }
+    }
+    // core#1206: every team finding the creator's worker DEFERRED to this review is a checklist
+    // item by its engine-minted id, so a PASS cannot let one go unruled. Only the id, severity and
+    // location are written here; the claim stays in the fenced [team findings] block.
+    let deferred = deferred_team_findings(creator);
+    if !deferred.is_empty() {
+        c.push_str(
+            "Deferred team findings — the creator's worker deferred these to this review; rule on \
+             each one (FAIL when it holds on this change's own edit; PASS, with the evidence, when \
+             it does not hold or the change neither causes nor worsens it):\n",
+        );
+        let base = items.len() + after.len();
+        for (i, it) in deferred.iter().enumerate() {
+            if items.is_empty() {
+                c.push_str(&format!("  - {it} (number it after your own items)\n"));
+            } else {
+                c.push_str(&format!("  {}. {it}\n", base + i + 1));
             }
         }
     }
