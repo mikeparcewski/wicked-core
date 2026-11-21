@@ -501,6 +501,24 @@ pub(crate) fn codec_plan(roots: &[(String, &PlanRoot)]) -> Value {
     )
 }
 
+/// A dependency-backed tree excludes every node_modules component in the codec itself.
+pub(crate) fn pack_plan(roots: &[(String, &PlanRoot)], deps_tree: Option<&Path>) -> Value {
+    let mut plan = codec_plan(roots);
+    for (item, (_, root)) in plan
+        .as_array_mut()
+        .expect("plan array")
+        .iter_mut()
+        .zip(roots)
+    {
+        item.as_array_mut()
+            .expect("root array")
+            .push(serde_json::json!(
+                root.mode == Mode::Tree && deps_tree == Some(root.host.as_path())
+            ));
+    }
+    plan
+}
+
 /// The replica path of a host path under an optional scope.
 pub(crate) fn replica_of(scope: Option<&str>, p: &Path) -> Result<String, String> {
     let replica = render::scoped_sub_path(scope, p)
@@ -836,6 +854,8 @@ fn ensure_sync(
     if running(kube).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))? {
         return Ok(());
     }
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    super::images::ensure_for(kube, &rt, &[image, floor])?;
     let existing = kube
         .get_json(Some(ns), "pod", "sync")
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
@@ -1800,7 +1820,7 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) generation: u64,
     pub(crate) ord: u32,
     pub(crate) cli: &'a str,
-    /// The seat image (in the builder's store, which the cluster shares: D2).
+    /// The immutable per-id seat tag, already inspected and loaded into the node store.
     pub(crate) image: &'a str,
     pub(crate) floor_image: &'a str,
     pub(crate) sync_image: &'a str,
@@ -2342,15 +2362,32 @@ pub(crate) fn arm(
     s: &ArmSpec<'_>,
     landrun: Vec<String>,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
+    // A retry is another arm: a replaced node needs the images again before any pod apply.
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    super::images::ensure_for(kube, &rt, &[s.image, s.floor_image, s.sync_image])?;
     let (ns, scope, run) = place(kube, s.run_id);
     if scope.is_some() {
-        if let Ok(mut m) = SCOPES.lock() {
-            m.get_or_insert_with(HashMap::new)
-                .insert(s.run_id.to_string(), kube.clone());
-        }
+        let arming = arm_lock(&ns);
+        let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
+        SCOPES
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                s.run_id.to_string(),
+                ScopeRecord {
+                    kube: kube.clone(),
+                    pending: false,
+                },
+            );
     }
     super::admit_arm(s.run_id, s.generation, || {
-        cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
+        cluster::ensure_run(
+            kube,
+            &run,
+            &RunBudget::default(),
+            &format!("{}Gi", render::REPLICA_CLAIM_GI),
+        )
     })
     .ok_or_else(|| {
         (
@@ -2366,6 +2403,13 @@ pub(crate) fn arm(
         let arming = arm_lock(&ns);
         let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
         ensure_sync(kube, &ns, &run, s.sync_image, s.floor_image)?;
+        // An earlier session's failed cleanup is retried here; its failure never refuses
+        // this arm (the record stays for the next drain).
+        if scope.is_some() {
+            if let Err(e) = drain_scopes(kube, &ns) {
+                eprintln!("wicked-core: session scopes in {ns} not removed: {e}");
+            }
+        }
     }
     super::clock::mark("sync_pod");
     let (roots, pod_mounts) = plan(
@@ -2399,6 +2443,20 @@ pub(crate) fn arm(
     clear_stale(kube, &ns)?;
     super::clock::mark("clear_stale");
     let (base, baseline, tracked) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
+    if s.deps.is_some() {
+        let tree = replica_of(scope.as_deref(), s.tree)
+            .map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+        let r = codec(kube, &ns, &["deps", &tree], None, CALL);
+        if !r.ok() {
+            return Err((
+                FloorUnarmed::CopyInRefused,
+                format!(
+                    "the dependency mount destination could not be prepared: {}",
+                    r.err_text()
+                ),
+            ));
+        }
+    }
     // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
     let branch = match &base {
         Some(_) => head_branch(s.tree).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?,
@@ -2466,7 +2524,10 @@ pub(crate) fn arm(
     drop(_arming);
     // Owned from here: every way out before the caller holds the seat reaps it (review r1: an
     // API error while waiting, or an apply whose reply was lost, leaked the Sandbox).
-    struct Guard(Option<String>);
+    struct Guard(
+        Option<String>,
+        Option<crate::checks_container::DependencyMount>,
+    );
     impl Drop for Guard {
         fn drop(&mut self) {
             if let Some(id) = self.0.take() {
@@ -2474,7 +2535,9 @@ pub(crate) fn arm(
             }
         }
     }
-    let mut guard = Guard(Some(id.clone()));
+    let mut guard = Guard(Some(id.clone()), None);
+    guard.1 = crate::checks_container::dependency_mounts(kube, &ns, s.deps)
+        .map_err(|e| (classify_apply(&e), e))?;
     kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
     super::clock::mark("sandbox_apply");
@@ -2512,6 +2575,11 @@ pub(crate) fn arm(
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
+                let msg = if why == FloorUnarmed::ImageUnavailable {
+                    format!("{msg}; {}", super::images::start_fix(kube))
+                } else {
+                    msg
+                };
                 let msg = format!("{msg} ({})", diagnose(pod.as_ref(), &seen));
                 reap(&id);
                 return Err((why, msg));
@@ -2549,6 +2617,9 @@ pub(crate) fn arm(
             last = pod;
         }
         std::thread::sleep(Duration::from_millis(200));
+    }
+    if let Some(dependencies) = guard.1.take() {
+        dependencies.mounted();
     }
     super::clock::mark("pod_ready");
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
@@ -2613,8 +2684,15 @@ pub(crate) fn arm(
     Ok((seat, wrapper))
 }
 
+#[cfg(test)]
+#[test]
+fn named_dependency_refusal_keeps_the_admission_pending_classification() {
+    let error = "admission_pending: dependency claim pvc/wfloor-nm-old was retired";
+    assert_eq!(classify_apply(error), FloorUnarmed::AdmissionPending);
+}
+
 fn classify_apply(e: &str) -> FloorUnarmed {
-    if e.contains("exceeded quota") {
+    if e.starts_with("admission_pending:") || e.contains("exceeded quota") {
         FloorUnarmed::AdmissionPending
     } else if e.contains("Unable to connect")
         || e.contains("connection refused")
@@ -3099,7 +3177,7 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     for r in &back {
         refs.push((replica_of(seat.scope.as_deref(), &r.host)?, r));
     }
-    let plan = codec_plan(&refs).to_string();
+    let plan = pack_plan(&refs, seat.deps.then_some(seat.tree.as_path())).to_string();
     let host_tracked = {
         let tracked = seat
             .tracked
@@ -3153,6 +3231,9 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         if &got.replica != replica {
             return Err("the write-back's roots are out of order".into());
         }
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            got.entries.retain(|e| !in_node_modules(&e.path));
+        }
         let left_out = sync::take_skipped(got)
             .map_err(|e| format!("the write-back of {} was refused: {e}", want.host.display()))?;
         warnings.extend(left_out.iter().map(|s| s.describe(&want.host)));
@@ -3178,9 +3259,6 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
         }
         if want.mode == Mode::Files {
             entries.retain(|e| want.files.contains(&e.path));
-        }
-        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
-            entries.retain(|e| !in_node_modules(&e.path));
         }
         checked.push((want, entries, left_out, skips));
     }
@@ -3244,7 +3322,10 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
     }
     let mut plans: Vec<RootPlan<'_>> = Vec::new();
     for (want, entries, left_out, skips) in checked {
-        let base = baseline.get(&want.host).cloned().unwrap_or_default();
+        let mut base = baseline.get(&want.host).cloned().unwrap_or_default();
+        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
+            base.retain(|p, _| !in_node_modules(p));
+        }
         let aliased = kept_by_alias(&base, &entries, &skips);
         let mut retained = retained_links(&entries, &base);
         retained.extend(
@@ -3253,9 +3334,6 @@ pub(crate) fn write_back(seat: &Seat, cancelled: &dyn Fn() -> bool) -> Result<Ve
             })?,
         );
         let (writes, mut deletes) = delta_keeping(&want.host, &base, entries, &skips, cancelled)?;
-        if seat.deps && want.mode == Mode::Tree && want.host == seat.tree {
-            deletes.retain(|d| !in_node_modules(d));
-        }
         // (core#1535 item 4) The pod lists the host's tracked set too: an absent tracked path
         // was deleted. An untracked one the host's ignore rules match is no deletion.
         if want.mode == Mode::Tree && !deletes.is_empty() {
@@ -3473,7 +3551,22 @@ pub(crate) fn check_retained_links(
     if writes.is_empty() && deletes.is_empty() {
         return Ok(());
     }
-    for l in retained {
+    // (core#1423) A host link the stream never carried (an ignored one) can only resolve
+    // differently when the write-back adds a link or replaces or deletes one: only then is the
+    // host walked for them (a plain file edit leaves every resolution as it was).
+    let is_host_link = |rel: &str| {
+        std::fs::symlink_metadata(host.join(rel)).is_ok_and(|m| m.file_type().is_symlink())
+    };
+    let changes_a_link = writes
+        .iter()
+        .any(|w| w.kind == sync::Kind::Link || is_host_link(&w.path))
+        || deletes.iter().any(|d| is_host_link(d));
+    let host_links = if changes_a_link {
+        sync::surviving_host_links(host, writes, deletes, fence)?
+    } else {
+        Vec::new()
+    };
+    for l in retained.iter().chain(&host_links) {
         let mut after: Vec<Entry> = writes.to_vec();
         after.push(l.clone());
         if sync::links_stay_inside_final(Some(host), &after, deletes, fence).is_ok() {
@@ -3894,56 +3987,114 @@ pub(crate) fn nested_unpack_script(tree: &Path) -> String {
 /// the replica has none either, and refuses when the seat made one.
 pub(crate) const NO_BASE: &str = "-";
 
-/// The cluster each one-shot session armed on (its scope is deleted there when it ends).
-static SCOPES: Mutex<Option<HashMap<String, Kube>>> = Mutex::new(None);
+/// Active scopes and failed cleanups share one registry; only a successful removal forgets one.
+struct ScopeRecord {
+    kube: Kube,
+    pending: bool,
+}
 
-/// Delete a one-shot session's replica scope (its session ended). A session that never armed a
-/// pod has nothing to delete.
+static SCOPES: Mutex<Option<HashMap<String, ScopeRecord>>> = Mutex::new(None);
+
+/// The boot sweep has confirmed stale pods gone. Reconcile replica scopes against this
+/// process's registry under the same lock that protects registration and copy-in.
+pub(crate) fn sweep_session_scopes(kube: &Kube, ns: &str) -> Result<(), String> {
+    let arming = arm_lock(ns);
+    let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
+    ensure_sync(
+        kube,
+        ns,
+        super::SESSIONS_RUN,
+        &crate::checks_container::image_tag(),
+        &crate::container_floor::floor_image_tag(),
+    )
+    .map_err(|(_, e)| e)?;
+    let keep: Vec<String> = SCOPES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .into_iter()
+        .flat_map(|m| m.iter())
+        .filter(|(id, record)| place(&record.kube, id).0 == ns)
+        .filter_map(|(id, _)| one_shot_scope(id))
+        .collect();
+    let keep = serde_json::to_string(&keep).map_err(|e| e.to_string())?;
+    let r = codec(kube, ns, &["scopes", &keep], None, CALL);
+    if r.ok() {
+        Ok(())
+    } else {
+        Err(r.err_text())
+    }
+}
+
+/// Delete a one-shot session's replica scope, retrying pending cleanups in its namespace.
 pub(crate) fn drop_scope(run_id: &str) {
-    let Some(scope) = one_shot_scope(run_id) else {
-        return;
-    };
     let kube = SCOPES
         .lock()
-        .ok()
-        .and_then(|mut m| m.as_mut().and_then(|m| m.remove(run_id)));
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .and_then(|m| m.get(run_id))
+        .map(|r| r.kube.clone());
     let Some(kube) = kube else {
         return;
     };
     let (ns, _, _) = place(&kube, run_id);
-    // (core#1463) A concurrent copy-in cannot publish stamps across this removal.
     let arming = arm_lock(&ns);
     let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
-    if let Ok(mut g) = SEEDED.lock() {
-        if let Some(set) = g.as_mut() {
-            let prefix = seeded_key(&ns, &format!("{scope}/"));
-            set.retain(|k| !k.starts_with(&prefix));
-        }
+    if let Some(record) = SCOPES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+        .and_then(|m| m.get_mut(run_id))
+    {
+        record.pending = true;
     }
+    if let Err(e) = drain_scopes(&kube, &ns) {
+        eprintln!("wicked-core: session scopes in {ns} not removed: {e}");
+    }
+}
 
-    let r = kube.call(
-        Some(&ns),
-        &[
-            "exec",
-            "-c",
-            "sync",
-            "sync",
-            "--",
-            "/floor/busybox",
-            "rm",
-            "-rf",
-            "/replica/.wicked-stamps",
-            &format!("/replica/{scope}"),
-        ],
-        None,
-        CALL,
-    );
-    if !r.ok() {
-        eprintln!(
-            "wicked-core: session scope {scope} not removed: {}",
-            r.err_text()
+/// Caller holds this namespace's arm lock, including against scope registration.
+fn drain_scopes(kube: &Kube, ns: &str) -> Result<(), String> {
+    let mut scopes = SCOPES.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(scopes) = scopes.as_mut() else {
+        return Ok(());
+    };
+    let pending: Vec<String> = scopes
+        .iter()
+        .filter(|(id, r)| r.pending && place(&r.kube, id).0 == ns)
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in pending {
+        let scope = one_shot_scope(&id).ok_or("a session scope is missing")?;
+        if let Ok(mut g) = SEEDED.lock() {
+            if let Some(set) = g.as_mut() {
+                let prefix = seeded_key(ns, &format!("{scope}/"));
+                set.retain(|k| !k.starts_with(&prefix));
+            }
+        }
+        let r = kube.call(
+            Some(ns),
+            &[
+                "exec",
+                "-c",
+                "sync",
+                "sync",
+                "--",
+                "/floor/busybox",
+                "rm",
+                "-rf",
+                "/replica/.wicked-stamps",
+                &format!("/replica/{scope}"),
+            ],
+            None,
+            CALL,
         );
+        if !r.ok() {
+            return Err(r.err_text());
+        }
+        scopes.remove(&id);
     }
+    Ok(())
 }
 
 /// Turn a plan's mounts (from the floor) into [`PlanMount`]s.
@@ -3993,4 +4144,239 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
 #[cfg(all(test, unix))]
 pub(crate) fn forget_for_test(id: &str) {
     unregister(id);
+}
+
+#[cfg(all(test, unix))]
+mod image_loading_tests {
+    use super::*;
+
+    #[test]
+    fn missing_sync_pod_loads_kind_images_before_apply() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::container_floor::RUNTIME_ENV, value),
+                    None => std::env::remove_var(crate::container_floor::RUNTIME_ENV),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(crate::container_floor::RUNTIME_ENV));
+        let dir = crate::container_floor::RemoveOnDrop(
+            std::env::temp_dir().join(format!("sync-images-{}", uuid::Uuid::new_v4().simple())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let log = dir.0.join("calls");
+        let applied = dir.0.join("applied");
+        let cli = dir.0.join("docker");
+        let script = r#"#!/bin/sh
+printf 'docker %s\n' "$*" >> '@LOG@'
+case "$1" in
+version) echo 27;;
+image) case "$*" in *sync:test) echo 'sha256:@SYNC@';; *) echo 'sha256:@FLOOR@';; esac;;
+save) : > "$3";;
+*) exit 98;;
+esac
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@SYNC@", &"d".repeat(64))
+        .replace("@FLOOR@", &"e".repeat(64));
+        crate::test_env::install_stub(&cli, &script);
+        crate::test_env::install_stub(
+            &dir.0.join("kind"),
+            &format!("#!/bin/sh\necho \"kind $*\" >> '{}'\n", log.display()),
+        );
+        let kubectl = dir.0.join("kubectl");
+        let nodes = serde_json::json!({"items": [{
+            "metadata": {"name": "n", "uid": dir.0.display().to_string()},
+            "spec": {"providerID": "kind://docker/c/n"},
+            "status": {"nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+        }]});
+        let pods = serde_json::json!({"items": [{
+            "metadata": {"name": "sync", "labels": {
+                "wicked.dev/owner": "wtest", "wicked.dev/boot": crate::k8s::boot_id()
+            }},
+            "status": {"phase": "Running", "conditions": [{
+                "type": "Ready", "status": "True"
+            }], "containerStatuses": [{"ready": true}]}
+        }]});
+        let script = r#"#!/bin/sh
+printf 'kubectl %s\n' "$*" >> '@LOG@'
+case "$*" in
+*'get nodes -o json'*) echo '@NODES@';;
+*'get pods '*) if [ -f '@APPLIED@' ]; then echo '@PODS@'; else echo '{"items":[]}'; fi;;
+*'get pod sync '*) exit 0;;
+*'apply '*) cat >/dev/null; touch '@APPLIED@';;
+*) exit 98;;
+esac
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@APPLIED@", &applied.display().to_string())
+        .replace("@NODES@", &nodes.to_string())
+        .replace("@PODS@", &pods.to_string());
+        crate::test_env::install_stub(&kubectl, &script);
+        std::env::set_var(crate::container_floor::RUNTIME_ENV, cli);
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: dir.0.display().to_string(),
+            owner: "wtest".into(),
+        };
+        ensure_sync(&kube, "sync-images", "run", "sync:test", "floor:test").unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let apply = calls.find("apply ").unwrap();
+        let loads: Vec<_> = calls.match_indices("kind load image-archive ").collect();
+        assert_eq!(loads.len(), 2, "{calls}");
+        assert!(loads.iter().all(|(at, _)| *at < apply), "{calls}");
+        for image in ["sync:test", "floor:test"] {
+            assert!(calls
+                .lines()
+                .any(|l| l.starts_with("docker save ") && l.ends_with(image)));
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pr_c2_tests {
+    use super::*;
+
+    #[test]
+    fn boot_scope_sweep_waits_for_pods_and_keeps_a_concurrently_registered_scope() {
+        let dir = std::env::temp_dir().join(format!("scope-sweep-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubectl = dir.join("kubectl");
+        let kube = Kube {
+            kubectl: kubectl.clone(),
+            kubeconfig: None,
+            context: "test".into(),
+            owner: format!("sweep-{}", uuid::Uuid::new_v4()),
+        };
+        let run = format!("validator-{}", uuid::Uuid::new_v4());
+        let (ns, current, _) = place(&kube, &run);
+        let current = current.unwrap();
+        let old = "s-000000000000000000000000";
+        std::fs::create_dir(dir.join(old)).unwrap();
+        std::fs::create_dir(dir.join(&current)).unwrap();
+        let namespace = render::run_namespace_docs(
+            &ns,
+            &kube.owner,
+            super::super::SESSIONS_RUN,
+            "daemon",
+            &RunBudget::default(),
+            "20Gi",
+        )
+        .remove(0);
+        let ready = serde_json::json!({"metadata": {"name": "sync", "labels": {
+            super::super::OWNER_LABEL: kube.owner, super::super::MANAGED_LABEL: super::super::MANAGED_BY,
+            super::super::BOOT_LABEL: super::super::boot_id()}}, "status": {
+            "phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"ready": true}]}});
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import os, sys, json
+from pathlib import Path
+d = Path({dir})
+a = sys.argv[1:]
+if 'namespaces' in a:
+    print(json.dumps({{'items': [json.loads({namespace})]}}))
+elif 'delete' in a:
+    (d / 'deleted').touch()
+elif 'get' in a and 'pods' in a:
+    assert (d / 'deleted').exists()
+    if not (d / 'polled').exists():
+        (d / 'polled').touch()
+        print(json.dumps({{'items': [{{'metadata': {{'labels': {{'wicked.dev/boot': 'old'}}}}}}]}}))
+    else:
+        (d / 'barrier').touch()
+        print(json.dumps({{'items': [json.loads({ready})]}}))
+elif 'exec' in a:
+    assert (d / 'barrier').exists()
+    i = a.index('python3')
+    os.environ['WICKED_SYNC_ROOT'] = str(d)
+    os.environ['WICKED_SYNC_JAIL'] = '-'
+    code = a[i + 3]
+    sys.argv = ['codec'] + a[i + 4:]
+    exec(code)
+else:
+    sys.exit(9)
+"#,
+            dir = serde_json::to_string(&dir).unwrap(),
+            namespace = serde_json::to_string(&namespace.to_string()).unwrap(),
+            ready = serde_json::to_string(&ready.to_string()).unwrap()
+        );
+        crate::test_env::install_stub(&kubectl, &script);
+        let arming = arm_lock(&ns);
+        let held = arming.lock().unwrap();
+        let worker_kube = kube.clone();
+        let sweep = std::thread::spawn(move || cluster::sweep(&worker_kube, &|_| true, None));
+        let start = Instant::now();
+        while !dir.join("barrier").exists() {
+            assert!(
+                start.elapsed() < crate::test_env::PATIENT,
+                "sweep did not reach its pod barrier"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        SCOPES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                run.clone(),
+                ScopeRecord {
+                    kube,
+                    pending: false,
+                },
+            );
+        drop(held);
+        sweep.join().unwrap().unwrap();
+        assert!(!dir.join(old).exists());
+        assert!(dir.join(current).is_dir());
+        SCOPES.lock().unwrap().as_mut().unwrap().remove(&run);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn failed_scope_removal_keeps_its_record_for_the_next_drain() {
+        let dir = std::env::temp_dir().join(format!("scope-retry-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubectl = dir.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\nif [ ! -f '{0}/failed' ]; then touch '{0}/failed'; exit 1; fi\necho removed >>'{0}/removed'\n",
+            dir.display()
+        ));
+        let kube = Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: format!("retry-{}", uuid::Uuid::new_v4()),
+        };
+        let run = format!("validator-{}", uuid::Uuid::new_v4());
+        SCOPES
+            .lock()
+            .unwrap()
+            .get_or_insert_with(HashMap::new)
+            .insert(
+                run.clone(),
+                ScopeRecord {
+                    kube,
+                    pending: false,
+                },
+            );
+        drop_scope(&run);
+        assert!(SCOPES.lock().unwrap().as_ref().unwrap().contains_key(&run));
+        drop_scope(&run);
+        assert!(!SCOPES.lock().unwrap().as_ref().unwrap().contains_key(&run));
+        assert_eq!(
+            std::fs::read_to_string(dir.join("removed"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -114,9 +114,10 @@ pub use domain_model::{
     touched_requirements, weighted_pct, BusinessDomain, BusinessDomainRef, CoverageConfig,
     CoverageReport, Domain, DomainBuildOptions, DomainGraphBuild, DomainModel, Entity, EntityField,
     ErrorPath, ListedRow, ListedRows, Metadata as DomainMetadata, ModelCoverage, PerApp,
-    Provenance as DomainProvenance, Requirement, RequirementUnits, Rule as DomainRule,
-    TouchedRequirement, UnaccountedNode, Uncounted, Validation, BUSINESS_DOMAIN_ANN,
-    DEFAULT_MIN_COVERAGE_PCT, DEFAULT_RESOLVE_THRESHOLD, MIN_COVERAGE_ENV,
+    Provenance as DomainProvenance, Requirement, RequirementLinks, RequirementUnits,
+    Rule as DomainRule, SatisfiedByLink, TouchedRequirement, UnaccountedNode, Uncounted,
+    Validation, BUSINESS_DOMAIN_ANN, DEFAULT_MIN_COVERAGE_PCT, DEFAULT_RESOLVE_THRESHOLD,
+    MIN_COVERAGE_ENV,
 };
 // Corroboration of each requirement (operator ruling 2026-10-31, "validation by duplication").
 pub use corroboration::{Corroboration, CorroborationIndex, Unconfirmed, VALIDATED_MIN_SOURCES};

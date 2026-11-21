@@ -15,6 +15,8 @@ use super::{
 };
 use crate::worker_sandbox::FloorUnarmed;
 
+pub(crate) use super::images::ImageStore;
+
 /// The pinned agent-sandbox release manifest, vendored byte for byte.
 pub(crate) const AGENT_SANDBOX_MANIFEST: &str =
     include_str!("../../containers/k8s/agent-sandbox-v1.0.10.yaml");
@@ -50,14 +52,6 @@ pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
         }
     }
     probe(kube)?;
-    // The engine's own token is renewed while the cluster answers (B-5): a 30-day TokenRequest,
-    // renewed inside its last week. Only the engine's own context (an operator's kubeconfig is
-    // never rewritten); a failed renewal is reported and the old token used until it expires.
-    if renews(kube) {
-        if let Err(e) = renew_token_if_due(kube) {
-            eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
-        }
-    }
     if let Ok(mut last) = LAST.lock() {
         *last = Some((kube.clone(), std::time::Instant::now()));
     }
@@ -407,7 +401,11 @@ pub(crate) fn admission_enforced(engine: &Kube) -> Result<(), String> {
 
 /// How long an engine token lives, and when it is renewed.
 pub(crate) const TOKEN_LIFETIME: &str = "720h";
+#[cfg(any(not(test), unix))]
 const TOKEN_RENEW_BELOW_SECS: u64 = 7 * 24 * 3600;
+/// Recheck wall time at least hourly while awake, since sleep may exclude suspended time.
+#[cfg(any(not(test), unix))]
+const RENEWAL_SLEEP_CAP: Duration = Duration::from_secs(3600);
 
 /// A TokenRequest token for the engine account (never stored in the cluster's datastore).
 fn mint_token(kube: &Kube, ns: &str) -> Result<String, String> {
@@ -443,14 +441,103 @@ pub(crate) fn token_expiry(token: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Renew the engine's own token (a TokenRequest it may make for itself only) when less than a
-/// week is left; the kubeconfig is rewritten in place. `Ok(false)` = nothing to do.
-pub(crate) fn renew_token_if_due(engine: &Kube) -> Result<bool, String> {
-    renew_token_below(engine, TOKEN_RENEW_BELOW_SECS)
+/// One daemon timer, independent of probes. Resolve settings again after a missing/expired
+/// credential so a later install can be picked up; operator credentials are never renewed.
+#[cfg(not(test))]
+pub(super) fn start_token_renewal() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if let Err(e) = std::thread::Builder::new()
+            .name("k8s-token-renewal".into())
+            .spawn(|| {
+                let mut backoff = 1;
+                loop {
+                    let engine = super::engine_home().and_then(|h| super::kube_for(&h).ok());
+                    let delay = match engine.filter(renews) {
+                        Some(engine) => token_renewal_step(&engine, unix_now(), &mut backoff),
+                        None => Duration::from_secs(60),
+                    };
+                    std::thread::sleep(delay);
+                }
+            })
+        {
+            eprintln!("wicked-core: could not start cluster token renewal: {e}");
+        }
+    });
 }
 
-/// [`renew_token_if_due`] with its threshold (a test renews at once with `u64::MAX`).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(any(not(test), unix))]
+fn credential_expiry(engine: &Kube) -> Result<u64, String> {
+    let path = engine.kubeconfig.as_deref().ok_or("no engine kubeconfig")?;
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let cfg: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    cfg.pointer("/users/0/user/token")
+        .and_then(Value::as_str)
+        .and_then(token_expiry)
+        .ok_or_else(|| "the engine token has no expiry".into())
+}
+
+/// A timer tick with an injected wall clock. The caller checks `renews` before entering.
+/// Failed requests back off only within the old token's remaining validity.
+/// Cap sleeps so the caller rechecks wall time after system suspension.
+#[cfg(any(not(test), unix))]
+fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
+    let expiry = match credential_expiry(engine) {
+        Ok(expiry) => expiry,
+        Err(e) => {
+            eprintln!("wicked-core: could not schedule cluster token renewal: {e}");
+            let delay = *backoff;
+            *backoff = (*backoff).saturating_mul(2).min(60);
+            return Duration::from_secs(delay).min(RENEWAL_SLEEP_CAP);
+        }
+    };
+    if expiry <= now {
+        // An expired credential cannot authorize its replacement. Re-read for a new install.
+        return Duration::from_secs(60);
+    }
+    let due = expiry.saturating_sub(TOKEN_RENEW_BELOW_SECS);
+    if now < due {
+        *backoff = 1;
+        return Duration::from_secs(due - now).min(RENEWAL_SLEEP_CAP);
+    }
+    match renew_token_at(engine, TOKEN_RENEW_BELOW_SECS, now) {
+        Ok(_) => {
+            *backoff = 1;
+            match credential_expiry(engine) {
+                Ok(exp) => Duration::from_secs(
+                    exp.saturating_sub(now.saturating_add(TOKEN_RENEW_BELOW_SECS))
+                        .max(1),
+                )
+                .min(RENEWAL_SLEEP_CAP),
+                Err(e) => {
+                    eprintln!("wicked-core: renewed cluster token has no usable expiry: {e}");
+                    Duration::from_secs(60)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
+            let delay = (*backoff).min(expiry - now);
+            *backoff = (*backoff).saturating_mul(2).min(60);
+            Duration::from_secs(delay).min(RENEWAL_SLEEP_CAP)
+        }
+    }
+}
+
+/// Renew below a threshold (the live test renews at once with `u64::MAX`).
+#[cfg(test)]
 pub(crate) fn renew_token_below(engine: &Kube, below_secs: u64) -> Result<bool, String> {
+    renew_token_at(engine, below_secs, unix_now())
+}
+
+fn renew_token_at(engine: &Kube, below_secs: u64, now: u64) -> Result<bool, String> {
     let Some(path) = engine.kubeconfig.clone() else {
         return Ok(false);
     };
@@ -459,10 +546,6 @@ pub(crate) fn renew_token_below(engine: &Kube, below_secs: u64) -> Result<bool, 
     let Some(token) = cfg.pointer("/users/0/user/token").and_then(Value::as_str) else {
         return Ok(false);
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     if token_expiry(token).is_some_and(|exp| exp > now.saturating_add(below_secs)) {
         return Ok(false);
     }
@@ -697,7 +780,64 @@ pub(crate) fn ensure_run(
         replica_size,
     );
     docs.push(exec_role_binding(&ns, &kube.owner));
+    // `create` distinguishes our new namespace atomically from a pre-existing one. Its reply
+    // supplies the UID; rollback can never delete a replacement with the same name.
+    let body = serde_json::to_vec(&docs[0]).map_err(|e| e.to_string())?;
+    let created = kube.call(
+        None,
+        &["create", "-f", "-", "-o", "json"],
+        Some(&body),
+        super::CALL_TIMEOUT,
+    );
+    let uid = if created.ok() {
+        let obj: Value = serde_json::from_slice(&created.stdout).map_err(|e| e.to_string())?;
+        Some(
+            obj.pointer("/metadata/uid")
+                .and_then(Value::as_str)
+                .ok_or("the created namespace has no UID")?
+                .to_string(),
+        )
+    } else if created.err_text().contains("AlreadyExists") {
+        None
+    } else {
+        return Err(created.err_text());
+    };
+    struct Rollback<'a> {
+        kube: &'a Kube,
+        namespace: &'a str,
+        uid: Option<String>,
+    }
+    impl Drop for Rollback<'_> {
+        fn drop(&mut self) {
+            if let Some(uid) = self.uid.take() {
+                let body = json!({"apiVersion": "v1", "kind": "DeleteOptions",
+                    "preconditions": {"uid": uid}})
+                .to_string();
+                let url = format!("/api/v1/namespaces/{}", self.namespace);
+                let r = self.kube.call(
+                    None,
+                    &["delete", "--raw", &url, "-f", "-"],
+                    Some(body.as_bytes()),
+                    super::CALL_TIMEOUT,
+                );
+                if !r.ok() {
+                    eprintln!(
+                        "wicked-core: namespace/{} rollback failed: {}",
+                        self.namespace,
+                        r.err_text()
+                    );
+                }
+            }
+        }
+    }
+    let mut rollback = Rollback {
+        kube,
+        namespace: &ns,
+        uid,
+    };
     kube.apply(&docs)?;
+    rollback.uid = None;
+    drop(rollback);
     Ok(ns)
 }
 
@@ -904,6 +1044,13 @@ pub(crate) fn sweep(
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
+                // Leftover session scopes are pruned; a failure is reported and never stops the
+                // sweep of the other namespaces.
+                if ns == run_namespace_name(&kube.owner, super::SESSIONS_RUN) {
+                    if let Err(e) = super::seat::sweep_session_scopes(kube, &ns) {
+                        eprintln!("wicked-core: session scopes in {ns} not swept: {e}");
+                    }
+                }
             }
         }
     }
@@ -920,7 +1067,17 @@ static PIDS_VERDICT: std::sync::Mutex<Option<(String, std::time::Instant, u32)>>
 
 /// The one node this runner certifies: v1 runs on a single-node local cluster, and a verdict
 /// for one node never approves another (review r1 P2).
-pub(crate) fn single_node(kube: &Kube) -> Result<(String, String), (FloorUnarmed, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeInfo {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+    pub(crate) store: ImageStore,
+}
+
+pub(crate) fn single_node(
+    kube: &Kube,
+    rt: &crate::container_floor::Runtime,
+) -> Result<NodeInfo, (FloorUnarmed, String)> {
     let r = kube.call(
         None,
         &["get", "nodes", "-o", "json"],
@@ -932,32 +1089,34 @@ pub(crate) fn single_node(kube: &Kube) -> Result<(String, String), (FloorUnarmed
     }
     let v: Value = serde_json::from_slice(&r.stdout)
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e.to_string()))?;
-    // (name, uid): the uid is the node's incarnation, so a reset cluster whose node keeps its
-    // name is probed again (review r2 P2).
-    let names: Vec<(String, String)> = v
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|n| {
-                    Some((
-                        n.pointer("/metadata/name")?.as_str()?.to_string(),
-                        n.pointer("/metadata/uid")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    match names.as_slice() {
-        [one] => Ok(one.clone()),
-        _ => Err((
+    let nodes = v.get("items").and_then(Value::as_array).ok_or_else(|| {
+        (
+            FloorUnarmed::ClusterUnreachable,
+            "node listing has no items array".to_string(),
+        )
+    })?;
+    let [node] = nodes.as_slice() else {
+        return Err((
             FloorUnarmed::PolicyRefused,
             format!(
                 "the runner certifies a single-node local cluster; this one has {} nodes",
-                names.len()
+                nodes.len()
             ),
-        )),
-    }
+        ));
+    };
+    let field = |p: &str| {
+        node.pointer(p)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| (FloorUnarmed::ClusterUnreachable, format!("node lacks {p}")))
+    };
+    Ok(NodeInfo {
+        name: field("/metadata/name")?,
+        // A reset cluster may keep its name; its node incarnation must be loaded/probed anew.
+        uid: field("/metadata/uid")?,
+        store: ImageStore::classify(node, rt.cli.file_name().is_some_and(|n| n == "nerdctl"))?,
+    })
 }
 
 /// Whether this cluster's pods are held to a pids limit and its NetworkPolicy is enforced
@@ -974,8 +1133,10 @@ pub(crate) fn ensure_pids_limited(
             "the pids probe lock is poisoned".to_string(),
         )
     })?;
-    let (node, node_uid) = single_node(kube)?;
-    let key = format!("{}|{node}|{node_uid}", kube.head(None).join(" "));
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    let node = single_node(kube, &rt)?;
+    super::images::ensure_loaded(kube, &rt, &node, &[floor_image])?;
+    let key = format!("{}|{}|{}", kube.head(None).join(" "), node.name, node.uid);
     if let Some((k, at, n)) = cache.as_ref() {
         if *k == key && at.elapsed() < PIDS_PROBE_EVERY {
             return Ok(*n);
@@ -995,7 +1156,7 @@ pub(crate) fn ensure_pids_limited(
         &kube.owner,
         &name,
         floor_image,
-        &node,
+        &node.name,
     )])
     .map_err(infra)?;
     let start = std::time::Instant::now();
@@ -1037,4 +1198,176 @@ pub(crate) fn ensure_pids_limited(
     })?;
     *cache = Some((key, std::time::Instant::now(), n));
     Ok(n)
+}
+
+#[cfg(all(test, unix))]
+mod renewal_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn idle_timer_caps_sleep_and_preserves_near_due_delay() {
+        use base64::Engine as _;
+        let dir =
+            std::env::temp_dir().join(format!("wicked-token-{}", uuid::Uuid::new_v4().simple()));
+        let path = super::super::own_kubeconfig(&dir);
+        let engine = Kube {
+            kubectl: dir.join("unused-kubectl"),
+            kubeconfig: Some(path.clone()),
+            context: OWN_CONTEXT.into(),
+            owner: "test".into(),
+        };
+        let now = 1_000_000;
+        let mut backoff = 60;
+        assert_eq!(RENEWAL_SLEEP_CAP, Duration::from_secs(3600));
+        for remaining in [30 * 24 * 3600, 3601, 3600, 3599, 1] {
+            let expiry = now + TOKEN_RENEW_BELOW_SECS + remaining;
+            let token = format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!(r#"{{"exp":{expiry}}}"#))
+            );
+            write_private(
+                &path,
+                &serde_json::to_vec(&engine_kubeconfig(
+                    json!({"server": "https://unused"}),
+                    &token,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                token_renewal_step(&engine, now, &mut backoff),
+                Duration::from_secs(remaining).min(RENEWAL_SLEEP_CAP),
+                "remaining until renewal: {remaining}",
+            );
+            assert_eq!(backoff, 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idle_timer_renews_at_the_expiry_margin_without_a_probe() {
+        use base64::Engine as _;
+        let token = |exp| {
+            format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!(r#"{{"exp":{exp}}}"#))
+            )
+        };
+        let dir =
+            std::env::temp_dir().join(format!("wicked-token-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubectl = dir.join("kubectl");
+        let now = 1_000_000;
+        let expiry = now + TOKEN_RENEW_BELOW_SECS + 10;
+        let fresh = token(expiry + 30 * 24 * 3600);
+        std::fs::write(
+            &kubectl,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *'create token wicked-engine'*) printf '%s' '{fresh}';;\n\
+                 *) exit 91;; esac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = super::super::own_kubeconfig(&dir);
+        write_private(
+            &path,
+            &serde_json::to_vec(&engine_kubeconfig(
+                json!({"server": "https://unused"}),
+                &token(expiry),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let engine = Kube {
+            kubectl,
+            kubeconfig: Some(path.clone()),
+            context: OWN_CONTEXT.into(),
+            owner: "test".into(),
+        };
+        let mut backoff = 1;
+        assert_eq!(
+            token_renewal_step(&engine, now, &mut backoff),
+            Duration::from_secs(10),
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&fresh));
+        // The daemon sleeps to the threshold; no probe or arm occurs as time advances.
+        let delay = token_renewal_step(&engine, now + 10, &mut backoff);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&fresh));
+        assert_eq!(delay, RENEWAL_SLEEP_CAP);
+
+        // Failed requests back off within validity, then stop at expiry even while idle.
+        write_private(
+            &path,
+            &serde_json::to_vec(&engine_kubeconfig(
+                json!({"server": "https://unused"}),
+                &token(now + 3),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &engine.kubectl,
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\n\
+             printf 'attempt\\n' >> attempts\nexit 23\n",
+        )
+        .unwrap();
+        for (elapsed, delay) in [(0, 1), (1, 2), (2, 1), (3, 60)] {
+            assert_eq!(
+                token_renewal_step(&engine, now + elapsed, &mut backoff),
+                Duration::from_secs(delay),
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pr_c2_tests {
+    use super::*;
+
+    #[test]
+    fn partial_namespace_apply_rolls_back_only_the_uid_this_call_created() {
+        for existing in [false, true] {
+            let dir =
+                std::env::temp_dir().join(format!("namespace-rollback-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let kubectl = dir.join("kubectl");
+            let create = if existing {
+                "echo AlreadyExists >&2; exit 1"
+            } else {
+                "echo '{\"metadata\":{\"uid\":\"created-uid\",\"resourceVersion\":\"1\"}}'; exit 0"
+            };
+            crate::test_env::install_stub(&kubectl, &format!(
+                "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' create '*) cat >'{0}/namespace'; {create};;\n*' apply '*) cat >'{0}/docs'; echo 'policy refused' >&2; exit 1;;\n*' delete --raw '*) cat >'{0}/delete'; exit 0;;\n*) exit 9;;\nesac\n",
+                dir.display()
+            ));
+            let kube = Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "me".into(),
+            };
+            let err = ensure_run(&kube, "run", &RunBudget::default(), "20Gi").unwrap_err();
+            assert!(err.contains("policy refused"), "{err}");
+            assert_eq!(dir.join("delete").exists(), !existing);
+            if !existing {
+                let delete: Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("delete")).unwrap()).unwrap();
+                assert_eq!(delete["preconditions"]["uid"], "created-uid");
+            }
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 }

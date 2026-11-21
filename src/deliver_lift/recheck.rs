@@ -15,8 +15,8 @@
 //!
 //! Three things differ from a live run's verify floor, each toward MORE checking (codex r1):
 //! - The floor runs under its own id (`<run>-recheck-<n>`), not the run's: a finished run's id is
-//!   in the floor-cancel set (its completion cancels its workers), which would refuse every
-//!   recheck; and a cancel of the run never reaches a recheck it does not own.
+//!   used for scratch and full-suite policy independently of the finished run. No actor launch
+//!   stop is attached: a cancel of the run never reaches a recheck it does not own.
 //! - The checks are the engine floor's own resolution, not a second resolver: a current base build
 //!   guide takes precedence over the detected tests in the directories it covers (a guide with only
 //!   a lint check runs lint only); elsewhere the full test command runs where the repository has one
@@ -145,6 +145,7 @@ pub fn check_run_tree(
     let floor_id = recheck_floor_id(run_id);
     let ctx = FloorContext {
         stage: FloorStage::Verify,
+        stop: None,
         force_install: true,
         base_head: Some(base.clone()),
         git_dir: Some(git_dir.clone()),
@@ -371,18 +372,22 @@ mod tests {
         }
     }
 
-    /// codex r1: a FINISHED run's id is in the floor-cancel set (its completion cancels its
-    /// workers). The recheck runs under its own floor id, so it is not refused, and it leaves
-    /// that cancel in place.
+    /// A finished run's stopped launch does not refuse an independent recheck or get revived
+    /// by it.
     #[test]
     fn a_finished_runs_cancel_does_not_refuse_its_recheck() {
         let (repo, wt, base) = simple("finished", true);
         let run = format!("run-finished-{}", std::process::id());
-        crate::repo_checks::cancel_floor(&run);
+        let stop = crate::repo_checks::FloorStop::new(|| Some("cancelled"));
+        let ctx = FloorContext {
+            run_id: Some(run.clone()),
+            stop: Some(stop.clone()),
+            ..Default::default()
+        };
+        let cancelled = crate::repo_checks::run_floor(&wt, &ctx);
+        assert_eq!(cancelled.outcome(), "not_run");
         let r = check_run_tree(&run, &wt, &repo, &base).unwrap();
-        let still = crate::repo_checks::floor_cancelled(Some(&run));
-        crate::repo_checks::clear_floor_cancel(&run);
-        assert!(still, "the finished run's cancel is left as it was");
+        assert_eq!(stop.reason(), Some("cancelled"));
         if unboxed(&r) {
             return;
         }

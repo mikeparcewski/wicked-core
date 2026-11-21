@@ -194,6 +194,8 @@ struct DispatchedTask {
     entity_mode: EntityMode,
     /// The run's worktree (the wrapped-CLI runner's cwd). `None` ⇒ the runner's default cwd.
     workdir: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base_commit: Option<String>,
     /// The unit — with its validator's SCRIPT blanked (finding #7); carries description, validator
     /// criterion, role, skill scope… everything the off-actor runner + agent judge legitimately need.
     unit: crate::domain::WorkUnit,
@@ -2124,6 +2126,7 @@ impl crate::rule_check::MachineCheck for NoMachineHere {
 /// without the change (kept); every one passing is a test that does not (broken). A repo with no
 /// test command, no pinned git dir or no OS boundary falls back to the judge, saying so.
 struct FloorMachine<'a> {
+    stop: Option<crate::repo_checks::FloorStop>,
     wd: &'a std::path::Path,
     git_dir: Option<&'a std::path::Path>,
     base: &'a str,
@@ -2178,6 +2181,7 @@ impl crate::rule_check::MachineCheck for FloorMachine<'_> {
             };
         let ctx = crate::repo_checks::FloorContext {
             stage: crate::repo_checks::FloorStage::Creator,
+            stop: self.stop.clone(),
             force_install: false,
             base_head: Some(self.base.to_string()),
             git_dir: Some(git_dir.to_path_buf()),
@@ -2351,6 +2355,7 @@ fn run_rule_check(
         runner,
         emit_delta,
         None,
+        None,
     )
 }
 
@@ -2375,6 +2380,7 @@ fn run_rule_check_with(
     runner: &dyn StepRunner,
     emit_delta: &DeltaSink,
     settle: Option<Settle<'_>>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
@@ -2611,6 +2617,7 @@ fn run_rule_check_with(
                 },
                 &judge,
                 &FloorMachine {
+                    stop: stop.clone(),
                     wd,
                     git_dir,
                     base: &base,
@@ -3133,6 +3140,7 @@ pub(crate) fn run_unit_and_judge(
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
     rule_council: Option<&CouncilCtx<'_>>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -3171,6 +3179,7 @@ pub(crate) fn run_unit_and_judge(
         },
         exec_bus,
         team,
+        stop,
     )
 }
 
@@ -3507,6 +3516,7 @@ fn run_unit_and_judge_with_roster(
         JudgeFallbackCtx::default(),
         None,
         None,
+        None,
     )
 }
 
@@ -3582,6 +3592,7 @@ fn run_unit_and_judge_with_launches(
         },
         None,
         None,
+        None,
     )
 }
 
@@ -3620,6 +3631,7 @@ fn run_unit_and_judge_reprobing(
         },
         None,
         None,
+        None,
     )
 }
 
@@ -3650,6 +3662,7 @@ pub(crate) fn run_unit_and_judge_with_team(
         JudgeFallbackCtx::default(),
         exec_bus,
         team,
+        None,
     )
 }
 
@@ -5032,6 +5045,7 @@ fn provisions_seat_deps(input: &StepInput) -> bool {
         && !input.governance.as_ref().is_some_and(|g| g.apps.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn floor_plan(
     input: &StepInput,
     output: &StepOutput,
@@ -5040,6 +5054,7 @@ fn floor_plan(
     current_tree: Option<&str>,
     default_floor_applies: bool,
     recheck_armed: bool,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> Option<FloorPlan> {
     let guard_denies = matches!(
         guard_first_look,
@@ -5081,6 +5096,7 @@ fn floor_plan(
     let baseline = input.unit.worktree_baseline.as_ref();
     let ctx = crate::repo_checks::FloorContext {
         stage,
+        stop,
         force_install: false,
         // The run base first (F-RC2-009): a creator that committed its work has moved the
         // baseline's HEAD onto the head itself, and base == head compares nothing.
@@ -5219,6 +5235,7 @@ fn run_unit_and_judge_on(
     fallback: JudgeFallbackCtx<'_>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -5243,11 +5260,13 @@ fn run_unit_and_judge_on(
             fallback,
             exec_bus,
             team,
+            stop,
         )
     });
     // (core#1390) The fold's tree reads, here on the worker thread for every worker path (in-process
     // and bus-mediated) and every way the unit ended — an early return included — so the fold runs
     // no git on the actor.
+    evidence.write_set = crate::worktree_guard::write_set_for_unit(input);
     let (worktree_clean, tree_after_failure) = crate::actor::post_step_reads(input, &output);
     evidence.worktree_clean = worktree_clean;
     evidence.tree_after_failure = tree_after_failure;
@@ -5343,6 +5362,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     fallback: JudgeFallbackCtx<'_>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -5786,6 +5806,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             current_tree.as_deref(),
             default_floor_applies,
             recheck_armed,
+            stop.clone(),
         )
     };
     // (power-speed-2) A floor that runs on a CLEAN CHECKOUT of a known tree starts now, on its own
@@ -6830,6 +6851,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 council: fallback.rule_council,
                 council_pool: &eligible_run,
             }),
+            stop.clone(),
         )
     } else {
         None
@@ -6940,6 +6962,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
         .map(|r| r.seat.clone())
         .collect();
     let evidence = crate::workflow::UnitEvidence {
+        write_set: None,
         observed_providers: work_observed.known().map(<[String]>::to_vec),
         worktree_guard,
         repo_checks,
@@ -7047,6 +7070,7 @@ pub(crate) fn try_publish_dispatched(
             launch_seq: input.launch_seq,
             is_acp,
             required_skills: input.required_skills.clone(),
+            base_commit: input.base_commit.clone(),
         };
         let payload = match serde_json::to_value(&task) {
             Ok(v) => v,
@@ -7689,6 +7713,7 @@ fn run_cli_runner(
                     process_gen: task.process_gen,
                     launch_seq: task.launch_seq,
                     required_skills: task.required_skills.clone(),
+                    base_commit: task.base_commit.clone(),
                 };
                 // Live-output sink (parity gap #11): stream each chunk to the actor's single emit
                 // point as a `Command::CliOutputDelta`, exactly as the in-process worker does.
@@ -7729,6 +7754,9 @@ fn run_cli_runner(
                     // rule check cannot establish creators, so it convenes no council (a dispute
                     // holds) — fail-closed.
                     None,
+                    // The floor stops on this task's launch identity, read from the actor's maps
+                    // exactly as an in-process worker's floor is (core#1533).
+                    crate::actor::launch_stop(&lifecycle_maps, &task.run_id, task.launch_seq),
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -7913,6 +7941,7 @@ mod tests {
         unit.instructions = Some("Check the citations in this report".into());
         unit.worktree_guarded = true;
         StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 2,
             attempt: 1,
@@ -8032,6 +8061,7 @@ mod tests {
                 &[],
                 JudgeFallbackCtx::default(),
                 Some(bus),
+                None,
                 None,
             )
         });
@@ -8328,6 +8358,7 @@ mod tests {
                 JudgeFallbackCtx::default(),
                 Some(bus),
                 None,
+                None,
             )
         });
         assert!(
@@ -8583,6 +8614,7 @@ mod tests {
         let expected_pin = crate::validator_vault::pin(&validator);
         unit.validator = Some(validator);
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -8645,6 +8677,7 @@ mod tests {
 
         let unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do it");
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -8802,6 +8835,7 @@ mod tests {
         unit.worktree_guarded = true;
         unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 0,
@@ -8905,6 +8939,7 @@ mod tests {
             let mut unit = crate::domain::WorkUnit::pending("r:build", "r", 4, "build");
             unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 3,
                 attempt: 0,
@@ -9000,6 +9035,7 @@ mod tests {
             });
             unit.exclude_seats = exclude.iter().map(|s| s.to_string()).collect();
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -9088,6 +9124,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -9177,6 +9214,7 @@ mod tests {
                 .unwrap(),
             );
             StepInput {
+                base_commit: None,
                 run_id: "r-1155".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -9283,6 +9321,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -9414,6 +9453,7 @@ mod tests {
             at: 0,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 3,
@@ -9628,6 +9668,7 @@ mod tests {
             .unwrap(),
         );
         let mut input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 3,
@@ -9767,6 +9808,7 @@ mod tests {
         unit.run_base_commit = Some(base);
         unit.worktree_baseline = Some(baseline);
         let input = StepInput {
+            base_commit: None,
             run_id: format!("early-floor-{}", std::process::id()),
             unit_ix: 1,
             attempt: 0,
@@ -9822,6 +9864,7 @@ mod tests {
         let mut unit = crate::domain::WorkUnit::pending("r:u1", "r", 1, "build");
         unit.assigned_cli = Some("claude".into());
         let mut input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -10002,6 +10045,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -10129,6 +10173,7 @@ mod tests {
             at: 0,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 2,
@@ -10286,6 +10331,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 2,
@@ -10325,6 +10371,7 @@ mod tests {
                         &[],
                         JudgeFallbackCtx::default(),
                         Some(bus),
+                        None,
                         None,
                     )
                 });
@@ -10436,6 +10483,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 1,
                 attempt: 2,
@@ -10592,6 +10640,7 @@ mod tests {
                 at: 0,
             });
             let input = StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 1,
                 attempt: 2,
@@ -10724,6 +10773,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11212,6 +11262,7 @@ mod tests {
                 unit.default_floor = true;
                 unit.worktree_baseline = Some(baseline.clone());
                 let input = StepInput {
+                    base_commit: None,
                     run_id: "r".into(),
                     unit_ix: 0,
                     attempt: 0,
@@ -11305,6 +11356,7 @@ mod tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11881,6 +11933,7 @@ mod tests {
         unit.default_floor = true;
 
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -11964,6 +12017,7 @@ mod tests {
         // Roster: claude (excluded as validator author), pi (excluded as creator), empty (unusable).
         // All three excluded/unusable → no distinct seat → pinned skips.
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -12175,6 +12229,7 @@ mod tests {
         // fields to simulate a pre-DES-002 payload arriving from an older sender.
         let unit = crate::domain::WorkUnit::pending("t7a:u1", "t7a", 1, "do it");
         let input = StepInput {
+            base_commit: None,
             run_id: "t7a-run".into(),
             unit_ix: 0,
             attempt: 0,
@@ -12575,6 +12630,7 @@ mod tests {
         let unit_a =
             crate::domain::WorkUnit::pending("run-t38a:u1", "run-t38a", 1, "degraded-mode test");
         let input_a = StepInput {
+            base_commit: None,
             run_id: "run-t38a".into(),
             unit_ix: 0,
             attempt: 0,
@@ -12676,6 +12732,7 @@ mod tests {
         let unit_b =
             crate::domain::WorkUnit::pending("run-t38b:u1", "run-t38b", 1, "degraded-mode test");
         let input_b = StepInput {
+            base_commit: None,
             run_id: "run-t38b".into(),
             unit_ix: 0,
             attempt: 0,
@@ -12851,6 +12908,7 @@ mod tests {
             ..red
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 1,
@@ -12960,6 +13018,7 @@ mod tests {
             git_dir: None,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 3,
             attempt: 1,
@@ -13097,6 +13156,7 @@ mod tests {
             unit.default_floor = true;
             unit.worktree_baseline = Some(crate::worktree_guard::snapshot(wt, &repo).unwrap());
             StepInput {
+                base_commit: None,
                 run_id: "r".into(),
                 unit_ix: 0,
                 attempt: 0,
@@ -13398,6 +13458,7 @@ mod tests {
         unit.default_floor = true;
         unit.worktree_baseline = Some(crate::worktree_guard::snapshot(&wt, &repo).unwrap());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14125,6 +14186,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14204,6 +14266,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "ua".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14292,6 +14355,7 @@ mod judge_routing_tests {
             approved: true,
         });
         let input = StepInput {
+            base_commit: None,
             run_id: "xr".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14444,6 +14508,7 @@ mod t5_bus_worker_tests {
             at: 0,
         });
         StepInput {
+            base_commit: None,
             run_id: run.into(),
             unit_ix: 0,
             attempt: 2,
@@ -14648,6 +14713,7 @@ mod t5_bus_worker_tests {
         stamp.stream_floor = Some(floor);
         unit.team = Some(stamp);
         let input = StepInput {
+            base_commit: None,
             run_id: run.into(),
             unit_ix: 0,
             attempt: 0,
@@ -14849,6 +14915,7 @@ mod judge_fallback_tests {
             approved: true,
         });
         StepInput {
+            base_commit: None,
             run_id: "r".into(),
             unit_ix: 4,
             attempt: 0,

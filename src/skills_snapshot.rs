@@ -5530,6 +5530,7 @@ mod tests {
         let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
         u.skill_ref = Some("wicked-garden-domain".to_string());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -6134,6 +6135,7 @@ mod tests {
             let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
             u.skill_ref = Some(skill.to_string());
             StepInput {
+                base_commit: None,
                 run_id: "r".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -6224,6 +6226,7 @@ mod tests {
             let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "index the repo");
             u.tool_cmd = Some(vec!["true".to_string()]);
             StepInput {
+                base_commit: None,
                 run_id: "r".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -6360,6 +6363,7 @@ mod tests {
         u.skill_ref = Some("wicked-garden-domain".to_string());
         u.base_skill_ref = Some("wicked-garden-governed-worker".to_string());
         let input = StepInput {
+            base_commit: None,
             run_id: "r".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -6729,6 +6733,7 @@ mod tests {
             let mut u = crate::domain::WorkUnit::pending("r:u1", "r", 1, "do");
             u.skill_ref = skill.map(str::to_string);
             StepInput {
+                base_commit: None,
                 run_id: "r".to_string(),
                 unit_ix: 0,
                 attempt: 0,

@@ -18,26 +18,8 @@ use sha2::{Digest, Sha256};
 
 use crate::seat_credentials::CredentialKind;
 
-#[cfg(test)]
-use crate::container_floor::{output_within, Runtime};
-#[cfg(test)]
-use std::process::{Output, Stdio};
-#[cfg(test)]
-use std::time::Duration;
-#[cfg(test)]
-use std::time::Instant;
-#[cfg(all(unix, test))]
-use wicked_apps_core::HardenedCommand;
-
 /// The OSS gateway image whose config shape the fixture proves.
 pub(crate) const GATEWAY_IMAGE: &str = "ghcr.io/agentgateway/agentgateway:v1.6.0";
-
-#[cfg(test)]
-/// The gateway label, distinct from the seat label so a seat sweep cannot reap it.
-pub(crate) const GATEWAY_LABEL: &str = "wicked.gateway";
-
-#[cfg(test)]
-const START_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// A route probe whose FOUND address is kept for the process; a miss is not (agy gw-r1 F-05: a
 /// transient failure, a cold helper image, must not refuse every later claude unit).
@@ -67,8 +49,6 @@ pub(crate) const HOST_ALIASES: &[&str] = &[
 pub(crate) static OWNED: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
-#[cfg(test)]
-const CLI_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The engine's readiness listener: the served key list, answered by the gateway itself (no
 /// upstream). Never a seat port; probed from inside the gateway's own network namespace.
@@ -695,29 +675,6 @@ pub(crate) fn gateway_name(state_home: &Path) -> String {
     let hash = Sha256::digest(state_home.as_os_str().as_encoded_bytes());
     let hex: String = hash[..6].iter().map(|b| format!("{b:02x}")).collect();
     format!("wicked-agw-{hex}")
-}
-
-/// The gateway and its normal (non-internal) external bridge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg(test)]
-pub(crate) struct Gateway {
-    pub(crate) name: String,
-    pub(crate) external_network: String,
-    /// The daemon's gateway directory the name is derived from: its bridge is labelled with it
-    /// ([`DIR_LABEL`]), so a sweep can tell a bridge whose daemon state is gone (core#1377).
-    pub(crate) dir: PathBuf,
-}
-
-#[cfg(test)]
-impl Gateway {
-    pub(crate) fn for_dir(dir: &Path) -> Self {
-        let name = gateway_name(dir);
-        Self {
-            external_network: format!("{name}-ext"),
-            name,
-            dir: dir.to_path_buf(),
-        }
-    }
 }
 
 /// Only model proxy values and the placeholder key enter the seat: 4000 (Anthropic) / 4001
@@ -1361,18 +1318,7 @@ pub(crate) fn copilot_account(dir: &Path) -> Option<crate::copilot_account::Copi
         .remove(COPILOT_CLI_FILE)
 }
 
-#[cfg(test)]
-pub(crate) fn route_sign_in(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-    literals: &RouteLiterals,
-) -> Result<(), String> {
-    route_sign_in_with(dir, cli, literals, || publish_for_cli(rt, gw, dir, cli))
-}
-
-/// The host half of [`route_sign_in`], for any transport (k8s-swap B-4): the route literals are
+/// The host half of route sign-in, for any transport (k8s-swap B-4): the route literals are
 /// persisted and the config re-rendered under the config transaction, then `publish` ships it.
 pub(crate) fn route_sign_in_with(
     dir: &Path,
@@ -1388,50 +1334,7 @@ pub(crate) fn route_sign_in_with(
     publish()
 }
 
-// codex lg-r1 #9: a temporary readiness key proves this reload generation was applied.
-// This confirms config application, not a provider request or upstream token-cache eviction.
-#[cfg(test)]
-pub(crate) fn confirm_sign_out(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-) -> Result<(), String> {
-    let _transaction = config_transaction(dir)?;
-    set_route_literals_locked(dir, cli, &RouteLiterals::default())?;
-    rerender_without_pending(dir)?;
-    // agy lg-r1 A3: only a running gateway can acknowledge a generation.
-    match gw_state(rt, gw, CLI_TIMEOUT) {
-        GwState::Running => {}
-        GwState::Stopped | GwState::Absent => {
-            let mut cmd = rt.cmd();
-            cmd.args(["volume", "ls", "--format", "{{.Name}}"]);
-            let out = output_within(cmd, rt.bound(CLI_TIMEOUT))
-                .ok_or("could not inspect config volumes")?;
-            if !out.status.success() {
-                return Err("could not inspect config volumes".into());
-            }
-            if String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .any(|v| v == volumes(gw).0)
-            {
-                publish_for_cli(rt, gw, dir, cli)?;
-            }
-            // agy lg-r1 A3: no stopped/absent process can still serve a pending probe key.
-            atomic_json(&revoking_path(dir), &Vec::<String>::new())?;
-            return Ok(());
-        }
-        GwState::Unknown => return Err("sign-out could not confirm gateway state".into()),
-    }
-    confirm_generation(
-        dir,
-        || publish_for_cli(rt, gw, dir, cli),
-        |key, accepted| confirm_key(rt, gw, key, accepted),
-    )
-    .map_err(|e| format!("sign-out could not confirm gateway config application: {e}"))
-}
-
-/// The host half of [`confirm_sign_out`] for a transport that answers whether a gateway serves
+/// The host half of sign-out confirmation for a transport that answers whether a gateway serves
 /// (k8s-swap B-4): `serving` = `Some(true)` serving (the generation is confirmed with a readiness
 /// key), `Some(false)` none serving (published if it can be, and no pending key can be served),
 /// `None` unknown (refused).
@@ -1544,521 +1447,15 @@ pub(crate) fn rerender_without_pending(dir: &Path) -> Result<Vec<String>, String
 /// (inotify does not cross virtiofs), so every config change is published from in there.
 pub(crate) const HELPER_IMAGE: &str = "busybox:1.37";
 
-/// The gateway's named volumes: its served config and the credential broker.
-#[cfg(test)]
-pub(crate) fn volumes(gw: &Gateway) -> (String, String) {
-    (format!("{}-cfg", gw.name), format!("{}-broker", gw.name))
-}
-
-#[cfg(test)]
-fn publish_for_cli(rt: &Runtime, gw: &Gateway, dir: &Path, cli: &str) -> Result<(), String> {
-    let body = fs::read(dir.join("config/config.json"))
-        .map_err(|e| format!("could not read the rendered gateway config: {e}"))?;
-    // codex lg-r2 C1: sign-in/out config writers share that agent's cleanup marker.
-    write_into_volume(rt, dir, cli, &volumes(gw).0, "config.json", &body)
-}
-
-/// Store a provider credential in the broker (`/broker/<file>`), the only place it lives: the
-/// gateway reads it to authenticate upstream; no seat ever mounts the broker.
-#[cfg_attr(any(not(test), not(unix)), allow(dead_code))] // the C4 sign-in flow is its production caller; its tests are unix-only
-#[cfg(test)]
-pub(crate) fn set_broker_credential(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-    file: &str,
-    secret: &[u8],
-) -> Result<(), String> {
-    if file.is_empty()
-        || !file
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-    {
-        return Err(format!("`{file}` is not a broker file name"));
-    }
-    write_into_volume(rt, dir, cli, &volumes(gw).1, file, secret)
-}
-
 // codex lg-r3 R5: a runtime client dying does not stop its daemon-owned container.
 // Journal before spawn; the next lock owner must settle abandoned helpers before mutating.
 pub(crate) fn unsettled_path(dir: &Path, scope: &str) -> PathBuf {
     dir.join("refresh").join(format!("{scope}.unsettled"))
 }
 
-/// Stop every host process whose argv carries the unique helper `name` (a dead owner's runtime
-/// client), and CONFIRM none remains; fail closed when that cannot be established (codex lg-r5:
-/// an unchecked `pkill` from the daemon's PATH could silently not run).
-#[cfg(unix)]
-#[cfg(test)]
-fn stop_orphan_clients(name: &str) -> Result<(), String> {
-    let tool = |t: &str| {
-        ["/usr/bin", "/bin"]
-            .iter()
-            .map(|d| Path::new(d).join(t))
-            .find(|p| p.is_file())
-    };
-    let (Some(pkill), Some(pgrep)) = (tool("pkill"), tool("pgrep")) else {
-        return Err("cannot confirm the helper's runtime client is gone (no pkill/pgrep)".into());
-    };
-    let mut kill = std::process::Command::new(&pkill);
-    kill.hardened().args(["-KILL", "-f", name]);
-    // 0 = killed, 1 = none matched; anything else (or no answer) fails closed.
-    match output_within(kill, CLI_TIMEOUT).and_then(|o| o.status.code()) {
-        Some(0 | 1) => {}
-        _ => return Err("could not stop the helper's runtime client".into()),
-    }
-    let start = Instant::now();
-    loop {
-        let mut look = std::process::Command::new(&pgrep);
-        look.hardened().args(["-f", name]);
-        match output_within(look, CLI_TIMEOUT).and_then(|o| o.status.code()) {
-            Some(1) => return Ok(()),
-            Some(0) if start.elapsed() < Duration::from_secs(5) => {
-                std::thread::sleep(Duration::from_millis(100))
-            }
-            _ => return Err("the helper's runtime client could not be confirmed gone".into()),
-        }
-    }
-}
-
-#[cfg(test)]
-fn remove_helper(rt: &Runtime, name: &str) -> Result<(), String> {
-    // codex lg-r4: an owner that died can leave its runtime CLIENT alive, still able to create
-    // the container after we saw it absent. The journaled name is unique, so any host process
-    // carrying it is that client: stop it first, then remove and confirm absence twice.
-    #[cfg(unix)]
-    stop_orphan_clients(name)?;
-    let absent = || {
-        let mut rm = rt.cmd();
-        rm.args(["rm", "--force", name]);
-        let _ = output_within(rm, rt.bound(CLI_TIMEOUT));
-        let mut inspect = rt.cmd();
-        inspect.args(["container", "inspect", name]);
-        output_within(inspect, rt.bound(CLI_TIMEOUT)).is_some_and(|out| {
-            !out.status.success()
-                && String::from_utf8_lossy(&out.stderr)
-                    .to_ascii_lowercase()
-                    .contains("no such container")
-        })
-    };
-    if absent() && {
-        std::thread::sleep(Duration::from_millis(500));
-        absent()
-    } {
-        return Ok(());
-    }
-    Err("mutation helper removal could not be confirmed".into())
-}
-
-#[cfg(test)]
-pub(crate) fn cleanup_unsettled(rt: &Runtime, dir: &Path, scope: &str) -> Result<(), String> {
-    let path = unsettled_path(dir, scope);
-    let name = match fs::read_to_string(&path) {
-        Ok(name) => name,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.to_string()),
-    };
-    if !name.starts_with("wicked-mutation-")
-        || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
-    {
-        return Err("invalid unsettled mutation helper identity".into());
-    }
-    remove_helper(rt, &name)?;
-    crate::seat_refresh::remove_private_file(&path)
-}
-
-#[cfg(test)]
-pub(crate) fn cleanup_mutations(rt: &Runtime, dir: &Path) -> Result<(), String> {
-    // codex lg-r3 R5: callers hold the exclusive mutation lock, so markers have dead owners.
-    for scope in [
-        "claude", "codex", "pi", "opencode", "copilot", "agy", "broker", "config",
-    ] {
-        cleanup_unsettled(rt, dir, scope)?;
-    }
-    Ok(())
-}
-
-/// Stdin and stdout run concurrently; the deadline includes both (codex lg-r2 C6).
-/// Error paths settle the named container before returning to a caller holding a lock.
-#[cfg(test)]
-pub(crate) fn mutation_helper(
-    rt: &Runtime,
-    dir: &Path,
-    scope: &str,
-    argv: &[String],
-    body: &[u8],
-    timeout: Duration,
-) -> Result<Vec<u8>, String> {
-    use std::io::Read;
-    let timeout = rt.bound(timeout);
-    cleanup_unsettled(rt, dir, scope)?;
-    let name = format!("wicked-mutation-{}", uuid::Uuid::new_v4().simple());
-    // codex lg-r3 R5: the lock's next owner must find even a helper whose owner died at spawn.
-    fs::create_dir_all(dir.join("refresh")).map_err(|e| e.to_string())?;
-    crate::seat_refresh::create_private_file(&unsettled_path(dir, scope), name.as_bytes())?;
-    let mut args = argv.to_vec();
-    args.splice(1..1, ["--name".into(), name.clone()]);
-    // codex lg-r3 R1: attached pipes do not disable the runtime's persistent logging.
-    if !args.windows(2).any(|w| w == ["--log-driver", "none"]) {
-        args.splice(3..3, ["--log-driver".into(), "none".into()]);
-    }
-    let mut cmd = rt.cmd();
-    cmd.args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let start = Instant::now();
-    let result = (|| {
-        let mut child = cmd.spawn().map_err(|_| "could not start mutation helper")?;
-        let stdin = child.stdin.take().ok_or("no helper stdin")?;
-        let stdout = child.stdout.take().ok_or("no helper stdout")?;
-        let bytes = body.to_vec();
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut stdin = stdin;
-            let result = stdin
-                .write_all(&bytes)
-                .map_err(|_| "could not stream helper input");
-            drop(stdin);
-            let _ = tx.send(result);
-        });
-        let (out_tx, out_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = stdout
-                .take(256 * 1024 + 1)
-                .read_to_end(&mut bytes)
-                .map(|_| bytes);
-            let _ = out_tx.send(result);
-        });
-        let result = (|| {
-            let status = loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => break status,
-                    Ok(None) if start.elapsed() < timeout => {
-                        std::thread::sleep(Duration::from_millis(10))
-                    }
-                    _ => return Err("mutation helper timed out".to_string()),
-                }
-            };
-            if !status.success() {
-                return Err(format!("mutation helper failed ({status})"));
-            }
-            let remaining = || timeout.saturating_sub(start.elapsed());
-            rx.recv_timeout(remaining())
-                .map_err(|_| "helper input timed out")?
-                .map_err(str::to_string)?;
-            let bytes = out_rx
-                .recv_timeout(remaining())
-                .map_err(|_| "helper output timed out")?
-                .map_err(|_| "could not read helper output")?;
-            if bytes.len() > 256 * 1024 {
-                return Err("helper output exceeds size limit".into());
-            }
-            Ok(bytes)
-        })();
-        if result.is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        result
-    })();
-    if result.is_err() {
-        cleanup_unsettled(rt, dir, scope)?;
-    } else {
-        // A successful attached `run` confirms exit; failures require confirmed removal.
-        crate::seat_refresh::remove_private_file(&unsettled_path(dir, scope))?;
-    }
-    result
-}
-
-/// Write `body` to `<volume>/<file>` from inside the runtime's VM (stdin, never argv), by an
-/// atomic rename the gateway's watcher sees. `file` is a plain name (checked by the callers).
-#[cfg(test)]
-fn write_into_volume(
-    rt: &Runtime,
-    dir: &Path,
-    scope: &str,
-    volume: &str,
-    file: &str,
-    body: &[u8],
-) -> Result<(), String> {
-    let argv = [
-        "run",
-        "--rm",
-        "--log-driver",
-        "none",
-        "-i",
-        "--network",
-        "none",
-        "--user",
-        "10001",
-        "--cap-drop",
-        "ALL",
-        "-v",
-        &format!("{volume}:/v"),
-        HELPER_IMAGE,
-        "sh",
-        "-c",
-        &format!("umask 077; cat > /v/.{file}.new && mv /v/.{file}.new /v/{file}"),
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
-    mutation_helper(rt, dir, scope, &argv, body, START_TIMEOUT).map(|_| ())
-}
-
-#[cfg(test)]
-pub(crate) fn remove_broker_file(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    cli: &str,
-    file: &str,
-) -> Result<(), String> {
-    if !file
-        .bytes()
-        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-        || file.is_empty()
-    {
-        return Err("invalid broker file name".into());
-    }
-    let argv = [
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--user",
-        "10001",
-        "-v",
-        &format!("{}:/v", volumes(gw).1),
-        HELPER_IMAGE,
-        "sh",
-        "-c",
-        &format!("rm -f /v/{file}"),
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect::<Vec<_>>();
-    mutation_helper(rt, dir, cli, &argv, &[], START_TIMEOUT).map(|_| ())
-}
-
 /// Serializes register/deregister WITH their publish, so the served config is never older than
 /// the last change (two units racing could otherwise publish out of order and drop a key).
 pub(crate) static PUBLISH_LOCK: Mutex<()> = Mutex::new(());
-
-/// Wait (bounded) until the running gateway accepts (`accepted`) or refuses `key` on its
-/// readiness listener, probed from inside its own network namespace; the key rides stdin.
-#[cfg(test)]
-pub(crate) fn confirm_key(
-    rt: &Runtime,
-    gw: &Gateway,
-    key: &str,
-    accepted: bool,
-) -> Result<(), String> {
-    use std::io::Write as _;
-    let want = if accepted { "HTTP/1.1 200" } else { " 401 " };
-    let script = format!(
-        "read K; i=0; while [ $i -lt 60 ]; do \
-         o=$(wget -S -O /dev/null --header \"x-api-key: $K\" http://127.0.0.1:{READY_PORT}/ 2>&1); \
-         case \"$o\" in *'{want}'*) exit 0;; esac; i=$((i+1)); sleep 0.25; done; exit 1"
-    );
-    let mut cmd = rt.cmd();
-    cmd.args([
-        "run",
-        "--rm",
-        "--log-driver",
-        "none",
-        "-i",
-        "--network",
-        &format!("container:{}", gw.name),
-        "--user",
-        "10001",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-        HELPER_IMAGE,
-        "sh",
-        "-c",
-        &script,
-    ]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not start the gateway readiness probe: {e}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = writeln!(stdin, "{key}");
-    }
-    let start = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(st)) if st.success() => return Ok(()),
-            Ok(Some(_)) => break,
-            Ok(None) if start.elapsed() < START_TIMEOUT => {
-                std::thread::sleep(Duration::from_millis(50))
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    Err(format!(
-        "the gateway did not {} the unit key in time (its config reload was not applied)",
-        if accepted { "accept" } else { "revoke" }
-    ))
-}
-
-/// Create the gateway's volumes owned by its user, with an (empty) credential file per route
-/// so the served config never names a missing file. Existing credentials are kept.
-#[cfg(test)]
-pub(crate) fn init_gateway_volumes(rt: &Runtime, gw: &Gateway, dir: &Path) -> Result<(), String> {
-    // codex lg-r3 R3: caller holds the mutation lock; preserve live keys and daemon ownership.
-    let _transaction = config_transaction(dir)?;
-    let mut config = load_config(dir)?;
-    reconcile_routes(&mut config);
-    init_volumes(rt, gw, dir, &config)
-}
-
-#[cfg(test)]
-fn init_volumes(
-    rt: &Runtime,
-    gw: &Gateway,
-    dir: &Path,
-    config: &GatewayConfig,
-) -> Result<(), String> {
-    let (cfg, broker) = volumes(gw);
-    for v in [&cfg, &broker] {
-        checked(
-            rt,
-            &[
-                "volume".into(),
-                "create".into(),
-                "--label".into(),
-                format!("{GATEWAY_LABEL}=1"),
-                v.clone(),
-            ],
-        )?;
-    }
-    let mut script = String::from("set -e; chown 10001 /cfg /broker;");
-    for r in &config.providers {
-        if let Some(f) = r.credential_file.file_name().and_then(|f| f.to_str()) {
-            if f.chars()
-                .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-            {
-                script.push_str(&format!(
-                    " [ -e /broker/{f} ] || : > /broker/{f}; chown 10001 /broker/{f}; chmod 600 /broker/{f};"
-                ));
-            }
-        }
-    }
-    // One-off, offline, root only for chown (a fresh volume is root-owned).
-    mutation_helper(
-        rt,
-        dir,
-        "broker",
-        &[
-            "run".into(),
-            "--rm".into(),
-            "--network".into(),
-            "none".into(),
-            "--user".into(),
-            "0".into(),
-            "-v".into(),
-            format!("{cfg}:/cfg"),
-            "-v".into(),
-            format!("{broker}:/broker"),
-            HELPER_IMAGE.into(),
-            "sh".into(),
-            "-c".into(),
-            script,
-        ],
-        &[],
-        START_TIMEOUT,
-    )
-    .map(|_| ())
-}
-
-#[cfg(test)]
-fn cli(rt: &Runtime, argv: &[String], limit: Duration) -> Option<Output> {
-    let mut cmd = rt.cmd();
-    cmd.args(argv);
-    output_within(cmd, rt.bound(limit))
-}
-
-#[cfg(test)]
-fn checked(rt: &Runtime, argv: &[String]) -> Result<(), String> {
-    match cli(rt, argv, CLI_TIMEOUT) {
-        Some(o) if o.status.success() => Ok(()),
-        // Do not relay runtime/config diagnostics that might contain credentials.
-        Some(o) => Err(format!(
-            "gateway runtime command `{}` failed ({})",
-            argv.join(" "),
-            o.status
-        )),
-        None => Err(format!(
-            "gateway runtime command `{}` could not start or timed out",
-            argv.join(" ")
-        )),
-    }
-}
-
-/// The gateway container's state as the runtime reports it. `Unknown` (the inspection failed or
-/// timed out) is never read as stopped: a reset clears every live key (codex gw-r2 P2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[cfg(test)]
-enum GwState {
-    Running,
-    /// The container exists and is not running.
-    Stopped,
-    /// No such container.
-    Absent,
-    Unknown,
-}
-
-#[cfg(test)]
-fn gw_state(rt: &Runtime, gw: &Gateway, limit: Duration) -> GwState {
-    let Some(o) = cli(rt, &inspect_argv(gw), limit) else {
-        return GwState::Unknown;
-    };
-    classify_inspect(
-        o.status.success(),
-        &String::from_utf8_lossy(&o.stdout),
-        &String::from_utf8_lossy(&o.stderr),
-    )
-}
-
-/// `container inspect --format {{.State.Running}}`: `true` / `false` on success; a failure is
-/// `Absent` only when the runtime says so (docker, podman and nerdctl all print "no such").
-#[cfg(test)]
-fn classify_inspect(ok: bool, stdout: &str, stderr: &str) -> GwState {
-    match (ok, stdout.trim()) {
-        (true, "true") => GwState::Running,
-        (true, "false") => GwState::Stopped,
-        (false, _) if stderr.to_ascii_lowercase().contains("no such") => GwState::Absent,
-        _ => GwState::Unknown,
-    }
-}
-
-#[cfg(test)]
-fn inspect_argv(gw: &Gateway) -> Vec<String> {
-    [
-        "container",
-        "inspect",
-        "--format",
-        "{{.State.Running}}",
-        &gw.name,
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
 
 /// Fill missing default routes while retaining the daemon's existing provider overrides.
 // codex lg-r1 #11: preserve overrides on existing routes, fill the missing C4 routes.
@@ -2220,6 +1617,8 @@ pub(crate) fn write_records(path: &Path, records: &[GatewayRecord]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
 
     const PROVEN: &str = include_str!("../tests/fixtures/gateway/proven-config.yaml");
     const ACCESS_LOG: &str = include_str!("../tests/fixtures/gateway/access-log.ndjson");
@@ -2666,11 +2065,9 @@ mod tests {
         .unwrap();
         register_unit(&temp.0, revoked.clone()).unwrap();
         mark_revoking(&temp.0, [revoked.key.clone()]).unwrap();
-        let runtime = temp.0.join("runtime");
-        crate::test_env::install_stub(&runtime, "#!/bin/sh\ncat > /dev/null\n");
-        route_sign_in(
-            &Runtime::answering(runtime),
-            &Gateway::for_dir(&temp.0),
+        let io = crate::seat_login::io_tests::MemIo::default();
+        crate::seat_login::BrokerIo::route_sign_in(
+            &io,
             &temp.0,
             "codex",
             &RouteLiterals::default(),
@@ -3246,6 +2643,75 @@ mod tests {
         }
     }
 
+    /// #1439: adopting a pre-subscription persisted config fills the new listeners without
+    /// sending them to a different upstream or overwriting an existing listener's override.
+    #[test]
+    fn reconcile_routes_adopts_an_older_persisted_config_without_losing_overrides() {
+        let temp = TempDir::new();
+        let defaults = GatewayConfig::default();
+        let mut old = defaults.clone();
+        old.providers.retain(|r| (4000..=4002).contains(&r.port));
+        for route in &mut old.providers {
+            route.upstream_host = format!("legacy-{:?}.example:8443", route.provider);
+            route.tls = route.provider != Provider::OpenAI;
+        }
+        // Two existing routes of the same provider may have distinct overrides. Neither is
+        // replaced, and newly added listeners inherit from the first persisted provider route.
+        let mut distinct = defaults
+            .providers
+            .iter()
+            .find(|r| r.port == 4001)
+            .unwrap()
+            .clone();
+        distinct.port = 4990;
+        distinct.upstream_host = "per-listener.example:8080".into();
+        distinct.tls = true;
+        old.providers.push(distinct);
+        configure_gateway(&temp.0, &old).unwrap();
+        let mut adopted = load_config(&temp.0).unwrap();
+        assert_eq!(adopted.providers, old.providers);
+
+        reconcile_routes(&mut adopted);
+        for existing in &old.providers {
+            assert_eq!(
+                adopted.providers.iter().find(|r| r.port == existing.port),
+                Some(existing)
+            );
+        }
+        for default in &defaults.providers {
+            let mut expected = default.clone();
+            if let Some(existing) = old.providers.iter().find(|r| r.port == default.port) {
+                expected = existing.clone();
+            } else if let Some(provider) = old
+                .providers
+                .iter()
+                .find(|r| r.provider == default.provider)
+            {
+                expected.upstream_host = provider.upstream_host.clone();
+                expected.tls = provider.tls;
+            }
+            assert_eq!(
+                adopted.providers.iter().find(|r| r.port == default.port),
+                Some(&expected)
+            );
+        }
+        let ports: std::collections::BTreeSet<_> =
+            adopted.providers.iter().map(|r| r.port).collect();
+        assert_eq!(
+            ports.len(),
+            adopted.providers.len(),
+            "no listener is duplicated"
+        );
+        assert_eq!(
+            ports.len(),
+            defaults.providers.len() + 1,
+            "all defaults plus the custom listener"
+        );
+        let once = adopted.clone();
+        reconcile_routes(&mut adopted);
+        assert_eq!(adopted, once, "adoption is idempotent");
+    }
+
     #[test]
     fn older_route_configs_keep_the_proven_api_key_policy() {
         let mut legacy = serde_json::to_value(plain_config()).unwrap();
@@ -3790,8 +3256,6 @@ mod tests {
         assert!(a["wicked-agw-".len()..]
             .bytes()
             .all(|c| c.is_ascii_hexdigit()));
-        let gw = Gateway::for_dir(Path::new("/state/one"));
-        assert_eq!(gw.external_network, format!("{a}-ext"));
     }
 
     #[test]

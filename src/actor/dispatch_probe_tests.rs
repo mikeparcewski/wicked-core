@@ -347,6 +347,7 @@ fn post_step_reads_cover_every_attempt_the_fold_treats_as_failed() {
         binaries_before: Vec::new(),
     });
     let input = StepInput {
+        base_commit: None,
         run_id: "p".into(),
         unit_ix: 0,
         attempt: 0,
@@ -432,6 +433,7 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         binaries_before: Vec::new(),
     });
     let input = StepInput {
+        base_commit: None,
         run_id: "e".into(),
         unit_ix: 0,
         attempt: 0,
@@ -459,6 +461,7 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(output.status, StepStatus::Ok, "the runner's own status");
     assert_eq!(evidence.worktree_clean, Some(true));
@@ -471,6 +474,82 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         .expect("the fold will fail this attempt: its tree is read on the worker");
     assert_eq!(tree.git_dir, git_dir);
     assert!(tree.tree.is_some());
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}
+
+/// (core#1533, core#1542, coord review of #1713) The worker entry point hands the launch's stop to
+/// the unit's floor: a floor whose launch a newer one superseded never starts, and says why. A
+/// `None` anywhere between `run_unit_and_judge` and `floor_plan` runs the check and fails this.
+#[test]
+fn the_worker_entry_point_wires_the_launch_stop_into_the_units_floor() {
+    struct Done;
+    impl StepRunner for Done {
+        fn run_unit(&self, i: &StepInput) -> StepOutput {
+            StepOutput {
+                run_id: i.run_id.clone(),
+                unit_ix: i.unit_ix,
+                attempt: i.attempt,
+                output: "done".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            }
+        }
+    }
+    let f = fixture("floor-stop");
+    let repo = f.dir.join("repo");
+    std::fs::create_dir_all(repo.join(".wicked")).unwrap();
+    std::fs::write(
+        repo.join(crate::repo_checks::CONFIG_PATH),
+        r#"{"test":["sh","-c","touch floor-ran"]}"#,
+    )
+    .unwrap();
+    let mut unit = crate::domain::WorkUnit::pending("s:s1", "s", 1, "do it");
+    unit.repo_checks_floor = true;
+    let input = StepInput {
+        base_commit: None,
+        run_id: "s".into(),
+        unit_ix: 0,
+        attempt: 0,
+        unit,
+        workflow_id: "wf".into(),
+        entity_mode: crate::EntityMode::Shared,
+        workdir: Some(repo.clone()),
+        governance: None,
+        prior_outputs: vec![],
+        elicitation_epoch: 0,
+        process_gen: None,
+        launch_seq: 0,
+        required_skills: Vec::new(),
+    };
+    let runner: Arc<dyn StepRunner> = Arc::new(Done);
+    let (_, _, evidence) = crate::cli_runner::run_unit_and_judge(
+        &runner,
+        &input,
+        None,
+        &|_: &str| {},
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        None,
+        None,
+        Some(crate::repo_checks::FloorStop::new(|| Some("superseded"))),
+    );
+    let report = evidence.repo_checks.expect("the unit's floor was planned");
+    assert!(
+        report
+            .sandbox_error
+            .as_deref()
+            .is_some_and(|e| e.contains("a newer launch superseded this attempt")),
+        "{report:?}"
+    );
+    assert!(!report.passed);
+    assert!(!repo.join("floor-ran").exists(), "the check never started");
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
 }
@@ -540,6 +619,7 @@ fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
     let mut unit = crate::domain::WorkUnit::pending("s:s1", "s", 1, "design it");
     unit.pre_build_scope = true;
     let input = StepInput {
+        base_commit: None,
         run_id: "s".into(),
         unit_ix: 0,
         attempt: 0,
@@ -563,6 +643,7 @@ fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
         &[],
         &[],
         &[],
+        None,
         None,
         None,
         None,

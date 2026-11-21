@@ -58,6 +58,8 @@ mod tests {
 
     fn make_unit(ord: u32, desc: &str, invocation: &str, cli_key: &str) -> WorkUnit {
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             requires_capture_report: false,
             answer_only: false,
             capture_report: None,
@@ -163,6 +165,7 @@ mod tests {
     fn make_input(run_id: &str, unit_ix: usize, attempt: u32, unit: WorkUnit) -> StepInput {
         use wicked_core::EntityMode;
         StepInput {
+            base_commit: None,
             run_id: run_id.to_string(),
             unit_ix,
             attempt,

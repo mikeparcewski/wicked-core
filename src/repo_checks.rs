@@ -479,11 +479,40 @@ impl FloorStage {
     }
 }
 
+/// The actor launch's lifetime, shared by tool children and every runner's floors.
+#[derive(Clone)]
+pub(crate) struct FloorStop(std::sync::Arc<dyn Fn() -> Option<&'static str> + Send + Sync>);
+
+impl std::fmt::Debug for FloorStop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FloorStop").finish_non_exhaustive()
+    }
+}
+
+impl FloorStop {
+    pub(crate) fn new(f: impl Fn() -> Option<&'static str> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    pub(crate) fn reason(&self) -> Option<&'static str> {
+        (self.0)()
+    }
+}
+
+fn floor_stop_text(reason: &str) -> &'static str {
+    match reason {
+        "superseded" => "a newer launch superseded this attempt",
+        "shutdown" => "the engine shut down",
+        _ => "the run was cancelled",
+    }
+}
+
 /// What the floor knows about the run when it runs — all optional, all degrading to the historical
 /// behaviour (no base ⇒ no baseline diff, no `{files}`/`{base}` substitution, no claim judgement).
 #[derive(Debug, Clone, Default)]
 pub struct FloorContext {
     pub stage: FloorStage,
+    pub(crate) stop: Option<FloorStop>,
     /// Force the dependency install step even when `node_modules/` is provisioned (F-433-003).
     pub force_install: bool,
     /// The commit the unit's change is measured against: the dispatch baseline's `HEAD`
@@ -932,9 +961,10 @@ pub struct RepoChecksReport {
 
 /// (J4) A floor's journal identity: the unit whose floor it is, the attempt running it and the tree
 /// its checks run on. A floor given one records each check's result in the run's log store as it
-/// finishes (`floor-journal-u<ord>.json`) and removes the record when the floor ends; a record left
-/// behind is a floor the process died in. The next floor of that unit on the SAME tree, base and
-/// check set ([`FloorKey`]) reuses the finished checks and runs only the rest.
+/// finishes (`floor-journal-u<ord>.json`) and removes the record when the floor finishes; a record
+/// left behind is an interrupted floor (stopped, or one the process died in). The next floor of
+/// that unit on the SAME tree, base and check set ([`FloorKey`]) reuses the finished checks and
+/// runs only the rest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FloorJournal {
     pub ord: u32,
@@ -964,6 +994,10 @@ pub(crate) fn is_provisioning(name: &str) -> bool {
 pub struct FloorResume {
     /// The attempt whose floor was interrupted.
     pub from_attempt: u32,
+    /// Why the earlier floor was interrupted. A report written before the cause was recorded
+    /// reads as the only cause there was then: a daemon restart.
+    #[serde(default = "restart_cause", skip_serializing_if = "String::is_empty")]
+    pub cause: String,
     /// The checks reused from it (finished there on the same tree, base and check set), in run order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reused: Vec<String>,
@@ -972,29 +1006,39 @@ pub struct FloorResume {
     pub restarted: Option<String>,
 }
 
+/// The interruption cause a report without one stands for (core#1151).
+fn restart_cause() -> String {
+    "the daemon restarted".into()
+}
+
 impl FloorResume {
     /// The operator's sentence for the gate's `floorNote`.
     pub fn note(&self) -> String {
         match &self.restarted {
             Some(why) => format!(
-                "the floor of attempt {} was interrupted (the daemon restarted) and could not be \
+                "the floor of attempt {} was interrupted ({}) and could not be \
                  resumed ({why}) — the checks ran again from the first one",
-                self.from_attempt
+                self.from_attempt, self.cause
             ),
             None if self.reused.is_empty() => format!(
-                "the floor of attempt {} was interrupted (the daemon restarted) before any check \
+                "the floor of attempt {} was interrupted ({}) before any check \
                  finished — the checks ran from the first one",
-                self.from_attempt
+                self.from_attempt, self.cause
             ),
             None => {
                 format!(
-                "resumed the floor of attempt {} that a daemon restart interrupted: {} finished \
+                    "resumed the floor of attempt {} interrupted because {}: {} finished \
                  there on this same tree, base and check set and {} reused, not run again; the \
                  rest ran",
-                self.from_attempt,
-                self.reused.join(", "),
-                if self.reused.len() == 1 { "was" } else { "were" }
-            )
+                    self.from_attempt,
+                    self.cause,
+                    self.reused.join(", "),
+                    if self.reused.len() == 1 {
+                        "was"
+                    } else {
+                        "were"
+                    }
+                )
             }
         }
     }
@@ -1262,8 +1306,17 @@ fn journal_path(logs: &Path, ord: u32) -> PathBuf {
     logs.join(format!("floor-journal-u{ord}.json"))
 }
 
+fn floor_daemon_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::new_v4().to_string())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 struct JournalRecord {
+    #[serde(default)]
+    daemon: String,
+    #[serde(default)]
+    stopped: Option<String>,
     floor_policy: u32,
     key: FloorKey,
     exclude: bool,
@@ -1324,8 +1377,18 @@ impl OpenJournal {
                 } else {
                     None
                 };
+                let cause = match rec.stopped.as_deref() {
+                    Some("superseded") => {
+                        format!("a newer launch superseded attempt {}", rec.attempt)
+                    }
+                    Some("cancelled") => "the run was cancelled".into(),
+                    Some("shutdown") => restart_cause(),
+                    _ if rec.daemon != floor_daemon_id() => restart_cause(),
+                    _ => "it ended before it finished".into(),
+                };
                 let resume = FloorResume {
                     from_attempt: rec.attempt,
+                    cause,
                     reused: Vec::new(),
                     restarted: why.clone(),
                 };
@@ -1340,6 +1403,8 @@ impl OpenJournal {
         let open = OpenJournal {
             path,
             record: JournalRecord {
+                daemon: floor_daemon_id().into(),
+                stopped: None,
                 floor_policy: FLOOR_POLICY_VERSION,
                 key,
                 exclude,
@@ -1413,10 +1478,14 @@ impl OpenJournal {
         }
     }
 
-    /// The floor ended (whatever its verdict): its record goes, so no later floor of the unit
-    /// stands on it — only an interrupted floor leaves one. Returns what this floor resumed.
-    fn finish(self) -> Option<FloorResume> {
-        let _ = std::fs::remove_file(&self.path);
+    /// A stopped floor is interrupted: keep its finished checks for the next attempt.
+    fn finish(mut self, stopped: Option<&str>) -> Option<FloorResume> {
+        if !self.spoiled && stopped.is_some() {
+            self.record.stopped = stopped.map(str::to_string);
+            self.persist();
+        } else {
+            let _ = std::fs::remove_file(&self.path);
+        }
         self.resume
     }
 }
@@ -3558,8 +3627,8 @@ pub(crate) struct CheckScratch {
     /// (DES-FLOOR-CONTAINER) Set when this floor's checks run in a fresh Linux container: every
     /// check is spawned there ([`run_one_with`]) instead of under the host's OS sandbox.
     pub(crate) container: Option<std::sync::Arc<crate::checks_container::ChecksFloor>>,
-    /// (core#1482) The run this floor belongs to: a cancel of it ends the floor's checks.
-    run_id: Option<String>,
+    /// The launch this floor belongs to, independent of the runner carrying it.
+    stop: Option<FloorStop>,
 }
 
 impl Drop for CheckScratch {
@@ -3591,40 +3660,104 @@ impl Drop for CheckScratch {
 /// has the LINK removed, never what it points at (codex confirmation on #1530). Under the leaf's
 /// EXCLUSIVE lock (non-blocking: a floor still building keeps it) the base is only RENAMED aside;
 /// the lock is released before the slow removal, so the run's next floor never waits on it.
+/// (core#1542) A container floor's base target claim is deleted UNDER that lock, waiting until it is
+/// gone (normally about a second: no pod mounts it any more; bounded at 180 s): released first, the
+/// run's next floor could re-apply the claim while it is still terminating and start a pod on a
+/// claim that then disappears. Meanwhile the next floor waits at its shared lease.
 /// Returns whether the base output is gone.
 fn drop_base_output(held: &HeldDir, leaf: &Path) -> bool {
     let aside = format!(".base-drop-{}", random_tmp_name());
+    // Claim before publishing the aside: another floor's prepare may reclaim abandoned ones.
+    let Some(claim) = BaseDropClaim::take(leaf, &aside) else {
+        return false;
+    };
     let target = {
         let Ok(Some(_exclusive)) = lock_leaf(leaf, true) else {
             return false;
         };
+        // (core#1542) A container floor built its base in the run's base target claim, not here:
+        // that claim goes too (the head claim stays warm).
+        if let Err(e) = crate::checks_container::retire_base_target_claim(leaf) {
+            eprintln!(
+                "wicked-core: the base target claim of {} was not deleted: {e}",
+                leaf.display()
+            );
+        }
         let target = match held.subdir("cargo-target", false) {
             Ok(t) => t,
             // Missing, or not a plain directory (a link a check left): unlinked, never entered.
             Err(_) => return held.remove_tree("cargo-target").is_ok(),
         };
-        match target.rename_child("base", &aside) {
-            Ok(true) => target,
-            Ok(false) => return true,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: could not set the floor's base build output aside under {}: {e}",
-                    leaf.display()
-                );
-                return false;
-            }
+        if let Err(e) = target.rename_child("base", &aside) {
+            eprintln!(
+                "wicked-core: could not set the floor's base build output aside under {}: {e}",
+                leaf.display()
+            );
+            return false;
+        }
+        target
+    };
+    reclaim_base_asides(&target, leaf, Some(claim))
+}
+
+/// Only in-progress removals are registered. An interrupted process leaves no live claim.
+static BASE_DROPS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+struct BaseDropClaim(PathBuf);
+
+impl BaseDropClaim {
+    fn take(leaf: &Path, name: &str) -> Option<Self> {
+        let key = leaf.join(name);
+        let mut active = BASE_DROPS.lock().unwrap_or_else(|p| p.into_inner());
+        if active.contains(&key) {
+            return None;
+        }
+        active.push(key.clone());
+        Some(Self(key))
+    }
+}
+
+impl Drop for BaseDropClaim {
+    fn drop(&mut self) {
+        BASE_DROPS
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retain(|key| key != &self.0);
+    }
+}
+
+/// Reclaim every abandoned aside through the held directory, never through a followed link.
+/// `own` was registered before rename and remains claimed until its removal finishes.
+fn reclaim_base_asides(target: &HeldDir, leaf: &Path, mut own: Option<BaseDropClaim>) -> bool {
+    let names = match target.child_names() {
+        Ok(names) => names,
+        Err(e) => {
+            eprintln!(
+                "wicked-core: could not list base build output under {}: {e}",
+                leaf.display()
+            );
+            return false;
         }
     };
-    match target.remove_tree(&aside) {
-        Ok(_) => true,
-        Err(e) => {
+    let mut removed = true;
+    for name in names.into_iter().filter(|n| n.starts_with(".base-drop-")) {
+        let claim = if own.as_ref().is_some_and(|c| c.0 == leaf.join(&name)) {
+            own.take()
+        } else {
+            BaseDropClaim::take(leaf, &name)
+        };
+        let Some(_claim) = claim else {
+            continue;
+        };
+        if let Err(e) = target.remove_tree(&name) {
             eprintln!(
                 "wicked-core: could not drop the floor's base build output under {}: {e}",
                 leaf.display()
             );
-            false
+            removed = false;
         }
     }
+    removed
 }
 
 /// A private, writable temp dir for ONE floor or ONE validator run: `<system temp>/wc-<6 hex>`
@@ -3961,6 +4094,9 @@ impl CheckScratch {
                 ),
             )
         })?;
+        if let Ok(target) = held.subdir("cargo-target", false) {
+            reclaim_base_asides(&target, &root, None);
+        }
         for sub in SCRATCH_LEAVES {
             held.subdir(sub, true).map_err(|e| {
                 std::io::Error::new(
@@ -3991,7 +4127,7 @@ impl CheckScratch {
             logs,
             log_cap: log_cap(),
             container: None,
-            run_id: run_id.map(str::to_string),
+            stop: None,
         })
     }
 
@@ -4345,6 +4481,14 @@ fn tree_bytes(dir: &Path) -> u64 {
 
 /// Remove a leaf directory (a link at its path is removed, never followed).
 fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
+    // The leaf's target claims go with it; a cluster that does not answer never keeps the host
+    // scratch (the claims stay registered and go with the run's namespace).
+    if let Err(e) = crate::checks_container::retire_target_claims(leaf) {
+        eprintln!(
+            "wicked-core: the target claims of {} were not deleted: {e}",
+            leaf.display()
+        );
+    }
     match std::fs::symlink_metadata(leaf) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -4522,8 +4666,45 @@ fn volume_space(at: &Path) -> Option<VolumeSpace> {
     })
 }
 
-/// No free-space reading off unix: the fixed caps alone decide.
-#[cfg(not(unix))]
+/// The volume's bytes available to this caller, including Windows quota limits.
+#[cfg(windows)]
+fn volume_space(at: &Path) -> Option<VolumeSpace> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "GetDiskFreeSpaceExW"]
+        fn get_disk_free_space_ex_w(
+            directory: *const u16,
+            available: *mut u64,
+            total: *mut u64,
+            free: *mut u64,
+        ) -> i32;
+    }
+    let mut path: Vec<u16> = at.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return None;
+    }
+    path.push(0);
+    let mut available = 0;
+    let mut total = 0;
+    // SAFETY: `path` is NUL-terminated, both output pointers are valid u64s, and the unused
+    // total-free output is optional in GetDiskFreeSpaceExW.
+    let ok = unsafe {
+        get_disk_free_space_ex_w(
+            path.as_ptr(),
+            &mut available,
+            &mut total,
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(VolumeSpace {
+        total,
+        free: available,
+    })
+}
+
+/// Other targets have no free-space probe: the fixed caps alone decide.
+#[cfg(not(any(unix, windows)))]
 fn volume_space(_at: &Path) -> Option<VolumeSpace> {
     None
 }
@@ -4568,19 +4749,26 @@ enum Evicted {
 
 /// Remove `leaf` for the cap pass, only under its EXCLUSIVE lock. A floor holds a SHARED lock for
 /// its life, so a leaf a floor is building into is never removed.
+pub(crate) fn evict_target_leaf(leaf: &Path) -> bool {
+    matches!(evict_leaf(leaf), Evicted::Removed | Evicted::AlreadyGone)
+}
+
 fn evict_leaf(leaf: &Path) -> Evicted {
     match lock_leaf(leaf, true) {
-        Ok(Some(_held)) if std::fs::symlink_metadata(leaf).is_err() => Evicted::AlreadyGone,
-        Ok(Some(_held)) => match remove_leaf_dir(leaf) {
-            Ok(()) => Evicted::Removed,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
-                    leaf.display()
-                );
-                Evicted::Kept
+        Ok(Some(_held)) => {
+            let existed = std::fs::symlink_metadata(leaf).is_ok();
+            match remove_leaf_dir(leaf) {
+                Ok(()) if existed => Evicted::Removed,
+                Ok(()) => Evicted::AlreadyGone,
+                Err(e) => {
+                    eprintln!(
+                        "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
+                        leaf.display()
+                    );
+                    Evicted::Kept
+                }
             }
-        },
+        }
         // A floor is building into it right now: it is not this cap's to take.
         Ok(None) => Evicted::Kept,
         Err(e) => {
@@ -5047,8 +5235,8 @@ pub fn run_floor_rerun(
 }
 
 /// [`run_floor_rerun`] with a [`FloorJournal`]: the ordinary floor (no re-run, nothing waived)
-/// records each finished check and resumes one a daemon restart interrupted on the same tree,
-/// base and check set. An operator's re-run never reads or writes a journal.
+/// records each finished check and resumes an interrupted floor on the same tree, base and check
+/// set. An operator's re-run never reads or writes a journal.
 pub fn run_floor_journaled(
     worktree: &Path,
     ctx: &FloorContext,
@@ -5056,47 +5244,6 @@ pub fn run_floor_journaled(
     journal: Option<&FloorJournal>,
 ) -> RepoChecksReport {
     run_floor_inner(worktree, ctx, rerun, journal, None)
-}
-
-/// [`run_floor_journaled`] with the probe a guarded checkout gives
-/// ([`FloorCheckout::run_floor_journaled`]): a check is journaled only while the checkout still
-/// holds the journal's tree.
-/// (core#1482) Runs whose floor must stop: a cancel marks the run here, every running check of it
-/// is killed at its next poll (its process group), and no floor of it starts. A resume clears it.
-static CANCELLED_FLOORS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
-
-/// How many ended runs [`CANCELLED_FLOORS`] remembers.
-const CANCELLED_FLOORS_KEPT: usize = 512;
-
-/// (core#1482) Mark run `run_id` cancelled for its floor (called with the run's worker cancel).
-pub(crate) fn cancel_floor(run_id: &str) {
-    let mut g = CANCELLED_FLOORS.lock().unwrap_or_else(|p| p.into_inner());
-    if !g.iter().any(|r| r == run_id) {
-        g.push(run_id.to_string());
-    }
-    // Bounded: every ended run (and engine one-shot) passes here; the newest are the ones a
-    // still-running floor can belong to.
-    let excess = g.len().saturating_sub(CANCELLED_FLOORS_KEPT);
-    g.drain(..excess);
-}
-
-/// (core#1482) A resumed run's floor may run again.
-pub(crate) fn clear_floor_cancel(run_id: &str) {
-    CANCELLED_FLOORS
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .retain(|r| r != run_id);
-}
-
-/// (core#1482) Whether run `run_id`'s floor was cancelled.
-pub(crate) fn floor_cancelled(run_id: Option<&str>) -> bool {
-    run_id.is_some_and(|id| {
-        CANCELLED_FLOORS
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .any(|r| r == id)
-    })
 }
 
 /// (core#1482) The free space a floor needs on the check cache's volume before it starts, in GiB:
@@ -5217,15 +5364,15 @@ fn floor_repo_key(ctx: &FloorContext) -> Option<PathBuf> {
 impl FloorSlot {
     fn admit(
         free: &dyn Fn() -> Option<u64>,
-        run_id: Option<&str>,
+        stop: Option<&FloorStop>,
         repo: Option<&Path>,
     ) -> Result<Self, String> {
-        Self::admit_with_wait(free, run_id, repo, floor_admit_wait())
+        Self::admit_with_wait(free, stop, repo, floor_admit_wait())
     }
 
     fn admit_with_wait(
         free: &dyn Fn() -> Option<u64>,
-        run_id: Option<&str>,
+        stop: Option<&FloorStop>,
         repo: Option<&Path>,
         wait: Duration,
     ) -> Result<Self, String> {
@@ -5245,8 +5392,11 @@ impl FloorSlot {
         let mut repo_logged = false;
         let mut waited_for_repo = false;
         loop {
-            if floor_cancelled(run_id) {
-                return Err("the run was cancelled: its floor does not start".into());
+            if let Some(reason) = stop.and_then(FloorStop::reason) {
+                return Err(format!(
+                    "{}: its floor does not start",
+                    floor_stop_text(reason)
+                ));
             }
             let available = free();
             if let Some(why) = disk_guard(available, min_gib) {
@@ -5367,15 +5517,21 @@ fn run_floor_inner(
     untouched: Option<&dyn Fn() -> bool>,
 ) -> RepoChecksReport {
     let report = run_floor_body(worktree, ctx, rerun, journal, untouched);
-    stopped_by_cancel(report, ctx.run_id.as_deref())
+    stopped_by_cancel(report, ctx.stop.as_ref())
 }
 
 /// (core#1482, codex confirmation on #1530) A floor whose run was cancelled while it ran is that
 /// cancellation, never a failed or a passed floor: the environment refusal a floor refused at
 /// entry gives (`not_run`), its checks kept for display.
-fn stopped_by_cancel(mut report: RepoChecksReport, run_id: Option<&str>) -> RepoChecksReport {
-    if floor_cancelled(run_id) && report.sandbox_error.is_none() {
-        report.sandbox_error = Some("the run was cancelled: its floor was stopped".into());
+fn stopped_by_cancel(mut report: RepoChecksReport, stop: Option<&FloorStop>) -> RepoChecksReport {
+    if let Some(reason) = stop
+        .and_then(FloorStop::reason)
+        .filter(|_| report.sandbox_error.is_none())
+    {
+        report.sandbox_error = Some(format!(
+            "{}: its floor was stopped",
+            floor_stop_text(reason)
+        ));
         report.passed = false;
     }
     report
@@ -5390,11 +5546,11 @@ fn run_floor_body(
 ) -> RepoChecksReport {
     // (core#1482) A cancelled run starts no floor; a host short of disk refuses one as an
     // environment failure (the checks would only fill the disk and fail the link step).
-    if floor_cancelled(ctx.run_id.as_deref()) {
+    if let Some(reason) = ctx.stop.as_ref().and_then(FloorStop::reason) {
         return runner_refused(
             worktree,
             ctx,
-            "the run was cancelled: its floor does not start".into(),
+            format!("{}: its floor does not start", floor_stop_text(reason)),
         );
     }
     // Declared before the scratch so the slot also spans its cleanup on early returns.
@@ -5403,24 +5559,24 @@ fn run_floor_body(
     // write root (core#489), and the launcher needs it to exist before the probe — bwrap `--bind`s
     // a directory, the SBPL profile canonicalizes it. A scratch that cannot be prepared is the
     // same fail-closed detection error as before, reported against a worktree-only probe.
-    let scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
+    let mut scratch = match CheckScratch::prepare_for(worktree, ctx.run_id.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             let sandbox = crate::validator::detect_floor_sandbox(&[worktree.to_path_buf()]);
             return scratch_refused(worktree, ctx, &sandbox, &e);
         }
     };
+    scratch.stop = ctx.stop.clone();
     // (core#1482, core#1560) Admit AFTER scratch preparation: its lease-protected eviction frees
     // stale leaves, and it creates the cache root so its volume can be read on a fresh home.
     // Wait for headroom while other floors run, re-reading free space after every wake. A slot
     // tracks this floor until every pass and cleanup has finished.
     let cache_root = check_cache_root().ok();
     let free = || cache_root.as_deref().and_then(free_bytes);
-    _floor_slot =
-        match FloorSlot::admit(&free, ctx.run_id.as_deref(), floor_repo_key(ctx).as_deref()) {
-            Ok(slot) => slot,
-            Err(why) => return runner_refused(worktree, ctx, why),
-        };
+    _floor_slot = match FloorSlot::admit(&free, ctx.stop.as_ref(), floor_repo_key(ctx).as_deref()) {
+        Ok(slot) => slot,
+        Err(why) => return runner_refused(worktree, ctx, why),
+    };
     // (round 11) The log store's lifetime is its age, collected best-effort at every floor's start.
     if let Some(root) = scratch.logs.parent() {
         crate::floor_log::gc(
@@ -6136,7 +6292,10 @@ fn run_detected(
     // interrupted floor's journal, which may have run in the live worktree (xreview r1).
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
     for check in detected.iter() {
-        if failed || scratch_error.is_some() {
+        if ctx.stop.as_ref().and_then(FloorStop::reason).is_some()
+            || failed
+            || scratch_error.is_some()
+        {
             skipped.push(check.name.clone());
             continue;
         }
@@ -6152,12 +6311,15 @@ fn run_detected(
             continue;
         }
         if let Some(run) = journal.as_mut().and_then(|j| j.reuse(check, &scratch.logs)) {
-            eprintln!(
-                "wicked-core: repo checks floor — `{}` {} on this tree in the floor a daemon \
-                 restart interrupted; reused, not run again",
-                run.name,
-                run.outcome()
-            );
+            if let Some(resume) = journal.as_ref().and_then(|j| j.resume.as_ref()) {
+                eprintln!(
+                    "wicked-core: repo checks floor — `{}` {} on this tree in the floor \
+                     interrupted ({}); reused, not run again",
+                    run.name,
+                    run.outcome(),
+                    resume.cause
+                );
+            }
             failed = run.denies();
             // (xreview) A failure the interrupted pass ran after reused checks sends the floor
             // round again just as it would have there.
@@ -6504,7 +6666,11 @@ fn run_detected(
     // A check that changed the checkout's tracked content (even one a later check restored)
     // spoiled the journal: nothing this floor ran may stand for the tree (xreview r1).
     let spoiled = journal.as_ref().is_none_or(|j| j.spoiled);
-    let resumed = journal.and_then(OpenJournal::finish);
+    let stopped = ctx.stop.as_ref().and_then(FloorStop::reason);
+    let resumed = journal.and_then(|j| j.finish(stopped));
+    if stopped.is_some() {
+        again = None;
+    }
     let claim = judge_claim(ctx, &checks);
     // An engine-written file (absent at detection, present now) is the checks' own side effect —
     // remove it so the guard's final comparison sees the tree the seat left. Never a symlink.
@@ -9155,6 +9321,17 @@ fn held_refusal(
 
 #[cfg(unix)]
 impl HeldDir {
+    fn child_names(&self) -> Result<Vec<String>, String> {
+        dir_names(&self.fd)
+            .map(|names| {
+                names
+                    .into_iter()
+                    .filter_map(|n| n.into_string().ok())
+                    .collect()
+            })
+            .map_err(|e| e.to_string())
+    }
+
     /// Hold `root` — call it before any command runs there.
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         use std::os::unix::ffi::OsStrExt;
@@ -9592,9 +9769,22 @@ fn dir_names(dir: &std::os::fd::OwnedFd) -> std::io::Result<Vec<std::ffi::CStrin
 /// Without directory fds: the path checks of [`confined`] before every operation.
 #[cfg(not(unix))]
 impl HeldDir {
+    fn child_names(&self) -> Result<Vec<String>, String> {
+        std::fs::read_dir(&self.path)
+            .map_err(|e| e.to_string())?
+            .map(|entry| entry.map(|e| e.file_name()).map_err(|e| e.to_string()))
+            .collect::<Result<Vec<_>, _>>()
+            .map(|names| {
+                names
+                    .into_iter()
+                    .filter_map(|n| n.into_string().ok())
+                    .collect()
+            })
+    }
+
     pub(crate) fn open(root: &Path) -> Result<Self, String> {
         match std::fs::symlink_metadata(root) {
-            Ok(m) if m.is_dir() => Ok(Self {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => Ok(Self {
                 path: root.to_path_buf(),
             }),
             _ => Err(format!("`{}` is not a plain directory", root.display())),
@@ -9692,10 +9882,16 @@ impl HeldDir {
 
     /// `remove_dir_all` removes a link (a junction, a symlink) without following it.
     pub(crate) fn remove_tree(&self, rel: &str) -> Result<bool, String> {
+        #[cfg(windows)]
+        use std::os::windows::fs::FileTypeExt;
         let p = self.leaf_path(rel)?;
         match std::fs::symlink_metadata(&p) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             Err(e) => Err(format!("`{rel}` cannot be inspected: {e}")),
+            #[cfg(windows)]
+            Ok(m) if m.file_type().is_symlink_dir() => std::fs::remove_dir(&p)
+                .map(|()| true)
+                .map_err(|e| format!("`{rel}`: {e}")),
             Ok(m) if m.is_dir() && !m.file_type().is_symlink() => std::fs::remove_dir_all(&p)
                 .map(|()| true)
                 .map_err(|e| format!("`{rel}`: {e}")),
@@ -11216,6 +11412,11 @@ pub(crate) fn run_one_with(
     if let Some(f) = test_seam::take_before_spawn() {
         f();
     }
+    if let Some(reason) = scratch.stop.as_ref().and_then(FloorStop::reason) {
+        result.spawn_error = Some(floor_stop_text(reason).into());
+        result.duration_ms = started.elapsed().as_millis() as u64;
+        return result;
+    }
     let spawned = cmd.spawn();
     // The child holds its own working directory now: the parent's handle goes.
     #[cfg(unix)]
@@ -11249,7 +11450,16 @@ pub(crate) fn run_one_with(
                 .map(|r| crate::floor_log::capture(r, store, cap)),
         ),
     };
+    // A stopped check keeps the stop as its reason, whatever its container reports after.
+    let mut stopped = false;
     let status = loop {
+        if let Some(reason) = scratch.stop.as_ref().and_then(FloorStop::reason) {
+            crate::validator::kill_child_tree(&mut child);
+            crate::validator::reap_bounded(&mut child);
+            result.spawn_error = Some(floor_stop_text(reason).into());
+            stopped = true;
+            break None;
+        }
         match crate::validator::has_exited_unreaped(&mut child) {
             Ok(true) => {
                 // Quiesce: nothing the check backgrounded may keep running (or writing) into the
@@ -11263,13 +11473,6 @@ pub(crate) fn run_one_with(
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
                 result.timed_out = true;
-                break None;
-            }
-            // (core#1482) The run was cancelled: the check's whole process group ends now.
-            Ok(false) if floor_cancelled(scratch.run_id.as_deref()) => {
-                crate::validator::kill_child_tree(&mut child);
-                crate::validator::reap_bounded(&mut child);
-                result.spawn_error = Some("the run was cancelled".into());
                 break None;
             }
             Ok(false) => std::thread::sleep(Duration::from_millis(50)),
@@ -11296,6 +11499,7 @@ pub(crate) fn run_one_with(
     if let Some(why) = container
         .as_deref()
         .and_then(|f| f.after(tree, result.exit_code))
+        .filter(|_| !stopped)
     {
         result.spawn_error = Some(why);
     }
@@ -12172,8 +12376,12 @@ pub(crate) mod tests {
     #[test]
     fn core_1604_a_cancelled_run_stops_waiting_for_its_repo() {
         static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
-        const RUN: &str = "core-1604-cancelled-repo-admission";
-        clear_floor_cancel(RUN);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let stop = FloorStop::new(move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+                .then_some("cancelled")
+        });
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let repo = Path::new("/core-1604/r/.git");
         let first = FloorSlot::admit(&|| Some(1000 << 30), None, Some(repo)).unwrap();
@@ -12186,7 +12394,7 @@ pub(crate) mod tests {
                 Some(1000 << 30)
             };
             done.send(
-                FloorSlot::admit_with_wait(&free, Some(RUN), Some(repo), Duration::from_secs(30))
+                FloorSlot::admit_with_wait(&free, Some(&stop), Some(repo), Duration::from_secs(30))
                     .map(drop),
             )
             .unwrap();
@@ -12196,9 +12404,8 @@ pub(crate) mod tests {
             result.recv_timeout(Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        cancel_floor(RUN);
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         let refused = result.recv_timeout(Duration::from_secs(10));
-        clear_floor_cancel(RUN);
         let why = refused
             .expect("cancellation is polled without releasing the held repo slot")
             .expect_err("a cancelled floor must not be admitted");
@@ -12308,8 +12515,12 @@ pub(crate) mod tests {
     #[test]
     fn core_1560_a_cancelled_run_stops_waiting_for_a_slot() {
         static COUNT: std::sync::Mutex<FloorSet> = std::sync::Mutex::new(FloorSet::new());
-        const RUN: &str = "core-1560-cancelled-admission";
-        clear_floor_cancel(RUN);
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = cancelled.clone();
+        let stop = FloorStop::new(move || {
+            flag.load(std::sync::atomic::Ordering::SeqCst)
+                .then_some("cancelled")
+        });
         let _admission = test_seam::floor_admission(&COUNT, 15, 20);
         let first = FloorSlot::admit(&|| Some(34 << 30), None, None).unwrap();
         let (probing, probed) = std::sync::mpsc::channel();
@@ -12321,7 +12532,7 @@ pub(crate) mod tests {
                 Some(34 << 30)
             };
             done.send(
-                FloorSlot::admit_with_wait(&free, Some(RUN), None, Duration::from_secs(30))
+                FloorSlot::admit_with_wait(&free, Some(&stop), None, Duration::from_secs(30))
                     .map(drop),
             )
             .unwrap();
@@ -12331,9 +12542,8 @@ pub(crate) mod tests {
             result.recv_timeout(Duration::from_millis(100)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout)
         ));
-        cancel_floor(RUN);
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
         let refused = result.recv_timeout(Duration::from_secs(10));
-        clear_floor_cancel(RUN);
         let why = refused
             .expect("cancellation is polled without releasing the held slot")
             .expect_err("a cancelled floor must not be admitted");
@@ -13980,6 +14190,171 @@ exit 1
         assert!(lease_path(&lb).is_file(), "the 0-byte lock file is kept");
         assert!(b.is_dir(), "the worktree itself is never touched");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_c2_last_scratch_retires_both_target_claims_without_ending_the_run() {
+        let base = scratch("retire-targets");
+        let cache = base.join("cache");
+        let wt = base.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let scratch = CheckScratch::prepare_in(&cache, &wt, Some("live-run"), u64::MAX).unwrap();
+        let leaf = scratch.root().to_path_buf();
+        let kubectl = base.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' apply '*) cat >/dev/null;;\n*' get pvc '*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"me\",\"app.kubernetes.io/managed-by\":\"wicked-core\"}}}}}}';;\nesac\n",
+            base.display()
+        ));
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: "me".into(),
+        };
+        let place = crate::k8s::floor::Place {
+            kube,
+            ns: "live-ns".into(),
+            run: "live-run".into(),
+            owned: false,
+        };
+        for tree in [Tree::Head, Tree::Base] {
+            let claim = crate::checks_container::target_volume(&leaf, tree);
+            crate::checks_container::admit_target_claim(
+                &leaf,
+                &place.kube,
+                &place.ns,
+                &claim,
+                crate::checks_container::MAX_TARGET_LEAVES,
+            )
+            .unwrap();
+            place.claim(&claim, "64Gi").unwrap();
+        }
+        assert!(!retire_leaf(&leaf), "a leased leaf is only marked orphaned");
+        assert!(
+            !std::fs::read_to_string(base.join("calls"))
+                .unwrap()
+                .contains("delete pvc"),
+            "no active claim is deleted"
+        );
+        drop(scratch);
+        assert!(!leaf.exists());
+        let calls = std::fs::read_to_string(base.join("calls")).unwrap();
+        for tree in [Tree::Head, Tree::Base] {
+            assert!(
+                calls.contains(&format!(
+                    "delete pvc {}",
+                    crate::checks_container::target_volume(&leaf, tree)
+                )),
+                "{calls}"
+            );
+        }
+        assert!(!calls.contains("delete namespace"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    /// (core#1542) The run's last floor out of a leaf deletes its BASE target claim and keeps the
+    /// head claim warm (and registered, so the leaf's retirement still deletes it).
+    #[cfg(unix)]
+    #[test]
+    fn core_1542_last_floor_out_drops_the_base_target_claim_and_keeps_the_head() {
+        let base = scratch("retire-base-claim");
+        let cache = base.join("cache");
+        let wt = base.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let scratch = CheckScratch::prepare_in(&cache, &wt, Some("base-run"), u64::MAX).unwrap();
+        let leaf = scratch.root().to_path_buf();
+        let kubectl = base.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' apply '*) cat >/dev/null;;\n*' get pvc '*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"me\",\"app.kubernetes.io/managed-by\":\"wicked-core\"}}}}}}';;\nesac\n",
+            base.display()
+        ));
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: "me".into(),
+        };
+        let ns = format!("base-claim-{}", uuid::Uuid::new_v4());
+        let [head, base_claim] = [Tree::Head, Tree::Base]
+            .map(|tree| crate::checks_container::target_volume(&leaf, tree));
+        for claim in [&head, &base_claim] {
+            crate::checks_container::admit_target_claim(
+                &leaf,
+                &kube,
+                &ns,
+                claim,
+                crate::checks_container::MAX_TARGET_LEAVES,
+            )
+            .unwrap();
+        }
+        drop(scratch);
+        assert!(leaf.exists(), "the leaf stays for the run's next floor");
+        let calls = std::fs::read_to_string(base.join("calls")).unwrap();
+        assert!(
+            calls.contains(&format!("delete pvc {base_claim}")),
+            "{calls}"
+        );
+        assert!(!calls.contains(&format!("delete pvc {head}")), "{calls}");
+        // The head claim is still the leaf's: retiring the leaf deletes it.
+        assert!(retire_leaf(&leaf));
+        let calls = std::fs::read_to_string(base.join("calls")).unwrap();
+        assert!(calls.contains(&format!("delete pvc {head}")), "{calls}");
+        assert_eq!(
+            calls.matches(&format!("delete pvc {base_claim}")).count(),
+            1
+        );
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_c2_target_budget_evicts_idle_leaves_and_refuses_when_all_are_leased() {
+        let base = scratch("target-budget");
+        let cache = base.join("cache");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let kubectl = base.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' get pvc '*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"me\",\"app.kubernetes.io/managed-by\":\"wicked-core\"}}}}}}';;\nesac\n", base.display()
+        ));
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: "me".into(),
+        };
+        let ns = format!("budget-{}", uuid::Uuid::new_v4());
+        let allocate = |leaf: &Path| {
+            crate::checks_container::admit_target_claim(
+                leaf,
+                &kube,
+                &ns,
+                &crate::checks_container::target_volume(leaf, Tree::Head),
+                2,
+            )
+        };
+        let idle = CheckScratch::prepare_in(&cache, &wt, Some("idle"), u64::MAX).unwrap();
+        let idle_leaf = idle.root().to_path_buf();
+        allocate(&idle_leaf).unwrap();
+        drop(idle);
+        let active = CheckScratch::prepare_in(&cache, &wt, Some("active"), u64::MAX).unwrap();
+        allocate(active.root()).unwrap();
+        let own = CheckScratch::prepare_in(&cache, &wt, Some("own"), u64::MAX).unwrap();
+        allocate(own.root()).unwrap();
+        assert!(!idle_leaf.exists(), "the idle leaf was evicted");
+        assert!(active.root().exists());
+        let blocked = CheckScratch::prepare_in(&cache, &wt, Some("blocked"), u64::MAX).unwrap();
+        let err = allocate(blocked.root()).unwrap_err();
+        assert!(err.starts_with("admission_pending:"), "{err}");
+        assert!(active.root().exists() && own.root().exists());
+        drop(blocked);
+        drop(own);
+        drop(active);
+        for run in ["own", "active"] {
+            assert!(remove_check_scratch_in(&cache, &wt, Some(run)));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// The per-repository cap: over it, the least recently used OTHER run leaves go first, a

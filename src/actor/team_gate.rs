@@ -3099,6 +3099,13 @@ pub(super) fn apply_scope(
             prior.max_score = prior.max_score.max(r.min_score());
         }
         prior.power_absorbs = crate::power::absorbs_after(qe, &prior.power_absorbs);
+        for phase in &qe.mandatory_phases {
+            if !matches!(phase.phase.as_str(), "design" | "test_plan")
+                && !prior.qe_phases.contains(&phase.phase)
+            {
+                prior.qe_phases.push(phase.phase.clone());
+            }
+        }
     }
     let decided = crate::plan_gate::decide_scoped(
         run_id,

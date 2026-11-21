@@ -294,7 +294,7 @@ fn the_verdict_binds_only_when_the_reviewer_session_recorded_it() {
         .contains("recorded no verdict"));
     l.verdict(&id, "PASS", Some("n1"), RUN, "2099-01-01T00:00:01.000Z");
     assert_eq!(
-        bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap(),
+        bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap().0,
         "PASS"
     );
     assert!(bind_verdict(&l.root, &id, RUN, "n1", "FAIL")
@@ -667,6 +667,7 @@ impl StepRunner for Scripted {
 
 fn input_for(unit: WorkUnit) -> StepInput {
     StepInput {
+        base_commit: None,
         run_id: RUN.into(),
         unit_ix: 2,
         attempt: 1,
@@ -1561,7 +1562,7 @@ fn the_engine_records_a_reply_once_and_only_a_ledger_verdict() {
     );
     assert_eq!(verdicts_of(&l.root, &id).unwrap().len(), 1);
     assert_eq!(
-        bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap(),
+        bind_verdict(&l.root, &id, RUN, "n1", "PASS").unwrap().0,
         "PASS"
     );
 }
@@ -2035,4 +2036,98 @@ fn a_reviewers_fail_is_never_rotated_away_as_a_seat_failure() {
     assert_eq!(seen.len(), 1, "no second reviewer was asked");
     assert_eq!(got.outcome, OUTCOME_FAIL, "{got:?}");
     assert_eq!(got.verdict.as_deref(), Some("FAIL"));
+}
+
+pub(crate) fn review_with_ledger_reason(verdict: &str, reason: Option<&str>) -> QeReview {
+    struct Reviewer {
+        root: PathBuf,
+        id: String,
+        verdict: String,
+        reason: Option<String>,
+    }
+    impl StepRunner for Reviewer {
+        fn run_unit(&self, input: &StepInput) -> StepOutput {
+            let mut rec = serde_json::json!({
+                "id": "reason-verdict", "created_at": "2099-01-01T00:00:05.000Z",
+                "run_id": self.id, "verdict": self.verdict,
+                "crew_run_id": input.run_id,
+                "review_session": input.unit.qe_review_session,
+            });
+            if let Some(reason) = &self.reason {
+                rec["reason"] = serde_json::json!(reason);
+            }
+            std::fs::write(self.root.join("verdicts/reason.json"), rec.to_string()).unwrap();
+            StepOutput {
+                output: format!("reviewed\nVERDICT: {}", self.verdict),
+                ..executor_output("")
+            }
+        }
+    }
+    let ledger = Ledger::new("reason");
+    let (id, dir) = ledger.evidence(RUN, &now_iso());
+    let mut unit = qe_unit("pi", &ledger.root);
+    unit.qe_reviewer_seats = vec![seat("claude", BASIS_DISTINCT)];
+    let runner: Arc<dyn StepRunner> = Arc::new(Reviewer {
+        root: ledger.root.clone(),
+        id,
+        verdict: verdict.into(),
+        reason: reason.map(str::to_string),
+    });
+    run(
+        &runner,
+        &input_for(with_dir(unit, &dir)),
+        &executor_output(&dir.to_string_lossy()),
+        0,
+        &|_| {},
+    )
+    .unwrap()
+}
+
+/// (core#1475) the bound ledger's findings reach the denial, without changing PASS/empty text.
+#[test]
+fn a_failed_review_carries_its_ledger_reason() {
+    for verdict in ["FAIL", "PARTIAL", "CONDITIONAL"] {
+        let got = review_with_ledger_reason(verdict, Some("IMPLEMENTATION_BUG — X\n  fix it"));
+        assert_eq!(got.outcome, OUTCOME_FAIL);
+        assert!(
+            got.reason.ends_with(": IMPLEMENTATION_BUG — X fix it"),
+            "{}",
+            got.reason
+        );
+        assert!(denial(&got)
+            .unwrap()
+            .reason
+            .contains("IMPLEMENTATION_BUG — X"));
+    }
+    for reason in [None, Some(""), Some(" \n ")] {
+        let got = review_with_ledger_reason("FAIL", reason);
+        assert!(
+            got.reason.ends_with(got.qe_run_id.as_deref().unwrap()),
+            "{}",
+            got.reason
+        );
+    }
+    let pass = review_with_ledger_reason("PASS", Some("must not be appended"));
+    assert!(!pass.reason.contains("must not be appended"));
+    let inconclusive = review_with_ledger_reason("INCONCLUSIVE", Some("must not be appended"));
+    assert_eq!(inconclusive.outcome, OUTCOME_INCONCLUSIVE);
+    assert!(!inconclusive.reason.contains("must not be appended"));
+}
+
+/// (core#1475) findings are redacted before a Unicode-safe, single-line character cap.
+#[test]
+fn ledger_reasons_are_redacted_and_capped_before_they_reach_the_builder() {
+    let reason = format!(
+        "IMPLEMENTATION_BUG — X\n token=sk-{} /home/alice/private/file\n{}",
+        "a".repeat(40),
+        "界".repeat(2100)
+    );
+    let got = review_with_ledger_reason("FAIL", Some(&reason));
+    let detail = got.reason.split_once(": ").unwrap().1;
+    assert!(detail.starts_with("IMPLEMENTATION_BUG — X "));
+    assert!(!detail.contains(&"a".repeat(40)), "{detail}");
+    assert!(!detail.contains("/home/alice"), "{detail}");
+    assert!(!detail.contains('\n'));
+    assert_eq!(detail.chars().count(), 2000);
+    assert!(detail.ends_with('…'));
 }

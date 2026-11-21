@@ -20,6 +20,8 @@ pub(crate) const UNIT_DIR: &str = "/wicked-unit";
 /// The PVC holding a run's replica (its trees, git state and the unit's admitted roots, each
 /// at its host path).
 pub(crate) const REPLICA_PVC: &str = "replica";
+/// The largest replica requested by the runner, included in its namespace storage budget.
+pub(crate) const REPLICA_CLAIM_GI: u64 = 20;
 /// The pod's own PID 1: a busybox shell loop. As its PID namespace's init it ignores every
 /// signal sent from inside the pod (a seat's or a check's `kill -9 -1` leaves it running, and the
 /// pod with it), and each `sleep` it waits for reaps any orphan that exited (no zombies hold the
@@ -110,6 +112,16 @@ impl Default for RunBudget {
 }
 
 pub(crate) fn resource_quota(ns: &str, owner: &str, b: &RunBudget) -> Value {
+    use crate::checks_container::{
+        CARGO_HOME_CLAIM_GI, DEPENDENCY_CLAIM_GI, MAX_DEPENDENCY_CLAIMS, MAX_TARGET_LEAVES,
+        TARGET_CLAIMS_PER_LEAF, TARGET_CLAIM_GI,
+    };
+    let targets = MAX_TARGET_LEAVES as u64 * TARGET_CLAIMS_PER_LEAF;
+    let claims = targets + 1 + 1 + MAX_DEPENDENCY_CLAIMS;
+    let storage = targets * TARGET_CLAIM_GI
+        + REPLICA_CLAIM_GI
+        + CARGO_HOME_CLAIM_GI
+        + MAX_DEPENDENCY_CLAIMS * DEPENDENCY_CLAIM_GI;
     json!({
         "apiVersion": "v1",
         "kind": "ResourceQuota",
@@ -118,6 +130,8 @@ pub(crate) fn resource_quota(ns: &str, owner: &str, b: &RunBudget) -> Value {
             "requests.memory": b.requests_memory,
             "requests.cpu": b.requests_cpu,
             "pods": b.pods.to_string(),
+            "persistentvolumeclaims": claims.to_string(),
+            "requests.storage": format!("{storage}Gi"),
             "services.loadbalancers": "0",
             "services.nodeports": "0",
         }}
@@ -1205,4 +1219,16 @@ pub(crate) fn pids_probe_verdict(log: &str) -> Result<u32, String> {
         ));
     }
     Ok(last)
+}
+
+#[cfg(test)]
+mod pr_c2_quota_tests {
+    use super::*;
+
+    #[test]
+    fn claim_quota_covers_the_bounded_targets_replica_and_dependencies() {
+        let doc = resource_quota("run", "me", &RunBudget::default());
+        assert_eq!(doc["spec"]["hard"]["persistentvolumeclaims"], "66");
+        assert_eq!(doc["spec"]["hard"]["requests.storage"], "2612Gi");
+    }
 }

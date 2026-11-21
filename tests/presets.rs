@@ -724,6 +724,11 @@ fn the_builtin_feature_steps_are_the_c1_mapping() {
     {
         let mut want: Vec<PlanStep> = serde_json::from_value(maps[name]["steps"].clone())
             .unwrap_or_else(|e| panic!("{name}: {e}"));
+        // wicked-core#1682: the preset's specialist now supplies the security_review slot.
+        if name == "mcp-server" {
+            let security = want.iter_mut().find(|s| s.id == "security-review").unwrap();
+            security.catalog = "security_review".to_string();
+        }
         // (DES-CATALOG-002 §5.1) `migration` gains ONLY its parity steps over its mapping: verify
         // checks parity, and a final `parity` test checks it again after cleanup.
         // (PLAN G12) `interactive-draft` gains ONLY its page-count step over its mapping: the engine
@@ -1207,7 +1212,7 @@ fn m1_bug_launches_the_preset_in_its_order_with_its_gates_and_pins() {
 
 /// M12 (DES-W7-M12, core#649): a launch naming `mcp-server` runs the built-in preset — the def's
 /// nine phases in order under their own ids, each review keeping its specialist skill and raised
-/// gate (security-review is a `review`, not the catalog's `security_review`), test on the evaluator
+/// gate (security-review supplies the catalog's `security_review` slot), test on the evaluator
 /// role (the bold cell), install-plan and install as Tool `run` steps with install gated
 /// `consent_before`. The PA's `pa-scope` comes first; floor fill may add steps by band.
 #[test]
@@ -1265,6 +1270,12 @@ fn m12_mcp_server_launches_the_preset_with_its_skills_gates_and_consent() {
         skill("security-review").as_deref(),
         Some("wicked-garden-platform-security-engineer")
     );
+    let security: Vec<_> = units
+        .iter()
+        .filter(|u| u.catalog.as_deref() == Some("security_review"))
+        .map(|u| u.id.as_str())
+        .collect();
+    assert_eq!(security, ["rmcp:security-review"]);
     assert_eq!(
         skill("observability-review").as_deref(),
         Some("wicked-garden-qe-observability-test-engineer")
@@ -1342,6 +1353,12 @@ fn x3_editor_plugin_launches_the_preset_with_its_skills_gates_and_consent() {
         skill("security-review").as_deref(),
         Some("wicked-garden-platform-security-engineer")
     );
+    let security: Vec<_> = units
+        .iter()
+        .filter(|u| u.catalog.as_deref() == Some("security_review"))
+        .map(|u| u.id.as_str())
+        .collect();
+    assert_eq!(security, ["redit:security-review"]);
     let install = units.iter().find(|u| u.id == "redit:install").unwrap();
     assert_eq!(install.depends_on, vec!["install-plan".to_string()]);
     // (DES-EDITOR-CONFORMANCE-HOST, e2e F18) The engine's own conformance Tool sits between build and

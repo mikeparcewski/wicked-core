@@ -91,6 +91,8 @@ The rules a built-in carries with it:
   plan-step field): its answer must exist and be non-blank, instead of meeting the 200-character
   substance floor. `WorkflowDef::validate` accepts it only on the def's last phase: an agent step
   the PA owns, not an evaluator, that executes no code, has no validator pin and a pool of one.
+  It also takes every tool away: the tool-less posture answers from the prompt alone (core#1257).
+  On the host floor, route it to claude or pi; other seats require the container floor.
 
 ## Requirements graph
 
@@ -141,6 +143,7 @@ the floor fails closed and the gate denies (core#416).
 |---|---|---|---|
 | **macOS** | a fresh Linux pod per floor side on the local Kubernetes cluster when the floor can be prepared there; else `sandbox-exec` (base system), with the reason | runs the checks (`repoChecksEvaluated`'s `floorRunner.runner`: `container`, or `macos-sandbox` with its `fallbackReason`) | primary |
 | **Linux** | `bwrap` — `apt install bubblewrap` / `dnf install bubblewrap` | runs the checks with `bwrap`; **without it, denies** | supported |
+| **WSL2** (daemon + checkouts inside the distro) | Linux behavior, with a local Kubernetes cluster for pod seats | `/mnt/<drive>` checkouts are refused: clone inside the WSL2 distro (for example under `~/src`) and run there | not certified on a Windows host yet |
 | **Windows** (incl. Git Bash / WSL host side) | none | **denies every floor phase, by construction** | not supported |
 
 `WICKED_FLOOR_RUNNER` picks the floor: `auto` (the default) tries pods on macOS only,
@@ -160,16 +163,44 @@ command is probed: a tool a script calls inside the container
 The escape hatch is an opt-in, not a default: `WICKED_REPO_CHECKS_UNSANDBOXED=1` runs the
 repository's own checks with **no OS write boundary**. The results are real; the pass is not
 containment evidence, and every report, gate note and `repoChecksEvaluated` event says so
-(`sandbox_level: "none"`). A real Windows boundary (AppContainer / a restricted-token job object,
-or the checks under WSL2 `bwrap`) is not designed and not shipped.
+(`sandbox_level: "none"`). A native Windows boundary (AppContainer / a restricted-token job object)
+is not designed and not shipped. A daemon running inside WSL2 is a Linux host and follows the
+Linux rules above.
 
 **Seats run as Kubernetes pods too.** Governed seats and the checks floor run on a local
 Kubernetes cluster (Rancher Desktop or Docker Desktop Kubernetes), installed once with
 `wicked-core cluster install --admin-context <ctx> --home <state home>`. Seats use the trusted
 floor launcher, a read-only root and the model gateway. A unit whose pod cannot start is refused;
 `WICKED_SEAT_FLOOR=host` keeps the labelled interim host floor. The container CLI (`docker`,
-`nerdctl` or `podman`) never runs a seat: it builds images into the store the cluster shares
-(`imagePullPolicy: Never`) and inspects a seat image before an arm. `wicked-core seat-image build|status` builds or reports the images.
+`nerdctl` or `podman`) never runs a seat: it builds images, loads them into the node store when needed
+(`imagePullPolicy: Never`), and reads the seat image archive as data before an arm. The seat runs an
+immutable `:id-<digest>` tag of the inspected image. `wicked-core seat-image build|status` builds or reports the images.
+
+**Kubernetes on Linux.** Single-node kind and k3s clusters are supported via an explicit image
+load step: `kind load image-archive <archive> --name <cluster>` or
+`k3s ctr --namespace k8s.io images import <archive>`. Install the corresponding CLI on the daemon's
+PATH. For k3s, the daemon needs access to its containerd socket; alternatively select `nerdctl`
+with `CONTAINERD_ADDRESS=/run/k3s/containerd/containerd.sock` (the engine always uses namespace
+`k8s.io`). Docker nodes share the builder store. An unknown store or failed load refuses the seat;
+engine images are never pulled from a registry.
+
+The cluster must enforce NetworkPolicy and a pod pids limit: `ensure_pids_limited` refuses one
+without those bounds. For kind, configure the control-plane node's `kubeadmConfigPatches` with
+`kind: KubeletConfiguration` and `podPidsLimit: 4096` before creating the cluster, and install a
+NetworkPolicy-enforcing CNI. For k3s, start the server with `--kubelet-arg=pod-max-pids=4096` and
+keep its NetworkPolicy controller enabled. For example, a single-node kind config uses:
+
+```yaml
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: KubeletConfiguration
+        podPidsLimit: 4096
+```
+
 Every default seat image includes the checks floor recipe as a named stage (`containers/checks/node22-rust.Dockerfile`:
 node, the pinned Rust toolchain linked into `/usr/local/bin`, git, a C toolchain), which the engine
 builds first (and again if an image cleanup removed it), so a builder or QE seat on a Rust repository

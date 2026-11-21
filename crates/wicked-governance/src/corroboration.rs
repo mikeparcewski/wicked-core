@@ -59,7 +59,10 @@ fn is_use_edge(kind: &wicked_apps_core::EdgeKind) -> bool {
     use wicked_apps_core::EdgeKind::*;
     match kind {
         Calls | References | Instantiates => true,
-        Other(t) => matches!(t.as_str(), "invokes" | "uses" | "accesses" | "serves"),
+        Other(t) => matches!(
+            t.as_str(),
+            "invokes" | "uses" | "accesses" | "serves" | "reads" | "writes"
+        ),
         _ => false,
     }
 }
@@ -407,6 +410,44 @@ fn unindexed_mentions(root: &Path, indexed: &[String]) -> HashMap<String, Vec<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sql_reads_and_writes_corroborate_a_db2_table() {
+        use wicked_apps_core::{
+            synthetic_symbol, Edge, EdgeKind, GraphWrite, Language, Location, Node, NodeKind,
+            ResolutionTier, Span, SqliteStore, SYMBOL_SCHEME,
+        };
+        for tag in ["reads", "writes"] {
+            let mut st = SqliteStore::in_memory().unwrap();
+            let mk = |name: &str, kind: NodeKind| {
+                Node::new(
+                    synthetic_symbol("code", name),
+                    kind,
+                    name.to_string(),
+                    Language::new(SYMBOL_SCHEME),
+                    Location::new("src/payment.cbl".to_string(), Span::ZERO),
+                )
+            };
+            let program = mk("PAYMENT", NodeKind::Module);
+            let table = mk("ACCOUNT", NodeKind::Other("db2_table".into()));
+            st.begin_batch().unwrap();
+            st.upsert_nodes(&[program.clone(), table.clone()]).unwrap();
+            st.upsert_edges(&[Edge::new(
+                program.symbol,
+                table.symbol.clone(),
+                EdgeKind::Other(tag.into()),
+                ResolutionTier::Parsed,
+                "test",
+            )])
+            .unwrap();
+            st.commit_batch().unwrap();
+            let assessment = CorroborationIndex::build(&st, None)
+                .unwrap()
+                .assess(&table, 1);
+            assert_eq!(assessment.call_sites, 1, "{tag} is a use");
+            assert_eq!(assessment.why.unwrap().code, "single_caller");
+        }
+    }
 
     #[test]
     fn test_paths_by_convention() {

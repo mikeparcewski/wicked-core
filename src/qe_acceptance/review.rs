@@ -750,7 +750,7 @@ fn verdicts_of(ledger_root: &Path, id: &str) -> Result<Vec<(String, Record)>, St
 
 /// (§3.1 step 4) Bind the reviewer's verdict: the NEWEST live verdict of QE run `id` (the one crew
 /// reads as that run's judgment) must carry this reviewer turn's nonce, this crew run, and the
-/// token the reviewer's own reply ended on. Returns that verdict. (core#1162) When it does not,
+/// token the reviewer's own reply ended on. Returns its verdict and reason (core#1475). Otherwise
 /// the error names the verdict that is newest and who recorded it.
 pub(crate) fn bind_verdict(
     ledger_root: &Path,
@@ -758,7 +758,7 @@ pub(crate) fn bind_verdict(
     crew_run: &str,
     nonce: &str,
     reply_token: &str,
-) -> Result<String, String> {
+) -> Result<(String, Option<String>), String> {
     let mut newest: Option<(String, Record)> = None;
     for (at, rec) in verdicts_of(ledger_root, id)? {
         if newest.as_ref().is_none_or(|(n, _)| at > *n) {
@@ -793,7 +793,21 @@ pub(crate) fn bind_verdict(
             "the recorded verdict ({verdict}) is not the reviewer's own ({reply_token})"
         ));
     }
-    Ok(verdict)
+    Ok((verdict, field(&rec, "reason").map(str::to_string)))
+}
+
+/// Bound ledger findings are safe for a one-line gate or rework brief (core#1475).
+const QE_REASON_MAX: usize = 2000;
+
+fn ledger_reason(reason: &str) -> String {
+    let redacted = crate::deliver_lift::redact_log_text(reason);
+    let line = redacted.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.chars().count() <= QE_REASON_MAX {
+        return line;
+    }
+    let mut capped: String = line.chars().take(QE_REASON_MAX - 1).collect();
+    capped.push('…');
+    capped
 }
 
 /// The verdict values wicked-ledger's index accepts (its migration 002 `CHECK`).
@@ -1438,7 +1452,7 @@ pub(crate) fn run(
             ));
         }
         match bind_verdict(ledger, &id, &input.run_id, &nonce, &token) {
-            Ok(v) => {
+            Ok((v, reason)) => {
                 review.attempts.push(attempt("verdict".to_string()));
                 // (j4-gates) A non-PASS the reviewer itself calls inconclusive — it could not run
                 // the checks it judges on this seat — is no FAIL of the work: it names what could
@@ -1468,6 +1482,17 @@ pub(crate) fn run(
                         c.seat, c.basis
                     ),
                 };
+                // The engine's own record of a reply carries the engine's words, not findings.
+                if v != "PASS" && inconclusive.is_none() && !recorded_by_engine {
+                    if let Some(reason) = reason
+                        .as_deref()
+                        .map(ledger_reason)
+                        .filter(|r| !r.is_empty())
+                    {
+                        review.reason.push_str(": ");
+                        review.reason.push_str(&reason);
+                    }
+                }
                 if recorded_by_engine {
                     review.reason.push_str(
                         " (the engine recorded the reviewer's reply: its own record was missing or \
@@ -1579,4 +1604,4 @@ pub(crate) fn operator_judged(unit: &WorkUnit, by: &str) -> Option<crate::assura
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

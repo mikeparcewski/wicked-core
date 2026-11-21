@@ -31,6 +31,7 @@ pub(crate) mod clock;
 pub(crate) mod cluster;
 pub(crate) mod floor;
 pub(crate) mod gw;
+pub(crate) mod images;
 // The sign-in transport (B-4); seat sign-ins need a Unix host, as the seat runner does.
 #[cfg(unix)]
 pub(crate) mod login;
@@ -277,6 +278,8 @@ pub(crate) fn note_engine_home(home: &Path) {
             *g = Some(home.to_path_buf());
         }
     }
+    #[cfg(not(test))]
+    cluster::start_token_renewal();
 }
 
 /// Forget the noted home (live tests: each installs into its own throwaway home).
@@ -285,6 +288,14 @@ pub(crate) fn forget_engine_home_for_test() {
     if let Ok(mut g) = ENGINE_HOME.lock() {
         *g = None;
     }
+}
+
+/// Swap only the explicitly noted home, preserving the absence of one in test guards.
+/// Callers hold ENV_LOCK for the lifetime of the override.
+#[cfg(test)]
+pub(crate) fn swap_engine_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
+    let mut current = ENGINE_HOME.lock().unwrap_or_else(|p| p.into_inner());
+    std::mem::replace(&mut *current, home)
 }
 
 /// The daemon's operational home as noted by its actor, else the worker home base (a floor run
@@ -453,6 +464,18 @@ pub(crate) fn release_run(run_id: &str, epoch: u64) {
     }
     crate::checks_container::forget_namespace(&run_namespace_name(&kube.owner, run_id));
     drop(g);
+}
+
+/// Execution liveness is independent of the worktree and governance-directory retention rules.
+pub(crate) fn cluster_status_live(status: crate::domain::SessionStatus) -> bool {
+    use crate::domain::SessionStatus;
+    match status {
+        SessionStatus::Planning
+        | SessionStatus::Distributing
+        | SessionStatus::Executing
+        | SessionStatus::AwaitingHuman => true,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => false,
+    }
 }
 
 /// The daemon's boot sweep (B-5), off the actor thread: the namespaces of runs that are not
@@ -902,4 +925,43 @@ pub(crate) fn rfc3339(unix: u64) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod pr_c2_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn completed_retained_runs_are_stale_but_awaiting_human_is_live() {
+        use crate::domain::SessionStatus;
+        let ns = |run| {
+            render::run_namespace_docs(
+                &run_namespace_name("me", run),
+                "me",
+                run,
+                "daemon",
+                &render::RunBudget::default(),
+                "20Gi",
+            )
+            .remove(0)
+        };
+        let statuses = [
+            ("retained", SessionStatus::Completed),
+            ("paused", SessionStatus::AwaitingHuman),
+        ];
+        let plan = cluster::sweep_plan(&[ns("retained"), ns("paused")], "me", &|run| {
+            statuses
+                .iter()
+                .any(|(id, status)| *id == run && cluster_status_live(*status))
+        });
+        assert_eq!(
+            plan,
+            vec![
+                cluster::SweepAction::DeleteNamespace(run_namespace_name("me", "retained")),
+                cluster::SweepAction::ReapStalePods(run_namespace_name("me", "paused")),
+            ]
+        );
+        assert!(!cluster_status_live(SessionStatus::Failed));
+        assert!(!cluster_status_live(SessionStatus::Cancelled));
+    }
 }

@@ -83,11 +83,12 @@ pub(crate) fn refusal_details(reason: &str) -> Option<(&str, &str)> {
     (!path.is_empty() && matches!(access, "write" | "read")).then_some((path, access))
 }
 
-/// Collapse `~`, `.` and `..` WITHOUT touching the filesystem.
+/// Collapse `~`, `.` and `..`, resolving each Unix parent against its physical prefix (core#1469).
 ///
 /// `std::fs::canonicalize` cannot be the whole answer: a `Write` to a file that does not exist yet
-/// fails it, and that is the single most important case to check. So resolve logically first, then
-/// canonicalize the nearest EXISTING ancestor to defeat symlinks.
+/// fails it. A prefix the host cannot see keeps the lexical parent: on the host floor the kernel
+/// fails that path with ENOENT, and a pod's own links are held by the pod (copy-back refuses a link
+/// leaving a root). Windows collapses parents before lookup and stays lexical.
 fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     let expanded: PathBuf = match (raw.strip_prefix("~/"), home) {
         (Some(rest), Some(h)) => h.join(rest),
@@ -106,6 +107,11 @@ fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     for c in joined.components() {
         match c {
             Component::ParentDir => {
+                if cfg!(unix) {
+                    if let Ok(real) = std::fs::canonicalize(&out) {
+                        out = real;
+                    }
+                }
                 // Popping is what makes `../../etc/hosts` resolvable at all. Refusing to pop past
                 // the root is deliberate: `/..` is `/`, not an error.
                 out.pop();
@@ -852,6 +858,55 @@ mod tests {
             "symlink was not resolved: {}",
             d.resolved.display()
         );
+    }
+
+    /// Resolve a link before taking its parent so a self-link cannot hide an escape (core#1469).
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_self_link_uses_the_physical_parent_1469() {
+        let wt = scratch("physical_parent_1469");
+        std::fs::create_dir(wt.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&wt, wt.join("self")).unwrap();
+        let raw = wt.join("self/sub/../../escape");
+        let d = check(raw.to_str().unwrap(), &roots(&wt), true, &wt, None)
+            .expect_err("the kernel writes beside the worktree, outside its write root");
+        assert_eq!(d.resolved, wt.parent().unwrap().join("escape"));
+        assert!(!raw_resolves_within(raw.to_str().unwrap(), &wt, None, &wt));
+        assert_eq!(
+            normalize_for_fence(raw.to_str().unwrap(), &wt, None),
+            d.resolved
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// A pod seat's own directories (out/, build/, .venv) do not exist on the host, so the host
+    /// reads `..` after them lexically. That is not a refusal: the pod holds its own links and
+    /// copy-back refuses one leaving a root (core#1469, coord review r1).
+    #[cfg(unix)]
+    #[test]
+    fn a_pod_write_through_a_pod_only_dir_and_dot_dot_is_admitted_1469() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(crate::gate_hook::SEAT_POD_ENV);
+        let wt = scratch("pod_only_dir_1469");
+        let raw = wt.join("newdir/../x");
+        std::env::set_var(crate::gate_hook::SEAT_POD_ENV, "1");
+        let pod = check(raw.to_str().unwrap(), &roots(&wt), true, &wt, None);
+        let relative = check("out/../log", &roots(&wt), true, &wt, None);
+        match previous {
+            Some(value) => std::env::set_var(crate::gate_hook::SEAT_POD_ENV, value),
+            None => std::env::remove_var(crate::gate_hook::SEAT_POD_ENV),
+        }
+        assert_eq!(
+            pod.expect("a pod-only dir before `..` is admitted"),
+            wt.join("x")
+        );
+        assert_eq!(
+            relative.expect("a pod-only cwd write is admitted"),
+            wt.join("log")
+        );
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// C4 — the invariant that decides shippability. Ordinary in-worktree work must be untouched,

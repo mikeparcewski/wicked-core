@@ -588,6 +588,7 @@ pub(crate) fn revise(
             requires_evaluator: prior.requires_evaluator,
             requires_qe: prior.requires_qe,
             power_absorbs: &prior.power_absorbs,
+            qe_phases: &prior.qe_phases,
         },
     ) {
         Ok(f) => f,
@@ -1113,6 +1114,7 @@ pub(crate) fn send_back(
             requires_evaluator: prior.requires_evaluator,
             requires_qe: prior.requires_qe,
             power_absorbs: &prior.power_absorbs,
+            qe_phases: &prior.qe_phases,
         },
     ) {
         Ok(f) => f,
