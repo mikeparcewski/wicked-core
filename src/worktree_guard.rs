@@ -943,6 +943,90 @@ pub(crate) fn restore_creator_tree(
     result
 }
 
+/// The worker's run-base comparison for a unit with a declared write set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteSetReport {
+    pub outside: Vec<String>,
+    pub error: Option<String>,
+}
+
+impl WriteSetReport {
+    pub(crate) fn denial_reason(&self) -> Option<String> {
+        if let Some(error) = &self.error {
+            return Some(format!("write-set check could not run: {error}"));
+        }
+        if self.outside.is_empty() {
+            return None;
+        }
+        const LIMIT: usize = 20;
+        let mut why = format!(
+            "run changed paths outside the unit's write set: {}",
+            self.outside
+                .iter()
+                .take(LIMIT)
+                .map(|p| format!("{p:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if self.outside.len() > LIMIT {
+            why.push_str(&format!(" (and {} more)", self.outside.len() - LIMIT));
+        }
+        Some(why)
+    }
+}
+
+pub(crate) fn paths_outside_write_set(paths: &[String], allowed: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .filter(|path| {
+            !allowed.iter().any(|entry| {
+                if entry.ends_with('/') {
+                    path.starts_with(entry.as_str())
+                } else {
+                    path.as_str() == entry.as_str()
+                }
+            })
+        })
+        .cloned()
+        .collect()
+}
+
+/// Runs off-actor after all work for the unit has settled.
+pub(crate) fn write_set_for_unit(input: &crate::workflow::StepInput) -> Option<WriteSetReport> {
+    if input.unit.write_set.is_empty() {
+        return None;
+    }
+    let result = (|| -> anyhow::Result<Vec<String>> {
+        let wd = input
+            .workdir
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no workdir recorded"))?;
+        let base = input
+            .base_commit
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("no run base recorded"))?;
+        let git_dir = input
+            .unit
+            .worktree_baseline
+            .as_ref()
+            .and_then(|b| b.git_dir.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("no pinned git dir recorded at dispatch"))?;
+        let snap = snapshot_through(wd, Path::new(git_dir))?;
+        let paths = paths_since_commit(wd, &snap, base)?;
+        Ok(paths_outside_write_set(&paths, &input.unit.write_set))
+    })();
+    Some(match result {
+        Ok(outside) => WriteSetReport {
+            outside,
+            error: None,
+        },
+        Err(error) => WriteSetReport {
+            outside: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    })
+}
+
 /// Run the guard for one finished unit: the worker-thread half. `None` when the unit is not
 /// guarded (or unbound) — the fold then expects no outcome. Never panics on git failure: that is
 /// [`WorktreeGuardOutcome::Unverifiable`], which the fold denies.
@@ -1220,6 +1304,71 @@ pub(crate) mod tests {
             }
             std::fs::remove_dir_all(wt.parent().unwrap()).unwrap();
         }
+    }
+
+    #[test]
+    fn write_set_filters_directory_prefixes_and_exact_files() {
+        let allowed = vec![".wicked/domain/".into(), "coverage-report.json".into()];
+        let paths = [
+            ".wicked/domain/rules.json",
+            ".wicked/domain-evil/x",
+            "src/x.rs",
+            "coverage-report.json",
+            "coverage-report.json.bak",
+            ".wicked/domain",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        assert_eq!(
+            paths_outside_write_set(&paths, &allowed),
+            [
+                ".wicked/domain-evil/x",
+                "src/x.rs",
+                "coverage-report.json.bak",
+                ".wicked/domain"
+            ]
+        );
+
+        let wt = creator_worktree("write-set");
+        let repo = repo_of(&wt);
+        let base = run_git(&repo, &["rev-parse", "HEAD"]).trim().to_string();
+        let mut unit = WorkUnit::pending("mapping:extract", "mapping", 1, "extract");
+        unit.write_set = allowed;
+        unit.worktree_baseline = Some(snapshot(&wt, &repo).unwrap());
+        std::fs::create_dir_all(wt.join(".wicked/domain")).unwrap();
+        std::fs::write(wt.join(".wicked/domain/rules.json"), "{}").unwrap();
+        std::fs::write(wt.join("coverage-report.json"), "{}").unwrap();
+        std::fs::write(wt.join("ignored.local.json"), "{}").unwrap();
+        let mut input = crate::workflow::StepInput {
+            run_id: "mapping".into(),
+            unit_ix: 0,
+            attempt: 0,
+            unit,
+            workflow_id: "mapping".into(),
+            entity_mode: crate::scope::EntityMode::Shared,
+            workdir: Some(wt.clone()),
+            base_commit: Some(base),
+            governance: None,
+            prior_outputs: Vec::new(),
+            elicitation_epoch: 0,
+            process_gen: None,
+            launch_seq: 0,
+            required_skills: Vec::new(),
+        };
+        let report = write_set_for_unit(&input).unwrap();
+        assert_eq!(report.error, None);
+        assert_eq!(report.outside, ["src/a.ts", "src/b.ts"]);
+        // Committing the edits cannot hide them from a comparison against the run base.
+        run_git(&wt, &["add", "-A"]);
+        run_git(&wt, &["commit", "-qm", "mapping work"]);
+        assert_eq!(write_set_for_unit(&input).unwrap(), report);
+        input.base_commit = None;
+        assert!(write_set_for_unit(&input)
+            .unwrap()
+            .error
+            .unwrap()
+            .contains("no run base"));
+        std::fs::remove_dir_all(wt.parent().unwrap()).unwrap();
     }
 
     fn guarded_unit() -> WorkUnit {

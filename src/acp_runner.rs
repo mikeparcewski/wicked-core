@@ -2205,6 +2205,7 @@ pub(crate) fn member_turn(
     unit.assigned_invocation = Some(invocation);
     unit.read_view = view.map(std::path::Path::to_path_buf);
     let input = StepInput {
+        base_commit: None,
         run_id: run_id.clone(),
         unit_ix: 0,
         attempt: 0,
@@ -3567,6 +3568,8 @@ mod tests {
     #[allow(dead_code)]
     fn claude_unit_running_echo() -> crate::domain::WorkUnit {
         crate::domain::WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             capture_report: None,
             requires_capture_report: false,
             answer_only: false,
@@ -3672,6 +3675,7 @@ mod tests {
     #[allow(dead_code)]
     fn governed_input(dir: &std::path::Path) -> StepInput {
         StepInput {
+            base_commit: None,
             run_id: "run-gov".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -4595,6 +4599,7 @@ acp_input_governance = true
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         u.executes_code = true;
         let input = StepInput {
+            base_commit: None,
             run_id,
             unit_ix: 0,
             attempt: 0,

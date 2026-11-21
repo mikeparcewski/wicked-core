@@ -128,6 +128,7 @@ pub fn author_deterministic_validator(
     // ACP session across every authoring call, so each author would see the last one's context.
     let run_id = validator_run_id();
     let input = StepInput {
+        base_commit: None,
         run_id: run_id.clone(),
         unit_ix: 0,
         attempt: 0,
@@ -2905,6 +2906,7 @@ pub(crate) fn run_rule_judge(
 
 fn build_validator_input(run_id: &str, unit: WorkUnit) -> StepInput {
     StepInput {
+        base_commit: None,
         run_id: run_id.to_string(),
         unit_ix: 0,
         attempt: 0,
@@ -2995,6 +2997,7 @@ pub fn triage_failure(
     // the operator; it does not make the id unique (a re-dispatch restarts at attempt 0).
     let triage_run_id = one_shot_run_id(&format!("triage-{triage_ctx}"));
     let input = StepInput {
+        base_commit: None,
         run_id: triage_run_id.clone(),
         unit_ix: 0,
         attempt: 0,

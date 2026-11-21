@@ -151,8 +151,10 @@ pub(super) fn after_pass(
             // denial, failed seats, review rounds or rulings is carried onto different work (codex
             // r1: page two's first FAIL reached the capped review's adjudication).
             let mut nodes = Vec::new();
+            let pass_started_ms = crate::interaction::now_millis();
             for (ix, u) in units.iter().enumerate().take(unit_ix + 1).skip(from_ix) {
                 let mut u = u.clone();
+                u.pass_started_ms = Some(pass_started_ms);
                 // What this pass's review deferred to delivery stays owed after the next pass
                 // reviews different work (codex r2 on #1226): kept on the unit, which the
                 // deliver gate lists beside the current pass's.
@@ -465,6 +467,20 @@ mod tests {
             .into_iter()
             .find(|u| u.ord == ord)
             .unwrap()
+    }
+
+    #[test]
+    fn repeat_rearm_stamps_every_unit_with_one_pass_clock() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let ix = seed(&mut store, "pass-clock", Vec::new(), |_| {});
+        assert_eq!(unit(&store, "pass-clock", 1).pass_started_ms, None);
+        let before = crate::interaction::now_millis();
+        let (r, _) = run(&mut store, "pass-clock", ix, CONTINUE);
+        assert!(r.is_some());
+        let page = unit(&store, "pass-clock", 1);
+        let next = unit(&store, "pass-clock", 2);
+        assert!(page.pass_started_ms.unwrap() >= before);
+        assert_eq!(page.pass_started_ms, next.pass_started_ms);
     }
 
     const CONTINUE: &str = r#"wicked-repeat {"next":"continue","line":"page 2"}"#;

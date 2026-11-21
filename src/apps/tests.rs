@@ -597,6 +597,7 @@ fn an_apps_launch_that_could_not_hold_its_rules_is_refused() {
 /// The input a carrier hands unit `u` of a run whose contract names `apps`.
 fn input_for(u: &WorkUnit, db_path: &str, apps: Option<&str>) -> StepInput {
     StepInput {
+        base_commit: None,
         run_id: u.session_id.clone(),
         unit_ix: (u.ord - 1) as usize,
         attempt: 0,

@@ -1270,6 +1270,213 @@ mod tests {
         p.to_str().map(str::to_string)
     }
 
+    /// core#1699: tripwire for engine-created state-home children missing from the registry.
+    /// This lexical scan sees home-like identifiers (plus `h` and `sh`), literal/constant joins,
+    /// and no dynamic paths. A differently named receiver is invisible; this is not a proof.
+    #[test]
+    fn every_state_home_child_the_engine_joins_is_registered() {
+        use std::collections::{BTreeMap, BTreeSet};
+
+        const NOT_THE_STATE_HOME: &[(&str, &str, &str)] = &[
+            ("bin/wicked-core.rs", ".wicked-crew", "the user's HOME"),
+            ("gate_hook.rs", ".claude", "the user's HOME (Claude state)"),
+            (
+                "gate_hook.rs",
+                ".wicked",
+                "the user's HOME (governance root)",
+            ),
+            (
+                "gate_hook.rs",
+                ".wicked-crew",
+                "the user's HOME (default state home)",
+            ),
+            (
+                "skills_snapshot.rs",
+                ".claude",
+                "the user's HOME (Claude skills fallback)",
+            ),
+            (
+                "path_policy.rs",
+                ".config",
+                "the user's HOME (configuration root)",
+            ),
+            (
+                "k8s/mod.rs",
+                ".rd/bin/kubectl",
+                "the user's HOME (Rancher Desktop)",
+            ),
+            (
+                "container_floor.rs",
+                "opencode",
+                "the seat's XDG configuration home",
+            ),
+            (
+                "seat_refresh.rs",
+                "codex/auth.json",
+                "the renewal seat's throwaway home",
+            ),
+            (
+                "seat_refresh.rs",
+                "pi/auth.json",
+                "the renewal seat's throwaway home",
+            ),
+            (
+                "codex_skills.rs",
+                ".wicked-skills.lock",
+                "CODEX_HOME (the seat's skill lock)",
+            ),
+        ];
+
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sources = BTreeMap::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let rel = path
+                        .strip_prefix(&root)
+                        .unwrap()
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    sources.insert(rel, std::fs::read_to_string(path).unwrap());
+                }
+            }
+        }
+
+        // Discover out-of-line test modules before stripping their declarations. In particular,
+        // k8s/live.rs is test-only despite its filename. Honor #[path] after the cfg attribute.
+        let test_module = regex::Regex::new(concat!(
+            r"(?m)^[ \t]*#\[cfg\(\s*(?:test\b|all\(\s*test\b)[^\]]*\)\]",
+            r"(?:\s*#\[[^\]]*\])*\s*",
+            r"(?:pub(?:\([^)]*\))?\s+)?mod\s+([A-Za-z_][A-Za-z0-9_]*)\s*;",
+        ))
+        .unwrap();
+        let path_attr = regex::Regex::new(r#"#\[path\s*=\s*"([^"]+)"\]"#).unwrap();
+        let string_const = regex::Regex::new(concat!(
+            r"\bconst\s+([A-Z][A-Z0-9_]*)\s*:\s*&\s*(?:'static\s+)?str\s*=\s*",
+            r#""([^"]*)"\s*;"#,
+        ))
+        .unwrap();
+        let mut excluded = BTreeSet::new();
+        let mut constants: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (rel, source) in &sources {
+            let path = root.join(rel);
+            for module in test_module.captures_iter(source) {
+                if let Some(attr) = path_attr.captures(&module[0]) {
+                    excluded.insert(path.parent().unwrap().join(&attr[1]));
+                } else {
+                    let base = match path.file_name().unwrap().to_str().unwrap() {
+                        "mod.rs" | "lib.rs" | "main.rs" => path.parent().unwrap().to_path_buf(),
+                        _ => path.with_extension(""),
+                    };
+                    excluded.insert(base.join(format!("{}.rs", &module[1])));
+                    excluded.insert(base.join(&module[1]).join("mod.rs"));
+                }
+            }
+            for constant in string_const.captures_iter(source) {
+                constants
+                    .entry(constant[1].to_string())
+                    .or_default()
+                    .insert(constant[2].to_string());
+            }
+        }
+
+        let join = regex::Regex::new(concat!(
+            r"\b([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\.\s*join\s*\(\s*",
+            r#"(?:"([^"]*)"|(?:[A-Za-z_][A-Za-z0-9_]*::)*([A-Z][A-Z0-9_]*)\b)"#,
+            r"\s*\)",
+        ))
+        .unwrap();
+        let registry = registry().unwrap();
+        let mut found = BTreeSet::new();
+        let mut failures = Vec::new();
+        for (rel, source) in &sources {
+            if rel.ends_with("tests.rs") || excluded.contains(&root.join(rel)) {
+                continue;
+            }
+            let lines = crate::run_context::tests::production(rel);
+            // Keep diagnostics at their original source lines after test-only items are removed.
+            let mut original = source.lines().enumerate();
+            let numbers: Vec<_> = lines
+                .iter()
+                .map(|kept| original.find(|(_, line)| *line == kept.as_str()).unwrap().0 + 1)
+                .collect();
+            let production = lines.join("\n");
+            for site in join.captures_iter(&production) {
+                let receiver = &site[1];
+                if !receiver.contains("home") && receiver != "h" && receiver != "sh" {
+                    continue;
+                }
+                let index = production[..site.get(0).unwrap().start()]
+                    .bytes()
+                    .filter(|b| *b == b'\n')
+                    .count();
+                if lines[index].trim_start().starts_with("//") {
+                    continue;
+                }
+                let line = numbers[index];
+                let value = if let Some(literal) = site.get(2) {
+                    literal.as_str()
+                } else {
+                    let name = &site[3];
+                    match constants.get(name) {
+                        Some(values) if values.len() == 1 => values.first().unwrap().as_str(),
+                        values => {
+                            failures.push(format!(
+                                "{rel}:{line}: cannot resolve constant {name}: {values:?}; \
+                                 extend the scanner"
+                            ));
+                            continue;
+                        }
+                    }
+                };
+                found.insert((rel.clone(), value.to_string()));
+                let segment = value.split('/').next().unwrap();
+                if registry.classify(segment).is_none()
+                    && !NOT_THE_STATE_HOME
+                        .iter()
+                        .any(|(file, literal, _)| *file == rel.as_str() && *literal == value)
+                {
+                    failures.push(format!("{rel}:{line}: {receiver}.join({value:?})"));
+                }
+            }
+        }
+        for (file, literal, why) in NOT_THE_STATE_HOME {
+            if !found.contains(&(file.to_string(), literal.to_string())) {
+                failures.push(format!(
+                    "dead NOT_THE_STATE_HOME row: {file} {literal:?} ({why})"
+                ));
+            }
+        }
+        for (file, literal) in [
+            ("k8s/seat.rs", "k8s-replica-git"),
+            ("k8s/mod.rs", "k8s"),
+            ("team/publish.rs", "team-outbox.ndjson"),
+            ("code_graph.rs", "repo-graphs"),
+            ("actor.rs", "gateway"),
+        ] {
+            if !found.contains(&(file.to_string(), literal.to_string()))
+                || registry.classify(literal).is_none()
+            {
+                failures.push(format!(
+                    "required registered site missing: {file} {literal:?}"
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "engine home joins must be classified:\n{}\nRegister each state-home child in \
+             tests/fixtures/state-home-subtrees.json (and crew's mirror + \
+             packages/crew/src/projects/state-home-registry.ts, released together), or, when \
+             the receiver is not the state home, add a NOT_THE_STATE_HOME row saying whose \
+             home it is.",
+            failures.join("\n")
+        );
+    }
+
     /// The embedded registry is the fixture crew mirrors: it parses, carries exactly one read
     /// slot (the skills root, `snapshots`), and classifies every top-level entry the live
     /// daemon's state home holds today plus every store crew's own audit names.
@@ -1367,6 +1574,11 @@ mod tests {
             "repo-watch.json",
             "repo-watch.json.tmp-4242",
             "repo-graphs",
+            // core#1699: the k8s seats' replica .git builders (src/k8s/seat.rs GitBuild::build).
+            "k8s-replica-git",
+            // core#1102/#1398: the k8s seat image facts cache and the transient image exports.
+            "seat-image-facts",
+            "image-archives",
             "skills",
             // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the
             // interactive bridge's docs root + recorder browser (`interactive`).

@@ -16,18 +16,19 @@
 //! with a read-only root and a memory cap. OOM kills are infrastructure failures, never
 //! failures of the change. Cache keys, tree serialization, and floor reports live here.
 //!
-//! The container CLI only builds the checks image into the cluster's shared image store
-//! (`imagePullPolicy: Never`). Install the local Rancher Desktop or Docker Desktop Kubernetes
+//! The container CLI builds the checks image; the engine loads it into the node's image store
+//! before use (`imagePullPolicy: Never`). Install the local Rancher Desktop or Docker Desktop Kubernetes
 //! cluster once with `wicked-core cluster install --admin-context <ctx> --home <state home>`.
 //!
 //! [`RUNNER_ENV`] selects `auto|container|sandbox`: auto tries pods on macOS, with the host
 //! sandbox as fallback; Linux auto keeps bwrap. Explicit container mode fails closed.
 
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -58,6 +59,14 @@ const TARGET_DIR: &str = "/wicked/target";
 const CARGO_HOME_DIR: &str = "/wicked/cargo-home";
 const FILL_DIR: &str = "/wicked/vol";
 const CARGO_HOME_VOLUME: &str = "wfloor-cargo-home";
+/// Admission maxima shared by allocation and the run's ResourceQuota.
+pub(crate) const MAX_TARGET_LEAVES: usize = 16;
+pub(crate) const TARGET_CLAIMS_PER_LEAF: u64 = 2;
+pub(crate) const TARGET_CLAIM_GI: u64 = 64;
+pub(crate) const CARGO_HOME_CLAIM_GI: u64 = 32;
+pub(crate) const MAX_DEPENDENCY_CLAIMS: u64 = 32;
+pub(crate) const DEPENDENCY_CLAIM_GI: u64 = 16;
+const DEPENDENCY_PREFIX: &str = "wfloor-nm-";
 const COMPLETE: &str = ".wicked-complete";
 pub(crate) const NESTED_TAR: &str = ".wicked-nested.tar";
 const INSTALL_LOG: &str = ".wicked-install.log";
@@ -419,6 +428,105 @@ pub(crate) fn nm_volume(
 /// The cargo target volume of one run leaf and side.
 pub(crate) fn target_volume(leaf: &Path, tree: Tree) -> String {
     format!("wfloor-target-{}-{}", leaf_key(leaf), side(tree))
+}
+
+struct TargetClaim {
+    kube: crate::k8s::Kube,
+    namespace: String,
+    name: String,
+}
+
+/// Retirement owns these claims, rather than the lifetime of any individual floor.
+static TARGET_CLAIMS: Mutex<Option<HashMap<PathBuf, TargetLeaf>>> = Mutex::new(None);
+
+struct TargetLeaf {
+    used: Instant,
+    claims: Vec<TargetClaim>,
+}
+
+/// Serialize admission, while letting retirement drain the registry under its own leaf lease.
+static TARGET_ADMISSION: Mutex<()> = Mutex::new(());
+
+pub(crate) fn admit_target_claim(
+    leaf: &Path,
+    kube: &crate::k8s::Kube,
+    ns: &str,
+    name: &str,
+    limit: usize,
+) -> Result<(), String> {
+    let _admission = TARGET_ADMISSION.lock().unwrap_or_else(|p| p.into_inner());
+    let (known, mut candidates) = {
+        let registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidates = Vec::new();
+        let mut known = false;
+        if let Some(registry) = registry.as_ref() {
+            for (path, record) in registry {
+                if record.claims.iter().any(|c| c.namespace == ns) {
+                    known |= path == leaf;
+                    candidates.push((record.used, path.clone()));
+                }
+            }
+        }
+        (known, candidates)
+    };
+    if !known {
+        candidates.sort_by_key(|(used, _)| *used);
+        let mut count = candidates.len();
+        for (_, victim) in candidates {
+            if count < limit {
+                break;
+            }
+            if crate::repo_checks::evict_target_leaf(&victim) {
+                count -= 1;
+            }
+        }
+        if count >= limit {
+            return Err("admission_pending: the run's target claim budget is held by active or unremovable leaves".into());
+        }
+    }
+    remember_target_claim(leaf, kube, ns, name);
+    Ok(())
+}
+
+fn remember_target_claim(leaf: &Path, kube: &crate::k8s::Kube, ns: &str, name: &str) {
+    let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    let record = registry
+        .get_or_insert_with(HashMap::new)
+        .entry(leaf.to_path_buf())
+        .or_insert_with(|| TargetLeaf {
+            used: Instant::now(),
+            claims: Vec::new(),
+        });
+    record.used = Instant::now();
+    if !record
+        .claims
+        .iter()
+        .any(|c| c.namespace == ns && c.name == name)
+    {
+        record.claims.push(TargetClaim {
+            kube: kube.clone(),
+            namespace: ns.into(),
+            name: name.into(),
+        });
+    }
+}
+
+/// Called only under the leaf's exclusive retirement lease. Failures remain retryable.
+pub(crate) fn retire_target_claims(leaf: &Path) -> Result<(), String> {
+    let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(registry) = registry.as_mut() else {
+        return Ok(());
+    };
+    if let Some(record) = registry.get_mut(leaf) {
+        while let Some(claim) = record.claims.last() {
+            claim
+                .kube
+                .delete_owned(Some(&claim.namespace), "pvc", &claim.name, false)?;
+            record.claims.pop();
+        }
+    }
+    registry.remove(leaf);
+    Ok(())
 }
 
 fn leaf_key(leaf: &Path) -> String {
@@ -1161,17 +1269,250 @@ struct VolumeLock {
     _file: std::fs::File,
 }
 
-fn lock_volume(volume: &str) -> Result<VolumeLock, String> {
+fn open_volume_lock(volume: &str) -> Result<std::fs::File, String> {
     let dir = lock_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let f = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(format!("{volume}.lock")))
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| e.to_string())
+}
+
+fn lock_volume(volume: &str) -> Result<VolumeLock, String> {
+    let f = open_volume_lock(volume)?;
     f.lock().map_err(|e| e.to_string())?;
     Ok(VolumeLock { _file: f })
+}
+
+fn try_lock_volume(volume: &str) -> Result<Option<VolumeLock>, String> {
+    let f = open_volume_lock(volume)?;
+    match f.try_lock() {
+        Ok(()) => Ok(Some(VolumeLock { _file: f })),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(e)) => Err(e.to_string()),
+    }
+}
+
+/// Namespace admission serializes list/evict/create with pending mount registration. Fill
+/// locks are only tried during eviction: waiting here would deadlock a fill awaiting admission.
+pub(crate) struct DependencyAdmission {
+    _lock: VolumeLock,
+}
+
+fn dependency_admission(ns: &str) -> Result<DependencyAdmission, String> {
+    lock_volume(&format!("{ns}-nm-admission")).map(|lock| DependencyAdmission { _lock: lock })
+}
+
+static DEPENDENCY_USED: Mutex<Option<HashMap<String, Instant>>> = Mutex::new(None);
+
+// Pending pods are not necessarily visible in the API inventory yet. Admission serializes
+// registration with eviction; the registry lock itself never spans an API call or pod wait.
+static PENDING_MOUNTS: LazyLock<Mutex<HashMap<String, usize>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn note_dependency_use(ns: &str, name: &str) {
+    if name.starts_with(DEPENDENCY_PREFIX) {
+        DEPENDENCY_USED
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_or_insert_with(HashMap::new)
+            .insert(format!("{ns}/{name}"), Instant::now());
+    }
+}
+
+/// Reserve room for a dependency claim, keeping admission locked until its apply completes.
+/// The API inventory also covers claims left by earlier daemon versions or processes.
+pub(crate) fn admit_dependency_claim(
+    kube: &crate::k8s::Kube,
+    ns: &str,
+    name: &str,
+) -> Result<Option<DependencyAdmission>, String> {
+    if !name.starts_with(DEPENDENCY_PREFIX) {
+        return Ok(None);
+    }
+    let admission = dependency_admission(ns)?;
+    let claims: HashSet<String> = kube
+        .list_owned(Some(ns), "pvc", &[])?
+        .iter()
+        .filter(|c| crate::k8s::is_owned_by(c, &kube.owner))
+        .filter_map(|c| {
+            c.pointer("/metadata/name")
+                .and_then(serde_json::Value::as_str)
+        })
+        .filter(|n| n.starts_with(DEPENDENCY_PREFIX))
+        .map(str::to_string)
+        .collect();
+    let existing = claims.contains(name);
+    let mut count = claims.len() as u64;
+    let desired = MAX_DEPENDENCY_CLAIMS - u64::from(!existing);
+    let mut candidates = {
+        let mut used = DEPENDENCY_USED.lock().unwrap_or_else(|p| p.into_inner());
+        let used = used.get_or_insert_with(HashMap::new);
+        let prefix = format!("{ns}/");
+        used.retain(|key, _| {
+            key.strip_prefix(&prefix)
+                .is_none_or(|claim| claims.contains(claim))
+        });
+        claims
+            .iter()
+            .filter(|c| c.as_str() != name)
+            .map(|c| (used.get(&format!("{ns}/{c}")).copied(), c.clone()))
+            .collect::<Vec<_>>()
+    };
+    // None sorts first: after a restart, claims we have never seen used are the oldest.
+    candidates.sort();
+    if count > desired {
+        // Snapshot pending protection before listing pods: a guard can drop after its pod
+        // starts while that listing is in flight. Admission prevents new registrations.
+        {
+            let pending = PENDING_MOUNTS.lock().unwrap_or_else(|p| p.into_inner());
+            candidates.retain(|(_, claim)| {
+                pending
+                    .get(&format!("{ns}/{claim}"))
+                    .is_none_or(|count| *count == 0)
+            });
+        }
+        // All pods count, including foreign, Pending and terminating pods. Only a terminal
+        // pod is known to have stopped using its claims.
+        let result = kube.call(Some(ns), &["get", "pods", "-o", "json"], None, PROBE);
+        if !result.ok() {
+            return Err(result.err_text());
+        }
+        let pods: serde_json::Value =
+            serde_json::from_slice(&result.stdout).map_err(|e| e.to_string())?;
+        let pods = pods["items"]
+            .as_array()
+            .ok_or("the namespace's pod inventory has no items")?;
+        let mut mounted = HashSet::new();
+        for pod in pods {
+            if matches!(
+                pod.pointer("/status/phase")
+                    .and_then(serde_json::Value::as_str),
+                Some("Succeeded" | "Failed")
+            ) {
+                continue;
+            }
+            if let Some(volumes) = pod
+                .pointer("/spec/volumes")
+                .and_then(serde_json::Value::as_array)
+            {
+                for volume in volumes {
+                    if let Some(claim) = volume
+                        .pointer("/persistentVolumeClaim/claimName")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        mounted.insert(claim.to_string());
+                    }
+                }
+            }
+        }
+        for (_, victim) in candidates {
+            if count <= desired {
+                break;
+            }
+            if mounted.contains(&victim) {
+                continue;
+            }
+            let Some(_fill) = try_lock_volume(&format!("{ns}-{victim}"))? else {
+                continue;
+            };
+            // Wait for deletion: a terminating PVC still counts against ResourceQuota.
+            if kube.delete_owned(Some(ns), "pvc", &victim, true).is_ok() {
+                count -= 1;
+                let key = format!("{ns}/{victim}");
+                FILLED
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retain(|k| k != &key);
+                if let Some(used) = DEPENDENCY_USED
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    used.remove(&key);
+                }
+            }
+        }
+    }
+    if count > desired {
+        return Err(
+            "admission_pending: the run's dependency claim budget is held by active or \
+             unremovable claims"
+                .into(),
+        );
+    }
+    Ok(Some(admission))
+}
+
+/// Protect claims until the pod exists without holding admission during pod startup.
+/// Dropping the guard releases its pending counts on both success and failure paths.
+pub(crate) struct DependencyMount {
+    namespace: String,
+    claims: Vec<String>,
+}
+
+impl DependencyMount {
+    pub(crate) fn mounted(&self) {
+        for claim in &self.claims {
+            note_dependency_use(&self.namespace, claim);
+        }
+    }
+}
+
+impl Drop for DependencyMount {
+    fn drop(&mut self) {
+        let mut pending = PENDING_MOUNTS.lock().unwrap_or_else(|p| p.into_inner());
+        for claim in &self.claims {
+            let key = format!("{}/{claim}", self.namespace);
+            if let Some(count) = pending.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    pending.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn dependency_mounts<'a>(
+    kube: &crate::k8s::Kube,
+    ns: &str,
+    names: impl IntoIterator<Item = &'a str>,
+) -> Result<Option<DependencyMount>, String> {
+    let claims: Vec<String> = names
+        .into_iter()
+        .filter(|n| n.starts_with(DEPENDENCY_PREFIX))
+        .map(str::to_string)
+        .collect();
+    if claims.is_empty() {
+        return Ok(None);
+    }
+    let _admission = dependency_admission(ns)?;
+    for claim in &claims {
+        let exists = kube.get_json(Some(ns), "pvc", claim)?.is_some_and(|c| {
+            crate::k8s::is_owned_by(&c, &kube.owner)
+                && c.pointer("/metadata/deletionTimestamp")
+                    .is_none_or(|t| t.is_null())
+        });
+        if !exists {
+            return Err(format!(
+                "admission_pending: dependency claim pvc/{claim} was retired; retry its fill"
+            ));
+        }
+    }
+    // Validate the entire set first so a failed check leaves no pending registrations.
+    {
+        let mut pending = PENDING_MOUNTS.lock().unwrap_or_else(|p| p.into_inner());
+        for claim in &claims {
+            *pending.entry(format!("{ns}/{claim}")).or_default() += 1;
+        }
+    }
+    Ok(Some(DependencyMount {
+        namespace: ns.into(),
+        claims,
+    }))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1774,6 +2115,13 @@ impl ChecksFloor {
         if plan.cargo {
             // The run's target claim for this leaf and side: warm across the leaf's floors.
             let target = target_volume(&self.leaf, tree);
+            admit_target_claim(
+                &self.leaf,
+                &self.place.kube,
+                &self.place.ns,
+                &target,
+                MAX_TARGET_LEAVES,
+            )?;
             let warm = self
                 .place
                 .kube
@@ -1782,7 +2130,7 @@ impl ChecksFloor {
                 .flatten()
                 .is_some();
             self.place
-                .claim(&target, "64Gi")
+                .claim(&target, &format!("{TARGET_CLAIM_GI}Gi"))
                 .map_err(|e| format!("the cargo target claim: {e}"))?;
             if let Ok(mut r) = self.record.lock() {
                 r.caches.push(CacheUse {
@@ -2342,10 +2690,11 @@ impl Filler<'_> {
         let key = format!("{}/{volume}", self.place.ns);
         let _lock = lock_volume(&format!("{}-{volume}", self.place.ns))?;
         if filled(&key) {
+            note_dependency_use(&self.place.ns, volume);
             return Ok(Fill::Hit);
         }
         self.place
-            .claim(volume, "16Gi")
+            .claim(volume, &format!("{DEPENDENCY_CLAIM_GI}Gi"))
             .map_err(|e| format!("the node_modules claim: {e}"))?;
         let pkg = sh_quote(&if dir.is_empty() {
             "/work/t".to_string()
@@ -2434,7 +2783,7 @@ impl Filler<'_> {
             return Ok(Fill::Hit);
         }
         self.place
-            .claim(CARGO_HOME_VOLUME, "32Gi")
+            .claim(CARGO_HOME_VOLUME, &format!("{CARGO_HOME_CLAIM_GI}Gi"))
             .map_err(|e| format!("the cargo home claim: {e}"))?;
         let file = format!(".wicked-fetched/{marker}");
         let pkg = sh_quote(&if dir.is_empty() {
@@ -2700,7 +3049,7 @@ pub(crate) fn seat_node_modules(
         &kube,
         &run,
         &crate::k8s::render::RunBudget::default(),
-        "20Gi",
+        &format!("{}Gi", crate::k8s::render::REPLICA_CLAIM_GI),
     )?;
     let place = crate::k8s::floor::Place {
         kube,
@@ -2800,6 +3149,24 @@ fn filled(key: &str) -> bool {
 /// Forget every completed claim of namespace `ns` (codex b3-floor #10): it was deleted, and a
 /// namespace of the same name later is new storage.
 pub(crate) fn forget_namespace(ns: &str) {
+    if let Some(used) = DEPENDENCY_USED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        let prefix = format!("{ns}/");
+        used.retain(|key, _| !key.starts_with(&prefix));
+    }
+    if let Some(registry) = TARGET_CLAIMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        registry.retain(|_, record| {
+            record.claims.retain(|c| c.namespace != ns);
+            !record.claims.is_empty()
+        });
+    }
     if let Ok(mut f) = FILLED.lock() {
         let pre = format!("{ns}/");
         f.retain(|k| !k.starts_with(&pre));
@@ -2821,6 +3188,9 @@ fn mark_filled(key: &str) {
         if !f.iter().any(|k| k == key) {
             f.push(key.to_string());
         }
+    }
+    if let Some((ns, name)) = key.split_once('/') {
+        note_dependency_use(ns, name);
     }
 }
 
@@ -2862,18 +3232,6 @@ impl Drop for ChecksFloor {
         if let Ok(mut live) = self.live.lock() {
             for l in live.iter_mut().filter_map(Option::take) {
                 self.remove(&l.name);
-            }
-        }
-        // The leaf was retired while this floor held its target claims: they go now (the rest
-        // go with the run's namespace).
-        if std::fs::symlink_metadata(&self.leaf).is_err() {
-            for tree in [Tree::Head, Tree::Base] {
-                let _ = self.place.kube.delete_owned(
-                    Some(&self.place.ns),
-                    "pvc",
-                    &target_volume(&self.leaf, tree),
-                    false,
-                );
             }
         }
     }

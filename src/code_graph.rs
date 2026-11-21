@@ -1120,6 +1120,16 @@ pub(crate) fn lease_graph(db: &Path, run_id: &str, base: Option<&str>) {
         .insert(run_id.to_string(), base.map(str::to_string));
 }
 
+/// Every run holding this graph, regardless of its base or persisted session status.
+pub(crate) fn graph_lease_holders(db: &Path) -> Vec<String> {
+    GRAPH_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(db)
+        .map(|runs| runs.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn release_graph_lease(run_id: &str) {
     GRAPH_LEASES
         .lock()
@@ -1170,6 +1180,7 @@ pub(crate) fn wait_checkout_index(db: &Path) {
 struct CheckoutIndexGuard {
     db: PathBuf,
     started: bool,
+    base_proved: bool,
 }
 
 impl CheckoutIndexGuard {
@@ -1181,14 +1192,16 @@ impl CheckoutIndexGuard {
         Self {
             db: db.to_path_buf(),
             started: false,
+            base_proved: false,
         }
     }
 }
 
 impl Drop for CheckoutIndexGuard {
     fn drop(&mut self) {
-        // Publish not-a-base before waking dispatches, including on indexer failure or panic.
-        if self.started {
+        // Without a clean-HEAD proof, publish not-a-base before waking dispatches,
+        // including on indexer failure or panic.
+        if self.started && !self.base_proved {
             mark_not_a_base(&self.db, "a checkout re-index");
         }
         CHECKOUT_INDEXING
@@ -1296,9 +1309,9 @@ fn index_at_base_with(
 /// [`crate::review_scale::graph_age`] reads it as `Dirty` and every later check fails closed (D8
 /// re-indexes at a launch; a floor runs the declared suite). For an index that did not finish
 /// (estate records `repo_info` BEFORE it rewrites the graph, so a killed or failed index leaves new
-/// provenance over partial rows; codex r1 on wicked-core#1230), and for every checkout re-index (a
-/// live checkout is never an immutable base: an edit can land while it is read, and git's status
-/// settings can hide untracked source from estate's dirty probe). A graph that cannot be opened is
+/// provenance over partial rows; codex r1 on wicked-core#1230), and for checkout re-indexes unless
+/// the checkout is proved clean at the same HEAD before and after indexing (wicked-core#1681:
+/// the run-base checkpoint may trust estate's provenance then). A graph that cannot be opened is
 /// left as it is (warned): the next index rewrites it.
 fn mark_not_a_base(db: &Path, why: &str) {
     use wicked_apps_core::GraphWrite;
@@ -1367,6 +1380,7 @@ pub enum CheckoutIndex {
     /// The repo was never indexed: onboarding builds the first graph, a re-index does not.
     NoGraph,
     /// The registered checkout, as it is on disk now, is indexed into the repo's graph.
+    /// wicked-core#1681: estate's base provenance stands only with a clean, unchanged HEAD proof.
     Indexed,
     /// Nothing written: these runs on the repo hold the graph at their base: planning, distributing
     /// or executing (scoring, the floor's affected set), or a domain mapping not ended (its pages).
@@ -1378,10 +1392,10 @@ pub enum CheckoutIndex {
 /// Re-index a registered repo's CHECKOUT (what is on disk now, uncommitted edits included) into its
 /// existing code graph: the onboarding index step's command, `wicked-estate index <repo> --db <db>`,
 /// taken under [`BASE_INDEX_LOCK`] so it is never a second writer beside a launch's D8 (crew's repo
-/// watcher, wicked-core#1230). The graph it leaves is marked not-a-base ([`mark_not_a_base`]), so a
-/// run's later checks ([`crate::review_scale::graph_age`]) fail closed until a launch's D8 indexes
-/// its base again. A repo with no graph yet is left to onboarding (`NoGraph`); linked graph paths
-/// return an error.
+/// watcher, wicked-core#1230). wicked-core#1681: a checkout proved clean at the same HEAD before and
+/// after a successful index keeps estate's provenance for the run-base checkpoint; otherwise the
+/// graph is marked not-a-base ([`mark_not_a_base`]) so later checks fail closed. A repo with no graph
+/// yet is left to onboarding (`NoGraph`); linked graph paths return an error.
 pub fn index_checkout(
     repo: &Path,
     key: &str,
@@ -1419,9 +1433,55 @@ fn index_checkout_with(
     if !held.is_empty() {
         return Ok(CheckoutIndex::Held(held));
     }
+    let before = clean_head(repo);
     indexing.started = true;
     run_indexer(bin, repo, &db, &budget_for(repo, bound))?;
+    let after = clean_head(repo);
+    indexing.base_proved = before.is_some() && before == after;
     Ok(CheckoutIndex::Indexed)
+}
+
+/// wicked-core#1681: prove a checkout clean without status settings or index flags hiding source edits.
+/// A failed probe leaves the run-base checkpoint closed, just like an unfinished index.
+fn clean_head(repo: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<Vec<u8>> {
+        let out = Command::new("git")
+            .hardened()
+            .arg("-C")
+            .arg(repo)
+            .args(["-c", "core.fsmonitor=false"])
+            .args(args)
+            .env("GIT_OPTIONAL_LOCKS", "0")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        out.status.success().then_some(out.stdout)
+    };
+    if !git(&[
+        "status",
+        "--porcelain=v1",
+        "-z",
+        "--untracked-files=all",
+        "--ignore-submodules=none",
+    ])?
+    .is_empty()
+    {
+        return None;
+    }
+    let files = git(&["ls-files", "-v", "-z"])?;
+    if files
+        .split(|&b| b == 0)
+        .filter(|entry| !entry.is_empty())
+        .any(|entry| !entry.starts_with(b"H "))
+    {
+        return None;
+    }
+    let head = String::from_utf8(git(&["rev-parse", "--verify", "HEAD^{commit}"])?)
+        .ok()?
+        .trim()
+        .to_string();
+    (!head.is_empty()).then_some(head)
 }
 
 /// P1 (operator ruling 2026-11-06): the indexer records the root it read (`indexed_root`), which for
@@ -1671,6 +1731,151 @@ mod tests {
     fn age(db: &Path, base: &str) -> crate::review_scale::GraphAge {
         let s = wicked_apps_core::open_store_ro(Some(&db.to_string_lossy())).unwrap();
         crate::review_scale::graph_age(&s, base)
+    }
+
+    #[cfg(unix)]
+    fn checkout_git(repo: &Path, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .hardened()
+            .arg("-C")
+            .arg(repo)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "core.fsmonitor=false",
+            ])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    #[cfg(unix)]
+    fn committed_checkout(repo: &Path) -> String {
+        std::fs::create_dir_all(repo).unwrap();
+        checkout_git(repo, &["init", "--quiet"]);
+        checkout_git(repo, &["config", "user.name", "Checkout test"]);
+        checkout_git(repo, &["config", "user.email", "checkout@example.invalid"]);
+        std::fs::write(repo.join("tracked.rs"), "fn original() {}\n").unwrap();
+        checkout_git(repo, &["add", "tracked.rs"]);
+        checkout_git(repo, &["commit", "--quiet", "-m", "initial"]);
+        checkout_git(repo, &["rev-parse", "HEAD"])
+    }
+
+    #[cfg(unix)]
+    fn checkout_reindex_ages(
+        tag: &str,
+        before: impl FnOnce(&Path),
+        during: &str,
+    ) -> (
+        String,
+        String,
+        crate::review_scale::GraphAge,
+        crate::review_scale::GraphAge,
+    ) {
+        let dir = scratch(tag);
+        let repo = dir.join("repo");
+        let head = committed_checkout(&repo);
+        before(&repo);
+        let root = dir.join("graphs");
+        let key = mint_repo_graph_key(tag);
+        let db = repo_graph_db_at(&root, &key);
+        graph_at(&db, "old-commit");
+        let fresh = dir.join("fresh.db");
+        graph_at(&fresh, &head);
+        let bin = dir.join("indexer");
+        crate::test_env::install_stub(
+            &bin,
+            &format!(
+                "#!/bin/sh\nset -e\n{during}\ncp '{}' \"$4\"\n",
+                fresh.display()
+            ),
+        );
+        assert_eq!(
+            index_checkout_with(
+                &bin.to_string_lossy(),
+                &repo,
+                &key,
+                Some(&root),
+                Some(crate::test_env::PATIENT),
+                || Ok(vec![]),
+            ),
+            Ok(CheckoutIndex::Indexed)
+        );
+        assert!(!checkout_index_in_flight(&db));
+        let after = checkout_git(&repo, &["rev-parse", "HEAD"]);
+        let ages = (age(&db, &head), age(&db, &after));
+        let _ = std::fs::remove_dir_all(dir);
+        (head, after, ages.0, ages.1)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_clean_checkout_reindex_preserves_the_run_base() {
+        let (head, after, at_head, _) = checkout_reindex_ages("checkout-clean", |_| {}, "");
+        assert_eq!(head, after);
+        assert_eq!(at_head, crate::review_scale::GraphAge::Current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_reindex_sees_untracked_files_hidden_by_status_config() {
+        let (_, _, at_head, _) = checkout_reindex_ages(
+            "checkout-hidden-untracked",
+            |repo| {
+                checkout_git(repo, &["config", "status.showUntrackedFiles", "no"]);
+                std::fs::write(repo.join("untracked.rs"), "fn untracked() {}\n").unwrap();
+                assert!(checkout_git(repo, &["status", "--porcelain"]).is_empty());
+            },
+            "",
+        );
+        assert!(matches!(
+            at_head,
+            crate::review_scale::GraphAge::Dirty { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_reindex_with_a_moving_head_is_not_a_run_base() {
+        let (head, after, at_head, at_after) = checkout_reindex_ages(
+            "checkout-moving-head",
+            |_| {},
+            "echo 'fn added() {}' > \"$2/added.rs\"\ngit -C \"$2\" add added.rs\ngit -C \"$2\" -c commit.gpgsign=false -c core.hooksPath=/dev/null commit --quiet -m moved",
+        );
+        assert_ne!(head, after, "the indexer must actually move HEAD");
+        assert!(matches!(
+            at_head,
+            crate::review_scale::GraphAge::Dirty { .. }
+        ));
+        // A different commit is Stale even when the graph's dirty bit is set.
+        assert!(matches!(
+            at_after,
+            crate::review_scale::GraphAge::Stale { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_reindex_rejects_assume_unchanged_files() {
+        let (_, _, at_head, _) = checkout_reindex_ages(
+            "checkout-assume-unchanged",
+            |repo| {
+                checkout_git(repo, &["update-index", "--assume-unchanged", "tracked.rs"]);
+                std::fs::write(repo.join("tracked.rs"), "fn edited() {}\n").unwrap();
+                assert!(checkout_git(repo, &["status", "--porcelain"]).is_empty());
+            },
+            "",
+        );
+        assert!(matches!(
+            at_head,
+            crate::review_scale::GraphAge::Dirty { .. }
+        ));
     }
 
     #[cfg(unix)]
@@ -2111,8 +2316,8 @@ mod tests {
 
     /// wicked-core#1230 (crew's repo watcher): the CHECKOUT is re-indexed into the repo's existing
     /// graph by the onboarding command, never while a launch's D8 is writing it (both writers hold
-    /// the lock for the WHOLE index), and the graph it leaves is no run's base. A never-onboarded
-    /// repo is left alone; a failing indexer is an `Err`.
+    /// the lock for the WHOLE index). This non-git checkout has no clean-HEAD proof, so its graph
+    /// is no run's base. A never-onboarded repo is left alone; a failing indexer is an `Err`.
     #[cfg(unix)]
     #[test]
     fn a_checkout_reindex_runs_the_onboarding_command_under_the_launch_lock() {
@@ -2197,7 +2402,7 @@ mod tests {
                 format!("checkout index {} --db {}", repo.display(), db.display())
             ]
         );
-        // The checkout's graph is recorded at the base commit, and is still no run's base.
+        // The non-git checkout cannot prove a base, even with a graph recording that commit.
         assert!(matches!(
             age(&db, BASE),
             crate::review_scale::GraphAge::Dirty { .. }

@@ -3488,8 +3488,9 @@ impl WrappedCliStepRunner {
         // (wicked-core#881) The QE unit (deliverable-roots for its interpreters) KEEPS its seat's
         // read-only argv lever — codex's scratch sandbox with the QE root added, pi's tool
         // denylist — so the tree stays protected by the seat itself (codex r1 on #889).
-        let takes_lever = write_posture == crate::write_posture::WritePosture::ReadOnly
-            || crate::qe_acceptance::carries_ledger_root(&input.unit);
+        let takes_lever = write_posture != crate::write_posture::WritePosture::ToolLess
+            && (write_posture == crate::write_posture::WritePosture::ReadOnly
+                || crate::qe_acceptance::carries_ledger_root(&input.unit));
         let sandbox_cannot_run_checks = !is_claude
             && takes_lever
             && matches!(
@@ -3513,7 +3514,14 @@ impl WrappedCliStepRunner {
         } else {
             None
         };
-        let task = if guard_only {
+        let tool_less = write_posture == crate::write_posture::WritePosture::ToolLess;
+        let task = if tool_less {
+            format!(
+                "{}\n\n{}",
+                unit_prompt(input, form, handed),
+                crate::gate_hook::TOOL_LESS_REASON
+            )
+        } else if guard_only {
             format!(
                 "{}\n\n{}",
                 unit_prompt(input, form, handed),
@@ -3567,7 +3575,8 @@ impl WrappedCliStepRunner {
         let seat_cli = wicked_apps_core::spawn::SeatCli::from_binary(&binary);
         let container = crate::container_floor::container_mode();
         // Ungoverned workers do not need ask discovery or configuration before spawning.
-        let otherwise_eligible = input.governance.is_some()
+        let otherwise_eligible = !tool_less
+            && input.governance.is_some()
             && ask_seat_enabled(
                 true,
                 container,
@@ -3638,6 +3647,11 @@ impl WrappedCliStepRunner {
         }
 
         if is_claude {
+            if tool_less {
+                if let Err(why) = apply_tool_less_posture(&mut argv, Vec::new(), is_claude, false) {
+                    return posture_refusal(input, &why);
+                }
+            }
             inject_claude_stream_flags(&mut argv);
             // Before governance arms: isolation applies to EVERY claude unit, governed or not. An
             // ungoverned unit reading the operator's config is the same defect as a governed one
@@ -3700,7 +3714,16 @@ impl WrappedCliStepRunner {
             // no code (`DeliverableRoots`) must still write its deliverable into the run's
             // declared roots, which a seat-wide read-only sandbox would refuse — it runs under the
             // seat's ordinary posture, guard-only, and the record says so below.
-            if takes_lever {
+            if tool_less {
+                if let Err(why) = apply_tool_less_posture(
+                    &mut argv,
+                    posture,
+                    is_claude,
+                    uses_container_seat(runs_in_seat(input), container),
+                ) {
+                    return posture_refusal(input, &why);
+                }
+            } else if takes_lever {
                 match apply_no_code_posture(&mut argv, posture, codex_checks.as_ref()) {
                     Ok(ReadOnlyLever::None) => {
                         let note = format!(
@@ -4937,6 +4960,12 @@ impl WrappedCliStepRunner {
                         None => cmd.env_remove(key),
                     };
                 }
+            }
+            // core#1257 protects host seats from inherited daemon secrets. On the container
+            // floor this command is the runtime client, which needs DOCKER_HOST, KUBECONFIG
+            // and XDG_RUNTIME_DIR; the seat itself receives only named variables.
+            if tool_less && !uses_container_seat(runs_in_seat(input), container) {
+                scrub_tool_less_env(&mut cmd, std::env::vars_os());
             }
             let cancel_token = self.register_token(input);
             // (ASK-K1b) The ceiling, lowered to the unit's own budget when its phase set one.
@@ -6653,7 +6682,10 @@ fn inject_codex_write_roots(
     extra_write_roots: &[String],
 ) {
     use crate::write_posture::{deliverable_roots_from, unit_admitted_roots, WritePosture};
-    if write_posture == WritePosture::ReadOnly {
+    if matches!(
+        write_posture,
+        WritePosture::ReadOnly | WritePosture::ToolLess
+    ) {
         return;
     }
     let sandbox = posture
@@ -7067,6 +7099,165 @@ pub(crate) fn no_code_posture(binary: &str, flags: Vec<String>) -> Result<NoCode
                 lever: ReadOnlyLever::None,
                 satisfied: true,
             })
+        }
+    }
+}
+
+/// Apply the verified tool-disabling levers. Other seats need the container floor, where
+/// their existing read-only lever and the prompt carry the rule without host secrets (core#1257).
+pub(crate) fn apply_tool_less_posture(
+    argv: &mut Vec<String>,
+    posture: Vec<String>,
+    is_claude: bool,
+    in_container: bool,
+) -> Result<(), String> {
+    let binary = argv.first().cloned().unwrap_or_default();
+    // The caller already identifies claude from its invocation. A container's bare `claude`
+    // need not exist on the daemon host's PATH, where known_seat resolves other seat names.
+    let seat = if is_claude {
+        Some("claude")
+    } else {
+        known_seat(&binary)
+    };
+    if !matches!(seat, Some("claude" | "pi")) {
+        if !in_container {
+            return Err(format!(
+                "tool-less seat `{binary}` has no verified tool-disabling lever on the host floor; \
+                 route the turn to claude or pi, or run it on the container floor (core#1257)"
+            ));
+        }
+        apply_no_code_posture(argv, posture, None)?;
+        return Ok(());
+    }
+    // Remove allowlists before appending the deny-all lever, in both the invocation and the
+    // resolved posture. Preserve every positional prompt token after the option guard.
+    let mut flags = Vec::new();
+    let guard = argv.iter().position(|a| a == "--").unwrap_or(argv.len());
+    let positional = argv.split_off(guard);
+    let tail = if argv.is_empty() {
+        Vec::new()
+    } else {
+        argv.split_off(1)
+    };
+    for source in [tail, posture] {
+        let mut tokens = source.into_iter();
+        while let Some(token) = tokens.next() {
+            if token == "--tools" || (seat == Some("pi") && token == "-t") {
+                tokens.next();
+            } else if token.starts_with("--tools=")
+                || (seat == Some("pi") && token.starts_with("-t="))
+            {
+                continue;
+            } else {
+                flags.push(token);
+            }
+        }
+    }
+    match seat {
+        Some("claude") => flags.extend(["--tools".to_string(), String::new()]),
+        Some("pi") => flags.extend(["--no-tools".to_string(), "--no-mcp".to_string()]),
+        _ => unreachable!("only verified seats reach the tool-disabling flags"),
+    }
+    argv.extend(flags);
+    argv.extend(positional);
+    Ok(())
+}
+
+/// Provider and sign-in variables a host claude or pi seat reads to reach its model: API keys,
+/// base URLs, custom headers, the claude config dir and `CLAUDE_CODE_*` switches, Bedrock (AWS)
+/// and Vertex (Google) routing, and pi's own settings. A tooled turn inherits them from the
+/// daemon, so a tool-less turn keeps them too: it must reach the same model the same way
+/// (core#1257, coord review r1). Only claude and pi run tool-less on the host floor.
+/// `GH_TOKEN`/`GITHUB_TOKEN` are not here: they are the daemon's repository credential, and pi's
+/// Copilot route reads `COPILOT_GITHUB_TOKEN` or its own login file.
+const TOOL_LESS_PROVIDER_PREFIXES: &[&str] = &[
+    "ANTHROPIC_",
+    "CLAUDE_",
+    "AWS_",
+    "CLOUD_ML_",
+    "VERTEX_REGION_",
+    "GOOGLE_",
+    "GCLOUD_",
+    "GEMINI_",
+    "OPENAI_",
+    "AZURE_OPENAI_",
+    "OPENROUTER_",
+    "GROQ_",
+    "XAI_",
+    "MISTRAL_",
+    "CEREBRAS_",
+    "DEEPSEEK_",
+    "ZAI_",
+    "MINIMAX_",
+    "AI_GATEWAY_",
+    "COPILOT_",
+    "PI_",
+];
+
+/// Remove inherited daemon variables except the fixed process/network base and the provider
+/// variables ([`TOOL_LESS_PROVIDER_PREFIXES`]). Explicit launch settings survive, including
+/// config homes, gate variables, MCP and the gateway (core#1257).
+fn scrub_tool_less_env(
+    cmd: &mut Command,
+    inherited: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) {
+    let env_key = |key: &std::ffi::OsStr| {
+        if cfg!(windows) {
+            key.to_ascii_uppercase()
+        } else {
+            key.to_os_string()
+        }
+    };
+    let explicit: std::collections::HashSet<_> =
+        cmd.get_envs().map(|(key, _)| env_key(key)).collect();
+    for (key, _) in inherited {
+        let normalized = env_key(&key);
+        let base = normalized.to_str().is_some_and(|name| {
+            name.starts_with("LC_")
+                || TOOL_LESS_PROVIDER_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                || matches!(
+                    name,
+                    "PATH"
+                        | "HOME"
+                        | "USER"
+                        | "LOGNAME"
+                        | "SHELL"
+                        | "TMPDIR"
+                        | "TMP"
+                        | "TEMP"
+                        | "LANG"
+                        | "TERM"
+                        | "TZ"
+                        | "HTTP_PROXY"
+                        | "HTTPS_PROXY"
+                        | "NO_PROXY"
+                        | "ALL_PROXY"
+                        | "http_proxy"
+                        | "https_proxy"
+                        | "no_proxy"
+                        | "all_proxy"
+                        | "SSL_CERT_FILE"
+                        | "SSL_CERT_DIR"
+                        | "NODE_EXTRA_CA_CERTS"
+                        | "REQUESTS_CA_BUNDLE"
+                )
+                || (cfg!(windows)
+                    && matches!(
+                        name,
+                        "SYSTEMROOT"
+                            | "WINDIR"
+                            | "COMSPEC"
+                            | "PATHEXT"
+                            | "USERPROFILE"
+                            | "APPDATA"
+                            | "LOCALAPPDATA"
+                            | "PROGRAMDATA"
+                    ))
+        });
+        if !base && !explicit.contains(&normalized) {
+            cmd.env_remove(key);
         }
     }
 }
@@ -9723,6 +9914,7 @@ mod tests {
         unit.assigned_cli = Some("sh".to_string());
         unit.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "reassign-wrapped".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9777,6 +9969,7 @@ mod tests {
     fn reassign_cancellation_is_epoch_and_launch_sequence_scoped() {
         let runner = WrappedCliStepRunner::default();
         let make_input = |epoch, launch_seq| StepInput {
+            base_commit: None,
             run_id: "same-run".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9822,6 +10015,7 @@ mod tests {
     fn a_launch_registering_after_its_run_ended_is_born_cancelled_until_a_resume() {
         let runner = WrappedCliStepRunner::default();
         let make = |launch_seq| StepInput {
+            base_commit: None,
             run_id: "ended-run".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9872,6 +10066,7 @@ mod tests {
     fn shutdown_cancels_every_wrapped_worker_and_later_registrations() {
         let runner = WrappedCliStepRunner::default();
         let judge = StepInput {
+            base_commit: None,
             run_id: "validator-abc".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -9899,6 +10094,7 @@ mod tests {
         let mut unit = WorkUnit::pending("validator-agent", "validator", 1, "judge");
         unit.parent_run_id = Some("parent-run".to_string());
         StepInput {
+            base_commit: None,
             run_id: "validator-child".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -10159,6 +10355,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: "run-unenf".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -10338,6 +10535,7 @@ mod tests {
         u.assigned_cli = Some("pi".to_string());
         u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cf-noruntime".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -10441,6 +10639,7 @@ mod tests {
             u.assigned_cli = Some("pi".to_string());
             u.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
             StepInput {
+                base_commit: None,
                 run_id: run_id.to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -10671,6 +10870,7 @@ mod tests {
         unit.assigned_cli = Some("ballot-seat".to_string());
         unit.assigned_invocation = Some(format!("{} {{PROMPT}}", stub.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: format!("council-streams-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -10779,6 +10979,7 @@ mod tests {
         let run_id = format!("run-ig1c2-{}", std::process::id());
         let _ = std::fs::remove_dir_all(crate::gate_hook::gov_run_dir(&run_id));
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -10974,6 +11175,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("wicked-ig1c2-cdx-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -11034,6 +11236,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let input = StepInput {
+            base_commit: None,
             run_id: "run-nogov".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11112,6 +11315,15 @@ mod tests {
         let exe = fixture_exe("protocol-1");
         seed_probe_for_test(&exe, Ok((1, Some(env!("CARGO_PKG_VERSION").to_string()))));
         let err = check_gate_protocol(&exe).expect_err("a protocol-1 hook must refuse to arm");
+        assert!(err.contains("gate protocol mismatch"), "{err}");
+    }
+
+    /// A protocol-3 binary parses tool-less as no fence and must not arm (core#1257).
+    #[test]
+    fn a_protocol_3_hook_refuses_to_arm_tool_less_turns() {
+        let exe = fixture_exe("protocol-3");
+        seed_probe_for_test(&exe, Ok((3, Some(env!("CARGO_PKG_VERSION").to_string()))));
+        let err = check_gate_protocol(&exe).expect_err("protocol 3 cannot enforce tool-less");
         assert!(err.contains("gate protocol mismatch"), "{err}");
     }
 
@@ -11358,6 +11570,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("armtest-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -11607,6 +11820,7 @@ mod tests {
             let mut u = WorkUnit::pending("s:u1", "s", 2, "do it");
             u.assigned_cli = Some("claude".to_string());
             StepInput {
+                base_commit: None,
                 run_id: "run-bc79".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -11735,6 +11949,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-envstrip".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11781,6 +11996,7 @@ mod tests {
             u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
             u.qe_ledger_root = qe_root.map(|p| p.to_string_lossy().into_owned());
             let input = StepInput {
+                base_commit: None,
                 run_id: "run-qe-ledger".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -11840,6 +12056,7 @@ mod tests {
         );
         u.notes_root = Some(dir.join("notes").to_string_lossy().into_owned());
         let input = StepInput {
+            base_commit: None,
             run_id: "run-928".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -11931,6 +12148,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cfg-strip".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12000,6 +12218,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-claude-md-wrapped".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12090,6 +12309,7 @@ mod tests {
         u.assigned_cli = Some("claude".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cfg-worker-home".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12206,6 +12426,7 @@ mod tests {
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let run_id = format!("run-653-wrapped-{}", std::process::id());
         let input = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -12286,6 +12507,7 @@ mod tests {
         u.assigned_cli = Some("probe".to_string());
         u.assigned_invocation = Some(format!("{} {{PROMPT}}", codex.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-codex-seat-root".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12359,6 +12581,7 @@ mod tests {
         u.assigned_cli = Some("claude#2".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-claude2-cfg-home".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -12962,6 +13185,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-posture".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13041,6 +13265,165 @@ mod tests {
                 "features.hooks=false"
             ])
         );
+    }
+
+    /// Only verified tool-disabling levers may answer on the host floor (core#1257).
+    #[test]
+    fn tool_less_argv_disables_claude_and_pi_tools_and_refuses_other_host_seats() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let mut claude = s(&["/opt/bin/claude", "-p", "--", "answer"]);
+        apply_tool_less_posture(&mut claude, vec![], true, false).unwrap();
+        assert!(claude
+            .windows(2)
+            .any(|w| w[0] == "--tools" && w[1].is_empty()));
+        assert_eq!(claude.last().map(String::as_str), Some("answer"));
+        let mut pi = s(&["/opt/bin/pi", "--tools", "read,bash", "--", "answer"]);
+        apply_tool_less_posture(&mut pi, s(&["-t", "write", "--tools=bash"]), false, false)
+            .unwrap();
+        assert!(pi.iter().any(|a| a == "--no-tools"));
+        assert!(pi.iter().any(|a| a == "--no-mcp"));
+        assert!(!pi
+            .iter()
+            .any(|a| a == "--tools" || a == "-t" || a == "--tools=bash"));
+        for seat in ["codex", "copilot", "agy", "opencode", "unknown"] {
+            let mut argv = vec![format!("/opt/bin/{seat}")];
+            let why = apply_tool_less_posture(&mut argv, vec![], false, false).unwrap_err();
+            assert!(why.contains(seat) && why.contains("claude or pi"));
+            assert!(why.contains("container floor"));
+            let mut argv = vec![format!("/opt/bin/{seat}")];
+            apply_tool_less_posture(&mut argv, vec![], false, true).unwrap();
+            if seat == "codex" {
+                assert!(argv
+                    .windows(2)
+                    .any(|w| w[0] == "--sandbox" && w[1] == "read-only"));
+            }
+        }
+    }
+
+    /// Claude identity comes from the carrier, independent of the daemon's PATH (core#1257).
+    #[test]
+    fn tool_less_bare_claude_disables_tools_on_both_floors() {
+        for in_container in [false, true] {
+            let mut argv = vec!["claude".to_string()];
+            apply_tool_less_posture(&mut argv, vec![], true, in_container)
+                .expect("a claude answer-only turn must not be refused");
+            assert_eq!(argv, ["claude", "--tools", ""]);
+        }
+    }
+
+    /// Inherited daemon secrets disappear on the host floor, while explicit channels survive
+    /// (core#1257). Supply the inherited snapshot without mutating the test process environment.
+    #[test]
+    fn tool_less_env_keeps_only_the_base_and_explicit_sets() {
+        use std::ffi::OsString;
+        // spawn-audit: test-only — never spawned; the scrub is judged on its `get_envs` alone.
+        let mut cmd = Command::new("unused");
+        cmd.env("WICKED_MCP_TOKEN", "unit-token");
+        cmd.env("SEAT_CONFIG_HOME", "/seat");
+        cmd.env("EXPLICIT_SECRET", "intentional");
+        let inherited = [
+            "PGPASSWORD",
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "SSL_CERT_FILE",
+            "WICKED_MCP_TOKEN",
+            "SEAT_CONFIG_HOME",
+            "EXPLICIT_SECRET",
+        ]
+        .into_iter()
+        .map(|k| (OsString::from(k), OsString::from("inherited")));
+        scrub_tool_less_env(&mut cmd, inherited);
+        let env: std::collections::HashMap<_, _> = cmd.get_envs().collect();
+        assert_eq!(env.get(std::ffi::OsStr::new("PGPASSWORD")), Some(&None));
+        for key in [
+            "PATH",
+            "HOME",
+            "LC_ALL",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "SSL_CERT_FILE",
+        ] {
+            assert!(
+                !env.contains_key(std::ffi::OsStr::new(key)),
+                "{key} remains inherited"
+            );
+        }
+        for (key, value) in [
+            ("WICKED_MCP_TOKEN", "unit-token"),
+            ("SEAT_CONFIG_HOME", "/seat"),
+            ("EXPLICIT_SECRET", "intentional"),
+        ] {
+            assert_eq!(
+                env.get(std::ffi::OsStr::new(key)),
+                Some(&Some(std::ffi::OsStr::new(value)))
+            );
+        }
+    }
+
+    /// A tool-less turn reaches its model exactly as a tooled one does (core#1257, coord review
+    /// r1): a tooled host turn inherits the daemon env untouched, so every provider and sign-in
+    /// variable it would see stays inherited here. Daemon secrets that are not a provider route
+    /// still go.
+    #[test]
+    fn tool_less_env_keeps_the_provider_env_a_tooled_turn_sees() {
+        use std::ffi::OsString;
+        let provider = [
+            "ANTHROPIC_BASE_URL",
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "ANTHROPIC_CUSTOM_HEADERS",
+            "ANTHROPIC_MODEL",
+            "CLAUDE_CONFIG_DIR",
+            "CLAUDE_CODE_USE_BEDROCK",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "AWS_REGION",
+            "AWS_PROFILE",
+            "CLOUD_ML_REGION",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "GEMINI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "PI_CODING_AGENT_DIR",
+        ];
+        let daemon_secrets = ["PGPASSWORD", "DATABASE_URL", "GH_TOKEN", "GITHUB_TOKEN"];
+        let inherited = provider
+            .into_iter()
+            .chain(daemon_secrets)
+            .map(|k| (OsString::from(k), OsString::from("inherited")));
+        // spawn-audit: test-only — never spawned; the tooled command is the comparison baseline.
+        let tooled = Command::new("unused");
+        // spawn-audit: test-only — never spawned; the scrub is judged on its `get_envs` alone.
+        let mut tool_less = Command::new("unused");
+        scrub_tool_less_env(&mut tool_less, inherited);
+        let removed = |cmd: &Command| {
+            cmd.get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(key, _)| key.to_os_string())
+                .collect::<std::collections::HashSet<_>>()
+        };
+        let tooled_removed = removed(&tooled);
+        let tool_less_removed = removed(&tool_less);
+        for key in provider {
+            assert_eq!(
+                tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                tooled_removed.contains(std::ffi::OsStr::new(key)),
+                "{key}: a tool-less turn must see the provider env a tooled turn sees"
+            );
+            assert!(
+                !tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                "{key} was scrubbed"
+            );
+        }
+        for key in daemon_secrets {
+            assert!(
+                tool_less_removed.contains(std::ffi::OsStr::new(key)),
+                "{key} is a daemon secret and must not reach a tool-less seat"
+            );
+        }
     }
 
     /// F-036, the posture half: a NO-CODE phase (`executes_code: false`) on a codex binary runs
@@ -13373,6 +13756,7 @@ mod tests {
         u.assigned_cli = Some("sh".to_string());
         u.assigned_invocation = Some(format!("sh {} {{PROMPT}}", script.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-quiesce".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13467,6 +13851,7 @@ mod tests {
         u.assigned_cli = Some("copilot".to_string());
         u.assigned_invocation = Some(format!("{copilot} -p {{PROMPT}}"));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-660-copilot".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13559,6 +13944,7 @@ mod tests {
                 stamp(&mut u, &run, 2);
             }
             let input = StepInput {
+                base_commit: None,
                 run_id: run.clone(),
                 unit_ix: 1,
                 attempt: 0,
@@ -13643,6 +14029,7 @@ mod tests {
         u.assigned_invocation = Some(format!("{codex} exec {{PROMPT}}"));
         u.worktree_guarded = true; // the def said `executes_code: false`
         let input = StepInput {
+            base_commit: None,
             run_id: "run-ro-posture".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13741,6 +14128,7 @@ mod tests {
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         u.worktree_guarded = true;
         let input = StepInput {
+            base_commit: None,
             run_id: "run-ro-refuse".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -13814,6 +14202,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-cap".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13876,6 +14265,7 @@ mod tests {
         u.assigned_cli = Some("codex".to_string());
         u.assigned_invocation = Some(format!("/bin/sh {} {{PROMPT}}", probe.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-scratch".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -13970,6 +14360,7 @@ mod tests {
             let mut u = WorkUnit::pending("s:u1", "s", 3, "do it");
             u.assigned_cli = Some("claude".to_string());
             let input = StepInput {
+                base_commit: None,
                 run_id: run_id.to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -14240,6 +14631,7 @@ mod tests {
         let mut creator = WorkUnit::pending("s:build", "s", 1, "add SSO login");
         creator.role = PhaseRole::Creator;
         let input = StepInput {
+            base_commit: None,
             run_id: "s".into(),
             unit_ix: 0,
             attempt: 0,
@@ -14435,6 +14827,7 @@ mod tests {
         u.role = crate::workflow::PhaseRole::Evaluator;
         let author = std::env::temp_dir().join("ev-753").join("author");
         let input = StepInput {
+            base_commit: None,
             run_id: "s".to_string(),
             unit_ix: 3,
             attempt: 0,
@@ -14535,6 +14928,7 @@ mod tests {
                 }
                 evaluators.push(format!("{}/{}", def.id, u.phase_id().unwrap_or("?")));
                 let input = StepInput {
+                    base_commit: None,
                     run_id: "s".into(),
                     unit_ix: ix,
                     attempt: 0,
@@ -14645,6 +15039,7 @@ mod tests {
             .find(|u| u.role == PhaseRole::Creator)
             .expect("bug.fix is the def's creator");
         let input = |unit: WorkUnit| StepInput {
+            base_commit: None,
             run_id: "s".into(),
             unit_ix: 2,
             attempt: 0,
@@ -14870,6 +15265,7 @@ mod tests {
         let mut unit = WorkUnit::pending("s:fix", "s", 3, "fix the API");
         unit.role = crate::workflow::PhaseRole::Creator;
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-base".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -14956,6 +15352,7 @@ mod tests {
 
         let unit = WorkUnit::pending("s:build", "s", 1, "fix the API");
         let mut input = StepInput {
+            base_commit: None,
             run_id: "layout-seam".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15341,6 +15738,7 @@ mod tests {
         }
 
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-line".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15413,6 +15811,7 @@ mod tests {
     #[test]
     fn pty_unit_prompt_refuses_an_embedded_newline() {
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-newline".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -15468,6 +15867,7 @@ mod tests {
         });
         unit.qe_floor_note = Some(format!("FLOORNOTE {}", "x".repeat(900)));
         let mut input = StepInput {
+            base_commit: None,
             run_id: "pty-qe-note".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -17442,6 +17842,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("skillsroot-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
@@ -17639,6 +18040,7 @@ mod tests {
             apps: None,
         };
         let input = StepInput {
+            base_commit: None,
             run_id: format!("sf1019-{}", uuid::Uuid::new_v4().simple()),
             unit_ix: 0,
             attempt: 0,
@@ -18366,6 +18768,7 @@ mod tests {
             }
             u.assigned_invocation = Some(format!("{} {tail}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-login-{seat}-{}-{read_only}", tail.len()),
                 unit_ix: 0,
                 attempt: 0,
@@ -18550,6 +18953,7 @@ mod tests {
             u.skill_ref = skill.map(str::to_string);
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-levers-{seat}"),
                 unit_ix: 0,
                 attempt: 0,
@@ -18801,6 +19205,7 @@ mod tests {
             u.skill_ref = Some("wicked-garden-domain".to_string());
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             StepInput {
+                base_commit: None,
                 run_id: "run-opencode".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -18884,6 +19289,7 @@ mod tests {
             u.assigned_cli = Some("opencode".to_string());
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             StepInput {
+                base_commit: None,
                 run_id: "run-opencode-mcp".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -19072,6 +19478,7 @@ headless_invocation = "claude --plugin-dir {stale} -p {{PROMPT}}"
             u.skill_ref = Some("wicked-garden-domain".to_string());
             u.assigned_cli = Some("skills-seat".to_string());
             StepInput {
+                base_commit: None,
                 run_id: "run-skills".to_string(),
                 unit_ix: 0,
                 attempt: 0,
@@ -19222,6 +19629,7 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
         u.skill_ref = Some("wicked-garden-domain".to_string());
         u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", claude.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: "run-refuse".to_string(),
             unit_ix: 0,
             attempt: 0,
@@ -19347,6 +19755,7 @@ headless_invocation = "claude --setting-sources user -p {PROMPT}"
             u.skill_ref = skill.map(str::to_string);
             u.assigned_invocation = Some(format!("{} -p {{PROMPT}}", bin.display()));
             let input = StepInput {
+                base_commit: None,
                 run_id: format!("run-hatch-{tag}"),
                 unit_ix: 0,
                 attempt: 0,
@@ -19852,6 +20261,7 @@ mod ask_config_tests {
             apps: None,
         };
         let mut input = StepInput {
+            base_commit: None,
             run_id: format!("ask-settings-{}", uuid::Uuid::new_v4()),
             unit_ix: 0,
             attempt: 0,

@@ -1176,8 +1176,7 @@ pub(crate) fn run(
     }
     // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
     // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
-    // skips it (liveness unknown). The same live set protects governance directories during the
-    // one-time retention sweep below.
+    // skips it (liveness unknown). Governance directories keep the worktree retention set.
     match crate::domain::all_sessions(&store) {
         Ok(sessions) => {
             let (live, _) = partition_sessions_for_reap(&sessions);
@@ -1191,7 +1190,13 @@ pub(crate) fn run(
                 crate::gate_hook::GOV_DIR_RETENTION,
                 std::time::SystemTime::now(),
             );
-            crate::k8s::boot_sweep(live);
+            crate::k8s::boot_sweep(
+                sessions
+                    .iter()
+                    .filter(|s| crate::k8s::cluster_status_live(s.status))
+                    .map(|s| s.id.clone())
+                    .collect(),
+            );
         }
         Err(e) => {
             eprintln!("wicked-core: skipping the cluster and governance boot sweeps: cannot read sessions ({e})")
@@ -2871,6 +2876,9 @@ pub(crate) fn run(
                     );
                 }
                 let _ = reply.send(res);
+            }
+            Command::UnregisterRepo { repo_id, reply } => {
+                let _ = reply.send(unregister_repo(&mut store, &repo_id));
             }
             Command::ListRepos { reply } => {
                 let _ = reply.send(crate::repo::list_repos(&store));
@@ -8663,6 +8671,47 @@ fn apply_step_result(
         }));
     }
 
+    if !unit.write_set.is_empty() {
+        let why = match evidence.write_set.as_ref() {
+            Some(report) => report.denial_reason(),
+            None => Some("write-set check could not run: no write-set evidence".to_string()),
+        };
+        if let Some(why) = why {
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new("write_set", why.clone()));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -8701,6 +8750,15 @@ fn apply_step_result(
                 Some(ms) => crate::path_policy::LaunchClock::At(ms),
                 None => crate::path_policy::LaunchClock::Undatable,
             },
+        };
+        let launch = match (launch, unit.pass_started_ms) {
+            (crate::path_policy::LaunchClock::At(run), Some(pass)) => {
+                crate::path_policy::LaunchClock::At(run.max(pass))
+            }
+            (crate::path_policy::LaunchClock::Unrecorded, Some(pass)) => {
+                crate::path_policy::LaunchClock::At(pass)
+            }
+            (clock, _) => clock,
         };
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
@@ -13592,6 +13650,7 @@ fn dispatch_unit_with(
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
+        base_commit: session.base_commit.clone(),
         // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
         // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
         // The repo-local graph is resolved HERE (the actor thread holds the store; the worker does not)
@@ -13831,6 +13890,7 @@ fn dispatch_unit_with(
                         )
                     }),
                     evidence_root: session.evidence_root.clone(),
+                    upstream_agents: upstream_agents(unit, &units),
                     base_commit: session.base_commit.clone(),
                     tree_from: session.workdir.clone().zip(
                         session
@@ -14254,6 +14314,7 @@ fn dispatch_unit_with(
                 // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
                 // here so the fold persists it on the unit and names the floor on the gate.
                 evidence: Box::new(crate::workflow::UnitEvidence {
+                    write_set: None,
                     // A Tool unit launches no seat: nothing to observe.
                     observed_providers: None,
                     worktree_guard: None,
@@ -15246,7 +15307,7 @@ fn run_conformance_tool(
             );
         }
     }
-    let (python, dist) = match ec::host_inputs() {
+    let inputs = match ec::host_inputs() {
         Ok(x) => x,
         Err((cause, why)) => return refused(&cause, why),
     };
@@ -15267,15 +15328,6 @@ fn run_conformance_tool(
             "engine_refused",
             "the worktree snapshot names no git directory to export its tree from".into(),
         );
-    };
-    let tmp = match crate::repo_checks::PrivateTmp::create() {
-        Ok(t) => t,
-        Err(e) => {
-            return refused(
-                "engine_refused",
-                format!("the harness's private temp dir: {e}"),
-            )
-        }
     };
     // The verify floor's own guarded checkout of exactly that tree (hooks off, no filter driver, blobs
     // written by the engine through a held directory, outside the seat's write boundary): the same
@@ -15315,7 +15367,74 @@ fn run_conformance_tool(
             )
         }
     };
-    let pack_tree = checkout.dir.clone();
+    let (out, status, killed, mut rec, _) = run_conformance_harness(
+        cmd,
+        &checkout.dir,
+        garden_root,
+        inputs,
+        attempt,
+        &d.run_id,
+        d.ord,
+        ec::DEADLINE,
+        jail,
+        stop,
+        on_spawn,
+        on_done,
+    );
+    // As before, the cases' report is bound to the exported tree; a refusal before the run or at
+    // the deadline (no `jail`) carries no tree because the cases did not finish on it.
+    if rec.jail.is_some() {
+        rec.tree = Some(snap.tree);
+    }
+    (out, status, killed, rec)
+}
+
+/// The shared review/install harness: the pack is readable, but only a fresh private temp
+/// directory is writable. Both callers use the same jail, environment and report judgment.
+#[allow(clippy::too_many_arguments)]
+fn run_conformance_harness(
+    cmd: &[String],
+    pack_dir: &std::path::Path,
+    garden_root: Option<&std::path::Path>,
+    (python, dist): (std::path::PathBuf, std::path::PathBuf),
+    attempt: u32,
+    run_id: &str,
+    ord: u32,
+    deadline: std::time::Duration,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::editor_conformance::ConformanceRecord,
+    Option<String>,
+) {
+    use crate::editor_conformance as ec;
+    use crate::workflow::StepStatus;
+    let refused = |cause: &str, why: String| {
+        (
+            format!("{}: ran nothing: {cause}: {why}", ec::CATALOG),
+            StepStatus::Ok,
+            None,
+            ec::ConformanceRecord::refused(attempt, cause, why),
+            None,
+        )
+    };
+    if let Some(r) = stop() {
+        return refused("engine_refused", format!("stopped before it began ({r})"));
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the harness's private temp dir: {e}"),
+            )
+        }
+    };
     let port = match ec::free_port() {
         Ok(p) => p,
         Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
@@ -15347,7 +15466,7 @@ fn run_conformance_tool(
         .collect();
     env.extend(ec::host_passthrough_env());
     env.extend(ec::tool_env(
-        &d.run_id, d.ord, &pack_tree, port, &out_file, &python, &dist, &kind,
+        run_id, ord, pack_dir, port, &out_file, &python, &dist, &kind,
     ));
     if let Some(groot) = garden_root {
         env.push((
@@ -15371,7 +15490,7 @@ fn run_conformance_tool(
         if let Some(r) = stop() {
             return Some(r);
         }
-        if started.elapsed() > ec::DEADLINE {
+        if started.elapsed() > deadline {
             over.set(true);
             return Some("deadline_exceeded");
         }
@@ -15386,23 +15505,24 @@ fn run_conformance_tool(
         on_spawn,
         on_done,
     );
+    let report = ec::read_report(&out_file);
     if over.get() {
-        let why = format!(
-            "the conformance run went past {} minutes and was stopped",
-            ec::DEADLINE.as_secs() / 60
-        );
-        return (
-            out,
-            StepStatus::Ok,
-            killed,
-            ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why),
-        );
+        let bound = if deadline == ec::DEADLINE {
+            format!("{} minutes", deadline.as_secs() / 60)
+        } else {
+            format!("{} seconds", deadline.as_secs())
+        };
+        let why = format!("the conformance run went past {bound} and was stopped");
+        let rec = ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why);
+        return (out, StepStatus::Ok, killed, rec, report.ok().flatten());
     }
-    let mut rec = ec::judge_file(&out_file, attempt);
-    drop(tmp);
-    drop(checkout);
-    // The cases ran on the export of exactly this tree.
-    rec.tree = Some(snap.tree);
+    let (mut rec, raw) = match report {
+        Ok(raw) => (ec::judge_report(raw.as_deref(), attempt), raw),
+        Err(why) => (
+            ec::ConformanceRecord::refused(attempt, "bad_report", why),
+            None,
+        ),
+    };
     rec.jail = Some(kind);
     // The verdict is the fold's (from the record); a command that ran to its end is Ok here, so a
     // failing run is never retried by the failure ladder as a broken command.
@@ -15411,7 +15531,254 @@ fn run_conformance_tool(
     } else {
         StepStatus::Ok
     };
-    (out, status, killed, rec)
+    (out, status, killed, rec, raw)
+}
+
+/// Run editor conformance for crew's install gate through the review harness's OS jail.
+/// The request is `{ "packRoot": string, "timeoutS"?: integer }` (no unknown fields):
+/// `packRoot` must name an absolute existing directory, and `timeoutS` must be 1..=900.
+/// Only invalid requests return `Err`. Resolves to JSON `{ "record": ConformanceRecord,
+/// "report": <parsed raw report or null> }`; host failures are refused records, including
+/// `unjailed_host` when no jail is available. The pack is read-only to the harness; only its
+/// private temp directory is writable. Crew's install gate calls this; it never runs the
+/// harness unjailed.
+pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
+    run_editor_conformance_with(request_json, &crate::validator::serve_jail)
+}
+
+fn run_editor_conformance_with(
+    request_json: &str,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+) -> Result<String, String> {
+    use crate::editor_conformance as ec;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Request {
+        pack_root: String,
+        timeout_s: Option<u64>,
+    }
+
+    let request: Request = serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+    let pack_root = std::path::Path::new(&request.pack_root);
+    if !pack_root.is_absolute() {
+        return Err("packRoot must be an absolute path to an existing directory".into());
+    }
+    let pack_root = pack_root
+        .canonicalize()
+        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
+    if !pack_root.is_dir() {
+        return Err("packRoot must be an existing directory".into());
+    }
+    let deadline = match request.timeout_s {
+        Some(s) if !(1..=900).contains(&s) => {
+            return Err("timeoutS must be an integer in 1..=900".into())
+        }
+        Some(s) => std::time::Duration::from_secs(s).min(ec::DEADLINE),
+        None => ec::DEADLINE,
+    };
+    let result = |record: ec::ConformanceRecord, raw: Option<String>| {
+        serde_json::json!({
+            "record": record,
+            "report": raw.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+        })
+        .to_string()
+    };
+    let refused = |why: String| {
+        Ok(result(
+            ec::ConformanceRecord::refused(1, "engine_refused", why),
+            None,
+        ))
+    };
+    // Match the review step's ladder when the run has no admitted skills generation.
+    let garden_root = match crate::skills_snapshot::resolve_ladder() {
+        Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
+        Ok(crate::skills_snapshot::Ladder::Absent) => None,
+        Ok(crate::skills_snapshot::Ladder::Failed(why)) => return refused(why),
+        Err(e) => return refused(e.to_string()),
+    };
+    for (name, root) in std::iter::once(("pack root", pack_root.as_path()))
+        .chain(garden_root.as_deref().map(|g| ("skills generation", g)))
+    {
+        let real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if let Some(mask) = crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+        {
+            return refused(format!(
+                "the {name} lives under {}, which the harness's jail hides",
+                mask.display()
+            ));
+        }
+    }
+    let inputs = match ec::host_inputs() {
+        Ok(x) => x,
+        Err((cause, why)) => {
+            return Ok(result(ec::ConformanceRecord::refused(1, &cause, why), None))
+        }
+    };
+    let cmd: Vec<String> = ec::CONFORMANCE_CMD.iter().map(|a| a.to_string()).collect();
+    let (_, _, _, record, raw) = run_conformance_harness(
+        &cmd,
+        &pack_root,
+        garden_root.as_deref(),
+        inputs,
+        1,
+        "editor-install",
+        0,
+        deadline,
+        jail,
+        &|| None,
+        &|_| {},
+        &|_| {},
+    );
+    Ok(result(record, raw))
+}
+
+#[cfg(test)]
+mod editor_install_conformance_tests {
+    use super::*;
+    use crate::editor_conformance as ec;
+    use std::path::Path;
+
+    #[test]
+    fn invalid_requests_are_errors_before_any_host_work() {
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let requests = [
+            "not JSON".to_string(),
+            "{}".to_string(),
+            serde_json::json!({ "packRoot": "relative/pack" }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path().join("missing") }).to_string(),
+            serde_json::json!({ "packRoot": file }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "unknown": true }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 0 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 901 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": -1 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 1.5 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": "1" }).to_string(),
+        ];
+        for request in requests {
+            assert!(run_editor_conformance(&request).is_err(), "{request}");
+        }
+    }
+
+    // The same interpreter-file + studio-index inputs as tests/editor_conformance.rs, with an
+    // absent garden ladder. Unit tests serialize process-global env mutations with the crate lock.
+    fn with_host_inputs(test: impl FnOnce(&Path)) {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let py = tmp.path().join("venv-python");
+        let dist = tmp.path().join("studio-dist");
+        let config = tmp.path().join("claude-config");
+        let home = tmp.path().join("home");
+        for dir in [&dist, &config, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&py, "fixture interpreter").unwrap();
+        std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                ec::PYTHON_ENV,
+                ec::STUDIO_DIST_ENV,
+                crate::skills_snapshot::SKILLS_SNAPSHOT_ENV,
+                crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
+                "HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(ec::PYTHON_ENV, py);
+        std::env::set_var(ec::STUDIO_DIST_ENV, dist);
+        std::env::remove_var(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        std::env::set_var(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV, config);
+        std::env::set_var("HOME", home);
+        test(tmp.path());
+    }
+
+    #[test]
+    fn an_unjailed_install_is_a_refusal_with_no_report() {
+        with_host_inputs(|root| {
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let real_pack = pack.canonicalize().unwrap();
+            for (level, wrapper) in [
+                (crate::validator::SandboxLevel::BestEffort, vec![]),
+                (
+                    crate::validator::SandboxLevel::NetworkOnly,
+                    vec!["must-not-run".to_string()],
+                ),
+                (crate::validator::SandboxLevel::Sandboxed, vec![]),
+            ] {
+                let called = std::cell::Cell::new(false);
+                let jail = |roots: &[&Path], port: u16| {
+                    called.set(true);
+                    assert_eq!(roots.len(), 1);
+                    assert_ne!(roots[0], real_pack.as_path());
+                    assert!(roots[0].is_dir());
+                    assert_ne!(port, 0);
+                    crate::validator::SandboxLauncher {
+                        wrapper: wrapper.clone(),
+                        level,
+                    }
+                };
+                for timeout in [1, 900] {
+                    let request =
+                        serde_json::json!({ "packRoot": pack, "timeoutS": timeout }).to_string();
+                    let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert!(called.get());
+                    assert_eq!(response["record"]["outcome"], "refused");
+                    assert_eq!(response["record"]["cause"], "unjailed_host");
+                    assert_eq!(response["record"]["attempt"], 1);
+                    assert!(response["report"].is_null());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_pack_hidden_by_the_secret_directory_mask_is_refused_before_the_jail() {
+        with_host_inputs(|root| {
+            let pack = root.join("home/.aws/pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            let jail = |_: &[&Path], _: u16| -> crate::validator::SandboxLauncher {
+                panic!("a hidden pack must not reach the jail")
+            };
+            let check = |path: &Path| {
+                let request = serde_json::json!({ "packRoot": path }).to_string();
+                let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(response["record"]["outcome"], "refused");
+                assert_eq!(response["record"]["cause"], "engine_refused");
+                let why = response["record"]["reason"].as_str().unwrap();
+                assert!(why.contains("pack root") && why.contains(".aws"), "{why}");
+                assert!(why.contains("jail hides"), "{why}");
+                assert!(response["report"].is_null());
+            };
+            check(&pack);
+            #[cfg(unix)]
+            {
+                let alias = root.join("pack-alias");
+                std::os::unix::fs::symlink(&pack, &alias).unwrap();
+                check(&alias);
+            }
+        });
+    }
 }
 
 /// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
@@ -15533,6 +15900,7 @@ mod crew_tool_channel_tests {
 /// (`tree_from` = the worktree and its registered repository root; absent or unsnapshottable ⇒
 /// the variable is not set, never set empty). The walkthrough recorder declares its own set.
 struct ToolRunEnv {
+    upstream_agents: Vec<(String, String)>,
     run_id: String,
     ord: u32,
     /// (core#820) The choice approved at this unit's consent gate, handed on as
@@ -15552,6 +15920,49 @@ struct ToolRunEnv {
 
 /// (e2e F30) The variable a generic Tool unit reads the run's base commit from.
 pub(crate) const RUN_BASE_ENV: &str = "WICKED_RUN_BASE";
+pub(crate) const UPSTREAM_AGENTS_ENV: &str = "WICKED_UPSTREAM_AGENTS";
+
+fn upstream_agents(
+    unit: &crate::domain::WorkUnit,
+    units: &[crate::domain::WorkUnit],
+) -> Vec<(String, String)> {
+    let mut pending = unit.depends_on.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(step) = pending.pop() {
+        if seen.insert(step.clone()) {
+            if let Some(upstream) = units.iter().find(|u| u.phase_id() == Some(step.as_str())) {
+                pending.extend(upstream.depends_on.iter().cloned());
+            }
+        }
+    }
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    let mut ordered: Vec<_> = units
+        .iter()
+        .filter(|u| {
+            u.tool_cmd.is_none()
+                && u.status == crate::domain::UnitStatus::Done
+                && u.phase_id().is_some_and(|s| seen.contains(s))
+        })
+        .collect();
+    ordered.sort_by_key(|u| u.ord);
+    ordered
+        .into_iter()
+        .filter_map(|u| {
+            let step = u.phase_id()?;
+            let agent = u
+                .assigned_cli
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("claude");
+            (valid(step) && valid(agent)).then(|| (step.to_string(), agent.to_string()))
+        })
+        .collect()
+}
 
 impl ToolRunEnv {
     fn vars(&self) -> Vec<(String, String)> {
@@ -15559,6 +15970,16 @@ impl ToolRunEnv {
             ("WICKED_RUN_ID".to_string(), self.run_id.clone()),
             ("WICKED_RUN_UNIT".to_string(), self.ord.to_string()),
         ];
+        if !self.upstream_agents.is_empty() {
+            env.push((
+                UPSTREAM_AGENTS_ENV.to_string(),
+                self.upstream_agents
+                    .iter()
+                    .map(|(step, agent)| format!("{step}={agent}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
         if let Some(choice) = &self.consent_choice {
             env.push((
                 crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
@@ -15878,6 +16299,7 @@ fn run_tool_cmd_jailed(
             p
         }
     };
+    proc.env_remove(UPSTREAM_AGENTS_ENV);
     for (k, v) in extra_env {
         proc.env(k, v);
     }
@@ -17194,6 +17616,7 @@ fn start_send_back(
         unit.assigned_cli = Some(lead);
         unit.assigned_invocation = Some(invocation);
         let input = StepInput {
+            base_commit: None,
             run_id: one_shot.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -17416,6 +17839,7 @@ fn units_are(
                 && u.catalog == p.catalog
                 && u.executes_code == p.executes_code
                 && u.required_deliverables == p.required_deliverables
+                && u.write_set == p.write_set
                 && u.skill_ref == p.skill_ref
                 && u.tool_cmd == p.tool_cmd
                 && u.rubric == p.rubric
@@ -22010,6 +22434,47 @@ fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Op
     let in_per = entry.get("input_per_mtok").and_then(|v| v.as_f64())?;
     let out_per = entry.get("output_per_mtok").and_then(|v| v.as_f64())?;
     Some(input_tokens as f64 / 1e6 * in_per + output_tokens as f64 / 1e6 * out_per)
+}
+
+/// The actor's unregister guard: session reads and removal share the launch/register writer.
+pub(crate) fn unregister_repo(store: &mut impl GraphStore, repo_id: &str) -> anyhow::Result<bool> {
+    let Some(repo) = crate::repo::get_repo(store, repo_id)? else {
+        return Ok(false);
+    };
+    let mut runs = Vec::new();
+    for run_id in list_sessions(store)? {
+        if let Some(session) = crate::domain::get_session(store, &run_id)? {
+            if session.repo_ref.as_deref() == Some(repo_id)
+                && !matches!(
+                    session.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                )
+            {
+                runs.push(run_id);
+            }
+        }
+    }
+    runs.extend(crate::code_graph::graph_lease_holders(
+        std::path::Path::new(&repo.code_graph_db),
+    ));
+    runs.sort();
+    runs.dedup();
+    if !runs.is_empty() {
+        anyhow::bail!(
+            "repo_in_use: repository {repo_id} has live runs: {} — \
+             wait for them to end or stop them first",
+            runs.join(", ")
+        );
+    }
+    let projects = crate::project::member_projects(store, "crew.repo", repo_id)?;
+    if !projects.is_empty() {
+        anyhow::bail!(
+            "repo_in_project: repository {repo_id} belongs to project(s) {} — \
+             remove it from the project first",
+            projects.join(", ")
+        );
+    }
+    crate::repo::unregister_repo(store, repo_id)
 }
 
 /// Read the agent session ids on the store (by their session-node names).
@@ -34325,12 +34790,29 @@ mod deliverable_floor_tests {
         subs: &mut crate::event_log::EventSink,
         run_id: &str,
     ) -> (AgentSession, WorkUnit) {
+        fold_with_evidence(
+            store,
+            subs,
+            run_id,
+            crate::workflow::UnitEvidence::default(),
+        )
+    }
+
+    fn fold_with_evidence(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (AgentSession, WorkUnit) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let out = StepOutput {
             run_id: run_id.into(),
             unit_ix: 0,
-            attempt: 0,
+            attempt: crate::domain::get_session(store, run_id)
+                .unwrap()
+                .unwrap()
+                .attempt,
             output: prose(),
             status: StepStatus::Ok,
             usage: None,
@@ -34345,7 +34827,7 @@ mod deliverable_floor_tests {
             &tx,
             out,
             None,
-            crate::workflow::UnitEvidence::default(),
+            evidence,
             "",
             &None,
             &None,
@@ -34358,6 +34840,114 @@ mod deliverable_floor_tests {
             .unwrap()
             .remove(0);
         (session, unit)
+    }
+
+    #[test]
+    fn a_previous_pass_deliverable_is_rejected_as_stale() {
+        let wd = tmp("pass-stale");
+        std::fs::write(wd.join("rules.json"), "{}").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(wd.join("rules.json"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run = "pass-stale";
+        seed(
+            &mut store,
+            run,
+            Some(wd.to_string_lossy().into_owned()),
+            vec![],
+            vec!["rules.json".into()],
+        );
+        let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+        unit.status = UnitStatus::Done;
+        unit.last_attempt = Some(0);
+        unit.assigned_cli = Some("claude".into());
+        put_node(&mut store, unit.to_node()).unwrap();
+        let mut next = WorkUnit::pending(format!("{run}:next"), run, 2, "next");
+        next.status = UnitStatus::Done;
+        next.tool_cmd = Some(vec!["true".into()]);
+        next.repeat_from = Some("u1".into());
+        put_node(&mut store, next.to_node()).unwrap();
+        let mut session = crate::domain::get_session(&store, run).unwrap().unwrap();
+        session.unit_ix = 1;
+        session.clis = vec!["claude".into()];
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        assert!(repeat_gate::after_pass(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut session,
+            1,
+            r#"wicked-repeat {"next":"continue","line":"page 2"}"#,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap()
+        .is_some());
+        let (_, unit) = fold(&mut store, &mut subs, run);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(unit.denial.as_ref().unwrap().source, "deliverables");
+        assert!(unit.denial_reason.unwrap().contains("(stale:"));
+        let _ = std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn write_set_evidence_rejects_outside_paths_and_unavailable_checks() {
+        for report in [
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec!["src/x.rs".into()],
+                error: None,
+            }),
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec![],
+                error: Some("snapshot failed".into()),
+            }),
+            None,
+        ] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run = "write-set-denied";
+            seed(&mut store, run, None, vec![], vec![]);
+            let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+            unit.write_set = vec![".wicked/domain/".into(), "coverage-report.json".into()];
+            put_node(&mut store, unit.to_node()).unwrap();
+            let expected = match &report {
+                Some(r) if r.error.is_some() => "snapshot failed",
+                Some(_) => "src/x.rs",
+                None => "no write-set evidence",
+            };
+            let mut subs = crate::event_log::EventSink::default();
+            let (tx, rx) = channel();
+            subs.push(tx);
+            let (session, unit) = fold_with_evidence(
+                &mut store,
+                &mut subs,
+                run,
+                crate::workflow::UnitEvidence {
+                    write_set: report,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(unit.status, UnitStatus::Rejected);
+            assert_eq!(unit.denial.as_ref().unwrap().source, "write_set");
+            assert!(unit.denial_reason.unwrap().contains(expected));
+            assert_eq!(session.status, SessionStatus::AwaitingHuman);
+            assert!(rx.try_iter().any(|e| matches!(
+                e,
+                CoreEvent::StepFailed {
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                    ..
+                }
+            )));
+        }
     }
 
     /// THE REPRODUCTION (§1). A unit declares `required_deliverables` and reports Ok having
@@ -34448,6 +35038,7 @@ mod deliverable_floor_tests {
         // `sandbox_root`, the fold starts checking a directory no worker ever wrote to and the
         // floor fails every unbound run that honestly produced its deliverable.
         let probe = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -36559,10 +37150,11 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            6,
-            "the substance gate, the deliverable floor, the dead-seat worker exit (core#461), the \
-             demo floor, the demo plan snapshot (core#1249) and the editor conformance floor \
-             (DES-EDITOR-CONFORMANCE-HOST) each open the escalation gate"
+            7,
+            "the substance gate, the write-set floor (core#1344), the deliverable floor, the \
+             dead-seat worker exit (core#461), the demo floor, the demo plan snapshot (core#1249) \
+             and the editor conformance floor (DES-EDITOR-CONFORMANCE-HOST) each open the \
+             escalation gate"
         );
     }
 
@@ -42348,6 +42940,7 @@ mod consent_plan_tests {
             run_id: run_id.into(),
             ord: 2,
             consent_choice: unit.consent_choice.clone(),
+            upstream_agents: Vec::new(),
             repeat: None,
             evidence_root: None,
             tree_from: None,
@@ -43213,5 +43806,75 @@ mod git_identity_missing_tests {
         let resolved = identity_missing_in(&repo);
         let _ = std::fs::remove_dir_all(&repo);
         assert!(resolved.is_empty(), "{resolved:?}");
+    }
+}
+
+#[cfg(test)]
+mod upstream_agents_tests {
+    use super::*;
+
+    #[test]
+    fn extract_apply_env_uses_done_transitive_agents_current_assignment() {
+        let plan = crate::plan::PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..Default::default()
+        };
+        let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "map", "upstream");
+        for u in &mut units {
+            u.status = crate::domain::UnitStatus::Done;
+            u.assigned_cli = Some("claude".into());
+            if u.phase_id() == Some("extract") {
+                u.assigned_cli = Some(" codex ".into());
+            }
+        }
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        let env = ToolRunEnv {
+            run_id: "upstream".into(),
+            ord: apply.ord,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(apply, &units),
+        }
+        .vars();
+        let pairs = &env
+            .iter()
+            .find(|(k, _)| k == UPSTREAM_AGENTS_ENV)
+            .unwrap()
+            .1;
+        assert!(pairs.split(',').any(|p| p == "extract=codex"), "{pairs}");
+        assert!(pairs.find("extract=codex") < pairs.find("critique=claude"));
+        units
+            .iter_mut()
+            .find(|u| u.phase_id() == Some("extract"))
+            .unwrap()
+            .assigned_cli = Some("bad,seat".into());
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        assert!(!upstream_agents(apply, &units)
+            .iter()
+            .any(|(s, _)| s == "extract"));
+
+        let unit = crate::domain::WorkUnit::pending("empty:tool", "empty", 1, "tool");
+        let env = ToolRunEnv {
+            run_id: "empty".into(),
+            ord: 1,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(&unit, &[]),
+        }
+        .vars();
+        assert!(!env.iter().any(|(k, _)| k == UPSTREAM_AGENTS_ENV));
     }
 }

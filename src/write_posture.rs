@@ -26,6 +26,7 @@
 //!
 //! | phase                                     | posture                 |
 //! |-------------------------------------------|-------------------------|
+//! | `answer_only: true`, agent               | [`WritePosture::ToolLess`] |
 //! | `executes_code: true`, Tool, prose-planned | [`WritePosture::Full`]  |
 //! | catalog `walkthrough_plan` (evaluator), BOUND | [`WritePosture::DeliverableRoots`] |
 //! | `executes_code: false`, evaluator/neutral  | [`WritePosture::ReadOnly`] |
@@ -77,6 +78,8 @@ pub(crate) enum WritePosture {
     /// rung, a review: every write-class call is refused. `bash` stays (the phase must run the
     /// suite); the worktree guard holds the rest.
     ReadOnly,
+    /// Answer from the prompt alone: every tool is refused on every carrier (core#1257).
+    ToolLess,
 }
 
 impl WritePosture {
@@ -84,6 +87,10 @@ impl WritePosture {
     /// / `AgentSession::workdir` is `Some`): the tree the guard protects and the creator fence
     /// excludes. Read off the unit's plan-time markers, never guessed from the prompt.
     pub(crate) fn of(unit: &WorkUnit, bound: bool) -> Self {
+        // Answer-only is stricter than every role or catalog exception (core#1257).
+        if unit.answer_only && unit.tool_cmd.is_none() {
+            return WritePosture::ToolLess;
+        }
         // The PA's review of a member's step (DES-TEAMING-002 §8.8) is an evaluator turn whatever
         // the step's own role or phase: its verdict is its output, the tree is the member's, and
         // it gets no write tools (review round 2 on #628, D2).
@@ -146,6 +153,7 @@ impl WritePosture {
             WritePosture::Full => "full",
             WritePosture::DeliverableRoots => "deliverable-roots",
             WritePosture::ReadOnly => "read-only",
+            WritePosture::ToolLess => "tool-less",
         }
     }
 
@@ -160,18 +168,21 @@ impl WritePosture {
     /// hook reads it as "no fence". That was acceptable while only a creator carried it (a bound
     /// creator became guard-only there). WT-C1 gives it to an EVALUATOR (the walkthrough author),
     /// so gate protocol 2 ([`crate::gate_hook::GATE_PROTOCOL_VERSION`]) makes a protocol-1 hook
-    /// refuse to arm instead of running that evaluator unfenced.
+    /// refuse to arm instead of running that evaluator unfenced. `tool-less` requires protocol 4:
+    /// older hooks read it as no fence and must not arm (core#1257).
     pub(crate) fn env_value(self) -> Option<&'static str> {
         match self {
             WritePosture::Full => None,
             WritePosture::ReadOnly => Some("1"),
+            WritePosture::ToolLess => Some("tool-less"),
             WritePosture::DeliverableRoots => Some("deliverable-roots"),
         }
     }
 
     /// The pure half of the env read. Parsed STRICTLY: `1`/`true` (what the launcher writes, and
     /// what it wrote before postures existed) or the label `read-only` ⇒
-    /// [`WritePosture::ReadOnly`]; `deliverable-roots` ⇒ [`WritePosture::DeliverableRoots`]; unset
+    /// [`WritePosture::ReadOnly`]; `deliverable-roots` ⇒ [`WritePosture::DeliverableRoots`];
+    /// `tool-less` ⇒ [`WritePosture::ToolLess`] (core#1257); unset
     /// or anything else ⇒ [`WritePosture::Full`]. An inherited junk value must never scope a build
     /// phase away from building — the inverse failure, and a louder one than the one the fence
     /// closes.
@@ -187,6 +198,7 @@ impl WritePosture {
             Some(s) if s.eq_ignore_ascii_case("deliverable-roots") => {
                 WritePosture::DeliverableRoots
             }
+            Some(s) if s.eq_ignore_ascii_case("tool-less") => WritePosture::ToolLess,
             _ => WritePosture::Full,
         }
     }
@@ -213,6 +225,7 @@ pub(crate) fn deliverable_roots_from(extra_write_roots: &[String]) -> Vec<PathBu
 /// ([`deliverable_roots_from`]); `ReadOnly` → the unit's NOTES ROOT (`WorkUnit::notes_root`, minted
 /// at dispatch for a bound read-only unit, core#464 — the sanctioned place outside the tree an
 /// evaluator may write its analysis; `[]` when the unit has none); `Full` → nothing (no fence).
+/// `ToolLess` → nothing: every tool call is refused regardless of roots (core#1257).
 /// The wrapped launcher arms this list on [`crate::gate_hook::DELIVERABLE_ROOTS_ENV`], the ACP
 /// carrier holds it in-process (`AcpWritePosture::deliverable_roots`), and the gate hook judges it —
 /// the same variable and the same judgement ([`deliverable_write_admitted`]) for both postures.
@@ -224,7 +237,7 @@ pub(crate) fn admitted_roots(
     match posture {
         WritePosture::DeliverableRoots => deliverable_roots_from(extra_write_roots),
         WritePosture::ReadOnly => notes_root.into_iter().map(PathBuf::from).collect(),
-        WritePosture::Full => Vec::new(),
+        WritePosture::Full | WritePosture::ToolLess => Vec::new(),
     }
 }
 
@@ -241,7 +254,11 @@ pub(crate) fn unit_admitted_roots(
     // (wicked-core#881) A fenced unit carrying a QE ledger root — the QE unit, deliverable-roots
     // on a bound run — admits exactly its own roots, never the launch extras (another phase's
     // deliverables, e.g. the walkthrough author's dir).
-    if posture != WritePosture::Full && crate::qe_acceptance::carries_ledger_root(unit) {
+    if matches!(
+        posture,
+        WritePosture::ReadOnly | WritePosture::DeliverableRoots
+    ) && crate::qe_acceptance::carries_ledger_root(unit)
+    {
         return unit
             .notes_root
             .iter()
@@ -403,6 +420,33 @@ mod tests {
         );
         let prose = WorkUnit::pending("r:x", "r", 1, "prose-planned");
         assert_eq!(WritePosture::of(&prose, true), WritePosture::Full);
+    }
+
+    /// Answer-only wins over review/catalog rules and admits no tool write roots (core#1257).
+    #[test]
+    fn answer_only_units_have_a_tool_less_posture() {
+        let mut u = unit(PhaseRole::Neutral, false);
+        u.answer_only = true;
+        u.catalog = Some("walkthrough_plan".into());
+        u.member_step = Some(crate::domain::MemberStepState {
+            member: "codex".into(),
+            reviewing: Some(0),
+            ..Default::default()
+        });
+        u.notes_root = Some("/notes/u1".into());
+        for bound in [false, true] {
+            let posture = WritePosture::of(&u, bound);
+            assert_eq!(posture.label(), "tool-less");
+            assert!(posture.fences_writes());
+            assert_eq!(posture.env_value(), Some("tool-less"));
+            assert_eq!(
+                WritePosture::parse_env(Some(OsStr::new("tool-less"))),
+                posture
+            );
+            assert!(unit_admitted_roots(posture, &u, &["/extra".into()]).is_empty());
+        }
+        u.tool_cmd = Some(vec!["true".into()]);
+        assert_eq!(WritePosture::of(&u, true), WritePosture::Full);
     }
 
     #[test]

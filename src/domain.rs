@@ -1312,8 +1312,9 @@ pub struct WorkUnit {
     pub requires_capture_report: bool,
     /// (crew#1311) Whether this unit's backing phase declared
     /// [`answer_only`](crate::workflow::PhaseDef::answer_only) — carried verbatim at plan time,
-    /// exactly the way `executes_code` is. One consumer: the phase-substance floor in
-    /// `actor::apply_step_result`, which asks such a read-only unit only for a non-empty answer.
+    /// exactly the way `executes_code` is. The phase-substance floor in `actor::apply_step_result`
+    /// asks only for a non-empty answer. The tool-less posture takes every tool away so the
+    /// answer comes from the prompt alone (core#1257).
     /// Skip-if-false: every other unit serializes byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_only: bool,
@@ -1669,6 +1670,12 @@ pub struct WorkUnit {
     /// send-back resets the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
+    /// Earliest deliverable timestamp for the current repeat pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_started_ms: Option<i64>,
+    /// Allowed run-relative paths: directory prefixes end in `/`, files match exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_set: Vec<String>,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1933,6 +1940,8 @@ impl WorkUnit {
     ) -> Self {
         let description = description.into();
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             id: id.into(),
             session_id: session_id.into(),
             parent_run_id: None,

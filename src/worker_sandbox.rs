@@ -493,9 +493,8 @@ impl FloorUnarmed {
                  be built (`wicked-core seat-image build <cli>` shows why)"
             }
             FloorUnarmed::ContainerUnsupportedHost => {
-                "container_unsupported_host: the container floor mounts host paths at the same path, \
-                 which native Windows paths cannot be — run the daemon inside WSL2 with a container \
-                 runtime"
+                "container_unsupported_host: native Windows cannot run the container floor; run the \
+                 daemon and its checkouts inside WSL2 with a local Kubernetes cluster"
             }
             FloorUnarmed::GateHookUnreachable => {
                 "gate_hook_unreachable: the unit's PreToolUse gate hook is a host command the seat \

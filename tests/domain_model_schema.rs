@@ -102,6 +102,13 @@ fn built_domain_model_validates_against_the_kept_schema() {
         .expect("build 1.0.0");
     let new = wicked_governance::build_domain_model_with(&store, &coverage, "1.1.0", &opts)
         .expect("build 1.1.0");
+    assert_eq!(
+        serde_json::to_value(&new).unwrap()["metadata"]["product_only"],
+        true
+    );
+    assert!(serde_json::to_value(&old).unwrap()["metadata"]
+        .get("product_only")
+        .is_none());
     assert!(new.metadata.coverage.is_some());
     assert_eq!(new.metadata.business_domains.len(), 1);
     assert!(old.metadata.business_domains.is_empty());
@@ -127,12 +134,23 @@ fn built_domain_model_validates_against_the_kept_schema() {
         .unwrap()
         .expect("the graph reads back from estate");
 
+    assert_eq!(
+        read_back["metadata"]["product_only"], true,
+        "relabel keeps the build marker"
+    );
+
     let schema: serde_json::Value = serde_json::from_str(SCHEMA).expect("schema parses");
     let compiled = jsonschema::JSONSchema::compile(&schema).expect("schema compiles");
     assert_eq!(
         read_back["domains"]["billing"]["requirements"]["REQ-002"]["business_domain"]["id"],
         "payment-collection",
         "the business domain reads back from estate"
+    );
+    let mut bad_marker = serde_json::to_value(&new).unwrap();
+    bad_marker["metadata"]["product_only"] = serde_json::json!("true");
+    assert!(
+        !compiled.is_valid(&bad_marker),
+        "the marker must be a boolean"
     );
     let instances = [
         serde_json::to_value(&old).unwrap(),
