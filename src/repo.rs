@@ -1457,6 +1457,12 @@ pub(crate) fn reserve_tree(repo_root: &str, run_id: &str) -> TreeTicket {
 }
 
 impl TreeTicket {
+    /// Give the place up without touching the tree: wait for its turn, then pass it on. A ticket
+    /// that is never waited for would hold the tree's queue forever.
+    pub(crate) fn release(self) {
+        drop(self.wait());
+    }
+
     fn wait(self) -> TreeLock {
         let (held, freed) = tree_locks();
         let mut map = held.lock().unwrap_or_else(|p| p.into_inner());

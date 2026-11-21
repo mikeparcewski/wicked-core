@@ -11149,12 +11149,24 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
     crate::code_graph::release_graph_lease(&rid);
+    // (core#1435, review of #1736) The reap's place in the tree's queue is taken HERE, on the
+    // actor: a campaign's busy-tree check (`campaign::try_fill`) and its mint also run on the
+    // actor, so a reap can never queue between them and leave the mint waiting on the actor.
+    let reap = repo.map(|r| {
+        let ticket = crate::repo::reserve_tree(&r.root_path, &rid);
+        (r, ticket)
+    });
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
+        let Some((repo, ticket)) = reap else {
+            return;
+        };
         // A run that armed again since it ended keeps its tree (codex r2): its live edits
         // may sit in the replica only.
-        if let Some(repo) = repo.filter(|_| crate::k8s::run_epoch(&rid) == epoch) {
-            let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
+        if crate::k8s::run_epoch(&rid) == epoch {
+            let _ = crate::repo::reap_worktree_with(ticket, &repo.root_path, &rid);
+        } else {
+            ticket.release();
         }
     });
 }
@@ -38600,6 +38612,32 @@ mod terminal_worktree_reap_tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1435 (review of #1736): a terminal run's reap takes its place in the tree's queue on
+    /// the actor, before `reap_terminal_worktree` returns. A campaign's busy-tree check and mint
+    /// also run on the actor, so no reap can queue between them and leave the mint waiting on the
+    /// actor. Here the next taker queues right after the call: the reap still runs first.
+    #[test]
+    fn a_terminal_reap_takes_its_place_in_the_trees_queue_before_it_returns() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let (root, wt) =
+            seeded_with_status(&mut store, "queued", "r-queued", SessionStatus::Failed);
+        let root_s = root.to_string_lossy().into_owned();
+        let held = crate::repo::hold_tree_for_test(&root_s, "r-queued");
+        let session = crate::domain::get_session(&store, "r-queued")
+            .unwrap()
+            .unwrap();
+        reap_terminal_worktree(&store, &session);
+        // What a campaign's mint takes next, on the actor.
+        let next = crate::repo::reserve_tree(&root_s, "r-queued");
+        drop(held);
+        next.release();
+        assert!(
+            !wt.exists(),
+            "the reap queued before the next taker of the tree, so it ran first"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
