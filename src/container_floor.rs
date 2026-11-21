@@ -840,10 +840,17 @@ pub(crate) struct ImageFacts {
     pub(crate) healthcheck: bool,
 }
 
+/// Bump when tighter inspection rules invalidate previously persisted facts.
+const SEAT_FACTS_VERSION: &str = "v1";
+
 fn seat_facts_path(id: &str) -> Option<PathBuf> {
     let home = crate::k8s::engine_home()?;
     let hex = id.strip_prefix("sha256:").unwrap_or(id);
-    Some(home.join("seat-image-facts").join(format!("{hex}.json")))
+    Some(
+        home.join("seat-image-facts")
+            .join(SEAT_FACTS_VERSION)
+            .join(format!("{hex}.json")),
+    )
 }
 
 fn read_seat_facts(path: &Path, id: &str) -> Option<ImageFacts> {
@@ -3743,7 +3750,7 @@ mod tests {
     }
 
     #[test]
-    fn seat_facts_survive_a_fresh_memory_cache_and_rewrite_invalid_files() {
+    fn seat_facts_ignore_old_versions_survive_fresh_cache_and_rewrite_invalid_files() {
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -3761,6 +3768,7 @@ mod tests {
         let path = dir
             .0
             .join("seat-image-facts")
+            .join("v1")
             .join(format!("{}.json", &id[7..]));
         assert!(path.is_file());
         #[cfg(unix)]
@@ -3770,6 +3778,20 @@ mod tests {
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+        }
+        for version in ["v0", ""] {
+            let stale_path = dir
+                .0
+                .join("seat-image-facts")
+                .join(version)
+                .join(format!("{}.json", &id[7..]));
+            write_seat_facts(&stale_path, &first).unwrap();
+            std::fs::remove_file(&path).unwrap();
+            std::fs::write(&log, "").unwrap();
+            let facts = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
+            assert_eq!(facts, first);
+            assert!(std::fs::read_to_string(&log).unwrap().contains("save "));
+            assert_eq!(read_seat_facts(&path, &id), Some(first.clone()));
         }
         std::fs::write(&log, "").unwrap();
         let next = inspect_seat_image_cached(&rt, "seat:build", &Mutex::new(None)).unwrap();
