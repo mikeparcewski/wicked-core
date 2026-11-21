@@ -2916,7 +2916,7 @@ pub(crate) fn arm_warm(
     checkout: Option<Arc<WarmCheckout>>,
     images: Option<(&str, &str)>,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
-    let result = arm_physical(kube, s, landrun.clone(), checkout.clone(), images, true);
+    let result = arm_physical(kube, s, landrun.clone(), checkout.clone(), images);
     if result.is_err() && checkout.as_ref().is_some_and(|c| c.live()) {
         if let Some(c) = &checkout {
             let old = c
@@ -2935,9 +2935,18 @@ pub(crate) fn arm_warm(
                 "wicked-core: warm judge preparation unproved; reaping and taking a cold arm: {e}"
             );
         }
-        return arm_physical(kube, s, landrun, checkout, images, false);
+        // (W24) A true cold arm: the checkout's own refusal (a judge the warm guard turns away)
+        // must never decide the fallback too.
+        return arm_physical(kube, s, landrun, None, images);
     }
     result
+}
+
+/// (W24) A warm judge is a read-only view whose write roots are at most its own tree: the view
+/// is thrown away with the pod and the warm plan writes nothing back. The wrapped runner arms
+/// every ungoverned judge with its tree as its write root (`worker_write_roots` = [cwd]).
+fn warm_admits(s: &ArmSpec<'_>) -> bool {
+    s.view && s.write_roots.iter().all(|w| w.starts_with(s.tree))
 }
 
 fn arm_physical(
@@ -2946,13 +2955,12 @@ fn arm_physical(
     landrun: Vec<String>,
     checkout: Option<Arc<WarmCheckout>>,
     images: Option<(&str, &str)>,
-    allow_cache: bool,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
     // A retry is another arm: a replaced node needs the images again before any pod apply.
     let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
     super::images::ensure_for(kube, &rt, &[s.image, s.floor_image, s.sync_image])?;
     let (ns, scope, run) = match &checkout {
-        Some(c) if c.live() && s.view && s.write_roots.is_empty() && images.is_some() => (
+        Some(c) if c.live() && warm_admits(s) && images.is_some() => (
             super::run_namespace_name(&kube.owner, &c.key.parent),
             Some(c.key.scope()),
             c.key.parent.clone(),
@@ -3023,12 +3031,18 @@ fn arm_physical(
         }
     }
     super::clock::mark("sync_pod");
+    // A warm judge's replica never comes back to the host (W24, [`warm_admits`]).
+    let write_back: &[PathBuf] = if checkout.is_some() {
+        &[]
+    } else {
+        s.write_roots
+    };
     let (roots, pod_mounts) = plan(
         s.tree,
         s.view,
         s.mounts,
         s.protected,
-        s.write_roots,
+        write_back,
         s.seed_base,
     );
     // Seat homes stay in the replica (review r7 #1); the unit's other writable dirs that do not
@@ -3066,7 +3080,7 @@ fn arm_physical(
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
     let mut unit_label = label_value(&format!("{}-{}", s.ord, &id[..10]));
-    let secs = if checkout.is_some() && allow_cache {
+    let secs = if checkout.is_some() {
         (6 * 3600).max(s.deadline.as_secs() + 600)
     } else {
         s.deadline.as_secs() + 600
@@ -3420,7 +3434,7 @@ fn arm_physical(
     if s.deps.is_some() {
         super::clock::mark("deps_unpack");
     }
-    if let Some(c) = checkout.as_ref().filter(|_| allow_cache) {
+    if let Some(c) = checkout.as_ref() {
         if !c.live() {
             return Err((
                 FloorUnarmed::PodNotReady,
