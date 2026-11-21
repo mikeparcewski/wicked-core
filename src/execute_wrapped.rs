@@ -13057,6 +13057,7 @@ mod tests {
     #[test]
     fn tool_less_env_keeps_only_the_base_and_explicit_sets() {
         use std::ffi::OsString;
+        // spawn-audit: test-only — never spawned; the scrub is judged on its `get_envs` alone.
         let mut cmd = Command::new("unused");
         cmd.env("WICKED_MCP_TOKEN", "unit-token");
         cmd.env("SEAT_CONFIG_HOME", "/seat");
