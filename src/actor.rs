@@ -9311,34 +9311,28 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     }
 }
 
-/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
-/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
-/// or `None`.
-fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
-    let rule_layer = |d: &crate::domain::UnitDenial| {
-        d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
-            || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
-    };
+/// The rule ids holding or denying `unit`, in denial order, or from its last rule-check rows
+/// when the layers behind the winning denial are unknown. `Some([])` is an unnamed rule hold:
+/// it still refuses Land because there are no individual rules the person can skip.
+fn open_rule_ids(unit: &crate::domain::WorkUnit) -> Option<Vec<String>> {
     let named: Vec<&crate::domain::UnitDenial> = unit
         .denial
         .iter()
         .chain(unit.denials_behind.iter().flatten())
-        .filter(|d| rule_layer(d))
+        .filter(|d| {
+            d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+                || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+        })
         .collect();
-    if !named.is_empty() {
-        let ids: Vec<&str> = named
+    let ids = if !named.is_empty() {
+        named
             .iter()
-            .flat_map(|d| d.rule_ids.iter().map(String::as_str))
-            .collect();
-        return Some(format!(
-            "broken, unchecked or disputed ({})",
-            ids.join(", ")
-        ));
-    }
-    if unit.denials_behind.is_none() {
+            .flat_map(|d| d.rule_ids.iter().cloned())
+            .collect::<Vec<_>>()
+    } else if unit.denials_behind.is_none() {
         let rc = unit.rule_check.as_ref()?;
         // (DES-RULE-CHECK-001 rev 2, Part B, Q6) A process rule's row is reported, never open.
-        let open: Vec<&str> = rc
+        let open: Vec<String> = rc
             .rows
             .iter()
             .filter(|r| {
@@ -9350,16 +9344,32 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                         | crate::rule_check::RuleStatus::Disputed
                 ) && !r.reported_only()
             })
-            .map(|r| r.rule_id.as_str())
+            .map(|r| r.rule_id.clone())
             .collect();
-        if !open.is_empty() {
-            return Some(format!(
-                "broken, unchecked or disputed ({})",
-                open.join(", ")
-            ));
+        if open.is_empty() {
+            return None;
         }
-    }
-    None
+        open
+    } else {
+        return None;
+    };
+    let mut seen = HashSet::new();
+    let ids = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    Some(ids)
+}
+
+/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
+/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
+/// or `None`.
+fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
+    let ids = open_rule_ids(unit)?;
+    Some(format!(
+        "broken, unchecked or disputed ({})",
+        ids.join(", ")
+    ))
 }
 
 /// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
@@ -18159,7 +18169,8 @@ pub(crate) fn confirm_gate_expecting(
 
     // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
     // second read after it could refuse an answer whose row is already answered. (DES-RULE-CHECK-001
-    // S2) …and the rule skips a `skip_rules` answer lands with its re-check.
+    // S2) …and the rule skips a `skip_rules` answer lands with its re-check, or a noted Land
+    // records with the landing.
     let ArmedAnswer {
         rejudge: mut armed_rejudge,
         rule_skips: mut armed_rule_skips,
@@ -18501,6 +18512,7 @@ pub(crate) fn confirm_gate_expecting(
                 session,
                 run_id,
                 amend.clone(),
+                armed_rule_skips,
                 lifecycle_maps,
                 actor_maps,
                 process_gen,
@@ -19384,6 +19396,82 @@ fn rejudge_request(
     })
 }
 
+/// Build one person's validated skip, shared by a rule re-check and a noted Land.
+fn rule_skip(
+    cursor: &crate::domain::WorkUnit,
+    id: &str,
+    reason: &str,
+    by: Option<&str>,
+    at: i64,
+    rulings_rev: &str,
+) -> anyhow::Result<crate::rule_check::RuleSkip> {
+    let rows = cursor
+        .rule_check
+        .as_ref()
+        .map(|r| r.rows.as_slice())
+        .unwrap_or_default();
+    let by = by
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator");
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
+    if reason.trim().is_empty() {
+        anyhow::bail!("skip of rule `{id}` needs a written reason");
+    }
+    // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
+    // may waive with a reason; a broken error/critical rule is reworked.
+    let Some(row) = rows.iter().find(|r| {
+        r.rule_id == id
+            && (matches!(
+                r.status,
+                crate::rule_check::RuleStatus::Unchecked
+                    | crate::rule_check::RuleStatus::Waived
+                    | crate::rule_check::RuleStatus::Disputed
+            ) || (r.status == crate::rule_check::RuleStatus::Broken
+                && r.waivable == Some(true)))
+    }) else {
+        anyhow::bail!(
+            "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
+             of unit {} — only a rule no judge or council ruled on, or a broken rule of \
+             severity warn or info, can be skipped (a broken error or critical rule denies the \
+             gate)",
+            cursor.ord
+        );
+    };
+    let Some(evidence_key) = row.evidence_key.clone() else {
+        anyhow::bail!(
+            "rule `{id}` has no evidence key on unit {}; retry the rule check",
+            cursor.ord
+        );
+    };
+    Ok(crate::rule_check::RuleSkip {
+        rule_id: id.to_string(),
+        reason: reason.trim().to_string(),
+        by: by.to_string(),
+        at,
+        rule_key: row.rule_key.clone(),
+        evidence_key,
+        seat_attempt: Some(attempt),
+        instruction: (row.status == crate::rule_check::RuleStatus::Waived)
+            .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+        // (core#1493) The carry key of the check it answered, so the run's later steps carry
+        // it on the same evidence…
+        carry_key: cursor
+            .rule_check
+            .as_ref()
+            .and_then(|r| r.carry_keys.get(id))
+            .cloned(),
+        ord: Some(cursor.ord),
+        // …while the person's words stay at this revision.
+        rulings_rev: Some(rulings_rev.to_string()),
+    })
+}
+
 /// (DES-RULE-CHECK-001 S2) The rule re-check to arm on `run_id`'s cursor unit, with the skips it
 /// lands: refused (the gate stays open) unless the cursor unit is held `rules_unchecked`, and
 /// unless every skip names one of its UNCHECKED rules with a non-empty reason. Carries the
@@ -19438,16 +19526,6 @@ fn rules_recheck_request(
             cursor.ord
         );
     }
-    let rows = cursor
-        .rule_check
-        .as_ref()
-        .map(|r| r.rows.as_slice())
-        .unwrap_or_default();
-    let by = by
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .unwrap_or("operator")
-        .to_string();
     let at = crate::interaction::now_millis();
     let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
     let attempt = cursor
@@ -19456,59 +19534,10 @@ fn rules_recheck_request(
         .filter(|b| b.consumed)
         .map(|b| b.attempt)
         .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
-    let mut landed = Vec::new();
-    for (id, reason) in skips {
-        if reason.trim().is_empty() {
-            anyhow::bail!("skip of rule `{id}` needs a written reason");
-        }
-        // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
-        // may waive with a reason; a broken error/critical rule is reworked.
-        let Some(row) = rows.iter().find(|r| {
-            &r.rule_id == id
-                && (matches!(
-                    r.status,
-                    crate::rule_check::RuleStatus::Unchecked
-                        | crate::rule_check::RuleStatus::Waived
-                        | crate::rule_check::RuleStatus::Disputed
-                ) || (r.status == crate::rule_check::RuleStatus::Broken
-                    && r.waivable == Some(true)))
-        }) else {
-            anyhow::bail!(
-                "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
-                 of unit {} — only a rule no judge or council ruled on, or a broken rule of \
-                 severity warn or info, can be skipped (a broken error or critical rule denies the \
-                 gate)",
-                cursor.ord
-            );
-        };
-        let Some(evidence_key) = row.evidence_key.clone() else {
-            anyhow::bail!(
-                "rule `{id}` has no evidence key on unit {}; retry the rule check",
-                cursor.ord
-            );
-        };
-        landed.push(crate::rule_check::RuleSkip {
-            rule_id: id.clone(),
-            reason: reason.trim().to_string(),
-            by: by.clone(),
-            at,
-            rule_key: row.rule_key.clone(),
-            evidence_key,
-            seat_attempt: Some(attempt),
-            instruction: (row.status == crate::rule_check::RuleStatus::Waived)
-                .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
-            // (core#1493) The carry key of the check it answered, so the run's later steps carry
-            // it on the same evidence…
-            carry_key: cursor
-                .rule_check
-                .as_ref()
-                .and_then(|r| r.carry_keys.get(id))
-                .cloned(),
-            ord: Some(cursor.ord),
-            // …while the person's words stay at this revision.
-            rulings_rev: Some(rulings_rev.clone()),
-        });
-    }
+    let landed = skips
+        .iter()
+        .map(|(id, reason)| rule_skip(cursor, id, reason, by, at, &rulings_rev))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
         .and_then(|t| t.output)
         .unwrap_or_default();
@@ -19821,8 +19850,8 @@ pub(crate) fn refuse_before_resolving(
     // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
     // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
     // that counts it — is refused while a steering rule of that unit is broken or unchecked,
-    // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
-    // or skipped with its reason (`retry_rules` / `skip_rules`).
+    // whichever layer named the gate. (core#1683) A noted Land can skip every open rule that
+    // `skip_rules` would take, recording the same reason on each without another review round.
     let counts_unit = match &decision {
         crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
         crate::workflow::HumanDecision::OperatorJudgment { .. }
@@ -19830,14 +19859,43 @@ pub(crate) fn refuse_before_resolving(
         _ => false,
     };
     if counts_unit {
-        if let Some(open) = cursor.and_then(rule_layers_open) {
-            anyhow::bail!(
-                "unit {cursor_ord} has steering rules {open}; this answer would count it — \
-                 request changes to rework it, re-check the rules (`{}`), skip an unchecked \
-                 rule with a reason (`{}`), or reject",
-                crate::rule_check::RETRY_ACTION,
-                crate::rule_check::SKIP_ACTION
-            );
+        if let Some((cursor, open)) = cursor.and_then(|u| rule_layers_open(u).map(|o| (u, o))) {
+            let skips = match decision {
+                crate::workflow::HumanDecision::Approve { amend: Some(a), .. }
+                    if adjudication_open && !a.trim().is_empty() =>
+                {
+                    let at = crate::interaction::now_millis();
+                    let rev =
+                        rulings_revision(&session.problem, &session.intent_amendments, &units);
+                    open_rule_ids(cursor)
+                        .filter(|ids| !ids.is_empty())
+                        .and_then(|ids| {
+                            ids.iter()
+                                .map(|id| rule_skip(cursor, id, a, actor, at, &rev))
+                                .collect::<anyhow::Result<Vec<_>>>()
+                                .ok()
+                        })
+                }
+                _ => None,
+            };
+            if let Some(skips) = skips {
+                armed.rule_skips = skips;
+            } else {
+                let land_hint = if adjudication_open
+                    && matches!(decision, crate::workflow::HumanDecision::Approve { .. })
+                {
+                    "; Land with your reason skips the open rules when all can be skipped"
+                } else {
+                    ""
+                };
+                anyhow::bail!(
+                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                     rule with a reason (`{}`), or reject{land_hint}",
+                    crate::rule_check::RETRY_ACTION,
+                    crate::rule_check::SKIP_ACTION
+                );
+            }
         }
     }
     match &decision {
@@ -20862,6 +20920,7 @@ fn land_with_carried_items(
     session: crate::domain::AgentSession,
     run_id: &str,
     amend: Option<String>,
+    rule_skips: Vec<crate::rule_check::RuleSkip>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -20883,6 +20942,7 @@ fn land_with_carried_items(
     let attempt = u.last_attempt.unwrap_or(0);
     let verdict = u.denial_reason.clone().unwrap_or_default();
     u.carried_items = crate::review_context::carried_items(&verdict);
+    u.rule_skips.extend(rule_skips);
     if let Some(r) = u.review_rounds.iter_mut().find(|r| r.attempt == attempt) {
         r.outcome = Some(crate::review_context::REVIEW_LANDED.to_string());
     }
@@ -30371,6 +30431,144 @@ mod request_changes_tests {
         }
     }
 
+    fn seed_adjudication_rule(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        status: crate::rule_check::RuleStatus,
+    ) {
+        fold_verify_after_send_backs(store, subs, run_id, 2, THIRD_FAIL);
+        assert_eq!(
+            open_gate_kind(store, run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                rule_id: "R1".into(),
+                status,
+                how: crate::rule_check::RuleHow::Judge,
+                reason: "environment blocked the check".into(),
+                rule_key: "k".into(),
+                evidence_key: Some("ek-R1".into()),
+                origin: Some(crate::rule_check::RuleOrigin::Judge),
+                waivable: None,
+                ..Default::default()
+            }],
+            carry_keys: [("R1".to_string(), "ck".to_string())].into(),
+            ..Default::default()
+        };
+        units[3].denials_behind = Some(vec![report.hold().or_else(|| report.denial()).unwrap()]);
+        units[3].rule_check = Some(report);
+        put_node(store, units[3].to_node()).unwrap();
+    }
+
+    fn assert_noted_land_skips_adjudication_rule(status: crate::rule_check::RuleStatus) {
+        let run_id = format!("adj-skip-{status:?}-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(&mut store, &mut subs, &run_id, status);
+        for amend in [None, Some("  ".into())] {
+            let err = gate(
+                &mut store,
+                &mut subs,
+                &run_id,
+                HumanDecision::Approve {
+                    amend,
+                    amend_scope: AmendScope::Cursor,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("steering rules") && err.contains("R1"),
+                "{err}"
+            );
+            assert_eq!(
+                open_gate_kind(&store, &run_id).as_deref(),
+                Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            assert!(units[3].rule_skips.is_empty());
+        }
+        let out = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("  env block, carried  ".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .expect("a noted Land skips the held rule without another review");
+        assert_eq!(out, SessionStatus::Completed);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let unit = &units[3];
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(unit.rule_skips.len(), 1);
+        let skip = &unit.rule_skips[0];
+        assert_eq!(skip.rule_id, "R1");
+        assert_eq!(skip.reason, "env block, carried");
+        assert_eq!(skip.by, "operator");
+        assert_eq!(skip.rule_key, "k");
+        assert_eq!(skip.evidence_key, "ek-R1");
+        assert_eq!(skip.seat_attempt, unit.last_attempt);
+        assert_eq!(skip.carry_key.as_deref(), Some("ck"));
+        assert_eq!(skip.ord, Some(unit.ord));
+        assert!(skip.rulings_rev.is_some());
+        assert!(skip.instruction.is_none());
+        assert!(
+            unit.requested_rejudge.is_none(),
+            "Land does not arm a re-check"
+        );
+    }
+
+    #[test]
+    fn a_noted_land_skips_a_disputed_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Disputed);
+    }
+
+    #[test]
+    fn a_noted_land_skips_an_unchecked_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Unchecked);
+    }
+
+    #[test]
+    fn a_noted_land_refuses_a_broken_error_rule_at_adjudication() {
+        let run_id = format!("adj-broken-error-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(
+            &mut store,
+            &mut subs,
+            &run_id,
+            crate::rule_check::RuleStatus::Broken,
+        );
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("env block, carried".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steering rules") && err.contains("R1"),
+            "{err}"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Rejected);
+        assert!(units[3].rule_skips.is_empty());
+        assert!(units[3].operator_rulings.is_empty());
+        assert_eq!(
+            open_gate_kind(&store, &run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+    }
+
     /// (DES-RULE-CHECK-001 rev 2 Part B, operator Q2) Rule against rule: the person's confirm of the
     /// judge's WAIVED on a shipped PACK rule (MCPS-1002 waived for this change by their gate
     /// ruling) goes through `skip_rules` like any open rule, carrying the pack row's own keys and
@@ -32998,8 +33196,8 @@ mod request_changes_tests {
         assert!(action(&listed, crate::workflow::RETRY_QE_ACTION).is_none());
     }
 
-    /// (studio#1155) A capped review whose rule is held: land is NOT listed until the rule is
-    /// settled; the rule actions are.
+    /// (core#1683) A capped review whose rule is held lists Land with a required skip reason,
+    /// alongside the existing rule actions.
     #[test]
     fn gate_actions_review_adjudication_with_a_held_rule() {
         let seed = |store: &mut dyn GraphStore, run_id: &str| {
@@ -33025,7 +33223,11 @@ mod request_changes_tests {
             put_node(store, units[3].to_node()).unwrap();
         };
         let listed = listed_is_accepted("adj-rules", &seed);
-        assert!(action(&listed, "approve").is_none(), "{listed:#?}");
+        let land = action(&listed, "approve").expect("a noted Land skips the held rule");
+        assert_eq!(land.intent, "land_with_carried_items");
+        assert_eq!(land.note, crate::NoteRule::Required);
+        assert_eq!(land.note_intent.as_deref(), Some("skip_rules"));
+        assert_eq!(land.rules, ["R1"]);
         assert!(action(&listed, crate::rule_check::RETRY_ACTION).is_some());
         assert_eq!(
             action(&listed, crate::rule_check::SKIP_ACTION)
