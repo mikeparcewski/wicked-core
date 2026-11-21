@@ -3684,7 +3684,7 @@ mod tests {
             macro_rules! forward {
                 ($($name:ident($($arg:ident: $ty:ty),*) -> $ret:ty;)*) => {
                     $(fn $name(&self, $($arg: $ty),*) -> $ret {
-                        self.inner.$name($($arg),*)
+                        GraphRead::$name(&self.inner, $($arg),*)
                     })*
                 };
             }
@@ -3722,14 +3722,14 @@ mod tests {
                         .borrow_mut()
                         .entry(symbol.to_string())
                         .or_default() += 1;
-                    self.inner.annotations(symbol)
+                    GraphRead::annotations(&self.inner, symbol)
                 }
 
                 fn get_node(&self, id: &SymbolId) -> Result<Option<Node>> {
                     if self.missing.as_ref() == Some(id) {
                         return Ok(None);
                     }
-                    self.inner.get_node(id)
+                    GraphRead::get_node(&self.inner, id)
                 }
 
                 fn neighbors(&self, id: &SymbolId, dir: Direction) -> Result<Vec<Edge>> {
@@ -3738,7 +3738,7 @@ mod tests {
                         .borrow_mut()
                         .entry(id.to_string())
                         .or_default() += 1;
-                    self.inner.neighbors(id, dir)
+                    GraphRead::neighbors(&self.inner, id, dir)
                 }
             }
         }
