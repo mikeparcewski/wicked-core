@@ -277,6 +277,8 @@ pub(crate) fn note_engine_home(home: &Path) {
             *g = Some(home.to_path_buf());
         }
     }
+    #[cfg(not(test))]
+    cluster::start_token_renewal();
 }
 
 /// Forget the noted home (live tests: each installs into its own throwaway home).

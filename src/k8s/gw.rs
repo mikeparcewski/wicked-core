@@ -12,7 +12,11 @@
 //! write is `cat > tmp`, then a sha256 check against the digest on the argv, then `mv`: a client
 //! killed mid-write can never commit a partial credential.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdout, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
@@ -24,6 +28,7 @@ use crate::worker_sandbox::FloorUnarmed;
 
 const EXEC_TIMEOUT: Duration = Duration::from_secs(60);
 const READY_TIMEOUT: Duration = Duration::from_secs(120);
+const POD_SPOOL_CAP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// The daemon's gateway as the engine drives it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +50,7 @@ pub(crate) struct LogState {
     pod: String,
     uid: String,
     restarts: u64,
+    lease: Option<Arc<RecordLease>>,
 }
 
 impl LogState {
@@ -58,11 +64,13 @@ impl LogState {
             pod: pod.pointer("/metadata/name")?.as_str()?.to_string(),
             uid: pod.pointer("/metadata/uid")?.as_str()?.to_string(),
             restarts: gateway["restartCount"].as_u64()?,
+            lease: None,
         })
     }
 }
 
 /// Whether current and previous logs can cover the launch (core#1546).
+#[cfg(test)]
 pub(crate) fn logs_complete(
     arm: Option<&LogState>,
     release: Option<&LogState>,
@@ -80,6 +88,752 @@ pub(crate) fn logs_complete(
             .is_some_and(|delta| delta <= 1)
         && current_ok
         && (release.restarts == 0 || previous_ok)
+}
+
+/// A launch holds its coverage window open, including when another launch overlaps it.
+#[derive(Debug)]
+struct RecordLease {
+    spool: Arc<RecordSpool>,
+    id: String,
+}
+
+impl PartialEq for RecordLease {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for RecordLease {}
+
+impl Drop for RecordLease {
+    fn drop(&mut self) {
+        // Serialize idle teardown with new leases. The worker never takes this lock.
+        let mut worker = self.spool.worker.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = self.spool.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.leases.remove(&self.id);
+        if state.leases.is_empty() {
+            state.reset();
+            drop(state);
+            if let Some(worker) = worker.take() {
+                let _ = worker.join();
+            }
+        } else {
+            state.prune();
+        }
+    }
+}
+
+/// Kill the entire local kubectl group and reap its direct child before releasing resources.
+/// A child already reaped is left alone: its pid (and so its group id) may have been reused.
+/// An exited but unreaped child stays a zombie, so its pid cannot be reused before the kill.
+fn stop_record_child(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(Some(_))) {
+        return;
+    }
+    #[cfg(unix)]
+    // SAFETY: each record child is spawned into its own process group.
+    unsafe {
+        libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(windows)]
+    {
+        // Windows has no killpg; taskkill /T includes kubectl's descendants.
+        use wicked_apps_core::HardenedCommand;
+        let _ = std::process::Command::new("taskkill")
+            .hardened()
+            .args(["/F", "/T", "/PID", &child.id().to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[derive(Debug)]
+struct RecordFollower {
+    child: Arc<Mutex<Child>>,
+    writer: Option<std::thread::JoinHandle<()>>,
+    failed: Arc<AtomicBool>,
+}
+
+impl Drop for RecordFollower {
+    fn drop(&mut self) {
+        stop_record_child(&mut self.child.lock().unwrap_or_else(|p| p.into_inner()));
+        if let Some(writer) = self.writer.take() {
+            let _ = writer.join();
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Coverage {
+    uids: HashSet<String>,
+    complete: bool,
+}
+
+#[derive(Debug)]
+struct PodRecords {
+    name: String,
+    path: PathBuf,
+    attached_after: u64,
+    restarts: u64,
+    follower: Option<RecordFollower>,
+    sealed: bool,
+    finished: bool,
+    failed: bool,
+    gone: bool,
+    running: bool,
+}
+
+#[derive(Debug, Default)]
+struct RecordState {
+    pods: HashMap<String, PodRecords>,
+    leases: HashMap<String, Coverage>,
+    watch: Option<Child>,
+    covered: bool,
+}
+
+impl RecordState {
+    fn reset(&mut self) {
+        self.covered = false;
+        if let Some(mut watch) = self.watch.take() {
+            stop_record_child(&mut watch);
+        }
+        for pod in self.pods.values_mut() {
+            // Join writers before unlinking (including on Windows).
+            pod.follower = None;
+            Self::remove_file(&pod.path);
+        }
+        self.pods.clear();
+    }
+
+    fn remove_file(path: &Path) {
+        if let Err(e) = std::fs::remove_file(path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "wicked-core: could not remove gateway spool {}: {e}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    fn prune(&mut self) {
+        self.pods.retain(|uid, pod| {
+            if !pod.gone || self.leases.values().any(|l| l.uids.contains(uid)) {
+                return true;
+            }
+            pod.follower = None;
+            Self::remove_file(&pod.path);
+            false
+        });
+    }
+
+    fn gap(&mut self) {
+        for lease in self.leases.values_mut() {
+            lease.complete = false;
+        }
+    }
+
+    fn interrupt(&mut self) {
+        self.covered = false;
+        self.gap();
+    }
+
+    fn mark_failed_pods(&mut self) {
+        for lease in self.leases.values_mut() {
+            if lease
+                .uids
+                .iter()
+                .any(|uid| self.pods.get(uid).is_some_and(|pod| pod.failed))
+            {
+                lease.complete = false;
+            }
+        }
+    }
+}
+
+/// Leases own the watch and bounded followers. Replacing a pod preserves earlier records
+/// until the last covering lease closes; idle spools own no processes, threads or files.
+#[derive(Debug)]
+struct RecordSpool {
+    gw: Gw,
+    state: Mutex<RecordState>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    cap: u64,
+}
+
+impl RecordSpool {
+    fn lease(gw: &Gw, uid: &str) -> Result<Arc<RecordLease>, String> {
+        static SPOOLS: Mutex<Vec<Weak<RecordSpool>>> = Mutex::new(Vec::new());
+        let mut spools = SPOOLS.lock().unwrap_or_else(|p| p.into_inner());
+        spools.retain(|s| s.strong_count() > 0);
+        let existing = spools
+            .iter()
+            .filter_map(Weak::upgrade)
+            .find(|s| s.gw.dir == gw.dir);
+        let spool = if let Some(spool) = existing {
+            if spool.gw.kube != gw.kube {
+                return Err("the gateway spool already belongs to another cluster setting".into());
+            }
+            spool
+        } else {
+            let records = gw.dir.join("records");
+            std::fs::create_dir_all(&records).map_err(|e| e.to_string())?;
+            // No lease from a previous daemon is live in this process.
+            for entry in std::fs::read_dir(&records).map_err(|e| e.to_string())? {
+                let path = entry.map_err(|e| e.to_string())?.path();
+                if path.extension().is_some_and(|s| s == "log") {
+                    std::fs::remove_file(path).map_err(|e| e.to_string())?;
+                }
+            }
+            let spool = Arc::new(Self {
+                gw: gw.clone(),
+                state: Mutex::new(RecordState::default()),
+                worker: Mutex::new(None),
+                cap: POD_SPOOL_CAP_BYTES,
+            });
+            spools.push(Arc::downgrade(&spool));
+            spool
+        };
+        drop(spools);
+        spool.open_lease(uid)
+    }
+
+    fn open_lease(self: &Arc<Self>, uid: &str) -> Result<Arc<RecordLease>, String> {
+        let mut worker = self.worker.lock().unwrap_or_else(|p| p.into_inner());
+        let id = uuid::Uuid::new_v4().simple().to_string();
+        let first = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            let first = state.leases.is_empty();
+            Self::reap(&mut state);
+            for (uid, pod) in &mut state.pods {
+                if pod.follower.is_none() && !pod.sealed && pod.running && !pod.gone {
+                    let identity = LogState {
+                        pod: pod.name.clone(),
+                        uid: uid.clone(),
+                        restarts: pod.restarts,
+                        lease: None,
+                    };
+                    match self.follow(&identity, &pod.path, true) {
+                        Ok((follower, offset)) => {
+                            pod.follower = Some(follower);
+                            pod.attached_after = offset;
+                            pod.finished = false;
+                            pod.failed = false;
+                        }
+                        Err(e) => {
+                            eprintln!("wicked-core: could not resume gateway follower: {e}");
+                            pod.failed = true;
+                        }
+                    }
+                }
+            }
+            // The first lease is not exposed until startup succeeds. Discovery may
+            // invalidate it before then; never overwrite such a gap at watch startup.
+            let complete = state.covered || first;
+            let mut uids: HashSet<_> = state
+                .pods
+                .iter()
+                .filter(|(_, pod)| !pod.gone)
+                .map(|(uid, _)| uid.clone())
+                .collect();
+            uids.insert(uid.to_string());
+            state.leases.insert(id.clone(), Coverage { uids, complete });
+            state.mark_failed_pods();
+            first
+        };
+        if first {
+            // Publish coverage only after both the list and the new watch are up.
+            let start = self.snapshot().and_then(|version| {
+                let stdout = self.start_watch(&version)?;
+                let spool = Arc::clone(self);
+                std::thread::Builder::new()
+                    .name("gateway-records".into())
+                    .spawn(move || spool.run_watch(version, stdout))
+                    .map_err(|e| e.to_string())
+            });
+            match start {
+                Ok(handle) => {
+                    *worker = Some(handle);
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.mark_failed_pods();
+                }
+                Err(e) => {
+                    let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    state.leases.remove(&id);
+                    state.reset();
+                    return Err(e);
+                }
+            }
+        }
+        drop(worker);
+        Ok(Arc::new(RecordLease {
+            spool: Arc::clone(self),
+            id,
+        }))
+    }
+
+    fn run_watch(self: Arc<Self>, mut version: String, mut stdout: ChildStdout) {
+        loop {
+            let result = self.watch(&mut version, stdout);
+            if self.idle() {
+                return;
+            }
+            if let Err(e) = result {
+                eprintln!("wicked-core: gateway record watch stopped: {e}");
+                self.state
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .interrupt();
+                // A failed watch may need a fresh resourceVersion. snapshot's child is also
+                // tracked, so the final lease can cancel it while it is reading the list.
+                std::thread::sleep(Duration::from_millis(100));
+                loop {
+                    match self.snapshot() {
+                        Ok(next) => {
+                            version = next;
+                            break;
+                        }
+                        Err(e) => {
+                            if self.idle() {
+                                return;
+                            }
+                            eprintln!("wicked-core: gateway record discovery failed: {e}");
+                            std::thread::sleep(Duration::from_millis(100));
+                        }
+                    }
+                }
+            }
+            loop {
+                match self.start_watch(&version) {
+                    Ok(next) => {
+                        stdout = next;
+                        break;
+                    }
+                    Err(e) => {
+                        {
+                            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                            if state.leases.is_empty() {
+                                return;
+                            }
+                            state.interrupt();
+                        }
+                        eprintln!("wicked-core: could not restart gateway watch: {e}");
+                        std::thread::sleep(Duration::from_millis(100));
+                    }
+                }
+            }
+        }
+    }
+
+    fn idle(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .leases
+            .is_empty()
+    }
+
+    // The state lock makes spawning atomic with the final lease's reset. Both list and watch
+    // use this slot, so no kubectl can be spawned after reset or escape cancellation.
+    fn start_stream(&self, args: &[&str], covered: bool) -> Result<ChildStdout, String> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.leases.is_empty() {
+            return Err("gateway record spool is idle".into());
+        }
+        let mut cmd = self.gw.kube.cmd(Some(&self.gw.ns));
+        cmd.args(args).stdout(Stdio::piped()).stderr(Stdio::null());
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let stdout = child.stdout.take().expect("piped gateway stdout");
+        state.watch = Some(child);
+        state.covered = covered;
+        Ok(stdout)
+    }
+
+    fn finish_stream(&self) -> bool {
+        // stdout can close before the process exits. Never block in wait while holding the
+        // state lock: the final lease must still be able to kill a stalled child.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            {
+                let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                state.covered = false;
+                let Some(child) = state.watch.as_mut() else {
+                    return false;
+                };
+                let status = child.try_wait();
+                if !matches!(status, Ok(None)) || Instant::now() >= deadline {
+                    let ok = matches!(status, Ok(Some(status)) if status.success());
+                    if let Some(mut child) = state.watch.take() {
+                        stop_record_child(&mut child);
+                    }
+                    return ok;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn snapshot(&self) -> Result<String, String> {
+        let selector =
+            super::owner_selector(&self.gw.kube.owner, &[(super::ROLE_LABEL, "gateway")]);
+        let stdout = self.start_stream(
+            &[
+                "get",
+                "pods",
+                "-l",
+                &selector,
+                "-o",
+                "json",
+                "--request-timeout=60s",
+            ],
+            false,
+        )?;
+        let list = serde_json::from_reader::<_, serde_json::Value>(stdout);
+        let ok = self.finish_stream();
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if !ok || state.leases.is_empty() {
+            return Err("gateway pod list stopped".into());
+        }
+        let list = list.map_err(|e| e.to_string())?;
+        let version = list
+            .pointer("/metadata/resourceVersion")
+            .and_then(serde_json::Value::as_str)
+            .ok_or("gateway pod list has no resourceVersion")?
+            .to_string();
+        let pods = list["items"]
+            .as_array()
+            .ok_or("gateway pod list has no items")?;
+        for pod in state.pods.values_mut() {
+            pod.gone = true;
+            pod.running = false;
+        }
+        for pod in pods {
+            self.observe(&mut state, pod, false);
+        }
+        Self::reap(&mut state);
+        state.prune();
+        Ok(version)
+    }
+
+    fn start_watch(&self, version: &str) -> Result<ChildStdout, String> {
+        let selector =
+            super::owner_selector(&self.gw.kube.owner, &[(super::ROLE_LABEL, "gateway")]);
+        // `kubectl get` has no resource-version flag. Use the exact list checkpoint.
+        let uri = format!(
+            "/api/v1/namespaces/{}/pods?watch=true&allowWatchBookmarks=true\
+             &resourceVersion={}&labelSelector={}",
+            self.gw.ns,
+            query_component(version),
+            query_component(&selector),
+        );
+        self.start_stream(&["get", "--raw", &uri], true)
+    }
+
+    fn watch(&self, version: &mut String, stdout: ChildStdout) -> Result<(), String> {
+        let stream = serde_json::Deserializer::from_reader(std::io::BufReader::new(stdout))
+            .into_iter::<serde_json::Value>();
+        let mut interrupted = false;
+        for event in stream {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            if state.leases.is_empty() {
+                return Ok(());
+            }
+            match event {
+                Ok(event) => match event["type"].as_str() {
+                    Some("ADDED" | "MODIFIED" | "DELETED") => {
+                        let Some(next) = event
+                            .pointer("/object/metadata/resourceVersion")
+                            .and_then(serde_json::Value::as_str)
+                        else {
+                            interrupted = true;
+                            break;
+                        };
+                        self.observe(&mut state, &event["object"], event["type"] == "DELETED");
+                        *version = next.to_string();
+                        Self::reap(&mut state);
+                        state.prune();
+                    }
+                    Some("BOOKMARK") => {
+                        if let Some(next) = event
+                            .pointer("/object/metadata/resourceVersion")
+                            .and_then(serde_json::Value::as_str)
+                        {
+                            *version = next.to_string();
+                        }
+                    }
+                    _ => {
+                        interrupted = true;
+                        break;
+                    }
+                },
+                Err(_) => {
+                    interrupted = true;
+                    break;
+                }
+            }
+        }
+        if !interrupted {
+            interrupted = !self.finish_stream();
+        }
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(mut child) = state.watch.take() {
+            stop_record_child(&mut child);
+        }
+        if interrupted {
+            state.interrupt();
+            Err("pod event coverage was interrupted; active leases are incomplete".into())
+        } else {
+            // Normal API watch timeouts resume at the last event/bookmark, never a fresh list.
+            Ok(())
+        }
+    }
+
+    fn observe(&self, state: &mut RecordState, pod: &serde_json::Value, deleted: bool) {
+        let Some(identity) = LogState::from_pod(pod) else {
+            state.gap();
+            return;
+        };
+        let statuses = pod
+            .pointer("/status/containerStatuses")
+            .and_then(serde_json::Value::as_array);
+        let running = statuses.is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c["name"] == "gateway" && c.pointer("/state/running").is_some())
+        });
+        let terminated = statuses.is_some_and(|cs| {
+            cs.iter()
+                .any(|c| c["name"] == "gateway" && c.pointer("/state/terminated").is_some())
+        });
+        if !deleted && !running && identity.restarts == 0 && !terminated {
+            return;
+        }
+        if plain_name(&identity.uid).is_err() {
+            state.gap();
+            return;
+        }
+        for lease in state.leases.values_mut() {
+            lease.uids.insert(identity.uid.clone());
+        }
+        let entry = state.pods.entry(identity.uid.clone()).or_insert_with(|| {
+            let path = self
+                .gw
+                .dir
+                .join("records")
+                .join(format!("{}.log", identity.uid));
+            let mut records = PodRecords {
+                name: identity.pod.clone(),
+                path,
+                attached_after: 0,
+                restarts: identity.restarts,
+                follower: None,
+                sealed: false,
+                finished: false,
+                failed: !running || deleted,
+                gone: deleted,
+                running,
+            };
+            if running && !deleted {
+                match self.follow(&identity, &records.path, false) {
+                    Ok((follower, offset)) => {
+                        records.follower = Some(follower);
+                        records.attached_after = offset;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "wicked-core: could not follow gateway {}: {e}",
+                            identity.pod
+                        );
+                        records.failed = true;
+                    }
+                }
+            }
+            records
+        });
+        entry.gone = deleted;
+        entry.running = running && !deleted;
+        // A single follower cannot cover a container restart under the same UID.
+        let restarted = entry.restarts != identity.restarts;
+        entry.failed |= restarted;
+        entry.restarts = identity.restarts;
+        if restarted {
+            state.gap();
+        }
+    }
+
+    fn reap(state: &mut RecordState) {
+        for pod in state.pods.values_mut() {
+            if let Some(follower) = pod.follower.as_ref() {
+                let status = follower
+                    .child
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .try_wait();
+                pod.sealed |= follower.failed.load(Ordering::Acquire);
+                match status {
+                    Ok(Some(status)) => {
+                        // Join the writer before declaring EOF or inspecting its failure.
+                        let follower = pod.follower.take().expect("active follower");
+                        let failed = Arc::clone(&follower.failed);
+                        drop(follower);
+                        pod.sealed |= failed.load(Ordering::Acquire);
+                        pod.finished = true;
+                        pod.failed |= pod.sealed || !status.success() || pod.running;
+                    }
+                    Ok(None) => pod.failed |= pod.sealed,
+                    Err(e) => {
+                        eprintln!("wicked-core: gateway log follower failed: {e}");
+                        pod.failed = true;
+                    }
+                }
+            }
+        }
+        state.mark_failed_pods();
+    }
+
+    fn follow(
+        &self,
+        pod: &LogState,
+        path: &Path,
+        resume: bool,
+    ) -> Result<(RecordFollower, u64), String> {
+        use std::io::{Read as _, Write as _};
+        let mut opts = std::fs::OpenOptions::new();
+        opts.append(true).create_new(!resume);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        }
+        let mut file = opts.open(path).map_err(|e| e.to_string())?;
+        let offset = file.metadata().map_err(|e| e.to_string())?.len();
+        if offset >= self.cap {
+            return Err("gateway pod spool is at its size cap".into());
+        }
+        let mut cmd = self.gw.kube.cmd(Some(&self.gw.ns));
+        cmd.args([
+            "logs",
+            "-f",
+            "-c",
+            "gateway",
+            &pod.pod,
+            "--pod-running-timeout=5s",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        if resume {
+            // Earlier leases retain their gap. New launches append without replay.
+            cmd.arg("--tail=0");
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd.spawn().map_err(|e| e.to_string())?;
+        let mut stdout = child.stdout.take().expect("piped gateway logs");
+        let mut follower = RecordFollower {
+            child: Arc::new(Mutex::new(child)),
+            writer: None,
+            failed: Arc::new(AtomicBool::new(false)),
+        };
+        let child = Arc::clone(&follower.child);
+        let failed = Arc::clone(&follower.failed);
+        let cap = self.cap;
+        let writer = std::thread::Builder::new()
+            .name("gateway-record-writer".into())
+            .spawn(move || {
+                let result = (|| -> std::io::Result<()> {
+                    let mut written = offset;
+                    let mut buf = [0; 8192];
+                    loop {
+                        let count = match stdout.read(&mut buf) {
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            result => result?,
+                        };
+                        if count == 0 {
+                            return Ok(());
+                        }
+                        let allowed = (cap - written).min(count as u64) as usize;
+                        if allowed < count {
+                            failed.store(true, Ordering::Release);
+                        }
+                        file.write_all(&buf[..allowed])?;
+                        written += allowed as u64;
+                        if allowed < count {
+                            return Err(std::io::Error::other(
+                                "gateway pod spool size cap reached",
+                            ));
+                        }
+                    }
+                })();
+                if let Err(e) = result {
+                    // Includes ENOSPC: no silent truncation or resumption after a disk error.
+                    failed.store(true, Ordering::Release);
+                    eprintln!("wicked-core: gateway record writer stopped: {e}");
+                    stop_record_child(&mut child.lock().unwrap_or_else(|p| p.into_inner()));
+                }
+            })
+            .map_err(|e| e.to_string())?;
+        follower.writer = Some(writer);
+        Ok((follower, offset))
+    }
+
+    fn records(&self, id: &str, unit: &str) -> (Vec<GatewayRecord>, bool) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        Self::reap(&mut state);
+        let watching = state
+            .watch
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(None)));
+        let Some(lease) = state.leases.get(id) else {
+            return (Vec::new(), false);
+        };
+        let mut complete = lease.complete && state.covered && watching;
+        let mut records = Vec::new();
+        for uid in &lease.uids {
+            let Some(pod) = state.pods.get(uid) else {
+                complete = false;
+                continue;
+            };
+            complete &= !pod.failed && (!pod.gone || pod.finished);
+            match std::fs::read_to_string(&pod.path) {
+                Ok(log) => {
+                    // An empty, still-pending stream has not demonstrated attachment yet.
+                    complete &= (log.len() as u64 > pod.attached_after || pod.finished)
+                        && (log.is_empty() || log.ends_with('\n'));
+                    records.extend(crate::seat_gateway::parse_records(&log, unit));
+                    complete &= !pod
+                        .follower
+                        .as_ref()
+                        .is_some_and(|f| f.failed.load(Ordering::Acquire));
+                }
+                Err(_) => complete = false,
+            }
+        }
+        (records, complete)
+    }
+}
+
+/// Percent-encode an opaque resourceVersion or label selector as one query component.
+fn query_component(raw: &str) -> String {
+    let mut out = String::new();
+    for byte in raw.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 /// Where a writer write lands.
@@ -185,6 +939,19 @@ pub(crate) fn confirm_script(accepted: bool) -> String {
     )
 }
 
+/// Kill the looping shell and confirm it is gone. Each wget has its own two-second timeout.
+/// Bracket the marker so the cleanup exec cannot match itself.
+fn cleanup_script(marker: &str) -> String {
+    let pattern = format!("[{}]{}", &marker[..1], &marker[1..]);
+    format!(
+        "set -e; pkill -9 -f '{pattern}' || [ $? -eq 1 ]; \
+         i=0; while :; do \
+           if pgrep -f '{pattern}' >/dev/null; then \
+             i=$((i+1)); [ $i -lt 50 ] || exit 70; sleep 0.1; \
+           else code=$?; [ $code -eq 1 ] && exit 0; exit \"$code\"; fi; done"
+    )
+}
+
 /// The broker-read script: for each named file that exists and is a regular file (no link on
 /// the way), `name size` and the body (`presence` names are read as a marker only: `1` when
 /// nonempty).
@@ -260,7 +1027,24 @@ impl Gw {
             script,
             &marker,
         ]);
-        self.kube.call(Some(&self.ns), &args, stdin, limit)
+        let mut result = self.kube.call(Some(&self.ns), &args, stdin, limit);
+        if result.code.is_none() {
+            let cleanup = cleanup_script(&marker);
+            let cleaned = self.kube.call(
+                Some(&self.ns),
+                &[
+                    "exec", "-c", "writer", &self.pod, "--", "sh", "-c", &cleanup,
+                ],
+                None,
+                Duration::from_secs(10),
+            );
+            if !cleaned.ok() {
+                result.stderr.extend_from_slice(
+                    format!("\nremote exec cleanup failed: {}", cleaned.err_text()).as_bytes(),
+                );
+            }
+        }
+        result
     }
 
     /// Replace `<volume>/<file>` with `body`, whole or not at all.
@@ -371,8 +1155,10 @@ impl Gw {
             Ok(())
         } else {
             Err(format!(
-                "the gateway did not {} the unit key in time (its config reload was not applied)",
-                if accepted { "accept" } else { "revoke" }
+                "the gateway did not {} the unit key in time \
+                 (its config reload was not applied): {}",
+                if accepted { "accept" } else { "revoke" },
+                r.err_text()
             ))
         }
     }
@@ -399,64 +1185,31 @@ impl Gw {
 
     /// The named pod's identity and gateway restart count, unknown on a failed read (core#1546).
     pub(crate) fn log_state(&self) -> Option<LogState> {
-        self.kube
+        let mut state = self
+            .kube
             .get_json(Some(&self.ns), "pod", &self.pod)
             .ok()
             .flatten()
             .as_ref()
-            .and_then(LogState::from_pod)
+            .and_then(LogState::from_pod)?;
+        match RecordSpool::lease(self, &state.uid) {
+            Ok(lease) => state.lease = Some(lease),
+            Err(e) => eprintln!("wicked-core: gateway records will be incomplete: {e}"),
+        }
+        Some(state)
     }
 
     /// The launch's access-log records and whether the available logs cover it (core#1546).
     pub(crate) fn records(
         &self,
-        since: &str,
+        _since: &str,
         unit: &str,
         arm: Option<&LogState>,
     ) -> (Vec<GatewayRecord>, bool) {
-        let Some(gw) = self.find_current() else {
+        let Some(lease) = arm.and_then(|state| state.lease.as_ref()) else {
             return (Vec::new(), false);
         };
-        let since = since
-            .parse::<u64>()
-            .map(super::rfc3339)
-            .unwrap_or_else(|_| super::rfc3339(0));
-        let t = format!("--since-time={since}");
-        let release = gw.log_state();
-        let mut out = Vec::new();
-        let mut previous_ok = false;
-        let mut current_ok = false;
-        for previous in [true, false] {
-            if previous && !release.as_ref().is_some_and(|s| s.restarts > 0) {
-                continue;
-            }
-            let mut a = vec!["logs", "-c", "gateway", gw.pod.as_str(), t.as_str()];
-            if previous {
-                a.push("--previous");
-            }
-            let r = gw.kube.call(Some(&gw.ns), &a, None, EXEC_TIMEOUT);
-            if previous {
-                previous_ok = r.ok();
-            } else {
-                current_ok = r.ok();
-            }
-            if !r.ok() {
-                continue;
-            }
-            out.extend(crate::seat_gateway::parse_records(
-                &String::from_utf8_lossy(&r.stdout),
-                unit,
-            ));
-            out.extend(crate::seat_gateway::parse_records(
-                &String::from_utf8_lossy(&r.stderr),
-                unit,
-            ));
-        }
-        // A restart during the reads can split the two logs too (core#1546).
-        let stable = release == gw.find_current().and_then(|current| current.log_state());
-        let complete = stable && logs_complete(arm, release.as_ref(), previous_ok, current_ok);
-        // Known limits (core#1546): no durable accumulation; rotation and clock skew are unseen.
-        (out, complete)
+        lease.spool.records(&lease.id, unit)
     }
 }
 
@@ -1116,6 +1869,547 @@ pub(crate) fn claude_seat_token(_gw: &Gw) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    struct TestDir(PathBuf);
+
+    #[cfg(unix)]
+    impl TestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("wicked-gw-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait_until(message: &str, mut ready: impl FnMut() -> bool) {
+        let start = Instant::now();
+        while !ready() {
+            assert!(start.elapsed() < Duration::from_secs(5), "{message}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    fn record_gateway(dir: &TestDir) -> Gw {
+        use std::os::unix::fs::PermissionsExt;
+        let kubectl = dir.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+while [ "$1" != get ] && [ "$1" != logs ]; do shift; done
+case "$1:$2" in
+    get:pod) cat pod.json;;
+    get:pods)
+        if [ -f block-list ]; then
+            sleep 300 &
+            echo "$!" > list-descendant
+            wait
+            exit 23
+        fi
+        printf '{"metadata":{"resourceVersion":"1"},"items":['
+        cat pod.json
+        printf ']}';;
+    get:--raw)
+        sleep 300 &
+        echo "$!" > watch-descendant
+        while [ ! -f interrupt-watch ]; do sleep 0.02; done
+        printf '{"type":"ERROR"}\n'
+        wait;;
+    logs:*)
+        echo "$$" >> followers
+        sleep 300 &
+        echo "$!" > follower-descendant
+        cat record
+        while :; do
+            if [ -f burst ]; then cat burst; rm burst; fi
+            sleep 0.02
+        done;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pod = serde_json::json!({
+            "metadata": {"name": "pod-1", "uid": "uid-1", "resourceVersion": "1"},
+            "status": {"containerStatuses": [{"name": "gateway", "restartCount": 0,
+                "ready": true, "state": {"running": {}}}]}
+        });
+        std::fs::write(dir.path().join("pod.json"), pod.to_string()).unwrap();
+        std::fs::write(
+            dir.path().join("record"),
+            concat!(
+                "{\"scope\":\"request\",\"wicked_unit\":\"launch@nonce\",",
+                "\"wicked_run\":\"run\",\"http.status\":200,\"llm_model\":\"A\"}\n",
+            ),
+        )
+        .unwrap();
+        Gw {
+            kube: Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "test".into(),
+            },
+            ns: "test".into(),
+            pod: "pod-1".into(),
+            service_ip: String::new(),
+            dir: dir.path().into(),
+        }
+    }
+
+    #[cfg(unix)]
+    fn process_running(pid: u32) -> bool {
+        // ps also distinguishes orphaned zombies on systems whose init reaps slowly.
+        let result = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .unwrap();
+        let stat = String::from_utf8_lossy(&result.stdout);
+        !stat.trim().is_empty() && !stat.trim().starts_with('Z')
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_record_lease_kills_children_removes_files_and_restarts_fresh() {
+        let dir = TestDir::new();
+        let gw = record_gateway(&dir);
+        let arm = gw.log_state().unwrap();
+        let overlap = gw.log_state().unwrap();
+        let spool = Arc::clone(&arm.lease.as_ref().unwrap().spool);
+        wait_until("initial records were not covered", || {
+            gw.records("0", "launch@nonce", Some(&arm)).1
+                && ["watch-descendant", "follower-descendant"]
+                    .iter()
+                    .all(|name| {
+                        std::fs::read_to_string(dir.path().join(name))
+                            .is_ok_and(|pid| pid.trim().parse::<u32>().is_ok())
+                    })
+        });
+        let (watch, follower) = {
+            let state = spool.state.lock().unwrap();
+            let follower = state.pods["uid-1"]
+                .follower
+                .as_ref()
+                .unwrap()
+                .child
+                .lock()
+                .unwrap()
+                .id();
+            (state.watch.as_ref().unwrap().id(), follower)
+        };
+        let descendants: Vec<u32> = ["watch-descendant", "follower-descendant"]
+            .iter()
+            .map(|name| {
+                std::fs::read_to_string(dir.path().join(name))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap()
+            })
+            .collect();
+        drop(arm);
+        assert!(process_running(watch));
+        assert!(process_running(follower));
+        assert!(dir.path().join("records/uid-1.log").is_file());
+        drop(overlap);
+        assert!(
+            spool.worker.lock().unwrap().is_none(),
+            "watch thread was not joined"
+        );
+        {
+            let state = spool.state.lock().unwrap();
+            assert!(state.watch.is_none());
+            assert!(state.pods.is_empty());
+            assert!(state.leases.is_empty());
+            assert!(!state.covered);
+        }
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("records"))
+                .unwrap()
+                .count(),
+            0
+        );
+        for pid in [watch, follower] {
+            // The daemon must reap its direct children, not leave zombies behind.
+            // SAFETY: signal zero only probes the PIDs of this test's kubectl children.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, 0) }, -1);
+        }
+        for pid in descendants {
+            wait_until("a record process group descendant survived", || {
+                !process_running(pid)
+            });
+        }
+
+        // Keep the idle spool alive to exercise its reset path, rather than a new registry entry.
+        std::fs::write(dir.path().join("record"), b"fresh\n").unwrap();
+        let next = gw.log_state().unwrap();
+        assert!(Arc::ptr_eq(&spool, &next.lease.as_ref().unwrap().spool));
+        wait_until("a later lease did not start fresh", || {
+            std::fs::read_to_string(dir.path().join("records/uid-1.log"))
+                .is_ok_and(|log| log == "fresh\n")
+        });
+        assert!(spool.state.lock().unwrap().covered);
+        assert!(gw.records("0", "launch@nonce", Some(&next)).0.is_empty());
+        drop(next);
+        assert!(spool.worker.lock().unwrap().is_none());
+        assert!(!dir.path().join("records/uid-1.log").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn last_lease_cancels_discovery_during_watch_recovery() {
+        let dir = TestDir::new();
+        let gw = record_gateway(&dir);
+        let arm = gw.log_state().unwrap();
+        let spool = Arc::clone(&arm.lease.as_ref().unwrap().spool);
+        wait_until("initial watch was not covered", || {
+            gw.records("0", "launch@nonce", Some(&arm)).1
+        });
+        std::fs::write(dir.path().join("block-list"), b"").unwrap();
+        std::fs::write(dir.path().join("interrupt-watch"), b"").unwrap();
+        wait_until("recovery did not start discovery", || {
+            std::fs::read_to_string(dir.path().join("list-descendant"))
+                .is_ok_and(|pid| pid.trim().parse::<u32>().is_ok())
+        });
+        let list = spool.state.lock().unwrap().watch.as_ref().unwrap().id();
+        let descendant: u32 = std::fs::read_to_string(dir.path().join("list-descendant"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(!spool.state.lock().unwrap().covered);
+        drop(arm);
+        assert!(!process_running(list));
+        wait_until("discovery's descendant survived", || {
+            !process_running(descendant)
+        });
+        assert!(spool.worker.lock().unwrap().is_none());
+        assert!(spool.state.lock().unwrap().pods.is_empty());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("records"))
+                .unwrap()
+                .count(),
+            0
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capped_pod_stops_writing_and_invalidates_all_covering_leases() {
+        let dir = TestDir::new();
+        let gw = record_gateway(&dir);
+        std::fs::create_dir_all(dir.path().join("records")).unwrap();
+        let spool = Arc::new(RecordSpool {
+            gw,
+            state: Mutex::new(RecordState::default()),
+            worker: Mutex::new(None),
+            cap: 256,
+        });
+        let first = spool.open_lease("uid-1").unwrap();
+        let second = spool.open_lease("uid-1").unwrap();
+        wait_until("initial records were not covered", || {
+            spool.records(&first.id, "launch@nonce").1
+                && spool.records(&second.id, "launch@nonce").1
+        });
+        let pid = spool.state.lock().unwrap().pods["uid-1"]
+            .follower
+            .as_ref()
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .id();
+        std::fs::write(dir.path().join("burst.tmp"), vec![b'x'; 2048]).unwrap();
+        std::fs::rename(dir.path().join("burst.tmp"), dir.path().join("burst")).unwrap();
+        wait_until("capped follower did not stop", || {
+            let mut state = spool.state.lock().unwrap();
+            RecordSpool::reap(&mut state);
+            let pod = &state.pods["uid-1"];
+            pod.sealed && pod.follower.is_none()
+        });
+        assert!(!process_running(pid));
+        assert!(!spool.records(&first.id, "launch@nonce").1);
+        assert!(!spool.records(&second.id, "launch@nonce").1);
+        let path = dir.path().join("records/uid-1.log");
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), spool.cap);
+
+        let later = spool.open_lease("uid-1").unwrap();
+        assert!(!spool.records(&later.id, "launch@nonce").1);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), spool.cap);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("followers"))
+                .unwrap()
+                .lines()
+                .count(),
+            1,
+            "a capped pod must never resume within the active spool",
+        );
+        drop(first);
+        drop(second);
+        assert!(path.exists());
+        drop(later);
+        assert!(!path.exists());
+        assert!(spool.worker.lock().unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lease_records_survive_a_gateway_pod_replacement() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let kubectl = dir.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+while [ "$1" != get ] && [ "$1" != logs ]; do shift; done
+case "$1" in
+get)
+    if [ "$2" = pod ]; then cat pod.json
+    else case " $* " in
+        *' --raw '*)
+            previous=$(cat watch-start.json)
+            while [ -f pod.json ]; do
+                current=$(cat pod.json)
+                if [ "$current" != "$previous" ]; then
+                    printf '{"type":"DELETED","object":%s}\n' "$previous"
+                    printf '{"type":"ADDED","object":%s}\n' "$current"
+                    previous=$current
+                fi
+                sleep 0.02
+            done;;
+        *) cp pod.json watch-start.json
+           printf '{"metadata":{"resourceVersion":"1"},"items":['; cat pod.json; printf ']}';;
+    esac; fi;;
+logs)
+    case " $* " in *' pod-1 '*) pod=1;; *) pod=2;; esac
+    printf '%s\n' "$pod" >> followers
+    case " $* " in *' --tail=0 '*) :;; *) cat "record-$pod";; esac
+    while [ ! -f "end-$pod" ]; do
+        if [ -f "more-$pod" ]; then cat "more-$pod"; rm "more-$pod"; fi
+        sleep 0.02
+    done;;
+esac
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let pod = |n: u64| {
+            serde_json::json!({
+                "metadata": {
+                    "name": format!("pod-{n}"),
+                    "uid": format!("uid-{n}"),
+                    "resourceVersion": n.to_string(),
+                },
+                "status": {"containerStatuses": [{"name": "gateway", "restartCount": 0,
+                    "ready": true, "state": {"running": {}}}]}
+            })
+        };
+        let set_pod = |n| {
+            let tmp = dir.path().join("pod.tmp");
+            std::fs::write(&tmp, pod(n).to_string()).unwrap();
+            std::fs::rename(tmp, dir.path().join("pod.json")).unwrap();
+        };
+        let record = |unit: &str, model: &str| {
+            let value = serde_json::json!({
+                "scope": "request", "wicked_unit": unit, "wicked_run": "run",
+                "http.status": 200, "llm_model": model,
+            });
+            format!("{value}\n")
+        };
+        for (n, model) in [(1, "A"), (2, "B")] {
+            std::fs::write(
+                dir.path().join(format!("record-{n}")),
+                record("launch@nonce", model),
+            )
+            .unwrap();
+        }
+        set_pod(1);
+        let gw = Gw {
+            kube: Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "test".into(),
+            },
+            ns: "test".into(),
+            pod: "pod-1".into(),
+            service_ip: String::new(),
+            dir: dir.path().into(),
+        };
+        let arm = gw.log_state().unwrap();
+        let overlapping = gw.log_state().unwrap();
+        let wait_for_spool = |uid: &str| {
+            wait_until("follower did not spool the pod", || {
+                std::fs::read_to_string(dir.path().join(format!("records/{uid}.log")))
+                    .is_ok_and(|s| s.contains("launch@nonce"))
+            });
+        };
+        wait_for_spool("uid-1");
+        set_pod(2);
+        std::fs::write(dir.path().join("end-1"), b"").unwrap();
+        wait_for_spool("uid-2");
+        wait_until("both serving pods were not covered", || {
+            gw.records("0", "launch@nonce", Some(&arm)).1
+        });
+        let (records, complete) = gw.records("0", "launch@nonce", Some(&arm));
+        let mut models: Vec<_> = records.iter().filter_map(|r| r.model.as_deref()).collect();
+        models.sort_unstable();
+        assert_eq!(models, ["A", "B"]);
+        assert!(
+            complete,
+            "both serving pods were followed throughout the lease"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("followers"))
+                .unwrap()
+                .lines()
+                .count(),
+            2,
+        );
+        assert_eq!(
+            gw.records("0", "launch@nonce", Some(&overlapping)).0.len(),
+            2
+        );
+
+        // A later lease restarts a dead follower at the live tail. Earlier windows retain
+        // their gap; replay must not duplicate the A/B evidence already in the spool.
+        let spool = &arm.lease.as_ref().unwrap().spool;
+        spool
+            .state
+            .lock()
+            .unwrap()
+            .pods
+            .get_mut("uid-2")
+            .unwrap()
+            .follower
+            .as_ref()
+            .unwrap()
+            .child
+            .lock()
+            .unwrap()
+            .kill()
+            .unwrap();
+        wait_until("follower did not exit", || {
+            !gw.records("0", "launch@nonce", Some(&arm)).1
+        });
+        let resumed = gw.log_state().unwrap();
+        wait_until("follower did not resume", || {
+            std::fs::read_to_string(dir.path().join("followers"))
+                .unwrap()
+                .lines()
+                .count()
+                >= 3
+        });
+        std::fs::write(dir.path().join("more.tmp"), record("launch@resumed", "C")).unwrap();
+        std::fs::rename(dir.path().join("more.tmp"), dir.path().join("more-2")).unwrap();
+        wait_until("resumed stream did not append", || {
+            std::fs::read_to_string(dir.path().join("records/uid-2.log"))
+                .unwrap()
+                .contains("launch@resumed")
+        });
+        let (records, complete) = gw.records("0", "launch@resumed", Some(&resumed));
+        assert_eq!(records.len(), 1);
+        assert!(complete);
+        let (records, complete) = gw.records("0", "launch@nonce", Some(&arm));
+        assert_eq!(records.len(), 2);
+        assert!(!complete);
+
+        // A pod first observed after it ended is an explicit coverage gap.
+        let mut missed = pod(3);
+        missed["status"]["containerStatuses"][0]["state"] = serde_json::json!({"terminated": {}});
+        std::fs::write(dir.path().join("pod.tmp"), missed.to_string()).unwrap();
+        std::fs::rename(dir.path().join("pod.tmp"), dir.path().join("pod.json")).unwrap();
+        wait_until("missed pod event was not observed", || {
+            arm.lease
+                .as_ref()
+                .unwrap()
+                .spool
+                .state
+                .lock()
+                .unwrap()
+                .pods
+                .contains_key("uid-3")
+        });
+        assert!(!gw.records("0", "launch@nonce", Some(&arm)).1);
+        std::fs::write(dir.path().join("end-2"), b"").unwrap();
+        drop(arm);
+        assert!(dir.path().join("records/uid-1.log").is_file());
+        drop(overlapping);
+        assert!(!dir.path().join("records/uid-1.log").exists());
+        drop(resumed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_confirmation_cleans_up_the_same_remote_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TestDir::new();
+        let kubectl = dir.path().join("kubectl");
+        std::fs::write(
+            &kubectl,
+            r#"#!/bin/sh
+cd "$(dirname "$0")" || exit 1
+while [ "$1" != exec ]; do shift; done
+shift
+while [ "$1" != -- ]; do shift; done
+shift
+if [ ! -f marker ]; then
+    for arg do marker=$arg; done
+    printf '%s' "$marker" > marker
+    sleep 30
+else
+    printf '%s\n' "$@" > cleanup
+    exit 23
+fi
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let gw = Gw {
+            kube: Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "test".into(),
+            },
+            ns: "test".into(),
+            pod: "gateway".into(),
+            service_ip: String::new(),
+            dir: dir.path().into(),
+        };
+        let result = gw.exec_marked(
+            "wicked-writer-",
+            &confirm_script(true),
+            Some(b"test-key\n"),
+            Duration::from_millis(300),
+        );
+        assert_eq!(result.code, None);
+        let marker = std::fs::read_to_string(dir.path().join("marker")).unwrap();
+        let cleanup = std::fs::read_to_string(dir.path().join("cleanup"))
+            .expect("a timed-out exec must issue a bounded cleanup exec");
+        // The bracketed pattern avoids killing the cleanup shell itself.
+        assert!(cleanup.contains(&format!("[{}]{}", &marker[..1], &marker[1..])));
+        assert!(cleanup.contains("pkill -9 -f"));
+        assert!(cleanup.contains("pgrep -f"));
+        assert!(result.err_text().contains("cleanup"), "{result:?}");
+    }
 
     #[test]
     fn log_completeness_requires_the_same_pod_and_all_available_logs_1546() {

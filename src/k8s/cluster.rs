@@ -50,14 +50,6 @@ pub(crate) fn probe_cached(kube: &Kube) -> Result<(), (FloorUnarmed, String)> {
         }
     }
     probe(kube)?;
-    // The engine's own token is renewed while the cluster answers (B-5): a 30-day TokenRequest,
-    // renewed inside its last week. Only the engine's own context (an operator's kubeconfig is
-    // never rewritten); a failed renewal is reported and the old token used until it expires.
-    if renews(kube) {
-        if let Err(e) = renew_token_if_due(kube) {
-            eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
-        }
-    }
     if let Ok(mut last) = LAST.lock() {
         *last = Some((kube.clone(), std::time::Instant::now()));
     }
@@ -407,6 +399,7 @@ pub(crate) fn admission_enforced(engine: &Kube) -> Result<(), String> {
 
 /// How long an engine token lives, and when it is renewed.
 pub(crate) const TOKEN_LIFETIME: &str = "720h";
+#[cfg(any(not(test), unix))]
 const TOKEN_RENEW_BELOW_SECS: u64 = 7 * 24 * 3600;
 
 /// A TokenRequest token for the engine account (never stored in the cluster's datastore).
@@ -443,14 +436,101 @@ pub(crate) fn token_expiry(token: &str) -> Option<u64> {
         .as_u64()
 }
 
-/// Renew the engine's own token (a TokenRequest it may make for itself only) when less than a
-/// week is left; the kubeconfig is rewritten in place. `Ok(false)` = nothing to do.
-pub(crate) fn renew_token_if_due(engine: &Kube) -> Result<bool, String> {
-    renew_token_below(engine, TOKEN_RENEW_BELOW_SECS)
+/// One daemon timer, independent of probes. Resolve settings again after a missing/expired
+/// credential so a later install can be picked up; operator credentials are never renewed.
+#[cfg(not(test))]
+pub(super) fn start_token_renewal() {
+    static START: std::sync::Once = std::sync::Once::new();
+    START.call_once(|| {
+        if let Err(e) = std::thread::Builder::new()
+            .name("k8s-token-renewal".into())
+            .spawn(|| {
+                let mut backoff = 1;
+                loop {
+                    let engine = super::engine_home().and_then(|h| super::kube_for(&h).ok());
+                    let delay = match engine.filter(renews) {
+                        Some(engine) => token_renewal_step(&engine, unix_now(), &mut backoff),
+                        None => Duration::from_secs(60),
+                    };
+                    std::thread::sleep(delay);
+                }
+            })
+        {
+            eprintln!("wicked-core: could not start cluster token renewal: {e}");
+        }
+    });
 }
 
-/// [`renew_token_if_due`] with its threshold (a test renews at once with `u64::MAX`).
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(any(not(test), unix))]
+fn credential_expiry(engine: &Kube) -> Result<u64, String> {
+    let path = engine.kubeconfig.as_deref().ok_or("no engine kubeconfig")?;
+    let raw = std::fs::read(path).map_err(|e| e.to_string())?;
+    let cfg: Value = serde_json::from_slice(&raw).map_err(|e| e.to_string())?;
+    cfg.pointer("/users/0/user/token")
+        .and_then(Value::as_str)
+        .and_then(token_expiry)
+        .ok_or_else(|| "the engine token has no expiry".into())
+}
+
+/// A timer tick with an injected wall clock. The caller checks `renews` before entering.
+/// Failed requests back off only within the old token's remaining validity.
+#[cfg(any(not(test), unix))]
+fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
+    let expiry = match credential_expiry(engine) {
+        Ok(expiry) => expiry,
+        Err(e) => {
+            eprintln!("wicked-core: could not schedule cluster token renewal: {e}");
+            let delay = *backoff;
+            *backoff = (*backoff).saturating_mul(2).min(60);
+            return Duration::from_secs(delay);
+        }
+    };
+    if expiry <= now {
+        // An expired credential cannot authorize its replacement. Re-read for a new install.
+        return Duration::from_secs(60);
+    }
+    let due = expiry.saturating_sub(TOKEN_RENEW_BELOW_SECS);
+    if now < due {
+        *backoff = 1;
+        return Duration::from_secs(due - now);
+    }
+    match renew_token_at(engine, TOKEN_RENEW_BELOW_SECS, now) {
+        Ok(_) => {
+            *backoff = 1;
+            match credential_expiry(engine) {
+                Ok(exp) => Duration::from_secs(
+                    exp.saturating_sub(now.saturating_add(TOKEN_RENEW_BELOW_SECS))
+                        .max(1),
+                ),
+                Err(e) => {
+                    eprintln!("wicked-core: renewed cluster token has no usable expiry: {e}");
+                    Duration::from_secs(60)
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
+            let delay = (*backoff).min(expiry - now);
+            *backoff = (*backoff).saturating_mul(2).min(60);
+            Duration::from_secs(delay)
+        }
+    }
+}
+
+/// Renew below a threshold (the live test renews at once with `u64::MAX`).
+#[cfg(test)]
 pub(crate) fn renew_token_below(engine: &Kube, below_secs: u64) -> Result<bool, String> {
+    renew_token_at(engine, below_secs, unix_now())
+}
+
+fn renew_token_at(engine: &Kube, below_secs: u64, now: u64) -> Result<bool, String> {
     let Some(path) = engine.kubeconfig.clone() else {
         return Ok(false);
     };
@@ -459,10 +539,6 @@ pub(crate) fn renew_token_below(engine: &Kube, below_secs: u64) -> Result<bool, 
     let Some(token) = cfg.pointer("/users/0/user/token").and_then(Value::as_str) else {
         return Ok(false);
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
     if token_expiry(token).is_some_and(|exp| exp > now.saturating_add(below_secs)) {
         return Ok(false);
     }
@@ -1037,4 +1113,96 @@ pub(crate) fn ensure_pids_limited(
     })?;
     *cache = Some((key, std::time::Instant::now(), n));
     Ok(n)
+}
+
+#[cfg(all(test, unix))]
+mod renewal_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn idle_timer_renews_at_the_expiry_margin_without_a_probe() {
+        use base64::Engine as _;
+        let token = |exp| {
+            format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!(r#"{{"exp":{exp}}}"#))
+            )
+        };
+        let dir =
+            std::env::temp_dir().join(format!("wicked-token-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubectl = dir.join("kubectl");
+        let now = 1_000_000;
+        let expiry = now + TOKEN_RENEW_BELOW_SECS + 10;
+        let fresh = token(expiry + 30 * 24 * 3600);
+        std::fs::write(
+            &kubectl,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n\
+                 *'create token wicked-engine'*) printf '%s' '{fresh}';;\n\
+                 *) exit 91;; esac\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&kubectl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = super::super::own_kubeconfig(&dir);
+        write_private(
+            &path,
+            &serde_json::to_vec(&engine_kubeconfig(
+                json!({"server": "https://unused"}),
+                &token(expiry),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let engine = Kube {
+            kubectl,
+            kubeconfig: Some(path.clone()),
+            context: OWN_CONTEXT.into(),
+            owner: "test".into(),
+        };
+        let mut backoff = 1;
+        assert_eq!(
+            token_renewal_step(&engine, now, &mut backoff),
+            Duration::from_secs(10),
+        );
+        assert!(!std::fs::read_to_string(&path).unwrap().contains(&fresh));
+        // The daemon sleeps to the threshold; no probe or arm occurs as time advances.
+        let delay = token_renewal_step(&engine, now + 10, &mut backoff);
+        assert!(std::fs::read_to_string(&path).unwrap().contains(&fresh));
+        assert!(delay > Duration::from_secs(TOKEN_RENEW_BELOW_SECS));
+
+        // Failed requests back off within validity, then stop at expiry even while idle.
+        write_private(
+            &path,
+            &serde_json::to_vec(&engine_kubeconfig(
+                json!({"server": "https://unused"}),
+                &token(now + 3),
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            &engine.kubectl,
+            "#!/bin/sh\ncd \"$(dirname \"$0\")\" || exit 1\n\
+             printf 'attempt\\n' >> attempts\nexit 23\n",
+        )
+        .unwrap();
+        for (elapsed, delay) in [(0, 1), (1, 2), (2, 1), (3, 60)] {
+            assert_eq!(
+                token_renewal_step(&engine, now + elapsed, &mut backoff),
+                Duration::from_secs(delay),
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(dir.join("attempts"))
+                .unwrap()
+                .lines()
+                .count(),
+            3,
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }
