@@ -241,9 +241,87 @@ fn once_the_actor_takes_shutdown_no_read_is_answered_off_it() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// (core#1346) The per-run read answers one run's view, with its own units in `ord` order, while
+/// the actor is held, and `None` for a run the store does not hold. A core with no read model (in
+/// memory) answers it through the actor.
+#[test]
+fn session_detail_answers_one_run_off_the_actor() {
+    let (dir, db) = temp_db("one");
+    seed(&db);
+    let core = crate::Core::spawn_with_engine(
+        db,
+        Arc::new(NoCouncil),
+        Arc::new(crate::workflow::StubStepRunner),
+    );
+    core.ping();
+    let (entered_tx, entered) = channel();
+    let (release, release_rx) = channel();
+    core.hold_actor(entered_tx, release_rx);
+    entered
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the actor parks on the hold");
+    // As in the test above: the reads run on their own thread behind a bounded wait, and the hold
+    // is released whatever they do, so a read that fell back to the actor fails instead of hanging.
+    let (done_tx, done) = channel();
+    {
+        let core = core.clone();
+        std::thread::spawn(move || {
+            let _ = done_tx.send((
+                core.session_detail("run-a"),
+                core.session_detail("no-such-run"),
+            ));
+        });
+    }
+    let got = done.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    let (one, unknown) = got.expect("the per-run read answered while the actor was held");
+    let one = one.expect("session_detail").expect("a run the store holds");
+    assert_eq!(one.session.id, "run-a");
+    assert_eq!(
+        one.units.iter().map(|u| u.ord).collect::<Vec<_>>(),
+        vec![1, 2],
+        "the run's own units, in ord order (run-b's unit is not in it)"
+    );
+    assert!(
+        unknown.expect("session_detail").is_none(),
+        "a run the store does not hold is None, not an error"
+    );
+    drop(core);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The actor's own answer (`Command::Project`, for a store with no read model) is the same
+    // per-run fold, over the actor's store.
+    let (dir, db) = temp_db("one-actor");
+    seed(&db);
+    let store = wicked_apps_core::open_store(Some(db.as_str())).unwrap();
+    let one = crate::actor::project_view(&store, "run-a")
+        .unwrap()
+        .expect("a run the store holds");
+    assert_eq!(one.session.id, "run-a");
+    assert_eq!(
+        one.units.iter().map(|u| u.ord).collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    assert!(crate::actor::project_view(&store, "no-such-run")
+        .unwrap()
+        .is_none());
+    drop(store);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mem = crate::Core::spawn_with_engine(
+        ":memory:",
+        Arc::new(NoCouncil),
+        Arc::new(crate::workflow::StubStepRunner),
+    );
+    assert!(
+        mem.session_detail("run-a").unwrap().is_none(),
+        "an in-memory core answers through the actor (Command::Project)"
+    );
+}
+
 /// The Core methods allowed to answer from the read model. Every one is a read a caller shows or
 /// polls; none decides a gate, a reassign, a delivery or a deny.
-const READ_ONLY_METHODS: [&str; 3] = ["sessions", "sessions_detail", "run_team"];
+const READ_ONLY_METHODS: [&str; 4] = ["sessions", "sessions_detail", "session_detail", "run_team"];
 
 /// `(method, line)` for each line of `lib` inside a `fn`.
 fn methods_of(lib: &str) -> Vec<(String, &str)> {

@@ -129,6 +129,12 @@ async function main() {
   assert(Array.isArray(detail) && detail.length === 1, 'sessionsDetail should list 1 session')
   assert(detail[0].session.status === 'completed', `session status should be completed, got ${detail[0].session.status}`)
   console.log('[smoke] ✓ sessionsDetail reflects a completed run')
+  // (core#1346) The per-run read: the same view for one run, and null for an unknown one.
+  const one = JSON.parse(await core.sessionDetail(sessionId))
+  assert(one && one.session.id === sessionId && one.session.status === 'completed', `sessionDetail should read the run, got ${JSON.stringify(one)}`)
+  assert(Array.isArray(one.units) && one.units.length === 1, 'sessionDetail should carry the run\'s one unit')
+  assert(JSON.parse(await core.sessionDetail('no-such-run')) === null, 'sessionDetail of an unknown run should be null')
+  console.log('[smoke] ✓ sessionDetail reads one run (null for an unknown one)')
 
   console.log(`\n[smoke] event stream (${events.length} events): ${events.map((e) => e.type).join(' → ')}`)
   sub.close() // tidy teardown (also exercises the Subscription handle)

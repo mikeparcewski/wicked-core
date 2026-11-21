@@ -515,6 +515,12 @@ export declare class Core {
    */
   sessionsDetail(): Promise<string>
   /**
+   * (core#1346) One run's session + its ordered units, as a JSON `{ session, units }` object, or
+   * `null` for a run the store does not hold: the per-run read, so a poll about one run never
+   * folds every run on the store. Answered off the engine actor where the store allows it.
+   */
+  sessionDetail(runId: string): Promise<string>
+  /**
    * A unit's captured work output (transcript), as a JSON value — a string, or `null` if none.
    * A REJECTED unit answers with whatever PARTIAL output existed at rejection (usability review
    * #1) — the unit record's `status`/`denial` marks it partial; `null` only when no output was
