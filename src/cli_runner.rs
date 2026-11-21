@@ -3316,7 +3316,13 @@ pub(crate) fn verdict_completes_the_turn(
     }
     // (core#1743, codex xreview #2) A result the engine lost in settlement stays a failure: its
     // `failure` gate, not a verdict over work that did not come back.
-    if crate::execute_wrapped::lost_result_reason(&output.output, false).is_some() {
+    if crate::execute_wrapped::lost_result_reason(
+        &output.output,
+        (&output.run_id, output.unit_ix, output.attempt),
+        false,
+    )
+    .is_some()
+    {
         return output;
     }
     engine_note(

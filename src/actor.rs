@@ -7860,7 +7860,13 @@ fn apply_step_result(
         // The reason is the engine's own record (never the seat's text), whole and redacted; only
         // the seat's own words are bounded.
         if let Some(lost) = (unit.tool_cmd.is_none())
-            .then(|| crate::execute_wrapped::lost_result_reason(&output.output, true))
+            .then(|| {
+                crate::execute_wrapped::lost_result_reason(
+                    &output.output,
+                    (&output.run_id, output.unit_ix, output.attempt),
+                    true,
+                )
+            })
             .flatten()
         {
             let reason = crate::deliver_lift::redact_log_text(&lost);
@@ -36506,6 +36512,7 @@ mod seat_failover_tests {
         );
         let lost = crate::execute_wrapped::settle_failure_output(
             "claude",
+            (&run_id, 0, 3),
             &format!(
                 "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
                 crate::execute_wrapped::SETTLE_FAILED
@@ -36585,6 +36592,7 @@ mod seat_failover_tests {
             );
             let lost = crate::execute_wrapped::settle_failure_output(
                 "claude",
+                (&run_id, 0, 0),
                 &format!("{}{reason}", crate::execute_wrapped::SETTLE_FAILED),
                 &"the seat's own report of its extraction page\n".repeat(200),
             );

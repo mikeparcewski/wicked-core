@@ -1999,7 +1999,12 @@ fn k8s_a_failed_settlement_keeps_the_clis_output_as_the_result_lost_frame() {
         "{}the write-back was refused: `x` is inside a git dir",
         crate::execute_wrapped::SETTLE_FAILED
     );
-    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "minutes of work");
+    let out = crate::execute_wrapped::settle_failure_output(
+        "claude",
+        ("t", 0, 0),
+        &err,
+        "minutes of work",
+    );
     assert!(
         out.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
         "{out}"
@@ -2016,7 +2021,7 @@ fn k8s_a_failed_settlement_keeps_the_clis_output_as_the_result_lost_frame() {
         crate::execute_wrapped::SETTLE_FAILED,
         crate::execute_wrapped::SETTLE_SEP
     );
-    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "");
+    let out = crate::execute_wrapped::settle_failure_output("claude", ("t", 0, 0), &err, "");
     assert!(
         out.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
         "{out}"
@@ -2035,7 +2040,8 @@ fn k8s_core_1743_a_multi_line_settlement_reason_stays_on_the_frame_line() {
          with exit code 3",
         crate::execute_wrapped::SETTLE_FAILED
     );
-    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "seat words");
+    let out =
+        crate::execute_wrapped::settle_failure_output("claude", ("t", 0, 0), &err, "seat words");
     let first = out.lines().next().unwrap();
     assert!(
         first.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
