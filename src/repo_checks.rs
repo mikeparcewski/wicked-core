@@ -6039,7 +6039,10 @@ pub(crate) fn run_with_sandbox_ctx(
         untouched,
         None,
     );
-    let Some((why, inputs)) = again else {
+    // (core#1731) A floor the disk watch stopped never starts a second pass: a nested run's stop
+    // (a base, an inventory) leaves its head failure without an environment cause, and running
+    // every check again would only add disk pressure at the stop line.
+    let Some((why, inputs)) = again.filter(|_| scratch.disk_stop.get().is_none()) else {
         return disk_stopped(first, &scratch);
     };
     eprintln!(
@@ -6375,9 +6378,12 @@ fn run_detected(
     // interrupted floor's journal, which may have run in the live worktree (xreview r1).
     let mut ran_here: Vec<CreatorEntry> = Vec::new();
     for check in detected.iter() {
+        // (core#1731) Once the disk watch stopped a run, no further check starts: the floor is
+        // that environment refusal ([`disk_stopped`]).
         if ctx.stop.as_ref().and_then(FloorStop::reason).is_some()
             || failed
             || scratch_error.is_some()
+            || scratch.disk_stop.get().is_some()
         {
             skipped.push(check.name.clone());
             continue;
@@ -6731,6 +6737,14 @@ fn run_detected(
                 again = s.set_aside_by(check, &run);
             }
             s.fresh.push(check.name.clone());
+        }
+        #[cfg(test)]
+        if test_seam::take_disk_stop_after(&check.name) {
+            let _ = scratch.disk_stop.set(format!(
+                "{ENVIRONMENT_REFUSAL_PREFIX} the disk was nearly full during `{}`'s base run \
+                 (test stop)",
+                check.name
+            ));
         }
         // (core#1731) A check decided while the disk watch stopped a run of this floor (its own,
         // its retry's, its base's or an inventory's) is no evidence for a later floor.
@@ -11756,6 +11770,23 @@ pub(crate) mod test_seam {
         static CAP: Cell<Option<u64>> = const { Cell::new(None) };
         static EXCLUDE: Cell<Option<bool>> = const { Cell::new(None) };
         static ADMISSION: Cell<Option<Admission>> = const { Cell::new(None) };
+        static DISK_STOP_AFTER: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+    /// (core#1731) Record a disk-watch stop on this thread's floor once the check `name` is
+    /// decided, as a stop in one of its nested runs (a base, an inventory) would.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn disk_stop_after(name: &str) {
+        DISK_STOP_AFTER.with(|n| *n.borrow_mut() = Some(name.to_string()));
+    }
+    pub(super) fn take_disk_stop_after(name: &str) -> bool {
+        DISK_STOP_AFTER.with(|n| {
+            let mut n = n.borrow_mut();
+            let hit = n.as_deref() == Some(name);
+            if hit {
+                *n = None;
+            }
+            hit
+        })
     }
     pub(super) fn floor_admission_config() -> Option<Admission> {
         ADMISSION.with(Cell::get)

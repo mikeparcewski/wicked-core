@@ -6440,6 +6440,75 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
     let _ = std::fs::remove_dir_all(&wt);
 }
 
+/// (core#1731, coord on #1732) Once the disk watch stopped a run of a floor, no further check
+/// starts, and a fresh failure after reused checks (a nested base stop leaves the head without an
+/// environment cause) never sends the floor round a second time: the floor is the environment
+/// refusal.
+#[cfg(unix)]
+#[test]
+fn core_1731_a_disk_stopped_floor_starts_no_further_check_and_no_second_pass() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    // Headroom: no identical retry, so the e2e run count below is exact (core#1191).
+    let _load = seam::pin(0.5, 4);
+    // The next check after a stop does not start.
+    let r = Core1144::new(
+        "core-1731-skip",
+        serde_json::json!({"typecheck": false, "lint": Core1144::NONCE, "test": Core1144::NONCE}),
+    );
+    seam::disk_stop_after("lint");
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    if creator.checks.is_empty() {
+        eprintln!("repo_checks: no sandbox tool here — the floor cannot run");
+        return;
+    }
+    assert!(
+        creator.skipped.contains(&"test".to_string())
+            && !creator.checks.iter().any(|c| c.name == "test"),
+        "{creator:#?}"
+    );
+    assert!(!creator.passed, "{creator:#?}");
+    assert!(
+        creator
+            .environment_refusal()
+            .is_some_and(|e| e.contains("`lint`'s base run")),
+        "{creator:#?}"
+    );
+    let _ = std::fs::remove_dir_all(&r.wt);
+
+    // No second pass after reused checks (the core#1152 `again` shape).
+    let r = Core1144::new(
+        "core-1731-again",
+        serde_json::json!({
+            "typecheck": false,
+            "lint": ["sh", "-c", "mkdir -p out && echo m > out/marker && echo nonce-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' ')"],
+            "test": Core1144::NONCE,
+            "e2e": ["sh", "-c", "echo e2e-run-$$-$(od -An -N8 -tx8 /dev/urandom | tr -d ' '); test -f out/marker"],
+        }),
+    );
+    let creator = r.guarded(FloorStage::Creator, &r.base, 4, "fix");
+    assert!(creator.passed && r.record_exists(), "{creator:#?}");
+    seam::disk_stop_after("e2e");
+    let verify = r.guarded(FloorStage::Verify, &r.base, 6, "verify");
+    assert!(!verify.passed, "{verify:#?}");
+    assert!(verify.environment_refusal().is_some(), "{verify:#?}");
+    let reuse = verify.reused_from.as_ref().expect("{verify:#?}");
+    assert_eq!(reuse.voided, None, "no second pass: {verify:#?}");
+    let e2e_runs = std::fs::read_dir(r.logs())
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .filter(|e| {
+                    std::fs::read(e.path())
+                        .is_ok_and(|b| String::from_utf8_lossy(&b).starts_with("e2e-run-"))
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    assert_eq!(e2e_runs, 1, "e2e ran once, on the first pass only");
+    let _ = std::fs::remove_dir_all(&r.wt);
+}
+
 /// A stopped journal remains reusable and names the actual interruption.
 #[cfg(unix)]
 #[test]
