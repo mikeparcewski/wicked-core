@@ -1447,6 +1447,38 @@ pub(crate) fn kill_pgroup_graceful(pgid: u32) -> bool {
     if term_rc != 0 {
         return false;
     }
+    escalate_after_term(pgid)
+}
+
+/// (core#1409) A cancel's kill, the actor's half only: SIGTERM the group NOW, before the cancel is
+/// written (AC2 of core#500 needs the kill signalled before the write, not its reaping), and hand
+/// the grace wait and the SIGKILL escalation ([`kill_pgroup_graceful`]'s second half) to a thread
+/// of their own. The actor never sleeps through a group's grace: a group that ignores SIGTERM
+/// held every run's reads and gate answers for 700 ms per group before.
+///
+/// Returns `true` when the SIGTERM reached a live group (what `runCancelled.toolChildrenKilled`
+/// counts), `false` for a bogus pgid (0, 1) or a group already gone (ESRCH). The worker thread
+/// that owns the `Child` still collects it ([`kill_after_stop`]).
+#[cfg(unix)]
+pub(crate) fn signal_pgroup_and_escalate(pgid: u32) -> bool {
+    // The same bounds guard as `kill_pgroup_graceful`: 0 is our own group, 1 is init.
+    if pgid <= 1 {
+        return false;
+    }
+    let pgid = pgid as i32;
+    if unsafe { sig::killpg(pgid, sig::SIGTERM) } != 0 {
+        return false;
+    }
+    std::thread::spawn(move || {
+        let _ = escalate_after_term(pgid);
+    });
+    true
+}
+
+/// After a SIGTERM to `pgid`: wait up to ~500 ms for the group to die, SIGKILL it if it did not,
+/// and confirm the SIGKILL within ~200 ms. `true` = the group is confirmed dead.
+#[cfg(unix)]
+fn escalate_after_term(pgid: i32) -> bool {
     // Poll up to 500 ms in 20 ms ticks for the group to die after SIGTERM.
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {

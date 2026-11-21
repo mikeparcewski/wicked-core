@@ -616,8 +616,11 @@ pub enum CoreEvent {
     /// A paused run was resumed by a human approval (optionally with an amendment applied).
     Resumed { session: String, ord: u32 },
     /// A run was cancelled (by the operator, or by a rejected gate).
-    /// `tool_children_killed` is the count of tool child process groups that were synchronously
-    /// killed BEFORE this event was emitted (core#500 / AC2); 0 when no tool unit was live.
+    /// `tool_children_killed` is the count of tool child process groups that were signalled
+    /// (SIGTERM) BEFORE the cancel was written and this event emitted (core#500 / AC2); 0 when no
+    /// tool unit was live. (core#1409) The SIGKILL escalation of a group that outlives its grace
+    /// runs off the actor, after this event. A kept worktree's `WorktreeRetained` follows this
+    /// event, once the cancel's off-actor reap ends.
     RunCancelled {
         session: String,
         tool_children_killed: u32,

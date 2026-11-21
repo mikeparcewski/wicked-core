@@ -43,6 +43,7 @@ mod power_gate;
 pub(crate) use dispatch_probe::DispatchProbe;
 mod repeat_gate;
 mod team_gate;
+mod worktree_cleanup;
 pub use team_gate::{CONTINUE_WITHOUT_TEAM, TEAM_TRANSPORT_GATE};
 
 /// The actor-owned terminal registry entry (DES §4 "id → status"). Presence in the registry map IS
@@ -1153,6 +1154,11 @@ pub(crate) fn run(
             eprintln!("{notice}");
         }
     }
+    // (core#1434) A cancel's cleanup the last life of this daemon never heard the end of is reaped
+    // again, off the actor, and its outcome said through the same continuation. The boot reaper
+    // below keeps its hands off those trees (counted live): it would reap them on the actor, and a
+    // kept one would be named only on stderr.
+    let cleanups_resumed = worktree_cleanup::resume_pending(&mut store, &self_tx);
     // Startup orphan reaper (FINDING-003): worktrees of runs in a TERMINAL status are reaped when
     // clean (the same rule the terminal-status reap applies — so a crash between a run finishing
     // and its reap, or a run predating the reap, converges here instead of surviving restarts);
@@ -1164,7 +1170,9 @@ pub(crate) fn run(
         if !repos.is_empty() {
             match crate::domain::all_sessions(&store) {
                 Ok(sessions) => {
-                    let (live, terminal) = partition_sessions_for_reap(&sessions);
+                    let (mut live, mut terminal) = partition_sessions_for_reap(&sessions);
+                    terminal.retain(|id| !cleanups_resumed.contains(id));
+                    live.extend(cleanups_resumed.iter().cloned());
                     let owner = crate::repo::bound_daemon_owner();
                     crate::repo::reap_orphan_worktrees(&repos, &live, &terminal, owner.as_deref());
                 }
@@ -1392,6 +1400,12 @@ pub(crate) fn run(
             }
             Command::Projects(reply) => {
                 let _ = reply.send(list_projects(&store));
+            }
+            Command::WorktreeCleanupDone { run_id, reaped } => {
+                worktree_cleanup::done(&mut store, &mut subscribers, &run_id, reaped);
+            }
+            Command::WorktreeCleanupPending { run_id, reply } => {
+                let _ = reply.send(worktree_cleanup::is_pending(&store, &run_id));
             }
             Command::WorkOutput(unit_id, reply) => {
                 // The OPERATOR transcript read (usability review #1): a rejected unit answers with
@@ -22237,10 +22251,11 @@ fn shared_run_terminal(
 /// Mark a run terminally `Cancelled` and emit `RunCancelled` (a no-op status change on an already
 /// terminal run). A late worker result for a cancelled run is discarded by `apply_step_result`'s
 /// terminal guard.
-/// (core#1429) How long a cancel waits on the actor for its worktree reap before the reap goes on
-/// by itself (and says its outcome when it ends).
-const CANCEL_REAP_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
-
+///
+/// (core#1409) Nothing here waits: the tool groups are signalled and their escalation runs on its
+/// own thread, and the worktree reap runs off the actor with its outcome said later
+/// (`worktreeRetained` follows `runCancelled`), so a bulk cancel (`campaign::cancel`,
+/// `fail_fast`) adds no wait per node either (core#1435).
 pub(crate) fn cancel_run(
     store: &mut dyn GraphStore,
     subscribers: &mut crate::event_log::EventSink,
@@ -22267,11 +22282,13 @@ pub(crate) fn cancel_run(
         maps.tombstone_run(run_id);
         maps.advance_launch_seq(run_id);
     }
-    // core#500 / AC2: kill any live tool child group BEFORE the Cancelled status is written to the
-    // store — a reader polling the store between the write and the kill would see a cancelled run
-    // with a live child, violating AC2. SIGTERM → bounded wait → SIGKILL; the background thread
-    // owns the Child handle and will reap after it observes stop(). Double-signalling an
-    // already-dead group is harmless (ESRCH). Returns true only when death is confirmed.
+    // core#500 / AC2: signal any live tool child group BEFORE the Cancelled status is written to
+    // the store — a reader polling the store between the write and the kill would otherwise see a
+    // cancelled run whose child was never told to stop. (core#1409) The SIGTERM is sent here; the
+    // grace wait and the SIGKILL escalation run on a thread of their own, so the actor never waits
+    // out a group's grace. The background thread owns the Child handle and reaps it after it
+    // observes stop(). Double-signalling an already-dead group is harmless (ESRCH). Counts the
+    // groups the SIGTERM reached.
     let tool_children_killed: u32 = {
         #[cfg(unix)]
         {
@@ -22285,7 +22302,7 @@ pub(crate) fn cancel_run(
                 .unwrap_or_default();
             let mut killed = 0u32;
             for pgid in pgroups {
-                if crate::validator::kill_pgroup_graceful(pgid) {
+                if crate::validator::signal_pgroup_and_escalate(pgid) {
                     killed += 1;
                 }
             }
@@ -22308,7 +22325,32 @@ pub(crate) fn cancel_run(
     session.status = SessionStatus::Cancelled;
     power_gate::set_outcome(&*store, &mut session, "cancelled");
     session.finished_at = Some(crate::interaction::now_millis());
-    put_node(store, session.to_node())?;
+    // (core#1434) The worktree cleanup goes on the record in the SAME batch as the cancel: the
+    // reap's outcome is said after the cancel replies, and a stop before it ends must not lose it
+    // (the next boot reaps again and says it, `worktree_cleanup::resume_pending`).
+    let cleanup = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(&*store, id).ok().flatten())
+        .map(|repo| worktree_cleanup::PendingCleanup {
+            run_id: run_id.to_string(),
+            repo_root: repo.root_path,
+            // Review of #456, F6: a kept tree is said on the wire, not only on stderr — the
+            // operator's work survived and this is where. The retention window then applies to
+            // the cancelled tree exactly as to a completed one (`worktree_retained`).
+            path: session.workdir.clone().unwrap_or_default(),
+            reason: format!(
+                "cancelled with uncommitted work the `{}` branch does not carry — the worktree is \
+                 kept (clean-only reap; retained for WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then \
+                 reaped clean-only again)",
+                crate::repo::worktree_branch(run_id)
+            ),
+            pending: true,
+        });
+    match &cleanup {
+        Some(c) => crate::domain::put_nodes(store, &[session.to_node(), c.to_node()])?,
+        None => put_node(store, session.to_node())?,
+    }
     // (core#1390) Only once the cancel is on the store: a dispatch probe still out for this run is
     // no longer its dispatch (a cancel that failed before this leaves the probe to land).
     dispatch_probe::forget(run_id);
@@ -22341,51 +22383,17 @@ pub(crate) fn cancel_run(
     // `refs/wicked/suggestions`. A reject at the deliver gate (F-E2E-030) is the same cancel, one
     // phase later, over verified-but-unpushed work. Uncommitted bytes are never a run's to discard
     // on the operator's behalf; the boot reaper applies this rule to cancelled runs too.
-    if let Some(repo_id) = &session.repo_ref {
-        if let Ok(Some(repo)) = crate::repo::get_repo(store, repo_id) {
-            // Review of #456, F6: a kept tree is said on the wire, not only on stderr — the
-            // operator's work survived and this is where. The retention window then applies to
-            // the cancelled tree exactly as to a completed one (`worktree_retained`).
-            let retained = CoreEvent::WorktreeRetained {
-                session: run_id.to_string(),
-                path: session.workdir.clone().unwrap_or_default(),
-                reason: format!(
-                    "cancelled with uncommitted work the `{}` branch does not carry — the \
-                     worktree is kept (clean-only reap; retained for \
-                     WICKED_COMPLETED_WORKTREE_KEEP_DAYS, then reaped clean-only again)",
-                    crate::repo::worktree_branch(run_id)
-                ),
-            };
-            // (core#1429) The reap runs OFF the actor: removing a large tree (a dependency
-            // directory of thousands of files) took a Stop 175 s on the dev host, and every other
-            // run's gate answer and step result waited behind it. The actor waits a short while
-            // for it, so a small tree's outcome is said in order; a longer reap says its outcome
-            // when it ends (`worktreeRetained` then follows `runCancelled`). A relaunch of the
-            // same run id waits for the reap of its tree (`repo`'s per-tree lock).
-            let (root, rid, tx) = (repo.root_path.clone(), run_id.to_string(), self_tx.clone());
-            let (done_tx, done_rx) = std::sync::mpsc::sync_channel::<bool>(0);
-            let late = retained.clone();
-            // Its place in the tree's queue is taken HERE, before the cancel replies: a relaunch
-            // of this run id (only possible after the reply) mints after the reap.
-            let ticket = crate::repo::reserve_tree(&root, &rid);
-            crate::repo::spawn_bound(move || {
-                let reaped = crate::repo::reap_worktree_with(ticket, &root, &rid);
-                // A rendezvous: delivered only while the actor still waits for it; otherwise the
-                // outcome is posted as an event of its own.
-                if done_tx.send(reaped).is_err() && !reaped {
-                    let _ = tx.send(Command::EmitEvent(late));
-                }
-            });
-            match done_rx.recv_timeout(CANCEL_REAP_WAIT) {
-                Ok(false) => emit(subscribers, retained),
-                Ok(true) => {}
-                Err(_) => eprintln!(
-                    "wicked-core: run {run_id}'s worktree is still being reaped after {} ms; it \
-                     finishes off the actor (core#1429)",
-                    CANCEL_REAP_WAIT.as_millis()
-                ),
-            }
-        }
+    //
+    // (core#1429, core#1409) The reap runs OFF the actor and the cancel does not wait for it:
+    // removing a large tree (a dependency directory of thousands of files) took a Stop 175 s on
+    // the dev host, and every other run's gate answer and step result waited behind it. Its
+    // outcome comes back as `WorktreeCleanupDone`, which says a kept tree (`worktreeRetained`
+    // after `runCancelled`) and resolves the record. Its place in the tree's queue is taken HERE,
+    // before the cancel replies: a relaunch of this run id (only possible after the reply) mints
+    // after the reap.
+    if let Some(c) = &cleanup {
+        let ticket = crate::repo::reserve_tree(&c.repo_root, run_id);
+        worktree_cleanup::start(self_tx, ticket, c);
     }
     emit(
         subscribers,
@@ -38499,13 +38507,31 @@ mod terminal_worktree_reap_tests {
         String::from_utf8_lossy(&out.stdout).contains(branch)
     }
 
-    /// core#1429: a cancel (a Stop at a gate is one) never waits on the actor for a slow reap. With
-    /// the tree's reap held (a dependency directory of thousands of files deleting under load), the
-    /// cancel returns within its short wait, the run is cancelled and said so, and the reap's outcome
-    /// (here: the dirty tree is kept) arrives as its own event once the reap ends. A small reap is
-    /// still said in order, inside the cancel.
+    /// (core#1434) Wait for the continuation a cancel's reap posts for `run_id` (other follow-ups,
+    /// a campaign notice say, may come first) and return its outcome (`true` = the tree went). The
+    /// bound only fails a reap that never ends; it never decides a pass.
+    fn wait_cleanup_done(rx: &std::sync::mpsc::Receiver<Command>, run_id: &str) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Command::WorktreeCleanupDone { run_id: r, reaped }) if r == run_id => {
+                    return reaped
+                }
+                Ok(_) => continue,
+                Err(e) => panic!("the reap of {run_id} says its outcome: {e}"),
+            }
+        }
+    }
+
+    /// core#1429, core#1409, core#1434: a cancel (a Stop at a gate is one) never waits on the actor
+    /// for its reap. With the tree's reap held (a dependency directory of thousands of files
+    /// deleting under load), the cancel replies, the run is cancelled and said so, and the cleanup
+    /// is on the record. Once the reap ends, its continuation says the kept dirty tree
+    /// (`worktreeRetained`, after `runCancelled`) and resolves the record; a second outcome for the
+    /// resolved record says nothing.
     #[test]
-    fn a_cancel_reaps_off_the_actor_and_says_a_late_outcome_when_it_ends() {
+    fn a_cancel_does_not_wait_for_its_reap_and_says_the_outcome_when_it_ends() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let (root, wt) = seeded(&mut store, "cancel-slow", "r-cancel-slow");
         std::fs::write(wt.join("unlanded.txt"), "uncommitted work\n").unwrap();
@@ -38515,72 +38541,192 @@ mod terminal_worktree_reap_tests {
         let (tx, rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let held = crate::repo::hold_tree_for_test(root.to_str().unwrap(), "r-cancel-slow");
-        let t = std::time::Instant::now();
         let status =
             cancel_run(&mut store, &mut subs, &runner, &tx, "r-cancel-slow", &None).unwrap();
-        let took = t.elapsed();
         assert_eq!(status, SessionStatus::Cancelled);
-        assert!(
-            took < CANCEL_REAP_WAIT + std::time::Duration::from_millis(700),
-            "the cancel waited {took:?} on a reap it does not own"
-        );
         let said: Vec<CoreEvent> = ev_rx.try_iter().collect();
         assert!(said
             .iter()
             .any(|e| matches!(e, CoreEvent::RunCancelled { .. })));
-        assert!(!said
-            .iter()
-            .any(|e| matches!(e, CoreEvent::WorktreeRetained { .. })));
+        assert!(
+            !said
+                .iter()
+                .any(|e| matches!(e, CoreEvent::WorktreeRetained { .. })),
+            "nothing of the reap is said inside the cancel: {said:?}"
+        );
+        assert!(
+            super::worktree_cleanup::is_pending(&store, "r-cancel-slow").unwrap(),
+            "the cleanup is on the record, written with the cancel"
+        );
         drop(held);
-        // Other follow-ups the cancel posts (a campaign notice, say) may come first.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            match rx.recv_timeout(left) {
-                Ok(Command::EmitEvent(CoreEvent::WorktreeRetained { session, .. })) => {
-                    assert_eq!(session, "r-cancel-slow");
-                    break;
-                }
-                Ok(_) => continue,
-                Err(e) => panic!("the late reap says its outcome: {e}"),
-            }
-        }
+        let reaped = wait_cleanup_done(&rx, "r-cancel-slow");
+        assert!(!reaped, "the dirty tree is kept");
+        super::worktree_cleanup::done(&mut store, &mut subs, "r-cancel-slow", reaped);
+        let said: Vec<CoreEvent> = ev_rx.try_iter().collect();
+        assert!(
+            said.iter().any(|e| matches!(
+                e,
+                CoreEvent::WorktreeRetained { session, .. } if session == "r-cancel-slow"
+            )),
+            "the kept tree is said once the reap ends: {said:?}"
+        );
+        assert!(
+            !super::worktree_cleanup::is_pending(&store, "r-cancel-slow").unwrap(),
+            "the record is resolved"
+        );
+        super::worktree_cleanup::done(&mut store, &mut subs, "r-cancel-slow", false);
+        assert!(
+            ev_rx.try_iter().next().is_none(),
+            "a resolved cleanup says nothing again"
+        );
         assert!(wt.join("unlanded.txt").is_file(), "the dirty tree is kept");
         let _ = std::fs::remove_dir_all(&root);
+    }
 
-        // A reap that ends inside the wait is said in order, by the cancel itself.
+    /// core#1434: the actor stopped before the reap ended (its channel is gone, so the outcome was
+    /// never heard): the record stays pending. The next boot hands it to an off-actor reap through
+    /// the same continuation, which says the kept tree and resolves the record; a later boot finds
+    /// nothing left. A record of a run that is live again is resolved without a word.
+    #[test]
+    fn a_cleanup_a_stop_left_pending_is_reaped_and_said_at_the_next_boot() {
         let mut store = open_store(Some(":memory:")).unwrap();
-        let (root, wt) = seeded(&mut store, "cancel-fast", "r-cancel-fast");
+        let (root, wt) = seeded(&mut store, "cancel-stop", "r-cancel-stop");
         std::fs::write(wt.join("unlanded.txt"), "uncommitted work\n").unwrap();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        {
+            let mut subs = crate::event_log::EventSink::default();
+            let (tx, rx) = channel::<Command>();
+            drop(rx);
+            cancel_run(&mut store, &mut subs, &runner, &tx, "r-cancel-stop", &None).unwrap();
+        }
+        assert!(
+            super::worktree_cleanup::is_pending(&store, "r-cancel-stop").unwrap(),
+            "an outcome nobody heard leaves the record pending"
+        );
+
+        // The next boot.
+        let (tx, rx) = channel::<Command>();
+        let handed = super::worktree_cleanup::resume_pending(&mut store, &tx);
+        assert!(handed.contains("r-cancel-stop"), "{handed:?}");
+        let reaped = wait_cleanup_done(&rx, "r-cancel-stop");
+        assert!(!reaped, "the dirty tree is kept");
         let (ev_tx, ev_rx) = channel::<CoreEvent>();
         let mut subs = crate::event_log::EventSink::default();
         subs.push(ev_tx);
-        let (tx, rx) = channel::<Command>();
-        cancel_run(&mut store, &mut subs, &runner, &tx, "r-cancel-fast", &None).unwrap();
+        super::worktree_cleanup::done(&mut store, &mut subs, "r-cancel-stop", reaped);
         let said: Vec<CoreEvent> = ev_rx.try_iter().collect();
-        let retained = said
-            .iter()
-            .position(|e| matches!(e, CoreEvent::WorktreeRetained { .. }));
-        let cancelled = said
-            .iter()
-            .position(|e| matches!(e, CoreEvent::RunCancelled { .. }));
-        assert!(cancelled.is_some(), "{said:?}");
-        match retained {
-            Some(r) => assert!(Some(r) < cancelled, "in order, inside the cancel: {said:?}"),
-            // A loaded host can take the small reap past the wait: then it is said late, once.
-            None => {
-                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-                loop {
-                    let left = deadline.saturating_duration_since(std::time::Instant::now());
-                    match rx.recv_timeout(left) {
-                        Ok(Command::EmitEvent(CoreEvent::WorktreeRetained { .. })) => break,
-                        Ok(_) => continue,
-                        Err(e) => panic!("the reap's outcome is said: {e}"),
-                    }
-                }
-            }
-        }
+        assert!(
+            said.iter().any(|e| matches!(
+                e,
+                CoreEvent::WorktreeRetained { session, .. } if session == "r-cancel-stop"
+            )),
+            "the boot says the kept tree: {said:?}"
+        );
+        assert!(!super::worktree_cleanup::is_pending(&store, "r-cancel-stop").unwrap());
+        assert!(
+            super::worktree_cleanup::resume_pending(&mut store, &tx).is_empty(),
+            "nothing is left for a later boot"
+        );
+        assert!(wt.join("unlanded.txt").is_file(), "the dirty tree is kept");
+
+        // A pending record whose run is live again (relaunched) is resolved, not reaped.
+        let relaunched = super::worktree_cleanup::PendingCleanup {
+            run_id: "r-live-again".into(),
+            repo_root: root.to_string_lossy().into_owned(),
+            path: String::new(),
+            reason: String::new(),
+            pending: true,
+        };
+        put_node(&mut store, relaunched.to_node()).unwrap();
+        let mut live = crate::actor::sessions_detail_fold_tests::session("r-live-again");
+        live.status = SessionStatus::Executing;
+        put_node(&mut store, live.to_node()).unwrap();
+        assert!(super::worktree_cleanup::resume_pending(&mut store, &tx).is_empty());
+        assert!(!super::worktree_cleanup::is_pending(&store, "r-live-again").unwrap());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1409: a cancel SIGTERMs a registered tool group before the cancel is written and does
+    /// not wait out its grace on the actor. A group that ignores SIGTERM is still alive when the
+    /// cancel returns (main waited for its SIGKILL, ~700 ms, on the actor), is counted on
+    /// `runCancelled`, and is dead soon after: the SIGKILL escalation runs on its own thread.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_signals_a_term_ignoring_group_and_does_not_wait_out_its_grace() {
+        use std::os::unix::process::CommandExt;
+        let mut store = open_store(Some(":memory:")).unwrap();
+        put_node(
+            &mut store,
+            crate::actor::sessions_detail_fold_tests::session("r-kill").to_node(),
+        )
+        .unwrap();
+        let ready = std::env::temp_dir().join(format!(
+            "wicked-kill-ready-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&ready);
+        // The group ignores SIGTERM (a disposition `exec` keeps), and says so once the trap is in.
+        // spawn-audit: hardened — a stand-in for a tool child; it must inherit no engine state.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.hardened();
+        let mut child = cmd
+            .arg("-c")
+            .arg(format!(
+                "trap '' TERM; : > '{}'; exec sleep 300",
+                ready.display()
+            ))
+            .process_group(0)
+            .spawn()
+            .expect("spawn the stand-in tool child");
+        let pgid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !ready.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never installed its trap"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Reap concurrently, as the worker that owns the Child does: a killed leader left a
+        // zombie would keep answering `killpg(pgid, 0)`.
+        let reaper = std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+        let maps = Arc::new(std::sync::Mutex::new(
+            crate::acp_runner::ElicitationMaps::new(),
+        ));
+        let _ = maps.lock().unwrap().register_tool_child("r-kill", pgid);
+        let lifecycle = Some(maps);
+        let (ev_tx, ev_rx) = channel::<CoreEvent>();
+        let mut subs = crate::event_log::EventSink::default();
+        subs.push(ev_tx);
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        cancel_run(&mut store, &mut subs, &runner, &tx, "r-kill", &lifecycle).unwrap();
+        let alive_at_return = unsafe { libc::killpg(pgid as i32, 0) } == 0;
+        let killed = ev_rx.try_iter().find_map(|e| match e {
+            CoreEvent::RunCancelled {
+                tool_children_killed,
+                ..
+            } => Some(tool_children_killed),
+            _ => None,
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while unsafe { libc::killpg(pgid as i32, 0) } == 0 {
+            if std::time::Instant::now() >= deadline {
+                unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+                panic!("the SIGTERM-ignoring group was never SIGKILLed off the actor");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        reaper.join().unwrap();
+        let _ = std::fs::remove_file(&ready);
+        assert!(
+            alive_at_return,
+            "the cancel returned before the group's grace ran out: the actor did not wait it out"
+        );
+        assert_eq!(killed, Some(1), "runCancelled counts the signalled group");
     }
 
     /// Wave 6 (F-7R2-013): a COMPLETED run's clean worktree is RETAINED by default — the files

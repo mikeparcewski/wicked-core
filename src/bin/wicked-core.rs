@@ -1038,8 +1038,15 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                             }
                         }
                     }
+                    // (core#1434) A cancel's worktree reap ends after `RunCancelled`: keep
+                    // reading until its outcome (a kept tree's `worktreeRetained`) is said.
+                    CoreEvent::RunCancelled { session, .. } if is_mine(session) => {
+                        if let Some((core, run_id)) = gate {
+                            settle_cancel_cleanup(events, core, run_id);
+                        }
+                        break;
+                    }
                     CoreEvent::SessionCompleted { session }
-                    | CoreEvent::RunCancelled { session, .. }
                     | CoreEvent::SessionFailed { session, .. }
                         if is_mine(session) =>
                     {
@@ -1058,6 +1065,37 @@ fn drain_events(events: &std::sync::mpsc::Receiver<CoreEvent>, gate: Option<(&Co
                 return;
             }
         }
+    }
+}
+
+/// (core#1434) After its run's `RunCancelled`: print events until the cancel's worktree cleanup is
+/// over. The reap runs off the engine's actor, and a tree kept for its uncommitted work is said
+/// (`worktreeRetained`) only when it ends. `worktree_cleanup_pending` answers on the actor after
+/// that event was emitted, so the queued events drained last include it. Bounded, so a hung reap
+/// never hangs the CLI.
+fn settle_cancel_cleanup(events: &std::sync::mpsc::Receiver<CoreEvent>, core: &Core, run_id: &str) {
+    const SETTLE_CAP: Duration = Duration::from_secs(600);
+    let started = std::time::Instant::now();
+    let mut said = false;
+    while matches!(core.worktree_cleanup_pending(run_id), Ok(true)) {
+        if started.elapsed() >= SETTLE_CAP {
+            println!(
+                "  (the worktree cleanup is still going after {} s; the next start of the engine \
+                 finishes it)",
+                SETTLE_CAP.as_secs()
+            );
+            return;
+        }
+        if !said {
+            println!("  (waiting for the run's worktree cleanup to finish)");
+            said = true;
+        }
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+            println!("  {ev:?}");
+        }
+    }
+    while let Ok(ev) = events.try_recv() {
+        println!("  {ev:?}");
     }
 }
 
