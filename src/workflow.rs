@@ -1111,8 +1111,9 @@ pub struct PhaseDef {
     /// only where nothing in the run builds on the output or reviews it: the def's LAST phase, an
     /// agent (not Tool), non-evaluator phase of pool 1 that executes no code, carries no validator
     /// pin and is owned by the PA (a `team` member's step is reviewed by the PA). The fold checks again
-    /// that no unit follows it in the run. It changes nothing else: the phase's write posture,
-    /// tools and gate are its entry's. `skip_serializing_if`: a phase that
+    /// that no unit follows it in the run. It also takes every tool away: the unit answers from
+    /// its prompt alone under the tool-less posture (core#1257). The gate remains its entry's.
+    /// `skip_serializing_if`: a phase that
     /// declares nothing serializes byte-identically to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_only: bool,

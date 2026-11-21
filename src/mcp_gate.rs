@@ -471,6 +471,7 @@ fn context(unit: &McpUnit, call: &McpCall, class: McpClass) -> Value {
             WritePosture::Full => "full",
             WritePosture::DeliverableRoots => "deliverable_roots",
             WritePosture::ReadOnly => "read_only",
+            WritePosture::ToolLess => "tool_less",
         },
         "seat": unit.seat,
         "carrier": call.carrier,
@@ -495,11 +496,17 @@ pub(crate) fn evaluate(
     let subject = subject_of(&call.server, &call.tool);
     let ctx = context(unit, call, class);
 
-    // The engine gates hold in every mode and no rule can lift them. D-7 first: an Apps unit is
+    // The engine gates hold in every mode and no rule can lift them. Tool-less refuses even
+    // reads (core#1257). D-7: an Apps unit is
     // refused every write and destructive tool, whatever the registry says; its reads go on to
     // the gates below, and crew's data gate decides rows and visibility (DES-KNOWLEDGE-DATA-001 §9.3).
-    let engine_deny = if let (Some(preset), true) = (unit.apps.as_deref(), class != McpClass::Read)
-    {
+    let engine_deny = if unit.posture == WritePosture::ToolLess {
+        Some((
+            crate::gate_hook::TOOL_LESS_RULE_ID,
+            crate::gate_hook::TOOL_LESS_REASON.to_string(),
+            crate::gate_hook::TOOL_LESS_REASON,
+        ))
+    } else if let (Some(preset), true) = (unit.apps.as_deref(), class != McpClass::Read) {
         Some((
             RULE_APPS_NO_SOURCE_TOOL,
             format!(
@@ -1629,6 +1636,25 @@ mod tests {
                     assert_eq!(v.decision, "allow", "{seat} {mode:?}: a read runs: {v:?}");
                 }
             }
+        }
+    }
+
+    /// Tool-less also refuses approved brokered reads on every mode (core#1257).
+    #[test]
+    fn tool_less_refuses_even_approved_mcp_reads() {
+        let mut store = seeded_store();
+        approve(&mut store, "MCP-FIRST-USE", "mcp:jira");
+        for mode in [McpMode::Ask, McpMode::Balanced, McpMode::Autonomous] {
+            let posture = WritePosture::parse_env(Some(std::ffi::OsStr::new("tool-less")));
+            let u = unit(posture, PhaseRole::Neutral, "claude", mode);
+            assert_eq!(
+                context(&u, &call("get_issue", read_only()), McpClass::Read)["write_posture"],
+                "tool_less"
+            );
+            let (v, claim) = evaluate(&store, &u, &call("get_issue", read_only()), 1).unwrap();
+            assert_eq!(v.decision, "deny");
+            assert_eq!(claim.policy_ids, vec!["engine:tool-less-posture"]);
+            assert!(crate::gate_hook::is_advisory_deny(&claim));
         }
     }
 

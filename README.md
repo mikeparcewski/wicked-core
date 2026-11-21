@@ -91,6 +91,8 @@ The rules a built-in carries with it:
   plan-step field): its answer must exist and be non-blank, instead of meeting the 200-character
   substance floor. `WorkflowDef::validate` accepts it only on the def's last phase: an agent step
   the PA owns, not an evaluator, that executes no code, has no validator pin and a pool of one.
+  It also takes every tool away: the tool-less posture answers from the prompt alone (core#1257).
+  On the host floor, route it to claude or pi; other seats require the container floor.
 
 ## Requirements graph
 

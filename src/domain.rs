@@ -1312,8 +1312,9 @@ pub struct WorkUnit {
     pub requires_capture_report: bool,
     /// (crew#1311) Whether this unit's backing phase declared
     /// [`answer_only`](crate::workflow::PhaseDef::answer_only) — carried verbatim at plan time,
-    /// exactly the way `executes_code` is. One consumer: the phase-substance floor in
-    /// `actor::apply_step_result`, which asks such a read-only unit only for a non-empty answer.
+    /// exactly the way `executes_code` is. The phase-substance floor in `actor::apply_step_result`
+    /// asks only for a non-empty answer. The tool-less posture takes every tool away so the
+    /// answer comes from the prompt alone (core#1257).
     /// Skip-if-false: every other unit serializes byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_only: bool,
