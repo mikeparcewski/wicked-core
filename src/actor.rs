@@ -15302,7 +15302,7 @@ fn run_conformance_tool(
             );
         }
     }
-    let (python, dist) = match ec::host_inputs() {
+    let inputs = match ec::host_inputs() {
         Ok(x) => x,
         Err((cause, why)) => return refused(&cause, why),
     };
@@ -15323,15 +15323,6 @@ fn run_conformance_tool(
             "engine_refused",
             "the worktree snapshot names no git directory to export its tree from".into(),
         );
-    };
-    let tmp = match crate::repo_checks::PrivateTmp::create() {
-        Ok(t) => t,
-        Err(e) => {
-            return refused(
-                "engine_refused",
-                format!("the harness's private temp dir: {e}"),
-            )
-        }
     };
     // The verify floor's own guarded checkout of exactly that tree (hooks off, no filter driver, blobs
     // written by the engine through a held directory, outside the seat's write boundary): the same
@@ -15371,7 +15362,74 @@ fn run_conformance_tool(
             )
         }
     };
-    let pack_tree = checkout.dir.clone();
+    let (out, status, killed, mut rec, _) = run_conformance_harness(
+        cmd,
+        &checkout.dir,
+        garden_root,
+        inputs,
+        attempt,
+        &d.run_id,
+        d.ord,
+        ec::DEADLINE,
+        jail,
+        stop,
+        on_spawn,
+        on_done,
+    );
+    // As before, the cases' report is bound to the exported tree; a refusal before the run or at
+    // the deadline (no `jail`) carries no tree because the cases did not finish on it.
+    if rec.jail.is_some() {
+        rec.tree = Some(snap.tree);
+    }
+    (out, status, killed, rec)
+}
+
+/// The shared review/install harness: the pack is readable, but only a fresh private temp
+/// directory is writable. Both callers use the same jail, environment and report judgment.
+#[allow(clippy::too_many_arguments)]
+fn run_conformance_harness(
+    cmd: &[String],
+    pack_dir: &std::path::Path,
+    garden_root: Option<&std::path::Path>,
+    (python, dist): (std::path::PathBuf, std::path::PathBuf),
+    attempt: u32,
+    run_id: &str,
+    ord: u32,
+    deadline: std::time::Duration,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::editor_conformance::ConformanceRecord,
+    Option<String>,
+) {
+    use crate::editor_conformance as ec;
+    use crate::workflow::StepStatus;
+    let refused = |cause: &str, why: String| {
+        (
+            format!("{}: ran nothing: {cause}: {why}", ec::CATALOG),
+            StepStatus::Ok,
+            None,
+            ec::ConformanceRecord::refused(attempt, cause, why),
+            None,
+        )
+    };
+    if let Some(r) = stop() {
+        return refused("engine_refused", format!("stopped before it began ({r})"));
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the harness's private temp dir: {e}"),
+            )
+        }
+    };
     let port = match ec::free_port() {
         Ok(p) => p,
         Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
@@ -15403,7 +15461,7 @@ fn run_conformance_tool(
         .collect();
     env.extend(ec::host_passthrough_env());
     env.extend(ec::tool_env(
-        &d.run_id, d.ord, &pack_tree, port, &out_file, &python, &dist, &kind,
+        run_id, ord, pack_dir, port, &out_file, &python, &dist, &kind,
     ));
     if let Some(groot) = garden_root {
         env.push((
@@ -15427,7 +15485,7 @@ fn run_conformance_tool(
         if let Some(r) = stop() {
             return Some(r);
         }
-        if started.elapsed() > ec::DEADLINE {
+        if started.elapsed() > deadline {
             over.set(true);
             return Some("deadline_exceeded");
         }
@@ -15442,23 +15500,24 @@ fn run_conformance_tool(
         on_spawn,
         on_done,
     );
+    let report = ec::read_report(&out_file);
     if over.get() {
-        let why = format!(
-            "the conformance run went past {} minutes and was stopped",
-            ec::DEADLINE.as_secs() / 60
-        );
-        return (
-            out,
-            StepStatus::Ok,
-            killed,
-            ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why),
-        );
+        let bound = if deadline == ec::DEADLINE {
+            format!("{} minutes", deadline.as_secs() / 60)
+        } else {
+            format!("{} seconds", deadline.as_secs())
+        };
+        let why = format!("the conformance run went past {bound} and was stopped");
+        let rec = ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why);
+        return (out, StepStatus::Ok, killed, rec, report.ok().flatten());
     }
-    let mut rec = ec::judge_file(&out_file, attempt);
-    drop(tmp);
-    drop(checkout);
-    // The cases ran on the export of exactly this tree.
-    rec.tree = Some(snap.tree);
+    let (mut rec, raw) = match report {
+        Ok(raw) => (ec::judge_report(raw.as_deref(), attempt), raw),
+        Err(why) => (
+            ec::ConformanceRecord::refused(attempt, "bad_report", why),
+            None,
+        ),
+    };
     rec.jail = Some(kind);
     // The verdict is the fold's (from the record); a command that ran to its end is Ok here, so a
     // failing run is never retried by the failure ladder as a broken command.
@@ -15467,7 +15526,254 @@ fn run_conformance_tool(
     } else {
         StepStatus::Ok
     };
-    (out, status, killed, rec)
+    (out, status, killed, rec, raw)
+}
+
+/// Run editor conformance for crew's install gate through the review harness's OS jail.
+/// The request is `{ "packRoot": string, "timeoutS"?: integer }` (no unknown fields):
+/// `packRoot` must name an absolute existing directory, and `timeoutS` must be 1..=900.
+/// Only invalid requests return `Err`. Resolves to JSON `{ "record": ConformanceRecord,
+/// "report": <parsed raw report or null> }`; host failures are refused records, including
+/// `unjailed_host` when no jail is available. The pack is read-only to the harness; only its
+/// private temp directory is writable. Crew's install gate calls this; it never runs the
+/// harness unjailed.
+pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
+    run_editor_conformance_with(request_json, &crate::validator::serve_jail)
+}
+
+fn run_editor_conformance_with(
+    request_json: &str,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+) -> Result<String, String> {
+    use crate::editor_conformance as ec;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Request {
+        pack_root: String,
+        timeout_s: Option<u64>,
+    }
+
+    let request: Request = serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+    let pack_root = std::path::Path::new(&request.pack_root);
+    if !pack_root.is_absolute() {
+        return Err("packRoot must be an absolute path to an existing directory".into());
+    }
+    let pack_root = pack_root
+        .canonicalize()
+        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
+    if !pack_root.is_dir() {
+        return Err("packRoot must be an existing directory".into());
+    }
+    let deadline = match request.timeout_s {
+        Some(s) if !(1..=900).contains(&s) => {
+            return Err("timeoutS must be an integer in 1..=900".into())
+        }
+        Some(s) => std::time::Duration::from_secs(s).min(ec::DEADLINE),
+        None => ec::DEADLINE,
+    };
+    let result = |record: ec::ConformanceRecord, raw: Option<String>| {
+        serde_json::json!({
+            "record": record,
+            "report": raw.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+        })
+        .to_string()
+    };
+    let refused = |why: String| {
+        Ok(result(
+            ec::ConformanceRecord::refused(1, "engine_refused", why),
+            None,
+        ))
+    };
+    // Match the review step's ladder when the run has no admitted skills generation.
+    let garden_root = match crate::skills_snapshot::resolve_ladder() {
+        Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
+        Ok(crate::skills_snapshot::Ladder::Absent) => None,
+        Ok(crate::skills_snapshot::Ladder::Failed(why)) => return refused(why),
+        Err(e) => return refused(e.to_string()),
+    };
+    for (name, root) in std::iter::once(("pack root", pack_root.as_path()))
+        .chain(garden_root.as_deref().map(|g| ("skills generation", g)))
+    {
+        let real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if let Some(mask) = crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+        {
+            return refused(format!(
+                "the {name} lives under {}, which the harness's jail hides",
+                mask.display()
+            ));
+        }
+    }
+    let inputs = match ec::host_inputs() {
+        Ok(x) => x,
+        Err((cause, why)) => {
+            return Ok(result(ec::ConformanceRecord::refused(1, &cause, why), None))
+        }
+    };
+    let cmd: Vec<String> = ec::CONFORMANCE_CMD.iter().map(|a| a.to_string()).collect();
+    let (_, _, _, record, raw) = run_conformance_harness(
+        &cmd,
+        &pack_root,
+        garden_root.as_deref(),
+        inputs,
+        1,
+        "editor-install",
+        0,
+        deadline,
+        jail,
+        &|| None,
+        &|_| {},
+        &|_| {},
+    );
+    Ok(result(record, raw))
+}
+
+#[cfg(test)]
+mod editor_install_conformance_tests {
+    use super::*;
+    use crate::editor_conformance as ec;
+    use std::path::Path;
+
+    #[test]
+    fn invalid_requests_are_errors_before_any_host_work() {
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let requests = [
+            "not JSON".to_string(),
+            "{}".to_string(),
+            serde_json::json!({ "packRoot": "relative/pack" }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path().join("missing") }).to_string(),
+            serde_json::json!({ "packRoot": file }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "unknown": true }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 0 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 901 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": -1 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 1.5 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": "1" }).to_string(),
+        ];
+        for request in requests {
+            assert!(run_editor_conformance(&request).is_err(), "{request}");
+        }
+    }
+
+    // The same interpreter-file + studio-index inputs as tests/editor_conformance.rs, with an
+    // absent garden ladder. Unit tests serialize process-global env mutations with the crate lock.
+    fn with_host_inputs(test: impl FnOnce(&Path)) {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let py = tmp.path().join("venv-python");
+        let dist = tmp.path().join("studio-dist");
+        let config = tmp.path().join("claude-config");
+        let home = tmp.path().join("home");
+        for dir in [&dist, &config, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&py, "fixture interpreter").unwrap();
+        std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                ec::PYTHON_ENV,
+                ec::STUDIO_DIST_ENV,
+                crate::skills_snapshot::SKILLS_SNAPSHOT_ENV,
+                crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
+                "HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(ec::PYTHON_ENV, py);
+        std::env::set_var(ec::STUDIO_DIST_ENV, dist);
+        std::env::remove_var(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        std::env::set_var(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV, config);
+        std::env::set_var("HOME", home);
+        test(tmp.path());
+    }
+
+    #[test]
+    fn an_unjailed_install_is_a_refusal_with_no_report() {
+        with_host_inputs(|root| {
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let real_pack = pack.canonicalize().unwrap();
+            for (level, wrapper) in [
+                (crate::validator::SandboxLevel::BestEffort, vec![]),
+                (
+                    crate::validator::SandboxLevel::NetworkOnly,
+                    vec!["must-not-run".to_string()],
+                ),
+                (crate::validator::SandboxLevel::Sandboxed, vec![]),
+            ] {
+                let called = std::cell::Cell::new(false);
+                let jail = |roots: &[&Path], port: u16| {
+                    called.set(true);
+                    assert_eq!(roots.len(), 1);
+                    assert_ne!(roots[0], real_pack.as_path());
+                    assert!(roots[0].is_dir());
+                    assert_ne!(port, 0);
+                    crate::validator::SandboxLauncher {
+                        wrapper: wrapper.clone(),
+                        level,
+                    }
+                };
+                for timeout in [1, 900] {
+                    let request =
+                        serde_json::json!({ "packRoot": pack, "timeoutS": timeout }).to_string();
+                    let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert!(called.get());
+                    assert_eq!(response["record"]["outcome"], "refused");
+                    assert_eq!(response["record"]["cause"], "unjailed_host");
+                    assert_eq!(response["record"]["attempt"], 1);
+                    assert!(response["report"].is_null());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_pack_hidden_by_the_secret_directory_mask_is_refused_before_the_jail() {
+        with_host_inputs(|root| {
+            let pack = root.join("home/.aws/pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            let jail = |_: &[&Path], _: u16| -> crate::validator::SandboxLauncher {
+                panic!("a hidden pack must not reach the jail")
+            };
+            let check = |path: &Path| {
+                let request = serde_json::json!({ "packRoot": path }).to_string();
+                let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(response["record"]["outcome"], "refused");
+                assert_eq!(response["record"]["cause"], "engine_refused");
+                let why = response["record"]["reason"].as_str().unwrap();
+                assert!(why.contains("pack root") && why.contains(".aws"), "{why}");
+                assert!(why.contains("jail hides"), "{why}");
+                assert!(response["report"].is_null());
+            };
+            check(&pack);
+            #[cfg(unix)]
+            {
+                let alias = root.join("pack-alias");
+                std::os::unix::fs::symlink(&pack, &alias).unwrap();
+                check(&alias);
+            }
+        });
+    }
 }
 
 /// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
