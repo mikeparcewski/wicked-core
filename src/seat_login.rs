@@ -14,10 +14,6 @@ use serde_json::Value;
 
 #[cfg(unix)]
 use crate::container_floor::output_within;
-#[cfg(all(unix, test))]
-use crate::container_floor::Runtime;
-#[cfg(all(unix, test))]
-use crate::seat_gateway::{volumes, Gateway};
 #[cfg(unix)]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1651,8 +1647,7 @@ pub(crate) fn status_from_files(cli: &str, files: &[(String, Vec<u8>)], now: u64
 /// The transport the sign-in state machine drives (k8s-swap B-4): the broker's storage, the
 /// gateway's publication, the login stores and the account reads. The state machine (journals,
 /// tombstones, sessions and their repair order) is one copy over this seam; the cluster's
-/// transport is [`crate::k8s::login::K8sIo`], and the test-only Docker transport is kept
-/// only for the legacy tests pending their port to MemIo.
+/// transport is [`crate::k8s::login::K8sIo`]; state-machine tests use MemIo.
 ///
 /// The mutating methods are called with the broker's mutation lock held; a status read
 /// (`broker_status`) and [`BrokerIo::prepare_login`] run without it.
@@ -1712,271 +1707,13 @@ pub(crate) trait BrokerIo {
     ) -> Result<Value, String>;
 }
 
-/// Test transport only (k8s-final B-6): the state-machine tests below still drive the sign-in
-/// flow through it; port them to MemIo (`src/seat_login_io_tests.rs`, core#1438) and delete it.
-#[cfg(unix)]
-#[derive(Clone)]
-#[cfg(test)]
-pub(crate) struct DockerIo {
-    pub(crate) rt: Runtime,
-    pub(crate) gw: Gateway,
-}
-
-#[cfg(unix)]
-#[cfg(test)]
-impl DockerIo {
-    pub(crate) fn new(rt: &Runtime, gw: &Gateway) -> Self {
-        Self {
-            rt: rt.clone(),
-            gw: gw.clone(),
-        }
-    }
-}
-
-#[cfg(unix)]
-#[cfg(test)]
-impl BrokerIo for DockerIo {
-    fn broker_present(&self) -> Result<bool, String> {
-        volume_exists(&self.rt, &volumes(&self.gw).1)
-    }
-    fn init_broker(&self, dir: &Path) -> Result<(), String> {
-        crate::seat_gateway::init_gateway_volumes(&self.rt, &self.gw, dir)
-    }
-    fn read_broker(
-        &self,
-        paths: &[&str],
-        presence: bool,
-    ) -> Result<Vec<(String, Vec<u8>)>, String> {
-        read_volume(&self.rt, &volumes(&self.gw).1, paths, presence)
-    }
-    fn write_broker(&self, dir: &Path, cli: &str, file: &str, body: &[u8]) -> Result<(), String> {
-        crate::seat_gateway::set_broker_credential(&self.rt, &self.gw, dir, cli, file, body)
-    }
-    fn empty_broker(&self, dir: &Path, cli: &str, files: &[&str]) -> Result<(), String> {
-        crate::seat_gateway::mutation_helper(
-            &self.rt,
-            dir,
-            cli,
-            &revoke_argv(&volumes(&self.gw).1, files),
-            &[],
-            TIMEOUT,
-        )
-        .map(|_| ())
-    }
-    fn remove_broker(&self, dir: &Path, cli: &str, file: &str) -> Result<(), String> {
-        crate::seat_gateway::remove_broker_file(&self.rt, &self.gw, dir, cli, file)
-    }
-    fn cleanup(&self, dir: &Path) -> Result<(), String> {
-        crate::seat_gateway::cleanup_mutations(&self.rt, dir)
-    }
-    fn route_sign_in(
-        &self,
-        dir: &Path,
-        cli: &str,
-        literals: &crate::seat_gateway::RouteLiterals,
-    ) -> Result<(), String> {
-        crate::seat_gateway::route_sign_in(&self.rt, &self.gw, dir, cli, literals)
-    }
-    fn confirm_sign_out(&self, dir: &Path, cli: &str) -> Result<(), String> {
-        crate::seat_gateway::confirm_sign_out(&self.rt, &self.gw, dir, cli)
-    }
-    fn login_exists(&self, session: &str) -> Result<bool, String> {
-        volume_exists(&self.rt, session)
-    }
-    fn create_login(&self, session: &str) -> Result<(), String> {
-        checked(
-            &self.rt,
-            &["volume".into(), "create".into(), session.into()],
-        )
-    }
-    fn init_login(&self, dir: &Path, cli: &str, session: &str) -> Result<(), String> {
-        crate::seat_gateway::mutation_helper(
-            &self.rt,
-            dir,
-            cli,
-            &init_login_argv(session, cli),
-            &[],
-            TIMEOUT,
-        )
-        .map(|_| ())
-    }
-    fn open_login(&self, _cli: &str, _session: &str) -> Result<Vec<String>, String> {
-        Err("the test transport does not launch sign-in processes".into())
-    }
-    fn read_login(&self, session: &str, paths: &[&str]) -> Result<Vec<(String, Vec<u8>)>, String> {
-        read_volume(&self.rt, session, paths, false)
-    }
-    fn stop_login(&self, session: &str) -> Result<(), String> {
-        stop_login_container(&self.rt, session)
-    }
-    fn remove_login(&self, session: &str) -> Result<(), String> {
-        remove_login_volume(&self.rt, session)
-    }
-    fn send(
-        &self,
-        dir: &Path,
-        cli: &str,
-        request: &crate::seat_refresh::Request,
-    ) -> Result<Value, String> {
-        crate::seat_refresh::send(&self.rt, dir, cli, &self.gw.external_network, request)
-    }
-}
-
 /// The daemon's gateway name for gateway dir `dir` (session and renewal-home names carry it).
 pub(crate) fn gw_name(dir: &Path) -> String {
     crate::seat_gateway::gateway_name(dir)
 }
 
-/// Helper argv is pure; scripts and paths are fixed by this module, never supplied by the CLI.
-#[cfg(test)]
-fn helper_argv(volume: &str, readonly: bool, user: &str, script: String) -> Vec<String> {
-    let mut argv: Vec<String> = [
-        "run",
-        "--rm",
-        "--log-driver",
-        "none",
-        "--network",
-        "none",
-        "--user",
-        user,
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    if user == "0" {
-        argv.extend([
-            "--cap-add".into(),
-            "CHOWN".into(),
-            "--cap-add".into(),
-            "FOWNER".into(),
-        ]);
-    }
-    argv.extend([
-        "-v".into(),
-        format!("{volume}:/in{}", if readonly { ":ro" } else { "" }),
-        crate::seat_gateway::HELPER_IMAGE.into(),
-        "sh".into(),
-        "-c".into(),
-        script,
-    ]);
-    argv
-}
-
-#[cfg(test)]
-fn read_argv(volume: &str, path: &str, presence_only: bool) -> Vec<String> {
-    let mut script = String::from("set -e;");
-    let mut prefix = String::from("/in");
-    for part in path.split('/') {
-        prefix.push('/');
-        prefix.push_str(part);
-        script.push_str(&format!(" [ ! -L {prefix} ] || exit 46;"));
-    }
-    script.push_str(&format!(
-        " [ -e /in/{path} ] || exit 44; [ -f /in/{path} ] && [ -r /in/{path} ] || exit 45;"
-    ));
-    if presence_only {
-        script.push_str(&format!(" if [ -s /in/{path} ]; then printf present; fi"));
-    } else {
-        script.push_str(&format!(" head -c {} /in/{path}", MAX_FILE_BYTES + 1));
-    }
-    helper_argv(volume, true, "10001", script)
-}
-
-/// Revoke by emptying, never deleting: the gateway's routes reference these files, and a
-/// reload that names a missing file is refused, leaving the OLD credential served (found by the
-/// live sign-out test). An empty file is the signed-out state the gateway starts with.
-#[cfg(test)]
-fn revoke_argv(volume: &str, files: &[&str]) -> Vec<String> {
-    helper_argv(
-        volume,
-        false,
-        "10001",
-        files
-            .iter()
-            .map(|f| format!(": > /in/{f}"))
-            .collect::<Vec<_>>()
-            .join(" && "),
-    )
-}
-
-/// Own the volume as the login user and create the CLI's configuration homes ([`login_homes`]).
-/// The helper has CHOWN and FOWNER, never DAC_OVERRIDE or DAC_READ_SEARCH: the homes are made
-/// while root still owns the volume, and the volume root is handed over LAST, since root can no
-/// longer reach a child once `/in` is another user's 0700 directory.
-#[cfg(test)]
-fn init_login_argv(volume: &str, cli: &str) -> Vec<String> {
-    let dirs: Vec<String> = login_homes(cli)
-        .iter()
-        .map(|(_, dir)| format!("/in/{dir}"))
-        .chain(std::iter::once("/in".to_string()))
-        .collect();
-    let dirs = dirs.join(" ");
-    let seed = match cli {
-        // copilot stores its token in the system keychain, and with none (a container) only
-        // after the user consents to plaintext; the throwaway volume's settings consent up
-        // front, so the login writes `copilot/config.json`, which ingest moves to the broker.
-        "copilot" => format!(
-            " && printf '%s' '{COPILOT_SETTINGS}' > /in/copilot/settings.json \
-             && chown 10001 /in/copilot/settings.json"
-        ),
-        _ => String::new(),
-    };
-    helper_argv(
-        volume,
-        false,
-        "0",
-        format!("mkdir -p {dirs}{seed} && chown 10001 {dirs} && chmod 700 {dirs}"),
-    )
-}
-
 /// The copilot settings its login volume is seeded with (`storeTokenPlaintext`, see above).
 pub(crate) const COPILOT_SETTINGS: &str = r#"{"storeTokenPlaintext":true}"#;
-
-#[cfg(unix)]
-#[cfg(test)]
-fn execute(rt: &Runtime, argv: &[String]) -> Result<std::process::Output, String> {
-    let mut cmd = rt.cmd();
-    cmd.args(argv);
-    output_within(cmd, rt.bound(TIMEOUT))
-        .ok_or_else(|| "login runtime command could not start or timed out".into())
-}
-
-#[cfg(unix)]
-#[cfg(test)]
-fn checked(rt: &Runtime, argv: &[String]) -> Result<(), String> {
-    let out = execute(rt, argv)?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        // Runtime/helper output may contain credentials. Return only the exit status.
-        Err(format!("login runtime command failed ({})", out.status))
-    }
-}
-
-#[cfg(unix)]
-#[cfg(test)]
-fn volume_exists(rt: &Runtime, volume: &str) -> Result<bool, String> {
-    let out = execute(
-        rt,
-        &[
-            "volume".into(),
-            "ls".into(),
-            "--format".into(),
-            "{{.Name}}".into(),
-        ],
-    )?;
-    if !out.status.success() {
-        return Err("could not list login/broker volumes".into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .any(|name| name == volume))
-}
 
 /// Broker files read whole by a status reading (retained OAuth records and route literals);
 /// every other broker file is read as a presence marker only.
@@ -1990,35 +1727,9 @@ pub(crate) fn is_archive(name: &str) -> bool {
     )
 }
 
-#[cfg(unix)]
-#[cfg(test)]
-fn read_volume(
-    rt: &Runtime,
-    volume: &str,
-    paths: &[&str],
-    broker: bool,
-) -> Result<Vec<(String, Vec<u8>)>, String> {
-    let mut files = Vec::new();
-    for path in paths {
-        let archive = is_archive(path);
-        let out = execute(rt, &read_argv(volume, path, broker && !archive))?;
-        if out.status.code() == Some(44) {
-            continue;
-        }
-        if !out.status.success() {
-            return Err(format!("could not read credential file {path}"));
-        }
-        if out.stdout.len() > MAX_FILE_BYTES {
-            return Err(format!("credential file {path} exceeds size limit"));
-        }
-        files.push(((*path).into(), out.stdout));
-    }
-    Ok(files)
-}
-
 /// Extract everything before changing the broker; remove the login volume only after every
 /// write succeeds. Failure retains the login volume for a retry. Writes are individually atomic
-/// through set_broker_credential, but the runtime offers no multi-file transaction here.
+/// through [`BrokerIo::write_broker`], but the transport offers no multi-file transaction here.
 #[cfg(unix)]
 fn ingest(io: &dyn BrokerIo, dir: &Path, cli: &str, volume: &str) -> Result<IngestReport, String> {
     let owned = broker_files(cli)?;
@@ -2854,7 +2565,7 @@ fn sweep_login_homes(dir: &Path, cli: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Read `paths` from host login home `home` as [`read_volume`] reads a login volume: a missing
+/// Read `paths` from host login home `home` as [`BrokerIo::read_login`] reads a store: a missing
 /// file is skipped; a symlink anywhere on the path, a non-regular file or an oversized one is
 /// refused. Every component is opened relative to its parent with `O_NOFOLLOW` (`openat`), and
 /// the file itself non-blocking and checked with `fstat`, so no link or FIFO swapped in after a
@@ -2963,89 +2674,9 @@ fn discard_login(io: &dyn BrokerIo, dir: &Path, cli: &str, session: &str) -> Res
     io.remove_login(session)
 }
 
-/// Stop and remove the login container of session `volume`, if it still runs. Its terminal is
-/// over whenever this is called (ingest runs on the terminal's exit), but a terminal whose client
-/// was killed leaves `docker run -it` behind, still holding the volume: every later volume
-/// removal, and so every later sign-in, would fail (found on the proof daemon, C6).
-#[cfg(unix)]
-#[cfg(test)]
-fn stop_login_container(rt: &Runtime, volume: &str) -> Result<(), String> {
-    // agy c6-r1: a login that just exited is still being removed by its own `--rm` (`rm -f` then
-    // answers "removal already in progress" and `ps -a` still lists it), so poll until it is gone.
-    let deadline = std::time::Instant::now() + LOGIN_STOP_WAIT;
-    loop {
-        let names = login_containers_on(rt, volume)?;
-        if names.is_empty() {
-            return Ok(());
-        }
-        if std::time::Instant::now() >= deadline {
-            return Err("could not stop the login container".into());
-        }
-        for name in names {
-            // Judged by the next listing: one that removed itself meanwhile makes `rm -f` fail.
-            let _ = checked(rt, &["rm".into(), "-f".into(), name]);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 /// How long a login container's removal may take before stopping it counts as failed.
 #[cfg(unix)]
 const LOGIN_STOP_WAIT: Duration = Duration::from_secs(10);
-
-/// The login containers that mount session `volume`: the one named after the session, and one an
-/// earlier engine named `wicked-login-<cli>-<32 hex>` (codex c6-r1: an abandoned login from before
-/// the upgrade still holds its volume). Nothing else that mounts the volume is ours to stop.
-#[cfg(unix)]
-#[cfg(test)]
-fn login_containers_on(rt: &Runtime, volume: &str) -> Result<Vec<String>, String> {
-    let out = execute(
-        rt,
-        &[
-            "ps".into(),
-            "-a".into(),
-            "--filter".into(),
-            format!("volume={volume}"),
-            "--format".into(),
-            "{{.Names}}".into(),
-        ],
-    )?;
-    if !out.status.success() {
-        return Err("could not list the login containers".into());
-    }
-    Ok(String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| ours_on(volume, name))
-        .map(str::to_string)
-        .collect())
-}
-
-#[cfg(test)]
-fn ours_on(volume: &str, name: &str) -> bool {
-    name == volume
-        || name.strip_prefix("wicked-login-").is_some_and(|rest| {
-            rest.rsplit_once('-').is_some_and(|(cli, id)| {
-                supported_cli(cli) && id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
-            })
-        })
-}
-
-/// Remove a login volume (stopping its login container first), treating one that is already
-/// gone as removed (a crash after the removal and before its marker was unlinked).
-#[cfg(unix)]
-#[cfg(test)]
-fn remove_login_volume(rt: &Runtime, volume: &str) -> Result<(), String> {
-    stop_login_container(rt, volume)?;
-    match checked(rt, &["volume".into(), "rm".into(), volume.into()]) {
-        Ok(()) => Ok(()),
-        Err(e) if !volume_exists(rt, volume)? => {
-            let _ = e;
-            Ok(())
-        }
-        Err(e) => Err(e),
-    }
-}
 
 fn session_committed(dir: &Path, cli: &str) -> Result<bool, String> {
     std::fs::read_to_string(session_path(dir, cli))
@@ -3334,7 +2965,7 @@ pub fn seat_login_main(args: &[String]) -> i32 {
 /// The state machine over its transport seam (k8s-swap B-4), with an in-memory transport.
 #[cfg(all(test, unix))]
 #[path = "seat_login_io_tests.rs"]
-mod io_tests;
+pub(crate) mod io_tests;
 
 /// agy's API-key sign-in: the paste, the broker kind, the route, the seat (and LIVE, end to end).
 #[cfg(all(test, unix))]
@@ -3347,89 +2978,32 @@ mod tests {
     use serde_json::json;
 
     #[cfg(unix)]
-    struct FakeRuntime {
+    use super::io_tests::{Fail, GatewayState, MemIo};
+
+    #[cfg(unix)]
+    struct Fixture {
         dir: std::path::PathBuf,
-        rt: Runtime,
-        gw: Gateway,
+        io: MemIo,
     }
 
     #[cfg(unix)]
-    impl FakeRuntime {
+    impl Fixture {
         fn new() -> Self {
             let dir = std::env::temp_dir()
                 .join(format!(".c4-login-test-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&dir).unwrap();
-            let gw = Gateway::for_dir(&dir);
-            let path = dir.join("runtime");
-            // Offline stand-in: it records argv and stdin; it never invokes a container runtime.
-            crate::test_env::install_stub(
-                &path,
-                r#"#!/bin/sh
-base=${0%/*}
-printf '%s\n' "$*" >> "$base/calls"
-if [ "$1 $2" = 'image inspect' ]; then exit 0; fi
-if [ "$1 $2" = 'container inspect' ]; then
-  case "$3" in
-    wicked-mutation-*) [ -e "$base/fail_cleanup" ] && { printf 'still live'; exit 0; }; printf 'No such container\n' >&2; exit 1;;
-    *) case "$(cat "$base/state" 2>/dev/null)" in
-      stopped) printf 'false\n';; absent) printf 'No such container\n' >&2; exit 1;; unknown) exit 1;; *) printf 'true\n';; esac; exit 0;;
-  esac
-fi
-if [ "$1 $2" = 'rm --force' ]; then exit 0; fi
-if [ "$1 $2" = 'volume ls' ]; then cat "$base/volumes"; exit 0; fi
-if [ "$1 $2" = 'volume create' ]; then
-  for arg do last=$arg; done
-  printf '%s\n' "$last" >> "$base/volumes"; exit 0
-fi
-if [ "$1 $2" = 'volume rm' ]; then [ ! -e "$base/fail_remove" ]; exit $?; fi
-for arg do last=$arg; done
-case "$last" in
-  *'chown 10001 /cfg /broker;'*)
-    for word in $last; do
-      case "$word" in /broker/*) name=${word#/broker/}; name=${name%;};
-        [ -e "$base/broker/$name" ] || : > "$base/broker/$name";; esac
-    done;;
-  *'cat > /v/.config.json.new'*) cat > "$base/published"; [ ! -e "$base/fail_publish" ];;
-  *'cat > /v/.'*)
-    file=${last##* /v/}
-    cat > "$base/broker/$file.new"
-    [ -e "$base/fail_$file" ] && exit 1
-    mv "$base/broker/$file.new" "$base/broker/$file";;
-  *'head -c'*|*'printf present'*)
-    case "$*" in
-      *'-broker:/in:ro'*)
-        file=${last##*/in/}; file=${file%% *}
-        [ -f "$base/broker/$file" ] || exit 44
-        case "$last" in *'head -c'*) cat "$base/broker/$file";; *) [ ! -s "$base/broker/$file" ] || printf present;; esac;;
-      *wicked-setup-token*) [ -f "$base/setup-token" ] || exit 44; cat "$base/setup-token";;
-      *) [ -f "$base/input" ] || exit 44; cat "$base/input";;
-    esac;;
-  *': > /in/'*)
-    for word in $last; do case "$word" in /in/*) : > "$base/broker/${word#/in/}";; esac; done;;
-  *'rm -f /v/'*) file=${last##*/v/};
-    [ ! -e "$base/fail_remove_$file" ] || exit 1
-    rm -f "$base/broker/$file";;
-  *'read K;'*) cat > /dev/null; [ ! -e "$base/fail_probe" ];;
-  *) exit 0;;
-esac
-"#,
-            );
-            std::fs::create_dir(dir.join("broker")).unwrap();
-            std::fs::write(dir.join("volumes"), format!("{}\n", volumes(&gw).1)).unwrap();
-            Self {
-                dir,
-                rt: Runtime::answering(path),
-                gw,
-            }
+            let io = MemIo::default();
+            io.seed_broker("anthropic.token", b"");
+            Self { dir, io }
         }
         fn calls(&self) -> String {
-            std::fs::read_to_string(self.dir.join("calls")).unwrap_or_default()
+            self.io.calls()
         }
     }
 
     /// Write `content` at `path` in `cli`'s open host login home (what the host CLI leaves).
     #[cfg(unix)]
-    fn host_input(fake: &FakeRuntime, cli: &str, path: &str, content: &str) {
+    fn host_input(fake: &Fixture, cli: &str, path: &str, content: &str) {
         let session = read_session(&fake.dir, cli)
             .unwrap()
             .expect("an open login session");
@@ -3439,7 +3013,7 @@ esac
     }
 
     #[cfg(unix)]
-    impl Drop for FakeRuntime {
+    impl Drop for Fixture {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
@@ -3454,42 +3028,29 @@ esac
             return;
         }
         use crate::seat_gateway::{configure_gateway, register_unit, GatewayConfig, UnitKey};
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         configure_gateway(&fake.dir, &GatewayConfig::default()).unwrap();
         let live = UnitKey::new("FAKE-run", "FAKE-unit", "claude");
         register_unit(&fake.dir, live.clone()).unwrap();
         let before = std::fs::read(fake.dir.join("config/units.json")).unwrap();
         // First ingest has no broker volume yet; initialization keeps existing files, too.
-        std::fs::write(fake.dir.join("volumes"), "").unwrap();
-        std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-live-claude").unwrap();
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        *fake.io.broker_missing.borrow_mut() = true;
+        fake.io.seed_broker("anthropic.token", "FAKE-live-claude");
+        new_session(&fake.io, &fake.dir, "codex").unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        ingest_and_route(&fake.io, &fake.dir, "codex").unwrap();
         assert_eq!(
             std::fs::read(fake.dir.join("config/units.json")).unwrap(),
             before
         );
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"FAKE-live-claude"
         );
         let calls = fake.calls();
-        assert!(calls.contains("chown 10001 /cfg /broker;"));
-        assert!(
-            calls.find("chown 10001 /cfg /broker;").unwrap()
-                < calls.find("cat > /v/.codex.auth.json.new").unwrap()
-        );
-        assert!(std::fs::read_to_string(fake.dir.join("published"))
+        assert!(calls.contains("init broker"));
+        assert!(calls.find("init broker").unwrap() < calls.find("write codex.auth.json").unwrap());
+        assert!(String::from_utf8(fake.io.published.borrow().clone())
             .unwrap()
             .contains(&live.key));
         assert!(!fake.dir.join("config/revoking.json").exists());
@@ -3503,7 +3064,7 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         let _lock = crate::seat_refresh::mutation_lock(&fake.dir).unwrap();
         let old = oauth(1000);
         let mut staged = old.clone();
@@ -3513,45 +3074,31 @@ esac
         rescued["claudeAiOauth"]["accessToken"] = json!("FAKE-access-R3");
         let pending = crate::seat_refresh::pending_path(&fake.dir, "claude");
         std::fs::write(&pending, "rotated credential issued").unwrap();
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json"),
-            old.to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json.next"),
-            staged.to_string(),
-        )
-        .unwrap();
+        fake.io
+            .seed_broker("claude.credentials.json", old.to_string());
+        fake.io
+            .seed_broker("claude.credentials.json.next", staged.to_string());
         let rescue = crate::seat_refresh::rescue_path(&fake.dir, "claude");
         crate::seat_refresh::create_private_file(&rescue, rescued.to_string().as_bytes()).unwrap();
-        std::fs::write(fake.dir.join("fail_claude.credentials.json.next"), "").unwrap();
-        assert!(crate::seat_refresh::repair_refresh(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude"
-        )
-        .is_err());
+        fake.io
+            .fail(Fail::Write("claude.credentials.json.next".into()));
+        assert!(crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude").is_err());
         assert!(rescue.exists());
         assert_eq!(
-            std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
+            fake.io.broker_text("claude.credentials.json").unwrap(),
             old.to_string()
         );
-        std::fs::remove_file(fake.dir.join("fail_claude.credentials.json.next")).unwrap();
-        crate::seat_refresh::repair_refresh(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        fake.io
+            .recover(Fail::Write("claude.credentials.json.next".into()));
+        crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude").unwrap();
         assert!(!rescue.exists());
         assert!(!pending.exists());
         assert_eq!(
-            std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
+            fake.io.broker_text("claude.credentials.json").unwrap(),
             rescued.to_string()
         );
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"FAKE-access-R3"
         );
         assert!(
@@ -3563,14 +3110,9 @@ esac
         // A pending issued generation without a recovery source cannot use the current record.
         for marker in ["", "rotated credential issued"] {
             std::fs::write(&pending, marker).unwrap();
-            std::fs::write(fake.dir.join("calls"), "").unwrap();
+            fake.io.clear_calls();
             assert_eq!(
-                crate::seat_refresh::repair_refresh(
-                    &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                    &fake.dir,
-                    "claude"
-                )
-                .unwrap_err(),
+                crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude").unwrap_err(),
                 "rotated credential not yet stored in the broker"
             );
             assert!(pending.exists());
@@ -3579,34 +3121,21 @@ esac
                     .unwrap()
                     .ok
             );
-            assert!(!fake.calls().contains("cat > /v/"));
+            assert!(!fake.calls().contains("write "));
         }
         // Only a fully committed generation may recover from current after `.next` removal.
         std::fs::write(&pending, "rotated credential stored").unwrap();
-        crate::seat_refresh::repair_refresh(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude").unwrap();
         assert!(!pending.exists());
         // codex lg-r4: a staged record with no pending marker can only be an orphan writer's
         // (a real one always writes the marker before staging): it is discarded, never served.
         let mut orphan = rescued.clone();
         orphan["claudeAiOauth"]["refreshToken"] = json!("FAKE-R4");
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json.next"),
-            orphan.to_string(),
-        )
-        .unwrap();
-        crate::seat_refresh::repair_refresh(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        fake.io
+            .seed_broker("claude.credentials.json.next", orphan.to_string());
+        crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude").unwrap();
         assert_eq!(
-            std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
+            fake.io.broker_text("claude.credentials.json").unwrap(),
             rescued.to_string()
         );
         assert!(!pending.exists());
@@ -3621,13 +3150,8 @@ esac
             return;
         }
         for recovery in 0..3 {
-            let fake = FakeRuntime::new();
-            new_session(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "claude",
-            )
-            .unwrap();
+            let fake = Fixture::new();
+            new_session(&fake.io, &fake.dir, "claude").unwrap();
             let record = oauth(9_000_000_000_000);
             let journal = vec![
                 ("claude.credentials.json", record.to_string()),
@@ -3642,7 +3166,7 @@ esac
                 ),
                 ("anthropic.token", "FAKE-replay".to_string()),
             ] {
-                std::fs::write(fake.dir.join("broker").join(name), bytes).unwrap();
+                fake.io.seed_broker(name, bytes);
             }
             std::fs::write(
                 crate::seat_refresh::pending_path(&fake.dir, "claude"),
@@ -3656,75 +3180,52 @@ esac
             let rescue = crate::seat_refresh::rescue_path(&fake.dir, "claude");
             crate::seat_refresh::create_private_file(&rescue, record.to_string().as_bytes())
                 .unwrap();
-            std::fs::write(fake.dir.join("fail_remove_claude.ingest.next"), "").unwrap();
-            assert!(sign_out_and_route(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "claude"
-            )
-            .is_err());
+            fake.io
+                .fail(Fail::RemoveBroker("claude.ingest.next".into()));
+            assert!(sign_out_and_route(&fake.io, &fake.dir, "claude").is_err());
             assert!(signout_path(&fake.dir, "claude").exists());
-            assert!(std::fs::read(fake.dir.join("broker/anthropic.token"))
-                .unwrap()
-                .is_empty());
+            assert!(fake.io.broker_file("anthropic.token").unwrap().is_empty());
             assert!(fake
-                .dir
-                .join("broker/claude.credentials.json.next")
-                .exists());
-            std::fs::remove_file(fake.dir.join("fail_remove_claude.ingest.next")).unwrap();
-            std::fs::write(fake.dir.join("fail_probe"), "").unwrap();
-            std::fs::write(fake.dir.join("calls"), "").unwrap();
+                .io
+                .broker_file("claude.credentials.json.next")
+                .is_some());
+            fake.io
+                .recover(Fail::RemoveBroker("claude.ingest.next".into()));
+            fake.io.fail(Fail::Probe);
+            fake.io.clear_calls();
             let repair = || -> Result<(), String> {
                 match recovery {
-                    0 => crate::seat_refresh::refresh(
-                        &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                        &fake.dir,
-                        "claude",
-                        false,
-                    )
-                    .map(|_| ()),
+                    0 => crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", false)
+                        .map(|_| ()),
                     1 => {
                         let _lock = crate::seat_refresh::mutation_lock(&fake.dir)?;
-                        repair_ingest(
-                            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                            &fake.dir,
-                            "claude",
-                        )
-                        .map(|_| ())
+                        repair_ingest(&fake.io, &fake.dir, "claude").map(|_| ())
                     }
                     _ => {
                         let _lock = crate::seat_refresh::mutation_lock(&fake.dir)?;
-                        crate::seat_refresh::repair_refresh(
-                            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                            &fake.dir,
-                            "claude",
-                        )
-                        .map(|_| ())
+                        crate::seat_refresh::repair_refresh(&fake.io, &fake.dir, "claude")
+                            .map(|_| ())
                     }
                 }
             };
             assert!(repair().is_err());
             assert!(signout_path(&fake.dir, "claude").exists());
-            std::fs::remove_file(fake.dir.join("fail_probe")).unwrap();
+            fake.io.recover(Fail::Probe);
             repair().unwrap();
             assert!(!signout_path(&fake.dir, "claude").exists());
             for name in broker_files("claude").unwrap() {
-                assert!(std::fs::read(fake.dir.join("broker").join(name))
-                    .unwrap()
-                    .is_empty());
+                assert!(fake.io.broker_file(name).unwrap().is_empty());
             }
-            assert!(!fake
-                .dir
-                .join("broker/claude.credentials.json.next")
-                .exists());
-            assert!(!fake.dir.join("broker/claude.ingest.next").exists());
+            assert!(fake
+                .io
+                .broker_file("claude.credentials.json.next")
+                .is_none());
+            assert!(fake.io.broker_file("claude.ingest.next").is_none());
             assert!(!rescue.exists());
             assert!(!crate::seat_refresh::pending_path(&fake.dir, "claude").exists());
             assert!(!session_path(&fake.dir, "claude").exists());
-            assert!(!fake
-                .calls()
-                .contains("cat > /v/.claude.credentials.json.new"));
-            assert!(!fake.calls().contains("cat > /v/.anthropic.token.new"));
+            assert!(!fake.calls().contains("write claude.credentials.json"));
+            assert!(!fake.calls().contains("write anthropic.token"));
         }
     }
 
@@ -3736,79 +3237,44 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
+        let fake = Fixture::new();
+        let session = new_session(&fake.io, &fake.dir, "codex").unwrap();
+        fake.io.clear_calls();
         let mut invalid = chatgpt();
         invalid["tokens"]["account_id"] = json!("FAKE\r\nx-evil: 1");
         host_input(&fake, "codex", "codex/auth.json", &invalid.to_string());
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex"
-        )
-        .is_err());
-        assert!(!fake.calls().contains("cat > /v/"));
+        assert!(ingest_and_route(&fake.io, &fake.dir, "codex").is_err());
+        assert!(!fake.calls().contains("write "));
         // Nothing usable: the host login is over and its home is gone.
         assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         assert!(!login_home(&fake.dir, &session).exists());
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        let session = new_session(&fake.io, &fake.dir, "codex").unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex"
-        )
-        .is_err());
-        assert!(fake.calls().contains("cat > /v/.openai.token.new"));
+        fake.io.fail(Fail::Publish);
+        assert!(ingest_and_route(&fake.io, &fake.dir, "codex").is_err());
+        assert!(fake.calls().contains("write openai.token"));
         assert_eq!(
             read_session(&fake.dir, "codex").unwrap(),
             Some(session.clone())
         );
-        std::fs::remove_file(fake.dir.join("fail_publish")).unwrap();
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        fake.io.recover(Fail::Publish);
+        ingest_and_route(&fake.io, &fake.dir, "codex").unwrap();
         assert!(!login_home(&fake.dir, &session).exists());
         assert!(read_session(&fake.dir, "codex").unwrap().is_none());
         // A login container keeps its session (and volume) for a retry until removal succeeds.
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+        let session = new_session(&fake.io, &fake.dir, "claude").unwrap();
+        fake.io.seed_login(
             &fake.dir,
             "claude",
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
-        std::fs::write(fake.dir.join("fail_remove"), "").unwrap();
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude"
-        )
-        .is_err());
+            "claude/.credentials.json",
+            oauth(9_000_000_000_000).to_string(),
+        );
+        fake.io.fail(Fail::RemoveLogin);
+        assert!(ingest_and_route(&fake.io, &fake.dir, "claude").is_err());
         assert_eq!(read_session(&fake.dir, "claude").unwrap(), Some(session));
-        std::fs::remove_file(fake.dir.join("fail_remove")).unwrap();
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
-        assert!(fake.calls().contains("volume rm"));
+        fake.io.recover(Fail::RemoveLogin);
+        ingest_and_route(&fake.io, &fake.dir, "claude").unwrap();
+        assert!(fake.calls().contains("remove login"));
         assert!(read_session(&fake.dir, "claude").unwrap().is_none());
     }
 
@@ -3818,39 +3284,26 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_login_volume_already_gone_counts_as_removed() {
-        let fake = FakeRuntime::new();
-        std::fs::write(fake.dir.join("fail_remove"), "").unwrap();
-        assert!(remove_login_volume(&fake.rt, "wicked-agw-x-login-codex-0000abcd").is_ok());
-        std::fs::write(
-            fake.dir.join("volumes"),
-            "wicked-agw-x-login-codex-0000abcd\n",
-        )
-        .unwrap();
-        assert!(remove_login_volume(&fake.rt, "wicked-agw-x-login-codex-0000abcd").is_err());
+        let fake = Fixture::new();
+        fake.io.fail(Fail::RemoveLogin);
+        let session = "wicked-agw-x-login-codex-0000abcd";
+        assert!(fake.io.remove_login(session).is_ok());
+        fake.io.create_login(session).unwrap();
+        assert!(fake.io.remove_login(session).is_err());
     }
 
     #[cfg(unix)]
     #[test]
     fn new_login_sessions_remove_previous_volume_and_ingest_only_recorded_session() {
         use std::os::unix::fs::PermissionsExt;
-        let fake = FakeRuntime::new();
-        let first = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
-        let second = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        let first = new_session(&fake.io, &fake.dir, "claude").unwrap();
+        let second = new_session(&fake.io, &fake.dir, "claude").unwrap();
         assert_ne!(first, second);
         let calls = fake.calls();
         assert!(
-            calls.find(&format!("volume rm {first}")).unwrap()
-                < calls.find(&format!("volume create {second}")).unwrap()
+            calls.find(&format!("remove login {first}")).unwrap()
+                < calls.find(&format!("create login {second}")).unwrap()
         );
         assert_eq!(
             read_session(&fake.dir, "claude").unwrap(),
@@ -3864,15 +3317,15 @@ esac
                 & 0o777,
             0o600
         );
-        std::fs::write(fake.dir.join("input"), oauth(9_000_000_000_000).to_string()).unwrap();
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+        fake.io.seed_login(
             &fake.dir,
             "claude",
-        )
-        .unwrap();
-        assert!(fake.calls().contains(&format!("{second}:/in:ro")));
+            "claude/.credentials.json",
+            oauth(9_000_000_000_000).to_string(),
+        );
+        fake.io.clear_calls();
+        ingest_and_route(&fake.io, &fake.dir, "claude").unwrap();
+        assert!(fake.calls().contains(&format!("read login {second}")));
         assert!(!fake.calls().contains(&first));
     }
 
@@ -3885,25 +3338,22 @@ esac
             return;
         }
         for sign_out in [false, true] {
-            let fake = FakeRuntime::new();
-            new_session(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "codex",
-            )
-            .unwrap();
+            let mut fake = Fixture::new();
+            new_session(&fake.io, &fake.dir, "codex").unwrap();
             host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-            std::fs::write(fake.dir.join("calls"), "").unwrap();
+            fake.io.clear_calls();
             let held = crate::seat_refresh::mutation_lock(&fake.dir).unwrap();
             let (tx, rx) = std::sync::mpsc::channel();
-            let (rt, gw, dir) = (fake.rt.clone(), fake.gw.clone(), fake.dir.clone());
+            let dir = fake.dir.clone();
+            let calls = fake.io.log.clone();
+            // Move only the transport; the fixture still owns its temporary directory.
+            let io = std::mem::take(&mut fake.io);
             let worker = std::thread::spawn(move || {
                 tx.send(()).unwrap();
                 if sign_out {
-                    sign_out_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
+                    sign_out_and_route(&io, &dir, "codex")
                 } else {
-                    ingest_and_route(&crate::seat_login::DockerIo::new(&rt, &gw), &dir, "codex")
-                        .map(|_| ())
+                    ingest_and_route(&io, &dir, "codex").map(|_| ())
                 }
             });
             rx.recv().unwrap();
@@ -3912,10 +3362,10 @@ esac
                 .unwrap()
                 .try_lock()
                 .is_err());
-            assert!(fake.calls().is_empty());
+            assert!(calls.lock().unwrap().is_empty());
             drop(held);
             worker.join().unwrap().unwrap();
-            assert!(!fake.calls().is_empty());
+            assert!(!calls.lock().unwrap().is_empty());
         }
     }
 
@@ -3927,24 +3377,14 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
-        std::fs::write(fake.dir.join("fail_probe"), "").unwrap();
-        let error = sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap_err();
+        let fake = Fixture::new();
+        fake.io.fail(Fail::Probe);
+        let error = sign_out_and_route(&fake.io, &fake.dir, "claude").unwrap_err();
         assert!(error.contains("sign-out could not confirm"));
-        assert!(fake.calls().contains("cat > /v/.config.json.new"));
-        assert!(fake.calls().contains("read K;"));
-        std::fs::remove_file(fake.dir.join("fail_probe")).unwrap();
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        assert!(fake.calls().contains("publish"));
+        assert!(fake.calls().contains("probe"));
+        fake.io.recover(Fail::Probe);
+        sign_out_and_route(&fake.io, &fake.dir, "claude").unwrap();
     }
 
     /// codex c6-r3: arm finishes a published sign-in's interrupted cleanup (its login volume holds
@@ -3952,32 +3392,17 @@ esac
     #[cfg(unix)]
     #[test]
     fn arm_finishes_a_committed_sign_ins_cleanup_and_leaves_an_open_login_alone() {
-        let fake = FakeRuntime::new();
-        std::fs::write(fake.dir.join("broker/pi.token"), "FAKE-key").unwrap();
-        let open = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        fake.io.seed_broker("pi.token", "FAKE-key");
+        let open = new_session(&fake.io, &fake.dir, "pi").unwrap();
         assert_eq!(
-            seat_sign_in(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "pi"
-            )
-            .unwrap(),
+            seat_sign_in(&fake.io, &fake.dir, "pi").unwrap(),
             crate::seat_credentials::CredentialKind::ProviderKey.into()
         );
         assert_eq!(read_session(&fake.dir, "pi").unwrap(), Some(open.clone()));
         assert!(login_home(&fake.dir, &open).exists());
         write_session_state(&fake.dir, "pi", &open, true).unwrap();
-        assert!(seat_sign_in(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi"
-        )
-        .is_ok());
+        assert!(seat_sign_in(&fake.io, &fake.dir, "pi").is_ok());
         assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
         assert!(!login_home(&fake.dir, &open).exists());
     }
@@ -3985,83 +3410,51 @@ esac
     #[cfg(unix)]
     #[test]
     fn committed_ingest_retry_preserves_since_rotated_record() {
-        let fake = FakeRuntime::new();
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        new_session(&fake.io, &fake.dir, "codex").unwrap();
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        std::fs::write(fake.dir.join("fail_publish"), "").unwrap();
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex"
-        )
-        .is_err());
+        fake.io.fail(Fail::Publish);
+        assert!(ingest_and_route(&fake.io, &fake.dir, "codex").is_err());
         assert!(session_committed(&fake.dir, "codex").unwrap());
         let mut rotated = chatgpt();
         rotated["tokens"]["refresh_token"] = json!("FAKE-rotated-R2");
-        std::fs::write(fake.dir.join("broker/codex.auth.json"), rotated.to_string()).unwrap();
-        std::fs::remove_file(fake.dir.join("fail_publish")).unwrap();
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
-        assert!(!fake.calls().contains("cat > /v/.codex.auth.json.new"));
-        let current: Value = serde_json::from_slice(
-            &std::fs::read(fake.dir.join("broker/codex.auth.json")).unwrap(),
-        )
-        .unwrap();
+        fake.io.seed_broker("codex.auth.json", rotated.to_string());
+        fake.io.recover(Fail::Publish);
+        fake.io.clear_calls();
+        ingest_and_route(&fake.io, &fake.dir, "codex").unwrap();
+        assert!(!fake.calls().contains("write codex.auth.json"));
+        let current: Value =
+            serde_json::from_slice(&fake.io.broker_file("codex.auth.json").unwrap()).unwrap();
         assert_eq!(current["tokens"]["refresh_token"], "FAKE-rotated-R2");
     }
 
     #[cfg(unix)]
     #[test]
     fn partial_ingest_is_unknown_and_refresh_repairs_before_not_due() {
-        let fake = FakeRuntime::new();
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        new_session(&fake.io, &fake.dir, "claude").unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        std::fs::write(
-            fake.dir.join("input"),
-            oauth((now + 7200) * 1000).to_string(),
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("fail_anthropic.token"), "").unwrap();
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+        fake.io.seed_login(
             &fake.dir,
-            "claude"
-        )
-        .is_err());
+            "claude",
+            "claude/.credentials.json",
+            oauth((now + 7200) * 1000).to_string(),
+        );
+        fake.io.fail(Fail::Write("anthropic.token".into()));
+        assert!(ingest_and_route(&fake.io, &fake.dir, "claude").is_err());
         assert!(
             matches!(publication_status(&fake.dir, "claude", BrokerStatus::SignedOut), BrokerStatus::Unknown(ref reason) if reason == "sign-in incomplete")
         );
-        std::fs::remove_file(fake.dir.join("fail_anthropic.token")).unwrap();
+        fake.io.recover(Fail::Write("anthropic.token".into()));
         assert!(matches!(
-            crate::seat_refresh::refresh(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "claude",
-                false
-            )
-            .unwrap(),
+            crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", false).unwrap(),
             crate::seat_refresh::Outcome::NotDue { .. }
         ));
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"FAKE-claude-access"
         );
         assert!(!crate::seat_refresh::pending_path(&fake.dir, "claude").exists());
@@ -4075,9 +3468,13 @@ esac
         ) {
             return;
         }
-        for state in ["stopped", "absent", "unknown"] {
-            let fake = FakeRuntime::new();
-            std::fs::write(fake.dir.join("state"), state).unwrap();
+        for state in [
+            GatewayState::Stopped,
+            GatewayState::Absent,
+            GatewayState::Unknown,
+        ] {
+            let fake = Fixture::new();
+            *fake.io.gateway_state.borrow_mut() = state;
             crate::seat_refresh::record_last(
                 &fake.dir,
                 "codex",
@@ -4087,13 +3484,9 @@ esac
                     error: None,
                 }),
             );
-            let result = sign_out_and_route(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "codex",
-            );
-            assert_eq!(result.is_ok(), state != "unknown");
-            assert!(!fake.calls().contains("read K;"));
+            let result = sign_out_and_route(&fake.io, &fake.dir, "codex");
+            assert_eq!(result.is_ok(), state != GatewayState::Unknown);
+            assert!(!fake.calls().contains("probe"));
             let revoking: Vec<String> = std::fs::read(fake.dir.join("config/revoking.json"))
                 .ok()
                 .map(|b| serde_json::from_slice(&b).unwrap())
@@ -4113,26 +3506,20 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         std::fs::create_dir_all(fake.dir.join("refresh")).unwrap();
         std::fs::write(crate::seat_refresh::pending_path(&fake.dir, "claude"), "").unwrap();
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json"),
-            oauth(1000).to_string(),
-        )
-        .unwrap();
+        fake.io
+            .seed_broker("claude.credentials.json", oauth(1000).to_string());
         let mut staged = oauth((now + 7200) * 1000);
         staged["claudeAiOauth"]["accessToken"] = json!("FAKE-new-access");
         staged["claudeAiOauth"]["refreshToken"] = json!("FAKE-rotated-R2");
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json.next"),
-            staged.to_string(),
-        )
-        .unwrap();
+        fake.io
+            .seed_broker("claude.credentials.json.next", staged.to_string());
         crate::seat_refresh::record_last(
             &fake.dir,
             "claude",
@@ -4143,38 +3530,29 @@ esac
             }),
         );
         assert!(matches!(
-            crate::seat_refresh::refresh(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "claude",
-                false
-            )
-            .unwrap(),
+            crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", false).unwrap(),
             crate::seat_refresh::Outcome::NotDue { .. }
         ));
         assert_eq!(
-            std::fs::read_to_string(fake.dir.join("broker/claude.credentials.json")).unwrap(),
+            fake.io.broker_text("claude.credentials.json").unwrap(),
             staged.to_string()
         );
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"FAKE-new-access"
         );
-        assert!(!fake
-            .dir
-            .join("broker/claude.credentials.json.next")
-            .exists());
+        assert!(fake
+            .io
+            .broker_file("claude.credentials.json.next")
+            .is_none());
         assert!(matches!(
             with_last_refresh(
-                broker_status(
-                    &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                    "claude"
-                ),
+                broker_status(&fake.io, "claude"),
                 crate::seat_refresh::last_refresh(&fake.dir, "claude")
             ),
             BrokerStatus::SignedIn { .. }
         ));
-        assert!(!fake.calls().contains(crate::seat_refresh::REFRESH_IMAGE));
+        assert!(!fake.calls().contains("send "));
     }
 
     #[cfg(unix)]
@@ -4185,34 +3563,23 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         std::fs::create_dir_all(fake.dir.join("refresh")).unwrap();
-        // Unique: cleanup `pkill -f`s / `pgrep -f`s the name host-wide, so a fixed one would hit
-        // (or wait on) a parallel test's runtime calls carrying a name it prefixes.
+        // An interrupted writer leaves a marker until cleanup can confirm it settled.
         std::fs::write(
             crate::seat_gateway::unsettled_path(&fake.dir, "claude"),
             format!("wicked-mutation-FAKE{}", uuid::Uuid::new_v4().simple()),
         )
         .unwrap();
-        std::fs::write(fake.dir.join("fail_cleanup"), "").unwrap();
-        assert!(sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude"
-        )
-        .is_err());
-        assert!(!fake.calls().contains(": > /in/"));
+        fake.io.fail(Fail::Cleanup);
+        assert!(sign_out_and_route(&fake.io, &fake.dir, "claude").is_err());
+        assert!(!fake.calls().contains("empty "));
         assert!(crate::seat_gateway::unsettled_path(&fake.dir, "claude").exists());
-        std::fs::remove_file(fake.dir.join("fail_cleanup")).unwrap();
-        std::fs::write(fake.dir.join("state"), "stopped").unwrap();
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        fake.io.recover(Fail::Cleanup);
+        *fake.io.gateway_state.borrow_mut() = GatewayState::Stopped;
+        sign_out_and_route(&fake.io, &fake.dir, "claude").unwrap();
         assert!(!crate::seat_gateway::unsettled_path(&fake.dir, "claude").exists());
-        assert!(fake.calls().contains(": > /in/anthropic.token"));
+        assert!(fake.calls().contains("empty anthropic.token"));
     }
 
     #[test]
@@ -4354,114 +3721,72 @@ esac
             let e = setup_token(bad).unwrap_err();
             assert!(!e.contains("FAKE"), "{e}");
         }
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         // An earlier `claude auth login` record is in the broker.
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json"),
+        fake.io.seed_broker(
+            "claude.credentials.json",
             oauth(9_000_000_000_000).to_string(),
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("broker/anthropic.token"), "FAKE-old-access").unwrap();
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+        );
+        fake.io.seed_broker("anthropic.token", "FAKE-old-access");
+        new_session(&fake.io, &fake.dir, "claude").unwrap();
+        fake.io.seed_login(
             &fake.dir,
             "claude",
-        )
-        .unwrap();
-        std::fs::write(
-            fake.dir.join("setup-token"),
+            CLAUDE_SETUP_TOKEN_PATH,
             "sk-ant-oat01-FAKE-setup-0001\n",
-        )
-        .unwrap();
-        let report = ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        );
+        let report = ingest_and_route(&fake.io, &fake.dir, "claude").unwrap();
         assert_eq!(report.files, vec!["anthropic.token".to_string()]);
         assert_eq!(report.expires_at, None);
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"sk-ant-oat01-FAKE-setup-0001"
         );
-        assert!(
-            std::fs::read(fake.dir.join("broker/claude.credentials.json"))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(fake
+            .io
+            .broker_file("claude.credentials.json")
+            .unwrap()
+            .is_empty());
         assert_eq!(
-            broker_status(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                "claude"
-            ),
+            broker_status(&fake.io, "claude"),
             BrokerStatus::SignedIn { expires_at: None }
         );
-        let sign_in = seat_sign_in(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
+        let sign_in = seat_sign_in(&fake.io, &fake.dir, "claude").unwrap();
         assert_eq!(
             sign_in.kind,
             Some(crate::seat_credentials::CredentialKind::ClaudeOauth)
         );
         assert_eq!(
-            claude_seat_token(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir
-            )
-            .unwrap(),
+            claude_seat_token(&fake.io, &fake.dir).unwrap(),
             "sk-ant-oat01-FAKE-setup-0001"
         );
         assert_eq!(
-            crate::seat_refresh::refresh(
-                &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-                &fake.dir,
-                "claude",
-                true
-            )
-            .unwrap(),
+            crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", true).unwrap(),
             crate::seat_refresh::Outcome::NotRefreshable,
             "a pass-through token is never renewed by the broker"
         );
         // A bad paste is refused before the broker changes, and never repeated.
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
+        new_session(&fake.io, &fake.dir, "claude").unwrap();
+        fake.io.seed_login(
             &fake.dir,
             "claude",
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("setup-token"), "FAKE-pasted-url").unwrap();
-        let err = ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap_err();
+            CLAUDE_SETUP_TOKEN_PATH,
+            "FAKE-pasted-url",
+        );
+        let err = ingest_and_route(&fake.io, &fake.dir, "claude").unwrap_err();
         assert!(
             err.contains("claude setup-token") && !err.contains("FAKE"),
             "{err}"
         );
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"sk-ant-oat01-FAKE-setup-0001"
         );
         // Nothing pasted back (the window closed, or the script stopped): the error says so.
-        new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap();
-        std::fs::remove_file(fake.dir.join("setup-token")).unwrap();
-        let err = ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-        )
-        .unwrap_err();
+        new_session(&fake.io, &fake.dir, "claude").unwrap();
+        fake.io
+            .remove_login_file(&fake.dir, "claude", CLAUDE_SETUP_TOKEN_PATH);
+        let err = ingest_and_route(&fake.io, &fake.dir, "claude").unwrap_err();
         assert!(
             err.contains("signed out") && err.contains("nor pasted back"),
             "{err}"
@@ -4592,8 +3917,7 @@ esac
             &stub,
             "#!/bin/sh\n[ \"$1\" = setup-token ] || exit 2\nstty raw -echo\n\
              printf '\\033[?1049h\\033[?1000h\\033[?1006h\\033[>1u\\033[>4;2m\\033[?2026h\\033[?2004h \\033[93m%s\\r\\033[1C\\033[1B%s\\r\\n\\033[?1049l' \"$ROW1\" \"$ROW2\"\n",
-        )
-        .unwrap();
+        ).unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
         let path = format!(
@@ -5087,8 +4411,7 @@ esac
                  { printf 'Script started on 2026-10-19 [COMMAND=\"%s\"]\\n' \"$4\"; cat \"$5.raw\"; \
                  printf '\\nScript done on 2026-10-19 [COMMAND_EXIT_CODE=\"%s\"]\\n' \"$rc\"; } > \"$5\"\n\
                  rm -f \"$5.raw\"; exit $rc\n",
-            )
-            .unwrap();
+            ).unwrap();
             std::fs::set_permissions(bin.join("script"), std::fs::Permissions::from_mode(0o755))
                 .unwrap();
         }
@@ -5107,8 +4430,7 @@ esac
              if [ -n \"$GARBLED\" ]; then printf 'Your OAuth token (valid for 1 year):\\r\\n\\r\\n  %s\\r\\n%s\\r\\n' \"$ROW1\" \"$ROW2\"; \
              elif [ -n \"$TRUNCATED\" ]; then printf 'Your OAuth token (valid for 1 year):\\r\\n\\r\\n%s\\r\\n' \"$ROW1\"; exit 0; \
              else cat \"$d/claude-screen\"; fi\nprintf '\\033[?1000h\\033[?1006h\\033[>1u'\n",
-        )
-        .unwrap();
+        ).unwrap();
         std::fs::set_permissions(bin.join("claude"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
         let path = format!(
@@ -5239,40 +4561,29 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_due_claude_oauth_record_fails_with_sign_in_again_and_no_request() {
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        std::fs::write(
-            fake.dir.join("broker/claude.credentials.json"),
+        fake.io.seed_broker(
+            "claude.credentials.json",
             oauth((now + 300) * 1000).to_string(),
-        )
-        .unwrap();
-        std::fs::write(
-            fake.dir.join("broker/anthropic.token"),
-            "FAKE-claude-access",
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
-        let err = crate::seat_refresh::refresh(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "claude",
-            false,
-        )
-        .unwrap_err();
+        );
+        fake.io.seed_broker("anthropic.token", "FAKE-claude-access");
+        fake.io.clear_calls();
+        let err = crate::seat_refresh::refresh(&fake.io, &fake.dir, "claude", false).unwrap_err();
         assert_eq!(err, crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN);
         assert!(matches!(
             with_last_refresh(
-                broker_status(&crate::seat_login::DockerIo::new(&fake.rt, &fake.gw), "claude"),
+                broker_status(&fake.io, "claude"),
                 crate::seat_refresh::last_refresh(&fake.dir, "claude")
             ),
             BrokerStatus::RefreshFailing { ref reason, .. } if reason == crate::seat_refresh::CLAUDE_SIGN_IN_AGAIN
         ));
-        assert!(!fake.calls().contains(crate::seat_refresh::REFRESH_IMAGE));
+        assert!(!fake.calls().contains("send "));
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/anthropic.token")).unwrap(),
+            fake.io.broker_file("anthropic.token").unwrap(),
             b"FAKE-claude-access",
             "the record is served until it expires"
         );
@@ -5424,45 +4735,36 @@ esac
             return;
         }
         use std::os::unix::fs::PermissionsExt;
-        let fake = FakeRuntime::new();
-        let first = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        let first = new_session(&fake.io, &fake.dir, "codex").unwrap();
         let home = login_home(&fake.dir, &first);
         for d in std::iter::once(home.clone()).chain(host_login_dirs(&home, "codex")) {
             let mode = std::fs::metadata(&d).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "{}", d.display());
         }
         assert!(home.join("codex").is_dir());
-        let orphan = login_home(&fake.dir, &format!("{}-login-codex-0000abcd", fake.gw.name));
+        let orphan = login_home(
+            &fake.dir,
+            &format!("{}-login-codex-0000abcd", gw_name(&fake.dir)),
+        );
         std::fs::create_dir_all(orphan.join("codex")).unwrap();
-        let other = login_home(&fake.dir, &format!("{}-login-pi-0000abcd", fake.gw.name));
+        let other = login_home(
+            &fake.dir,
+            &format!("{}-login-pi-0000abcd", gw_name(&fake.dir)),
+        );
         std::fs::create_dir_all(&other).unwrap();
         std::fs::write(home.join("codex/auth.json"), chatgpt().to_string()).unwrap();
-        let second = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        let second = new_session(&fake.io, &fake.dir, "codex").unwrap();
         assert!(
             !home.exists() && !orphan.exists(),
             "previous and orphaned homes are swept"
         );
         assert!(other.exists(), "another agent's login is left alone");
-        assert!(!fake.calls().contains("volume create"), "no login volume");
+        assert!(!fake.calls().contains("create login"), "no login volume");
         host_input(&fake, "codex", "codex/auth.json", &chatgpt().to_string());
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        ingest_and_route(&fake.io, &fake.dir, "codex").unwrap();
         assert_eq!(
-            std::fs::read(fake.dir.join("broker/openai.token")).unwrap(),
+            fake.io.broker_file("openai.token").unwrap(),
             b"FAKE-codex-access"
         );
         assert!(!login_home(&fake.dir, &second).exists());
@@ -5474,31 +4776,16 @@ esac
     #[cfg(unix)]
     #[test]
     fn a_host_login_that_left_nothing_usable_is_cleaned_up_before_any_broker_change() {
-        let fake = FakeRuntime::new();
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
-        let err = ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap_err();
+        let fake = Fixture::new();
+        let session = new_session(&fake.io, &fake.dir, "pi").unwrap();
+        fake.io.clear_calls();
+        let err = ingest_and_route(&fake.io, &fake.dir, "pi").unwrap_err();
         assert!(err.contains("pi"), "{err}");
         assert!(!login_home(&fake.dir, &session).exists());
         assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
-        assert!(!fake.calls().contains("cat > /v/"), "no broker write");
+        assert!(!fake.calls().contains("write "), "no broker write");
         // A symlinked credential file is refused, never followed.
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
+        let session = new_session(&fake.io, &fake.dir, "codex").unwrap();
         let elsewhere = fake.dir.join("elsewhere.json");
         std::fs::write(&elsewhere, chatgpt().to_string()).unwrap();
         std::os::unix::fs::symlink(
@@ -5506,28 +4793,13 @@ esac
             login_home(&fake.dir, &session).join("codex/auth.json"),
         )
         .unwrap();
-        assert!(ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex"
-        )
-        .is_err());
+        assert!(ingest_and_route(&fake.io, &fake.dir, "codex").is_err());
         assert!(!login_home(&fake.dir, &session).exists());
         assert!(elsewhere.exists(), "the link's target is never touched");
-        assert!(!fake.calls().contains("cat > /v/"));
+        assert!(!fake.calls().contains("write "));
         // Sign-out removes an open host login's home too.
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "opencode",
-        )
-        .unwrap();
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "opencode",
-        )
-        .unwrap();
+        let session = new_session(&fake.io, &fake.dir, "opencode").unwrap();
+        sign_out_and_route(&fake.io, &fake.dir, "opencode").unwrap();
         assert!(!login_home(&fake.dir, &session).exists());
         assert_eq!(read_session(&fake.dir, "opencode").unwrap(), None);
     }
@@ -5542,17 +4814,11 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
+        let fake = Fixture::new();
         let bin = fake.dir.join("bin");
         std::fs::create_dir(&bin).unwrap();
         let env = |path: &Path| vec![("PATH".to_string(), path.display().to_string())];
-        let err = prepare_host_login_argv(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-            &env(&bin),
-        )
-        .unwrap_err();
+        let err = prepare_host_login_argv(&fake.io, &fake.dir, "codex", &env(&bin)).unwrap_err();
         assert!(err.contains("codex is not installed on this host"), "{err}");
         assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         // A stand-in that records where it ran and with which environment.
@@ -5560,13 +4826,7 @@ esac
             &bin.join("codex"),
             "#!/bin/sh\nprintf '%s\\n' \"$PWD\" \"$HOME\" \"$CODEX_HOME\" \"${OPENAI_API_KEY:-unset}\" > \"$HOME/../probe\"\necho 'codex-cli 9.9.9'\n",
         );
-        let argv = prepare_host_login_argv(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-            &env(&bin),
-        )
-        .unwrap();
+        let argv = prepare_host_login_argv(&fake.io, &fake.dir, "codex", &env(&bin)).unwrap();
         let session = read_session(&fake.dir, "codex").unwrap().unwrap();
         let home = login_home(&fake.dir, &session);
         assert_eq!(argv.last().unwrap(), "cli_auth_credentials_store=\"file\"");
@@ -5606,13 +4866,7 @@ esac
         assert!(pid.parse::<i32>().is_ok_and(|p| p > 1), "{pid}");
         // Not a coding agent (no version): refused, and its session removed.
         crate::test_env::install_stub(&bin.join("pi"), "#!/bin/sh\necho 'not that tool'\n");
-        let err = prepare_host_login_argv(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-            &env(&bin),
-        )
-        .unwrap_err();
+        let err = prepare_host_login_argv(&fake.io, &fake.dir, "pi", &env(&bin)).unwrap_err();
         assert!(err.contains("answered no version"), "{err}");
         assert_eq!(read_session(&fake.dir, "pi").unwrap(), None);
     }
@@ -5634,13 +4888,8 @@ esac
             return;
         }
         use std::os::unix::process::CommandExt;
-        let fake = FakeRuntime::new();
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
+        let fake = Fixture::new();
+        let session = new_session(&fake.io, &fake.dir, "pi").unwrap();
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — a stand-in login: records its pid as the login shell does.
         let mut login = std::process::Command::new("/bin/sh")
@@ -5656,23 +4905,13 @@ esac
         while !pid_file.exists() && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
+        sign_out_and_route(&fake.io, &fake.dir, "pi").unwrap();
         let status = login.wait().unwrap();
         assert!(!status.success(), "the login was ended: {status:?}");
         assert!(!login_home(&fake.dir, &session).exists());
         assert!(!pid_file.exists());
         // A pid file older than the process it names is a recycled pid: left alone.
-        let session = new_session(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
+        let session = new_session(&fake.io, &fake.dir, "pi").unwrap();
         let pid_file = login_pid_file(&fake.dir, &session);
         // spawn-audit: test-only — an unrelated process that happens to lead its group.
         let mut other = std::process::Command::new("sleep")
@@ -5688,12 +4927,7 @@ esac
             .unwrap()
             .set_modified(old)
             .unwrap();
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "pi",
-        )
-        .unwrap();
+        sign_out_and_route(&fake.io, &fake.dir, "pi").unwrap();
         assert!(
             other.try_wait().unwrap().is_none(),
             "a recycled pid is never signalled"
@@ -5712,33 +4946,23 @@ esac
         ) {
             return;
         }
-        let fake = FakeRuntime::new();
-        let legacy = format!("{}-login-codex-0000abcd", fake.gw.name);
-        let mut volumes = std::fs::read_to_string(fake.dir.join("volumes")).unwrap();
-        volumes.push_str(&format!("{legacy}\n"));
-        std::fs::write(fake.dir.join("volumes"), volumes).unwrap();
+        let fake = Fixture::new();
+        let legacy = format!("{}-login-codex-0000abcd", gw_name(&fake.dir));
+        fake.io.create_login(&legacy).unwrap();
         write_session(&fake.dir, "codex", &legacy).unwrap();
         // Its credential is still ingested from the volume, as before the upgrade.
-        std::fs::write(fake.dir.join("input"), chatgpt().to_string()).unwrap();
-        ingest_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
-        assert!(fake.calls().contains(&format!("{legacy}:/in:ro")));
-        assert!(fake.calls().contains(&format!("volume rm {legacy}")));
+        fake.io
+            .seed_login(&fake.dir, "codex", "codex/auth.json", chatgpt().to_string());
+        ingest_and_route(&fake.io, &fake.dir, "codex").unwrap();
+        assert!(fake.calls().contains(&format!("read login {legacy}")));
+        assert!(fake.calls().contains(&format!("remove login {legacy}")));
         assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
         // A sign-out of an open legacy session removes its volume too.
-        std::fs::write(fake.dir.join("calls"), "").unwrap();
+        fake.io.clear_calls();
+        fake.io.create_login(&legacy).unwrap();
         write_session(&fake.dir, "codex", &legacy).unwrap();
-        sign_out_and_route(
-            &crate::seat_login::DockerIo::new(&fake.rt, &fake.gw),
-            &fake.dir,
-            "codex",
-        )
-        .unwrap();
-        assert!(fake.calls().contains(&format!("volume rm {legacy}")));
+        sign_out_and_route(&fake.io, &fake.dir, "codex").unwrap();
+        assert!(fake.calls().contains(&format!("remove login {legacy}")));
         assert_eq!(read_session(&fake.dir, "codex").unwrap(), None);
     }
 
@@ -6121,13 +5345,19 @@ esac
         assert!(extract_tokens("copilot", &invalid).is_err());
         let no_user = copilot_config().replace("lastLoggedInUser", "somethingElse");
         assert!(extract_tokens("copilot", &cfg(no_user)).is_err());
-        // The init helper seeds copilot's plaintext consent beside its home.
-        let init = init_login_argv("vol", "copilot");
-        assert!(init.last().unwrap().contains("/in/copilot/settings.json"));
-        assert!(init
-            .last()
-            .unwrap()
-            .contains(r#"{"storeTokenPlaintext":true}"#));
+        #[cfg(unix)]
+        {
+            // Consent is stored beside the login home, independent of the transport.
+            let io = super::io_tests::MemIo::default();
+            io.create_login("copilot-session").unwrap();
+            io.init_login(Path::new("/unused"), "copilot", "copilot-session")
+                .unwrap();
+            let settings = io
+                .read_login("copilot-session", &["copilot/settings.json"])
+                .unwrap();
+            assert_eq!(settings[0].0, "copilot/settings.json");
+            assert_eq!(settings[0].1, COPILOT_SETTINGS.as_bytes());
+        }
     }
 
     /// What opencode's login leaves after `auth export` (FAKE values): its ChatGPT sign-in, its
@@ -6163,8 +5393,7 @@ esac
         std::fs::write(
             &fake,
             "#!/bin/sh\n[ \"$3\" = --standalone ] || exit 9\ncase \"$2\" in\n  login) [ -e \"$FAKE_DIR/login_fails\" ] && exit 3; exit 0;;\n  export) printf '[{\"partial\":'; [ -e \"$FAKE_DIR/export_fails\" ] && exit 4; printf '1}]';;\nesac\n",
-        )
-        .unwrap();
+        ).unwrap();
         std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
         let run = |case: &str| {
             let data = dir.join(case);
