@@ -2983,7 +2983,6 @@ impl WrappedCliStepRunner {
     /// Reopen `run_id`'s container sessions for a reactivated run (its launches are admitted
     /// again; a superseded launch of the old lifecycle stays fenced by its `launch_seq`).
     pub(crate) fn reopen_run_sessions(&self, run_id: &str, min_launch_seq: u64) {
-        crate::repo_checks::clear_floor_cancel(run_id);
         // (core#1491) A resumed run's seats arm again.
         crate::k8s::forget_ended(run_id);
         self.sessions.reopen_run(run_id, min_launch_seq);
@@ -3019,8 +3018,6 @@ impl WrappedCliStepRunner {
     }
 
     pub(crate) fn cancel_run_workers(&self, run_id: &str) {
-        // (core#1482) …and the run's repo-checks floor: its checks are killed, none starts.
-        crate::repo_checks::cancel_floor(run_id);
         self.sessions.forget_run(run_id);
         let tokens = {
             let mut guard = self.cancel_tokens.lock().unwrap_or_else(|p| p.into_inner());

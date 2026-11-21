@@ -461,6 +461,7 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         None,
         None,
         None,
+        None,
     );
     assert_eq!(output.status, StepStatus::Ok, "the runner's own status");
     assert_eq!(evidence.worktree_clean, Some(true));
@@ -566,6 +567,7 @@ fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
         &[],
         &[],
         &[],
+        None,
         None,
         None,
         None,

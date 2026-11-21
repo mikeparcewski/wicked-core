@@ -2126,6 +2126,7 @@ impl crate::rule_check::MachineCheck for NoMachineHere {
 /// without the change (kept); every one passing is a test that does not (broken). A repo with no
 /// test command, no pinned git dir or no OS boundary falls back to the judge, saying so.
 struct FloorMachine<'a> {
+    stop: Option<crate::repo_checks::FloorStop>,
     wd: &'a std::path::Path,
     git_dir: Option<&'a std::path::Path>,
     base: &'a str,
@@ -2180,6 +2181,7 @@ impl crate::rule_check::MachineCheck for FloorMachine<'_> {
             };
         let ctx = crate::repo_checks::FloorContext {
             stage: crate::repo_checks::FloorStage::Creator,
+            stop: self.stop.clone(),
             force_install: false,
             base_head: Some(self.base.to_string()),
             git_dir: Some(git_dir.to_path_buf()),
@@ -2353,6 +2355,7 @@ fn run_rule_check(
         runner,
         emit_delta,
         None,
+        None,
     )
 }
 
@@ -2377,6 +2380,7 @@ fn run_rule_check_with(
     runner: &dyn StepRunner,
     emit_delta: &DeltaSink,
     settle: Option<Settle<'_>>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> Option<crate::rule_check::RuleCheckReport> {
     let wd = std::path::Path::new(input.workdir.as_deref()?);
     let gov = input.governance.as_ref()?;
@@ -2613,6 +2617,7 @@ fn run_rule_check_with(
                 },
                 &judge,
                 &FloorMachine {
+                    stop: stop.clone(),
                     wd,
                     git_dir,
                     base: &base,
@@ -3135,6 +3140,7 @@ pub(crate) fn run_unit_and_judge(
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
     rule_council: Option<&CouncilCtx<'_>>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -3173,6 +3179,7 @@ pub(crate) fn run_unit_and_judge(
         },
         exec_bus,
         team,
+        stop,
     )
 }
 
@@ -3509,6 +3516,7 @@ fn run_unit_and_judge_with_roster(
         JudgeFallbackCtx::default(),
         None,
         None,
+        None,
     )
 }
 
@@ -3584,6 +3592,7 @@ fn run_unit_and_judge_with_launches(
         },
         None,
         None,
+        None,
     )
 }
 
@@ -3622,6 +3631,7 @@ fn run_unit_and_judge_reprobing(
         },
         None,
         None,
+        None,
     )
 }
 
@@ -3652,6 +3662,7 @@ pub(crate) fn run_unit_and_judge_with_team(
         JudgeFallbackCtx::default(),
         exec_bus,
         team,
+        None,
     )
 }
 
@@ -5034,6 +5045,7 @@ fn provisions_seat_deps(input: &StepInput) -> bool {
         && !input.governance.as_ref().is_some_and(|g| g.apps.is_some())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn floor_plan(
     input: &StepInput,
     output: &StepOutput,
@@ -5042,6 +5054,7 @@ fn floor_plan(
     current_tree: Option<&str>,
     default_floor_applies: bool,
     recheck_armed: bool,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> Option<FloorPlan> {
     let guard_denies = matches!(
         guard_first_look,
@@ -5083,6 +5096,7 @@ fn floor_plan(
     let baseline = input.unit.worktree_baseline.as_ref();
     let ctx = crate::repo_checks::FloorContext {
         stage,
+        stop,
         force_install: false,
         // The run base first (F-RC2-009): a creator that committed its work has moved the
         // baseline's HEAD onto the head itself, and base == head compares nothing.
@@ -5221,6 +5235,7 @@ fn run_unit_and_judge_on(
     fallback: JudgeFallbackCtx<'_>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -5245,6 +5260,7 @@ fn run_unit_and_judge_on(
             fallback,
             exec_bus,
             team,
+            stop,
         )
     });
     // (core#1390) The fold's tree reads, here on the worker thread for every worker path (in-process
@@ -5346,6 +5362,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
     fallback: JudgeFallbackCtx<'_>,
     exec_bus: Option<&str>,
     team: Option<&crate::team::runner::TeamRunner>,
+    stop: Option<crate::repo_checks::FloorStop>,
 ) -> (
     StepOutput,
     Option<crate::validator::AgentVerdict>,
@@ -5789,6 +5806,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
             current_tree.as_deref(),
             default_floor_applies,
             recheck_armed,
+            stop.clone(),
         )
     };
     // (power-speed-2) A floor that runs on a CLEAN CHECKOUT of a known tree starts now, on its own
@@ -6833,6 +6851,7 @@ fn run_unit_and_judge_in<'scope, 'env>(
                 council: fallback.rule_council,
                 council_pool: &eligible_run,
             }),
+            stop.clone(),
         )
     } else {
         None
@@ -7735,6 +7754,7 @@ fn run_cli_runner(
                     // rule check cannot establish creators, so it convenes no council (a dispute
                     // holds) — fail-closed.
                     None,
+                    None,
                 );
                 let completed = CompletedTask {
                     run_id: output.run_id.clone(),
@@ -8040,6 +8060,7 @@ mod tests {
                 JudgeFallbackCtx::default(),
                 Some(bus),
                 None,
+                None,
             )
         });
         assert_eq!(requests.len(), 1);
@@ -8334,6 +8355,7 @@ mod tests {
                 &[],
                 JudgeFallbackCtx::default(),
                 Some(bus),
+                None,
                 None,
             )
         });
@@ -10347,6 +10369,7 @@ mod tests {
                         &[],
                         JudgeFallbackCtx::default(),
                         Some(bus),
+                        None,
                         None,
                     )
                 });
