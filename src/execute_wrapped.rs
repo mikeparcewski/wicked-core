@@ -4928,8 +4928,8 @@ impl WrappedCliStepRunner {
             // unobserved.
             let mut observed: Option<Vec<crate::observed_provider::Provider>> = None;
             if let Some(lease) = gateway_lease.take() {
-                let records = lease.release();
-                observed = crate::observed_provider::providers_of(&records);
+                let observation = lease.release();
+                observed = observation.providers;
                 let phase = gov_env
                     .as_ref()
                     .map(|g| g.phase.clone())
@@ -4937,7 +4937,7 @@ impl WrappedCliStepRunner {
                 crate::seat_gateway::write_records(
                     &crate::gate_hook::decisions_path_for_input(input)
                         .with_file_name(format!("gateway-{phase}.ndjson")),
-                    &records,
+                    &observation.records,
                 );
             }
             crate::observed_provider::record_receipt(&cli_key, observed);
