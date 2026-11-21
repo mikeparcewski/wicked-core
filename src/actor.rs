@@ -2872,6 +2872,9 @@ pub(crate) fn run(
                 }
                 let _ = reply.send(res);
             }
+            Command::UnregisterRepo { repo_id, reply } => {
+                let _ = reply.send(unregister_repo(&mut store, &repo_id));
+            }
             Command::ListRepos { reply } => {
                 let _ = reply.send(crate::repo::list_repos(&store));
             }
@@ -22010,6 +22013,47 @@ fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Op
     let in_per = entry.get("input_per_mtok").and_then(|v| v.as_f64())?;
     let out_per = entry.get("output_per_mtok").and_then(|v| v.as_f64())?;
     Some(input_tokens as f64 / 1e6 * in_per + output_tokens as f64 / 1e6 * out_per)
+}
+
+/// The actor's unregister guard: session reads and removal share the launch/register writer.
+pub(crate) fn unregister_repo(store: &mut impl GraphStore, repo_id: &str) -> anyhow::Result<bool> {
+    let Some(repo) = crate::repo::get_repo(store, repo_id)? else {
+        return Ok(false);
+    };
+    let mut runs = Vec::new();
+    for run_id in list_sessions(store)? {
+        if let Some(session) = crate::domain::get_session(store, &run_id)? {
+            if session.repo_ref.as_deref() == Some(repo_id)
+                && !matches!(
+                    session.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                )
+            {
+                runs.push(run_id);
+            }
+        }
+    }
+    runs.extend(crate::code_graph::graph_lease_holders(
+        std::path::Path::new(&repo.code_graph_db),
+    ));
+    runs.sort();
+    runs.dedup();
+    if !runs.is_empty() {
+        anyhow::bail!(
+            "repo_in_use: repository {repo_id} has live runs: {} — \
+             wait for them to end or stop them first",
+            runs.join(", ")
+        );
+    }
+    let projects = crate::project::member_projects(store, "crew.repo", repo_id)?;
+    if !projects.is_empty() {
+        anyhow::bail!(
+            "repo_in_project: repository {repo_id} belongs to project(s) {} — \
+             remove it from the project first",
+            projects.join(", ")
+        );
+    }
+    crate::repo::unregister_repo(store, repo_id)
 }
 
 /// Read the agent session ids on the store (by their session-node names).

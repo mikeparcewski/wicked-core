@@ -363,6 +363,17 @@ pub fn register_repo(store: &mut dyn GraphStore, spec: RepoSpec) -> anyhow::Resu
     Ok(entry)
 }
 
+/// Remove only the registry node, returning false if it is unknown. Leaves the checkout folder,
+/// code graph database, and worktrees on disk. The actor checks runs, leases, and memberships
+/// first.
+pub fn unregister_repo(store: &mut dyn GraphStore, repo_id: &str) -> anyhow::Result<bool> {
+    let Some(node) = store.get_node(&synthetic_symbol(REPO_ENTRY, repo_id))? else {
+        return Ok(false);
+    };
+    store.remove_file(&node.location.file)?;
+    Ok(true)
+}
+
 /// Adopt each pre-#1419 record's current legacy graph key without moving graph data.
 /// Inspect raw metadata: `from_node` fills the legacy key even before it is persisted.
 pub(crate) fn pin_graph_keys(store: &mut dyn GraphStore) -> anyhow::Result<Vec<(String, String)>> {
@@ -3582,6 +3593,214 @@ mod tests {
         assert_eq!(fetched.code_graph_db, entry.code_graph_db);
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unregister_repo_unknown_id_returns_false() {
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        assert!(!unregister_repo(&mut store, "unknown").unwrap());
+        assert!(!crate::actor::unregister_repo(&mut store, "unknown").unwrap());
+    }
+
+    #[test]
+    fn unregister_repo_removes_only_the_registration_and_allows_registering_again() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("unregister-idle");
+        let home = scratch_state_home("unregister-idle");
+        let _home = crate::code_graph::StateHomeScope::bind(Some(home.clone()));
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let spec = RepoSpec {
+            name: "Unregister Idle".into(),
+            root_path: root.to_string_lossy().into_owned(),
+            registered_at: 0,
+        };
+        let entry = register_repo(&mut store, spec.clone()).unwrap();
+        let db = Path::new(&entry.code_graph_db);
+        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
+        std::fs::write(db, b"preserved graph").unwrap();
+        let tree = create_worktree(root.to_str().unwrap(), "unregister-leftover").unwrap();
+
+        assert!(crate::actor::unregister_repo(&mut store, &entry.id).unwrap());
+        assert!(get_repo(&store, &entry.id).unwrap().is_none());
+        assert!(list_repos(&store).unwrap().is_empty());
+        assert!(root.join("README.md").is_file());
+        assert!(tree.join("README.md").is_file());
+        assert_eq!(std::fs::read(db).unwrap(), b"preserved graph");
+        assert!(!crate::actor::unregister_repo(&mut store, &entry.id).unwrap());
+        assert_eq!(register_repo(&mut store, spec).unwrap().id, entry.id);
+        assert_eq!(list_repos(&store).unwrap().len(), 1);
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unregister_repo_refuses_every_non_terminal_session_and_names_the_runs() {
+        use crate::domain::SessionStatus;
+
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("unregister-live");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Unregister Live".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        for status in [
+            SessionStatus::Planning,
+            SessionStatus::Distributing,
+            SessionStatus::Executing,
+            SessionStatus::AwaitingHuman,
+        ] {
+            for id in ["r2", "r1"] {
+                let mut session = crate::actor::sessions_detail_fold_tests::session(id);
+                session.repo_ref = Some(entry.id.clone());
+                session.status = status;
+                put_node(&mut store, session.to_node()).unwrap();
+            }
+            let message = crate::actor::unregister_repo(&mut store, &entry.id)
+                .unwrap_err()
+                .to_string();
+            assert!(message.starts_with("repo_in_use: "), "{message}");
+            assert!(message.contains(&entry.id), "{message}");
+            assert!(message.contains("r1, r2"), "{message}");
+            assert!(get_repo(&store, &entry.id).unwrap().is_some());
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unregister_repo_allows_terminal_sessions_and_live_runs_on_other_repos() {
+        use crate::domain::SessionStatus;
+
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("unregister-terminal");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Unregister Terminal".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        for (id, status) in [
+            ("completed", SessionStatus::Completed),
+            ("cancelled", SessionStatus::Cancelled),
+            ("failed", SessionStatus::Failed),
+        ] {
+            let mut session = crate::actor::sessions_detail_fold_tests::session(id);
+            session.repo_ref = Some(entry.id.clone());
+            session.status = status;
+            put_node(&mut store, session.to_node()).unwrap();
+        }
+        let mut other = crate::actor::sessions_detail_fold_tests::session("other");
+        other.repo_ref = Some("another-repo".into());
+        put_node(&mut store, other.to_node()).unwrap();
+        assert!(crate::actor::unregister_repo(&mut store, &entry.id).unwrap());
+        assert_eq!(crate::domain::all_sessions(&store).unwrap().len(), 4);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unregister_repo_refuses_a_graph_lease_without_a_session() {
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("unregister-leased");
+        let home = scratch_state_home("unregister-leased");
+        let _home = crate::code_graph::StateHomeScope::bind(Some(home.clone()));
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Unregister Leased".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let holder = format!("unregister-holder-{:?}", std::thread::current().id());
+        crate::code_graph::lease_graph(Path::new(&entry.code_graph_db), &holder, None);
+        let result = crate::actor::unregister_repo(&mut store, &entry.id);
+        crate::code_graph::release_graph_lease(&holder);
+        let message = result.unwrap_err().to_string();
+        assert!(message.starts_with("repo_in_use: "), "{message}");
+        assert!(message.contains(&holder), "{message}");
+        assert!(get_repo(&store, &entry.id).unwrap().is_some());
+        assert!(crate::actor::unregister_repo(&mut store, &entry.id).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn unregister_repo_refuses_project_membership_until_detached() {
+        use crate::project::{attach_member, create_project, detach_member, MemberSpec};
+
+        let _env = crate::code_graph::REPO_GRAPH_ROOT_ENV_LOCK
+            .read()
+            .unwrap_or_else(|p| p.into_inner());
+        let root = git_repo("unregister-project");
+        let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+        let entry = register_repo(
+            &mut store,
+            RepoSpec {
+                name: "Unregister Project".into(),
+                root_path: root.to_string_lossy().into_owned(),
+                registered_at: 0,
+            },
+        )
+        .unwrap();
+        let mut members = Vec::new();
+        for name in ["p1", "p2"] {
+            let project = create_project(&mut store, name, None, 1).unwrap();
+            let (member, _) = attach_member(
+                &mut store,
+                MemberSpec {
+                    project_id: project.id.clone(),
+                    member_kind: "crew.repo".into(),
+                    member_ref: entry.id.clone(),
+                    meta: None,
+                    attached_by: "api".into(),
+                },
+                2,
+            )
+            .unwrap();
+            members.push((project.id, member.id));
+        }
+        // A live run takes precedence over the project refusal.
+        let mut session = crate::actor::sessions_detail_fold_tests::session("project-live");
+        session.repo_ref = Some(entry.id.clone());
+        put_node(&mut store, session.to_node()).unwrap();
+        let message = crate::actor::unregister_repo(&mut store, &entry.id)
+            .unwrap_err()
+            .to_string();
+        assert!(message.starts_with("repo_in_use: "), "{message}");
+        session.status = crate::domain::SessionStatus::Completed;
+        put_node(&mut store, session.to_node()).unwrap();
+        let message = crate::actor::unregister_repo(&mut store, &entry.id)
+            .unwrap_err()
+            .to_string();
+        assert!(message.starts_with("repo_in_project: "), "{message}");
+        assert!(message.contains(&entry.id), "{message}");
+        for (project_id, member_id) in members {
+            assert!(message.contains(&project_id), "{message}");
+            assert!(detach_member(&mut store, &project_id, &member_id, 3).unwrap());
+        }
+        assert!(get_repo(&store, &entry.id).unwrap().is_some());
+        assert!(crate::actor::unregister_repo(&mut store, &entry.id).unwrap());
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// core#406 at the registration seam: a repo whose checkout ALREADY carries an in-tree graph

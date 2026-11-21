@@ -1402,6 +1402,21 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// Unregister a repository, returning false if it is unknown. Refuses live runs, graph leases,
+    /// and project memberships. Leaves the checkout folder, code graph database, and worktrees on
+    /// disk.
+    pub fn unregister_repo(&self, repo_id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::UnregisterRepo {
+                repo_id: repo_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// List every registered repository.
     pub fn list_repos(&self) -> anyhow::Result<Vec<RepoEntry>> {
         let (reply, rx) = channel();

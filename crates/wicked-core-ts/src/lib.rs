@@ -1896,6 +1896,18 @@ impl Core {
         })
     }
 
+    /// Unregister a repository; resolves to the JSON literal `true`, or `false` for an unknown id.
+    /// Rejects with `repo_in_use: ` for live runs or graph leases, or `repo_in_project: ` for
+    /// project memberships. Leaves the checkout folder, code graph database, and worktrees on disk.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn unregister_repo(&self, repo_id: String) -> AsyncTask<CoreTask> {
+        let core = self.inner.clone();
+        task(move || {
+            let removed = core.unregister_repo(&repo_id).map_err(err)?;
+            serde_json::to_string(&removed).map_err(err)
+        })
+    }
+
     /// (rejudge) Whether the run's open gate can RE-RUN ITS JUDGE now, as a JSON
     /// `RejudgeReadiness` object: `{applies, available, ord, eligible, missing: [{seat, reason}],
     /// reason}`. `applies` — the gate is a unit's `judge_unavailable` denial; `available` — the
