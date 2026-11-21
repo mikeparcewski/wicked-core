@@ -53,10 +53,20 @@ pub struct Denial {
     pub write: bool,
     /// Where the call WOULD have been allowed.
     pub allowed: Vec<PathBuf>,
+    /// A pod write crossed `..` after a prefix the host could not resolve (core#1469).
+    pub host_blind: bool,
 }
 
 impl std::fmt::Display for Denial {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.host_blind {
+            return write!(
+                f,
+                "path cannot be resolved on the host: {} (write); a pod may have an unseen \
+                 symlink before `..`; spell the path without `..`",
+                self.resolved.display()
+            );
+        }
         // Naming the allowed roots is the point, not decoration. An agent told only "denied" retries
         // the same thing or fails the unit; one told where it MAY look adapts. Same principle as
         // FINDING-066 — a remedy that cannot be acted on is not a remedy.
@@ -74,12 +84,13 @@ impl std::fmt::Display for Denial {
     }
 }
 
-/// Collapse `~`, `.` and `..` WITHOUT touching the filesystem.
+/// Collapse `~`, `.` and `..`, resolving each Unix parent against its physical prefix (core#1469).
 ///
 /// `std::fs::canonicalize` cannot be the whole answer: a `Write` to a file that does not exist yet
-/// fails it, and that is the single most important case to check. So resolve logically first, then
-/// canonicalize the nearest EXISTING ancestor to defeat symlinks.
-fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
+/// fails it. A missing prefix keeps the lexical parent and records that the host cannot see it;
+/// a pod write cannot trust that reading. Windows collapses parents before lookup and stays
+/// lexical.
+fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> (PathBuf, bool) {
     let expanded: PathBuf = match (raw.strip_prefix("~/"), home) {
         (Some(rest), Some(h)) => h.join(rest),
         _ if raw == "~" => home
@@ -94,9 +105,16 @@ fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
     };
 
     let mut out = PathBuf::new();
+    let mut host_blind = false;
     for c in joined.components() {
         match c {
             Component::ParentDir => {
+                if cfg!(unix) {
+                    match std::fs::canonicalize(&out) {
+                        Ok(real) => out = real,
+                        Err(_) => host_blind = true,
+                    }
+                }
                 // Popping is what makes `../../etc/hosts` resolvable at all. Refusing to pop past
                 // the root is deliberate: `/..` is `/`, not an error.
                 out.pop();
@@ -105,7 +123,7 @@ fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
             other => out.push(other.as_os_str()),
         }
     }
-    out
+    (out, host_blind)
 }
 
 /// [`normalize`] for a fence that needs an ABSOLUTE base to join relative tokens onto, without
@@ -114,7 +132,7 @@ fn normalize(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
 /// collapsed exactly as the boundary check collapses them, so the fence and the boundary cannot
 /// disagree about where the shell stands.
 pub(crate) fn normalize_for_fence(raw: &str, cwd: &Path, home: Option<&Path>) -> PathBuf {
-    normalize(raw, cwd, home)
+    normalize(raw, cwd, home).0
 }
 
 /// Resolve symlinks as far as the filesystem allows.
@@ -191,7 +209,9 @@ pub fn check(
     cwd: &Path,
     home: Option<&Path>,
 ) -> Result<PathBuf, Denial> {
-    let resolved = resolve_symlinks(&normalize(raw, cwd, home));
+    let (normalized, host_blind) = normalize(raw, cwd, home);
+    let resolved = resolve_symlinks(&normalized);
+    let host_blind = host_blind && write && crate::gate_hook::seat_in_pod();
 
     let permitted: Vec<&PathBuf> = if write {
         roots.write.iter().collect()
@@ -200,7 +220,7 @@ pub fn check(
     };
 
     for root in &permitted {
-        if resolved_is_within(&resolved, root) {
+        if !host_blind && resolved_is_within(&resolved, root) {
             return Ok(resolved);
         }
     }
@@ -208,6 +228,7 @@ pub fn check(
         resolved,
         write,
         allowed: permitted.into_iter().cloned().collect(),
+        host_blind,
     })
 }
 
@@ -233,7 +254,7 @@ pub fn resolved_is_within(resolved: &Path, root: &Path) -> bool {
 /// roots. Sharing the chain is what keeps "inside" meaning one thing on both carriers and on
 /// every OS (`/tmp`→`/private/tmp`, Windows verbatim prefixes).
 pub(crate) fn raw_resolves_within(raw: &str, cwd: &Path, home: Option<&Path>, root: &Path) -> bool {
-    let resolved = resolve_symlinks(&normalize(raw, cwd, home));
+    let resolved = resolve_symlinks(&normalize(raw, cwd, home).0);
     resolved_is_within(&resolved, root)
 }
 
@@ -245,7 +266,7 @@ pub(crate) fn raw_resolves_within(raw: &str, cwd: &Path, home: Option<&Path>, ro
 /// so `/tmp` vs `/private/tmp` cannot make the unit's own tree look foreign. Returns the sibling
 /// tree (or the listing directory) the path is inside.
 pub(crate) fn sibling_worktree(raw: &str, cwd: &Path, home: Option<&Path>) -> Option<PathBuf> {
-    let resolved = resolve_symlinks(&normalize(raw, cwd, home));
+    let resolved = resolve_symlinks(&normalize(raw, cwd, home).0);
     let own = resolve_symlinks(cwd);
     if resolved_is_within(&resolved, &own) {
         return None;
@@ -822,6 +843,60 @@ mod tests {
             "symlink was not resolved: {}",
             d.resolved.display()
         );
+    }
+
+    /// Resolve a link before taking its parent so a self-link cannot hide an escape (core#1469).
+    #[cfg(unix)]
+    #[test]
+    fn dot_dot_after_a_self_link_uses_the_physical_parent_1469() {
+        let wt = scratch("physical_parent_1469");
+        std::fs::create_dir(wt.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&wt, wt.join("self")).unwrap();
+        let raw = wt.join("self/sub/../../escape");
+        let d = check(raw.to_str().unwrap(), &roots(&wt), true, &wt, None)
+            .expect_err("the kernel writes beside the worktree, outside its write root");
+        assert_eq!(d.resolved, wt.parent().unwrap().join("escape"));
+        assert!(!raw_resolves_within(raw.to_str().unwrap(), &wt, None, &wt));
+        assert_eq!(
+            normalize_for_fence(raw.to_str().unwrap(), &wt, None),
+            d.resolved
+        );
+        let _ = std::fs::remove_dir_all(&wt);
+    }
+
+    /// A pod may have a link the host cannot inspect before `..`; refuse that write and name
+    /// the plain-path remedy, while reads and host-floor writes keep their rules (core#1469).
+    #[cfg(unix)]
+    #[test]
+    fn a_pod_write_with_a_host_blind_parent_is_unresolved_1469() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let previous = std::env::var_os(crate::gate_hook::SEAT_POD_ENV);
+        let wt = scratch("host_blind_1469");
+        std::fs::create_dir(wt.join("a")).unwrap();
+        let raw = wt.join("podonly/../x");
+        std::env::remove_var(crate::gate_hook::SEAT_POD_ENV);
+        let host = check(raw.to_str().unwrap(), &roots(&wt), true, &wt, None);
+        std::env::set_var(crate::gate_hook::SEAT_POD_ENV, "1");
+        let pod = check(raw.to_str().unwrap(), &roots(&wt), true, &wt, None);
+        let read = check(raw.to_str().unwrap(), &roots(&wt), false, &wt, None);
+        let plain = check("a/../b", &roots(&wt), true, &wt, None);
+        match previous {
+            Some(value) => std::env::set_var(crate::gate_hook::SEAT_POD_ENV, value),
+            None => std::env::remove_var(crate::gate_hook::SEAT_POD_ENV),
+        }
+        assert_eq!(host.unwrap(), wt.join("x"));
+        let denial = pod.expect_err("a pod-only component could be an unseen link");
+        let reason = denial.to_string();
+        assert!(
+            reason.contains("cannot be resolved on the host"),
+            "{reason}"
+        );
+        assert!(reason.contains("spell the path without `..`"), "{reason}");
+        assert_eq!(read.unwrap(), wt.join("x"));
+        assert_eq!(plain.unwrap(), wt.join("b"));
+        let _ = std::fs::remove_dir_all(&wt);
     }
 
     /// C4 — the invariant that decides shippability. Ordinary in-worktree work must be untouched,
