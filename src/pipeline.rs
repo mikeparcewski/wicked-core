@@ -5431,7 +5431,9 @@ mod judge_bench_tests {
             script: "exit 1".into(),
             approved: true,
         };
-        let fold = |sid: &str, read_workdir: &str| -> Vec<crate::domain::UnitDenial> {
+        // The pinned-validator denial reasons the fold recorded: the outcome's winner and the
+        // unit's record (which holds the winner too), each reason once.
+        let fold = |sid: &str, read_workdir: &str| -> Vec<String> {
             let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
             let mut sink = |_e: CoreEvent| {};
             let Planned {
@@ -5499,18 +5501,21 @@ mod judge_bench_tests {
                 .into_iter()
                 .chain(units[0].denials_behind.clone().unwrap_or_default())
                 .filter(|d| d.source == "pinned_validator")
+                .map(|d| d.reason)
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
                 .collect()
         };
         let read = fold("pinned-read-same", &wd);
         assert_eq!(
-            read.iter().map(|d| d.reason.as_str()).collect::<Vec<_>>(),
-            vec!["read off the actor"],
+            read,
+            vec!["read off the actor".to_string()],
             "a read on the fold's own inputs is applied as it is: {read:?}"
         );
         let other = fold("pinned-read-other", "/elsewhere");
         assert_eq!(other.len(), 1, "{other:?}");
         assert!(
-            other[0].reason.starts_with("pinned validator failed"),
+            other[0].starts_with("pinned validator failed"),
             "a read on other inputs is ignored and the fold runs the validator: {other:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
