@@ -7862,15 +7862,17 @@ const CANCELLED: &str = "__wicked_cancelled__";
 pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
     let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
     let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
-    // (core#1743) The reason is the frame's ONE line (a codec error carries line breaks), so a
-    // reader takes the whole first line as the engine's reason and bounds only the seat's output.
+    // (core#1743) The reason is the frame's ONE line (a codec error carries line breaks), and the
+    // engine keeps it whole under an unguessable reference the frame names
+    // ([`lost_result_reason`]), so no reader has to parse it back out of the seat's text.
     let why = why
         .split(['\n', '\r'])
         .map(str::trim)
         .filter(|l| !l.is_empty())
         .collect::<Vec<_>>()
         .join(" ");
-    let mut text = format!("{RESULT_LOST_PREFIX}{cli}`: {why})");
+    let token = record_lost_result(&why);
+    let mut text = format!("{RESULT_LOST_PREFIX}{cli}` {LOST_REF_OPEN}{token}]: {why})");
     if !out.trim().is_empty() {
         text.push('\n');
         text.push_str(out);
@@ -7880,6 +7882,50 @@ pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
         text.push_str(stderr);
     }
     text
+}
+
+/// (core#1743) Where a result-lost frame names the engine's record of its reason.
+const LOST_REF_OPEN: &str = "[lost-result ";
+
+/// (core#1743) Settlement failures the engine framed and no reader has consumed yet: reference ->
+/// whole reason. Bounded: a frame whose step never reached the actor (the run was cancelled) is
+/// dropped oldest first.
+static LOST_RESULTS: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+const LOST_RESULTS_KEPT: usize = 256;
+
+fn record_lost_result(why: &str) -> String {
+    let token = uuid::Uuid::new_v4().simple().to_string();
+    let mut kept = LOST_RESULTS.lock().unwrap_or_else(|p| p.into_inner());
+    if kept.len() >= LOST_RESULTS_KEPT {
+        kept.remove(0);
+    }
+    kept.push((token.clone(), why.to_string()));
+    token
+}
+
+/// (core#1743) The engine's whole reason for a result it lost in settlement, read from ITS OWN
+/// record through the reference its frame carries, wherever the frame sits in `output` (a power
+/// turn folds earlier summaries ahead of it). A seat cannot forge one: the reference is random and
+/// recorded only by [`settle_failure_output`]. `take` consumes the record (the step's one report).
+pub(crate) fn lost_result_reason(output: &str, take: bool) -> Option<String> {
+    let mut kept = LOST_RESULTS.lock().unwrap_or_else(|p| p.into_inner());
+    for (at, _) in output.match_indices(RESULT_LOST_PREFIX) {
+        let Some(open) = output[at..].find(LOST_REF_OPEN) else {
+            continue;
+        };
+        let start = at + open + LOST_REF_OPEN.len();
+        let Some(token) = output.get(start..start + 32) else {
+            continue;
+        };
+        if let Some(ix) = kept.iter().position(|(t, _)| t == token) {
+            return Some(if take {
+                kept.remove(ix).1
+            } else {
+                kept[ix].1.clone()
+            });
+        }
+    }
+    None
 }
 
 /// Between a settlement failure's reason and the CLI's stderr in the sentinel.
@@ -7898,14 +7944,6 @@ pub(crate) const RESULT_LOST_PREFIX: &str = "(the engine lost the result of `";
 pub(crate) fn failed_after_the_seat_ran(output: &str) -> bool {
     output.starts_with(RESULT_LOST_PREFIX)
         || output.starts_with(crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER)
-}
-
-/// (core#1743) The engine's whole reason for a result it lost in settlement: the frame's one line
-/// ([`settle_failure_output`]), never cut; `None` for any other output.
-pub(crate) fn result_lost_reason(output: &str) -> Option<&str> {
-    output
-        .starts_with(RESULT_LOST_PREFIX)
-        .then(|| output.lines().next().unwrap_or(output))
 }
 
 /// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
@@ -8221,7 +8259,13 @@ pub(crate) fn run_bounded(
             Err(e) => {
                 // (core#1743) The whole reason in the daemon log: the step's own report bounds the
                 // seat's output, and this is where an operator greps for why a result was lost.
-                eprintln!("wicked-core: the engine lost a seat's result in settlement: {e}");
+                // Credentials cut: the reason may name a seat-made path (codex xreview #6).
+                eprintln!(
+                    "wicked-core: the engine lost a seat's result in settlement: {}",
+                    crate::deliver_lift::redact_log_text(&e)
+                );
+                // The reason never carries the separator (a file name may): it stays whole.
+                let e = e.replace(SETTLE_SEP, " ");
                 // The reason, then the CLI's own stderr (review r4: it may say why it failed).
                 return Ok((
                     -1,
@@ -14728,11 +14772,25 @@ mod tests {
             &format!("{SETTLE_FAILED}the write-back was refused:\n`a` leaves its root"),
             "seat words\nmore",
         );
-        assert_eq!(
-            result_lost_reason(&out),
-            Some("(the engine lost the result of `claude`: the write-back was refused: `a` leaves its root)")
+        let whole = "the write-back was refused: `a` leaves its root";
+        assert!(
+            out.lines().next().unwrap().ends_with(&format!("{whole})")),
+            "{out}"
         );
-        assert_eq!(result_lost_reason("(cli `claude` exited 1) x"), None);
+        assert_eq!(lost_result_reason(&out, false).as_deref(), Some(whole));
+        // (codex xreview #1) A power turn folds summaries ahead of the frame: still found.
+        let folded = format!("[power checkpoint 1] summary\n{out}");
+        assert_eq!(lost_result_reason(&folded, false).as_deref(), Some(whole));
+        // (codex xreview #5) A seat's forged frame names no record the engine kept.
+        let forged = format!(
+            "{RESULT_LOST_PREFIX}claude` [lost-result {}]: nothing landed)",
+            "0".repeat(32)
+        );
+        assert_eq!(lost_result_reason(&forged, false), None);
+        assert_eq!(lost_result_reason("(cli `claude` exited 1) x", false), None);
+        // Taken once: the step's one report.
+        assert_eq!(lost_result_reason(&out, true).as_deref(), Some(whole));
+        assert_eq!(lost_result_reason(&out, true), None);
     }
 
     #[test]

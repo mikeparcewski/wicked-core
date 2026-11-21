@@ -7856,28 +7856,48 @@ fn apply_step_result(
         // the work and no seat failure, so neither the triage judge nor the failover ladder rules
         // on it, and it never ends the run (#1518). It pauses at the `failure` gate on EVERY
         // human_confirm, as a denial does (core#464): approve re-dispatches at a fresh attempt,
-        // reject stops. "Keep the captured output" is not offered: the tree changes never landed.
-        // The engine's reason rides whole (path-redacted); only the seat's own words are bounded.
-        if let Some(lost) = crate::execute_wrapped::result_lost_reason(&output.output)
-            .filter(|_| unit.tool_cmd.is_none())
+        // reject stops. "Keep the captured output" is not offered: the work did not come back.
+        // The reason is the engine's own record (never the seat's text), whole and redacted; only
+        // the seat's own words are bounded.
+        if let Some(lost) = (unit.tool_cmd.is_none())
+            .then(|| crate::execute_wrapped::lost_result_reason(&output.output, true))
+            .flatten()
         {
-            let reason = wicked_apps_core::emit::redact_paths(lost);
+            let reason = crate::deliver_lift::redact_log_text(&lost);
             let cli = unit
                 .assigned_cli
                 .clone()
                 .unwrap_or_else(|| "claude".to_string());
-            let seat_words = output.output[lost.len()..].trim();
+            let seat_words = output
+                .output
+                .lines()
+                .filter(|l| !l.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let seat_words = seat_words.trim();
             let why = format!(
-                "Unit {ord} ({cli}) ran on attempt {}, but its result did not come back: {reason}",
+                "Unit {ord} ({cli}) ran on attempt {}, but the engine lost its result: {reason}",
                 output.attempt + 1
             );
+            // (codex xreview #7) A governed attempt's hook claims are conformed, as on the
+            // terminal path this arm replaces.
+            if output.governed {
+                let phase = crate::scope::unit_phase(ord);
+                let _ = crate::gate_hook::fold_input_denial(
+                    store,
+                    &run_id,
+                    output.attempt,
+                    &phase,
+                    true,
+                );
+            }
             unit.status = crate::domain::UnitStatus::Rejected;
             unit.denial_reason = Some(if seat_words.is_empty() {
                 why.clone()
             } else {
                 format!(
                     "{why}\nThe seat's own output: {}",
-                    wicked_apps_core::emit::redact_paths(&failure_detail_excerpt(seat_words))
+                    crate::deliver_lift::redact_log_text(&failure_detail_excerpt(seat_words))
                 )
             });
             unit.denial = Some(crate::domain::UnitDenial::new(
@@ -7897,9 +7917,11 @@ fn apply_step_result(
                     failure_kind: crate::event::StepFailureKind::WorkerError,
                 },
             );
+            // (codex xreview #4) A failure while the write-back applied can leave some of it in
+            // the tree; the reason says how far it got, and the prompt never promises a clean one.
             let prompt = format!(
-                "{why}. Nothing it changed was applied to the run's tree. Approve to run the unit \
-                 again (optionally amend), or reject to stop the run."
+                "{why}. The reason says whether any of its work reached the run's tree. Approve to \
+                 run the unit again (optionally amend), or reject to stop the run."
             );
             pause_for_human(
                 store,
