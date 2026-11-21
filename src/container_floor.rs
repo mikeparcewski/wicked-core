@@ -6006,11 +6006,19 @@ esac
             .collect();
         assert_eq!(temp.len(), 1, "set once: {:?}", plan.env);
         assert_eq!(temp[0], &PathBuf::from("/tmp"), "{:?}", plan.env);
-        assert!(!temp[0].starts_with(&tree), "never under the tree: {:?}", temp[0]);
+        assert!(
+            !temp[0].starts_with(&tree),
+            "never under the tree: {:?}",
+            temp[0]
+        );
         // No new mount and no new write root: the #1578 fence regressions came from a host scratch
         // mounted under the worker home.
         assert!(
-            !plan.inputs.write_roots.iter().any(|r| r == Path::new("/tmp")),
+            !plan
+                .inputs
+                .write_roots
+                .iter()
+                .any(|r| r == Path::new("/tmp")),
             "{:?}",
             plan.inputs.write_roots
         );
