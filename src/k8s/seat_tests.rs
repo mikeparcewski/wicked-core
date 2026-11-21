@@ -6097,7 +6097,10 @@ fn warm_judge_failed_settle_barrier_reaps_and_never_caches_the_pod() {
     let (a, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
     let pod = a.pod.clone();
     std::fs::write(dir.join("fail-reset"), "1").unwrap();
-    assert!(seat::settle(&a, Ending::Exited(0)).is_err());
+    assert_eq!(seat::settle(&a, Ending::Exited(0)).unwrap(), 0);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(state.get(&pod).is_none(), "failed barrier pod was deleted");
     drop(a);
     std::fs::remove_file(dir.join("fail-reset")).unwrap();
     let (b, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
@@ -6117,6 +6120,7 @@ fn warm_reset_script_removes_history_tmp_unit_and_view_sentinels_without_crossin
     let dir = tmp("warm-reset-script");
     for d in [
         "home",
+        "shm",
         "tmp/mounted/config",
         "tmp/mounted/tree",
         "unit",
@@ -6127,6 +6131,7 @@ fn warm_reset_script_removes_history_tmp_unit_and_view_sentinels_without_crossin
     }
     for d in [
         "home",
+        "shm",
         "tmp",
         "unit",
         "canary",
@@ -6142,8 +6147,12 @@ fn warm_reset_script_removes_history_tmp_unit_and_view_sentinels_without_crossin
     // Run only the reset, in temporary directories. The process-kill barrier is never run
     // in the host PID namespace. `host_tools` stands in for the floor's busybox dispatcher.
     let mut script = seat::warm_reset_script(&tree, &mounts, std::slice::from_ref(&config));
+    // The IPC tables are the pod's own; the host test never touches the host's.
+    assert!(script.contains(seat::WARM_IPC_CLEAR));
+    script = script.replace(seat::WARM_IPC_CLEAR, "");
     for (from, to) in [
         ("wipe /home/seat", "home"),
+        ("wipe /dev/shm", "shm"),
         ("wipe /tmp", "tmp"),
         ("wipe /wicked-unit", "unit"),
         ("wipe /wicked-canary", "canary"),
@@ -6168,6 +6177,7 @@ fn warm_reset_script_removes_history_tmp_unit_and_view_sentinels_without_crossin
     );
     for d in [
         "home",
+        "shm",
         "tmp",
         "unit",
         "canary",

@@ -995,6 +995,19 @@ fn shell_path(path: &Path) -> String {
     format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
 }
 
+/// Remove every SysV IPC object of the pod's IPC namespace (busybox `ipcrm` has no `-a`), then
+/// prove all three tables are empty. Fails closed when /proc/sysvipc cannot be read.
+pub(crate) const WARM_IPC_CLEAR: &str = r#"for t in shm:m sem:s msg:q; do
+    f=/proc/sysvipc/${t%%:*}
+    o=${t##*:}
+    [ -r "$f" ] || exit 1
+    $F tail -n +2 "$f" | while read -r key id rest; do $F ipcrm -"$o" "$id" || exit 1; done
+done
+for f in shm sem msg; do
+    [ "$($F tail -n +2 /proc/sysvipc/$f | $F wc -l)" -eq 0 ] || exit 1
+done
+"#;
+
 /// Clear disposable contents, preserving separately mounted roots (including beneath /tmp).
 /// Traverse only ancestors of a protected mount; rm never follows a seat-planted symlink.
 pub(crate) fn warm_reset_script(tree: &Path, mounts: &[PathBuf], homes: &[PathBuf]) -> String {
@@ -1025,9 +1038,10 @@ wipe() {{
 }}
 wipe /home/seat
 wipe /tmp
+wipe /dev/shm
 wipe /wicked-unit
 wipe /wicked-canary
-"#
+{WARM_IPC_CLEAR}"#
     );
     for home in homes {
         script.push_str(&format!("wipe {}\n", shell_path(home)));
@@ -3917,7 +3931,13 @@ pub(crate) fn settle_unless(
         unregister(&seat.id);
         gone?;
         drop_scratch(seat);
-        barrier?;
+        // Confirmed deletion proves the stop barrier even if quiescence was not proved.
+        if let Err(e) = barrier {
+            eprintln!(
+                "wicked-core: seat {} quiescence failed; pod deletion confirmed: {e}",
+                seat.id
+            );
+        }
         return code.map(|c| (c, Vec::new()));
     }
     let gone = delete_pod(seat);
