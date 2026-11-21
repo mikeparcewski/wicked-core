@@ -30419,6 +30419,109 @@ mod request_changes_tests {
         )
     }
 
+    /// core#1069 DONE WHEN 2: pi's exact failed judge output from run `290a7fee`,
+    /// `events-rejudge2.json` seq 325, must exclude pi from the next rejudge roster.
+    /// Regression guard expected green on main: quota classification and fold benching shipped
+    /// in #1154; `judge_refusal` only extracts the production classification for this test.
+    #[test]
+    fn pis_captured_usage_refusal_is_folded_into_rejudge_readiness() {
+        let run_id = format!("rejudge-pi-usage-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_rejudge_fix(&mut store, &run_id, &["claude", "pi"]);
+        let transcript = include_str!("../tests/fixtures/refusals/pi-out-of-extra-usage.txt");
+        let (_, refusal) = crate::cli_runner::judge_refusal("pi", transcript)
+            .expect("pi's captured output is a production judge refusal");
+        assert_eq!(refusal.seat, "pi");
+        assert_eq!(refusal.reason, "quota_exhausted");
+        let mut session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        session.status = SessionStatus::Executing;
+        // Run 290a7fee was attended: the operator answered its gates.
+        session.human_confirm = HumanConfirm::All;
+        put_node(&mut store, session.to_node()).unwrap();
+        // The orchestration workflow the fold updates (as `pre_distribute` registers it).
+        let phases: Vec<(String, &str)> = ["triage", "reproduce", "fix", "verify", "deliver"]
+            .iter()
+            .enumerate()
+            .map(|(i, p)| (format!("wf-{run_id}:unit-{}", i + 1), *p))
+            .collect();
+        wicked_orchestration::register_workflow(&mut store, format!("wf-{run_id}"), "p", &phases)
+            .unwrap();
+        let mut units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert!(!units
+            .iter()
+            .any(|u| u.status == UnitStatus::Done && u.assigned_cli.as_deref() == Some("pi")));
+        units[2].status = UnitStatus::Distributed;
+        units[2].denial = None;
+        units[2].denial_reason = None;
+        put_node(&mut store, units[2].to_node()).unwrap();
+        let (tx, _rx) = channel::<Command>();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        let mut subs = crate::event_log::EventSink::default();
+        let applied = apply_step_result(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            StepOutput {
+                run_id: run_id.clone(),
+                unit_ix: 2,
+                attempt: 2,
+                output: "Fixed the retry: callers pass an empty head.".into(),
+                status: StepStatus::Ok,
+                usage: None,
+                files: Vec::new(),
+                tools: Vec::new(),
+                governed: false,
+            },
+            Some(crate::validator::AgentVerdict {
+                pass: false,
+                reasoning: "agent judge could not run: pi exhausted its quota".into(),
+                judge_cli: None,
+                judge_distinct: None,
+                seat_failure: Some(format!("pi ({transcript})")),
+                judge_fallback: None,
+            }),
+            crate::workflow::UnitEvidence {
+                judge_refusals: vec![refusal],
+                ..Default::default()
+            },
+            "",
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap();
+        // The fold benched pi for the run, under the quota cause, from its own transcript.
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        assert!(
+            session.benched_seats.iter().any(|b| b.cli == "pi"
+                && b.source == "judge"
+                && b.reason.starts_with("quota_exhausted")),
+            "{:?}",
+            session.benched_seats
+        );
+        assert!(
+            matches!(applied, StepApplied::Paused),
+            "{:?}",
+            session.status
+        );
+        let r = rejudge_readiness(&store, &run_id).unwrap();
+        assert!(r.applies, "the fold leaves a judge_unavailable gate: {r:?}");
+        assert!(!r.eligible.iter().any(|seat| seat == "pi"), "{r:?}");
+        assert!(
+            r.missing.iter().any(|m| m.seat == "pi"
+                && m.reason
+                    .starts_with("benched for this run: quota_exhausted")),
+            "{r:?}"
+        );
+        REJUDGE_REGISTRY.with(|c| *c.borrow_mut() = None);
+    }
+
     /// (rejudge) Once a judge seat can rule again, `rejudge` RE-ARMS THE JUDGE on the same work:
     /// the fix step is re-dispatched at the next attempt carrying the reviewed output (so its seat
     /// does not run), the eligible seats come from the engine's own selection (pi — never claude,
@@ -36156,6 +36259,18 @@ mod seat_failover_tests {
         assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"));
     }
 
+    fn codex_content_refusal_fixture() -> String {
+        use crate::execute_wrapped::{CodexJsonl, OutputAdapter};
+
+        let mut adapter = CodexJsonl::default();
+        let mut text = Vec::new();
+        for line in include_str!("../tests/fixtures/refusals/codex-0.166.0-cyber.jsonl").lines() {
+            text.extend(adapter.on_line(line).text);
+        }
+        text.extend(adapter.finish().text);
+        format!("(cli `codex` exited 1) {}", text.join("\n"))
+    }
+
     /// core#1492: an attended provider content refusal skips triage and uses the unit's ladder.
     #[test]
     fn core_1492_a_codex_content_refusal_fails_the_unit_over_instead_of_triage() {
@@ -36186,8 +36301,7 @@ mod seat_failover_tests {
                 UnitStatus::Distributed,
             );
         }
-        let refusal =
-            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
+        let refusal = codex_content_refusal_fixture();
         for unit_ix in 0..2 {
             if unit_ix > 0 {
                 let mut session = crate::domain::get_session(&store, &run_id)
@@ -36197,7 +36311,7 @@ mod seat_failover_tests {
                 session.attempt = 0;
                 put_node(&mut store, session.to_node()).unwrap();
             }
-            let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+            let (applied, session, units) = fold_failed(&mut store, &run_id, &refusal);
             assert!(matches!(applied, StepApplied::Continuing));
             assert_eq!(session.status, SessionStatus::Executing);
             assert_eq!(session.attempt, 1);
@@ -36206,7 +36320,7 @@ mod seat_failover_tests {
             assert!(session.benched_seats.is_empty());
             let transcript = crate::domain::get_unit_transcript(&store, &units[unit_ix].id)
                 .expect("the refused output survives failover on its unit");
-            assert_eq!(transcript.output.as_deref(), Some(refusal));
+            assert_eq!(transcript.output.as_deref(), Some(refusal.as_str()));
             assert_eq!(transcript.resolution, crate::execute::RESOLUTION_REJECTED);
             assert_eq!(transcript.attempt, Some(0));
         }
@@ -36232,9 +36346,8 @@ mod seat_failover_tests {
             &[],
             UnitStatus::Distributed,
         );
-        let refusal =
-            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
-        let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+        let refusal = codex_content_refusal_fixture();
+        let (applied, session, units) = fold_failed(&mut store, &run_id, &refusal);
         assert!(matches!(applied, StepApplied::Paused));
         assert_eq!(session.status, SessionStatus::AwaitingHuman);
         assert!(session.benched_seats.is_empty());
@@ -36249,7 +36362,7 @@ mod seat_failover_tests {
             .contains("refused_content"));
         let transcript = crate::domain::get_unit_transcript(&store, &units[0].id)
             .expect("the refused output survives exhaustion");
-        assert_eq!(transcript.output.as_deref(), Some(refusal));
+        assert_eq!(transcript.output.as_deref(), Some(refusal.as_str()));
     }
 
     /// core#1492 (round 2): a second refusal after a rework (attempt > 0) still fails over; it does
@@ -36281,9 +36394,8 @@ mod seat_failover_tests {
             &[],
             UnitStatus::Distributed,
         );
-        let refusal =
-            "(cli `codex` exited 1) This content was flagged for possible cybersecurity risk.";
-        let (applied, session, units) = fold_failed(&mut store, &run_id, refusal);
+        let refusal = codex_content_refusal_fixture();
+        let (applied, session, units) = fold_failed(&mut store, &run_id, &refusal);
         assert!(matches!(applied, StepApplied::Continuing));
         assert_eq!(session.status, SessionStatus::Executing);
         assert_eq!(units[0].assigned_cli.as_deref(), Some("pi"));
@@ -36302,43 +36414,137 @@ mod seat_failover_tests {
         assert!(none.contains("`codex` refused this content]"), "{none}");
     }
 
+    /// core#1612: real CLI frames count; quoted signatures in a failed review do not.
+    /// Red on main: Claude 2.1.311, bio/misalignment are missed and echoed cyber text matches.
     #[test]
-    fn core_1492_content_refusal_requires_a_nonzero_wrapped_exit_and_a_tail_signature() {
+    fn content_refusal_requires_a_nonzero_wrapped_exit_and_the_clis_own_tail_frame() {
         use crate::acp_runner::is_content_refusal;
 
-        let codex = "This content was FLAGGED FOR POSSIBLE CYBERSECURITY RISK.";
+        let codex = codex_content_refusal_fixture();
+        assert!(is_content_refusal(&codex), "{codex}");
+        assert!(!is_content_refusal(
+            codex.strip_prefix("(cli `codex` exited 1) ").unwrap()
+        ));
+        assert!(!is_content_refusal(
+            &codex.replacen("exited 1", "exited 0", 1)
+        ));
+        for claude in [
+            include_str!("../tests/fixtures/refusals/claude-2.1.311-safeguards.txt"),
+            include_str!("../tests/fixtures/refusals/claude-2.1.311-cyber.txt"),
+            include_str!("../tests/fixtures/refusals/claude-2.1.311-cant-help.txt"),
+            include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt"),
+        ] {
+            assert!(is_content_refusal(&format!(
+                "(cli `claude` exited 1) {claude}"
+            )));
+            assert!(!is_content_refusal(claude));
+            assert!(!is_content_refusal(&format!(
+                "(cli `claude` exited 0) {claude}"
+            )));
+            // A variable model name and label case still belong to the CLI's frame.
+            let other = claude.replace("Claude", "Sonnet").to_ascii_uppercase();
+            assert!(is_content_refusal(&format!(
+                "(cli `claude` exited 1) {other}"
+            )));
+        }
+        for sentence in [
+            "This content was flagged for possible biological risk.",
+            "This request was blocked due to a misalignment policy violation.",
+            "This content was flagged for possible cybersecurity risk",
+            // The server's own wording passes through codex; its opening is codex's frame.
+            "This request has been flagged for possible cybersecurity risk. If this seems wrong, \
+             try rephrasing your request.",
+            "This content has been flagged for possible misuse and was not processed",
+        ] {
+            let sentence = sentence.to_ascii_uppercase();
+            assert!(is_content_refusal(&format!(
+                "(cli `codex` exited 1) error: {sentence}"
+            )));
+            for prefix in ["- ", "\"", "the seat quoted ", "tail.contains(\""] {
+                assert!(!is_content_refusal(&format!(
+                    "(cli `codex` exited 1) {prefix}{sentence}"
+                )));
+            }
+        }
+        let older = "API Error: Claude is unable to respond to this request, which appears to \
+                     violate our Usage Policy";
         assert!(is_content_refusal(&format!(
-            "(cli `codex` exited 1) {codex}"
+            "(cli `claude` exited 1) {older}"
         )));
-        assert!(!is_content_refusal(codex));
+        for echo in [
+            include_str!("../tests/fixtures/refusals/echoed-review.txt"),
+            "Claude's safeguards flagged this message.",
+            "error: Claude can't help with this. Start a new session to continue.",
+            "- API Error: Claude is unable to respond to this request, which appears to violate \
+             our Usage Policy",
+            "\"API Error: Claude is unable to respond to this request, which appears to violate \
+             our Usage Policy\"",
+        ] {
+            assert!(!is_content_refusal(&format!(
+                "(cli `claude` exited 1) {echo}"
+            )));
+        }
+        // A failed unit keeps stdout THEN stderr: a stdout refusal behind a chatty stderr is still
+        // read (16 KiB window), and one pushed out of the window is not.
+        let stderr_noise = "warning: retrying the telemetry upload\n".repeat(200);
+        assert!(stderr_noise.len() > 4096);
+        assert!(is_content_refusal(&format!("{codex}\n{stderr_noise}")));
         assert!(!is_content_refusal(&format!(
-            "(cli `codex` exited 0) {codex}"
-        )));
-        assert!(!is_content_refusal(&format!(
-            "(cli `codex` exited 1) {codex}\n{}",
-            "x".repeat(4096)
+            "{codex}\n{}",
+            "x".repeat(crate::acp_runner::CONTENT_REFUSAL_TAIL_BYTES + 1)
         )));
         assert!(!is_content_refusal(
             "(cli `codex` exited 1) unrelated failure"
         ));
-        let claude =
-            "This appears to violate our usage policy. I am UNABLE TO RESPOND TO THIS REQUEST.";
+        // The tail boundary can split a multibyte character; the refusal leads its own line.
         assert!(is_content_refusal(&format!(
-            "(cli `claude` exited 1) {claude}"
+            "(cli `codex` exited 1) {}\nThis request has been flagged for possible \
+             cybersecurity risk.",
+            "界".repeat(6000)
         )));
-        for phrase in [
-            "appears to violate our usage policy",
-            "unable to respond to this request",
-        ] {
-            assert!(!is_content_refusal(&format!(
-                "(cli `claude` exited 1) {phrase}"
-            )));
-        }
-        // The byte boundary of the tail may land inside a multibyte character.
-        assert!(is_content_refusal(&format!(
-            "(cli `codex` exited 1) {}{codex}",
-            "界".repeat(1024)
-        )));
+    }
+
+    /// core#1612: claude's stream-json refusal after earlier assistant text reaches the classifier
+    /// through `ClaudeStreamJson`, whether claude sends the `API Error:` text as an assistant event
+    /// or only in its failed `result` (red on main for the second: the result was dropped once
+    /// text had streamed, and 2.1.311's wording was not matched).
+    #[test]
+    fn a_claude_stream_json_refusal_after_earlier_text_reaches_the_classifier() {
+        use crate::acp_runner::is_content_refusal;
+        use crate::execute_wrapped::{ClaudeStreamJson, OutputAdapter};
+
+        let session = include_str!("../tests/fixtures/refusals/claude-2.1.311-session.txt").trim();
+        let stream = include_str!("../tests/fixtures/refusals/claude-2.1.311-refusal.stream.jsonl");
+        let run = |lines: Vec<&str>| {
+            let mut adapter = ClaudeStreamJson::default();
+            let mut text = Vec::new();
+            for line in lines {
+                text.extend(adapter.on_line(line).text);
+            }
+            text.extend(adapter.finish().text);
+            format!("(cli `claude` exited 1) {}", text.join("\n"))
+        };
+        // The API error as an assistant event, then the failed result: the refusal once.
+        let both = run(stream.lines().collect());
+        assert!(
+            both.contains("reading the parser's decompression limits"),
+            "{both}"
+        );
+        assert_eq!(both.matches(session).count(), 1, "{both}");
+        assert!(is_content_refusal(&both), "{both}");
+        // Only the failed result carries it (no assistant event for the error).
+        let result_only = run(stream
+            .lines()
+            .filter(|l| !l.contains("msg_fixture_2"))
+            .collect());
+        assert!(result_only.ends_with(session), "{result_only}");
+        assert!(is_content_refusal(&result_only), "{result_only}");
+        // A successful result after text is still not repeated.
+        let ok = run(vec![
+            r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"done"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done (summary)"}"#,
+        ]);
+        assert_eq!(ok, "(cli `claude` exited 1) done");
     }
 
     /// A resume of a worker-failed run must NOT re-dispatch the seat that failed the unit

@@ -1142,18 +1142,63 @@ fn sign_in_refusal_frame(text: &str) -> bool {
         })
 }
 
-/// (core#1479) `line` with the wrapped runner's exit marker (`(cli `claude` exited 1) `) and any
-/// [`ERROR_LABELS`] stripped from its front: what the CLI itself led its line with.
-fn refusal_line_head(line: &str) -> &str {
-    let mut s = line.trim_start();
+/// (core#1612) A content refusal in the CLI's own error frame, inside the caller's tail.
+/// codex: after the runner's exit marker and the error labels, the line OPENS with codex's
+/// refusal opening, `This request ...` / `This content ...`, whose first sentence says `flagged for
+/// possible` or `policy violation`. codex 0.166.0's own sentences are only its fallback when the
+/// server sends no message; a server's wording keeps that opening.
+/// Claude Code: the line starts with its own `API Error:` label and carries one of its refusal
+/// stems. 2.1.311 assembles `<model>'s safeguards flagged this message` and `... flagged this
+/// session` from one template, plus `can't help with this. Start a new session to continue`;
+/// older builds say `appears to violate our Usage Policy`.
+/// Quoted source, Markdown bullets and prose about refusals lead neither frame.
+/// ASCII-case-insensitive; a content refusal concerns this unit, not the seat's run-wide health.
+pub fn content_refusal_frame(tail: &str) -> bool {
+    const CODEX_OPENINGS: &[&str] = &["this request ", "this content "];
+    const CODEX_STEMS: &[&str] = &["flagged for possible", "policy violation"];
+    const CLAUDE: &[&str] = &[
+        "safeguards flagged this",
+        "can't help with this. start a new session to continue",
+        "appears to violate our usage policy",
+    ];
+    tail.lines().any(|line| {
+        let head = refusal_line_head(line);
+        let first = head.split('.').next().unwrap_or(head);
+        let codex = CODEX_OPENINGS.iter().any(|p| {
+            first.len() >= p.len() && first.as_bytes()[..p.len()].eq_ignore_ascii_case(p.as_bytes())
+        }) && CODEX_STEMS
+            .iter()
+            .any(|p| contains_ignore_ascii_case(first, p));
+        codex || {
+            let framed = wrapped_line_head(line);
+            let label = b"api error:";
+            framed.len() >= label.len()
+                && framed.as_bytes()[..label.len()].eq_ignore_ascii_case(label)
+                && CLAUDE
+                    .iter()
+                    .any(|p| contains_ignore_ascii_case(&framed[label.len()..], p))
+        }
+    })
+}
+
+/// A line after the wrapped runner's exit marker, shared by the refusal frame readers.
+fn wrapped_line_head(line: &str) -> &str {
+    let s = line.trim_start();
     if let Some(rest) = s.strip_prefix("(cli `") {
         if let Some((_, after)) = rest
             .split_once("` exited ")
             .and_then(|(_, r)| r.split_once(')'))
         {
-            s = after.trim_start();
+            return after.trim_start();
         }
     }
+    s
+}
+
+/// (core#1479) `line` with the wrapped runner's exit marker (`(cli `claude` exited 1) `) and any
+/// [`ERROR_LABELS`] stripped from its front: what the CLI itself led its line with.
+fn refusal_line_head(line: &str) -> &str {
+    let mut s = wrapped_line_head(line);
     loop {
         let before = s.len();
         for label in ERROR_LABELS {

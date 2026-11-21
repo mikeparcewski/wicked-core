@@ -1490,21 +1490,24 @@ pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
         || o.contains("acp timeout") // acp_runner's rpc/turn deadline
 }
 
+/// How much of a failed output's tail [`is_content_refusal`] reads (core#1612). A failed unit keeps
+/// stdout THEN stderr, so a refusal at the end of stdout sits behind the whole stderr; 16 KiB keeps
+/// it in view behind a chatty stderr, and the line-start frame rule keeps the wider window safe.
+pub(crate) const CONTENT_REFUSAL_TAIL_BYTES: usize = 16 * 1024;
+
 /// Whether a wrapped CLI refused this unit's content (core#1492). Require the runner's own
-/// nonzero-exit marker and a narrow provider signature in the last 2 KiB: earlier output may
-/// discuss refusals as subject matter. This is unit-specific, not a reason to bench the seat.
+/// nonzero-exit marker and the CLI's own refusal frame in the last [`CONTENT_REFUSAL_TAIL_BYTES`]:
+/// output may discuss refusal signatures as subject matter (core#1612). This is unit-specific, not
+/// a reason to bench the seat.
 pub(crate) fn is_content_refusal(output: &str) -> bool {
     if !crate::execute_wrapped::wrapped_exit_code(output).is_some_and(|code| code != 0) {
         return false;
     }
-    let mut start = output.len().saturating_sub(2048);
+    let mut start = output.len().saturating_sub(CONTENT_REFUSAL_TAIL_BYTES);
     while !output.is_char_boundary(start) {
         start += 1;
     }
-    let tail = output[start..].to_ascii_lowercase();
-    tail.contains("flagged for possible cybersecurity risk")
-        || (tail.contains("appears to violate our usage policy")
-            && tail.contains("unable to respond to this request"))
+    wicked_council::types::content_refusal_frame(&output[start..])
 }
 
 // ── ACP input governance ──────────────────────────────────────────────────────

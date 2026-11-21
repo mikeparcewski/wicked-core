@@ -1,0 +1,2 @@
+API Error: Claude Opus 4.7's safeguards flagged this message (https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal conversations. Claude Code can't respond to this message with Claude Opus 4.7.
+Learn more: https://www.anthropic.com/legal/aup

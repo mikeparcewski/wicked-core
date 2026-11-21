@@ -1,0 +1,4 @@
+{"type":"thread.started","thread_id":"fixture-thread"}
+{"type":"turn.started"}
+{"type":"error","message":"This request has been flagged for possible cybersecurity risk."}
+{"type":"turn.failed","error":{"message":"This request has been flagged for possible cybersecurity risk."}}

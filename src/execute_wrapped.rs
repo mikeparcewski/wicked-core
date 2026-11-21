@@ -105,6 +105,8 @@ impl OutputAdapter for Passthrough {
 pub(crate) struct ClaudeStreamJson {
     /// Whether any assistant text delta was emitted this run — gates the terminal `result` fallback.
     emitted_text: bool,
+    /// The last assistant text block emitted, so a failed turn's `result` is not repeated.
+    last_text: Option<String>,
     /// Live per-tool frames for the unit (`toolActivity`), when its actor is reachable.
     pub(crate) activity: Option<crate::tool_activity::ToolActivitySink>,
     /// Each assistant message's usage so far (`message.id` → fresh + cache input, output), summed
@@ -277,8 +279,9 @@ impl OutputAdapter for ClaudeStreamJson {
                     }
                     _ => {}
                 }
-                if !out.text.is_empty() {
+                if let Some(t) = out.text.last() {
                     self.emitted_text = true;
+                    self.last_text = Some(t.clone());
                 }
             }
             // The terminal result carries the run totals + cost directly (B3).
@@ -315,12 +318,19 @@ impl OutputAdapter for ClaudeStreamJson {
                 }
                 // (S3b) FALLBACK: no assistant text streamed this run ⇒ the final answer lives only in the
                 // result envelope. Emit `result.result` as text so `StepOutput.output` is non-empty.
-                if !self.emitted_text {
-                    if let Some(answer) = v.get("result").and_then(|r| r.as_str()) {
-                        if !answer.is_empty() {
-                            out.text.push(answer.to_string());
-                            self.emitted_text = true;
-                        }
+                // (core#1612) A FAILED turn's result says why it stopped (claude's `API Error:`
+                // refusal, a sign-in or quota error): it reaches the output after earlier assistant
+                // text too, unless that text already ended with it.
+                let failed = v.get("is_error").and_then(|e| e.as_bool()) == Some(true);
+                if let Some(answer) = v
+                    .get("result")
+                    .and_then(|r| r.as_str())
+                    .filter(|a| !a.is_empty())
+                {
+                    if !self.emitted_text || (failed && self.last_text.as_deref() != Some(answer)) {
+                        out.text.push(answer.to_string());
+                        self.emitted_text = true;
+                        self.last_text = Some(answer.to_string());
                     }
                 }
             }
@@ -5121,13 +5131,10 @@ impl WrappedCliStepRunner {
                     tools,
                 ),
                 Ok((code, out, err, _, _, tools)) => {
-                    // An engine-internal session (judge, triage, council ballot) keeps BOTH
-                    // streams: its caller classifies the refusal from this text, and a CLI that
-                    // prints progress on stdout says why it stopped on stderr (codex council-r3).
+                    // Every failed unit keeps both streams for refusal classification: a CLI
+                    // may print progress on stdout and say why it stopped on stderr (core#1612).
                     let detail = match (out.trim().is_empty(), err.trim().is_empty()) {
-                        (false, false) if is_engine_internal(&input.unit) => {
-                            format!("{out}\n{err}")
-                        }
+                        (false, false) => format!("{out}\n{err}"),
                         (false, _) => out,
                         _ => err,
                     };
@@ -10854,11 +10861,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
         let stub = dir.join("ballot-seat");
-        std::fs::write(
-            &stub,
-            "#!/bin/sh\necho 'starting the ballot'\necho 'Not logged in \u{b7} Please run /login' >&2\nexit 1\n",
-        )
-        .unwrap();
+        let sign_in_stub = "#!/bin/sh\necho 'starting the ballot'\n\
+                            echo 'Not logged in · Please run /login' >&2\nexit 1\n";
+        std::fs::write(&stub, sign_in_stub).unwrap();
         {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -10889,14 +10894,37 @@ mod tests {
         assert_eq!(out.status, StepStatus::Failed, "{}", out.output);
         assert!(out.output.contains("starting the ballot"), "{}", out.output);
         assert!(out.output.contains("Not logged in"), "{}", out.output);
-        // An ordinary unit's failure text is unchanged: stdout when it has any.
+        // core#1612: ordinary units also keep stderr (red on main: it is discarded).
         let mut plain = input.clone();
         plain.unit.id = "run:review".into();
         plain.unit.session_id = "run".into();
         plain.run_id = format!("plain-streams-{}", std::process::id());
         let p = runner.run_unit(&plain);
         let _ = std::fs::remove_dir_all(sandbox_for(&plain));
-        assert!(!p.output.contains("Not logged in"), "{}", p.output);
+        assert_eq!(p.status, StepStatus::Failed, "{}", p.output);
+        assert!(p.output.contains("starting the ballot"), "{}", p.output);
+        assert!(p.output.contains("Not logged in"), "{}", p.output);
+        // A content refusal on stderr must reach the same classifier on an ordinary unit.
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\necho 'starting the ballot'\ncat >&2 <<'REFUSAL'\n{}REFUSAL\nexit 1\n",
+                include_str!("../tests/fixtures/refusals/claude-2.1.311-safeguards.txt")
+            ),
+        )
+        .unwrap();
+        let content = runner.run_unit(&plain);
+        let _ = std::fs::remove_dir_all(sandbox_for(&plain));
+        assert_eq!(content.status, StepStatus::Failed, "{}", content.output);
+        let progress_at = content.output.find("starting the ballot").unwrap();
+        let refusal_at = content
+            .output
+            .find(include_str!("../tests/fixtures/refusals/claude-2.1.311-safeguards.txt").trim())
+            .expect("the ordinary unit keeps the stderr refusal verbatim");
+        assert!(progress_at < refusal_at, "{}", content.output);
+        assert!(crate::acp_runner::is_content_refusal(&content.output));
+        // Restore the sign-in refusal for the council dispatcher below.
+        std::fs::write(&stub, sign_in_stub).unwrap();
         // Through the carrier and the production dispatcher, the refusal is classified.
         let seat = wicked_council::AgenticCli {
             key: "ballot-seat".into(),

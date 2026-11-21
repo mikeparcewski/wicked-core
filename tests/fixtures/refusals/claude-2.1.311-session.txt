@@ -1,0 +1,2 @@
+API Error: Claude Opus 4.7's safeguards flagged this session (https://www.anthropic.com/legal/aup). You may be seeing this for the first time: Claude Opus 4.7 is more capable and has stronger safeguards as a result, which can sometimes flag non-cybersecurity work. We're improving these safeguards to reduce the amount of incorrectly flagged messages. Claude Code can't respond to your last message with Claude Opus 4.7.
+Learn more: https://www.anthropic.com/legal/aup
