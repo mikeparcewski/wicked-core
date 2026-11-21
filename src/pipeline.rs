@@ -3051,6 +3051,7 @@ fn evaluator_layer(
                 denied_tool: None,
                 phase: None, // filled in by apply_unit with the unit-phase token
                 findings_trimmed: false,
+                refused: None,
                 refused_before_run: Vec::new(),
             });
             (Some(e), None, denial)
@@ -7484,6 +7485,8 @@ mod standing_first_tests {
                 tool: Some("Bash".into()),
                 command: Some(cmd.into()),
                 reason: "estate-deny fence".into(),
+                path: None,
+                access: None,
             }],
             ..UnitDenial::new("input_governance", "refused")
         }

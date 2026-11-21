@@ -724,6 +724,140 @@ mod tests {
         assert!(out_of_scope(&moved, &out).is_none());
     }
 
+    fn launch_match_args(root: Option<&std::path::Path>, workflow: Option<&str>) -> String {
+        let mut rules = shipped_rules().unwrap();
+        rules.retain(|r| r.id.starts_with("MCPS-"));
+        assert_eq!(rules.len(), 7);
+        let mut ordinary = rules[0].clone();
+        ordinary.id = "ORG-1001".into();
+        rules.push(ordinary);
+        let mut job = serde_json::json!({});
+        if let Some(root) = root {
+            job["repoRoot"] = serde_json::json!(root);
+        }
+        if let Some(workflow) = workflow {
+            job["workflow"] = serde_json::json!(workflow);
+        }
+        serde_json::json!({"rules": rules, "job": job}).to_string()
+    }
+
+    /// wicked-core#1703: launch uses the same shipped-pack fit as the review gate.
+    #[test]
+    fn launch_match_rules_out_the_mcp_pack_in_a_non_mcp_repo() {
+        let root = scope_dir("1703-non-mcp");
+        std::fs::write(root.join("package.json"), r#"{"name":"math-js"}"#).unwrap();
+        let args = launch_match_args(Some(&root), Some("test-plan"));
+        let before: serde_json::Value =
+            serde_json::from_str(&wicked_governance::match_rules_json(&args).unwrap()).unwrap();
+        let after: serde_json::Value =
+            serde_json::from_str(&crate::match_rules_json(&args).unwrap()).unwrap();
+        let rows = after["matches"].as_array().unwrap();
+        assert_eq!(rows.len(), 8);
+        for row in rows
+            .iter()
+            .filter(|r| r["rule_id"].as_str().unwrap().starts_with("MCPS-"))
+        {
+            assert_eq!(row["status"], "not_applicable", "{row}");
+            assert_eq!(row["facts"].as_array().unwrap().len(), 1);
+            assert_eq!(row["facts"][0]["kind"], "pack");
+            let detail = row["facts"][0]["detail"].as_str().unwrap();
+            assert!(
+                detail.contains(concat!(
+                    "the mcp-server pack: this job is not the mcp-server workflow and no manifest ",
+                    "at the repository root names an MCP server SDK; if the change adds one, ",
+                    "the review's rule check judges these rules"
+                )),
+                "{detail}"
+            );
+        }
+        let ordinary = before["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["rule_id"] == "ORG-1001")
+            .unwrap();
+        assert_eq!(
+            &rows[0], ordinary,
+            "the ordinary may_apply rule sorts ahead of the pack"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    fn assert_launch_match_unchanged(root: Option<&std::path::Path>, workflow: Option<&str>) {
+        let args = launch_match_args(root, workflow);
+        assert_eq!(
+            crate::match_rules_json(&args).unwrap(),
+            wicked_governance::match_rules_json(&args).unwrap(),
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::match_rules_json(&args).unwrap()).unwrap();
+        assert!(json["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["status"] == "may_apply"));
+    }
+
+    /// wicked-core#1703: the named MCP workflow fits even before it adds its SDK.
+    #[test]
+    fn launch_match_keeps_the_mcp_pack_for_the_mcp_workflow() {
+        let root = scope_dir("1703-workflow");
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        assert_launch_match_unchanged(Some(&root), Some("mcp-server"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// wicked-core#1703: a declared server SDK fits on any workflow.
+    #[test]
+    fn launch_match_keeps_the_mcp_pack_for_a_server_sdk() {
+        let root = scope_dir("1703-sdk");
+        std::fs::write(
+            root.join("package.json"),
+            r#"{"dependencies":{"fastmcp":"1"}}"#,
+        )
+        .unwrap();
+        assert_launch_match_unchanged(Some(&root), Some("test-plan"));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// wicked-core#1703: older launch callers and unknown repository facts remove nothing.
+    #[test]
+    fn launch_match_keeps_the_mcp_pack_when_fit_is_unknown() {
+        assert_launch_match_unchanged(None, Some("test-plan"));
+        let root = scope_dir("1703-unknown");
+        assert_launch_match_unchanged(Some(&root), None);
+        // Manifests are matched as text; an oversized manifest without an SDK is unknown.
+        std::fs::write(
+            root.join("package.json"),
+            "x".repeat(MANIFEST_CAP as usize + 1),
+        )
+        .unwrap();
+        assert_eq!(builds_mcp_server(&root, &[], ""), None);
+        assert_launch_match_unchanged(Some(&root), Some("test-plan"));
+        assert_launch_match_unchanged(
+            Some(std::path::Path::new("relative-root")),
+            Some("test-plan"),
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// wicked-core#1703: partial rules cannot establish a shipped pack's identity.
+    #[test]
+    fn launch_match_keeps_partial_rules() {
+        let root = scope_dir("1703-partial");
+        std::fs::write(root.join("package.json"), "{}").unwrap();
+        let args = serde_json::json!({
+            "rules": [{"id": "MCPS-1001"}],
+            "job": {"workflow": "test-plan", "repoRoot": root}
+        })
+        .to_string();
+        assert_eq!(
+            crate::match_rules_json(&args).unwrap(),
+            wicked_governance::match_rules_json(&args).unwrap()
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     fn scope_dir(tag: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("pack-scope-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&d);

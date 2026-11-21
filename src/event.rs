@@ -1884,14 +1884,18 @@ fn floor_env_json(e: &crate::repo_checks::FloorEnv) -> serde_json::Value {
 }
 
 fn denial_json(d: &crate::domain::UnitDenial) -> serde_json::Value {
-    serde_json::json!({
+    let mut json = serde_json::json!({
         "source": d.source,
         "reason": d.reason,
         "claimId": d.claim_id,
         "ruleIds": d.rule_ids,
         "deniedTool": d.denied_tool,
         "phase": d.phase,
-    })
+    });
+    if let Some(refused) = &d.refused {
+        json["refused"] = serde_json::to_value(refused).expect("refused call serializes");
+    }
+    json
 }
 
 /// (core#759) The answers a gate of `gate_kind` accepts, in the order a client offers them, and
@@ -3782,6 +3786,26 @@ mod tests {
                 "{kind}: {j}"
             );
         }
+    }
+
+    /// wicked-core#1702: the event serializer preserves the refusal and omits an absent one.
+    #[test]
+    fn the_gate_wire_carries_an_optional_boundary_refusal() {
+        let mut denial = crate::domain::UnitDenial::new("input_governance", "denied");
+        assert!(denial_json(&denial).get("refused").is_none());
+        denial.refused = Some(crate::domain::RefusedCall {
+            evaluator: "wicked-governance-boundary".into(),
+            rule: "engine:filesystem-boundary-write".into(),
+            tool: Some("Bash".into()),
+            command: Some("cd /outside && touch x".into()),
+            reason: "outside the boundary".into(),
+            path: Some("/outside".into()),
+            access: Some("write".into()),
+        });
+        let json = denial_json(&denial);
+        assert_eq!(json["refused"]["path"], "/outside");
+        assert_eq!(json["refused"]["access"], "write");
+        assert_eq!(json["refused"]["rule"], "engine:filesystem-boundary-write");
     }
 
     /// TR-W1b: `repoChecksEvaluated.changed` / `changedTruncated` ride the wire only when the

@@ -189,8 +189,8 @@ pub use drift::{
 // symbols, where the knowledge + xedge stores exist (AW-9 / arch-R6 second clause).
 pub use knowledge_link::{relate_linked_rules, KnowledgeLink, KnowledgeLinkReport};
 pub use rule_match::{
-    match_rule, match_rules, match_rules_json, JobFacts, JobStep, MatchFact, MatchRule,
-    MatchStatus, MatchTargets, MatchTrigger, RuleMatch,
+    match_rule, match_rules, match_rules_json, sort_rule_matches, JobFacts, JobStep, MatchFact,
+    MatchRule, MatchStatus, MatchTargets, MatchTrigger, RuleMatch,
 };
 
 // The governance schema bundle — owner copies embedded from `schemas/` (AW-2 / arch-R10).

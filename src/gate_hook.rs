@@ -7047,6 +7047,34 @@ pub(crate) fn refused_command_record(command: &str) -> String {
     format!("{head}…")
 }
 
+/// wicked-core#1702: both fold passes record the same refusal details and redaction.
+fn refused_call(claim: &ConformanceClaim, tool: Option<String>) -> crate::domain::RefusedCall {
+    let reason = claim
+        .obligations
+        .first()
+        .map(String::as_str)
+        .unwrap_or_default();
+    let details = crate::path_policy::refusal_details(reason);
+    crate::domain::RefusedCall {
+        evaluator: claim.evaluator_identity.clone(),
+        rule: claim
+            .policy_ids
+            .iter()
+            .find(|p| *p == BOUNDARY_WRITE_RULE_ID || *p == ESTATE_FENCE_RULE_ID)
+            .cloned()
+            .unwrap_or_default(),
+        tool,
+        command: claim
+            .obligations
+            .get(1)
+            .filter(|c| !c.trim().is_empty())
+            .map(|c| refused_command_record(c)),
+        path: details.map(|(path, _)| refused_command_record(path)),
+        access: details.map(|(_, access)| access.to_string()),
+        reason: refused_command_record(reason),
+    }
+}
+
 /// (core#1562) A call the engine refused BEFORE it ran: a blocked filesystem-boundary write or a
 /// blocked estate-fence graph write. Never a policy deny, an infra deny or a fail-closed arm.
 pub(crate) fn is_refused_before_run(claim: &ConformanceClaim) -> bool {
@@ -7608,29 +7636,7 @@ fn fold_input_denial_pass(
             && is_blocked_boundary_write(&claim))
             || (discount_refusals && is_refused_before_run(&claim));
         if discount_refusals && is_refused_before_run(&claim) {
-            refused.push(crate::domain::RefusedCall {
-                evaluator: claim.evaluator_identity.clone(),
-                rule: claim
-                    .policy_ids
-                    .iter()
-                    .find(|p| *p == BOUNDARY_WRITE_RULE_ID || *p == ESTATE_FENCE_RULE_ID)
-                    .cloned()
-                    .unwrap_or_default(),
-                tool: tool_for_claim.clone(),
-                command: claim
-                    .obligations
-                    .get(1)
-                    .filter(|c| !c.trim().is_empty())
-                    .map(|c| refused_command_record(c)),
-                // The fence's reason names the command segment too: redacted and capped the same way.
-                reason: refused_command_record(
-                    claim
-                        .obligations
-                        .first()
-                        .map(String::as_str)
-                        .unwrap_or_default(),
-                ),
-            });
+            refused.push(refused_call(&claim, tool_for_claim.clone()));
         }
         if denial.is_none()
             && claim.decision == Decision::Deny
@@ -7659,6 +7665,8 @@ fn fold_input_denial_pass(
                 reason,
                 claim_id: Some(claim.claim_id.clone()),
                 rule_ids: claim.policy_ids.clone(),
+                refused: is_blocked_boundary_write(&claim)
+                    .then(|| refused_call(&claim, tool_for_claim.clone())),
                 denied_tool: tool_for_claim,
                 phase: Some(phase.to_string()),
                 findings_trimmed: false,
@@ -11076,6 +11084,8 @@ mod tests {
                 tool: Some("Bash".into()),
                 command: Some("wicked-estate index --db /srv/g.db".into()),
                 reason: "estate-deny fence: a write subcommand on the shared graph".into(),
+                path: None,
+                access: None,
             }]
         );
 
@@ -11297,6 +11307,126 @@ mod tests {
             assert_eq!(check(read), None, "a read or an in-tree edit: {read}");
         }
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// wicked-core#1702: both fold passes keep the same structured boundary refusal.
+    /// This fixture uses a Unix absolute path and POSIX shell quoting.
+    #[cfg(unix)]
+    #[test]
+    fn a_boundary_cd_denial_carries_the_refused_call() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run_id = format!("core1702-fold-{}", std::process::id());
+        let base = std::env::temp_dir().join(&run_id);
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+        let wt = base.join("wt");
+        let outside = std::path::Path::new("/wicked-core-1702-outside");
+        std::fs::create_dir_all(&wt).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![std::fs::canonicalize(&wt).unwrap()],
+            read: vec![],
+        };
+        let command = format!("cd '{}' && npm test", outside.display());
+        let (reason, fatal) = boundary_denial_with(
+            &roots,
+            &wt,
+            None,
+            None,
+            &serde_json::json!({"command": command}),
+            "Bash",
+        )
+        .expect("cd outside the boundary denies");
+        assert!(fatal);
+        let path = decisions_path_for(&run_id, 0);
+        write_armed_marker(&path, "unit-2").unwrap();
+        write_hook_fired(&path, "unit-2");
+        append_boundary_deny(
+            path.to_str().unwrap(),
+            "wf/unit-2",
+            "unit-2",
+            "Bash",
+            &reason,
+            Some(&command),
+            fatal,
+        );
+        let denial = fold_input_denial(&mut store, &run_id, 0, "unit-2", true)
+            .unwrap()
+            .expect("the blocked write denies");
+        assert_eq!(denial.denied_tool.as_deref(), Some("Bash"));
+        let refused = denial.refused.as_ref().expect("structured refusal");
+        let resolved =
+            crate::path_policy::check(outside.to_str().unwrap(), &roots, true, &wt, None)
+                .unwrap_err()
+                .resolved
+                .display()
+                .to_string();
+        assert_eq!(refused.path.as_deref(), Some(resolved.as_str()));
+        assert_eq!(refused.access.as_deref(), Some("write"));
+        assert_eq!(refused.rule, "engine:filesystem-boundary-write");
+        assert_eq!(refused.tool.as_deref(), Some("Bash"));
+        assert_eq!(refused.command.as_deref(), Some(command.as_str()));
+        assert_eq!(denial.refused_before_run, vec![refused.clone()]);
+        let json = serde_json::to_value(&denial).unwrap();
+        assert_eq!(json["refused"]["path"], resolved);
+        assert_eq!(json["refused"]["access"], "write");
+        let _ = std::fs::remove_dir_all(base);
+        let _ = std::fs::remove_dir_all(gov_run_dir(&run_id));
+    }
+
+    /// wicked-core#1702: structured fields retain the refusal record's redaction and byte cap.
+    #[test]
+    fn a_boundary_refusal_redacts_and_caps_each_record_field() {
+        let token = "ghp_core1702SECRETvalue0123456789";
+        for path in [
+            "/skills/editor scaffold (draft)".to_string(),
+            format!("/skills/{token}"),
+            format!("/skills/{}", "€".repeat(2048)),
+        ] {
+            let deny = crate::path_policy::Denial {
+                resolved: std::path::PathBuf::from(&path),
+                write: true,
+                allowed: vec![],
+            };
+            let mut claim = allow_claim("boundary-deny:unit-2", "unit-2");
+            claim.policy_ids = vec![BOUNDARY_WRITE_RULE_ID.into()];
+            let command = format!("GH_TOKEN={token} cd '{path}' && npm test");
+            claim.obligations = vec![deny.to_string(), command.clone()];
+            let call = refused_call(&claim, Some("Bash".into()));
+            assert_eq!(
+                call.path.as_deref(),
+                Some(refused_command_record(&path).as_str())
+            );
+            assert_eq!(
+                call.command.as_deref(),
+                Some(refused_command_record(&command).as_str())
+            );
+            assert_eq!(call.access.as_deref(), Some("write"));
+            for record in [call.path.unwrap(), call.command.unwrap(), call.reason] {
+                assert!(record.len() <= REFUSED_COMMAND_MAX);
+                assert!(!record.contains(token), "{record}");
+            }
+        }
+        let mut claim = allow_claim("boundary-deny:unit-2", "unit-2");
+        claim.obligations = vec!["an older boundary refusal".into()];
+        let call = refused_call(&claim, None);
+        assert_eq!((call.path, call.access), (None, None));
+    }
+
+    /// wicked-core#1702: old records retain their absent optional fields.
+    #[test]
+    fn refused_call_fields_are_optional_in_denial_json() {
+        let denial = crate::domain::UnitDenial::new("governance", "denied");
+        let json = serde_json::to_value(&denial).unwrap();
+        assert!(json.get("refused").is_none());
+        let old: crate::domain::UnitDenial = serde_json::from_value(json).unwrap();
+        assert_eq!(old.refused, None);
+        let call: crate::domain::RefusedCall = serde_json::from_value(serde_json::json!({
+            "evaluator": "boundary", "rule": "rule", "reason": "unrecognized reason"
+        }))
+        .unwrap();
+        assert_eq!((call.path.as_deref(), call.access.as_deref()), (None, None));
+        let json = serde_json::to_value(call).unwrap();
+        assert!(json.get("path").is_none() && json.get("access").is_none());
     }
 
     /// core#1494: the card keeps the selected boundary claim's path and command, including when

@@ -767,6 +767,7 @@ pub fn job_facts(
     let complete = change.paths.iter().all(|(p, _)| language_of(p).is_some());
     JobFacts {
         workflow: None,
+        repo_root: None,
         steps: (!steps.is_empty()).then(|| steps.to_vec()),
         kinds: None,
         project: project.map(str::to_string),
@@ -1034,6 +1035,11 @@ fn no_source_code(change: &Change) -> Option<String> {
 /// requirements file and a lockfile is a dependency change, so those reach the judges.
 fn docs_only(change: &Change) -> Option<String> {
     let changed: Vec<&str> = change.paths.iter().map(|(p, _)| p.as_str()).collect();
+    prose_paths(&changed).map(|paths| format!("the change touches no source code ({paths})"))
+}
+
+/// wicked-core#1701: the prose predicate and bounded path list shared with the repo-checks floor.
+pub(crate) fn prose_paths(changed: &[&str]) -> Option<String> {
     let prose = |p: &str| {
         let name = p.rsplit('/').next().unwrap_or(p).to_ascii_lowercase();
         let stem = name.split('.').next().unwrap_or(&name).to_string();
@@ -1044,12 +1050,7 @@ fn docs_only(change: &Change) -> Option<String> {
             || matches!(stem.as_str(), "license" | "changelog" | "readme")
                 && !name.ends_with(".mdx")
     };
-    (!changed.is_empty() && changed.iter().all(|p| prose(p))).then(|| {
-        format!(
-            "the change touches no source code ({})",
-            list_paths(&changed)
-        )
-    })
+    (!changed.is_empty() && changed.iter().all(|p| prose(p))).then(|| list_paths(changed))
 }
 
 /// Decide `check:test-fails-on-base` from the change alone where it can: no source change is not

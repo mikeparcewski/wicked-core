@@ -38,7 +38,7 @@ pub enum MatchStatus {
 }
 
 /// One fact behind a status. `kind` is a stable token (`phase`, `tool`, `project`, `language`, `framework`, `layer`,
-/// `trigger`, `retired`, `unscoped`); `detail` says it in words.
+/// `trigger`, `retired`, `unscoped`, `pack` (wicked-core#1703)); `detail` says it in words.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MatchFact {
     pub kind: String,
@@ -65,9 +65,12 @@ pub struct JobStep {
 /// What is known about the job. `None` = not known yet (it decides nothing); `Some(empty)` = known to be none.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobFacts {
-    /// The workflow id, for the words only.
+    /// The workflow id; core uses it for shipped-pack fit too (wicked-core#1703).
     #[serde(default)]
     pub workflow: Option<String>,
+    /// wicked-core#1703: the absolute repository root, for core's launch-time shipped-pack fit.
+    #[serde(default, rename = "repoRoot", skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
     /// The job's steps with their selection tokens (review time). `None` (a launch, whose steps are planned later):
     /// `applies_to` / `excludes` decide nothing.
     #[serde(default)]
@@ -511,9 +514,15 @@ fn kind_types(job: &JobFacts) -> BTreeSet<&'static str> {
 
 /// Match every rule, one result each, in reading order (see the module docs). Never drops a rule.
 pub fn match_rules(rules: &[MatchRule], job: &JobFacts) -> Vec<RuleMatch> {
-    let types = kind_types(job);
     let mut rows: Vec<(&MatchRule, RuleMatch)> =
         rules.iter().map(|r| (r, match_rule(r, job))).collect();
+    sort_rule_matches(&mut rows, job);
+    rows.into_iter().map(|(_, m)| m).collect()
+}
+
+/// wicked-core#1703: restore reading order after core applies shipped-pack fit facts.
+pub fn sort_rule_matches(rows: &mut [(&MatchRule, RuleMatch)], job: &JobFacts) {
+    let types = kind_types(job);
     rows.sort_by(|(ra, a), (rb, b)| {
         let named = |r: &MatchRule| {
             !r.steering_type
@@ -526,7 +535,6 @@ pub fn match_rules(rules: &[MatchRule], job: &JobFacts) -> Vec<RuleMatch> {
             .then_with(|| rb.severity.rank().cmp(&ra.severity.rank()))
             .then_with(|| ra.id.cmp(&rb.id))
     });
-    rows.into_iter().map(|(_, m)| m).collect()
 }
 
 #[derive(Deserialize)]

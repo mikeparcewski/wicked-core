@@ -29336,6 +29336,8 @@ mod request_changes_tests {
             tool: Some("Bash".into()),
             command: cmd.map(str::to_string),
             reason: "estate-deny fence: a write subcommand".into(),
+            path: None,
+            access: None,
         };
         let governance = |calls: Vec<crate::domain::RefusedCall>| UnitDenial {
             claim_id: Some("boundary-deny:unit-2".into()),

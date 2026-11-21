@@ -971,6 +971,9 @@ pub struct UnitDenial {
     /// The tool whose call was refused (`Bash`, `Edit`, …) — input-governance denies only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub denied_tool: Option<String>,
+    /// wicked-core#1702: the winning boundary refusal, with its structured path and access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<RefusedCall>,
     /// The unit-phase token the deny targeted (e.g. `unit-2`), when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
@@ -1007,6 +1010,12 @@ pub struct RefusedCall {
     /// recorder names the path in `reason`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// wicked-core#1702: the resolved refused path, redacted and capped for the record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// wicked-core#1702: the refused access (`write` or `read`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     /// The fence's own reason (the path, or the segment and why).
     pub reason: String,
 }
@@ -1021,6 +1030,7 @@ impl UnitDenial {
             claim_id: None,
             rule_ids: Vec::new(),
             denied_tool: None,
+            refused: None,
             phase: None,
             findings_trimmed: false,
             refused_before_run: Vec::new(),

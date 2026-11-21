@@ -311,8 +311,78 @@ pub use team::{TeamLedger, TeamPlan};
 // receipt JSON these return are the pinned crew `/testing/evals` wire contract, passed through
 // verbatim. Typed surface (samples/report/corpus sources) rides along for in-process callers.
 // DES-RULE-CHECK-001 (S1): which in-force rules a job is checked against, each with the facts that decided it
-// (`Core.matchRules(argsJson)`). Pure: no store, no model.
-pub use wicked_governance::match_rules_json;
+// (`Core.matchRules(argsJson)`). No store, no model.
+const LAUNCH_MCP_PACK_OUT_OF_SCOPE: &str = "the mcp-server pack: this job is not the mcp-server \
+    workflow and no manifest at the repository root names an MCP server SDK; if the change adds \
+    one, the review's rule check judges these rules";
+
+/// Match rules with governance's facts and the repository's shipped-pack fit (wicked-core#1703).
+/// `job.repoRoot`, when supplied with `job.workflow`, is the absolute repository root.
+pub fn match_rules_json(args_json: &str) -> anyhow::Result<String> {
+    #[derive(serde::Deserialize)]
+    struct Args {
+        rules: Vec<serde_json::Value>,
+        #[serde(default)]
+        job: wicked_governance::JobFacts,
+    }
+    let args: Args =
+        serde_json::from_str(args_json).map_err(|e| anyhow::anyhow!("bad_request: {e}"))?;
+    let rules = args
+        .rules
+        .iter()
+        .cloned()
+        .map(serde_json::from_value::<wicked_governance::MatchRule>)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("bad_request: {e}"))?;
+    let fit = args
+        .job
+        .workflow
+        .as_ref()
+        .zip(args.job.repo_root.as_deref())
+        .filter(|(_, root)| std::path::Path::new(root).is_absolute())
+        .map(|(workflow, root)| steering_packs::RunFit {
+            preset: Some(Some(workflow.clone())),
+            builds_mcp_server: steering_packs::builds_mcp_server(
+                std::path::Path::new(root),
+                &[],
+                "",
+            ),
+        });
+    let Some(fit) = fit.filter(|fit| fit.builds_mcp_server.is_some()) else {
+        let matches = wicked_governance::match_rules(&rules, &args.job);
+        return Ok(serde_json::to_string(
+            &serde_json::json!({"matches": matches}),
+        )?);
+    };
+    // wicked-core#1703: keep each match beside its handed rule, even if ids are repeated.
+    let mut rows: Vec<_> = rules
+        .iter()
+        .zip(&args.rules)
+        .map(|(rule, raw)| {
+            let mut matched = wicked_governance::match_rules(std::slice::from_ref(rule), &args.job)
+                .pop()
+                .expect("one handed rule yields one match");
+            if let Ok(full) =
+                serde_json::from_value::<wicked_governance::ConformanceRule>(raw.clone())
+            {
+                if steering_packs::out_of_scope(&full, &fit).is_some() {
+                    matched.status = wicked_governance::MatchStatus::NotApplicable;
+                    matched.facts = vec![wicked_governance::MatchFact {
+                        kind: "pack".into(),
+                        detail: LAUNCH_MCP_PACK_OUT_OF_SCOPE.into(),
+                    }];
+                }
+            }
+            (rule, matched)
+        })
+        .collect();
+    wicked_governance::sort_rule_matches(&mut rows, &args.job);
+    let matches: Vec<_> = rows.into_iter().map(|(_, matched)| matched).collect();
+    Ok(serde_json::to_string(
+        &serde_json::json!({"matches": matches}),
+    )?)
+}
+
 pub use wicked_governance::{
     governance_corpus_import, governance_evals, import_corpus as governance_import_corpus,
     load_corpus as governance_load_corpus, run_evals as governance_run_evals, CorpusSource,
