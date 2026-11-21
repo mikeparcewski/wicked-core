@@ -351,6 +351,8 @@ impl BusDb {
                 return Ok(entry.db.clone());
             }
         }
+        #[cfg(test)]
+        tests::open_checkpoint(&key);
         let conn = Connection::open(path).with_context(|| format!("open bus db at {path}"))?;
         let limits = match init_bus_connection(&conn, path) {
             Ok(limits) => limits,
@@ -1722,38 +1724,71 @@ mod tests {
     }
 
     /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
-    /// (core#887) An open of a locked bus file waits in SQLite's busy handler (up to
-    /// `BUSY_TIMEOUT_MS`); it must not hold every OTHER bus file in the process hostage. On Windows
-    /// CI a second engine's launch bridge missed its 2 s arming deadline behind an earlier test's
-    /// open of a locked bus, because the registry lock was held across the open.
+    type Park = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+
+    /// Opens a test has parked, by registry key: (entered, release).
+    fn parked_opens() -> &'static Mutex<HashMap<PathBuf, Park>> {
+        static PARKED: OnceLock<Mutex<HashMap<PathBuf, Park>>> = OnceLock::new();
+        PARKED.get_or_init(Default::default)
+    }
+
+    /// TEST-ONLY (core#887): called by [`BusDb::shared`] right before `Connection::open`. An open
+    /// a test parked for `key` reports that it got there and waits for the release, standing in
+    /// for an open that sits in SQLite's busy handler on a locked file. Any other key passes.
+    pub(super) fn open_checkpoint(key: &Path) {
+        let parked = parked_opens()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(key);
+        if let Some((entered, release)) = parked {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
+    }
+
+    /// (core#887) An open that blocks (on a locked bus file it sits in SQLite's busy handler for
+    /// up to `BUSY_TIMEOUT_MS`) must not hold every OTHER bus file in the process hostage. On
+    /// Windows CI a second engine's launch bridge missed its 2 s arming deadline behind an earlier
+    /// test's open of a locked bus, because the registry lock was held across the open. One
+    /// connection per bus file still holds: a second opener of the parked path waits its turn.
     #[test]
-    fn a_stuck_open_of_one_bus_file_does_not_block_another_887() {
-        let locked = tmp_bus("887-locked");
+    fn a_blocked_open_of_one_bus_file_does_not_block_another_887() {
+        let parked = tmp_bus("887-parked");
         let free = tmp_bus("887-free");
-        // Rollback journal + EXCLUSIVE: even the opener's first read waits on the busy handler.
-        let holder = Connection::open(&locked).unwrap();
-        holder
-            .execute_batch(
-                "PRAGMA journal_mode=DELETE; CREATE TABLE hold(x); BEGIN EXCLUSIVE; \
-                 INSERT INTO hold VALUES (1);",
-            )
-            .unwrap();
-        let stuck = {
-            let locked = locked.clone();
-            std::thread::spawn(move || BusDb::shared(&locked).map(|_| ()))
+        let (entered_tx, entered) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        parked_opens()
+            .lock()
+            .unwrap()
+            .insert(shared_key(&parked), (entered_tx, release_rx));
+        let in_background = |path: &str| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let path = path.to_string();
+            std::thread::spawn(move || {
+                let _ = tx.send(BusDb::shared(&path).map(|_| ()).map_err(|e| e.to_string()));
+            });
+            rx
         };
-        // A head start into the busy handler. Too short only lets the old code pass too; the
-        // fixed code passes either way.
-        std::thread::sleep(Duration::from_millis(300));
-        let opened = BusDb::shared(&free);
-        let still_stuck = !stuck.is_finished();
-        holder.execute_batch("COMMIT;").unwrap();
-        drop(holder);
-        let _ = stuck.join();
-        assert!(opened.is_ok(), "the free bus opened: {:?}", opened.err());
-        assert!(
-            still_stuck,
-            "the open of {free} waited until the stuck open of {locked} gave up"
+        let first = in_background(&parked);
+        entered
+            .recv_timeout(crate::test_env::PATIENT)
+            .expect("the parked open reached Connection::open");
+        let second = in_background(&parked);
+        let opened = in_background(&free).recv_timeout(crate::test_env::PATIENT);
+        // Release before asserting, so a failure never leaves the parked open behind.
+        release.send(()).unwrap();
+        assert_eq!(
+            opened,
+            Ok(Ok(())),
+            "the open of {free} waited on the blocked open of another bus file"
+        );
+        for opener in [first, second] {
+            assert_eq!(opener.recv_timeout(crate::test_env::PATIENT), Ok(Ok(())));
+        }
+        assert_eq!(
+            shared_bus_stats(&parked).map(|s| s.0),
+            Some(1),
+            "the second opener of the parked path reused its one connection"
         );
         assert_eq!(shared_bus_stats(&free).map(|s| s.0), Some(1));
     }
