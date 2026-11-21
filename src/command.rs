@@ -373,8 +373,13 @@ pub(crate) enum Command {
     /// reference. The actor fans the event out to all subscribers on receipt.
     EmitEvent(CoreEvent),
     /// Internal (core#1409, core#1434): a cancel's worktree reap ended off the actor. A kept tree
-    /// (`reaped: false`) is said as `worktreeRetained`, and the cleanup record is resolved.
-    WorktreeCleanupDone { run_id: String, reaped: bool },
+    /// (`reaped: false`) is said as `worktreeRetained`, and the cleanup record of that cancel
+    /// (`cancel_id`) is resolved.
+    WorktreeCleanupDone {
+        run_id: String,
+        cancel_id: u64,
+        reaped: bool,
+    },
     /// (core#1434) Whether a cancel's worktree cleanup for this run is still going (its outcome not
     /// said yet). Read on the actor, so a `false` comes after the outcome's event.
     WorktreeCleanupPending {

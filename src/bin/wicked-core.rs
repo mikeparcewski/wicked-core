@@ -1086,11 +1086,12 @@ fn settle_cancel_cleanup(events: &std::sync::mpsc::Receiver<CoreEvent>, core: &C
             );
             return;
         }
-        if !said {
+        // A clean tree's reap says nothing and ends in a moment: speak up only for a slow one.
+        if !said && started.elapsed() >= Duration::from_secs(1) {
             println!("  (waiting for the run's worktree cleanup to finish)");
             said = true;
         }
-        if let Ok(ev) = events.recv_timeout(Duration::from_millis(200)) {
+        if let Ok(ev) = events.recv_timeout(Duration::from_millis(50)) {
             println!("  {ev:?}");
         }
     }
