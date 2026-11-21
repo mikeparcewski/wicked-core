@@ -401,6 +401,9 @@ pub(crate) fn admission_enforced(engine: &Kube) -> Result<(), String> {
 pub(crate) const TOKEN_LIFETIME: &str = "720h";
 #[cfg(any(not(test), unix))]
 const TOKEN_RENEW_BELOW_SECS: u64 = 7 * 24 * 3600;
+/// Recheck wall time at least hourly while awake, since sleep may exclude suspended time.
+#[cfg(any(not(test), unix))]
+const RENEWAL_SLEEP_CAP: Duration = Duration::from_secs(3600);
 
 /// A TokenRequest token for the engine account (never stored in the cluster's datastore).
 fn mint_token(kube: &Kube, ns: &str) -> Result<String, String> {
@@ -481,6 +484,7 @@ fn credential_expiry(engine: &Kube) -> Result<u64, String> {
 
 /// A timer tick with an injected wall clock. The caller checks `renews` before entering.
 /// Failed requests back off only within the old token's remaining validity.
+/// Cap sleeps so the caller rechecks wall time after system suspension.
 #[cfg(any(not(test), unix))]
 fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
     let expiry = match credential_expiry(engine) {
@@ -489,7 +493,7 @@ fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
             eprintln!("wicked-core: could not schedule cluster token renewal: {e}");
             let delay = *backoff;
             *backoff = (*backoff).saturating_mul(2).min(60);
-            return Duration::from_secs(delay);
+            return Duration::from_secs(delay).min(RENEWAL_SLEEP_CAP);
         }
     };
     if expiry <= now {
@@ -499,7 +503,7 @@ fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
     let due = expiry.saturating_sub(TOKEN_RENEW_BELOW_SECS);
     if now < due {
         *backoff = 1;
-        return Duration::from_secs(due - now);
+        return Duration::from_secs(due - now).min(RENEWAL_SLEEP_CAP);
     }
     match renew_token_at(engine, TOKEN_RENEW_BELOW_SECS, now) {
         Ok(_) => {
@@ -508,7 +512,8 @@ fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
                 Ok(exp) => Duration::from_secs(
                     exp.saturating_sub(now.saturating_add(TOKEN_RENEW_BELOW_SECS))
                         .max(1),
-                ),
+                )
+                .min(RENEWAL_SLEEP_CAP),
                 Err(e) => {
                     eprintln!("wicked-core: renewed cluster token has no usable expiry: {e}");
                     Duration::from_secs(60)
@@ -519,7 +524,7 @@ fn token_renewal_step(engine: &Kube, now: u64, backoff: &mut u64) -> Duration {
             eprintln!("wicked-core: the engine's cluster token was not renewed: {e}");
             let delay = (*backoff).min(expiry - now);
             *backoff = (*backoff).saturating_mul(2).min(60);
-            Duration::from_secs(delay)
+            Duration::from_secs(delay).min(RENEWAL_SLEEP_CAP)
         }
     }
 }
@@ -1121,6 +1126,47 @@ mod renewal_tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn idle_timer_caps_sleep_and_preserves_near_due_delay() {
+        use base64::Engine as _;
+        let dir =
+            std::env::temp_dir().join(format!("wicked-token-{}", uuid::Uuid::new_v4().simple()));
+        let path = super::super::own_kubeconfig(&dir);
+        let engine = Kube {
+            kubectl: dir.join("unused-kubectl"),
+            kubeconfig: Some(path.clone()),
+            context: OWN_CONTEXT.into(),
+            owner: "test".into(),
+        };
+        let now = 1_000_000;
+        let mut backoff = 60;
+        assert_eq!(RENEWAL_SLEEP_CAP, Duration::from_secs(3600));
+        for remaining in [30 * 24 * 3600, 3601, 3600, 3599, 1] {
+            let expiry = now + TOKEN_RENEW_BELOW_SECS + remaining;
+            let token = format!(
+                "header.{}.signature",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!(r#"{{"exp":{expiry}}}"#))
+            );
+            write_private(
+                &path,
+                &serde_json::to_vec(&engine_kubeconfig(
+                    json!({"server": "https://unused"}),
+                    &token,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                token_renewal_step(&engine, now, &mut backoff),
+                Duration::from_secs(remaining).min(RENEWAL_SLEEP_CAP),
+                "remaining until renewal: {remaining}",
+            );
+            assert_eq!(backoff, 1);
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn idle_timer_renews_at_the_expiry_margin_without_a_probe() {
         use base64::Engine as _;
         let token = |exp| {
@@ -1172,7 +1218,7 @@ mod renewal_tests {
         // The daemon sleeps to the threshold; no probe or arm occurs as time advances.
         let delay = token_renewal_step(&engine, now + 10, &mut backoff);
         assert!(std::fs::read_to_string(&path).unwrap().contains(&fresh));
-        assert!(delay > Duration::from_secs(TOKEN_RENEW_BELOW_SECS));
+        assert_eq!(delay, RENEWAL_SLEEP_CAP);
 
         // Failed requests back off within validity, then stop at expiry even while idle.
         write_private(
