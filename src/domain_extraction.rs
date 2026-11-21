@@ -155,9 +155,10 @@ impl PageStated {
 const UNSTATED_SAMPLE: usize = 5;
 
 /// (core#1724, review) The largest page file [`page_stated`] reads: the fold runs on the actor, so
-/// it never materializes an outsized file a seat left. A real page is about 1 MiB (500 framed
-/// units); a file past this is not measured (garden's apply step refuses it).
-const PAGE_FILE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+/// it never materializes an outsized file a seat left. Garden's own worklist ceiling (64 MiB); a
+/// real page is about 1 MiB (500 framed units). A worklist past it is not measured; a rules file
+/// past it states nothing (garden's apply step refuses it).
+const PAGE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 /// (core#1724) The page the extract seat was handed ([`WORKLIST_REL`]) against what its rules file
 /// ([`RULES_REL`]) states, read from the run's worktree. A seat that stated 79 of 500 units and

@@ -5815,21 +5815,44 @@ fn failure_detail_excerpt(raw: &str) -> String {
     bounded_excerpt(raw, DETAIL_EXCERPT_HEAD, DETAIL_EXCERPT_TAIL)
 }
 
-/// (core#1722) The cause a failover's `stepFailed` names: the failed output's head (the runner's
-/// own frame: `(cli `x` exited N)`, a timeout, a spawn failure) and its tail (where a CLI says why
-/// it stopped), bounded, with the operator's home and temp prefixes redacted. An empty output says
-/// so, so the event never reads as a failure with no cause.
+/// (core#1722) The cause a failover's `stepFailed` names: the runner's own frame at the head of the
+/// failed output (`(cli `x` exited N)`, `(cli `x` exceeded the timeout and was killed)`, `(could
+/// not run `x`: …)`), path-redacted and bounded. Only the frame: crew's seat health classifies the
+/// whole `detail` (a sign-in refusal, a deliver refusal), so the seat's own words must not ride it
+/// (review r2) — they are already on the attempt's `unitOutputDelta` events. An output with no
+/// frame (an ACP or adapter failure) and an empty one say so, so the event is never cause-less.
 fn failover_cause(raw: &str) -> String {
-    let raw = raw.trim();
-    if raw.is_empty() {
+    let raw = raw.trim_start();
+    if raw.trim().is_empty() {
         return "the seat printed nothing".to_string();
     }
-    // Redacted BEFORE the cut, so a cut inside a home prefix never leaves its user name behind.
-    bounded_excerpt(
-        &wicked_apps_core::emit::redact_paths(raw),
-        FAILURE_EXCERPT_HEAD,
-        FAILURE_EXCERPT_TAIL,
-    )
+    let frame = raw.starts_with('(').then(|| {
+        let mut depth = 0usize;
+        for (ix, c) in raw.char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(&raw[..=ix]);
+                    }
+                }
+                '\n' => return None,
+                _ => {}
+            }
+        }
+        None
+    });
+    match frame.flatten() {
+        Some(f) => bounded_excerpt(
+            &wicked_apps_core::emit::redact_paths(f),
+            FAILURE_EXCERPT_HEAD,
+            FAILURE_EXCERPT_TAIL,
+        ),
+        None => "no runner frame: the seat's process failed without one (its own words are on \
+                 this attempt's live output)"
+            .to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -8911,6 +8934,30 @@ fn apply_step_result(
                         failure_kind: crate::event::StepFailureKind::SubstanceRejected,
                     },
                 );
+                // The attempt's governance record is folded before the rewind, as on the
+                // deliverable floor: the re-dispatch reads a new attempt's log (review r2).
+                let phase = crate::scope::unit_phase(ord);
+                let _ = crate::gate_hook::fold_input_denial(
+                    store,
+                    &run_id,
+                    output.attempt,
+                    &phase,
+                    true,
+                );
+                // A send-back this attempt answered stays in force beside the page's ask (review
+                // r2): the round replaces the unit's amendment.
+                let note = match unit
+                    .rework_amendment
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|a| !a.is_empty())
+                {
+                    Some(prev) => format!(
+                        "{}\n\nStill in force from the round this attempt answered:\n{prev}",
+                        page_round_note(&page)
+                    ),
+                    None => page_round_note(&page),
+                };
                 let mut scratch_in_flight = HashSet::new();
                 return match rewind_to_creator_scoped(
                     store,
@@ -8920,7 +8967,7 @@ fn apply_step_result(
                     &mut scratch_in_flight,
                     session.clone(),
                     &run_id,
-                    Some(page_round_note(&page)),
+                    Some(note),
                     PAGE_ROUND_SCOPE,
                     lifecycle_maps,
                     actor_maps,
@@ -35347,10 +35394,11 @@ mod deliverable_floor_tests {
 
         // Still partial after the round: one round only, and the page goes on, disclosed.
         let (_session, unit) = fold(&mut store, &mut subs, &run_id);
-        assert_ne!(
+        assert_eq!(
             unit.status,
-            UnitStatus::Distributed,
-            "no second automatic round"
+            UnitStatus::Done,
+            "no second automatic round: {:?}",
+            unit.denial_reason
         );
         let evs: Vec<CoreEvent> = std::iter::from_fn(|| erx.try_recv().ok()).collect();
         assert!(
@@ -36301,9 +36349,9 @@ mod seat_failover_tests {
             "{detail}"
         );
         assert!(
-            detail.contains("cause: (cli `agy` exited 1)")
-                && detail.contains("segmentation fault in the agent runtime"),
-            "the event names the cause: {detail}"
+            detail.ends_with("cause: (cli `agy` exited 1)"),
+            "the event names the runner's frame and only that (crew classifies the whole \
+             detail): {detail}"
         );
     }
 
