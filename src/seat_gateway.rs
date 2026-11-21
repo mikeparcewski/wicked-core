@@ -2650,8 +2650,7 @@ mod tests {
         let temp = TempDir::new();
         let defaults = GatewayConfig::default();
         let mut old = defaults.clone();
-        old.providers
-            .retain(|r| matches!(r.port, 4000 | 4001 | 4002));
+        old.providers.retain(|r| (4000..=4002).contains(&r.port));
         for route in &mut old.providers {
             route.upstream_host = format!("legacy-{:?}.example:8443", route.provider);
             route.tls = route.provider != Provider::OpenAI;
