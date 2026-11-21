@@ -1723,7 +1723,6 @@ mod tests {
         );
     }
 
-    /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
     type Park = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
     /// Opens a test has parked, by registry key: (entered, release).
@@ -1793,6 +1792,7 @@ mod tests {
         assert_eq!(shared_bus_stats(&free).map(|s| s.0), Some(1));
     }
 
+    /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
     #[test]
     fn shared_opens_once_per_file_and_clones_share_the_connection() {
         let path = tmp_bus("shared-once");
