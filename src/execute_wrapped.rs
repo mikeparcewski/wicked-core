@@ -5125,7 +5125,7 @@ impl WrappedCliStepRunner {
                 ),
                 Ok((-1, out, err, usage, files, tools)) if err.starts_with(SETTLE_FAILED) => (
                     StepStatus::Failed,
-                    settle_failure_output(&argv[0], &err, &out),
+                    settle_failure_output(&cli_key, &err, &out),
                     usage,
                     files,
                     tools,
@@ -7829,12 +7829,18 @@ const TIMED_OUT: &str = "__wicked_timed_out__";
 /// deadline is the engine's own turn ceiling. Collapsing them re-creates the 616c8661 ambiguity
 /// where a turn-timeout and an operator cancel are indistinguishable downstream.
 const CANCELLED: &str = "__wicked_cancelled__";
-/// The unit output of a seat pod whose settlement failed: the could-not-run line first (what
-/// classifiers read), then whatever the CLI printed.
-pub(crate) fn settle_failure_output(argv0: &str, err: &str, out: &str) -> String {
+/// The unit output of a seat pod whose settlement failed: the engine's result-lost line first
+/// (what classifiers read), then whatever the CLI printed.
+///
+/// (core#1722) Never the could-not-run line: the CLI RAN (the seat pod launched it and its stream
+/// ended); what failed is the engine bringing its result back (the rc read, the pod delete, the
+/// write-back). Framed as could-not-run, it read as a seat that failed to start, so the failover
+/// ladder moved the unit to another seat with no cause in the event (J6 run d32f3b9a: claude's
+/// attempt stated all 500 units, `--check-rules` exited 0, and the unit failed over to codex).
+pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
     let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
     let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
-    let mut text = format!("{COULD_NOT_RUN_PREFIX}{argv0}`: {why})");
+    let mut text = format!("{RESULT_LOST_PREFIX}{cli}`: {why})");
     if !out.trim().is_empty() {
         text.push('\n');
         text.push_str(out);
@@ -7849,8 +7855,24 @@ pub(crate) fn settle_failure_output(argv0: &str, err: &str, out: &str) -> String
 /// Between a settlement failure's reason and the CLI's stderr in the sentinel.
 pub(crate) const SETTLE_SEP: char = '\u{1e}';
 
+/// (core#1722) The wrapped runner's own frame for a seat pod whose CLI ran but whose result the
+/// engine could not settle ([`settle_failure_output`]).
+pub(crate) const RESULT_LOST_PREFIX: &str = "(the engine lost the result of `";
+
+/// (core#1722) Whether a FAILED output is the engine's own verdict over a seat that RAN: its
+/// result was lost in settlement ([`RESULT_LOST_PREFIX`]), or its work carried a credential the
+/// platform put into the seat (the seat-secret guard's refusal, which leads the text). Read from
+/// the frame the engine puts FIRST, never from the seat's own words after it: a seat's transcript
+/// that says "`--check-rules` exited 0" is not a crash. Neither is the seat's failure, so neither
+/// enters the seat failover ladder; the step's failure path names the cause instead.
+pub(crate) fn failed_after_the_seat_ran(output: &str) -> bool {
+    output.starts_with(RESULT_LOST_PREFIX)
+        || output.starts_with(crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER)
+}
+
 /// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
-/// write-back was refused): could not run, the reason after the prefix, the CLI's output kept.
+/// write-back was refused): the result lost (core#1722), the reason after the prefix, the CLI's
+/// output kept.
 pub(crate) const SETTLE_FAILED: &str = "__wicked_settle_failed__";
 
 /// Upper bound on retained tool names per unit turn (FINDING-046 review, Copilot). `output` is capped

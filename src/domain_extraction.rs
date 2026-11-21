@@ -132,6 +132,89 @@ shows a rule (a page that states almost nothing is not sound, however correct it
 are), or its `business_domains` hold a domain the cited code does not show or one named after a \
 directory (a stored catalog is never replaced, so an unsound one must not pass).";
 
+/// (core#1724) How much of the page the extract seat's rules file states.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PageStated {
+    /// Worklist units with an entry in the rules file: a rule, or an empty statement where the
+    /// unit's source shows none (the extractor skill's own "stated").
+    pub stated: usize,
+    /// Units on the page (the worklist's `units`).
+    pub units: usize,
+    /// The first few unstated units' `symbol_id`s, for the note that asks for them.
+    pub unstated: Vec<String>,
+}
+
+impl PageStated {
+    /// The units the file does not state yet.
+    pub fn left(&self) -> usize {
+        self.units.saturating_sub(self.stated)
+    }
+}
+
+/// How many unstated `symbol_id`s [`page_stated`] keeps for the note.
+const UNSTATED_SAMPLE: usize = 5;
+
+/// (core#1724, review) The largest page file [`page_stated`] reads: the fold runs on the actor, so
+/// it never materializes an outsized file a seat left. Garden's own worklist ceiling (64 MiB); a
+/// real page is about 1 MiB (500 framed units). A worklist past it is not measured; a rules file
+/// past it states nothing (garden's apply step refuses it).
+const PAGE_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// (core#1724) The page the extract seat was handed ([`WORKLIST_REL`]) against what its rules file
+/// ([`RULES_REL`]) states, read from the run's worktree. A seat that stated 79 of 500 units and
+/// left the rest "for subsequent pages" passed as a whole page: garden's `--check-rules` exits 0
+/// on a file whose entries conform however few they are, and the page's review judges the rules
+/// stated, not the page's coverage. `None` when there is no readable worklist (nothing to
+/// measure); a rules file that is absent or unreadable states nothing.
+pub fn page_stated(workdir: &std::path::Path) -> Option<PageStated> {
+    let read = |rel: &str| -> Option<serde_json::Value> {
+        let path = workdir.join(rel);
+        let meta = std::fs::symlink_metadata(&path).ok()?;
+        if !meta.is_file() || meta.len() > PAGE_FILE_MAX_BYTES {
+            return None;
+        }
+        serde_json::from_slice(&std::fs::read(path).ok()?).ok()
+    };
+    let worklist = read(WORKLIST_REL)?;
+    let ids: Vec<&str> = worklist
+        .get("units")?
+        .as_array()?
+        .iter()
+        .filter_map(|u| u.get("symbol_id").and_then(|i| i.as_str()))
+        .collect();
+    let rules = read(RULES_REL);
+    let have: std::collections::HashSet<&str> = rules
+        .as_ref()
+        .and_then(|r| r.get("rules"))
+        .and_then(|r| r.as_array())
+        .map(|entries| {
+            entries
+                .iter()
+                .filter(|e| e.get("statement").is_some_and(|st| st.is_string()))
+                .filter_map(|e| e.get("symbol_id").and_then(|i| i.as_str()))
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut unique = std::collections::HashSet::new();
+    let mut stated = 0;
+    let mut unstated = Vec::new();
+    for id in ids {
+        if !unique.insert(id) {
+            continue;
+        }
+        if have.contains(id) {
+            stated += 1;
+        } else if unstated.len() < UNSTATED_SAMPLE {
+            unstated.push(id.to_string());
+        }
+    }
+    Some(PageStated {
+        stated,
+        units: unique.len(),
+        unstated,
+    })
+}
+
 /// The argv of a host step that runs a garden domain script on the run's repository: through the
 /// garden generation the run was admitted against (`WICKED_GARDEN_ROOT`, handed to every generic
 /// Tool unit — never a `wicked-garden` from the daemon's PATH), with the store and the repository

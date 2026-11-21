@@ -1453,6 +1453,11 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
 /// read. Structural, not string-sniffed — and it closes the small hole where a worker printing that
 /// sentence into its own transcript could reclassify its own failure.
 pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
+    // (core#1722) The engine's own verdict over a seat that ran is no CLI failure, whatever the
+    // seat's transcript after the frame says.
+    if crate::execute_wrapped::failed_after_the_seat_ran(output) {
+        return false;
+    }
     let o = output.to_ascii_lowercase();
     o.contains("exited") // the wrapped runner's "(cli `x` exited N) …" nonzero-exit message
         || o.contains("could not run")
@@ -1481,6 +1486,9 @@ pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
 /// timed out twice on the same unit because the timeout shape never entered the ladder, so the
 /// engine re-dispatched the same seat until the run died.
 pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
+    if crate::execute_wrapped::failed_after_the_seat_ran(output) {
+        return false;
+    }
     if is_transient_cli_failure(output) {
         return true;
     }
@@ -2767,6 +2775,39 @@ mod tests {
         assert!(!is_worker_originated_failure(
             "the requirement claim is content-free"
         ));
+    }
+
+    /// core#1722 (J6 run d32f3b9a): an attempt the ENGINE failed after the seat ran (its result
+    /// lost in the seat pod's settlement, or a seat credential in its work) is no worker failure,
+    /// whatever the seat's own transcript says after the engine's frame. Claude's attempt there
+    /// stated all 500 units ("`--check-rules` exited 0") and was failed over to another seat as a
+    /// worker error, with no cause in the event.
+    #[test]
+    fn core_1722_an_engine_verdict_after_the_seat_ran_is_no_worker_failure() {
+        let transcript = "All 500 units on this page's worklist now have an entry, and \
+                          `--check-rules` exited 0: 500 conform. The six file-close paragraphs \
+                          are stated (each file is closed with status '00').";
+        let lost = crate::execute_wrapped::settle_failure_output(
+            "claude",
+            &format!(
+                "{}exec stream lost: kubectl exited 0 and the pod's rc file is missing",
+                crate::execute_wrapped::SETTLE_FAILED
+            ),
+            transcript,
+        );
+        let credential = format!(
+            "{} — unit 3 could not be checked for a credential the platform put into its seat \
+             (git exited 128); the unit failed so unchecked work is not carried on. Retry it.\n\n\
+             {transcript}",
+            crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER
+        );
+        for out in [&lost, &credential] {
+            assert!(!is_worker_originated_failure(out), "{out}");
+            assert!(!is_transient_cli_failure(out), "{out}");
+        }
+        // The seat's own crash keeps its ladder.
+        let crash = format!("(cli `claude` exited 1) {transcript}");
+        assert!(is_worker_originated_failure(&crash), "{crash}");
     }
 
     /// crew#267 option 3 — the worker home is STABLE across spawns (one login persists), and
