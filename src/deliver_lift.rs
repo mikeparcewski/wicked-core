@@ -2504,6 +2504,12 @@ mod tests {
 
     #[test]
     fn an_ado_fetch_sends_the_minted_header_to_the_canonical_url_only_never_the_ambient_one() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "an_ado_fetch_sends_the_minted_header_to_the_canonical_url_only_never_the_ambient_one",
+        ) {
+            return;
+        }
         use std::io::{BufRead, BufReader, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();

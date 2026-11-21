@@ -1418,6 +1418,12 @@ mod tests {
 
     #[test]
     fn relay_client_fails_closed_without_local_evaluation_1621() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "relay_client_fails_closed_without_local_evaluation_1621",
+        ) {
+            return;
+        }
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -1530,6 +1536,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn relay_client_records_deny_only_for_the_live_tokens_unit_1621() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "relay_client_records_deny_only_for_the_live_tokens_unit_1621",
+        ) {
+            return;
+        }
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -1710,6 +1722,12 @@ exit 2
     #[cfg(unix)]
     #[test]
     fn a_registered_token_is_judged_with_its_units_env_and_a_revoked_one_is_denied() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_registered_token_is_judged_with_its_units_env_and_a_revoked_one_is_denied",
+        ) {
+            return;
+        }
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());
@@ -1851,6 +1869,12 @@ exit 2
     #[cfg(unix)]
     #[test]
     fn a_killed_gate_hook_is_judged_again_and_every_relay_refusal_is_recorded() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "a_killed_gate_hook_is_judged_again_and_every_relay_refusal_is_recorded",
+        ) {
+            return;
+        }
         let _env = crate::test_env::ENV_LOCK
             .write()
             .unwrap_or_else(|p| p.into_inner());

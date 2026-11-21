@@ -129,6 +129,12 @@ fn open_retry(core: &Core, cmd: Vec<String>) -> String {
 
 #[test]
 fn pty_roundtrip_and_reap() {
+    if wicked_core::test_sandbox::skip(
+        wicked_core::test_sandbox::Need::Pty,
+        "pty_roundtrip_and_reap",
+    ) {
+        return;
+    }
     // Keep the memory engine offline in CI (no model download).
     std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
 
@@ -207,6 +213,12 @@ fn pty_roundtrip_and_reap() {
 /// bounded join, `close_terminal` must (a) return promptly and (b) leave no orphan.
 #[test]
 fn close_terminal_kills_process_group_no_orphan_no_hang() {
+    if wicked_core::test_sandbox::skip(
+        wicked_core::test_sandbox::Need::Pty,
+        "close_terminal_kills_process_group_no_orphan_no_hang",
+    ) {
+        return;
+    }
     std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
     let core = Core::spawn(unique_db());
     let events = core.subscribe();
@@ -277,6 +289,12 @@ fn close_terminal_kills_process_group_no_orphan_no_hang() {
 /// holds only A's writer, so B's close completes promptly.
 #[test]
 fn stuck_write_does_not_block_other_terminals() {
+    if wicked_core::test_sandbox::skip(
+        wicked_core::test_sandbox::Need::Pty,
+        "stuck_write_does_not_block_other_terminals",
+    ) {
+        return;
+    }
     std::env::set_var("WICKED_MEMORY_EMBEDDER", "hash");
     let core = Core::spawn(unique_db());
     let events = core.subscribe();

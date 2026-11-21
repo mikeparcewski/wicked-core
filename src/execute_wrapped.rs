@@ -11587,6 +11587,12 @@ mod tests {
 
     #[test]
     fn arm_input_governance_writes_a_pretool_settings_file_and_returns_env() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "arm_input_governance_writes_a_pretool_settings_file_and_returns_env",
+        ) {
+            return;
+        }
         // Pin the host floor and protect the process-global config/home inputs arming reads.
         let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
         let _host = VarGuard::set("WICKED_SEAT_FLOOR", Path::new("host"));

@@ -3893,6 +3893,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Pty,
+            "the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested(
             "the_claude_login_script_captures_a_wrapped_token_pasted_in_a_pty",
         ) {
@@ -4374,6 +4380,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Pty,
+            "the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty",
+        ) {
+            return;
+        }
         if crate::validator::skip_when_nested(
             "the_claude_login_script_reads_the_token_from_claudes_output_in_a_pty",
         ) {

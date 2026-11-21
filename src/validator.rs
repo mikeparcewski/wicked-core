@@ -4837,6 +4837,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn the_port_jail_reaches_only_its_port_on_macos() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "the_port_jail_reaches_only_its_port_on_macos",
+        ) {
+            return;
+        }
         if find_on_path("python3").is_none() {
             return;
         }
@@ -4931,6 +4937,12 @@ mod tests {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn the_serve_jail_reaches_only_its_own_port() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "the_serve_jail_reaches_only_its_own_port",
+        ) {
+            return;
+        }
         if find_on_path("python3").is_none() {
             return;
         }
@@ -7151,6 +7163,12 @@ mod worker_sandbox_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Pty,
+            "a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-floor-ptymint-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
@@ -7194,6 +7212,12 @@ mod worker_sandbox_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Pty,
+            "a_pty_opens_inside_the_floor_sandbox_and_no_existing_terminal_is_reachable",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-floor-ptyrun-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
