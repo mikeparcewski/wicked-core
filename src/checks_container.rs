@@ -23,6 +23,7 @@
 //! [`RUNNER_ENV`] selects `auto|container|sandbox`: auto tries pods on macOS, with the host
 //! sandbox as fallback; Linux auto keeps bwrap. Explicit container mode fails closed.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
@@ -58,6 +59,13 @@ const TARGET_DIR: &str = "/wicked/target";
 const CARGO_HOME_DIR: &str = "/wicked/cargo-home";
 const FILL_DIR: &str = "/wicked/vol";
 const CARGO_HOME_VOLUME: &str = "wfloor-cargo-home";
+/// Admission maxima shared by allocation and the run's ResourceQuota.
+pub(crate) const MAX_TARGET_LEAVES: usize = 16;
+pub(crate) const TARGET_CLAIMS_PER_LEAF: u64 = 2;
+pub(crate) const TARGET_CLAIM_GI: u64 = 64;
+pub(crate) const CARGO_HOME_CLAIM_GI: u64 = 32;
+pub(crate) const MAX_DEPENDENCY_CLAIMS: u64 = 32;
+pub(crate) const DEPENDENCY_CLAIM_GI: u64 = 16;
 const COMPLETE: &str = ".wicked-complete";
 pub(crate) const NESTED_TAR: &str = ".wicked-nested.tar";
 const INSTALL_LOG: &str = ".wicked-install.log";
@@ -419,6 +427,105 @@ pub(crate) fn nm_volume(
 /// The cargo target volume of one run leaf and side.
 pub(crate) fn target_volume(leaf: &Path, tree: Tree) -> String {
     format!("wfloor-target-{}-{}", leaf_key(leaf), side(tree))
+}
+
+struct TargetClaim {
+    kube: crate::k8s::Kube,
+    namespace: String,
+    name: String,
+}
+
+/// Retirement owns these claims, rather than the lifetime of any individual floor.
+static TARGET_CLAIMS: Mutex<Option<HashMap<PathBuf, TargetLeaf>>> = Mutex::new(None);
+
+struct TargetLeaf {
+    used: Instant,
+    claims: Vec<TargetClaim>,
+}
+
+/// Serialize admission, while letting retirement drain the registry under its own leaf lease.
+static TARGET_ADMISSION: Mutex<()> = Mutex::new(());
+
+pub(crate) fn admit_target_claim(
+    leaf: &Path,
+    kube: &crate::k8s::Kube,
+    ns: &str,
+    name: &str,
+    limit: usize,
+) -> Result<(), String> {
+    let _admission = TARGET_ADMISSION.lock().unwrap_or_else(|p| p.into_inner());
+    let (known, mut candidates) = {
+        let registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+        let mut candidates = Vec::new();
+        let mut known = false;
+        if let Some(registry) = registry.as_ref() {
+            for (path, record) in registry {
+                if record.claims.iter().any(|c| c.namespace == ns) {
+                    known |= path == leaf;
+                    candidates.push((record.used, path.clone()));
+                }
+            }
+        }
+        (known, candidates)
+    };
+    if !known {
+        candidates.sort_by_key(|(used, _)| *used);
+        let mut count = candidates.len();
+        for (_, victim) in candidates {
+            if count < limit {
+                break;
+            }
+            if crate::repo_checks::evict_target_leaf(&victim) {
+                count -= 1;
+            }
+        }
+        if count >= limit {
+            return Err("admission_pending: the run's target claim budget is held by active or unremovable leaves".into());
+        }
+    }
+    remember_target_claim(leaf, kube, ns, name);
+    Ok(())
+}
+
+fn remember_target_claim(leaf: &Path, kube: &crate::k8s::Kube, ns: &str, name: &str) {
+    let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    let record = registry
+        .get_or_insert_with(HashMap::new)
+        .entry(leaf.to_path_buf())
+        .or_insert_with(|| TargetLeaf {
+            used: Instant::now(),
+            claims: Vec::new(),
+        });
+    record.used = Instant::now();
+    if !record
+        .claims
+        .iter()
+        .any(|c| c.namespace == ns && c.name == name)
+    {
+        record.claims.push(TargetClaim {
+            kube: kube.clone(),
+            namespace: ns.into(),
+            name: name.into(),
+        });
+    }
+}
+
+/// Called only under the leaf's exclusive retirement lease. Failures remain retryable.
+pub(crate) fn retire_target_claims(leaf: &Path) -> Result<(), String> {
+    let mut registry = TARGET_CLAIMS.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(registry) = registry.as_mut() else {
+        return Ok(());
+    };
+    if let Some(record) = registry.get_mut(leaf) {
+        while let Some(claim) = record.claims.last() {
+            claim
+                .kube
+                .delete_owned(Some(&claim.namespace), "pvc", &claim.name, false)?;
+            record.claims.pop();
+        }
+    }
+    registry.remove(leaf);
+    Ok(())
 }
 
 fn leaf_key(leaf: &Path) -> String {
@@ -1774,6 +1881,13 @@ impl ChecksFloor {
         if plan.cargo {
             // The run's target claim for this leaf and side: warm across the leaf's floors.
             let target = target_volume(&self.leaf, tree);
+            admit_target_claim(
+                &self.leaf,
+                &self.place.kube,
+                &self.place.ns,
+                &target,
+                MAX_TARGET_LEAVES,
+            )?;
             let warm = self
                 .place
                 .kube
@@ -1782,7 +1896,7 @@ impl ChecksFloor {
                 .flatten()
                 .is_some();
             self.place
-                .claim(&target, "64Gi")
+                .claim(&target, &format!("{TARGET_CLAIM_GI}Gi"))
                 .map_err(|e| format!("the cargo target claim: {e}"))?;
             if let Ok(mut r) = self.record.lock() {
                 r.caches.push(CacheUse {
@@ -2345,7 +2459,7 @@ impl Filler<'_> {
             return Ok(Fill::Hit);
         }
         self.place
-            .claim(volume, "16Gi")
+            .claim(volume, &format!("{DEPENDENCY_CLAIM_GI}Gi"))
             .map_err(|e| format!("the node_modules claim: {e}"))?;
         let pkg = sh_quote(&if dir.is_empty() {
             "/work/t".to_string()
@@ -2434,7 +2548,7 @@ impl Filler<'_> {
             return Ok(Fill::Hit);
         }
         self.place
-            .claim(CARGO_HOME_VOLUME, "32Gi")
+            .claim(CARGO_HOME_VOLUME, &format!("{CARGO_HOME_CLAIM_GI}Gi"))
             .map_err(|e| format!("the cargo home claim: {e}"))?;
         let file = format!(".wicked-fetched/{marker}");
         let pkg = sh_quote(&if dir.is_empty() {
@@ -2700,7 +2814,7 @@ pub(crate) fn seat_node_modules(
         &kube,
         &run,
         &crate::k8s::render::RunBudget::default(),
-        "20Gi",
+        &format!("{}Gi", crate::k8s::render::REPLICA_CLAIM_GI),
     )?;
     let place = crate::k8s::floor::Place {
         kube,
@@ -2800,6 +2914,16 @@ fn filled(key: &str) -> bool {
 /// Forget every completed claim of namespace `ns` (codex b3-floor #10): it was deleted, and a
 /// namespace of the same name later is new storage.
 pub(crate) fn forget_namespace(ns: &str) {
+    if let Some(registry) = TARGET_CLAIMS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_mut()
+    {
+        registry.retain(|_, record| {
+            record.claims.retain(|c| c.namespace != ns);
+            !record.claims.is_empty()
+        });
+    }
     if let Ok(mut f) = FILLED.lock() {
         let pre = format!("{ns}/");
         f.retain(|k| !k.starts_with(&pre));
@@ -2862,18 +2986,6 @@ impl Drop for ChecksFloor {
         if let Ok(mut live) = self.live.lock() {
             for l in live.iter_mut().filter_map(Option::take) {
                 self.remove(&l.name);
-            }
-        }
-        // The leaf was retired while this floor held its target claims: they go now (the rest
-        // go with the run's namespace).
-        if std::fs::symlink_metadata(&self.leaf).is_err() {
-            for tree in [Tree::Head, Tree::Base] {
-                let _ = self.place.kube.delete_owned(
-                    Some(&self.place.ns),
-                    "pvc",
-                    &target_volume(&self.leaf, tree),
-                    false,
-                );
             }
         }
     }

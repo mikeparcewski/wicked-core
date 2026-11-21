@@ -679,6 +679,49 @@ pub(crate) fn links_stay_inside_on(root: Option<&Path>, entries: &[Entry]) -> Re
     links_stay_inside_final(root, entries, &[], &[])
 }
 
+/// Host links that survive a write-back, including ignored paths absent from its stream.
+/// Walk directory entries without following links, and leave separately owned roots alone.
+pub(crate) fn surviving_host_links(
+    root: &Path,
+    writes: &[Entry],
+    deletes: &[String],
+    fence: &[String],
+) -> Result<Vec<Entry>, String> {
+    let mut links = Vec::new();
+    let mut skip = fence.to_vec();
+    skip.push(".git".into());
+    for rel in host_plain_listing(root, &skip)? {
+        if rel.split('/').any(is_git_name) {
+            continue;
+        }
+        let path = root.join(&rel);
+        let kind = std::fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        if !kind.file_type().is_symlink()
+            || deletes
+                .iter()
+                .any(|d| rel == *d || rel.starts_with(&format!("{d}/")))
+            || writes.iter().any(|w| {
+                rel == w.path
+                    || rel.starts_with(&format!("{}/", w.path))
+                    || w.path.starts_with(&format!("{rel}/"))
+            })
+        {
+            continue;
+        }
+        let target = std::fs::read_link(path).map_err(|e| e.to_string())?;
+        links.push(Entry {
+            kind: Kind::Link,
+            path: rel,
+            data: target
+                .to_str()
+                .ok_or("a host link is not Unicode")?
+                .as_bytes()
+                .to_vec(),
+        });
+    }
+    Ok(links)
+}
+
 /// [`links_stay_inside_on`] over the tree as the write-back will leave it (review r4): a host
 /// link the same write-back deletes or replaces (by an entry at its path or under it) is not
 /// followed, and no link may lead into `fence` (the root's nested roots and masks, written back
@@ -1616,10 +1659,10 @@ def entries(f):
         dl = struct.unpack(">Q", rd(f, 8))[0]; d = rd(f, dl)
         if k == b"E": return
         yield k, p.decode("utf-8"), d
-def tree_list(root, repos=None):
+def tree_list(root, repos=None, deps=False):
     if not os.path.isdir(root + "/.git") or os.path.islink(root + "/.git"):
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
-        try: return [p for p in plain_list(fd) if not under(p, ".git")]
+        try: return [p for p in plain_list(fd, deps) if not under(p, ".git")]
         finally: os.close(fd)
     r = git(root, "ls-files", "-z", "-c", "-o", "--exclude-standard")
     if r.returncode != 0: die("git ls-files failed: " + r.stderr.decode(errors="replace").strip())
@@ -1628,10 +1671,11 @@ def tree_list(root, repos=None):
     # tree, never written back, and the mirror removes it (`repos`).
     if repos is not None: repos.extend(x[:-1] for x in out if x.endswith("/"))
     return [x for x in out if not x.endswith("/")]
-def plain_list(rootfd):
+def plain_list(rootfd, deps=False):
     out = []
     def walk(fd, pre):
         for name in os.listdir(fd):
+            if deps and fold(name) == "node_modules": continue
             st = os.stat(name, dir_fd=fd, follow_symlinks=False)
             rel = pre + name
             if stat.S_ISDIR(st.st_mode):
@@ -1935,6 +1979,7 @@ def pack(plan, host_tracked):
     try:
         for item in plan:
             r, m, skip = item[0], item[1], item[2]
+            deps = len(item) > 4 and item[4] is True
             rootfd = openroot(r, False)
             work.append((r, m, rootfd, [], []))
             if rootfd is None: continue
@@ -1947,11 +1992,12 @@ def pack(plan, host_tracked):
             tracked = host_tracked.get(r) if m in ("tree", "plain") else None
             # (core#1535 item 4) Untracking and ignoring a host file cannot hide its edit.
             if m == "tree":
-                rels = sorted(set(tree_list(R + "/" + r)) | set(tracked or ()))
-            else: rels = plain_list(rootfd)
+                rels = sorted(set(tree_list(R + "/" + r, deps=deps)) | set(tracked or ()))
+            else: rels = plain_list(rootfd, deps)
             # No root but the tree's own `.git` root carries git metadata, either way (codex
             # b2-sync #17): a plain root's repository stays on the host.
-            rels = [x for x in rels if not any(under(x, s) for s in skip)
+            rels = [x for x in rels if not (deps and any(fold(c) == "node_modules" for c in x.split("/")))
+                    and not any(under(x, s) for s in skip)
                     and not (m in ("tree", "plain") and isgit(x))]
             # (core#1498) Build output (a tagged cache dir) never comes back: named once, so
             # the host keeps whatever it had there and the step says it was left out. Matched
@@ -1999,6 +2045,26 @@ def pack(plan, host_tracked):
         for w in work:
             if w[2] is not None: os.close(w[2])
     put(out, b"E", "", b""); out.flush()
+def prune_scopes(keep):
+    fd = os.open(R, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for name in os.listdir(fd):
+            if (len(name) == 26 and name.startswith("s-")
+                    and all(c in "0123456789abcdef" for c in name[2:]) and name not in keep):
+                remove_any(fd, name)
+    finally: os.close(fd)
+def prepare_deps(tree):
+    fd = openroot(tree, False)
+    if fd is None: die("the dependency tree is missing")
+    try:
+        try: child = opendir(fd, "node_modules")
+        except OSError as e:
+            if e.errno not in (errno.ENOENT, errno.ENOTDIR, errno.ELOOP): raise
+            try: remove_any(fd, "node_modules")
+            except FileNotFoundError: pass
+            os.mkdir("node_modules", 0o755, dir_fd=fd)
+        else: os.close(child)
+    finally: os.close(fd)
 def bundle(tree, base):
     root = R + "/" + tree
     # A seat-written link to another replica scope's objects (review r6 #13): refused before git
@@ -2035,6 +2101,8 @@ try:
     if op == "unpack": unpack(json.loads(sys.argv[2]))
     elif op == "stamps": stamps(json.loads(sys.argv[2]))
     elif op == "pack": pack(json.loads(sys.argv[2]), json.load(sys.stdin))
+    elif op == "deps": prepare_deps(sys.argv[2])
+    elif op == "scopes": prune_scopes(json.loads(sys.argv[2]))
     elif op == "bundle": bundle(sys.argv[2], sys.argv[3])
     else: die("unknown op")
 except SystemExit: raise
