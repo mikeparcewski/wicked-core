@@ -1272,7 +1272,9 @@ fn a_name_failing_in_one_binary_and_passing_in_another_cannot_be_separated() {
         git_dir: Some(repo.join(".git")),
         ..FloorContext::default()
     };
-    std::fs::write(repo.join("README.md"), "head\n").unwrap();
+    // wicked-core#1701: a prose-only head would pass as the base's failure; a non-prose file the
+    // crate does not compile keeps the head's run unchanged and the change judged.
+    std::fs::write(repo.join("src/unused.rs"), "// head\n").unwrap();
     let report = run_floor(&repo, &ctx);
     if report.sandbox_error.is_some() {
         return;
@@ -2559,6 +2561,197 @@ fn with_exclusion_off_a_red_base_escalates_and_nothing_is_deselected() {
     for mode in ["toc", "alone", "excluded"] {
         assert!(!counters.join(mode).exists(), "a `{mode}` run happened");
     }
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-core#1701: a completed red base cannot be caused by a prose-only change.
+#[cfg(unix)]
+#[test]
+fn prose_only_on_a_red_base_passes_with_exclusion_off() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let (repo, ctx, _) = red_base("1701-prose");
+    std::fs::create_dir_all(repo.join("docs/test-plans")).unwrap();
+    std::fs::write(repo.join("docs/test-plans/math-js.md"), "A test plan.\n").unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.outcome, OUTCOME_PASS_EXCLUDED, "{d:?}");
+    assert_eq!(c.classification.as_deref(), Some(PRE_EXISTING_IN_SANDBOX));
+    assert_eq!(
+        d.reason.as_deref(),
+        Some("the base fails this check too and the change touches only prose (docs/test-plans/math-js.md): not the change's failure")
+    );
+    assert!(
+        report.passed && !c.denies(),
+        "the floor allows the gate: {report:?}"
+    );
+    let note = report.classification_note().unwrap();
+    assert!(note.contains("docs/test-plans/math-js.md"), "{note}");
+    assert!(!note.contains("deselected"), "{note}");
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-core#1701: one source path keeps the red-base hold.
+#[cfg(unix)]
+#[test]
+fn prose_and_source_on_a_red_base_still_need_separation() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let (repo, ctx, _) = red_base("1701-mixed");
+    std::fs::write(repo.join("notes.md"), "A test plan.\n").unwrap();
+    std::fs::write(repo.join("math.js"), "export const x = 1;\n").unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert_eq!(
+        c.decision.as_ref().unwrap().outcome,
+        OUTCOME_BASE_RED_UNSEPARATED,
+        "{c:?}"
+    );
+    assert!(!report.passed && c.denies());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-core#1701 (coord review on core#1706): code named like prose, and an image baseline,
+/// keep the red-base hold: `src/changelog.ts` is code, and a changed screenshot baseline can be
+/// what the failing check compares against.
+#[cfg(unix)]
+#[test]
+fn a_prose_named_source_file_or_an_image_on_a_red_base_still_needs_separation() {
+    for (label, path) in [
+        ("1701-changelog-ts", "src/changelog.ts"),
+        ("1701-png", "tests/__screenshots__/home.png"),
+    ] {
+        let _load = seam::pin(0.5, 4);
+        let _off = seam::exclude(false);
+        let (repo, ctx, _) = red_base(label);
+        let file = repo.join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "export const v = 2;\n").unwrap();
+        let Some((report, c)) = floor_test(&repo, &ctx) else {
+            return;
+        };
+        assert_eq!(
+            c.decision.as_ref().unwrap().outcome,
+            OUTCOME_BASE_RED_UNSEPARATED,
+            "{path}: {c:?}"
+        );
+        assert!(!report.passed && c.denies(), "{path}");
+        let _ = std::fs::remove_dir_all(&repo);
+    }
+}
+
+/// wicked-core#1701: a precise excluded run proves a new failure, even for a markdown change.
+#[cfg(unix)]
+#[test]
+fn prose_only_that_fails_after_precise_exclusion_is_a_new_failure() {
+    let _load = seam::pin(0.5, 4);
+    let _on = seam::exclude(true);
+    let (repo, ctx, argv) = red_base("1701-prose-excluded");
+    // The runner lives outside the repo: only notes.md changes. Its presence makes the head
+    // fail even after `old` is deselected; inventory and base-alone confirmation stay precise.
+    let runner = std::fs::read_to_string(&argv[0]).unwrap();
+    std::fs::write(
+        &argv[0],
+        runner.replace(
+            "exit $(code excluded.exit)",
+            "[ -f notes.md ] && exit 101; exit $(code excluded.exit)",
+        ),
+    )
+    .unwrap();
+    std::fs::write(repo.join("notes.md"), "A test plan.\n").unwrap();
+    assert_eq!(changed_files(&repo, &ctx).unwrap(), s(&["notes.md"]));
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    let d = c.decision.as_ref().expect("decided");
+    assert_eq!(d.excluded, s(&["old"]), "{d:?}");
+    assert_eq!(c.reruns.last().unwrap().exit_code, Some(101));
+    assert_eq!(d.outcome, OUTCOME_NEW_FAILURE, "{d:?}");
+    assert!(!report.passed && c.denies());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-core#1701: a package's prose cannot hide a source edit elsewhere in the repository.
+#[cfg(unix)]
+#[test]
+fn a_package_prose_change_with_root_source_still_needs_separation() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let repo = scratch("1701-package-mixed");
+    let package = repo.join("packages/docs");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    let argv = s(&["sh", "-c", "exit 1"]);
+    // Both the package floor and the root of its base export declare the same failing check.
+    write_tree(&repo, &argv, &[]);
+    write_tree(&package, &argv, &[]);
+    std::fs::write(repo.join(".gitignore"), "tmp/\n").unwrap();
+    std::fs::write(repo.join("src/lib.js"), "export const x = 1;\n").unwrap();
+    std::fs::write(package.join("README.md"), "Docs.\n").unwrap();
+    let base = git_repo_with_commit(&repo);
+    let ctx = FloorContext {
+        stage: FloorStage::Verify,
+        base_head: Some(base),
+        git_dir: Some(repo.join(".git")),
+        package_dir: Some("packages/docs".into()),
+        ..FloorContext::default()
+    };
+    std::fs::write(repo.join("src/lib.js"), "export const x = 2;\n").unwrap();
+    std::fs::write(package.join("README.md"), "Updated docs.\n").unwrap();
+    assert_eq!(changed_files(&package, &ctx).unwrap(), s(&["README.md"]));
+    let Some((report, c)) = floor_test(&package, &ctx) else {
+        return;
+    };
+    assert_eq!(
+        c.base.as_ref().unwrap().run.as_ref().unwrap().exit_code,
+        Some(1)
+    );
+    assert_eq!(
+        c.decision.as_ref().unwrap().outcome,
+        OUTCOME_BASE_RED_UNSEPARATED,
+        "{c:?}"
+    );
+    assert!(!report.passed && c.denies());
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// wicked-core#1701: prose cannot excuse a failure absent from the base.
+#[cfg(unix)]
+#[test]
+fn prose_only_on_a_green_base_is_a_new_failure() {
+    let _load = seam::pin(0.5, 4);
+    let _off = seam::exclude(false);
+    let (repo, ctx, argv) = red_base("1701-green");
+    std::fs::write(repo.join("run.exit"), "0").unwrap();
+    git(&repo, &["commit", "-qam", "a green base"]);
+    let ctx = FloorContext {
+        base_head: Some(git(&repo, &["rev-parse", "HEAD"])),
+        ..ctx
+    };
+    // wicked-core#1701: the runner is outside the repo; only markdown differs between the trees.
+    let runner = std::fs::read_to_string(&argv[0]).unwrap();
+    std::fs::write(
+        &argv[0],
+        runner.replace(
+            "exit $(code run.exit)",
+            "[ -f notes.md ] && exit 101; exit $(code run.exit)",
+        ),
+    )
+    .unwrap();
+    std::fs::write(repo.join("notes.md"), "A test plan.\n").unwrap();
+    let Some((report, c)) = floor_test(&repo, &ctx) else {
+        return;
+    };
+    assert!(c.base.as_ref().unwrap().run.as_ref().unwrap().passed());
+    assert_eq!(
+        c.decision.as_ref().unwrap().outcome,
+        OUTCOME_NEW_FAILURE,
+        "{c:?}"
+    );
+    assert!(!report.passed && c.denies());
     let _ = std::fs::remove_dir_all(&repo);
 }
 

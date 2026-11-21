@@ -74,6 +74,15 @@ impl std::fmt::Display for Denial {
     }
 }
 
+/// wicked-core#1702: recover the path and access from this module's refusal, possibly prefixed
+/// by the shell boundary. Unknown text carries neither field.
+pub(crate) fn refusal_details(reason: &str) -> Option<(&str, &str)> {
+    let (_, detail) = reason.split_once("path outside this unit's boundary: ")?;
+    let (denied, _) = detail.split_once("). Allowed: ")?;
+    let (path, access) = denied.rsplit_once(" (")?;
+    (!path.is_empty() && matches!(access, "write" | "read")).then_some((path, access))
+}
+
 /// Collapse `~`, `.` and `..`, resolving each Unix parent against its physical prefix (core#1469).
 ///
 /// `std::fs::canonicalize` cannot be the whole answer: a `Write` to a file that does not exist yet
@@ -728,6 +737,27 @@ fn ago(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// wicked-core#1702: parse the formatter's own refusal, including a shell reason's prefix.
+    #[test]
+    fn a_formatted_boundary_denial_round_trips_path_and_access() {
+        let base = scratch("1702-details");
+        let roots = roots(&base.join("wt"));
+        let target = base.join("outside (draft).md");
+        for write in [true, false] {
+            let deny = check(target.to_str().unwrap(), &roots, write, &base, None).unwrap_err();
+            let reason = format!("Bash `cd` leaves the unit boundary: {deny}");
+            assert_eq!(
+                refusal_details(&reason),
+                Some((
+                    deny.resolved.to_str().unwrap(),
+                    if write { "write" } else { "read" }
+                ))
+            );
+        }
+        assert_eq!(refusal_details("a policy refused this call"), None);
+        let _ = std::fs::remove_dir_all(base);
+    }
 
     fn roots(dir: &Path) -> AllowedRoots {
         AllowedRoots {

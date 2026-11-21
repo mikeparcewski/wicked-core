@@ -1698,6 +1698,9 @@ impl RepoChecksReport {
         for c in &self.checks {
             let Some(d) = &c.decision else { continue };
             let said = match d.outcome.as_str() {
+                OUTCOME_PASS_EXCLUDED if d.excluded.is_empty() => {
+                    d.reason.clone().unwrap_or_else(|| d.outcome.clone())
+                }
                 OUTCOME_PASS_EXCLUDED => format!(
                     "passed with {} (the base fails them too; the head passed with them \
                      deselected){}",
@@ -6008,6 +6011,8 @@ struct FloorInputs {
     touched: Vec<String>,
     changed: Result<Vec<String>, String>,
     removed: Result<Vec<String>, String>,
+    /// Complete repository-relative change, eligible for the prose exception, even on a package floor.
+    prose_change: Option<Vec<String>>,
     candidates: Vec<String>,
     baseline_diff: bool,
     package_baseline: std::collections::HashMap<String, bool>,
@@ -6132,6 +6137,25 @@ fn run_detected(
                     ),
                     _ => (Ok(None), Vec::new(), Ok(Vec::new()), Ok(Vec::new())),
                 };
+            // wicked-core#1701: package-relative lists omit changes outside the package. Prose
+            // must describe the whole change, including removals, read before any check runs.
+            let (repo_changed, repo_removed) = match package_root(worktree, ctx) {
+                Some((root, _)) => {
+                    let root_ctx = FloorContext {
+                        package_dir: None,
+                        ..ctx.clone()
+                    };
+                    (
+                        changed_files(&root, &root_ctx),
+                        removed_files(&root, &root_ctx),
+                    )
+                }
+                None => (changed.clone(), removed.clone()),
+            };
+            let prose_change = repo_changed.ok().filter(|paths| {
+                paths.len() <= crate::worktree_guard::CHANGED_PATHS_CAP
+                    && matches!(&repo_removed, Ok(paths) if paths.is_empty())
+            });
             let candidates = engine_generated_candidates(worktree, &detected);
             // (core#817) Per package: a subdirectory package's own `baseline_diff: false` holds for it.
             // The root's opt-out covers the whole repo; a package's own opt-out covers the package.
@@ -6171,6 +6195,7 @@ fn run_detected(
                 touched,
                 changed,
                 removed,
+                prose_change,
                 candidates,
                 baseline_diff,
                 package_baseline,
@@ -6190,6 +6215,7 @@ fn run_detected(
         touched,
         changed,
         removed,
+        prose_change,
         candidates,
         baseline_diff,
         package_baseline,
@@ -6588,6 +6614,7 @@ fn run_detected(
                         check,
                         &mut run,
                         side,
+                        prose_change.as_deref(),
                         &gcheck,
                         exclude,
                         sandbox,
@@ -8881,7 +8908,8 @@ pub struct CheckDecision {
 
 /// The check exited 0 (on its first run, or on its identical retry — `flaky`).
 pub const OUTCOME_PASS: &str = "pass";
-/// The head exited 0 once the base's own failing tests were deselected natively.
+/// The base's failures were deselected, or a prose-only change shares a completed base failure
+/// (wicked-core#1701).
 pub const OUTCOME_PASS_EXCLUDED: &str = "pass_excluded";
 /// The deciding run exited non-zero and no base failure explains it — denies.
 pub const OUTCOME_NEW_FAILURE: &str = "new_failure";
@@ -8902,8 +8930,10 @@ pub const BASE_RED_UNSEPARATED: &str = "base_red_unseparated";
 /// base inventory; v14, F24: a check in a package directory the change introduced is decided as
 /// the change's own, so a recorded `base_red_unseparated` for one is not reused; v15, core#1422:
 /// the pod floor's copies are converted like a checkout, so a base result recorded from a raw
-/// copy is not reused): a record of any other version, or a bare `CheckRun`, is a miss.
-const FLOOR_POLICY_VERSION: u32 = 15;
+/// copy is not reused; v16, wicked-core#1701: a prose-only change sharing a completed base failure
+/// passes, so earlier floor decisions must be reconsidered): a record of any other version, or a
+/// bare `CheckRun`, is a miss.
+const FLOOR_POLICY_VERSION: u32 = 16;
 /// The most base failures the floor confirms one by one (each run alone on the base); more than
 /// this escalates rather than paying for them.
 const MAX_ALONE_CONFIRMATIONS: usize = 16;
@@ -10347,6 +10377,7 @@ struct BaseSide {
 /// (DES-FLOOR-V2 §3) Decide a FAILED head check `head` (its first, unchanged run) against its base
 /// side: the head's exit codes decide, the base's TOC-validated failures are the only ones that
 /// may be excluded, and head text is never read to decide.
+/// wicked-core#1701: a prose-only change may excuse an otherwise unseparated completed base failure.
 #[allow(clippy::too_many_arguments)]
 fn decide(
     worktree: &Path,
@@ -10354,6 +10385,7 @@ fn decide(
     check: &RepoCheck,
     head: &mut CheckRun,
     side: Option<BaseSide>,
+    changed: Option<&[String]>,
     guide: &Result<&GuideCheck, String>,
     exclude: bool,
     sandbox: &WorkerSandbox,
@@ -10595,9 +10627,36 @@ fn decide(
     } else if deciding.passed() {
         (OUTCOME_PASS, Some(FLAKY_UNDER_LOAD))
     } else if let Some(why) = &cannot_separate {
-        // Before a retry's own timeout or spawn failure: the first run decided this.
-        decision.reason = Some(format!("base red, cannot separate: {why}"));
-        (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
+        // wicked-core#1701: excuse prose only where the outcome would be base_red_unseparated.
+        // A precise excluded run that still fails is evidence of a new failure, even in prose.
+        // The caller supplies the whole repository's run-base paths, withheld above the event's
+        // path cap or when deleted, renamed-away or type-changed paths cannot be classified.
+        let prose = red_base
+            .filter(|b| {
+                b.exit_code.is_some_and(|code| code != 0)
+                    && !b.environment_failure()
+                    && crashed(b, guide.as_ref().ok().copied()).is_none()
+                    && !deciding.timed_out
+                    && deciding.spawn_error.is_none()
+                    && deciding.exit_code.is_some_and(|code| code != 0)
+                    && crashed(&deciding, guide.as_ref().ok().copied()).is_none()
+            })
+            .and(changed)
+            .and_then(|paths| {
+                crate::rule_check::prose_paths(
+                    &paths.iter().map(String::as_str).collect::<Vec<_>>(),
+                )
+            });
+        if let Some(paths) = prose {
+            decision.reason = Some(format!(
+                "the base fails this check too and the change touches only prose ({paths}): not the change's failure"
+            ));
+            (OUTCOME_PASS_EXCLUDED, Some(PRE_EXISTING_IN_SANDBOX))
+        } else {
+            // Before a retry's own timeout or spawn failure: the first run decided this.
+            decision.reason = Some(format!("base red, cannot separate: {why}"));
+            (OUTCOME_BASE_RED_UNSEPARATED, Some(BASE_RED_UNSEPARATED))
+        }
     } else if deciding.timed_out {
         (OUTCOME_TIMED_OUT, None)
     } else if deciding.spawn_error.is_some() {
@@ -10619,10 +10678,12 @@ fn decide(
     };
     if outcome == OUTCOME_PASS_EXCLUDED {
         let n = decision.excluded.len();
-        decision.reason = Some(format!(
-            "{n} pre-existing excluded: {}",
-            decision.excluded.join(", ")
-        ));
+        if decision.reason.is_none() {
+            decision.reason = Some(format!(
+                "{n} pre-existing excluded: {}",
+                decision.excluded.join(", ")
+            ));
+        }
         head.pre_existing = decision.excluded.clone();
     } else if matches!(outcome, OUTCOME_NEW_FAILURE | OUTCOME_FLAKY_TWICE) {
         head.regressions = annotated;
@@ -11835,6 +11896,7 @@ pub(crate) mod tests {
                 &check,
                 &mut head,
                 Some(side),
+                None,
                 &Ok(&guide),
                 true,
                 &sandbox,

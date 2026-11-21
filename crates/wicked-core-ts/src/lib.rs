@@ -2842,12 +2842,15 @@ impl Core {
     }
 
     /// (DES-RULE-CHECK-001, S1) Which in-force rules a job is checked against. `args_json` is `{ rules:
-    /// [ConformanceRule…], job: { workflow?, steps?: [{ tokens, kind? }], kinds?, project?, languages?, frameworks?,
-    /// layers?, diff? } }`; resolves to `{ matches: [{ rule_id, status: "applies"|"may_apply"|"not_applicable", facts:
+    /// [ConformanceRule…], job: { workflow?, repoRoot? (absolute path), steps?: [{ tokens, kind? }], kinds?,
+    /// project?, languages?, frameworks?, layers?, diff? } }`; resolves to `{ matches: [{ rule_id,
+    /// status: "applies"|"may_apply"|"not_applicable", facts:
     /// [{ kind, detail }] }] }`: one match per rule, none dropped, in reading order. "not_applicable" is only ever a
     /// recorded fact (no step of the job selects it, with the gate's literal tokens; tool tokens the MCP and editor gates
     /// judge per call; another project; a facet or trigger the
-    /// job's diff does not meet); an unknown fact decides nothing. Pure: no store, no model. Rejects with
+    /// job's diff does not meet; a shipped pack does not fit the workflow and repoRoot's manifests);
+    /// an unknown fact decides nothing. No store, no model. wicked-core#1703: `repoRoot` is an absolute path.
+    /// Rejects with
     /// `bad_request: …`. Static, like `evaluateMcpCall`.
     #[napi(ts_return_type = "Promise<string>")]
     pub fn match_rules(args_json: String) -> AsyncTask<CoreTask> {
