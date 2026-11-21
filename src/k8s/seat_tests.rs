@@ -5200,6 +5200,53 @@ fn a_failed_read_after_a_runtime_error_keeps_that_error() {
     );
 }
 
+// core#1699: a first arm and a restarted engine's first arm must admit later worker launches.
+#[cfg(unix)]
+#[test]
+fn a_k8s_seat_arm_leaves_the_state_home_admissible_across_restarts() {
+    let host = tmp("admissible-host");
+    let home = tmp("admissible-home");
+    let snapshot = home.join("skills/snapshots/000001");
+    std::fs::create_dir_all(&snapshot).unwrap();
+    assert_eq!(
+        crate::state_home::of_snapshot(&snapshot),
+        Some(home.clone())
+    );
+    git_in(&host, &["init", "-q", "-b", "main"]);
+    std::fs::write(host.join("a"), "one").unwrap();
+    git_in(&host, &["add", "a"]);
+    git_in(&host, &["commit", "-qm", "c1"]);
+    let sha = std::process::Command::new("git")
+        .hardened()
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&host)
+        .output()
+        .unwrap();
+    assert!(sha.status.success());
+    let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+    for arm in ["first arm", "first arm after restart"] {
+        // Fresh process-local state; the second arm wipes and re-creates the persisted cache.
+        let builders = std::sync::Mutex::new(seat::GitBuilders::default());
+        seat::GitBuild {
+            tree: &host,
+            sha: &sha,
+            branch: &Some("refs/heads/main".to_string()),
+            masks: &[],
+            budget: sync::MAX_STREAM,
+        }
+        .build(&builders, Some(&home))
+        .unwrap();
+        assert!(home.join("k8s-replica-git").is_dir(), "{arm}");
+        let unregistered = crate::state_home::survey(&home).unwrap();
+        assert!(unregistered.is_empty(), "{arm}: found {unregistered:?}");
+        let admitted = crate::state_home::intake_fence_for(Some(&snapshot));
+        assert!(admitted.is_ok(), "{arm}: next launch refused: {admitted:?}");
+    }
+    for p in [host, home] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
 // (core#1441) A kept builder fetches the next commit and repairs a broken object store.
 #[cfg(unix)]
 #[test]
