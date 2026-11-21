@@ -151,7 +151,7 @@ pub(super) fn after_pass(
             // denial, failed seats, review rounds or rulings is carried onto different work (codex
             // r1: page two's first FAIL reached the capped review's adjudication).
             let mut nodes = Vec::new();
-            let pass_started_ms = chrono::Utc::now().timestamp_millis();
+            let pass_started_ms = crate::interaction::now_millis();
             for (ix, u) in units.iter().enumerate().take(unit_ix + 1).skip(from_ix) {
                 let mut u = u.clone();
                 u.pass_started_ms = Some(pass_started_ms);
@@ -474,7 +474,7 @@ mod tests {
         let mut store = open_store(Some(":memory:")).unwrap();
         let ix = seed(&mut store, "pass-clock", Vec::new(), |_| {});
         assert_eq!(unit(&store, "pass-clock", 1).pass_started_ms, None);
-        let before = chrono::Utc::now().timestamp_millis();
+        let before = crate::interaction::now_millis();
         let (r, _) = run(&mut store, "pass-clock", ix, CONTINUE);
         assert!(r.is_some());
         let page = unit(&store, "pass-clock", 1);
