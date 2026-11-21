@@ -1865,13 +1865,26 @@ pub(crate) fn apply_and_finish_unit(
     let same_seat_denial = if assurance.enforces(crate::assurance::DISTINCT_EVALUATOR) {
         let units = crate::domain::session_units(&*store, session_id).unwrap_or_default();
         // (core#1540) Gate denials use this attempt's facts, never LAST_SEEN predictions.
-        evaluator_relation(
+        let rel = evaluator_relation(
             &units,
             unit,
             evidence.observed_providers.as_deref().or(Some(&[])),
         )
-        .filter(|rel| rel.on_builder_seat)
-        .map(|rel| rel.denial(unit))
+        .filter(|rel| rel.on_builder_seat);
+        // (core#1719) A seat seen calling an author's provider is on the unit's record, so no
+        // retry re-picks it, and when no other seat could review the work the gate says so.
+        if let (Some(true), Some(seat)) = (
+            rel.as_ref().map(|r| r.provider_only),
+            unit.assigned_cli.clone(),
+        ) {
+            if !unit.provider_shared_seats.contains(&seat) {
+                unit.provider_shared_seats.push(seat);
+            }
+        }
+        rel.map(|rel| {
+            let dead_end = no_distinct_reviewer(&units, unit, cli_keys);
+            rel.denial(unit, dead_end.as_deref())
+        })
     } else {
         None
     };
@@ -3082,16 +3095,31 @@ struct EvaluatorRelation {
     /// Whether the unit's own seat is one of its builders' seats.
     on_builder_seat: bool,
     conflict: Option<String>,
+    /// (core#1719) The conflict is a provider the seat was observed calling, not a seat key of
+    /// the authors: what [`crate::domain::WorkUnit::provider_shared_seats`] records.
+    provider_only: bool,
 }
 
 impl EvaluatorRelation {
-    fn denial(&self, unit: &crate::domain::WorkUnit) -> crate::domain::UnitDenial {
+    /// The gate's denial. `dead_end` ([`no_distinct_reviewer`]): no other seat of the run can
+    /// review the work, so the words say that instead of asking for a reassign that cannot help.
+    fn denial(
+        &self,
+        unit: &crate::domain::WorkUnit,
+        dead_end: Option<&str>,
+    ) -> crate::domain::UnitDenial {
+        let next = dead_end.map_or_else(
+            || {
+                "reassign it to a distinct signed-in seat and approve to re-run, or relaunch \
+                 with reduced assurance"
+                    .to_string()
+            },
+            str::to_string,
+        );
         crate::domain::UnitDenial::new(
             DENIAL_SOURCE_SAME_SEAT_EVALUATOR,
             format!(
-                "unit {} ran on `{}`, {}; the run requires a distinct evaluator ({}) — \
-                 reassign it to a distinct signed-in seat and approve to re-run, or relaunch \
-                 with reduced assurance",
+                "unit {} ran on `{}`, {}; the run requires a distinct evaluator ({}) — {next}",
                 unit.ord,
                 unit.assigned_cli.as_deref().unwrap_or("unknown"),
                 self.conflict
@@ -3101,6 +3129,105 @@ impl EvaluatorRelation {
             ),
         )
     }
+}
+
+/// (core#1719) Why `seat` cannot review the work `unit` checks independently, or `None`: a seat
+/// key of the work's authors, a seat this unit's gate already denied for calling an author's
+/// provider (the record, [`crate::domain::WorkUnit::provider_shared_seats`]), or a seat this
+/// process last saw calling one.
+pub(crate) fn not_distinct_reviewer(
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+    seat: &str,
+) -> Option<String> {
+    let authors = work_authors(units, unit.ord);
+    let providers = work_author_providers(units, unit.ord);
+    crate::observed_provider::shares_identity(seat, None, &authors, &providers).or_else(|| {
+        unit.provider_shared_seats
+            .iter()
+            .any(|s| s == seat)
+            .then(|| {
+                format!(
+                    "`{seat}` was seen at this step's gate calling a provider of the work's \
+                     authors ({})",
+                    authors.join(", ")
+                )
+            })
+    })
+}
+
+/// (core#1719) THE dead end of a distinct-evaluator review, in plain words, or `None` while a
+/// retry could still go somewhere: `unit`'s own seat is on its record as calling an author's
+/// provider, and no other seat of `roster` (benched ones included: a seat signed back in can take
+/// a reassign) could review the work, by [`not_distinct_reviewer`], the unit's failed seats and
+/// the seats its skill admits. A retry would land on the same seat and be denied the same way, so
+/// the words say so, and name a helper outside the run that could review it when one is set up.
+pub(crate) fn no_distinct_reviewer(
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+    roster: &[String],
+) -> Option<String> {
+    use crate::domain::StageKind;
+    if unit.tool_cmd.is_some() || !matches!(unit.stage, StageKind::Review | StageKind::Test) {
+        return None;
+    }
+    let seat = unit.assigned_cli.as_deref()?;
+    if !unit.provider_shared_seats.iter().any(|s| s == seat) {
+        return None;
+    }
+    let mut why: Vec<String> = Vec::new();
+    for k in roster.iter().filter(|k| k.as_str() != seat) {
+        match not_distinct_reviewer(units, unit, k) {
+            Some(w) => why.push(w),
+            None if unit.worker_failed_clis.contains(k) => {
+                why.push(format!("`{k}` already failed on this step"));
+            }
+            None if !crate::distribute::seat_admits_unit(unit, k, None) => {
+                why.push(format!("`{k}` cannot take this step"));
+            }
+            None => return None,
+        }
+    }
+    let others = if why.is_empty() {
+        String::new()
+    } else {
+        format!("; {}", why.join("; "))
+    };
+    let outside = match outside_reviewer(units, unit, roster) {
+        Some(k) => format!(
+            "`{k}` could review it, but it is not one of this run's helpers: start the job again \
+             with `{k}` among its helpers, or relaunch with reduced assurance"
+        ),
+        None => "start the job again with a helper that calls another provider, or relaunch \
+                 with reduced assurance"
+            .to_string(),
+    };
+    Some(format!(
+        "no distinct reviewer remains among this run's helpers (`{seat}` calls a provider of the \
+         work's authors{others}), so a retry would run on `{seat}` again and be denied the same \
+         way: {outside}"
+    ))
+}
+
+/// (core#1719) A helper outside the run that could review `unit`'s work: the first usable
+/// registry seat that can work, is not in `roster`, and is not known to share the authors' seat
+/// keys or providers. `None` when no such seat is set up.
+fn outside_reviewer(
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+    roster: &[String],
+) -> Option<String> {
+    let in_run = |k: &str| {
+        roster
+            .iter()
+            .any(|r| r == k || crate::team::runner::seat_key(r) == k)
+    };
+    crate::registry_roster()
+        .into_iter()
+        .filter(|c| c.health.as_ref().is_none_or(|h| h.usable))
+        .filter(|c| c.seat_eligible_for_work && !c.headless_invocation.trim().is_empty())
+        .map(|c| c.key)
+        .find(|k| !in_run(k) && not_distinct_reviewer(units, unit, k).is_none())
 }
 
 /// `None` for a unit that is not a Review/Test agent unit or has no builder before it.
@@ -3128,6 +3255,10 @@ fn evaluator_relation(
     let conflict = unit.assigned_cli.as_deref().and_then(|seat| {
         crate::observed_provider::shares_identity(seat, own_observed, &authors, &providers)
     });
+    let provider_only = conflict.is_some()
+        && unit.assigned_cli.as_deref().is_some_and(|seat| {
+            crate::observed_provider::shares_identity(seat, Some(&[]), &authors, &[]).is_none()
+        });
     Some(EvaluatorRelation {
         creator: builders
             .iter()
@@ -3136,6 +3267,7 @@ fn evaluator_relation(
             .or_else(|| gatherers.last().cloned()),
         on_builder_seat: conflict.is_some(),
         conflict,
+        provider_only,
     })
 }
 
@@ -6892,6 +7024,61 @@ mod guarded_read_step_tests {
         );
     }
 
+    /// core#1719: a reviewer denied for a provider it was OBSERVED calling (not a seat key of the
+    /// authors) is what the unit's record keeps; with no other seat of the run able to review the
+    /// work, the gate's words say the dead end instead of asking for a reassign.
+    #[test]
+    fn core_1719_a_provider_only_denial_is_recorded_and_names_the_dead_end() {
+        let provider = format!("t1719p-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, PhaseRole::Creator, "t1719p-codex");
+        build.authored_by = vec!["t1719p-claude".into(), "t1719p-codex".into()];
+        build.observed_providers = vec![provider.clone()];
+        let review = unit(2, StageKind::Review, PhaseRole::Evaluator, "t1719p-pi");
+        let units = [build, review.clone()];
+        let seen = [provider.clone()];
+        let rel = super::evaluator_relation(&units, &review, Some(&seen)).unwrap();
+        assert!(rel.on_builder_seat && rel.provider_only);
+        let mut on_author = review.clone();
+        on_author.assigned_cli = Some("t1719p-claude".into());
+        let rel_author = super::evaluator_relation(&units, &on_author, Some(&seen)).unwrap();
+        assert!(rel_author.on_builder_seat && !rel_author.provider_only);
+
+        let roster: Vec<String> = ["t1719p-claude", "t1719p-codex", "t1719p-pi"]
+            .iter()
+            .map(|k| k.to_string())
+            .collect();
+        // Not on the record yet: nothing is a dead end.
+        assert_eq!(super::no_distinct_reviewer(&units, &review, &roster), None);
+        let mut recorded = review.clone();
+        recorded.provider_shared_seats = vec!["t1719p-pi".into()];
+        let dead_end = super::no_distinct_reviewer(&units, &recorded, &roster).expect("dead end");
+        let d = rel.denial(&recorded, Some(dead_end.as_str()));
+        assert_eq!(d.source, super::DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
+        assert!(
+            d.reason.contains("requires a distinct evaluator"),
+            "{}",
+            d.reason
+        );
+        assert!(
+            d.reason.contains("no distinct reviewer remains"),
+            "{}",
+            d.reason
+        );
+        assert!(
+            !d.reason.contains("reassign it to a distinct"),
+            "{}",
+            d.reason
+        );
+        // Another seat that could review it: the reassign words stay.
+        let mut wider = roster.clone();
+        wider.push("t1719p-opencode".into());
+        assert_eq!(super::no_distinct_reviewer(&units, &recorded, &wider), None);
+        assert!(rel
+            .denial(&recorded, None)
+            .reason
+            .contains("reassign it to a distinct signed-in seat"));
+    }
+
     #[test]
     fn an_unobserved_evaluator_is_not_denied_on_last_seen_at_the_gate() {
         use wicked_apps_core::ToNode;
@@ -6977,7 +7164,7 @@ mod guarded_read_step_tests {
         assert_eq!(super::work_author_providers(&units, 2), observed);
         let rel = super::evaluator_relation(&units, &review, Some(&observed)).unwrap();
         assert!(rel.on_builder_seat);
-        let denial = rel.denial(&review);
+        let denial = rel.denial(&review, None);
         assert_eq!(denial.source, super::DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
         assert!(denial.reason.contains("observed calling `chatgpt.com:443`"));
         assert!(denial.reason.contains("`codex`"));

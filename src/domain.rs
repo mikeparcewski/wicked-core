@@ -1391,6 +1391,13 @@ pub struct WorkUnit {
     /// `last_attempt` for unique dispatch keys. Consumed by the next dispatch.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub observation_reset: bool,
+    /// (core#1719) Seats this Review/Test unit's gate denied as not distinct because their launch
+    /// was OBSERVED calling a provider of the work's authors (`same_seat_evaluator` on a provider,
+    /// not on a seat key). A fact on the record, unlike the process's last-seen map: the re-seat
+    /// never moves a retry back onto one (`actor::distinct_evaluator_seat`), and a retry left with
+    /// only such a seat is refused at the gate. Cleared with the authors on a repeat page.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_shared_seats: Vec<String>,
     /// (PRODUCT-WORKS J6) The dispatch that made its seat a NEW author of this unit, with the tree
     /// that attempt started on. An attempt that then fails as a WORKER (the CLI exited, timed out
     /// or refused before doing anything) and left the tree exactly as it found it produced nothing:
@@ -2009,6 +2016,7 @@ impl WorkUnit {
             providers_unobserved: false,
             observation_pending: false,
             observation_reset: false,
+            provider_shared_seats: Vec::new(),
             author_probe: None,
             depends_on: Vec::new(),
             pre_build_scope: false,

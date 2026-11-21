@@ -10719,8 +10719,11 @@ fn distinct_evaluator_seat(
     let seat = unit.assigned_cli.as_ref()?;
     let authors = crate::pipeline::work_authors(units, unit.ord);
     let providers = crate::pipeline::work_author_providers(units, unit.ord);
+    // (core#1719) …or a seat this unit's gate already found calling an author's provider: on the
+    // unit's record, so a retry never re-picks it, even after a restart cleared the last-seen map.
     let shares = |k: &str| {
         crate::observed_provider::shares_identity(k, None, &authors, &providers).is_some()
+            || unit.provider_shared_seats.iter().any(|s| s == k)
     };
     if !shares(seat) {
         return None;
@@ -10739,6 +10742,29 @@ fn distinct_evaluator_seat(
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
     })
+}
+
+/// (core#1719) Why a retry of the gated `unit` cannot succeed, or `None`: a denied Review/Test
+/// unit on a distinct-evaluator run whose seat is on its record as calling a provider of the
+/// work's authors, with no other seat of the run able to review it
+/// ([`crate::pipeline::no_distinct_reviewer`]). Not the operator's judgment over a unit no judge
+/// could rule on, which runs nothing.
+fn retry_dead_end(
+    session: &crate::domain::AgentSession,
+    units: &[crate::domain::WorkUnit],
+    unit: &crate::domain::WorkUnit,
+) -> Option<String> {
+    if unit.status != crate::domain::UnitStatus::Rejected
+        || !seats_off_authors(unit)
+        || !session
+            .assurance
+            .enforces(crate::assurance::DISTINCT_EVALUATOR)
+        || approve_is_operator_judgment(session, unit)
+        || distinct_evaluator_seat(session, units, unit).is_some()
+    {
+        return None;
+    }
+    crate::pipeline::no_distinct_reviewer(units, unit, &session.clis)
 }
 
 /// (core#933) An operator's reassign of a Review/Test agent unit onto a seat that AUTHORED the work
@@ -20348,6 +20374,19 @@ pub(crate) fn refuse_before_resolving(
     let units = crate::domain::session_units(store, run_id)?;
     let cursor = units.get(session.unit_ix);
     let cursor_ord = cursor.map(|u| u.ord).unwrap_or(0);
+    // (core#1719) A retry of a review whose seat is on its record as calling an author's
+    // provider, with no other seat of the run able to review the work, would run on that seat
+    // again and be denied the same way: refused, with the dead end in plain words.
+    if matches!(decision, crate::workflow::HumanDecision::Approve { .. })
+        && !adjudication_open
+        && !floor_fix_route
+        && !team_gate::transport_gate_open(session)
+        && !team_gate::dispute_gate_open(session)
+    {
+        if let Some(why) = cursor.and_then(|u| retry_dead_end(session, &units, u)) {
+            anyhow::bail!("{why} — send the work back, or stop");
+        }
+    }
     // (core#1313) Refuse before the row resolves; the plain retry does not promise
     // an eligible reviewer now (only retry_qe makes that stronger promise).
     if matches!(decision, crate::workflow::HumanDecision::Approve { .. }) {
@@ -43592,6 +43631,94 @@ mod work_author_tests {
         let two = session(&["reassign-author", "reassign-sharing"], &[]);
         assert!(refuse_author_reassign(&two, &units, 1, "reassign-sharing").is_ok());
         crate::observed_provider::take_receipts();
+    }
+
+    /// core#1719, train-11 J6: the extract failed over from claude to codex (authors claude +
+    /// codex); the critique ran on pi, was seen calling claude's provider and was denied. Retry
+    /// dispatched pi again (the last-seen map knew nothing after a restart): the same denial 20
+    /// minutes later. The gate's finding is now on the unit's record, so the re-seat never re-picks
+    /// that seat while a distinct one exists.
+    #[test]
+    fn core_1719_a_retry_never_repicks_a_seat_recorded_calling_an_authors_provider() {
+        let s = session(
+            &["t1719-claude", "t1719-codex", "t1719-pi", "t1719-opencode"],
+            &[],
+        );
+        let mut extract = unit(
+            2,
+            StageKind::Build,
+            "t1719-codex",
+            &["t1719-claude", "t1719-codex"],
+        );
+        extract.observed_providers = vec![format!("t1719-{}:443", uuid::Uuid::new_v4())];
+        let mut critique = unit(3, StageKind::Review, "t1719-pi", &[]);
+        critique.status = crate::domain::UnitStatus::Rejected;
+        let units = vec![extract.clone(), critique.clone()];
+        // Nothing seen in this process: without the record the retry stays on pi.
+        assert_eq!(distinct_evaluator_seat(&s, &units, &critique), None);
+        critique.provider_shared_seats = vec!["t1719-pi".into()];
+        let units = vec![extract, critique.clone()];
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &critique).as_deref(),
+            Some("t1719-opencode")
+        );
+        assert_eq!(
+            retry_dead_end(&s, &units, &critique),
+            None,
+            "a distinct seat remains"
+        );
+    }
+
+    /// core#1719: with no other seat able to review the work, a retry would land on the recorded
+    /// seat again, so it is refused with the dead end in plain words; a benched distinct seat
+    /// (which can be signed back in and reassigned) keeps the retry open.
+    #[test]
+    fn core_1719_a_retry_with_no_distinct_reviewer_left_names_the_dead_end() {
+        let s = session(&["t1719b-claude", "t1719b-codex", "t1719b-pi"], &[]);
+        let mut extract = unit(
+            2,
+            StageKind::Build,
+            "t1719b-codex",
+            &["t1719b-claude", "t1719b-codex"],
+        );
+        extract.observed_providers = vec![format!("t1719b-{}:443", uuid::Uuid::new_v4())];
+        let mut critique = unit(3, StageKind::Review, "t1719b-pi", &[]);
+        critique.status = crate::domain::UnitStatus::Rejected;
+        let units = vec![extract.clone(), critique.clone()];
+        assert_eq!(
+            retry_dead_end(&s, &units, &critique),
+            None,
+            "not on the record: nothing is known"
+        );
+        critique.provider_shared_seats = vec!["t1719b-pi".into()];
+        let units = vec![extract, critique.clone()];
+        assert_eq!(distinct_evaluator_seat(&s, &units, &critique), None);
+        let why = retry_dead_end(&s, &units, &critique).expect("a dead end");
+        assert!(why.contains("no distinct reviewer remains"), "{why}");
+        assert!(
+            why.contains("a retry would run on `t1719b-pi` again"),
+            "{why}"
+        );
+        assert!(
+            why.contains("seat `t1719b-claude` authored the work"),
+            "{why}"
+        );
+        assert!(why.contains("start the job again with"), "{why}");
+        // A distinct seat benched now: not a dead end.
+        let benched = session(
+            &[
+                "t1719b-claude",
+                "t1719b-codex",
+                "t1719b-pi",
+                "t1719b-opencode",
+            ],
+            &["t1719b-opencode"],
+        );
+        assert_eq!(retry_dead_end(&benched, &units, &critique), None);
+        // A unit that passed is not retried.
+        let mut passed = critique.clone();
+        passed.status = crate::domain::UnitStatus::Done;
+        assert_eq!(retry_dead_end(&s, &units, &passed), None);
     }
 
     /// No distinct seat left (the rest benched): the unit stays, and its gate's

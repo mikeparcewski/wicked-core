@@ -214,6 +214,8 @@ pub(super) fn after_pass(
                 u.observed_providers.clear();
                 u.providers_unobserved = u.observation_pending;
                 u.observation_reset = true;
+                // (core#1719) …and which seats this page's gate found sharing them.
+                u.provider_shared_seats.clear();
                 u.review_rounds.clear();
                 u.operator_rulings.clear();
                 u.floor_auto_retries = 0;

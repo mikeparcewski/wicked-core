@@ -120,6 +120,7 @@ mod tests {
             providers_unobserved: false,
             observation_pending: false,
             observation_reset: false,
+            provider_shared_seats: Vec::new(),
             author_probe: None,
             team_run: false,
             team: None,

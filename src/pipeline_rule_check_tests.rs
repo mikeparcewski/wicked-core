@@ -348,3 +348,138 @@ fn a_disputed_rule_alone_holds_the_gate() {
     assert_eq!(d.rule_ids, vec!["R1".to_string()]);
     assert!(d.reason.contains("R1 DISPUTED"), "{}", d.reason);
 }
+
+/// core#1719 (coord r1 W4): the fold of a review on `seat`, after a build authored by two other
+/// seats whose launch called `provider`; the review's own launch was observed calling `observed`.
+/// Returns the persisted review unit and the gate's denial.
+fn fold_review_after_build(
+    sid: &str,
+    seat: &str,
+    provider: &str,
+    observed: Option<Vec<String>>,
+) -> (crate::domain::WorkUnit, Option<crate::domain::UnitDenial>) {
+    use wicked_apps_core::ToNode;
+    let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+    let Planned {
+        mut units,
+        workflow_id,
+        cli_keys,
+        ..
+    } = plan_and_distribute(
+        &mut store,
+        &[cli("a")],
+        "Do step one.",
+        EntityMode::Shared,
+        sid,
+        crate::domain::HumanConfirm::None,
+        false,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+        None,
+        &mut |_e| {},
+        None,
+        false,
+        false,
+        Vec::new(),
+        None,
+        // Not reduced: the run requires a distinct evaluator, as J6's did.
+        false,
+        &crate::assurance::QeOverride::Auto,
+    )
+    .expect("plan");
+    let at = units[0].ord;
+    let mut build = crate::domain::WorkUnit::pending(format!("{sid}:build"), sid, at, "build");
+    build.stage = crate::domain::StageKind::Build;
+    build.role = PhaseRole::Creator;
+    build.assigned_cli = Some(format!("{seat}-codex"));
+    build.authored_by = vec![format!("{seat}-claude"), format!("{seat}-codex")];
+    build.observed_providers = vec![provider.to_string()];
+    let review = &mut units[0];
+    review.ord = at + 1;
+    review.stage = crate::domain::StageKind::Review;
+    review.role = PhaseRole::Evaluator;
+    review.assigned_cli = Some(seat.to_string());
+    crate::domain::put_node(&mut store, build.to_node()).unwrap();
+    crate::domain::put_node(&mut store, review.to_node()).unwrap();
+    let evidence = crate::workflow::UnitEvidence {
+        observed_providers: observed,
+        ..Default::default()
+    };
+    let output = crate::workflow::stub_output(review);
+    let outcome = apply_and_finish_unit(
+        &mut store,
+        review,
+        &output,
+        &workflow_id,
+        EntityMode::Shared,
+        sid,
+        0,
+        false,
+        false,
+        &cli_keys,
+        None,
+        &evidence,
+        &mut |_e| {},
+        None,
+    )
+    .expect("apply");
+    let persisted = crate::domain::session_units(&store, sid)
+        .unwrap()
+        .into_iter()
+        .find(|u| u.id == review.id)
+        .expect("the review persisted");
+    (persisted, outcome.denial)
+}
+
+/// core#1719 (coord r1 W4): a review whose OWN launch this attempt was observed calling an author's
+/// provider is denied `same_seat_evaluator`, and the fold records its seat on the unit; a seat
+/// known to share only from the process's last-seen map (not this attempt) is never recorded.
+#[test]
+fn core_1719_the_fold_records_a_seat_only_from_this_attempts_observed_provider() {
+    let provider = format!("t1719f-{}:443", uuid::Uuid::new_v4());
+    let (unit, denial) = fold_review_after_build(
+        "t1719f-run",
+        "t1719f-pi",
+        &provider,
+        Some(vec![provider.clone()]),
+    );
+    assert_eq!(unit.provider_shared_seats, vec!["t1719f-pi".to_string()]);
+    let all = [denial.as_ref()]
+        .into_iter()
+        .flatten()
+        .chain(unit.denials_behind.iter().flatten())
+        .chain(unit.denial.as_ref())
+        .any(|d| d.source == DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
+    assert!(
+        all,
+        "the gate denies the seat: {denial:?} / {:?}",
+        unit.denials_behind
+    );
+
+    // Last-seen only: the process saw this seat call the provider, this attempt was not observed
+    // calling it. Nothing is recorded.
+    let provider2 = format!("t1719g-{}:443", uuid::Uuid::new_v4());
+    crate::observed_provider::record_receipt("t1719g-pi", Some(vec![provider2.clone()]));
+    let (unit2, _) = fold_review_after_build(
+        "t1719g-run",
+        "t1719g-pi",
+        &provider2,
+        Some(vec!["t1719g-elsewhere:443".to_string()]),
+    );
+    assert!(
+        unit2.provider_shared_seats.is_empty(),
+        "{:?}",
+        unit2.provider_shared_seats
+    );
+    let (unit3, _) = fold_review_after_build("t1719h-run", "t1719g-pi", &provider2, None);
+    assert!(
+        unit3.provider_shared_seats.is_empty(),
+        "{:?}",
+        unit3.provider_shared_seats
+    );
+    crate::observed_provider::take_receipts();
+}
