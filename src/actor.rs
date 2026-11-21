@@ -5815,6 +5815,23 @@ fn failure_detail_excerpt(raw: &str) -> String {
     bounded_excerpt(raw, DETAIL_EXCERPT_HEAD, DETAIL_EXCERPT_TAIL)
 }
 
+/// (core#1722) The cause a failover's `stepFailed` names: the failed output's head (the runner's
+/// own frame: `(cli `x` exited N)`, a timeout, a spawn failure) and its tail (where a CLI says why
+/// it stopped), bounded, with the operator's home and temp prefixes redacted. An empty output says
+/// so, so the event never reads as a failure with no cause.
+fn failover_cause(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "the seat printed nothing".to_string();
+    }
+    // Redacted BEFORE the cut, so a cut inside a home prefix never leaves its user name behind.
+    bounded_excerpt(
+        &wicked_apps_core::emit::redact_paths(raw),
+        FAILURE_EXCERPT_HEAD,
+        FAILURE_EXCERPT_TAIL,
+    )
+}
+
 #[cfg(test)]
 mod excerpt_tests {
     use super::*;
@@ -7489,7 +7506,11 @@ fn apply_step_result(
         // CLI's own frame (core#1479) — so a worker whose SUBJECT was rate limiting or a sign-on
         // system is not mistaken for one that was rate limited or signed out. A quota or sign-in
         // bench is re-probed after its backoff (`seat_bench`).
-        let seat_refusal = if unit.tool_cmd.is_none() {
+        // (core#1722) An output the engine failed after the seat ran (its result lost in
+        // settlement, or a seat credential in its work) is never read as the seat refusing.
+        let seat_refusal = if unit.tool_cmd.is_none()
+            && !crate::execute_wrapped::failed_after_the_seat_ran(&output.output)
+        {
             // (r2-N2) The generic quota rule needs exit evidence — the wrapped runner's own
             // `(cli … exited N)` marker with N ≠ 0; a provider sentence needs none.
             let exited_nonzero =
@@ -8220,6 +8241,11 @@ fn apply_step_result(
                 } else {
                     "failed (worker error)"
                 };
+                // (core#1722) The cause rides the event: the runner's own frame (exit status,
+                // timeout, spawn failure) and the seat's last words, bounded and path-redacted.
+                // After the counts, so readers of the `seat '…' failed (…); failing over to '…'`
+                // shape (crew seat-health, evals) keep matching.
+                let cause = failover_cause(&output.output);
                 emit(
                     subscribers,
                     CoreEvent::StepFailed {
@@ -8228,7 +8254,8 @@ fn apply_step_result(
                         attempt: output.attempt,
                         detail: format!(
                             "seat '{failed_cli}' {failure}; failing over to '{next}' \
-                             (seats worker-failed on this unit: {seats_tried}/{}){}",
+                             (seats worker-failed on this unit: {seats_tried}/{}){} — cause: \
+                             {cause}",
                             session.clis.len().max(seats_tried),
                             failover_distinctness
                                 .as_deref()
@@ -8832,6 +8859,98 @@ fn apply_step_result(
         }
     }
 
+    // ── PAGE FLOOR (core#1724) ───────────────────────────────────────────────────────────────
+    // A domain map's extract step states ONE page: every unit of the worklist the host framed. A
+    // seat that stated 79 of 500 units and left the rest "for subsequent pages" passed as a whole
+    // page (its file conformed; the page's review judges what was stated), and the map's minimum
+    // came hours later. The page's own deliverable (the rules file) is measured against the page:
+    // a partial page is asked for again ONCE, automatically, naming what is left — the units
+    // already stated stay in the file — and a page still partial after that round goes on,
+    // disclosed with its count (the units left are framed again by the next page).
+    if unit.tool_cmd.is_none()
+        && unit.role == crate::workflow::PhaseRole::Creator
+        && unit
+            .required_deliverables
+            .iter()
+            .any(|d| d == crate::domain_extraction::RULES_REL)
+    {
+        let cwd = session
+            .workdir
+            .clone()
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| crate::execute_wrapped::sandbox_root(&run_id));
+        if let Some(page) = crate::domain_extraction::page_stated(&cwd).filter(|p| p.left() > 0) {
+            let asked = unit
+                .rework_amendment
+                .as_deref()
+                .is_some_and(|a| a.contains(PAGE_ROUND_MARKER));
+            if !asked {
+                let why = format!(
+                    "page incomplete: the rules file states {} of the {} worklist units on this \
+                     page ({} not stated)",
+                    page.stated,
+                    page.units,
+                    page.left()
+                );
+                unit.status = crate::domain::UnitStatus::Rejected;
+                unit.denial_reason = Some(why.clone());
+                unit.denial = Some(crate::domain::UnitDenial::new(
+                    PAGE_INCOMPLETE_SOURCE,
+                    why.clone(),
+                ));
+                put_node(store, unit.to_node())?;
+                persist_rejected_transcript(store, &session, unit, &output.output);
+                emit(
+                    subscribers,
+                    CoreEvent::StepFailed {
+                        session: run_id.clone(),
+                        ord,
+                        attempt: output.attempt,
+                        detail: format!("{why} — asking the seat once more for the whole page"),
+                        // Core's veto over a healthy seat: never a seat failure.
+                        failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                    },
+                );
+                let mut scratch_in_flight = HashSet::new();
+                return match rewind_to_creator_scoped(
+                    store,
+                    subscribers,
+                    runner,
+                    self_tx,
+                    &mut scratch_in_flight,
+                    session.clone(),
+                    &run_id,
+                    Some(page_round_note(&page)),
+                    PAGE_ROUND_SCOPE,
+                    lifecycle_maps,
+                    actor_maps,
+                    process_gen,
+                    is_acp,
+                )? {
+                    SessionStatus::Executing => Ok(StepApplied::Continuing),
+                    SessionStatus::AwaitingHuman => Ok(StepApplied::Paused),
+                    _ => Ok(StepApplied::Finished),
+                };
+            }
+            emit(
+                subscribers,
+                CoreEvent::UnitOutputDelta {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    text: format!(
+                        "\n[wicked-core] partial page: stated {} of {} worklist units after the \
+                         automatic page round; the {} left are framed again by the next page \
+                         (core#1724)\n",
+                        page.stated,
+                        page.units,
+                        page.left()
+                    ),
+                },
+            );
+        }
+    }
+
     // (DES-DEMO-RECORD-001 §3.3) The plan a later `demo_record` records is snapshotted NOW, into the
     // engine's own `approved/<gen>/`: the person's gate shows that snapshot and the recorder reads
     // only it, so what records is what was approved. A plan that cannot be snapshotted is denied
@@ -9286,6 +9405,53 @@ fn vault_host_validator(
 
 /// (core#651) The `unitReworkAmended.scope` token of the automatic creator-floor round.
 pub(crate) const FLOOR_AUTO_RETRY_SCOPE: &str = "floor_auto_retry";
+
+/// (core#1724) The `unitReworkAmended.scope` token of the automatic page round.
+pub(crate) const PAGE_ROUND_SCOPE: &str = "page_incomplete";
+
+/// (core#1724) The denial source of a partial page (the extract step's rules file states only
+/// part of its worklist).
+pub(crate) const PAGE_INCOMPLETE_SOURCE: &str = "page_incomplete";
+
+/// (core#1724) The marker the automatic page round's amendment carries: present on the unit's
+/// `rework_amendment`, the round was taken (a send-back replaces the amendment, and the next page
+/// clears it, so each re-run of the page gets its own round).
+const PAGE_ROUND_MARKER: &str = "[automatic page round — 1 of 1 (core#1724)]";
+
+/// (core#1724) What the automatic page round asks for: the whole page, with what is left.
+fn page_round_note(page: &crate::domain_extraction::PageStated) -> String {
+    let sample = if page.unstated.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " (among them {}{})",
+            page.unstated
+                .iter()
+                .map(|id| format!("`{id}`"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if page.left() > page.unstated.len() {
+                ", …"
+            } else {
+                ""
+            }
+        )
+    };
+    format!(
+        "{PAGE_ROUND_MARKER} This page's worklist (`{wl}`) has {units} units and `{rules}` states \
+         {stated}: {left} are not stated yet{sample}. A page is the whole worklist: no unit is left \
+         for a later page. Keep the entries already in the file and add one for every unit it does \
+         not hold yet — the rule its source shows, or an empty statement where the source shows \
+         none. If the harness stopped at its time budget, run it again: it resumes after the units \
+         already stated. Then run `--check-rules` with `--worklist` until it reports 0 worklist \
+         units not stated. A page still partial after this round goes on with its count shown.",
+        wl = crate::domain_extraction::WORKLIST_REL,
+        rules = crate::domain_extraction::RULES_REL,
+        units = page.units,
+        stated = page.stated,
+        left = page.left(),
+    )
+}
 
 /// (core#651) The marker the automatic round's amendment carries after the floor's own denial
 /// (which already names each failing check with its stdout/stderr tails).
@@ -35132,6 +35298,12 @@ mod deliverable_floor_tests {
             Vec::new(),
             vec![crate::domain_extraction::RULES_REL.to_string()],
         );
+        // What `dispatch_unit` stamped when attempt 0 ran.
+        let mut u = crate::domain::session_units(&store, &run_id)
+            .unwrap()
+            .remove(0);
+        u.last_attempt = Some(0);
+        put_node(&mut store, u.to_node()).unwrap();
         let mut subs = crate::event_log::EventSink::default();
         let (esub, erx) = channel();
         subs.push(esub);
@@ -36042,6 +36214,7 @@ mod seat_failover_tests {
     }
 
     /// [`fold_failed`], with every event the fold emitted.
+    #[allow(clippy::type_complexity)]
     fn fold_failed_capturing(
         store: &mut dyn GraphStore,
         run_id: &str,

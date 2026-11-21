@@ -1991,18 +1991,24 @@ fn k8s_a_quarantine_owed_by_a_dead_engine_still_rotates_the_boot_token() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// (core#1722) The CLI RAN: a failed settlement is the engine losing its result, never a seat that
+/// could not start (which the failover ladder reads as the seat's own failure).
 #[test]
-fn k8s_a_failed_settlement_keeps_the_clis_output_as_could_not_run() {
+fn k8s_a_failed_settlement_keeps_the_clis_output_as_the_result_lost_frame() {
     let err = format!(
         "{}the write-back was refused: `x` is inside a git dir",
         crate::execute_wrapped::SETTLE_FAILED
     );
     let out = crate::execute_wrapped::settle_failure_output("claude", &err, "minutes of work");
     assert!(
-        out.starts_with(crate::execute_wrapped::COULD_NOT_RUN_PREFIX),
+        out.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
         "{out}"
     );
     assert!(out.contains("inside a git dir"));
+    assert!(
+        crate::execute_wrapped::spawn_failure_detail(&out).is_none(),
+        "{out}"
+    );
     assert!(out.ends_with("minutes of work"));
     // Review r4: the CLI's stderr is kept too.
     let err = format!(
@@ -2012,7 +2018,7 @@ fn k8s_a_failed_settlement_keeps_the_clis_output_as_could_not_run() {
     );
     let out = crate::execute_wrapped::settle_failure_output("claude", &err, "");
     assert!(
-        out.starts_with(crate::execute_wrapped::COULD_NOT_RUN_PREFIX),
+        out.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
         "{out}"
     );
     assert!(out.contains("the rc could not be read)"), "{out}");

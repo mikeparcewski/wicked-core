@@ -1453,6 +1453,11 @@ pub(crate) fn strip_pi_banner(text: &str) -> &str {
 /// read. Structural, not string-sniffed — and it closes the small hole where a worker printing that
 /// sentence into its own transcript could reclassify its own failure.
 pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
+    // (core#1722) The engine's own verdict over a seat that ran is no CLI failure, whatever the
+    // seat's transcript after the frame says.
+    if crate::execute_wrapped::failed_after_the_seat_ran(output) {
+        return false;
+    }
     let o = output.to_ascii_lowercase();
     o.contains("exited") // the wrapped runner's "(cli `x` exited N) …" nonzero-exit message
         || o.contains("could not run")
@@ -1481,6 +1486,9 @@ pub(crate) fn is_transient_cli_failure(output: &str) -> bool {
 /// timed out twice on the same unit because the timeout shape never entered the ladder, so the
 /// engine re-dispatched the same seat until the run died.
 pub(crate) fn is_worker_originated_failure(output: &str) -> bool {
+    if crate::execute_wrapped::failed_after_the_seat_ran(output) {
+        return false;
+    }
     if is_transient_cli_failure(output) {
         return true;
     }
