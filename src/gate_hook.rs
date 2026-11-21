@@ -185,8 +185,8 @@ pub const GRAPH_WRITE_DIR_ENV: &str = "WICKED_GRAPH_WRITE_DIR";
 /// IS the real worktree: there both still run (coord, 2026-11-11), until the host floor is removed.
 pub const SEAT_POD_ENV: &str = "WICKED_SEAT_POD";
 
-/// Whether this hook judges a pod seat's call, including host-blind parents (core#1469).
-pub(crate) fn seat_in_pod() -> bool {
+/// Whether this hook judges a pod seat's call ([`SEAT_POD_ENV`]).
+fn seat_in_pod() -> bool {
     std::env::var_os(SEAT_POD_ENV).is_some_and(|v| v == "1")
 }
 
