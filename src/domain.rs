@@ -1129,6 +1129,9 @@ pub struct WorkUnit {
     pub id: String,
     /// The owning session id.
     pub session_id: String,
+    /// (core#1413) The asking run, only on engine-internal session units.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_run_id: Option<String>,
     /// 1-based order in the plan.
     pub ord: u32,
     /// The unit's description (becomes the gate's governance `work` context).
@@ -1309,8 +1312,9 @@ pub struct WorkUnit {
     pub requires_capture_report: bool,
     /// (crew#1311) Whether this unit's backing phase declared
     /// [`answer_only`](crate::workflow::PhaseDef::answer_only) — carried verbatim at plan time,
-    /// exactly the way `executes_code` is. One consumer: the phase-substance floor in
-    /// `actor::apply_step_result`, which asks such a read-only unit only for a non-empty answer.
+    /// exactly the way `executes_code` is. The phase-substance floor in `actor::apply_step_result`
+    /// asks only for a non-empty answer. The tool-less posture takes every tool away so the
+    /// answer comes from the prompt alone (core#1257).
     /// Skip-if-false: every other unit serializes byte-identical to before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub answer_only: bool,
@@ -1666,6 +1670,12 @@ pub struct WorkUnit {
     /// send-back resets the unit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub draft_render: Option<crate::draft_render::DraftRenderRecord>,
+    /// Earliest deliverable timestamp for the current repeat pass.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pass_started_ms: Option<i64>,
+    /// Allowed run-relative paths: directory prefixes end in `/`, files match exactly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_set: Vec<String>,
     /// (DES-RULE-CHECK-001 rev 2) The council rulings of the run's other units (stamped at
     /// dispatch on a review unit): reused only on an equal rule key and evidence key.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1930,8 +1940,11 @@ impl WorkUnit {
     ) -> Self {
         let description = description.into();
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             id: id.into(),
             session_id: session_id.into(),
+            parent_run_id: None,
             ord,
             stage: StageKind::classify(&description),
             description,
@@ -2853,6 +2866,22 @@ mod tests {
             u, back,
             "WorkUnit must survive a node round-trip losslessly"
         );
+    }
+
+    // (core#1413) Ordinary and legacy units keep the same wire shape.
+    #[test]
+    fn parent_run_id_is_optional_and_only_serializes_when_set() {
+        let unit = WorkUnit::pending("r:u1", "r", 1, "work");
+        assert_eq!(unit.parent_run_id, None);
+        let node = unit.to_node();
+        assert!(!node.metadata.contains_key("parent_run_id"));
+        assert_eq!(WorkUnit::from_node(&node).unwrap().parent_run_id, None);
+
+        let mut judge = WorkUnit::pending("validator-agent", "validator", 1, "judge");
+        judge.parent_run_id = Some("r".to_string());
+        let wire = serde_json::to_value(&judge).unwrap();
+        assert_eq!(wire["parent_run_id"], "r");
+        assert_eq!(serde_json::from_value::<WorkUnit>(wire).unwrap(), judge);
     }
 
     /// crew#311 / core#297 §2 back-compat: `executes_code` round-trips when set, serializes to

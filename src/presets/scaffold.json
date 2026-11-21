@@ -43,7 +43,7 @@
    "instructions": "Phase 4/5 TEST (test automation engineer, independent evaluator): run the new project's build and tests from a clean state, and check that every part of its public surface has a test. Change nothing: report each failing command and each untested part of the surface, with its file:line. End with one plain-text line VERDICT: PASS or VERDICT: FAIL as the last line, findings above it; never quote another VERDICT line."
   },
   {
-   "catalog": "review",
+   "catalog": "security_review",
    "id": "security",
    "gate": {
     "human_confirm_if": "verdict_not_pass"

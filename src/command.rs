@@ -146,6 +146,11 @@ pub(crate) enum Command {
         spec: RepoSpec,
         reply: Sender<anyhow::Result<RepoEntry>>,
     },
+    /// Remove a repo registration after checking runs, graph leases, and project memberships.
+    UnregisterRepo {
+        repo_id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     /// List every registered repository.
     ListRepos {
         reply: Sender<anyhow::Result<Vec<RepoEntry>>>,
@@ -703,6 +708,7 @@ impl Command {
             Command::GateActions { .. } => "GateActions",
             Command::CancelRun { .. } => "CancelRun",
             Command::RegisterRepo { .. } => "RegisterRepo",
+            Command::UnregisterRepo { .. } => "UnregisterRepo",
             Command::ListRepos { .. } => "ListRepos",
             Command::ProjectCreate { .. } => "ProjectCreate",
             Command::ProjectUpdate { .. } => "ProjectUpdate",

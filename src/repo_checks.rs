@@ -4342,6 +4342,14 @@ fn tree_bytes(dir: &Path) -> u64 {
 
 /// Remove a leaf directory (a link at its path is removed, never followed).
 fn remove_leaf_dir(leaf: &Path) -> std::io::Result<()> {
+    // The leaf's target claims go with it; a cluster that does not answer never keeps the host
+    // scratch (the claims stay registered and go with the run's namespace).
+    if let Err(e) = crate::checks_container::retire_target_claims(leaf) {
+        eprintln!(
+            "wicked-core: the target claims of {} were not deleted: {e}",
+            leaf.display()
+        );
+    }
     match std::fs::symlink_metadata(leaf) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
@@ -4565,19 +4573,26 @@ enum Evicted {
 
 /// Remove `leaf` for the cap pass, only under its EXCLUSIVE lock. A floor holds a SHARED lock for
 /// its life, so a leaf a floor is building into is never removed.
+pub(crate) fn evict_target_leaf(leaf: &Path) -> bool {
+    matches!(evict_leaf(leaf), Evicted::Removed | Evicted::AlreadyGone)
+}
+
 fn evict_leaf(leaf: &Path) -> Evicted {
     match lock_leaf(leaf, true) {
-        Ok(Some(_held)) if std::fs::symlink_metadata(leaf).is_err() => Evicted::AlreadyGone,
-        Ok(Some(_held)) => match remove_leaf_dir(leaf) {
-            Ok(()) => Evicted::Removed,
-            Err(e) => {
-                eprintln!(
-                    "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
-                    leaf.display()
-                );
-                Evicted::Kept
+        Ok(Some(_held)) => {
+            let existed = std::fs::symlink_metadata(leaf).is_ok();
+            match remove_leaf_dir(leaf) {
+                Ok(()) if existed => Evicted::Removed,
+                Ok(()) => Evicted::AlreadyGone,
+                Err(e) => {
+                    eprintln!(
+                        "wicked-core: repo checks floor — could not remove the check scratch {}: {e}",
+                        leaf.display()
+                    );
+                    Evicted::Kept
+                }
             }
-        },
+        }
         // A floor is building into it right now: it is not this cap's to take.
         Ok(None) => Evicted::Kept,
         Err(e) => {
@@ -13918,6 +13933,117 @@ exit 1
         assert!(lease_path(&lb).is_file(), "the 0-byte lock file is kept");
         assert!(b.is_dir(), "the worktree itself is never touched");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_c2_last_scratch_retires_both_target_claims_without_ending_the_run() {
+        let base = scratch("retire-targets");
+        let cache = base.join("cache");
+        let wt = base.join("worktree");
+        std::fs::create_dir_all(&wt).unwrap();
+        let scratch = CheckScratch::prepare_in(&cache, &wt, Some("live-run"), u64::MAX).unwrap();
+        let leaf = scratch.root().to_path_buf();
+        let kubectl = base.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' apply '*) cat >/dev/null;;\n*' get pvc '*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"me\",\"app.kubernetes.io/managed-by\":\"wicked-core\"}}}}}}';;\nesac\n",
+            base.display()
+        ));
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: "me".into(),
+        };
+        let place = crate::k8s::floor::Place {
+            kube,
+            ns: "live-ns".into(),
+            run: "live-run".into(),
+            owned: false,
+        };
+        for tree in [Tree::Head, Tree::Base] {
+            let claim = crate::checks_container::target_volume(&leaf, tree);
+            crate::checks_container::admit_target_claim(
+                &leaf,
+                &place.kube,
+                &place.ns,
+                &claim,
+                crate::checks_container::MAX_TARGET_LEAVES,
+            )
+            .unwrap();
+            place.claim(&claim, "64Gi").unwrap();
+        }
+        assert!(!retire_leaf(&leaf), "a leased leaf is only marked orphaned");
+        assert!(
+            !std::fs::read_to_string(base.join("calls"))
+                .unwrap()
+                .contains("delete pvc"),
+            "no active claim is deleted"
+        );
+        drop(scratch);
+        assert!(!leaf.exists());
+        let calls = std::fs::read_to_string(base.join("calls")).unwrap();
+        for tree in [Tree::Head, Tree::Base] {
+            assert!(
+                calls.contains(&format!(
+                    "delete pvc {}",
+                    crate::checks_container::target_volume(&leaf, tree)
+                )),
+                "{calls}"
+            );
+        }
+        assert!(!calls.contains("delete namespace"));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pr_c2_target_budget_evicts_idle_leaves_and_refuses_when_all_are_leased() {
+        let base = scratch("target-budget");
+        let cache = base.join("cache");
+        let wt = base.join("wt");
+        std::fs::create_dir_all(&wt).unwrap();
+        let kubectl = base.join("kubectl");
+        crate::test_env::install_stub(&kubectl, &format!(
+            "#!/bin/sh\necho \"$*\" >>'{0}/calls'\ncase \" $* \" in\n*' get pvc '*) echo '{{\"metadata\":{{\"labels\":{{\"wicked.dev/owner\":\"me\",\"app.kubernetes.io/managed-by\":\"wicked-core\"}}}}}}';;\nesac\n", base.display()
+        ));
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: "test".into(),
+            owner: "me".into(),
+        };
+        let ns = format!("budget-{}", uuid::Uuid::new_v4());
+        let allocate = |leaf: &Path| {
+            crate::checks_container::admit_target_claim(
+                leaf,
+                &kube,
+                &ns,
+                &crate::checks_container::target_volume(leaf, Tree::Head),
+                2,
+            )
+        };
+        let idle = CheckScratch::prepare_in(&cache, &wt, Some("idle"), u64::MAX).unwrap();
+        let idle_leaf = idle.root().to_path_buf();
+        allocate(&idle_leaf).unwrap();
+        drop(idle);
+        let active = CheckScratch::prepare_in(&cache, &wt, Some("active"), u64::MAX).unwrap();
+        allocate(active.root()).unwrap();
+        let own = CheckScratch::prepare_in(&cache, &wt, Some("own"), u64::MAX).unwrap();
+        allocate(own.root()).unwrap();
+        assert!(!idle_leaf.exists(), "the idle leaf was evicted");
+        assert!(active.root().exists());
+        let blocked = CheckScratch::prepare_in(&cache, &wt, Some("blocked"), u64::MAX).unwrap();
+        let err = allocate(blocked.root()).unwrap_err();
+        assert!(err.starts_with("admission_pending:"), "{err}");
+        assert!(active.root().exists() && own.root().exists());
+        drop(blocked);
+        drop(own);
+        drop(active);
+        for run in ["own", "active"] {
+            assert!(remove_check_scratch_in(&cache, &wt, Some(run)));
+        }
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     /// The per-repository cap: over it, the least recently used OTHER run leaves go first, a

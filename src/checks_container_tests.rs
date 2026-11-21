@@ -1,5 +1,361 @@
 use super::*;
 
+#[cfg(unix)]
+mod dependency_claim_admission {
+    use super::*;
+    use serde_json::json;
+
+    struct Claims {
+        dir: PathBuf,
+        place: crate::k8s::floor::Place,
+    }
+
+    impl Claims {
+        fn new(count: u64) -> Self {
+            let id = uuid::Uuid::new_v4();
+            let dir = std::env::temp_dir().join(format!("nm-admission-{id}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let kubectl = dir.join("kubectl");
+            crate::test_env::install_stub(
+                &kubectl,
+                r#"#!/bin/sh
+dir=${0%/*}
+while [ "$#" -gt 0 ]; do
+    case "$1" in get|delete|apply) break ;; esac
+    shift
+done
+printf '%s\n' "$*" >> "$dir/calls"
+case "$1 $2 $3" in
+    'get pvc -l') cat "$dir/claims.json" ;;
+    'get pods -o')
+        cat "$dir/pods.json"
+        if [ -f "$dir/pause-pod-list" ]; then
+            touch "$dir/pods-listed"
+            while [ -f "$dir/pause-pod-list" ]; do sleep 0.01; done
+        fi
+        ;;
+    get\ pvc\ *) cat "$dir/$3.json" ;;
+    delete\ pvc\ *) printf '%s\n' "$3" >> "$dir/deleted" ;;
+    apply\ *) cat > "$dir/applied.json" ;;
+    *) echo "unexpected kubectl: $*" >&2; exit 1 ;;
+esac
+"#,
+            );
+            let mut items = Vec::new();
+            for i in 0..count {
+                let name = format!("wfloor-nm-{i:02}");
+                let claim = json!({"metadata": {
+                    "name": name, "labels": {"wicked.dev/owner": "me"}
+                }});
+                std::fs::write(dir.join(format!("{name}.json")), claim.to_string()).unwrap();
+                items.push(claim);
+            }
+            // Neither another owner's nm claim nor our target claims consume this budget.
+            items.push(json!({"metadata": {
+                "name": "wfloor-nm-foreign", "labels": {"wicked.dev/owner": "other"}
+            }}));
+            items.push(json!({"metadata": {
+                "name": "wfloor-target", "labels": {"wicked.dev/owner": "me"}
+            }}));
+            std::fs::write(dir.join("claims.json"), json!({"items": items}).to_string()).unwrap();
+            std::fs::write(dir.join("pods.json"), r#"{"items":[]}"#).unwrap();
+            Self {
+                place: crate::k8s::floor::Place {
+                    kube: crate::k8s::Kube {
+                        kubectl,
+                        kubeconfig: None,
+                        context: "test".into(),
+                        owner: "me".into(),
+                    },
+                    ns: format!("nm-{id}"),
+                    run: "run".into(),
+                    owned: false,
+                },
+                dir,
+            }
+        }
+
+        fn mounted(&self, count: u64) {
+            let volumes: Vec<_> = (0..count)
+                .map(|i| {
+                    json!({"persistentVolumeClaim": {
+                        "claimName": format!("wfloor-nm-{i:02}")
+                    }})
+                })
+                .collect();
+            // Mounts by every live pod count, regardless of its owner label or readiness.
+            let pods = json!({"items": [{
+                "metadata": {"labels": {"wicked.dev/owner": "other"}},
+                "status": {"phase": "Pending"}, "spec": {"volumes": volumes}
+            }]});
+            std::fs::write(self.dir.join("pods.json"), pods.to_string()).unwrap();
+        }
+
+        fn allocate(&self) -> Result<(), String> {
+            self.place.claim("wfloor-nm-new", "16Gi")
+        }
+
+        fn deleted(&self) -> Vec<String> {
+            std::fs::read_to_string(self.dir.join("deleted"))
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+    }
+
+    impl Drop for Claims {
+        fn drop(&mut self) {
+            forget_namespace(&self.place.ns);
+            std::fs::remove_dir_all(&self.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn nm_at_bound_evicts_lru_idle_claim_before_creating_and_forgets_fill() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        for i in 0..MAX_DEPENDENCY_CLAIMS {
+            mark_filled(&format!("{}/wfloor-nm-{i:02}", claims.place.ns));
+        }
+        // A fill hit refreshes claim 00, making 01 the least recently used.
+        let filler = Filler {
+            place: &claims.place,
+            tag: "image",
+            floor_image: "floor",
+            memory: "6g",
+            git_dir: Path::new("unused.git"),
+        };
+        assert!(matches!(
+            filler.fill_nm("tree", &[], "", "wfloor-nm-00", &[]),
+            Ok(Fill::Hit)
+        ));
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+        assert!(!filled(&format!("{}/wfloor-nm-01", claims.place.ns)));
+        let calls = std::fs::read_to_string(claims.dir.join("calls")).unwrap();
+        assert!(calls.contains("wicked.dev/owner=me"), "{calls}");
+        assert!(calls.find("delete pvc").unwrap() < calls.find("apply").unwrap());
+        let applied = std::fs::read_to_string(claims.dir.join("applied.json")).unwrap();
+        assert!(applied.contains("wfloor-nm-new"), "{applied}");
+    }
+
+    #[test]
+    fn nm_mounted_by_live_pod_is_never_evicted() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        claims.mounted(1);
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+    }
+
+    #[test]
+    fn nm_pending_mount_allows_another_mount_and_allocation_without_eviction() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        let mount = dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+            .unwrap()
+            .unwrap();
+        // No pod is visible yet. Both operations must finish while the first guard lives.
+        let result = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let claims = &claims;
+            let worker = scope.spawn(move || {
+                let result =
+                    dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+                        .and_then(|second| {
+                            drop(second);
+                            claims.allocate()
+                        });
+                tx.send(result).unwrap();
+            });
+            let result = rx.recv_timeout(Duration::from_secs(2));
+            // Release before joining even on timeout, so a lock regression fails cleanly.
+            drop(mount);
+            worker.join().unwrap();
+            result
+        });
+        result
+            .expect("pending mount blocked namespace admission")
+            .unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+    }
+
+    #[test]
+    fn nm_pending_mount_counts_last_until_the_final_guard_drops() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        let first = dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+            .unwrap()
+            .unwrap();
+        let second = dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+            .unwrap()
+            .unwrap();
+        drop(first);
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+        // A failed pod start drops its guard without ever calling mounted().
+        drop(second);
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01", "wfloor-nm-00"]);
+    }
+
+    #[test]
+    fn nm_mount_completing_during_pod_inventory_is_still_protected() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        let mount = dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+            .unwrap()
+            .unwrap();
+        let pause = claims.dir.join("pause-pod-list");
+        std::fs::write(&pause, "").unwrap();
+        let listed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| claims.allocate());
+            let listed = claims.dir.join("pods-listed");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !listed.exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let listed = listed.exists();
+            // Complete the mount after the API captured an empty pod list, but before
+            // eviction receives that stale reply. Release both barriers even on timeout.
+            mount.mounted();
+            drop(mount);
+            std::fs::remove_file(&pause).unwrap();
+            worker.join().unwrap().unwrap();
+            listed
+        });
+        assert!(listed, "pending mount blocked the pod inventory");
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+    }
+
+    #[test]
+    fn nm_all_claims_pending_refuses_until_the_mount_guard_drops() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        let names: Vec<_> = (0..MAX_DEPENDENCY_CLAIMS)
+            .map(|i| format!("wfloor-nm-{i:02}"))
+            .collect();
+        let mount = dependency_mounts(
+            &claims.place.kube,
+            &claims.place.ns,
+            names.iter().map(String::as_str),
+        )
+        .unwrap()
+        .unwrap();
+        let error = claims.allocate().unwrap_err();
+        assert!(error.starts_with("admission_pending:"), "{error}");
+        assert!(claims.deleted().is_empty());
+        assert!(!claims.dir.join("applied.json").exists());
+        drop(mount);
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-00"]);
+    }
+
+    #[test]
+    fn nm_invalid_mount_claim_leaves_no_pending_counts() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        for metadata in [
+            json!({"labels": {"wicked.dev/owner": "other"}}),
+            json!({"labels": {"wicked.dev/owner": "me"},
+                "deletionTimestamp": "2026-11-21T00:00:00Z"}),
+        ] {
+            std::fs::write(
+                claims.dir.join("wfloor-nm-invalid.json"),
+                json!({"metadata": metadata}).to_string(),
+            )
+            .unwrap();
+            let result = dependency_mounts(
+                &claims.place.kube,
+                &claims.place.ns,
+                ["wfloor-nm-00", "wfloor-nm-invalid"],
+            );
+            let Err(error) = result else {
+                panic!("an invalid claim was admitted");
+            };
+            assert!(error.starts_with("admission_pending:"), "{error}");
+        }
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-00"]);
+    }
+
+    #[test]
+    fn nm_in_flight_fill_is_never_evicted() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        let _fill = lock_volume(&format!("{}-wfloor-nm-00", claims.place.ns)).unwrap();
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+    }
+
+    #[test]
+    fn nm_all_claims_in_use_refuses_as_admission_pending_without_creating() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        claims.mounted(MAX_DEPENDENCY_CLAIMS);
+        let error = claims.allocate().unwrap_err();
+        assert!(error.starts_with("admission_pending:"), "{error}");
+        assert!(claims.deleted().is_empty());
+        assert!(!claims.dir.join("applied.json").exists());
+    }
+
+    #[test]
+    fn nm_upgraded_namespace_evicts_to_bound_including_new_allocation() {
+        let count = MAX_DEPENDENCY_CLAIMS + 3;
+        let claims = Claims::new(count);
+        claims.allocate().unwrap();
+        assert_eq!(
+            claims.deleted(),
+            [
+                "wfloor-nm-00",
+                "wfloor-nm-01",
+                "wfloor-nm-02",
+                "wfloor-nm-03"
+            ]
+        );
+        assert_eq!(
+            count - claims.deleted().len() as u64 + 1,
+            MAX_DEPENDENCY_CLAIMS
+        );
+    }
+
+    #[test]
+    fn nm_unknown_last_use_is_older_than_a_recorded_fill() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        for i in 0..MAX_DEPENDENCY_CLAIMS - 1 {
+            mark_filled(&format!("{}/wfloor-nm-{i:02}", claims.place.ns));
+        }
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-31"]);
+    }
+
+    #[test]
+    fn nm_mount_refreshes_last_use_after_the_pod_finishes() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        for i in 0..MAX_DEPENDENCY_CLAIMS {
+            mark_filled(&format!("{}/wfloor-nm-{i:02}", claims.place.ns));
+        }
+        let mount = dependency_mounts(&claims.place.kube, &claims.place.ns, ["wfloor-nm-00"])
+            .unwrap()
+            .unwrap();
+        mount.mounted();
+        drop(mount);
+        claims.allocate().unwrap();
+        assert_eq!(claims.deleted(), ["wfloor-nm-01"]);
+    }
+
+    #[test]
+    fn nm_existing_claim_at_bound_needs_no_free_slot() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS);
+        claims.mounted(MAX_DEPENDENCY_CLAIMS);
+        claims.place.claim("wfloor-nm-00", "16Gi").unwrap();
+        assert!(claims.deleted().is_empty());
+        assert!(claims.dir.join("applied.json").exists());
+    }
+
+    #[test]
+    fn nm_upgraded_namespace_reusing_a_claim_evicts_only_the_excess() {
+        let claims = Claims::new(MAX_DEPENDENCY_CLAIMS + 3);
+        claims.place.claim("wfloor-nm-00", "16Gi").unwrap();
+        assert_eq!(
+            claims.deleted(),
+            ["wfloor-nm-01", "wfloor-nm-02", "wfloor-nm-03"]
+        );
+    }
+}
+
 #[test]
 fn the_floor_image_trusts_both_copied_sides_in_system_git_config() {
     for dir in ["/work/head", "/work/base"] {

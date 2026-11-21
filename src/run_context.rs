@@ -626,4 +626,4 @@ impl StepRunner for Stamping {
 
 #[cfg(test)]
 #[path = "run_context_tests.rs"]
-mod tests;
+pub(crate) mod tests;

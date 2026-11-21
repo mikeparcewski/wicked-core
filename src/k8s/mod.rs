@@ -457,6 +457,18 @@ pub(crate) fn release_run(run_id: &str, epoch: u64) {
     drop(g);
 }
 
+/// Execution liveness is independent of the worktree and governance-directory retention rules.
+pub(crate) fn cluster_status_live(status: crate::domain::SessionStatus) -> bool {
+    use crate::domain::SessionStatus;
+    match status {
+        SessionStatus::Planning
+        | SessionStatus::Distributing
+        | SessionStatus::Executing
+        | SessionStatus::AwaitingHuman => true,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed => false,
+    }
+}
+
 /// The daemon's boot sweep (B-5), off the actor thread: the namespaces of runs that are not
 /// `live` (terminal, or unknown to the store) go; a live run keeps its namespace and loses only
 /// the pods an earlier engine left. A namespace created after this boot is never touched. The
@@ -904,4 +916,43 @@ pub(crate) fn rfc3339(unix: u64) -> String {
         (rem % 3600) / 60,
         rem % 60
     )
+}
+
+#[cfg(test)]
+mod pr_c2_liveness_tests {
+    use super::*;
+
+    #[test]
+    fn completed_retained_runs_are_stale_but_awaiting_human_is_live() {
+        use crate::domain::SessionStatus;
+        let ns = |run| {
+            render::run_namespace_docs(
+                &run_namespace_name("me", run),
+                "me",
+                run,
+                "daemon",
+                &render::RunBudget::default(),
+                "20Gi",
+            )
+            .remove(0)
+        };
+        let statuses = [
+            ("retained", SessionStatus::Completed),
+            ("paused", SessionStatus::AwaitingHuman),
+        ];
+        let plan = cluster::sweep_plan(&[ns("retained"), ns("paused")], "me", &|run| {
+            statuses
+                .iter()
+                .any(|(id, status)| *id == run && cluster_status_live(*status))
+        });
+        assert_eq!(
+            plan,
+            vec![
+                cluster::SweepAction::DeleteNamespace(run_namespace_name("me", "retained")),
+                cluster::SweepAction::ReapStalePods(run_namespace_name("me", "paused")),
+            ]
+        );
+        assert!(!cluster_status_live(SessionStatus::Failed));
+        assert!(!cluster_status_live(SessionStatus::Cancelled));
+    }
 }

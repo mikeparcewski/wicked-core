@@ -72,6 +72,8 @@ pub const EXTRACT_NEXT_STEP: &str = "extract-next";
 pub const WORKLIST_REL: &str = ".wicked/domain/worklist.json";
 /// The rules the seat states, relative to the run's worktree (garden's `rules_file.RULES_REL`).
 pub const RULES_REL: &str = ".wicked/domain/rules.json";
+/// Q17 paths a mapping run's agents may change.
+pub const MAPPING_WRITE_SET: &[&str] = &[".wicked/domain/", COVERAGE_REPORT_FILE];
 
 /// The run's own review of what the seat stated, between `extract` and `extract-apply` (a `critique`
 /// step, so the floor adds no generic one). A run maps ONE page of a repository (the worklist,

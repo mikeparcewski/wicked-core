@@ -682,8 +682,6 @@ fn refusal(status: u16, body: &[u8]) -> String {
 #[cfg(unix)]
 mod live {
     use super::*;
-    #[cfg(test)]
-    use crate::container_floor::{output_within, Runtime};
     use crate::seat_login::BrokerIo;
     use std::time::{Duration, Instant};
     use wicked_apps_core::HardenedCommand;
@@ -721,56 +719,6 @@ mod live {
             argv,
             format!("authorization: Bearer {}\n", request.token).into_bytes(),
         ))
-    }
-
-    /// Make `request` from a short-lived hardened curl container on `network`; the answer comes
-    /// back on stdout. Errors name the status only, never the answer.
-    #[cfg(test)]
-    pub(crate) fn send(
-        rt: &Runtime,
-        dir: &Path,
-        cli: &str,
-        network: &str,
-        request: &Request,
-    ) -> Result<Value, String> {
-        let (curl, bytes) = request_argv(request)?;
-        if !crate::container_floor::image_present(rt, REFRESH_IMAGE) {
-            let mut pull = rt.cmd();
-            pull.args(["pull", "-q", REFRESH_IMAGE]);
-            match output_within(pull, rt.bound(POST_TIMEOUT)) {
-                Some(o) if o.status.success() => {}
-                _ => {
-                    return Err(format!(
-                        "could not pull the account reader image {REFRESH_IMAGE}"
-                    ))
-                }
-            }
-        }
-        let argv = [
-            "run",
-            "--rm",
-            "--log-driver",
-            "none",
-            "-i",
-            "--network",
-            network,
-            "--read-only",
-            "--cap-drop",
-            "ALL",
-            "--security-opt",
-            "no-new-privileges",
-            "--pids-limit",
-            "16",
-            "--memory",
-            "64m",
-            REFRESH_IMAGE,
-        ]
-        .into_iter()
-        .map(str::to_string)
-        .chain(curl)
-        .collect::<Vec<_>>();
-        let out = crate::seat_gateway::mutation_helper(rt, dir, cli, &argv, &bytes, POST_TIMEOUT)?;
-        answer(&out)
     }
 
     /// An account read's answer from curl's output ([`request_argv`]): a refusal names its
@@ -1305,10 +1253,10 @@ mod live {
     }
 }
 
+#[cfg(all(unix, test))]
+pub(crate) use live::renew_on_host;
 #[cfg(unix)]
 pub(crate) use live::{answer, refresh, request_argv, resolve_copilot, start, ACCOUNT_TIMEOUT};
-#[cfg(all(unix, test))]
-pub(crate) use live::{renew_on_host, send};
 
 /// (tests) FAKE renewing CLIs: shell stubs of codex, pi and opencode that renew the way the real
 /// ones do (in their own store, in the throwaway home they are run in) by rewriting each `from`
@@ -1907,17 +1855,11 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("c4-refresh-lock-{}", uuid::Uuid::new_v4().simple()));
         let lock = mutation_lock(&dir).unwrap();
-        let rt = crate::container_floor::Runtime::answering("/nonexistent-FAKE-runtime".into());
-        let gw = crate::seat_gateway::Gateway::for_dir(&dir);
-        assert_eq!(
-            refresh(
-                &crate::seat_login::DockerIo::new(&rt, &gw),
-                &dir,
-                "claude",
-                true
-            )
-            .unwrap(),
-            Outcome::Busy
+        let io = crate::seat_login::io_tests::MemIo::default();
+        assert_eq!(refresh(&io, &dir, "claude", true).unwrap(), Outcome::Busy);
+        assert!(
+            io.calls().is_empty(),
+            "a busy refresh never reaches the transport"
         );
         drop(lock);
         std::fs::remove_dir_all(dir).unwrap();

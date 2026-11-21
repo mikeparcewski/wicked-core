@@ -238,7 +238,8 @@ fn pre_build_scope_from_env() -> bool {
 /// `deliverable-roots` for a BOUND creator that declared `executes_code: false` (its deliverables
 /// live in the run's declared write roots, never in the tree under review; a pre-posture hook
 /// reads this as no fence — guard-only — never as a refused deliverable). Same carrier, same
-/// strict parse and same UNSET-is-honest rule as [`PRE_BUILD_SCOPE_ENV`]: unset means no phase
+/// strict parse and same UNSET-is-honest rule as [`PRE_BUILD_SCOPE_ENV`]. `tool-less` refuses
+/// every tool on an answer-only unit and requires gate protocol 4 (core#1257). Unset means no phase
 /// fence — a build phase must be free to write code, and an inherited junk value must never scope
 /// it away from that.
 pub const NO_CODE_SCOPE_ENV: &str = "WICKED_NO_CODE_SCOPE";
@@ -1406,6 +1407,9 @@ pub(crate) fn phase_scope_denial(
     deliverable_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
+    if posture == WritePosture::ToolLess {
+        return Some(TOOL_LESS_REASON.to_string());
+    }
     if !(pre_build_scope || posture.fences_writes()) {
         return None;
     }
@@ -1555,6 +1559,9 @@ pub(crate) fn bash_write_phase_scope(
     admitted_roots: &[std::path::PathBuf],
 ) -> Option<String> {
     use crate::write_posture::WritePosture;
+    if posture == WritePosture::ToolLess {
+        return Some(TOOL_LESS_REASON.to_string());
+    }
     // Full posture without pre-build scope: the phase is a code-executing creator — no fence of
     // any kind applies. Return early before the PRE-BUILD fallthrough in the match below.
     if matches!(posture, WritePosture::Full) && !pre_build_scope {
@@ -5488,8 +5495,28 @@ pub(crate) fn evaluate_tool_call(
         return 2;
     }
 
-    // Asking the operator writes nothing. This exact engine-owned tool bypasses every write
-    // posture; other MCP names still meet the fence below. Record its allow like other tools.
+    // Deny before ask, MCP, pod and filesystem exceptions: no tool can run, and a blocked
+    // attempt must not discard an otherwise valid answer (core#1257).
+    let write_posture = match boundary {
+        Some(b) => b.write_posture,
+        None => write_posture_from_env(),
+    };
+    if write_posture == crate::write_posture::WritePosture::ToolLess {
+        append_phase_scope_deny(
+            decisions_path,
+            scope,
+            phase,
+            tool,
+            TOOL_LESS_REASON,
+            context.get("command").and_then(serde_json::Value::as_str),
+        );
+        eprintln!("wicked-governance: DENY ({TOOL_LESS_REASON})");
+        return 2;
+    }
+
+    // Asking the operator writes nothing. This exact engine-owned tool bypasses write fences
+    // on postures that permit tools; other MCP names still meet the fence below. Record its
+    // allow like other tools.
     if tool == "mcp__wicked__ask" {
         let claim = ConformanceClaim {
             claim_id: format!("ask-allow:{phase}:{}", uuid::Uuid::new_v4().simple()),
@@ -5621,10 +5648,6 @@ pub(crate) fn evaluate_tool_call(
     let pre_build_scope = match boundary {
         Some(b) => b.pre_build_scope,
         None => pre_build_scope_from_env(),
-    };
-    let write_posture = match boundary {
-        Some(b) => b.write_posture,
-        None => write_posture_from_env(),
     };
     // The worktree the path must be judged against: explicit on the in-process carrier, the
     // process cwd on the subprocess one — the same split the roots use just above. The creator
@@ -6579,6 +6602,11 @@ const PHASE_SCOPE_EVALUATOR: &str = "wicked-governance-phase-scope";
 /// operator authors or edits per run.
 pub(crate) const PHASE_SCOPE_RULE_ID: &str = "engine:pre-build-scope";
 
+/// Every tool is refused while the caller's answer can still land (core#1257).
+pub(crate) const TOOL_LESS_RULE_ID: &str = "engine:tool-less-posture";
+/// The common remedy on the hook and broker carriers (core#1257).
+pub(crate) const TOOL_LESS_REASON: &str = "this step answers from its prompt only; no tool may run";
+
 /// The engine-owned rule ids the OTHER deny recorders carry (issue #570).
 ///
 /// `collect_hook_decisions` reports a Deny's FIRST policy id as `denyingPolicy`, and every
@@ -6672,7 +6700,11 @@ fn append_phase_scope_deny(
         claim_id: format!("{PHASE_SCOPE_DENY_PREFIX}{phase}"),
         scope: scope.to_string(),
         phase: phase.to_string(),
-        policy_ids: vec![PHASE_SCOPE_RULE_ID.to_string()],
+        policy_ids: vec![if reason == TOOL_LESS_REASON {
+            TOOL_LESS_RULE_ID.to_string()
+        } else {
+            PHASE_SCOPE_RULE_ID.to_string()
+        }],
         decision: Decision::Deny,
         obligations: vec![
             reason.to_string(),
@@ -12189,8 +12221,9 @@ mod tests {
 /// makes such a hook refuse to arm rather than run that evaluator unfenced. 3 (core#1055) — a
 /// hook relayed by the container floor's relay exits [`UNRECORDED_DENY_EXIT`] when it could not
 /// record its decision, which the relay records instead; a protocol-2 hook has no such exit, so
-/// its unrecorded denies would be lost.
-pub const GATE_PROTOCOL_VERSION: u32 = 3;
+/// its unrecorded denies would be lost. 4 (core#1257) — `tool-less` denies every tool;
+/// a protocol-3 hook parses that env spelling as no fence and must refuse to arm.
+pub const GATE_PROTOCOL_VERSION: u32 = 4;
 
 /// The line `gate-hook --protocol-version` prints. Parsed by the launcher; keep it one stable line.
 ///
@@ -12562,6 +12595,85 @@ mod boundary_tests {
         }
         std::env::remove_var(WRITE_ROOTS_ENV);
         out
+    }
+
+    /// Every tool, including ask and unknown names, is refused without failing the answer
+    /// (core#1257). Exercise the live hook before its MCP/ask and filesystem exceptions.
+    #[test]
+    fn tool_less_hook_denies_every_tool_as_an_advisory() {
+        let _env = ENV.read().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-tool-less-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("decisions.ndjson");
+        let boundary = BoundaryCtx {
+            roots: crate::path_policy::AllowedRoots {
+                write: vec![dir.clone()],
+                read: vec![],
+            },
+            cwd: dir.clone(),
+            home: None,
+            claude_config_dir: None,
+            pre_build_scope: true,
+            write_posture: crate::write_posture::WritePosture::parse_env(Some(
+                std::ffi::OsStr::new("tool-less"),
+            )),
+            deliverable_roots: vec![dir.clone()],
+            estate_store_pinned: false,
+            graph_write_dir: None,
+            graph_store_db: None,
+        };
+        for tool in [
+            "Read",
+            "Bash",
+            "Glob",
+            "Grep",
+            "Write",
+            "WebSearch",
+            "WebFetch",
+            "mcp__x__y",
+            "mcp__wicked__ask",
+            "UnknownTool",
+        ] {
+            assert_eq!(
+                evaluate_tool_call(
+                    "wf/u",
+                    "unit-1",
+                    None,
+                    None,
+                    None,
+                    log.to_str().unwrap(),
+                    &json!({"path": "docs/answer.md", "command": "pwd"}),
+                    tool,
+                    Some(&boundary),
+                ),
+                2,
+                "{tool}"
+            );
+        }
+        let claims: Vec<ConformanceClaim> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        assert_eq!(claims.len(), 10);
+        for claim in claims {
+            assert_eq!(claim.policy_ids, vec!["engine:tool-less-posture"]);
+            assert_eq!(claim.decision, Decision::Deny);
+            assert!(claim.obligations[0]
+                .contains("this step answers from its prompt only; no tool may run"));
+            assert!(is_advisory_deny(&claim));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Protocol 3 treats the new env spelling as no fence, so it cannot arm (core#1257).
+    #[test]
+    fn tool_less_requires_gate_protocol_four() {
+        assert_eq!(GATE_PROTOCOL_VERSION, 4);
     }
 
     fn ctx(path: &str) -> serde_json::Value {

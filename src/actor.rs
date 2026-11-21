@@ -1126,6 +1126,11 @@ pub(crate) fn run(
         }
         Err(e) => eprintln!("wicked-core: could not pin repo graph keys (core#1419): {e:#}"),
     }
+    if let Ok(sessions) = crate::domain::all_sessions(&store) {
+        for session in &sessions {
+            lease_mapping_graph(&store, session);
+        }
+    }
     let boot_repos = crate::repo::list_repos(&store);
     // One-time repo-graph migration (core#406, `code_graph.rs` ADR): a registered repo whose graph
     // sits under the pre-#406 estate home (`~/.wicked-estate/repo-graphs/<key>`) and nowhere under
@@ -1171,8 +1176,7 @@ pub(crate) fn run(
     }
     // k8s-swap B-5: the cluster's boot sweep (off-thread): namespaces of runs the store does not
     // hold live go, a live run loses only an earlier engine's pods. A sessions read failure
-    // skips it (liveness unknown). The same live set protects governance directories during the
-    // one-time retention sweep below.
+    // skips it (liveness unknown). Governance directories keep the worktree retention set.
     match crate::domain::all_sessions(&store) {
         Ok(sessions) => {
             let (live, _) = partition_sessions_for_reap(&sessions);
@@ -1186,7 +1190,13 @@ pub(crate) fn run(
                 crate::gate_hook::GOV_DIR_RETENTION,
                 std::time::SystemTime::now(),
             );
-            crate::k8s::boot_sweep(live);
+            crate::k8s::boot_sweep(
+                sessions
+                    .iter()
+                    .filter(|s| crate::k8s::cluster_status_live(s.status))
+                    .map(|s| s.id.clone())
+                    .collect(),
+            );
         }
         Err(e) => {
             eprintln!("wicked-core: skipping the cluster and governance boot sweeps: cannot read sessions ({e})")
@@ -1826,7 +1836,9 @@ pub(crate) fn run(
                         archive_note: None,
                         verified_tree: None,
                         run_branch: None,
-                        base_commit: None,
+                        base_commit: crate::domain::get_session(&store, &run_id)?
+                            .filter(|s| s.repo_ref == repo_ref)
+                            .and_then(|s| s.base_commit),
                         finished_at: None,
                         // The launch bench (`distribute::launch_benched`): seats that cannot keep a
                         // per-call check on the host floor (C5), and codex on a worktree-bound run
@@ -1916,6 +1928,13 @@ pub(crate) fn run(
                             .and_then(|(_, preset)| preset.as_deref())
                             .or_else(|| selected_def.as_ref().map(|d| d.id.as_str()))
                             == Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID);
+                        // Reserve on the actor before any later launch can start its D8.
+                        if graph_required {
+                            if let Some(db) = crate::code_graph::resolved_code_graph_db(&graph_key)
+                            {
+                                crate::code_graph::lease_graph(&db, &rid, None);
+                            }
+                        }
                         // (core#1373) The tree is minted on its own thread: it carries this
                         // daemon's id all the same.
                         let daemon_owner = crate::repo::bound_daemon_owner();
@@ -1945,6 +1964,8 @@ pub(crate) fn run(
                                             &wt,
                                             &b.commit,
                                             graph_root.as_deref(),
+                                            &rid,
+                                            graph_required,
                                         );
                                         if let Err(e) = &indexed {
                                             tracing::warn!(
@@ -1953,6 +1974,16 @@ pub(crate) fn run(
                                                  a behavioural scope fails closed",
                                                 b.commit
                                             );
+                                        }
+                                        if !graph_required {
+                                            if let Ok(crate::code_graph::BaseIndex::Held(held)) =
+                                                &indexed
+                                            {
+                                                tracing::warn!(
+                                                    run_id = %rid, ?held,
+                                                    "repo graph held away from the run base; scoring fails closed"
+                                                );
+                                            }
                                         }
                                         if let Some(why) = crate::code_graph::base_index_refusal(
                                             graph_required,
@@ -1963,6 +1994,7 @@ pub(crate) fn run(
                                             // here, before the run is failed, so a relaunch of
                                             // the same id never races its removal.
                                             crate::repo::discard_minted_worktree(&root, &rid);
+                                            crate::code_graph::release_graph_lease(&rid);
                                             let _ = tx.send(Command::WorktreeFailed {
                                                 run_id: rid,
                                                 error: why,
@@ -1979,11 +2011,14 @@ pub(crate) fn run(
                                         base_commit,
                                     }
                                 }
-                                Err(e) => Command::WorktreeFailed {
-                                    run_id: rid,
-                                    error: e.to_string(),
-                                    cleaned: false,
-                                },
+                                Err(e) => {
+                                    crate::code_graph::release_graph_lease(&rid);
+                                    Command::WorktreeFailed {
+                                        run_id: rid,
+                                        error: e.to_string(),
+                                        cleaned: false,
+                                    }
+                                }
                             };
                             let _ = tx.send(cmd);
                         });
@@ -2122,6 +2157,7 @@ pub(crate) fn run(
                         // Store read failure: cannot determine terminal state safely.
                         // Clean up the worktree and emit an error so the UI learns about it.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref path) = workdir {
                             let _ = std::fs::remove_dir_all(path);
                         }
@@ -2135,6 +2171,7 @@ pub(crate) fn run(
                 };
                 if already_terminal {
                     in_flight.remove(&run_id);
+                    crate::code_graph::release_graph_lease(&run_id);
                     // Spawn cleanup off the actor thread — git worktree remove can be slow
                     // and must not stall NAPI calls waiting on the actor.
                     if let Some(ref ref_id) = repo_ref {
@@ -2170,6 +2207,7 @@ pub(crate) fn run(
                         // Store write failure — cannot persist workdir; fail the session rather
                         // than proceeding with an inconsistent store state.
                         in_flight.remove(&run_id);
+                        crate::code_graph::release_graph_lease(&run_id);
                         if let Some(ref ref_id) = repo_ref {
                             if let Ok(Some(repo)) = crate::repo::get_repo(&store, ref_id) {
                                 let root = repo.root_path.clone();
@@ -2208,6 +2246,9 @@ pub(crate) fn run(
                     base_commit.as_deref(),
                     true,
                 );
+                if let Ok(Some(session)) = crate::domain::get_session(&store, &run_id) {
+                    lease_mapping_graph(&store, &session);
+                }
                 let (team_workflow, team_registry) = match team {
                     Ok(Some((_, id, reg))) => (Ok(Some(id)), Some(reg)),
                     Ok(None) => (Ok(spec.workflow.clone()), None),
@@ -2339,6 +2380,7 @@ pub(crate) fn run(
                 error,
                 cleaned,
             } => {
+                crate::code_graph::release_graph_lease(&run_id);
                 // The off-thread worktree creation failed. Mark the session Failed and surface
                 // the error as a CoreEvent::Error so the UI / bus bridge learns about it.
                 // Guard: only update if the session is not already in a terminal state (e.g.
@@ -2834,6 +2876,9 @@ pub(crate) fn run(
                     );
                 }
                 let _ = reply.send(res);
+            }
+            Command::UnregisterRepo { repo_id, reply } => {
+                let _ = reply.send(unregister_repo(&mut store, &repo_id));
             }
             Command::ListRepos { reply } => {
                 let _ = reply.send(crate::repo::list_repos(&store));
@@ -3426,6 +3471,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -3479,6 +3525,7 @@ pub(crate) fn run(
                     &dispatcher,
                     &runner,
                     crate::container_floor::container_mode(),
+                    Some(&req.session_id),
                 );
                 let op_home = operational_home.clone();
                 let relay = council_event_relay(self_tx.clone());
@@ -5200,13 +5247,15 @@ fn ballot_dispatcher(
     dispatcher: &Arc<dyn Dispatcher + Send + Sync>,
     runner: &Arc<dyn StepRunner>,
     container_floor: bool,
+    parent_run_id: Option<&str>,
 ) -> (Arc<dyn Dispatcher + Send + Sync>, Option<&'static str>) {
     if !container_floor {
         return (dispatcher.clone(), Some(crate::decision::BALLOTS_IN_HOST));
     }
-    match dispatcher
-        .with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(runner.clone())))
-    {
+    match dispatcher.with_ballot_carrier(Arc::new(crate::decision::SeatBallots::new(
+        runner.clone(),
+        parent_run_id,
+    ))) {
         Some(carried) => (carried, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER)),
         None => (dispatcher.clone(), None),
     }
@@ -8011,6 +8060,7 @@ fn apply_step_result(
                             &eligible_registry_roster(&run_roster_keys, &benched_keys),
                             &*runner2,
                             &ctx,
+                            Some(&run_id2),
                         )
                     }));
                     let (decision, analysis) = match result {
@@ -8621,6 +8671,47 @@ fn apply_step_result(
         }));
     }
 
+    if !unit.write_set.is_empty() {
+        let why = match evidence.write_set.as_ref() {
+            Some(report) => report.denial_reason(),
+            None => Some("write-set check could not run: no write-set evidence".to_string()),
+        };
+        if let Some(why) = why {
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(why.clone());
+            unit.denial = Some(crate::domain::UnitDenial::new("write_set", why.clone()));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: why,
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                },
+            );
+            let phase = crate::scope::unit_phase(ord);
+            let _ =
+                crate::gate_hook::fold_input_denial(store, &run_id, output.attempt, &phase, true);
+            let note = denial_gate_note(session.human_confirm);
+            escalate_denied_unit(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                unit,
+                output.attempt,
+                false,
+                !output.output.trim().is_empty(),
+                false,
+                note,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
+    }
+
     // ── DELIVERABLE FLOOR ────────────────────────────────────────────────────────────────────
     // A phase that declared `required_deliverables` may not fold Ok while its own declared
     // evidence is absent. This is the file-shaped sibling of the substance gate above: the
@@ -8659,6 +8750,15 @@ fn apply_step_result(
                 Some(ms) => crate::path_policy::LaunchClock::At(ms),
                 None => crate::path_policy::LaunchClock::Undatable,
             },
+        };
+        let launch = match (launch, unit.pass_started_ms) {
+            (crate::path_policy::LaunchClock::At(run), Some(pass)) => {
+                crate::path_policy::LaunchClock::At(run.max(pass))
+            }
+            (crate::path_policy::LaunchClock::Unrecorded, Some(pass)) => {
+                crate::path_policy::LaunchClock::At(pass)
+            }
+            (clock, _) => clock,
         };
         if let Some(missing) = crate::path_policy::missing_deliverables(
             &unit.required_deliverables,
@@ -9311,34 +9411,28 @@ fn denial_class(denial: Option<&crate::domain::UnitDenial>, hook_denied: bool) -
     }
 }
 
-/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
-/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
-/// or `None`.
-fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
-    let rule_layer = |d: &crate::domain::UnitDenial| {
-        d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
-            || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
-    };
+/// The rule ids holding or denying `unit`, in denial order, or from its last rule-check rows
+/// when the layers behind the winning denial are unknown. `Some([])` is an unnamed rule hold:
+/// it still refuses Land because there are no individual rules the person can skip.
+fn open_rule_ids(unit: &crate::domain::WorkUnit) -> Option<Vec<String>> {
     let named: Vec<&crate::domain::UnitDenial> = unit
         .denial
         .iter()
         .chain(unit.denials_behind.iter().flatten())
-        .filter(|d| rule_layer(d))
+        .filter(|d| {
+            d.source == crate::rule_check::DENIAL_SOURCE_BROKEN
+                || d.source == crate::rule_check::DENIAL_SOURCE_UNCHECKED
+        })
         .collect();
-    if !named.is_empty() {
-        let ids: Vec<&str> = named
+    let ids = if !named.is_empty() {
+        named
             .iter()
-            .flat_map(|d| d.rule_ids.iter().map(String::as_str))
-            .collect();
-        return Some(format!(
-            "broken, unchecked or disputed ({})",
-            ids.join(", ")
-        ));
-    }
-    if unit.denials_behind.is_none() {
+            .flat_map(|d| d.rule_ids.iter().cloned())
+            .collect::<Vec<_>>()
+    } else if unit.denials_behind.is_none() {
         let rc = unit.rule_check.as_ref()?;
         // (DES-RULE-CHECK-001 rev 2, Part B, Q6) A process rule's row is reported, never open.
-        let open: Vec<&str> = rc
+        let open: Vec<String> = rc
             .rows
             .iter()
             .filter(|r| {
@@ -9350,16 +9444,32 @@ fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
                         | crate::rule_check::RuleStatus::Disputed
                 ) && !r.reported_only()
             })
-            .map(|r| r.rule_id.as_str())
+            .map(|r| r.rule_id.clone())
             .collect();
-        if !open.is_empty() {
-            return Some(format!(
-                "broken, unchecked or disputed ({})",
-                open.join(", ")
-            ));
+        if open.is_empty() {
+            return None;
         }
-    }
-    None
+        open
+    } else {
+        return None;
+    };
+    let mut seen = HashSet::new();
+    let ids = ids
+        .into_iter()
+        .filter(|id| seen.insert(id.clone()))
+        .collect();
+    Some(ids)
+}
+
+/// (DES-RULE-CHECK-001 S2) The steering-rule layers still open on `unit` — its winning denial or
+/// any layer recorded behind it (`denials_behind`; unknown: its last rule-check rows) — in words,
+/// or `None`.
+fn rule_layers_open(unit: &crate::domain::WorkUnit) -> Option<String> {
+    let ids = open_rule_ids(unit)?;
+    Some(format!(
+        "broken, unchecked or disputed ({})",
+        ids.join(", ")
+    ))
 }
 
 /// (DES-RULE-CHECK-001 S2) The escalation class of a broken steering rule.
@@ -10741,6 +10851,7 @@ fn clean_retained_worktree(store: &dyn GraphStore, session: &crate::domain::Agen
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     // (review r3 on #1431) Bound to this daemon: its own marked tree is its to clean.
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
@@ -10757,6 +10868,7 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
     let (rid, workdir) = (session.id.clone(), session.workdir.clone());
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || {
         remove_run_floor_cache(workdir.as_deref(), &rid, epoch);
         // A run that armed again since it ended keeps its tree (codex r2): its live edits
@@ -10765,6 +10877,30 @@ fn reap_terminal_worktree(store: &dyn GraphStore, session: &crate::domain::Agent
             let _ = crate::repo::reap_worktree_if_clean(&repo.root_path, &rid);
         }
     });
+}
+
+/// Restore a mapping's lease from its durable preset and base, including a reused worktree.
+fn lease_mapping_graph(store: &dyn GraphRead, session: &AgentSession) {
+    if matches!(
+        session.status,
+        SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+    ) || session.team_plan.as_ref().and_then(|p| p.preset.as_deref())
+        != Some(crate::domain_extraction::DOMAIN_EXTRACTION_WORKFLOW_ID)
+    {
+        return;
+    }
+    if let Some(repo) = session
+        .repo_ref
+        .as_deref()
+        .and_then(|id| crate::repo::get_repo(store, id).ok().flatten())
+        .filter(|r| !r.code_graph_db.is_empty())
+    {
+        crate::code_graph::lease_graph(
+            std::path::Path::new(&repo.code_graph_db),
+            &session.id,
+            session.base_commit.as_deref(),
+        );
+    }
 }
 
 /// The run's registered repository, when it has one that still resolves.
@@ -10784,6 +10920,7 @@ fn drop_run_floor_cache(session: &crate::domain::AgentSession) {
     let rid = session.id.clone();
     // (core#1491) The end is recorded now, on the actor thread: no seat of it arms from here.
     let epoch = crate::k8s::end_run(&rid);
+    crate::code_graph::release_graph_lease(&rid);
     crate::repo::spawn_bound(move || remove_run_floor_cache(workdir.as_deref(), &rid, epoch));
 }
 
@@ -11685,6 +11822,12 @@ fn advance_or_pause_with(
         return Ok(Progress::Paused);
     }
 
+    // (core#1369) The checkout index's holder read must see this run before dispatch tests its
+    // marker: a parked run is persisted Executing first (Planning and Distributing already hold).
+    if session.status == SessionStatus::AwaitingHuman {
+        session.status = SessionStatus::Executing;
+        put_node(store, session.to_node())?;
+    }
     dispatch_unit(
         store,
         subscribers,
@@ -12511,7 +12654,10 @@ fn dispatch_probe_job(
     // a walkthrough review records the tree under review (`walkthrough::record_launch`).
     let publish_tree = crate::apps::reads_publish_tree(session, units, unit);
     let walkthrough = unit.catalog.as_deref() == Some(crate::walkthrough::REVIEW_CATALOG);
-    if !(baseline
+    let checkout_indexing =
+        crate::code_graph::checkout_index_in_flight(std::path::Path::new(&repo.code_graph_db));
+    if !(checkout_indexing
+        || baseline
         || new_author.is_some()
         || qe_unit
         || editor
@@ -13504,6 +13650,7 @@ fn dispatch_unit_with(
         workflow_id: session.workflow_id.clone(),
         entity_mode: session.entity_mode,
         workdir: session.workdir.as_ref().map(std::path::PathBuf::from),
+        base_commit: session.base_commit.clone(),
         // GOVERNED (DES-OUTGOV-003 §4): a real campaign unit — arm input governance when the store is a
         // file-backed SQLite db the hook subprocess can open. `None` for `:memory:`/`postgres://`.
         // The repo-local graph is resolved HERE (the actor thread holds the store; the worker does not)
@@ -13616,6 +13763,7 @@ fn dispatch_unit_with(
                 let words =
                     rule_instructions_words(&session.problem, &session.intent_amendments, &units);
                 crate::cli_runner::DeliveryRuleCtx {
+                    run_id: run_id.to_string(),
                     db_path: g.db_path,
                     project: session.project_id.clone(),
                     repo: session.repo_ref.clone(),
@@ -13742,6 +13890,7 @@ fn dispatch_unit_with(
                         )
                     }),
                     evidence_root: session.evidence_root.clone(),
+                    upstream_agents: upstream_agents(unit, &units),
                     base_commit: session.base_commit.clone(),
                     tree_from: session.workdir.clone().zip(
                         session
@@ -14165,6 +14314,7 @@ fn dispatch_unit_with(
                 // checks EXCEPT the deliver lift's re-verify (core#431), whose report rides
                 // here so the fold persists it on the unit and names the floor on the gate.
                 evidence: Box::new(crate::workflow::UnitEvidence {
+                    write_set: None,
                     // A Tool unit launches no seat: nothing to observe.
                     observed_providers: None,
                     worktree_guard: None,
@@ -15157,7 +15307,7 @@ fn run_conformance_tool(
             );
         }
     }
-    let (python, dist) = match ec::host_inputs() {
+    let inputs = match ec::host_inputs() {
         Ok(x) => x,
         Err((cause, why)) => return refused(&cause, why),
     };
@@ -15178,15 +15328,6 @@ fn run_conformance_tool(
             "engine_refused",
             "the worktree snapshot names no git directory to export its tree from".into(),
         );
-    };
-    let tmp = match crate::repo_checks::PrivateTmp::create() {
-        Ok(t) => t,
-        Err(e) => {
-            return refused(
-                "engine_refused",
-                format!("the harness's private temp dir: {e}"),
-            )
-        }
     };
     // The verify floor's own guarded checkout of exactly that tree (hooks off, no filter driver, blobs
     // written by the engine through a held directory, outside the seat's write boundary): the same
@@ -15226,7 +15367,74 @@ fn run_conformance_tool(
             )
         }
     };
-    let pack_tree = checkout.dir.clone();
+    let (out, status, killed, mut rec, _) = run_conformance_harness(
+        cmd,
+        &checkout.dir,
+        garden_root,
+        inputs,
+        attempt,
+        &d.run_id,
+        d.ord,
+        ec::DEADLINE,
+        jail,
+        stop,
+        on_spawn,
+        on_done,
+    );
+    // As before, the cases' report is bound to the exported tree; a refusal before the run or at
+    // the deadline (no `jail`) carries no tree because the cases did not finish on it.
+    if rec.jail.is_some() {
+        rec.tree = Some(snap.tree);
+    }
+    (out, status, killed, rec)
+}
+
+/// The shared review/install harness: the pack is readable, but only a fresh private temp
+/// directory is writable. Both callers use the same jail, environment and report judgment.
+#[allow(clippy::too_many_arguments)]
+fn run_conformance_harness(
+    cmd: &[String],
+    pack_dir: &std::path::Path,
+    garden_root: Option<&std::path::Path>,
+    (python, dist): (std::path::PathBuf, std::path::PathBuf),
+    attempt: u32,
+    run_id: &str,
+    ord: u32,
+    deadline: std::time::Duration,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+    stop: &dyn Fn() -> Option<&'static str>,
+    on_spawn: &dyn Fn(u32),
+    on_done: &dyn Fn(u32),
+) -> (
+    String,
+    crate::workflow::StepStatus,
+    Option<ToolKilled>,
+    crate::editor_conformance::ConformanceRecord,
+    Option<String>,
+) {
+    use crate::editor_conformance as ec;
+    use crate::workflow::StepStatus;
+    let refused = |cause: &str, why: String| {
+        (
+            format!("{}: ran nothing: {cause}: {why}", ec::CATALOG),
+            StepStatus::Ok,
+            None,
+            ec::ConformanceRecord::refused(attempt, cause, why),
+            None,
+        )
+    };
+    if let Some(r) = stop() {
+        return refused("engine_refused", format!("stopped before it began ({r})"));
+    }
+    let tmp = match crate::repo_checks::PrivateTmp::create() {
+        Ok(t) => t,
+        Err(e) => {
+            return refused(
+                "engine_refused",
+                format!("the harness's private temp dir: {e}"),
+            )
+        }
+    };
     let port = match ec::free_port() {
         Ok(p) => p,
         Err(e) => return refused("port_unavailable", format!("no free loopback port: {e}")),
@@ -15258,7 +15466,7 @@ fn run_conformance_tool(
         .collect();
     env.extend(ec::host_passthrough_env());
     env.extend(ec::tool_env(
-        &d.run_id, d.ord, &pack_tree, port, &out_file, &python, &dist, &kind,
+        run_id, ord, pack_dir, port, &out_file, &python, &dist, &kind,
     ));
     if let Some(groot) = garden_root {
         env.push((
@@ -15282,7 +15490,7 @@ fn run_conformance_tool(
         if let Some(r) = stop() {
             return Some(r);
         }
-        if started.elapsed() > ec::DEADLINE {
+        if started.elapsed() > deadline {
             over.set(true);
             return Some("deadline_exceeded");
         }
@@ -15297,23 +15505,24 @@ fn run_conformance_tool(
         on_spawn,
         on_done,
     );
+    let report = ec::read_report(&out_file);
     if over.get() {
-        let why = format!(
-            "the conformance run went past {} minutes and was stopped",
-            ec::DEADLINE.as_secs() / 60
-        );
-        return (
-            out,
-            StepStatus::Ok,
-            killed,
-            ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why),
-        );
+        let bound = if deadline == ec::DEADLINE {
+            format!("{} minutes", deadline.as_secs() / 60)
+        } else {
+            format!("{} seconds", deadline.as_secs())
+        };
+        let why = format!("the conformance run went past {bound} and was stopped");
+        let rec = ec::ConformanceRecord::refused(attempt, "deadline_exceeded", why);
+        return (out, StepStatus::Ok, killed, rec, report.ok().flatten());
     }
-    let mut rec = ec::judge_file(&out_file, attempt);
-    drop(tmp);
-    drop(checkout);
-    // The cases ran on the export of exactly this tree.
-    rec.tree = Some(snap.tree);
+    let (mut rec, raw) = match report {
+        Ok(raw) => (ec::judge_report(raw.as_deref(), attempt), raw),
+        Err(why) => (
+            ec::ConformanceRecord::refused(attempt, "bad_report", why),
+            None,
+        ),
+    };
     rec.jail = Some(kind);
     // The verdict is the fold's (from the record); a command that ran to its end is Ok here, so a
     // failing run is never retried by the failure ladder as a broken command.
@@ -15322,7 +15531,254 @@ fn run_conformance_tool(
     } else {
         StepStatus::Ok
     };
-    (out, status, killed, rec)
+    (out, status, killed, rec, raw)
+}
+
+/// Run editor conformance for crew's install gate through the review harness's OS jail.
+/// The request is `{ "packRoot": string, "timeoutS"?: integer }` (no unknown fields):
+/// `packRoot` must name an absolute existing directory, and `timeoutS` must be 1..=900.
+/// Only invalid requests return `Err`. Resolves to JSON `{ "record": ConformanceRecord,
+/// "report": <parsed raw report or null> }`; host failures are refused records, including
+/// `unjailed_host` when no jail is available. The pack is read-only to the harness; only its
+/// private temp directory is writable. Crew's install gate calls this; it never runs the
+/// harness unjailed.
+pub fn run_editor_conformance(request_json: &str) -> Result<String, String> {
+    run_editor_conformance_with(request_json, &crate::validator::serve_jail)
+}
+
+fn run_editor_conformance_with(
+    request_json: &str,
+    jail: &dyn Fn(&[&std::path::Path], u16) -> crate::validator::SandboxLauncher,
+) -> Result<String, String> {
+    use crate::editor_conformance as ec;
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields, rename_all = "camelCase")]
+    struct Request {
+        pack_root: String,
+        timeout_s: Option<u64>,
+    }
+
+    let request: Request = serde_json::from_str(request_json).map_err(|e| e.to_string())?;
+    let pack_root = std::path::Path::new(&request.pack_root);
+    if !pack_root.is_absolute() {
+        return Err("packRoot must be an absolute path to an existing directory".into());
+    }
+    let pack_root = pack_root
+        .canonicalize()
+        .map_err(|e| format!("packRoot could not be resolved: {e}"))?;
+    if !pack_root.is_dir() {
+        return Err("packRoot must be an existing directory".into());
+    }
+    let deadline = match request.timeout_s {
+        Some(s) if !(1..=900).contains(&s) => {
+            return Err("timeoutS must be an integer in 1..=900".into())
+        }
+        Some(s) => std::time::Duration::from_secs(s).min(ec::DEADLINE),
+        None => ec::DEADLINE,
+    };
+    let result = |record: ec::ConformanceRecord, raw: Option<String>| {
+        serde_json::json!({
+            "record": record,
+            "report": raw.as_deref().and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+        })
+        .to_string()
+    };
+    let refused = |why: String| {
+        Ok(result(
+            ec::ConformanceRecord::refused(1, "engine_refused", why),
+            None,
+        ))
+    };
+    // Match the review step's ladder when the run has no admitted skills generation.
+    let garden_root = match crate::skills_snapshot::resolve_ladder() {
+        Ok(crate::skills_snapshot::Ladder::Root(g)) => Some(g.root),
+        Ok(crate::skills_snapshot::Ladder::Absent) => None,
+        Ok(crate::skills_snapshot::Ladder::Failed(why)) => return refused(why),
+        Err(e) => return refused(e.to_string()),
+    };
+    for (name, root) in std::iter::once(("pack root", pack_root.as_path()))
+        .chain(garden_root.as_deref().map(|g| ("skills generation", g)))
+    {
+        let real = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if let Some(mask) = crate::validator::secret_read_block_dirs()
+            .into_iter()
+            .find(|m| real.starts_with(m.canonicalize().unwrap_or_else(|_| m.clone())))
+        {
+            return refused(format!(
+                "the {name} lives under {}, which the harness's jail hides",
+                mask.display()
+            ));
+        }
+    }
+    let inputs = match ec::host_inputs() {
+        Ok(x) => x,
+        Err((cause, why)) => {
+            return Ok(result(ec::ConformanceRecord::refused(1, &cause, why), None))
+        }
+    };
+    let cmd: Vec<String> = ec::CONFORMANCE_CMD.iter().map(|a| a.to_string()).collect();
+    let (_, _, _, record, raw) = run_conformance_harness(
+        &cmd,
+        &pack_root,
+        garden_root.as_deref(),
+        inputs,
+        1,
+        "editor-install",
+        0,
+        deadline,
+        jail,
+        &|| None,
+        &|_| {},
+        &|_| {},
+    );
+    Ok(result(record, raw))
+}
+
+#[cfg(test)]
+mod editor_install_conformance_tests {
+    use super::*;
+    use crate::editor_conformance as ec;
+    use std::path::Path;
+
+    #[test]
+    fn invalid_requests_are_errors_before_any_host_work() {
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let file = tmp.path().join("file");
+        std::fs::write(&file, "not a directory").unwrap();
+        let requests = [
+            "not JSON".to_string(),
+            "{}".to_string(),
+            serde_json::json!({ "packRoot": "relative/pack" }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path().join("missing") }).to_string(),
+            serde_json::json!({ "packRoot": file }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "unknown": true }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 0 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 901 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": -1 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": 1.5 }).to_string(),
+            serde_json::json!({ "packRoot": tmp.path(), "timeoutS": "1" }).to_string(),
+        ];
+        for request in requests {
+            assert!(run_editor_conformance(&request).is_err(), "{request}");
+        }
+    }
+
+    // The same interpreter-file + studio-index inputs as tests/editor_conformance.rs, with an
+    // absent garden ladder. Unit tests serialize process-global env mutations with the crate lock.
+    fn with_host_inputs(test: impl FnOnce(&Path)) {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let tmp = crate::repo_checks::PrivateTmp::create().unwrap();
+        let py = tmp.path().join("venv-python");
+        let dist = tmp.path().join("studio-dist");
+        let config = tmp.path().join("claude-config");
+        let home = tmp.path().join("home");
+        for dir in [&dist, &config, &home] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        std::fs::write(&py, "fixture interpreter").unwrap();
+        std::fs::write(dist.join("index.html"), "<!doctype html>").unwrap();
+        struct Restore(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, value) in &self.0 {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(
+            [
+                ec::PYTHON_ENV,
+                ec::STUDIO_DIST_ENV,
+                crate::skills_snapshot::SKILLS_SNAPSHOT_ENV,
+                crate::acp_runner::CLAUDE_CONFIG_DIR_ENV,
+                "HOME",
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect(),
+        );
+        std::env::set_var(ec::PYTHON_ENV, py);
+        std::env::set_var(ec::STUDIO_DIST_ENV, dist);
+        std::env::remove_var(crate::skills_snapshot::SKILLS_SNAPSHOT_ENV);
+        std::env::set_var(crate::acp_runner::CLAUDE_CONFIG_DIR_ENV, config);
+        std::env::set_var("HOME", home);
+        test(tmp.path());
+    }
+
+    #[test]
+    fn an_unjailed_install_is_a_refusal_with_no_report() {
+        with_host_inputs(|root| {
+            let pack = root.join("pack");
+            std::fs::create_dir(&pack).unwrap();
+            let real_pack = pack.canonicalize().unwrap();
+            for (level, wrapper) in [
+                (crate::validator::SandboxLevel::BestEffort, vec![]),
+                (
+                    crate::validator::SandboxLevel::NetworkOnly,
+                    vec!["must-not-run".to_string()],
+                ),
+                (crate::validator::SandboxLevel::Sandboxed, vec![]),
+            ] {
+                let called = std::cell::Cell::new(false);
+                let jail = |roots: &[&Path], port: u16| {
+                    called.set(true);
+                    assert_eq!(roots.len(), 1);
+                    assert_ne!(roots[0], real_pack.as_path());
+                    assert!(roots[0].is_dir());
+                    assert_ne!(port, 0);
+                    crate::validator::SandboxLauncher {
+                        wrapper: wrapper.clone(),
+                        level,
+                    }
+                };
+                for timeout in [1, 900] {
+                    let request =
+                        serde_json::json!({ "packRoot": pack, "timeoutS": timeout }).to_string();
+                    let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                    let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                    assert!(called.get());
+                    assert_eq!(response["record"]["outcome"], "refused");
+                    assert_eq!(response["record"]["cause"], "unjailed_host");
+                    assert_eq!(response["record"]["attempt"], 1);
+                    assert!(response["report"].is_null());
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn a_pack_hidden_by_the_secret_directory_mask_is_refused_before_the_jail() {
+        with_host_inputs(|root| {
+            let pack = root.join("home/.aws/pack");
+            std::fs::create_dir_all(&pack).unwrap();
+            let jail = |_: &[&Path], _: u16| -> crate::validator::SandboxLauncher {
+                panic!("a hidden pack must not reach the jail")
+            };
+            let check = |path: &Path| {
+                let request = serde_json::json!({ "packRoot": path }).to_string();
+                let raw = run_editor_conformance_with(&request, &jail).unwrap();
+                let response: serde_json::Value = serde_json::from_str(&raw).unwrap();
+                assert_eq!(response["record"]["outcome"], "refused");
+                assert_eq!(response["record"]["cause"], "engine_refused");
+                let why = response["record"]["reason"].as_str().unwrap();
+                assert!(why.contains("pack root") && why.contains(".aws"), "{why}");
+                assert!(why.contains("jail hides"), "{why}");
+                assert!(response["report"].is_null());
+            };
+            check(&pack);
+            #[cfg(unix)]
+            {
+                let alias = root.join("pack-alias");
+                std::os::unix::fs::symlink(&pack, &alias).unwrap();
+                check(&alias);
+            }
+        });
+    }
 }
 
 /// The worktree's tree id for a walkthrough record, snapshotted on the actor thread at dispatch
@@ -15444,6 +15900,7 @@ mod crew_tool_channel_tests {
 /// (`tree_from` = the worktree and its registered repository root; absent or unsnapshottable ⇒
 /// the variable is not set, never set empty). The walkthrough recorder declares its own set.
 struct ToolRunEnv {
+    upstream_agents: Vec<(String, String)>,
     run_id: String,
     ord: u32,
     /// (core#820) The choice approved at this unit's consent gate, handed on as
@@ -15463,6 +15920,49 @@ struct ToolRunEnv {
 
 /// (e2e F30) The variable a generic Tool unit reads the run's base commit from.
 pub(crate) const RUN_BASE_ENV: &str = "WICKED_RUN_BASE";
+pub(crate) const UPSTREAM_AGENTS_ENV: &str = "WICKED_UPSTREAM_AGENTS";
+
+fn upstream_agents(
+    unit: &crate::domain::WorkUnit,
+    units: &[crate::domain::WorkUnit],
+) -> Vec<(String, String)> {
+    let mut pending = unit.depends_on.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(step) = pending.pop() {
+        if seen.insert(step.clone()) {
+            if let Some(upstream) = units.iter().find(|u| u.phase_id() == Some(step.as_str())) {
+                pending.extend(upstream.depends_on.iter().cloned());
+            }
+        }
+    }
+    let valid = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
+    let mut ordered: Vec<_> = units
+        .iter()
+        .filter(|u| {
+            u.tool_cmd.is_none()
+                && u.status == crate::domain::UnitStatus::Done
+                && u.phase_id().is_some_and(|s| seen.contains(s))
+        })
+        .collect();
+    ordered.sort_by_key(|u| u.ord);
+    ordered
+        .into_iter()
+        .filter_map(|u| {
+            let step = u.phase_id()?;
+            let agent = u
+                .assigned_cli
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("claude");
+            (valid(step) && valid(agent)).then(|| (step.to_string(), agent.to_string()))
+        })
+        .collect()
+}
 
 impl ToolRunEnv {
     fn vars(&self) -> Vec<(String, String)> {
@@ -15470,6 +15970,16 @@ impl ToolRunEnv {
             ("WICKED_RUN_ID".to_string(), self.run_id.clone()),
             ("WICKED_RUN_UNIT".to_string(), self.ord.to_string()),
         ];
+        if !self.upstream_agents.is_empty() {
+            env.push((
+                UPSTREAM_AGENTS_ENV.to_string(),
+                self.upstream_agents
+                    .iter()
+                    .map(|(step, agent)| format!("{step}={agent}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ));
+        }
         if let Some(choice) = &self.consent_choice {
             env.push((
                 crate::consent_plan::CONSENT_CHOICE_ENV.to_string(),
@@ -15789,6 +16299,7 @@ fn run_tool_cmd_jailed(
             p
         }
     };
+    proc.env_remove(UPSTREAM_AGENTS_ENV);
     for (k, v) in extra_env {
         proc.env(k, v);
     }
@@ -17100,9 +17611,12 @@ fn start_send_back(
             1,
             prompt,
         );
+        // (core#1413) The lead's re-plan belongs to the held run.
+        unit.parent_run_id = Some(rid.clone());
         unit.assigned_cli = Some(lead);
         unit.assigned_invocation = Some(invocation);
         let input = StepInput {
+            base_commit: None,
             run_id: one_shot.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -17325,6 +17839,7 @@ fn units_are(
                 && u.catalog == p.catalog
                 && u.executes_code == p.executes_code
                 && u.required_deliverables == p.required_deliverables
+                && u.write_set == p.write_set
                 && u.skill_ref == p.skill_ref
                 && u.tool_cmd == p.tool_cmd
                 && u.rubric == p.rubric
@@ -18159,7 +18674,8 @@ pub(crate) fn confirm_gate_expecting(
 
     // (rejudge) The re-judge this answer arms — decided ONCE, here, before the row resolves: a
     // second read after it could refuse an answer whose row is already answered. (DES-RULE-CHECK-001
-    // S2) …and the rule skips a `skip_rules` answer lands with its re-check.
+    // S2) …and the rule skips a `skip_rules` answer lands with its re-check, or a noted Land
+    // records with the landing.
     let ArmedAnswer {
         rejudge: mut armed_rejudge,
         rule_skips: mut armed_rule_skips,
@@ -18501,6 +19017,7 @@ pub(crate) fn confirm_gate_expecting(
                 session,
                 run_id,
                 amend.clone(),
+                armed_rule_skips,
                 lifecycle_maps,
                 actor_maps,
                 process_gen,
@@ -19384,6 +19901,82 @@ fn rejudge_request(
     })
 }
 
+/// Build one person's validated skip, shared by a rule re-check and a noted Land.
+fn rule_skip(
+    cursor: &crate::domain::WorkUnit,
+    id: &str,
+    reason: &str,
+    by: Option<&str>,
+    at: i64,
+    rulings_rev: &str,
+) -> anyhow::Result<crate::rule_check::RuleSkip> {
+    let rows = cursor
+        .rule_check
+        .as_ref()
+        .map(|r| r.rows.as_slice())
+        .unwrap_or_default();
+    let by = by
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .unwrap_or("operator");
+    let attempt = cursor
+        .requested_rejudge
+        .as_ref()
+        .filter(|b| b.consumed)
+        .map(|b| b.attempt)
+        .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
+    if reason.trim().is_empty() {
+        anyhow::bail!("skip of rule `{id}` needs a written reason");
+    }
+    // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
+    // may waive with a reason; a broken error/critical rule is reworked.
+    let Some(row) = rows.iter().find(|r| {
+        r.rule_id == id
+            && (matches!(
+                r.status,
+                crate::rule_check::RuleStatus::Unchecked
+                    | crate::rule_check::RuleStatus::Waived
+                    | crate::rule_check::RuleStatus::Disputed
+            ) || (r.status == crate::rule_check::RuleStatus::Broken
+                && r.waivable == Some(true)))
+    }) else {
+        anyhow::bail!(
+            "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
+             of unit {} — only a rule no judge or council ruled on, or a broken rule of \
+             severity warn or info, can be skipped (a broken error or critical rule denies the \
+             gate)",
+            cursor.ord
+        );
+    };
+    let Some(evidence_key) = row.evidence_key.clone() else {
+        anyhow::bail!(
+            "rule `{id}` has no evidence key on unit {}; retry the rule check",
+            cursor.ord
+        );
+    };
+    Ok(crate::rule_check::RuleSkip {
+        rule_id: id.to_string(),
+        reason: reason.trim().to_string(),
+        by: by.to_string(),
+        at,
+        rule_key: row.rule_key.clone(),
+        evidence_key,
+        seat_attempt: Some(attempt),
+        instruction: (row.status == crate::rule_check::RuleStatus::Waived)
+            .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
+        // (core#1493) The carry key of the check it answered, so the run's later steps carry
+        // it on the same evidence…
+        carry_key: cursor
+            .rule_check
+            .as_ref()
+            .and_then(|r| r.carry_keys.get(id))
+            .cloned(),
+        ord: Some(cursor.ord),
+        // …while the person's words stay at this revision.
+        rulings_rev: Some(rulings_rev.to_string()),
+    })
+}
+
 /// (DES-RULE-CHECK-001 S2) The rule re-check to arm on `run_id`'s cursor unit, with the skips it
 /// lands: refused (the gate stays open) unless the cursor unit is held `rules_unchecked`, and
 /// unless every skip names one of its UNCHECKED rules with a non-empty reason. Carries the
@@ -19438,16 +20031,6 @@ fn rules_recheck_request(
             cursor.ord
         );
     }
-    let rows = cursor
-        .rule_check
-        .as_ref()
-        .map(|r| r.rows.as_slice())
-        .unwrap_or_default();
-    let by = by
-        .map(str::trim)
-        .filter(|a| !a.is_empty())
-        .unwrap_or("operator")
-        .to_string();
     let at = crate::interaction::now_millis();
     let rulings_rev = rulings_revision(&session.problem, &session.intent_amendments, &units);
     let attempt = cursor
@@ -19456,59 +20039,10 @@ fn rules_recheck_request(
         .filter(|b| b.consumed)
         .map(|b| b.attempt)
         .unwrap_or_else(|| cursor.last_attempt.unwrap_or(0));
-    let mut landed = Vec::new();
-    for (id, reason) in skips {
-        if reason.trim().is_empty() {
-            anyhow::bail!("skip of rule `{id}` needs a written reason");
-        }
-        // (e2e-1105 CJ9) …or a broken warning (`waivable`: severity warn/info), which the person
-        // may waive with a reason; a broken error/critical rule is reworked.
-        let Some(row) = rows.iter().find(|r| {
-            &r.rule_id == id
-                && (matches!(
-                    r.status,
-                    crate::rule_check::RuleStatus::Unchecked
-                        | crate::rule_check::RuleStatus::Waived
-                        | crate::rule_check::RuleStatus::Disputed
-                ) || (r.status == crate::rule_check::RuleStatus::Broken
-                    && r.waivable == Some(true)))
-        }) else {
-            anyhow::bail!(
-                "rule `{id}` is not an unchecked rule (nor a disputed one, nor a broken warning) \
-                 of unit {} — only a rule no judge or council ruled on, or a broken rule of \
-                 severity warn or info, can be skipped (a broken error or critical rule denies the \
-                 gate)",
-                cursor.ord
-            );
-        };
-        let Some(evidence_key) = row.evidence_key.clone() else {
-            anyhow::bail!(
-                "rule `{id}` has no evidence key on unit {}; retry the rule check",
-                cursor.ord
-            );
-        };
-        landed.push(crate::rule_check::RuleSkip {
-            rule_id: id.clone(),
-            reason: reason.trim().to_string(),
-            by: by.clone(),
-            at,
-            rule_key: row.rule_key.clone(),
-            evidence_key,
-            seat_attempt: Some(attempt),
-            instruction: (row.status == crate::rule_check::RuleStatus::Waived)
-                .then(|| row.cite.clone().unwrap_or_else(|| row.reason.clone())),
-            // (core#1493) The carry key of the check it answered, so the run's later steps carry
-            // it on the same evidence…
-            carry_key: cursor
-                .rule_check
-                .as_ref()
-                .and_then(|r| r.carry_keys.get(id))
-                .cloned(),
-            ord: Some(cursor.ord),
-            // …while the person's words stay at this revision.
-            rulings_rev: Some(rulings_rev.clone()),
-        });
-    }
+    let landed = skips
+        .iter()
+        .map(|(id, reason)| rule_skip(cursor, id, reason, by, at, &rulings_rev))
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let output = crate::domain::get_unit_transcript(store, &cursor.id)
         .and_then(|t| t.output)
         .unwrap_or_default();
@@ -19821,8 +20355,8 @@ pub(crate) fn refuse_before_resolving(
     // (DES-RULE-CHECK-001 S2, codex r2) An answer that COUNTS the gated unit as it stands —
     // landing it at the review loop's adjudication, the operator's own judgment, or a QE skip
     // that counts it — is refused while a steering rule of that unit is broken or unchecked,
-    // whichever layer named the gate: a broken rule is reworked, an unchecked one is re-checked
-    // or skipped with its reason (`retry_rules` / `skip_rules`).
+    // whichever layer named the gate. (core#1683) A noted Land can skip every open rule that
+    // `skip_rules` would take, recording the same reason on each without another review round.
     let counts_unit = match &decision {
         crate::workflow::HumanDecision::Approve { .. } => adjudication_open,
         crate::workflow::HumanDecision::OperatorJudgment { .. }
@@ -19830,14 +20364,43 @@ pub(crate) fn refuse_before_resolving(
         _ => false,
     };
     if counts_unit {
-        if let Some(open) = cursor.and_then(rule_layers_open) {
-            anyhow::bail!(
-                "unit {cursor_ord} has steering rules {open}; this answer would count it — \
-                 request changes to rework it, re-check the rules (`{}`), skip an unchecked \
-                 rule with a reason (`{}`), or reject",
-                crate::rule_check::RETRY_ACTION,
-                crate::rule_check::SKIP_ACTION
-            );
+        if let Some((cursor, open)) = cursor.and_then(|u| rule_layers_open(u).map(|o| (u, o))) {
+            let skips = match decision {
+                crate::workflow::HumanDecision::Approve { amend: Some(a), .. }
+                    if adjudication_open && !a.trim().is_empty() =>
+                {
+                    let at = crate::interaction::now_millis();
+                    let rev =
+                        rulings_revision(&session.problem, &session.intent_amendments, &units);
+                    open_rule_ids(cursor)
+                        .filter(|ids| !ids.is_empty())
+                        .and_then(|ids| {
+                            ids.iter()
+                                .map(|id| rule_skip(cursor, id, a, actor, at, &rev))
+                                .collect::<anyhow::Result<Vec<_>>>()
+                                .ok()
+                        })
+                }
+                _ => None,
+            };
+            if let Some(skips) = skips {
+                armed.rule_skips = skips;
+            } else {
+                let land_hint = if adjudication_open
+                    && matches!(decision, crate::workflow::HumanDecision::Approve { .. })
+                {
+                    "; Land with your reason skips the open rules when all can be skipped"
+                } else {
+                    ""
+                };
+                anyhow::bail!(
+                    "unit {cursor_ord} has steering rules {open}; this answer would count it — \
+                     request changes to rework it, re-check the rules (`{}`), skip an unchecked \
+                     rule with a reason (`{}`), or reject{land_hint}",
+                    crate::rule_check::RETRY_ACTION,
+                    crate::rule_check::SKIP_ACTION
+                );
+            }
         }
     }
     match &decision {
@@ -19996,6 +20559,7 @@ fn approve_redoes_qe(session: &AgentSession, cursor: &crate::domain::WorkUnit) -
 /// the unit was denied because no judge could rule (`judge_unavailable`), or no QE reviewer could
 /// judge its evidence. (DES-APPS-001 §9.3, K0) Never the QE layer of an Apps publish: there the
 /// operator standing in for the QE reviewer would be a QE skip, so the approve is a retry.
+/// A stored veto behind that hold also requires a retry: the seat must re-ask every layer.
 pub(crate) fn approve_is_operator_judgment(
     session: &crate::domain::AgentSession,
     u: &crate::domain::WorkUnit,
@@ -20007,6 +20571,12 @@ pub(crate) fn approve_is_operator_judgment(
         && u.denial.as_ref().is_some_and(|d| {
             d.source == crate::domain::DENIAL_SOURCE_JUDGE_UNAVAILABLE
                 || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+        })
+        && u.denials_behind.as_deref().is_none_or(|behind| {
+            behind.iter().all(|d| {
+                pipeline::judge_absent_behind_floor(d)
+                    || (!publish && crate::qe_acceptance::review::could_not_judge(d))
+            })
         })
 }
 
@@ -20855,6 +21425,7 @@ fn land_with_carried_items(
     session: crate::domain::AgentSession,
     run_id: &str,
     amend: Option<String>,
+    rule_skips: Vec<crate::rule_check::RuleSkip>,
     lifecycle_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     actor_maps: &Option<Arc<std::sync::Mutex<ElicitationMaps>>>,
     process_gen: uuid::Uuid,
@@ -20876,6 +21447,7 @@ fn land_with_carried_items(
     let attempt = u.last_attempt.unwrap_or(0);
     let verdict = u.denial_reason.clone().unwrap_or_default();
     u.carried_items = crate::review_context::carried_items(&verdict);
+    u.rule_skips.extend(rule_skips);
     if let Some(r) = u.review_rounds.iter_mut().find(|r| r.attempt == attempt) {
         r.outcome = Some(crate::review_context::REVIEW_LANDED.to_string());
     }
@@ -21862,6 +22434,47 @@ fn cost_from_price_table(cli: &str, input_tokens: u64, output_tokens: u64) -> Op
     let in_per = entry.get("input_per_mtok").and_then(|v| v.as_f64())?;
     let out_per = entry.get("output_per_mtok").and_then(|v| v.as_f64())?;
     Some(input_tokens as f64 / 1e6 * in_per + output_tokens as f64 / 1e6 * out_per)
+}
+
+/// The actor's unregister guard: session reads and removal share the launch/register writer.
+pub(crate) fn unregister_repo(store: &mut impl GraphStore, repo_id: &str) -> anyhow::Result<bool> {
+    let Some(repo) = crate::repo::get_repo(store, repo_id)? else {
+        return Ok(false);
+    };
+    let mut runs = Vec::new();
+    for run_id in list_sessions(store)? {
+        if let Some(session) = crate::domain::get_session(store, &run_id)? {
+            if session.repo_ref.as_deref() == Some(repo_id)
+                && !matches!(
+                    session.status,
+                    SessionStatus::Completed | SessionStatus::Cancelled | SessionStatus::Failed
+                )
+            {
+                runs.push(run_id);
+            }
+        }
+    }
+    runs.extend(crate::code_graph::graph_lease_holders(
+        std::path::Path::new(&repo.code_graph_db),
+    ));
+    runs.sort();
+    runs.dedup();
+    if !runs.is_empty() {
+        anyhow::bail!(
+            "repo_in_use: repository {repo_id} has live runs: {} — \
+             wait for them to end or stop them first",
+            runs.join(", ")
+        );
+    }
+    let projects = crate::project::member_projects(store, "crew.repo", repo_id)?;
+    if !projects.is_empty() {
+        anyhow::bail!(
+            "repo_in_project: repository {repo_id} belongs to project(s) {} — \
+             remove it from the project first",
+            projects.join(", ")
+        );
+    }
+    crate::repo::unregister_repo(store, repo_id)
 }
 
 /// Read the agent session ids on the store (by their session-node names).
@@ -27651,6 +28264,23 @@ mod request_changes_tests {
     }
 
     #[test]
+    fn approve_is_not_operator_judgment_with_a_standing_governance_veto() {
+        let run_id = format!("op-judge-standing-veto-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        seed_judge_unavailable_verify(&mut store, &run_id);
+        let session = crate::domain::get_session(&store, &run_id)
+            .unwrap()
+            .unwrap();
+        let mut unit = crate::domain::session_units(&store, &run_id).unwrap()[3].clone();
+        assert!(approve_is_operator_judgment(&session, &unit));
+        unit.denials_behind = Some(vec![UnitDenial::new("input_governance", "policy denied")]);
+        assert!(
+            !approve_is_operator_judgment(&session, &unit),
+            "plain approve must retry every layer when governance still vetoes"
+        );
+    }
+
+    #[test]
     fn approve_at_judge_unavailable_is_the_operators_judgment_and_the_run_proceeds_labelled() {
         let run_id = format!("op-judge-{}", std::process::id());
         let mut store = open_store(Some(":memory:")).unwrap();
@@ -30347,6 +30977,144 @@ mod request_changes_tests {
         }
     }
 
+    fn seed_adjudication_rule(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        status: crate::rule_check::RuleStatus,
+    ) {
+        fold_verify_after_send_backs(store, subs, run_id, 2, THIRD_FAIL);
+        assert_eq!(
+            open_gate_kind(store, run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+        let mut units = crate::domain::session_units(store, run_id).unwrap();
+        let report = crate::rule_check::RuleCheckReport {
+            rows: vec![crate::rule_check::RuleVerdict {
+                rule_id: "R1".into(),
+                status,
+                how: crate::rule_check::RuleHow::Judge,
+                reason: "environment blocked the check".into(),
+                rule_key: "k".into(),
+                evidence_key: Some("ek-R1".into()),
+                origin: Some(crate::rule_check::RuleOrigin::Judge),
+                waivable: None,
+                ..Default::default()
+            }],
+            carry_keys: [("R1".to_string(), "ck".to_string())].into(),
+            ..Default::default()
+        };
+        units[3].denials_behind = Some(vec![report.hold().or_else(|| report.denial()).unwrap()]);
+        units[3].rule_check = Some(report);
+        put_node(store, units[3].to_node()).unwrap();
+    }
+
+    fn assert_noted_land_skips_adjudication_rule(status: crate::rule_check::RuleStatus) {
+        let run_id = format!("adj-skip-{status:?}-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(&mut store, &mut subs, &run_id, status);
+        for amend in [None, Some("  ".into())] {
+            let err = gate(
+                &mut store,
+                &mut subs,
+                &run_id,
+                HumanDecision::Approve {
+                    amend,
+                    amend_scope: AmendScope::Cursor,
+                },
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("steering rules") && err.contains("R1"),
+                "{err}"
+            );
+            assert_eq!(
+                open_gate_kind(&store, &run_id).as_deref(),
+                Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+            );
+            let units = crate::domain::session_units(&store, &run_id).unwrap();
+            assert!(units[3].rule_skips.is_empty());
+        }
+        let out = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("  env block, carried  ".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .expect("a noted Land skips the held rule without another review");
+        assert_eq!(out, SessionStatus::Completed);
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        let unit = &units[3];
+        assert_eq!(unit.status, UnitStatus::Done);
+        assert_eq!(unit.rule_skips.len(), 1);
+        let skip = &unit.rule_skips[0];
+        assert_eq!(skip.rule_id, "R1");
+        assert_eq!(skip.reason, "env block, carried");
+        assert_eq!(skip.by, "operator");
+        assert_eq!(skip.rule_key, "k");
+        assert_eq!(skip.evidence_key, "ek-R1");
+        assert_eq!(skip.seat_attempt, unit.last_attempt);
+        assert_eq!(skip.carry_key.as_deref(), Some("ck"));
+        assert_eq!(skip.ord, Some(unit.ord));
+        assert!(skip.rulings_rev.is_some());
+        assert!(skip.instruction.is_none());
+        assert!(
+            unit.requested_rejudge.is_none(),
+            "Land does not arm a re-check"
+        );
+    }
+
+    #[test]
+    fn a_noted_land_skips_a_disputed_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Disputed);
+    }
+
+    #[test]
+    fn a_noted_land_skips_an_unchecked_rule_at_adjudication() {
+        assert_noted_land_skips_adjudication_rule(crate::rule_check::RuleStatus::Unchecked);
+    }
+
+    #[test]
+    fn a_noted_land_refuses_a_broken_error_rule_at_adjudication() {
+        let run_id = format!("adj-broken-error-{}", std::process::id());
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        seed_adjudication_rule(
+            &mut store,
+            &mut subs,
+            &run_id,
+            crate::rule_check::RuleStatus::Broken,
+        );
+        let err = gate(
+            &mut store,
+            &mut subs,
+            &run_id,
+            HumanDecision::Approve {
+                amend: Some("env block, carried".into()),
+                amend_scope: AmendScope::Cursor,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("steering rules") && err.contains("R1"),
+            "{err}"
+        );
+        let units = crate::domain::session_units(&store, &run_id).unwrap();
+        assert_eq!(units[3].status, UnitStatus::Rejected);
+        assert!(units[3].rule_skips.is_empty());
+        assert!(units[3].operator_rulings.is_empty());
+        assert_eq!(
+            open_gate_kind(&store, &run_id).as_deref(),
+            Some(crate::review_context::REVIEW_ADJUDICATION_GATE)
+        );
+    }
+
     /// (DES-RULE-CHECK-001 rev 2 Part B, operator Q2) Rule against rule: the person's confirm of the
     /// judge's WAIVED on a shipped PACK rule (MCPS-1002 waived for this change by their gate
     /// ruling) goes through `skip_rules` like any open rule, carrying the pack row's own keys and
@@ -32974,8 +33742,8 @@ mod request_changes_tests {
         assert!(action(&listed, crate::workflow::RETRY_QE_ACTION).is_none());
     }
 
-    /// (studio#1155) A capped review whose rule is held: land is NOT listed until the rule is
-    /// settled; the rule actions are.
+    /// (core#1683) A capped review whose rule is held lists Land with a required skip reason,
+    /// alongside the existing rule actions.
     #[test]
     fn gate_actions_review_adjudication_with_a_held_rule() {
         let seed = |store: &mut dyn GraphStore, run_id: &str| {
@@ -33001,7 +33769,11 @@ mod request_changes_tests {
             put_node(store, units[3].to_node()).unwrap();
         };
         let listed = listed_is_accepted("adj-rules", &seed);
-        assert!(action(&listed, "approve").is_none(), "{listed:#?}");
+        let land = action(&listed, "approve").expect("a noted Land skips the held rule");
+        assert_eq!(land.intent, "land_with_carried_items");
+        assert_eq!(land.note, crate::NoteRule::Required);
+        assert_eq!(land.note_intent.as_deref(), Some("skip_rules"));
+        assert_eq!(land.rules, ["R1"]);
         assert!(action(&listed, crate::rule_check::RETRY_ACTION).is_some());
         assert_eq!(
             action(&listed, crate::rule_check::SKIP_ACTION)
@@ -34018,12 +34790,29 @@ mod deliverable_floor_tests {
         subs: &mut crate::event_log::EventSink,
         run_id: &str,
     ) -> (AgentSession, WorkUnit) {
+        fold_with_evidence(
+            store,
+            subs,
+            run_id,
+            crate::workflow::UnitEvidence::default(),
+        )
+    }
+
+    fn fold_with_evidence(
+        store: &mut dyn GraphStore,
+        subs: &mut crate::event_log::EventSink,
+        run_id: &str,
+        evidence: crate::workflow::UnitEvidence,
+    ) -> (AgentSession, WorkUnit) {
         let (tx, _rx) = channel::<Command>();
         let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
         let out = StepOutput {
             run_id: run_id.into(),
             unit_ix: 0,
-            attempt: 0,
+            attempt: crate::domain::get_session(store, run_id)
+                .unwrap()
+                .unwrap()
+                .attempt,
             output: prose(),
             status: StepStatus::Ok,
             usage: None,
@@ -34038,7 +34827,7 @@ mod deliverable_floor_tests {
             &tx,
             out,
             None,
-            crate::workflow::UnitEvidence::default(),
+            evidence,
             "",
             &None,
             &None,
@@ -34051,6 +34840,114 @@ mod deliverable_floor_tests {
             .unwrap()
             .remove(0);
         (session, unit)
+    }
+
+    #[test]
+    fn a_previous_pass_deliverable_is_rejected_as_stale() {
+        let wd = tmp("pass-stale");
+        std::fs::write(wd.join("rules.json"), "{}").unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(wd.join("rules.json"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000))
+            .unwrap();
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let run = "pass-stale";
+        seed(
+            &mut store,
+            run,
+            Some(wd.to_string_lossy().into_owned()),
+            vec![],
+            vec!["rules.json".into()],
+        );
+        let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+        unit.status = UnitStatus::Done;
+        unit.last_attempt = Some(0);
+        unit.assigned_cli = Some("claude".into());
+        put_node(&mut store, unit.to_node()).unwrap();
+        let mut next = WorkUnit::pending(format!("{run}:next"), run, 2, "next");
+        next.status = UnitStatus::Done;
+        next.tool_cmd = Some(vec!["true".into()]);
+        next.repeat_from = Some("u1".into());
+        put_node(&mut store, next.to_node()).unwrap();
+        let mut session = crate::domain::get_session(&store, run).unwrap().unwrap();
+        session.unit_ix = 1;
+        session.clis = vec!["claude".into()];
+        put_node(&mut store, session.to_node()).unwrap();
+        let mut subs = crate::event_log::EventSink::default();
+        let (tx, _rx) = channel();
+        let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+        assert!(repeat_gate::after_pass(
+            &mut store,
+            &mut subs,
+            &runner,
+            &tx,
+            &mut session,
+            1,
+            r#"wicked-repeat {"next":"continue","line":"page 2"}"#,
+            &None,
+            &None,
+            uuid::Uuid::nil(),
+            false,
+        )
+        .unwrap()
+        .is_some());
+        let (_, unit) = fold(&mut store, &mut subs, run);
+        assert_eq!(unit.status, UnitStatus::Rejected);
+        assert_eq!(unit.denial.as_ref().unwrap().source, "deliverables");
+        assert!(unit.denial_reason.unwrap().contains("(stale:"));
+        let _ = std::fs::remove_dir_all(wd);
+    }
+
+    #[test]
+    fn write_set_evidence_rejects_outside_paths_and_unavailable_checks() {
+        for report in [
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec!["src/x.rs".into()],
+                error: None,
+            }),
+            Some(crate::worktree_guard::WriteSetReport {
+                outside: vec![],
+                error: Some("snapshot failed".into()),
+            }),
+            None,
+        ] {
+            let mut store = open_store(Some(":memory:")).unwrap();
+            let run = "write-set-denied";
+            seed(&mut store, run, None, vec![], vec![]);
+            let mut unit = crate::domain::session_units(&store, run).unwrap().remove(0);
+            unit.write_set = vec![".wicked/domain/".into(), "coverage-report.json".into()];
+            put_node(&mut store, unit.to_node()).unwrap();
+            let expected = match &report {
+                Some(r) if r.error.is_some() => "snapshot failed",
+                Some(_) => "src/x.rs",
+                None => "no write-set evidence",
+            };
+            let mut subs = crate::event_log::EventSink::default();
+            let (tx, rx) = channel();
+            subs.push(tx);
+            let (session, unit) = fold_with_evidence(
+                &mut store,
+                &mut subs,
+                run,
+                crate::workflow::UnitEvidence {
+                    write_set: report,
+                    ..Default::default()
+                },
+            );
+            assert_eq!(unit.status, UnitStatus::Rejected);
+            assert_eq!(unit.denial.as_ref().unwrap().source, "write_set");
+            assert!(unit.denial_reason.unwrap().contains(expected));
+            assert_eq!(session.status, SessionStatus::AwaitingHuman);
+            assert!(rx.try_iter().any(|e| matches!(
+                e,
+                CoreEvent::StepFailed {
+                    failure_kind: crate::event::StepFailureKind::SubstanceRejected,
+                    ..
+                }
+            )));
+        }
     }
 
     /// THE REPRODUCTION (§1). A unit declares `required_deliverables` and reports Ok having
@@ -34141,6 +35038,7 @@ mod deliverable_floor_tests {
         // `sandbox_root`, the fold starts checking a directory no worker ever wrote to and the
         // floor fails every unbound run that honestly produced its deliverable.
         let probe = StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,
@@ -36252,10 +37150,11 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            6,
-            "the substance gate, the deliverable floor, the dead-seat worker exit (core#461), the \
-             demo floor, the demo plan snapshot (core#1249) and the editor conformance floor \
-             (DES-EDITOR-CONFORMANCE-HOST) each open the escalation gate"
+            7,
+            "the substance gate, the write-set floor (core#1344), the deliverable floor, the \
+             dead-seat worker exit (core#461), the demo floor, the demo plan snapshot (core#1249) \
+             and the editor conformance floor (DES-EDITOR-CONFORMANCE-HOST) each open the \
+             escalation gate"
         );
     }
 
@@ -42041,6 +42940,7 @@ mod consent_plan_tests {
             run_id: run_id.into(),
             ord: 2,
             consent_choice: unit.consent_choice.clone(),
+            upstream_agents: Vec::new(),
             repeat: None,
             evidence_root: None,
             tree_from: None,
@@ -42660,10 +43560,10 @@ mod council_ballot_tests {
         let real: Arc<dyn Dispatcher + Send + Sync> =
             Arc::new(wicked_council::dispatch::RealDispatcher::default());
         let runner: Arc<dyn StepRunner> = Arc::new(crate::workflow::StubStepRunner);
-        let (host, at) = ballot_dispatcher(&real, &runner, false);
+        let (host, at) = ballot_dispatcher(&real, &runner, false, None);
         assert!(Arc::ptr_eq(&host, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_HOST));
-        let (carried, at) = ballot_dispatcher(&real, &runner, true);
+        let (carried, at) = ballot_dispatcher(&real, &runner, true, None);
         assert!(!Arc::ptr_eq(&carried, &real));
         assert_eq!(at, Some(crate::decision::BALLOTS_IN_SEAT_CONTAINER));
     }
@@ -42906,5 +43806,75 @@ mod git_identity_missing_tests {
         let resolved = identity_missing_in(&repo);
         let _ = std::fs::remove_dir_all(&repo);
         assert!(resolved.is_empty(), "{resolved:?}");
+    }
+}
+
+#[cfg(test)]
+mod upstream_agents_tests {
+    use super::*;
+
+    #[test]
+    fn extract_apply_env_uses_done_transitive_agents_current_assignment() {
+        let plan = crate::plan::PlanSteps {
+            steps: crate::catalog::builtin_preset("domain-extraction").unwrap(),
+            ..Default::default()
+        };
+        let def = crate::plan::compose(crate::catalog::catalog(), &plan).unwrap();
+        let mut units = crate::plan::plan_from_def(&def, "map", "upstream");
+        for u in &mut units {
+            u.status = crate::domain::UnitStatus::Done;
+            u.assigned_cli = Some("claude".into());
+            if u.phase_id() == Some("extract") {
+                u.assigned_cli = Some(" codex ".into());
+            }
+        }
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        let env = ToolRunEnv {
+            run_id: "upstream".into(),
+            ord: apply.ord,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(apply, &units),
+        }
+        .vars();
+        let pairs = &env
+            .iter()
+            .find(|(k, _)| k == UPSTREAM_AGENTS_ENV)
+            .unwrap()
+            .1;
+        assert!(pairs.split(',').any(|p| p == "extract=codex"), "{pairs}");
+        assert!(pairs.find("extract=codex") < pairs.find("critique=claude"));
+        units
+            .iter_mut()
+            .find(|u| u.phase_id() == Some("extract"))
+            .unwrap()
+            .assigned_cli = Some("bad,seat".into());
+        let apply = units
+            .iter()
+            .find(|u| u.phase_id() == Some("extract-apply"))
+            .unwrap();
+        assert!(!upstream_agents(apply, &units)
+            .iter()
+            .any(|(s, _)| s == "extract"));
+
+        let unit = crate::domain::WorkUnit::pending("empty:tool", "empty", 1, "tool");
+        let env = ToolRunEnv {
+            run_id: "empty".into(),
+            ord: 1,
+            consent_choice: None,
+            repeat: None,
+            evidence_root: None,
+            tree_from: None,
+            base_commit: None,
+            upstream_agents: upstream_agents(&unit, &[]),
+        }
+        .vars();
+        assert!(!env.iter().any(|(k, _)| k == UPSTREAM_AGENTS_ENV));
     }
 }

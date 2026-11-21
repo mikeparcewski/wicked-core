@@ -542,6 +542,7 @@ fn the_wrapped_runner_settles_and_names_agy_exits() {
         unit.assigned_cli = Some("agy".to_string());
         unit.assigned_invocation = Some(format!("{} -p {{PROMPT}}", agy.display()));
         let input = StepInput {
+            base_commit: None,
             run_id: format!("agy-runner-{tag}-{}", std::process::id()),
             unit_ix: 0,
             attempt: 0,
