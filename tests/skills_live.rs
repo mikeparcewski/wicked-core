@@ -32,6 +32,7 @@ fn a_skill_driven_unit_loads_the_named_skill_against_real_claude() {
     unit.assigned_invocation = Some("claude -p {PROMPT}".to_string());
 
     let input = StepInput {
+        base_commit: None,
         run_id: "live".to_string(),
         unit_ix: 0,
         attempt: 0,
@@ -319,6 +320,7 @@ fn the_pinned_harness_loads_the_snapshot_and_invokes_the_fixture_skill() {
     let wt = base.join("wt");
     std::fs::create_dir_all(&wt).unwrap();
     let input = StepInput {
+        base_commit: None,
         run_id: "live-skills".to_string(),
         unit_ix: 0,
         attempt: 0,

@@ -1329,6 +1329,7 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
         },
         PlanStep {
             skill_ref: Some(crate::domain_extraction::EXTRACTOR_SKILL.to_string()),
+            required_deliverables: Some(vec![RULES_REL.to_string()]),
             ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
         },
         // The page's own review (a `critique`, so the floor adds no generic one that judges a page
@@ -1582,6 +1583,7 @@ fn entry(
     executes_code: bool,
 ) -> PhaseDef {
     PhaseDef {
+        write_set: Vec::new(),
         requires_capture_report: false,
         answer_only: false,
         id: id.to_string(),
@@ -1914,6 +1916,16 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                 assert!(text.contains(why), "{case}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn domain_extract_declares_its_rules_deliverable() {
+        let def = composed("domain-extraction");
+        let extract = def.phases.iter().find(|p| p.id == "extract").unwrap();
+        assert_eq!(
+            extract.required_deliverables,
+            [crate::domain_extraction::RULES_REL]
+        );
     }
 
     /// #1320: fixing one old failure cannot pay for a new failure in the same file.

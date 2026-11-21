@@ -135,6 +135,7 @@ impl wicked_council::types::BallotCarrier for SeatBallots {
         unit.assigned_cli = Some(cli.key.clone());
         unit.assigned_invocation = Some(cli.headless_invocation.clone());
         let input = crate::workflow::StepInput {
+            base_commit: None,
             run_id: run_id.clone(),
             unit_ix: 0,
             attempt: 0,

@@ -347,6 +347,7 @@ fn post_step_reads_cover_every_attempt_the_fold_treats_as_failed() {
         binaries_before: Vec::new(),
     });
     let input = StepInput {
+        base_commit: None,
         run_id: "p".into(),
         unit_ix: 0,
         attempt: 0,
@@ -432,6 +433,7 @@ fn the_worker_entry_point_returns_the_folds_tree_reads() {
         binaries_before: Vec::new(),
     });
     let input = StepInput {
+        base_commit: None,
         run_id: "e".into(),
         unit_ix: 0,
         attempt: 0,
@@ -540,6 +542,7 @@ fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
     let mut unit = crate::domain::WorkUnit::pending("s:s1", "s", 1, "design it");
     unit.pre_build_scope = true;
     let input = StepInput {
+        base_commit: None,
         run_id: "s".into(),
         unit_ix: 0,
         attempt: 0,

@@ -802,6 +802,7 @@ fn the_launch_sink_sends_on_the_runner_channel() {
 
 fn input_for(unit: crate::domain::WorkUnit) -> crate::workflow::StepInput {
     crate::workflow::StepInput {
+        base_commit: None,
         run_id: session(),
         unit_ix: 0,
         attempt: 1,

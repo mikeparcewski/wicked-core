@@ -2502,6 +2502,7 @@ mod tests {
         u.worktree_guarded = true;
         u.assigned_cli = Some("pi".to_string());
         let mut input = crate::workflow::StepInput {
+            base_commit: None,
             run_id: "run-mcp-arm".to_string(),
             unit_ix: 0,
             attempt: 1,
@@ -2589,6 +2590,7 @@ mod tests {
             })
         };
         let mut input = crate::workflow::StepInput {
+            base_commit: None,
             run_id: "run-estate-scope".to_string(),
             unit_ix: 0,
             attempt: 2,

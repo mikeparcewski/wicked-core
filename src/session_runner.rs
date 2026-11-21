@@ -819,6 +819,8 @@ mod tests {
     /// session runner sends prompts via stdin, not as an argv element).
     fn make_unit(description: &str, invocation: &str) -> WorkUnit {
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             capture_report: None,
             requires_capture_report: false,
             answer_only: false,
@@ -942,6 +944,7 @@ mod tests {
 
     fn make_input(run_id: &str, unit_ix: usize, unit: WorkUnit) -> StepInput {
         StepInput {
+            base_commit: None,
             run_id: run_id.to_string(),
             unit_ix,
             attempt: 0,

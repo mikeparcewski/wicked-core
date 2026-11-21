@@ -110,6 +110,8 @@ pub struct StepInput {
     /// The git worktree to run in (set when the run targets a registered repo, P3). `None` ⇒ the
     /// runner uses its own default cwd. The real wrapped-CLI backend (P4a) runs the subprocess here.
     pub workdir: Option<std::path::PathBuf>,
+    /// The run's recorded base, used by the worker's write-set check.
+    pub base_commit: Option<String>,
     /// GOVERNANCE OPT-IN (DES-OUTGOV-003 §4). `Some` ⇒ a GOVERNED campaign unit: the wrapped-CLI
     /// launcher injects the `PreToolUse` gate-hook (input governance) + sets the decisions/store env, so
     /// the CLI's tool-calls are governed and a deny folds into the unit gate. `None` ⇒ an UNGOVERNED
@@ -349,6 +351,9 @@ pub struct UnitEvidence {
     pub observed_providers: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_guard: Option<crate::worktree_guard::WorktreeGuardOutcome>,
+    /// Run-base paths outside the unit's write set, or why the comparison could not run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_set: Option<crate::worktree_guard::WriteSetReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_checks: Option<crate::repo_checks::RepoChecksReport>,
     /// (core#431, F-433-001) The tree id the repository's own checks CERTIFIED for this unit —
@@ -1028,6 +1033,9 @@ fn tool_binary_resolves(bin: &str) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PhaseDef {
+    /// The composed mapping plan's allowed agent paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write_set: Vec<String>,
     /// Phase id, unique within the workflow (referenced by `depends_on`). The ONLY required field
     /// in a drop-in JSON file — everything below defaults, so the minimal phase is `{"id":"x"}`.
     pub id: String,
@@ -1189,6 +1197,7 @@ impl PhaseDef {
     /// tests (e.g. the planner's) can author fixture phases without a JSON detour.
     pub(crate) fn new(id: &str, kind: StageKind) -> Self {
         PhaseDef {
+            write_set: Vec::new(),
             id: id.to_string(),
             kind,
             instructions: None,
