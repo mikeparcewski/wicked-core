@@ -13690,7 +13690,7 @@ fn dispatch_unit_with(
                         )
                     }),
                     evidence_root: session.evidence_root.clone(),
-                    upstream_agents: upstream_agents(&unit, &units),
+                    upstream_agents: upstream_agents(unit, &units),
                     base_commit: session.base_commit.clone(),
                     tree_from: session.workdir.clone().zip(
                         session
