@@ -101,6 +101,19 @@ struct Engine {
     db: String,
 }
 
+/// (core#1305) Drop the engine and wait until its actor thread has returned, so its store
+/// connection is closed before the test reopens the file. A fixed sleep raced the actor's teardown
+/// on Windows (`database is locked` at the boot reopen). Every Core clone must be gone by then.
+fn stop(e: Engine) {
+    let exited = e.core.actor_exit_for_test();
+    drop(e);
+    assert_eq!(
+        exited.recv_timeout(crate::test_env::PATIENT),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        "the dropped engine's actor never returned"
+    );
+}
+
 fn engine(rig: &Rig, cfg: TeamConfig) -> Engine {
     let db = rig.dir.join("core.db").to_string_lossy().into_owned();
     engine_on(&db, cfg)
@@ -552,7 +565,7 @@ fn crashed_mid_path_started(rig: &Rig, run: &str) -> String {
     let db = e.db.clone();
     let view = e.core.run_team(run).unwrap().unwrap();
     assert_eq!(view.transport, "pending");
-    drop(e);
+    stop(e);
     db
 }
 
@@ -696,7 +709,7 @@ fn a_run_cancelled_while_its_fact_is_in_flight_dispatches_nothing() {
 fn crashed_mid_answer(name: &str, reject: bool) -> (Rig, String) {
     let (rig, e) = paused_on_plan(name);
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
     let mut session = crate::domain::get_session(&store, name).unwrap().unwrap();
     let team = session.team.as_mut().expect("team state");
@@ -821,7 +834,7 @@ fn boot_reopens_a_publishing_fact_as_a_transport_gate_the_team_handler_answers()
             == Some(tev::PLAN_ACCEPTED)
     });
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     let e = engine_on(&db, fast(&rig));
     assert_eq!(status(&e, "bootp"), Some(SessionStatus::AwaitingHuman));
     let view = e.core.run_team("bootp").unwrap().unwrap();
@@ -905,7 +918,7 @@ fn boot_ends_a_teamed_terminal_run(name: &str, status: SessionStatus, want: &str
             .any(|l| l["type"] == tev::PATH_ENDED)
     });
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     if status != SessionStatus::Completed {
         set_status(&db, name, status);
     }
@@ -918,7 +931,7 @@ fn boot_ends_a_teamed_terminal_run(name: &str, status: SessionStatus, want: &str
     wait_for("the run marked ended", || {
         e.core.run_team(name).unwrap().unwrap().ended
     });
-    drop(e);
+    stop(e);
     let e = engine_on(&db, fast(&rig));
     e.core.ping();
     e.core.replay_team_outbox().unwrap();
@@ -1109,7 +1122,7 @@ fn boot_keeps_the_pause_when_the_tombstone_cannot_be_written() {
 fn nobus_answer_writes_the_tombstone_before_continuing() {
     let (rig, e) = paused_on_plan("nba");
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     let e = engine_on(&db, no_bus(&rig));
     let s = e
         .core
@@ -1129,7 +1142,7 @@ fn nobus_answer_writes_the_tombstone_before_continuing() {
 fn nobus_answer_keeps_the_pause_when_the_tombstone_cannot_be_written() {
     let (rig, e) = paused_on_plan("nbw");
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     let aside = break_outbox(&rig);
     let e = engine_on(&db, no_bus(&rig));
     let s = e
@@ -1189,7 +1202,7 @@ fn live_teamed(name: &str) -> (Rig, String) {
     assert_eq!(e.core.live_team_runs().unwrap().len(), 1);
     assert_eq!(rig.types(name), vec![tev::PATH_STARTED, tev::PLAN_ACCEPTED]);
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     (rig, db)
 }
 
@@ -2322,9 +2335,7 @@ fn killed_mid_step(
         .session
         .team
         .unwrap();
-    drop(e1);
-    // Let the dead actor release the store before the new daemon opens it.
-    std::thread::sleep(Duration::from_millis(300));
+    stop(e1);
     (rig, db, team, release_tx)
 }
 
@@ -2545,8 +2556,8 @@ fn t6_restart_between_the_fold_and_the_dispute_pause_reopens_the_dispute() {
         };
         launch_team(&e, "t6od");
         wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+        stop(e);
     }
-    std::thread::sleep(Duration::from_millis(300));
     // The state a crash between the fold's unit write and the pause leaves behind.
     edit_store(&db, "t6od", |s, _| {
         s.status = SessionStatus::Executing;
@@ -2583,8 +2594,7 @@ fn t6_restart_between_a_members_fold_and_the_review_dispatches_the_review() {
     launch_member_run(&e, "t6or");
     wait_status(&e, "t6or", SessionStatus::Completed);
     let db = e.db.clone();
-    drop(e);
-    std::thread::sleep(Duration::from_millis(300));
+    stop(e);
     // The run never ended in the state being reconstructed: no `path.ended` on the bus or record.
     rig.conn()
         .execute(
@@ -2962,7 +2972,7 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
         "nothing applied before the ack"
     );
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     // The crash window: the retried gate.decided landed and its acknowledgement was persisted
     // (`Acknowledged`, the gate closed) — the apply never ran.
     rig.allow();
@@ -2985,8 +2995,8 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     assert_eq!(plan_revs(&e, "r9b"), (2, 2), "applied at boot");
     assert_eq!(unit_ids(&e, "r9b"), EDITED_UNITS);
@@ -3005,8 +3015,7 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
     let decided = types.iter().position(|t| t == tev::GATE_DECIDED).unwrap();
     let proposed = types.iter().rposition(|t| t == tev::PLAN_PROPOSED).unwrap();
     assert!(decided < proposed, "{types:?}");
-    drop(e);
-    std::thread::sleep(Duration::from_millis(300));
+    stop(e);
     let e = engine_on(&db, fast(&rig));
     assert_eq!(
         plan_revs(&e, "r9b"),
@@ -3144,7 +3153,7 @@ fn a_noted_edit_applied_at_boot_lands_its_note_once_1139() {
         "nothing lands before the ack"
     );
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     rig.allow();
     let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
     let mut session = crate::domain::get_session(&store, "nb").unwrap().unwrap();
@@ -3166,13 +3175,12 @@ fn a_noted_edit_applied_at_boot_lands_its_note_once_1139() {
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     assert_eq!(unit_ids(&e, "nb"), EDITED_UNITS, "applied at boot");
     assert_eq!(noted_units(&e, "nb", note), [("make".to_string(), 1)]);
-    drop(e);
-    std::thread::sleep(Duration::from_millis(300));
+    stop(e);
     let e = engine_on(&db, fast(&rig));
     assert_eq!(
         noted_units(&e, "nb", note),
@@ -3340,7 +3348,7 @@ fn a_held_plan_whose_row_is_already_answered_is_answered_through_the_plan_arm() 
     let e = engine(&rig, fast(&rig));
     at_the_plan_gate(&rig, &e, "r10a");
     let db = e.db.clone();
-    drop(e);
+    stop(e);
     let mut store = wicked_apps_core::open_store_any(Some(&db)).expect("store opens");
     crate::interaction::resolve_open_for_session(
         &mut store,
@@ -3350,8 +3358,8 @@ fn a_held_plan_whose_row_is_already_answered_is_answered_through_the_plan_arm() 
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     let _ = e.core.confirm_gate("r10a", approve(None));
     wait_for("plan.accepted", || {

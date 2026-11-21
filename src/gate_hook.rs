@@ -2638,6 +2638,13 @@ thread_local! {
     static SHELL_SCAN: std::cell::Cell<Option<ShellScanState>> = const { std::cell::Cell::new(None) };
 }
 
+#[cfg(test)]
+thread_local! {
+    /// TEST-ONLY (core#1293): every byte handed to a [`ShellScanGuard::scan`] on this thread,
+    /// extended or not, fresh-budget rejudges included. The scan's work, counted instead of timed.
+    static SHELL_SCAN_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 struct ShellScanGuard {
     previous: Option<ShellScanState>,
     extended: bool,
@@ -2656,6 +2663,8 @@ impl ShellScanGuard {
     }
 
     fn scan(command: &str, read_scan: bool) -> Self {
+        #[cfg(test)]
+        SHELL_SCAN_SEEN.with(|seen| seen.set(seen.get() + command.len()));
         SHELL_SCAN.with(|slot| {
             let previous = slot.get();
             let mut state = previous.unwrap_or_default();
@@ -13282,9 +13291,11 @@ mod boundary_tests {
             write: vec![scratch.clone()],
             read: vec![],
         };
-        for count in [10_000, 100] {
+        // (core#1293) Bounded is judged by the work, never by a clock (a 1 s bound failed on a
+        // loaded macOS runner): the bytes every scan was handed, per byte of command.
+        let scanned = |count: usize| {
             let command = format!("{}true", "env -S ".repeat(count));
-            let start = std::time::Instant::now();
+            SHELL_SCAN_SEEN.with(|seen| seen.set(0));
             assert_eq!(
                 boundary_denial_with(
                     &roots,
@@ -13296,7 +13307,26 @@ mod boundary_tests {
                 ),
                 None
             );
-            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            (SHELL_SCAN_SEEN.with(std::cell::Cell::get), command.len())
+        };
+        let (shallow, shallow_len) = scanned(100);
+        // 9 000 levels (63 004 bytes) fit the byte budget, so the recursive scan really walks
+        // the chain; 10 000 (70 004 bytes) exceed it from the first scan.
+        for count in [9_000, 10_000] {
+            let (deep, deep_len) = scanned(count);
+            assert!(
+                deep >= deep_len && shallow >= shallow_len,
+                "every judgment scans its command at least once: {deep}/{deep_len}, \
+                 {shallow}/{shallow_len}"
+            );
+            // Linear: a chain 90-100x deeper costs no more than 16x the shallow one per byte.
+            // Rescanning every `env -S` level (a budget that is not global, or no depth bound)
+            // costs ~depth/2 per byte: thousands of times more here.
+            assert!(
+                deep * shallow_len <= 16 * shallow * deep_len,
+                "the scan grows with the chain's depth ({count} levels): {deep} bytes for \
+                 {deep_len} vs {shallow} for {shallow_len}"
+            );
         }
         shell_read_951_r2_assert_reads(
             &scratch,
@@ -13478,13 +13508,11 @@ mod boundary_tests {
             .map(|d| format!("cd {d}"))
             .collect::<Vec<_>>()
             .join("; ");
-        let start = std::time::Instant::now();
         let cwds = bash_cd_targets_inner(&command, true);
         let candidates = shell_cwd_candidates(vec![base.clone()], &cwds, None);
         // r4's 60 included later destinations resolved against unrelated starting bases.
         assert_eq!(candidates.len(), 31);
         assert!(candidates.contains(&destinations.iter().fold(base.clone(), |p, d| p.join(d))));
-        assert!(start.elapsed() < std::time::Duration::from_secs(2));
         let destinations: Vec<_> = (0..100).map(|i| format!("d{i}")).collect();
         assert_eq!(
             shell_cwd_candidates(vec![base], &destinations, None).len(),
