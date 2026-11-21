@@ -1576,6 +1576,9 @@ mod tests {
             "repo-graphs",
             // core#1699: the k8s seats' replica .git builders (src/k8s/seat.rs GitBuild::build).
             "k8s-replica-git",
+            // core#1102/#1398: the k8s seat image facts cache and the transient image exports.
+            "seat-image-facts",
+            "image-archives",
             "skills",
             // crew-placed by a `join(<state home>, …)`: the chat transcripts (`chats`) and the
             // interactive bridge's docs root + recorder browser (`interactive`).
