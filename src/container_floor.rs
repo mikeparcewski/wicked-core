@@ -3757,6 +3757,7 @@ case "$*" in
 *'get nodes -o json'*) echo '@NODES@';;
 *'get deployment agent-sandbox-controller '*) echo '@CONTROLLER@';;
 *'get crd '*) echo '{}';;
+*' create -f - '*) cat >/dev/null; echo 'Error from server (AlreadyExists): exists' >&2; exit 1;;
 *'apply '*) body=$(cat); printf '%s\n' "$body" >> '@APPLIES@'; case "$body" in *'"kind":"Sandbox"'*) echo test-stop >&2; exit 1;; esac;;
 *'get pod pids-probe-'*) echo '{"metadata":{"labels":{"wicked.dev/owner":"@OWNER@"}},"status":{"phase":"Succeeded"}}';;
 *'logs pids-probe-'*) printf "net=closed\nnet=closed\nnet=closed\n4094\nsh: can't fork\n";;
