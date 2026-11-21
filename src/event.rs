@@ -337,6 +337,17 @@ pub enum CoreEvent {
         ord: u32,
         allow: bool,
     },
+    /// (core#1038) A stale answer was refused without changing state. Emitted once
+    /// by ConfirmGate for a `gate_changed:` error; `ord` names the currently open row,
+    /// or is null when no row is open. Expectations are null when the caller omitted them.
+    GateAnswerRefused {
+        session: String,
+        ord: Option<u32>,
+        expected_ord: Option<u32>,
+        expected_plan_rev: Option<u32>,
+        reason: String,
+        by: String,
+    },
     /// (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `GateDecided`: the criterion gated,
     /// whether the deterministic (layer-1) floor passed, the agent (layer-2) judge's verdict + reasoning
     /// when one ran, the evaluator≠creator second-pass result, and the final `combined` decision
@@ -2146,6 +2157,18 @@ impl CoreEvent {
                 ord,
                 allow,
             } => json!({ "type": "gateDecided", "session": session, "ord": ord, "allow": allow }),
+            CoreEvent::GateAnswerRefused {
+                session,
+                ord,
+                expected_ord,
+                expected_plan_rev,
+                reason,
+                by,
+            } => json!({
+                "type": "gateAnswerRefused", "session": session, "ord": ord,
+                "expectedOrd": expected_ord, "expectedPlanRev": expected_plan_rev,
+                "reason": reason, "by": by,
+            }),
             // (DES-STUDIO-COCKPIT-001 §3 B1) The gate's DEPTH alongside `gateDecided`. camelCase fields;
             // `criterion`/`agentVerdict`/`agentReasoning`/`denialReason` are nullable (Option → null),
             // `evaluatorPass` is a nullable bool (`None` = the evaluator≠creator pass did not run).
@@ -4120,6 +4143,31 @@ mod tests {
         assert_eq!(j["tree"], "abc123");
         assert_eq!(j["reused"], serde_json::json!(["fmt", "typecheck"]));
         assert!(j["restarted"].is_null());
+    }
+
+    /// (core#1038) Refusals carry both the open row and the stale expectation; nullable
+    /// ords stay explicit on the wire so a closed gate cannot look like the expected one.
+    #[test]
+    fn gate_answer_refused_to_json_carries_every_key() {
+        for ord in [Some(2), None] {
+            let j = CoreEvent::GateAnswerRefused {
+                session: "r".into(),
+                ord,
+                expected_ord: Some(1),
+                expected_plan_rev: None,
+                reason: "gate_changed: stale unit".into(),
+                by: "mike".into(),
+            }
+            .to_json();
+            assert_eq!(
+                j,
+                serde_json::json!({
+                    "type": "gateAnswerRefused", "session": "r", "ord": ord,
+                    "expectedOrd": 1, "expectedPlanRev": null,
+                    "reason": "gate_changed: stale unit", "by": "mike",
+                })
+            );
+        }
     }
 
     /// `judgeRerunRequested` names the attempt that re-judges, the attempt whose output it reads,
