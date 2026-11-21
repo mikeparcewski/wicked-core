@@ -3198,8 +3198,7 @@ fn deferred_high_skips_hold_and_council_and_is_rendered_for_review() {
         ledger.findings[0].worker_reason.as_deref(),
         Some("unrelated to failing checks")
     );
-    let mut snap =
-        super::super::UnitTeamSnapshot::stamped(super::super::Transport::Bus, None, None);
+    let mut snap = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
     snap.ledger = Some(ledger);
     let review = super::super::runner::render_for_gate(&snap).unwrap();
     assert!(review.contains("[HIGH] src/lib.rs:3"), "{review}");
