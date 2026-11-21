@@ -4154,7 +4154,8 @@ mod pr_c2_tests {
         let ready = serde_json::json!({"metadata": {"name": "sync", "labels": {
             super::super::OWNER_LABEL: kube.owner, super::super::MANAGED_LABEL: super::super::MANAGED_BY,
             super::super::BOOT_LABEL: super::super::boot_id()}}, "status": {
-            "phase": "Running", "containerStatuses": [{"ready": true}]}});
+            "phase": "Running", "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [{"ready": true}]}});
         let script = format!(
             r#"#!/usr/bin/env python3
 import os, sys, json
