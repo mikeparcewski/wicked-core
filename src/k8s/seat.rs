@@ -2519,7 +2519,10 @@ pub(crate) fn arm(
     drop(_arming);
     // Owned from here: every way out before the caller holds the seat reaps it (review r1: an
     // API error while waiting, or an apply whose reply was lost, leaked the Sandbox).
-    struct Guard(Option<String>);
+    struct Guard(
+        Option<String>,
+        Option<crate::checks_container::DependencyMount>,
+    );
     impl Drop for Guard {
         fn drop(&mut self) {
             if let Some(id) = self.0.take() {
@@ -2527,7 +2530,9 @@ pub(crate) fn arm(
             }
         }
     }
-    let mut guard = Guard(Some(id.clone()));
+    let mut guard = Guard(Some(id.clone()), None);
+    guard.1 = crate::checks_container::dependency_mounts(kube, &ns, s.deps)
+        .map_err(|e| (classify_apply(&e), e))?;
     kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
     super::clock::mark("sandbox_apply");
@@ -2603,6 +2608,9 @@ pub(crate) fn arm(
         }
         std::thread::sleep(Duration::from_millis(200));
     }
+    if let Some(dependencies) = guard.1.take() {
+        dependencies.mounted();
+    }
     super::clock::mark("pod_ready");
     if let Err(e) = deny_check(kube, &ns, &sandbox, s.gateway_ip.is_some()) {
         reap(&id);
@@ -2666,8 +2674,15 @@ pub(crate) fn arm(
     Ok((seat, wrapper))
 }
 
+#[cfg(test)]
+#[test]
+fn named_dependency_refusal_keeps_the_admission_pending_classification() {
+    let error = "admission_pending: dependency claim pvc/wfloor-nm-old was retired";
+    assert_eq!(classify_apply(error), FloorUnarmed::AdmissionPending);
+}
+
 fn classify_apply(e: &str) -> FloorUnarmed {
-    if e.contains("exceeded quota") {
+    if e.starts_with("admission_pending:") || e.contains("exceeded quota") {
         FloorUnarmed::AdmissionPending
     } else if e.contains("Unable to connect")
         || e.contains("connection refused")

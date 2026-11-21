@@ -178,6 +178,11 @@ impl Place {
     pub(crate) fn start(&self, spec: &FloorPod) -> Result<(), String> {
         self.reap_earlier()?;
         let doc = render::floor_pod(spec)?;
+        let dependencies = crate::checks_container::dependency_mounts(
+            &self.kube,
+            &self.ns,
+            spec.claims.iter().map(|(name, _, _)| name.as_str()),
+        )?;
         if let Err(e) = self.kube.apply(&[doc]) {
             self.delete(&spec.name);
             return Err(format!("the {} pod was not admitted: {e}", spec.role));
@@ -188,6 +193,9 @@ impl Place {
             match self.kube.get_json(Some(&self.ns), "pod", &spec.name) {
                 Ok(Some(p)) => {
                     if cluster::running_pod(std::slice::from_ref(&p)).is_some() {
+                        if let Some(dependencies) = &dependencies {
+                            dependencies.mounted();
+                        }
                         return Ok(());
                     }
                     if let Some(why) = stuck(&p) {
@@ -268,6 +276,8 @@ impl Place {
 
     /// Ensure the claim `name` exists in this place (idempotent).
     pub(crate) fn claim(&self, name: &str, size: &str) -> Result<(), String> {
+        let _admission =
+            crate::checks_container::admit_dependency_claim(&self.kube, &self.ns, name)?;
         self.kube
             .apply(&[render::pvc(&self.ns, &self.kube.owner, name, size)])
             .map_err(|e| {
