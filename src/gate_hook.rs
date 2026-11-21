@@ -1054,7 +1054,6 @@ fn boundary_denial_judged(
     // (container / Seatbelt) is the hermetic layer; this scan closes direct, literal escapes only.
     // An existing absolute path used as a SEARCH PATTERN (`rg '/etc/hosts' src/`) is also
     // judged as an operand: a rare advisory false positive accepted by the program-agnostic scan.
-    // A heredoc piped into a shell (`cat <<'EOF' | sh`) is also an accepted literal-scan limit.
     // A data heredoc nested inside a shell-fed heredoc (`sh <<'SCRIPT'` containing
     // `cat <<'DATA'`) can expose literal data to the operand scan: an accepted advisory
     // false positive when that data names an existing path outside the boundary.
@@ -1098,17 +1097,19 @@ fn boundary_denial_judged(
                 (directory_bases, read_targets) =
                     shell_cwd_walk(directory_bases, &[raw.to_string()], home);
             }
-            // (core#1461) `cd <absolute> && …` with nothing that runs after a failed `cd`: every
-            // later write starts there, never in a cwd an earlier call left the shell in.
-            if let Some(dir) =
-                leading_cd_dominates(command, home.filter(|_| !command_may_set_home(command)))
-            {
-                bases = vec![dir];
-            }
             let mut operands = ShellOperands::default();
             // Keep the real home for reads even when the command may set HOME. Clearing it
             // would silently drop home-relative reads instead of conservatively judging them.
             collect_shell_operands(command, home, &mut operands);
+            // (core#1461) A successful leading `cd` settles later writes only when the operand
+            // scan could see every cwd change; exhaustion keeps every candidate (core#1470).
+            if !operands.incomplete {
+                if let Some(dir) =
+                    leading_cd_dominates(command, home.filter(|_| !command_may_set_home(command)))
+                {
+                    bases = vec![dir];
+                }
+            }
             let mut write_cwds = bash_cd_targets_inner(command, true);
             let mut candidates = shell_cwd_candidates(bases.clone(), &write_cwds, home);
             for candidate in shell_cwd_candidates(bases, &operands.cwds, home) {
@@ -1651,7 +1652,7 @@ pub(crate) fn bash_write_phase_scope(
 /// any operator inside `'…'`/`"…"` are kept verbatim in the current token — split only the bare ones.
 ///
 /// (core#1465) A bare line break ends a command as `;` does, so it is the token `;` (a heredoc's
-/// header and body lines keep today's whitespace reading: the body is the program's data), and a
+/// data header and body lines keep the whitespace reading), and a
 /// glued control operator (`-&&sed`, `true||x`, `a|tee f`, `x&y`) is split off as its own token.
 /// The redirect spellings `>&`, `<&`, `>|` and `&>` stay inside their word, as the redirect scans
 /// read them. Comments are not modelled: a `#` and the words after it stay tokens, so a comment
@@ -1679,8 +1680,9 @@ fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<Stri
 }
 
 /// The lexer behind [`shell_tokens`] and [`shell_tokens_with_operators`]. `heredoc` lists the
-/// lines (0-based, sorted) whose line break ends a heredoc header or body line, where no command
-/// ends; it is read only when `split_operators` is false.
+/// lines (0-based, sorted) whose line break ends a data heredoc header or body line, where no
+/// command ends; it is read only when `split_operators` is false. A shell's body is not listed:
+/// its line breaks separate its commands (core#1470).
 fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -1695,12 +1697,15 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
             .binary_search(&at)
             .is_ok_and(|line| heredoc.binary_search(&line).is_ok())
     };
+    let line_of = |at: usize| breaks.partition_point(|b| *b < at);
     // A heredoc's body (or closing delimiter) line: the line before it ends inside the heredoc.
     // Its text is the program's data, read as before: no glued operator is split there.
-    let in_body = |at: usize| {
-        let line = breaks.partition_point(|b| *b < at);
-        line > 0 && heredoc.binary_search(&(line - 1)).is_ok()
-    };
+    let in_body = |line: usize| line > 0 && heredoc.binary_search(&(line - 1)).is_ok();
+    // (core#1470) The closing delimiter line of a data body: the body is data, so a quote it left
+    // open ends with it, and the command after the delimiter is read as a command. Inside the body
+    // nothing changes (a quote there still keeps its text literal, as before).
+    let closes_body = |line: usize| in_body(line) && heredoc.binary_search(&line).is_err();
+    let mut line_now = 0usize;
     // A `${…}` operand, `$[…]` arithmetic, a backtick substitution or a `$'…'` string may hold a
     // line break or `||` that is not a separator of the outer command (`rm -- -${X:-a|| ../f}`
     // removes `../f`), and this lexer does not track those contexts: a command holding any of
@@ -1715,6 +1720,16 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
         }
     };
     while let Some((ch, at)) = chars.next() {
+        let line = if split_operators { 0 } else { line_of(at) };
+        let data = in_body(line);
+        if line != line_now {
+            line_now = line;
+            if closes_body(line) && (in_single || in_double) {
+                in_single = false;
+                in_double = false;
+                flush(&mut cur, &mut out);
+            }
+        }
         if in_single {
             // Single quotes are fully literal — not even `\` escapes; only a closing `'` ends them.
             cur.push(ch);
@@ -1764,7 +1779,7 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
                 }
                 out.push(";".to_string());
             }
-            '\n' if split_operators || !(expansion || in_heredoc(at)) => {
+            '\n' if split_operators || (!in_heredoc(at) && (!expansion || data)) => {
                 flush(&mut cur, &mut out);
                 out.push(";".to_string());
             }
@@ -1799,7 +1814,7 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
                 let redirect = cur.strip_suffix(['>', '<']).is_some_and(|before| {
                     before.chars().rev().take_while(|b| *b == '\\').count() % 2 == 0
                 });
-                if redirect || expansion || in_body(at) {
+                if redirect || expansion || data {
                     cur.push(c);
                     continue;
                 }
@@ -1828,31 +1843,32 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> 
     out
 }
 
-/// (core#1465) The lines (0-based, sorted) whose line break ends a heredoc's header line or one of
-/// its body lines (any receiver). The closing delimiter line is not one of them (unless another
-/// heredoc of the same header follows): the next command starts after it. Only a plain delimiter
-/// ([`plain_heredoc_word`]) is read; any other spelling (`$'E'`, `E'O'F`) might close where this
-/// scan does not, so its line breaks stay separators.
+/// (core#1465, core#1470) The lines (0-based, sorted) whose line break ends a data heredoc's header
+/// or body line. Only shell bodies keep command separators. The closing delimiter is not one (unless
+/// another data heredoc of the same header follows): the next command starts after it. Only a
+/// plain delimiter ([`plain_heredoc_word`]) is read; another spelling (`$'E'`, `E'O'F`) might close
+/// where this scan does not, so its line breaks stay separators.
 fn heredoc_lines(command: &str) -> Vec<usize> {
     let lines: Vec<&str> = command.split('\n').collect();
     let last = lines.len().saturating_sub(1);
     let mut out = Vec::new();
-    let mut pending: std::collections::VecDeque<(String, bool)> = std::collections::VecDeque::new();
+    let mut pending: std::collections::VecDeque<Heredoc> = std::collections::VecDeque::new();
+    let mut quotes = HeredocQuotes::default();
     let mut i = 0usize;
     while i < lines.len() {
         let line = lines[i];
-        if let Some((delim, dash)) = pending.front() {
-            let probe = if *dash {
+        if let Some(h) = pending.front() {
+            let probe = if h.dash {
                 line.trim_start_matches('\t')
             } else {
                 line
             };
-            if probe == delim {
+            if probe == h.delim {
                 pending.pop_front();
-                if !pending.is_empty() {
+                if pending.front().is_some_and(|next| !next.shell) {
                     out.push(i);
                 }
-            } else {
+            } else if !h.shell {
                 out.push(i);
             }
             i += 1;
@@ -1864,10 +1880,12 @@ fn heredoc_lines(command: &str) -> Vec<usize> {
             header.push('\n');
             header.push_str(lines[i]);
         }
-        let found = heredocs_in(&header, true, false);
+        let found = heredocs_in(&header, true, false, &mut quotes);
         if !found.is_empty() && found.iter().all(|h| plain_heredoc_word(&h.word)) {
-            out.push(i);
-            pending.extend(found.into_iter().map(|h| (h.delim, h.dash)));
+            if !found[0].shell {
+                out.push(i);
+            }
+            pending.extend(found);
         }
         i += 1;
     }
@@ -1877,38 +1895,106 @@ fn heredoc_lines(command: &str) -> Vec<usize> {
 
 /// (core#552) `command` with the BODY lines of every quoted-delimiter heredoc (`<<'EOF'`,
 /// `<<"EOF"`, `<<\EOF`, and their `<<-` forms) fed to a data sink (`cat`, `tee`) blanked, up to
-/// and including the line that closes it. A heredoc fed to any other program (a shell, an
-/// interpreter) is a script it RUNS, so its body stays scanned. The operator counts only OUTSIDE quotes on its line (a quoted `"<<'EOF'"` starts nothing,
+/// and including the line that closes it. A heredoc fed to a shell is a shell script it RUNS,
+/// so its body stays scanned. Other interpreter bodies keep the ordinary token reading.
+/// The operator counts only OUTSIDE quotes on its line (a quoted `"<<'EOF'"` starts nothing,
 /// so a command hidden under a fake body is still scanned); `<<<` (a here-string) is not a
 /// heredoc. An unquoted delimiter leaves its body in place: the shell expands `$(…)` there.
 fn strip_quoted_heredoc_bodies(command: &str) -> String {
     let mut out: Vec<&str> = Vec::new();
-    let mut close: Option<(String, bool)> = None;
+    let mut pending: std::collections::VecDeque<(Heredoc, bool)> =
+        std::collections::VecDeque::new();
+    let mut quotes = HeredocQuotes::default();
     for line in command.split('\n') {
-        if let Some((delim, dash)) = &close {
-            let probe = if *dash {
+        if let Some((h, blank)) = pending.front() {
+            let probe = if h.dash {
                 line.trim_start_matches('\t')
             } else {
                 line
             };
-            if probe == delim {
-                close = None;
+            out.push(if *blank { "" } else { line });
+            if probe == h.delim {
+                pending.pop_front();
             }
-            out.push("");
             continue;
         }
         out.push(line);
-        close = quoted_heredoc_on(line);
+        let mut blank_quotes = quotes;
+        let close = quoted_heredoc_on(line, &mut blank_quotes);
+        // Also skip discovery inside unquoted data: its quotes are literal, even though the
+        // write scan must retain the body for substitutions (core#1470).
+        pending.extend(
+            heredocs_in(line, true, false, &mut quotes)
+                .into_iter()
+                .filter(|h| !h.shell)
+                .map(|h| {
+                    let blank = close
+                        .as_ref()
+                        .is_some_and(|(delim, dash)| *delim == h.delim && *dash == h.dash);
+                    (h, blank)
+                }),
+        );
     }
     out.join("\n")
+}
+
+/// Scan script bodies in their own quote context, and blank them in the outer command without
+/// changing its lines. An unmatched quote in a child script cannot hide the next outer command
+/// after its delimiter (core#1470). Uncertain delimiters stay visible to the ordinary scan.
+fn split_script_heredocs(command: &str) -> (String, Vec<String>) {
+    let mut out = Vec::new();
+    let mut scripts = Vec::new();
+    let mut pending: std::collections::VecDeque<(Heredoc, String)> =
+        std::collections::VecDeque::new();
+    let mut quotes = HeredocQuotes::default();
+    let mut lines = command.split('\n');
+    while let Some(line) = lines.next() {
+        if let Some((h, body)) = pending.front_mut() {
+            let probe = if h.dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            out.push(if h.shell { "" } else { line }.to_string());
+            if probe == h.delim {
+                let (h, body) = pending.pop_front().unwrap();
+                if h.shell {
+                    scripts.push(body);
+                }
+            } else if h.shell {
+                body.push_str(probe);
+                body.push('\n');
+            }
+            continue;
+        }
+        let mut header = line.to_string();
+        while header.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1 {
+            let Some(next) = lines.next() else { break };
+            header.push('\n');
+            header.push_str(next);
+        }
+        let found = heredocs_in(&header, true, false, &mut quotes);
+        if found.iter().all(|h| plain_heredoc_word(&h.word)) {
+            pending.extend(found.into_iter().map(|h| (h, String::new())));
+        }
+        out.push(header);
+    }
+    // A shell also consumes the remaining input when a delimiter is missing. Keep those writes
+    // visible rather than treating an unfinished script body as data (core#1470).
+    scripts.extend(
+        pending
+            .into_iter()
+            .filter_map(|(h, body)| h.shell.then_some(body)),
+    );
+    (out.join("\n"), scripts)
 }
 
 /// The delimiter (and `<<-` flag) of the quoted-delimiter heredoc operator on `line` that sits
 /// outside quotes, or `None`. FAIL-CLOSED on a line with more than one heredoc operator: the
 /// bodies follow one another (`cat <<EOF <<'DATA'` — the first, unquoted, body is EXPANDED by the
 /// shell), and blanking up to the last delimiter would hide the expanded one, so none is stripped.
-fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
-    heredocs_on(line, false)
+fn quoted_heredoc_on(line: &str, quotes: &mut HeredocQuotes) -> Option<(String, bool)> {
+    heredocs_on(line, false, quotes)
         .into_iter()
         .next()
         .map(|h| (h.delim, h.dash))
@@ -1918,6 +2004,7 @@ fn quoted_heredoc_on(line: &str) -> Option<(String, bool)> {
 fn strip_read_heredoc_bodies(command: &str) -> String {
     let mut out = Vec::new();
     let mut pending = std::collections::VecDeque::new();
+    let mut quotes = HeredocQuotes::default();
     let mut lines = command.split('\n');
     while let Some(line) = lines.next() {
         if let Some((delim, dash, executable)) = pending.front() {
@@ -1942,7 +2029,7 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
                 header.push_str(next);
             }
             pending.extend(
-                heredocs_on(&header, true)
+                heredocs_on(&header, true, &mut quotes)
                     .into_iter()
                     .map(|h| (h.delim, h.dash, h.executable)),
             );
@@ -1952,10 +2039,25 @@ fn strip_read_heredoc_bodies(command: &str) -> String {
     out.join("\n")
 }
 
-fn heredoc_runs_script(header: &str, operator: usize) -> bool {
+#[derive(Default)]
+struct HeredocReceiver {
+    executable: bool,
+    shell: bool,
+}
+
+fn heredoc_runs_script(header: &str, operator: usize) -> HeredocReceiver {
     let scan = ShellScanGuard::scan(header, true);
     if !scan.extended {
-        return false;
+        return HeredocReceiver::default();
+    }
+    heredoc_runs_script_inner(header, operator, 0)
+}
+
+/// Classify receivers without charging lexing to the operand budget (core#1470). Inline shells
+/// still have a depth bound; only consumers in this pipeline can run the body's text.
+fn heredoc_runs_script_inner(header: &str, operator: usize, depth: usize) -> HeredocReceiver {
+    if depth >= MAX_SHELL_SCAN_DEPTH {
+        return HeredocReceiver::default();
     }
     let owned = shell_tokens_with_operators(header, true);
     let separator =
@@ -1964,41 +2066,50 @@ fn heredoc_runs_script(header: &str, operator: usize) -> bool {
         .iter()
         .filter(|t| separator(t))
         .count();
-    let segment = owned
-        .split(separator)
-        .nth(segment_index)
-        .unwrap_or_default();
-    let mut skip_operand = false;
-    let words: Vec<_> = segment
-        .iter()
-        .filter_map(|token| {
-            if std::mem::take(&mut skip_operand) {
-                None
-            } else if let Some(takes_next) = redirection_operand(token) {
-                skip_operand = takes_next;
-                None
-            } else {
-                Some(token.as_str())
+    let mut result = HeredocReceiver::default();
+    for segment in owned.split_inclusive(separator).skip(segment_index) {
+        let mut skip_operand = false;
+        let words: Vec<_> = segment
+            .iter()
+            .filter_map(|token| {
+                if separator(token) || std::mem::take(&mut skip_operand) {
+                    None
+                } else if let Some(takes_next) = redirection_operand(token) {
+                    skip_operand = takes_next;
+                    None
+                } else {
+                    Some(token.as_str())
+                }
+            })
+            .collect();
+        let receiver = match unwrap_program_with_reads(&words, false, |_| {}) {
+            Unwrapped::Program { idx, .. } => {
+                let program = words.get(idx).map(|word| program_basename(word));
+                let shell = matches!(program, Some("sh" | "bash" | "zsh" | "dash" | "ksh"));
+                HeredocReceiver {
+                    executable: shell
+                        || matches!(
+                            program,
+                            Some("python" | "python3" | "node" | "perl" | "ruby")
+                        ),
+                    shell,
+                }
             }
-        })
-        .collect();
-    match unwrap_program_with_reads(&words, false, |_| {}) {
-        Unwrapped::Program { idx, .. } => words.get(idx).is_some_and(|word| {
-            matches!(
-                program_basename(word),
-                "sh" | "bash"
-                    | "zsh"
-                    | "dash"
-                    | "ksh"
-                    | "python"
-                    | "python3"
-                    | "node"
-                    | "perl"
-                    | "ruby"
-            )
-        }),
-        Unwrapped::Inline { inner, .. } => heredoc_runs_script(&inner, inner.len()),
+            Unwrapped::Inline { inner, .. } => {
+                heredoc_runs_script_inner(&inner, inner.len(), depth + 1)
+            }
+        };
+        result.executable |= receiver.executable;
+        result.shell |= receiver.shell;
+        if result.shell
+            || !segment
+                .last()
+                .is_some_and(|t| matches!(t.as_str(), "|" | "|&"))
+        {
+            break;
+        }
     }
+    result
 }
 
 /// The text of the word `rest` starts with: up to its first blank or operator character outside
@@ -2044,35 +2155,48 @@ struct Heredoc {
     delim: String,
     /// `<<-`: leading tabs are stripped from the body and the delimiter line.
     dash: bool,
-    /// A script program reads the body (read scan with classification only).
+    /// A shell/interpreter in this pipeline runs the body as a script (core#1470).
     executable: bool,
+    /// Only a shell receiver's body is shell syntax for the write scan.
+    shell: bool,
     /// The delimiter word as spelled.
     word: String,
     /// The delimiter word starts quoted or escaped (`'E'`, `"E"`, `\E`): the body is literal.
     quoted: bool,
 }
 
-fn heredocs_on(line: &str, read_scan: bool) -> Vec<Heredoc> {
-    heredocs_in(line, read_scan, read_scan)
+/// Quote state survives physical lines, so quoted `<<` text cannot invent a body (core#1470).
+#[derive(Clone, Copy, Default)]
+struct HeredocQuotes {
+    single: bool,
+    double: bool,
 }
 
-/// Each heredoc operator on `line`. `classify` asks whether a script program reads each body,
-/// a nested scan charged to the shell-scan budget: a caller that only needs where bodies are
-/// passes `false`.
-fn heredocs_in(line: &str, read_scan: bool, classify: bool) -> Vec<Heredoc> {
+fn heredocs_on(line: &str, read_scan: bool, quotes: &mut HeredocQuotes) -> Vec<Heredoc> {
+    heredocs_in(line, read_scan, read_scan, quotes)
+}
+
+/// Each heredoc operator outside `quotes` on `line`. `classify` charges receiver classification
+/// to the operand budget; lexing classifies without spending that budget (core#1470).
+fn heredocs_in(
+    line: &str,
+    read_scan: bool,
+    classify: bool,
+    quotes: &mut HeredocQuotes,
+) -> Vec<Heredoc> {
     let b = line.as_bytes();
-    let (mut i, mut sq, mut dq) = (0usize, false, false);
+    let mut i = 0usize;
     let mut found = Vec::new();
     let mut operators = 0usize;
     while i < b.len() {
         let c = b[i];
-        if sq {
-            sq = c != b'\'';
-        } else if dq {
+        if quotes.single {
+            quotes.single = c != b'\'';
+        } else if quotes.double {
             if c == b'\\' {
                 i += 1;
             } else if c == b'"' {
-                dq = false;
+                quotes.double = false;
             }
         } else if read_scan
             && c == b'#'
@@ -2083,9 +2207,9 @@ fn heredocs_in(line: &str, read_scan: bool, classify: bool) -> Vec<Heredoc> {
         } else if c == b'\\' {
             i += 1;
         } else if c == b'\'' {
-            sq = true;
+            quotes.single = true;
         } else if c == b'"' {
-            dq = true;
+            quotes.double = true;
         } else if c == b'<' && b.get(i + 1) == Some(&b'<') && b.get(i + 2) == Some(&b'<') {
             // `<<<` is a here-string, not a heredoc: step over ALL of it, or its second and third
             // `<` would read as a heredoc operator (codex round 2 on batch 3).
@@ -2134,8 +2258,16 @@ fn heredocs_in(line: &str, read_scan: bool, classify: bool) -> Vec<Heredoc> {
             let piped_on = line[i..].contains('|');
             let data_sink = !piped_on && matches!(program, Some("cat" | "tee"));
             if (read_scan && !word.is_empty()) || (!delim.is_empty() && quoted && data_sink) {
+                let receiver = if !read_scan {
+                    HeredocReceiver::default()
+                } else if classify {
+                    heredoc_runs_script(line, i)
+                } else {
+                    heredoc_runs_script_inner(line, i, 0)
+                };
                 found.push(Heredoc {
-                    executable: classify && heredoc_runs_script(line, i),
+                    executable: receiver.executable,
+                    shell: receiver.shell,
                     delim,
                     dash,
                     word: word.clone(),
@@ -2569,11 +2701,14 @@ struct ShellOperands {
     /// attached value (`grep --exclude-dir=wicked-worktrees`) names what the program skips.
     whole_reads: Vec<String>,
     cwds: Vec<String>,
+    /// An operand scan exhausted its budget, so cwd dominance is unproved (core#1470).
+    incomplete: bool,
 }
 
 fn collect_shell_operands(command: &str, home: Option<&Path>, out: &mut ShellOperands) {
     let _scan = ShellScanGuard::scan(command, true);
     if !_scan.extended {
+        out.incomplete = true;
         return;
     }
     let command = strip_read_heredoc_bodies(command);
@@ -2892,6 +3027,7 @@ fn data_heredocs_removed(command: &str) -> Option<String> {
     }
     let mut out: Vec<&str> = Vec::new();
     let mut pending: Option<Heredoc> = None;
+    let mut quotes = HeredocQuotes::default();
     for line in command.split('\n') {
         if let Some(h) = &pending {
             let probe = if h.dash {
@@ -2906,7 +3042,7 @@ fn data_heredocs_removed(command: &str) -> Option<String> {
             }
             continue;
         }
-        let mut found = heredocs_in(line, true, false);
+        let mut found = heredocs_in(line, true, false, &mut quotes);
         if found.is_empty() {
             out.push(line);
             continue;
@@ -3239,7 +3375,21 @@ fn collect_bash_write_targets(
     // words are no command's arguments: `tee docs/x.md <<'EOF'` naming `/var/log/app.log` in its
     // body writes only `docs/x.md`. An unquoted heredoc's body still expands `$(…)`, so it stays.
     let original = command;
-    let command = &strip_quoted_heredoc_bodies(command);
+    // Script heredocs are separate programs, with their own command boundaries and quotes
+    // (core#1470). Bound nested script rescans even in the legacy budget fallback.
+    let rescan = SHELL_SCAN.with(|slot| {
+        slot.get()
+            .is_some_and(|state| state.depth < MAX_SHELL_SCAN_DEPTH)
+    });
+    let (outer, scripts) = if rescan {
+        split_script_heredocs(command)
+    } else {
+        (command.to_string(), Vec::new())
+    };
+    for script in scripts {
+        collect_bash_write_targets(&script, unwrap_inline, home, targets);
+    }
+    let command = &strip_quoted_heredoc_bodies(&outer);
     let owned = shell_tokens_blanked(command, original);
     let toks: Vec<&str> = owned.iter().map(String::as_str).collect();
 
@@ -13752,6 +13902,136 @@ mod boundary_tests {
             None
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A leading `cd` through a self-link must judge later parents physically (core#1469).
+    #[cfg(unix)]
+    #[test]
+    fn a_leading_cd_through_a_self_link_cannot_hide_a_parent_escape_1469() {
+        let base = std::env::temp_dir().join(format!("gate-cd-parent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&wt, wt.join("self")).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        for command in [
+            format!("cd {}/self/sub && cat > ../../escape", wt.display()),
+            format!("cd {}/self/sub/../.. && cat > escape", wt.display()),
+        ] {
+            let denial = boundary_denial_with(
+                &roots,
+                &wt,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+            );
+            assert!(
+                denial.is_some(),
+                "the redirect leaves the physical worktree"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An unfinished operand scan cannot prove the leading `cd` settles every write's cwd;
+    /// keep the other candidate when the command exceeds the scan budget (core#1470).
+    #[cfg(unix)]
+    #[test]
+    fn a_leading_cd_keeps_other_cwds_when_the_operand_scan_exceeds_its_budget_1470() {
+        // The fixture path must not hold the word `cd`: leading_cd refuses any later word naming
+        // a directory move.
+        let base =
+            std::env::temp_dir().join(format!("gate-dominance-budget-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let wt = base.join("wt");
+        let other = base.join("other");
+        std::fs::create_dir_all(&wt).unwrap();
+        std::fs::create_dir_all(&other).unwrap();
+        let wt = std::fs::canonicalize(wt).unwrap();
+        let other = std::fs::canonicalize(other).unwrap();
+        let roots = crate::path_policy::AllowedRoots {
+            write: vec![wt.clone()],
+            read: vec![],
+        };
+        let command = format!(
+            "cd {} && env -C {} touch f {}",
+            wt.display(),
+            other.display(),
+            "x".repeat(MAX_SHELL_SCAN_BYTES)
+        );
+        assert_eq!(leading_cd_dominates(&command, None), Some(wt.clone()));
+        assert!(
+            boundary_denial_with(
+                &roots,
+                &other,
+                None,
+                None,
+                &json!({ "command": command }),
+                "Bash",
+            )
+            .is_some(),
+            "the write must also be judged under the other cwd, or refused"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Multiline quotes cannot invent heredocs, data quotes cannot swallow the next command,
+    /// and only a shell heredoc's line breaks separate its commands (core#1470).
+    #[test]
+    fn the_write_scan_sees_commands_around_data_and_inside_script_heredocs_1470() {
+        for cmd in [
+            "echo 'a\ncat <<E\n'\ntouch /outside/f\nE",
+            "echo \"a\ncat <<'E'\n\"\ntouch /outside/f\nE",
+            "cat <<EOF\n'\nEOF\ntouch /outside/f",
+            "cat <<EOF\n\"\nEOF\ntouch /outside/f",
+            "wc -l <<'E'\n$(echo ')\nE\ntouch /outside/f",
+            "wc -l <<\"E\"\n$(echo ')\nE\ntouch /outside/f",
+            "wc -l <<\\E\n$(echo ')\nE\ntouch /outside/f",
+            "wc -l <<'E'\n`echo '\nE\ntouch /outside/f",
+            "wc -l <<\"E\"\n`echo '\nE\ntouch /outside/f",
+            "wc -l <<\\E\n`echo '\nE\ntouch /outside/f",
+            "bash <<'E'\ntouch /outside/f\nE",
+            "cat <<'E' | sh\ntouch /outside/f\nE",
+            "bash <<'E'\ncp a /outside/f\nE",
+            "sh <<'E'\ncp a /outside/f\nE",
+            "zsh <<'E'\ncp a /outside/f\nE",
+            "dash <<'E'\ncp a /outside/f\nE",
+            "ksh <<'E'\ncp a /outside/f\nE",
+            "cat <<'E' | sh\ncp a /outside/f\nE",
+            "env bash <<'E'\ncp a /outside/f\nE",
+            "sh -c 'bash' <<'E'\ncp a /outside/f\nE",
+            "bash <<'E'\n'\nE\ntouch /outside/f",
+        ] {
+            let targets = bash_write_targets(cmd);
+            assert!(
+                targets.iter().any(|t| t == "/outside/f"),
+                "{cmd:?}: {targets:?}"
+            );
+        }
+        for cmd in [
+            "cat <<E\ntouch /outside/f\nE",
+            "cat <<'E'\ntouch /outside/f\nE",
+            "cat <<E\n'\ntouch /outside/f\nE",
+            "python <<'EOF'\ncp a /outside/f\nEOF",
+            "python3 <<'EOF'\ncp a /outside/f\nEOF",
+            "node <<'EOF'\ncp a /outside/f\nEOF",
+            "perl <<'EOF'\ncp a /outside/f\nEOF",
+            "ruby <<'EOF'\ncp a /outside/f\nEOF",
+            "env python3 <<'EOF'\ncp a /outside/f\nEOF",
+            "sh -c 'node' <<'EOF'\ncp a /outside/f\nEOF",
+            // A quote inside a data body still keeps its text literal, as on main: a body's
+            // quoted `>` or `tee` is no write (the sourced report's stdin packet, CS3).
+            "cat <<'P' | checker --packet -\n{\"t\":\"A > /outside/f, and tee /outside/g\"}\nP",
+            "python3 <<'EOF'\nprint(\"a > /outside/f\")\nEOF",
+            "wc -l <<E\nsay 'x > /outside/f'\nE",
+        ] {
+            let targets = bash_write_targets(cmd);
+            assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
+        }
     }
 
     /// core#1465: the Bash write scan reads a command after a bare line break or a glued control
