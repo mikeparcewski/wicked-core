@@ -35356,10 +35356,11 @@ mod def_gate_disclosure_tests {
         let pre_fold = body.split(marker).next().expect("text before the marker");
         assert_eq!(
             pre_fold.matches(gate_call).count(),
-            6,
-            "the substance gate, the deliverable floor, the dead-seat worker exit (core#461), the \
-             demo floor, the demo plan snapshot (core#1249) and the editor conformance floor \
-             (DES-EDITOR-CONFORMANCE-HOST) each open the escalation gate"
+            7,
+            "the substance gate, the write-set floor (core#1344), the deliverable floor, the \
+             dead-seat worker exit (core#461), the demo floor, the demo plan snapshot (core#1249) \
+             and the editor conformance floor (DES-EDITOR-CONFORMANCE-HOST) each open the \
+             escalation gate"
         );
     }
 
