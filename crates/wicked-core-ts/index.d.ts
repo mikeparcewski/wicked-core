@@ -563,6 +563,12 @@ export declare class Core {
    */
   registerRepo(name: string, rootPath: string): Promise<string>
   /**
+   * Unregister a repository; resolves to the JSON literal `true`, or `false` for an unknown id.
+   * Rejects with `repo_in_use: ` for live runs or graph leases, or `repo_in_project: ` for
+   * project memberships. Leaves the checkout folder, code graph database, and worktrees on disk.
+   */
+  unregisterRepo(repoId: string): Promise<string>
+  /**
    * (rejudge) Whether the run's open gate can RE-RUN ITS JUDGE now, as a JSON
    * `RejudgeReadiness` object: `{applies, available, ord, eligible, missing: [{seat, reason}],
    * reason}`. `applies` — the gate is a unit's `judge_unavailable` denial; `available` — the

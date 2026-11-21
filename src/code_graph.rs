@@ -1120,6 +1120,16 @@ pub(crate) fn lease_graph(db: &Path, run_id: &str, base: Option<&str>) {
         .insert(run_id.to_string(), base.map(str::to_string));
 }
 
+/// Every run holding this graph, regardless of its base or persisted session status.
+pub(crate) fn graph_lease_holders(db: &Path) -> Vec<String> {
+    GRAPH_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(db)
+        .map(|runs| runs.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 pub(crate) fn release_graph_lease(run_id: &str) {
     GRAPH_LEASES
         .lock()
