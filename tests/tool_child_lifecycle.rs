@@ -272,8 +272,9 @@ fn cancel_run_kills_the_live_tool_child_and_its_group_and_the_frame_follows_run_
     assert_eq!(status, SessionStatus::Cancelled);
 
     // 3. The kill frame follows runCancelled — within 5 s (one 50 ms poll tick + a bounded reap).
-    //    AC2: runCancelled must carry tool_children_killed >= 1 (the actor killed the group
-    //    synchronously BEFORE emitting the event).
+    //    AC2: runCancelled must carry tool_children_killed >= 1 (the actor sent the group
+    //    SIGTERM BEFORE emitting the event; since core#1409 the count is the groups signalled,
+    //    and the grace and SIGKILL run off the actor).
     let post = collect_until(
         &ev,
         Duration::from_secs(5),

@@ -1420,6 +1420,9 @@ pub(crate) fn run(
             Command::WorktreeCleanupPending { run_id, reply } => {
                 let _ = reply.send(worktree_cleanup::is_pending(&store, &run_id));
             }
+            Command::Project { run_id, reply } => {
+                let _ = reply.send(project_view(&store, &run_id));
+            }
             Command::WorkOutput(unit_id, reply) => {
                 // The OPERATOR transcript read (usability review #1): a rejected unit answers with
                 // whatever PARTIAL output existed at rejection — the unit record's status/denial
@@ -22837,6 +22840,31 @@ pub(crate) fn list_projects(store: &impl GraphRead) -> anyhow::Result<Vec<crate:
             crate::SessionView { session, units }
         })
         .collect())
+}
+
+/// (core#1346) One run's view: its session and its units in `ord` order; `None` for a run the
+/// store does not hold. The units are this run's alone ([`crate::domain::session_units`]), so the
+/// read never builds a view of any other run.
+pub(crate) fn project_view(
+    store: &impl GraphRead,
+    run_id: &str,
+) -> anyhow::Result<Option<crate::SessionView>> {
+    use wicked_apps_core::FromNode;
+    let Some(node) = store.get_node(&wicked_apps_core::synthetic_symbol(
+        wicked_apps_core::AGENT_SESSION,
+        run_id,
+    ))?
+    else {
+        return Ok(None);
+    };
+    // A session node that does not decode is no run here, as the list skips it
+    // (`domain::all_sessions`). An error would drop the read connection on every poll and send
+    // each one to the actor (coord review of #1733).
+    let Ok(session) = crate::domain::AgentSession::from_node(&node) else {
+        return Ok(None);
+    };
+    let units = crate::domain::session_units(store, run_id)?;
+    Ok(Some(crate::SessionView { session, units }))
 }
 
 #[cfg(test)]

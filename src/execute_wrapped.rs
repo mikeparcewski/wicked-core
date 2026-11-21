@@ -3277,6 +3277,13 @@ impl OneShotScratch {
     }
 }
 
+/// (core#992, W24) The call-id cleanup of an engine-internal call, a warm judge's too: a warm arm
+/// that falls back to a cold seat places it by this call's id, and only this guard drops that
+/// replica scope. A warm call's stable dirs stay its checkout's (its seat home is never noted).
+fn one_shot_scratch_for(input: &StepInput) -> Option<OneShotScratch> {
+    is_engine_internal(&input.unit).then(|| OneShotScratch::new(&input.run_id))
+}
+
 impl Drop for OneShotScratch {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(sandbox_root(&self.run_id));
@@ -3308,8 +3315,7 @@ impl WrappedCliStepRunner {
                 return posture_refusal(input, &why);
             }
         }
-        let one_shot_scratch = (is_engine_internal(&input.unit) && warm.is_none())
-            .then(|| OneShotScratch::new(&input.run_id));
+        let one_shot_scratch = one_shot_scratch_for(input);
         let cli_key = input
             .unit
             .assigned_cli
@@ -3373,7 +3379,7 @@ impl WrappedCliStepRunner {
         .and_then(|c| {
             let posture =
                 crate::write_posture::WritePosture::of(&input.unit, input.workdir.is_some());
-            if let Some(g) = &one_shot_scratch {
+            if let Some(g) = one_shot_scratch.as_ref().filter(|_| warm.is_none()) {
                 if uses_container_seat(
                     runs_in_seat(input),
                     crate::container_floor::container_mode(),
@@ -10135,6 +10141,27 @@ mod tests {
             launch_seq: 0,
             required_skills: Vec::new(),
         }
+    }
+
+    // W24 (codex review): a warm judge whose arm fell back to a cold seat placed that seat by its
+    // call id; the call's own cleanup must still drop it, so the guard is never warm-gated.
+    #[test]
+    fn a_warm_judge_call_still_owns_its_call_id_cleanup_for_a_cold_fallback_w24() {
+        let _env = ENV_LOCK.write().unwrap_or_else(|p| p.into_inner());
+        let _floor = VarGuard::set(
+            crate::container_floor::SEAT_FLOOR_ENV,
+            Path::new("container"),
+        );
+        let mut input = parented_judge_input();
+        input.unit.assigned_cli = Some("codex#2".into());
+        input.run_id = format!("validator-w24-{}", uuid::Uuid::new_v4().simple());
+        assert!(warm_judge_key(&input).is_some(), "a warm-eligible judge");
+        let guard = one_shot_scratch_for(&input).expect("the call owns its call-id cleanup");
+        assert_eq!(guard.run_id, input.run_id);
+        let sandbox = sandbox_root(&input.run_id);
+        std::fs::create_dir_all(&sandbox).unwrap();
+        drop(guard);
+        assert!(!sandbox.exists(), "the call's own scratch goes with it");
     }
 
     #[test]

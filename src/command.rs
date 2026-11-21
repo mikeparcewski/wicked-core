@@ -20,6 +20,11 @@ pub(crate) enum Command {
     Sessions(Sender<anyhow::Result<Vec<String>>>),
     /// Every session + its ordered units — what the UI builds its project list from.
     Projects(Sender<anyhow::Result<Vec<crate::SessionView>>>),
+    /// (core#1346) One run's session + its ordered units; `None` for a run the store does not hold.
+    Project {
+        run_id: String,
+        reply: Sender<anyhow::Result<Option<crate::SessionView>>>,
+    },
     /// A unit's captured work output (transcript), if any — a REJECTED unit answers with its
     /// partial output (usability review #1); `None` only when no output was ever stored.
     WorkOutput(String, Sender<Option<String>>),
@@ -705,6 +710,7 @@ impl Command {
             Command::Ping { .. } => "Ping",
             Command::Sessions { .. } => "Sessions",
             Command::Projects { .. } => "Projects",
+            Command::Project { .. } => "Project",
             Command::WorkOutput { .. } => "WorkOutput",
             Command::UnitTranscript { .. } => "UnitTranscript",
             Command::Subscribe { .. } => "Subscribe",
