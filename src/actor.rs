@@ -10525,10 +10525,11 @@ fn seats_off_authors(unit: &crate::domain::WorkUnit) -> bool {
 }
 
 /// (crew#972) The seat a Review/Test agent unit should run on instead of its assigned one, when its
-/// assigned seat AUTHORED the work it checks ([`crate::pipeline::work_authors`]): the first run
-/// seat, unbenched and in roster order, that authored nothing AND has not already worker-failed
-/// this unit. `None` when the unit is not a Review/Test agent unit, is not on an author's seat, or
-/// no such seat is left (the gate's `same_seat_evaluator` denial then escalates).
+/// assigned seat shares identity with its authors ([`crate::pipeline::work_authors`]): an
+/// unbenched, admitted seat that authored nothing and has not already worker-failed this unit.
+/// (core#1540) Provider-sharing candidates come last for a key-author; a provider-only
+/// conflict moves only to a seat sharing neither key nor provider. Otherwise the unit stays for
+/// the gate.
 ///
 /// (core#933) The worker-failed exclusion is what keeps the failover ladder bounded: without it a
 /// failover onto an EARLIER author (a seat the ladder's own creator check did not see) was moved
@@ -10551,13 +10552,24 @@ fn distinct_evaluator_seat(
     }
     let seat = unit.assigned_cli.as_ref()?;
     let authors = crate::pipeline::work_authors(units, unit.ord);
-    if !authors.contains(seat) {
+    let providers = crate::pipeline::work_author_providers(units, unit.ord);
+    let shares = |k: &str| {
+        crate::observed_provider::shares_identity(k, None, &authors, &providers).is_some()
+    };
+    if !shares(seat) {
         return None;
     }
+    // (core#1540) A provider-only conflict moves only when another seat improves independence.
+    let key_author =
+        crate::observed_provider::shares_identity(seat, Some(&[]), &authors, &[]).is_some();
     // Only a seat whose skills admit the unit (the rule distribution used); with none, the unit
     // stays and the gate decides (codex r1 on #898).
-    eligible_roster_keys(session).into_iter().find(|k| {
-        !authors.contains(k)
+    let mut candidates = eligible_roster_keys(session);
+    candidates.sort_by_key(|k| shares(k));
+    candidates.into_iter().find(|k| {
+        crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_none()
+            && (key_author || !shares(k))
+            && k != seat
             && !unit.worker_failed_clis.contains(k)
             && crate::distribute::seat_admits_unit(unit, k, None)
     })
@@ -10567,8 +10579,8 @@ fn distinct_evaluator_seat(
 /// it checks, on a run whose contract enforces a distinct evaluator, is REFUSED with the seats that
 /// could take it. Before this the reassign was accepted and `dispatch_unit` silently re-seated the
 /// unit elsewhere (only an `eprintln!` said so), so the operator's choice was overridden (run
-/// 872a964f: reassigned to codex, copilot dispatched). Any other target is honoured as given: the
-/// dispatch re-seat only ever moves a unit that sits on an author's seat.
+/// 872a964f: reassigned to codex, copilot dispatched). Any target the dispatch re-seat would keep
+/// is honoured as given.
 fn refuse_author_reassign(
     session: &crate::domain::AgentSession,
     units: &[crate::domain::WorkUnit],
@@ -10586,15 +10598,32 @@ fn refuse_author_reassign(
         return Ok(());
     }
     let authors = crate::pipeline::work_authors(units, unit.ord);
-    if !authors.iter().any(|a| a == cli) {
-        return Ok(());
-    }
-    let open: Vec<String> = eligible_roster_keys(session)
+    let providers = crate::pipeline::work_author_providers(units, unit.ord);
+    // (core#1540) The rule the dispatch re-seat applies ([`distinct_evaluator_seat`]), so a choice
+    // it would move is refused with the seats it would take instead (core#933): a seat key of the
+    // authors always; a seat last seen calling their provider only when an independent seat exists.
+    let key_author =
+        |k: &str| crate::observed_provider::shares_identity(k, Some(&[]), &authors, &[]).is_some();
+    let shares = |k: &str| crate::observed_provider::shares_identity(k, None, &authors, &providers);
+    let admits = |k: &String| crate::distribute::seat_admits_unit(unit, k, None);
+    let independent: Vec<String> = eligible_roster_keys(session)
         .into_iter()
-        .filter(|k| !authors.contains(k) && crate::distribute::seat_admits_unit(unit, k, None))
+        .filter(|k| shares(k).is_none() && admits(k))
         .collect();
+    let Some(why) = shares(cli).filter(|_| key_author(cli) || !independent.is_empty()) else {
+        return Ok(());
+    };
+    let mut open: Vec<String> = if key_author(cli) {
+        eligible_roster_keys(session)
+            .into_iter()
+            .filter(|k| !key_author(k) && admits(k))
+            .collect()
+    } else {
+        independent
+    };
+    open.sort_by_key(|k| shares(k).is_some());
     anyhow::bail!(
-        "cannot reassign unit {} to '{cli}': that seat authored the work this review checks \
+        "cannot reassign unit {} to '{cli}': {why} \
          (authors: {}), and this run requires a distinct evaluator — {}",
         unit.ord,
         authors.join(", "),
@@ -13557,6 +13586,7 @@ fn dispatch_unit_with(
                     repo: session.repo_ref.clone(),
                     creators: crate::pipeline::fallback_work_authors(&units, unit.ord),
                     creator_bins: crate::pipeline::work_author_binaries(&units, unit.ord),
+                    creator_providers: crate::pipeline::work_author_providers(&units, unit.ord),
                     exclude_seats: unit.exclude_seats.clone(),
                     pool,
                     registry,
@@ -41252,6 +41282,113 @@ mod work_author_tests {
             distinct_evaluator_seat(&s, &[build.clone(), on_pi.clone()], &on_pi),
             None
         );
+    }
+
+    #[test]
+    fn semantic_dispatch_moves_off_the_earlier_reports_seat() {
+        let s = session(&["claude", "codex", "pi"], &[]);
+        let mut diff = unit(1, StageKind::Recon, "claude", &[]);
+        diff.catalog = Some("understand".into());
+        diff.worktree_guarded = true;
+        let mut review = unit(2, StageKind::Review, "codex", &[]);
+        review.catalog = Some("critique".into());
+        review.rubric = Some("cited-findings".into());
+        let mut semantic = review.clone();
+        semantic.ord = 3;
+        let units = [diff, review, semantic.clone()];
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &semantic).as_deref(),
+            Some("pi")
+        );
+    }
+
+    #[test]
+    fn evaluator_dispatch_tries_a_seat_not_seen_on_the_authors_provider_first() {
+        let s = session(&["codex", "claude", "pi"], &[]);
+        let mut build = unit(1, StageKind::Build, "codex", &[]);
+        let provider = format!("actor-identity-{}:443", uuid::Uuid::new_v4());
+        build.observed_providers = vec![provider.clone()];
+        crate::observed_provider::record_receipt("claude", Some(vec![provider]));
+        let review = unit(2, StageKind::Review, "claude", &[]);
+        assert_eq!(
+            distinct_evaluator_seat(&s, &[build, review.clone()], &review).as_deref(),
+            Some("pi")
+        );
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn provider_only_reseating_requires_a_nonsharing_candidate() {
+        // (core#1540) Changing keys gains nothing when both seats share the author's provider.
+        let provider = format!("reseat-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, "reseat-author", &[]);
+        build.observed_providers = vec![provider.clone()];
+        for seat in ["reseat-sharing", "reseat-other-sharing"] {
+            crate::observed_provider::record_receipt(seat, Some(vec![provider.clone()]));
+        }
+        let review = unit(2, StageKind::Review, "reseat-sharing", &[]);
+        let units = [build, review.clone()];
+        let mut s = session(
+            &["reseat-author", "reseat-other-sharing", "reseat-sharing"],
+            &[],
+        );
+        assert_eq!(distinct_evaluator_seat(&s, &units, &review), None);
+
+        let mut on_author = review.clone();
+        on_author.assigned_cli = Some("reseat-author".into());
+        assert_eq!(
+            distinct_evaluator_seat(&s, &units, &on_author).as_deref(),
+            Some("reseat-other-sharing"),
+            "a key-author can still improve to a key-distinct, provider-sharing seat"
+        );
+
+        s.clis.push("reseat-independent".into());
+        for assigned in [&review, &on_author] {
+            assert_eq!(
+                distinct_evaluator_seat(&s, &units, assigned).as_deref(),
+                Some("reseat-independent")
+            );
+        }
+        crate::observed_provider::take_receipts();
+    }
+
+    #[test]
+    fn operator_reassign_follows_the_dispatch_reseat_rule() {
+        // (core#1540) A choice the dispatch re-seat would move is refused, naming its seats.
+        let provider = format!("reassign-{}:443", uuid::Uuid::new_v4());
+        let mut build = unit(1, StageKind::Build, "reassign-author", &[]);
+        build.observed_providers = vec![provider.clone()];
+        crate::observed_provider::record_receipt("reassign-sharing", Some(vec![provider]));
+        let review = unit(2, StageKind::Review, "reassign-other", &[]);
+        let units = [build, review];
+        let s = session(
+            &["reassign-author", "reassign-sharing", "reassign-other"],
+            &[],
+        );
+        let msg = refuse_author_reassign(&s, &units, 1, "reassign-sharing")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("reassign it to one of: reassign-other"),
+            "{msg}"
+        );
+        assert!(
+            !msg.contains("one of: reassign-other, reassign-sharing"),
+            "{msg}"
+        );
+        let msg = refuse_author_reassign(&s, &units, 1, "reassign-author")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            msg.contains("reassign it to one of: reassign-other, reassign-sharing"),
+            "{msg}"
+        );
+        assert!(refuse_author_reassign(&s, &units, 1, "reassign-author#2").is_err());
+        assert!(refuse_author_reassign(&s, &units, 1, "reassign-other").is_ok());
+        // With no independent seat the re-seat keeps a provider-only conflict: so does this.
+        let two = session(&["reassign-author", "reassign-sharing"], &[]);
+        assert!(refuse_author_reassign(&two, &units, 1, "reassign-sharing").is_ok());
+        crate::observed_provider::take_receipts();
     }
 
     /// No distinct seat left (the rest benched): the unit stays, and its gate's

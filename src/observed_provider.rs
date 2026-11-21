@@ -120,9 +120,46 @@ pub(crate) fn shared_with(seat: &str, avoid: &[Provider]) -> Option<Provider> {
     last_seen(seat)?.into_iter().find(|p| avoid.contains(p))
 }
 
+/// (core#1540) One seat identity: its key, then this attempt's providers or LAST_SEEN.
+pub(crate) fn shares_identity(
+    seat: &str,
+    own_observed: Option<&[Provider]>,
+    author_keys: &[String],
+    author_providers: &[Provider],
+) -> Option<String> {
+    if author_keys
+        .iter()
+        .any(|a| a == seat || a == crate::team::runner::seat_key(seat))
+    {
+        return Some(format!("seat `{seat}` authored the work"));
+    }
+    let shared = match own_observed {
+        Some(ps) => ps.iter().find(|p| author_providers.contains(p)).cloned(),
+        None => shared_with(seat, author_providers),
+    };
+    shared.map(|p| {
+        if author_keys.is_empty() {
+            return format!("observed calling `{p}`, a provider of the work");
+        }
+        format!(
+            "observed calling `{p}`, the provider the work's author {} called",
+            author_keys
+                .iter()
+                .map(|a| format!("`{a}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
+}
+
 /// The providers of the work being judged on this thread ([`JudgingWork`]); empty when none is held.
 pub(crate) fn work_providers() -> Vec<Provider> {
     AVOID.with(|a| a.borrow().avoid.clone())
+}
+
+/// (core#1546) Bus launches have no receipts and cannot satisfy this requirement.
+pub(crate) fn observation_required() -> bool {
+    AVOID.with(|a| a.borrow().require_observed)
 }
 
 /// What `seat`'s launches on this thread were observed calling (empty: nothing observed).
@@ -212,6 +249,19 @@ pub(crate) fn observed_for(receipts: &[LaunchReceipt], seat: &str) -> Observed {
 mod tests {
     use super::*;
     use crate::seat_gateway::GatewayRecord;
+
+    #[test]
+    fn identity_uses_the_attempt_before_last_seen_and_always_the_seat_key() {
+        let authors = vec!["identity-author".into()];
+        let providers = vec!["identity-provider:443".into()];
+        record_receipt("identity-reviewer", Some(providers.clone()));
+        assert!(shares_identity("identity-reviewer", None, &authors, &providers).is_some());
+        assert!(shares_identity("identity-reviewer", Some(&[]), &authors, &providers).is_none());
+        assert!(shares_identity("identity-cold", Some(&providers), &authors, &providers).is_some());
+        assert!(shares_identity("identity-author#2", Some(&[]), &authors, &[]).is_some());
+        assert!(shares_identity("identity-unseen", None, &authors, &providers).is_none());
+        take_receipts();
+    }
 
     fn rec(status: u16, endpoint: Option<&str>) -> GatewayRecord {
         GatewayRecord {
