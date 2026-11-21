@@ -449,21 +449,22 @@ jobs:
 
   # ── re-stamp main's lockfile against the packages that now exist on npm (#422) ───────────────────
   #
-  # The release PR structurally CANNOT carry resolvable platform entries: the five
-  # `wicked-core-ts-<platform>` packages do not exist on npm until this workflow publishes them, so
-  # `npm install --package-lock-only` at PR time writes them as version-less `{ "optional": true }`
-  # stubs. `npm ci` (ci.yml's `core-ts TypeScript contract assertions` step) accepts those stubs
-  # only while the version is unpublished; the moment the six packages land, the ideal tree
-  # resolves `<ver>` and every later `npm ci` on main fails with `lock file's
-  # wicked-core-ts-<platform>@ does not satisfy wicked-core-ts-<platform>@<ver>`. main went red
-  # after 0.7.17 (#414 absorbed the re-stamp) and 0.7.18 (run 34524209387 red on the leg that ran
-  # after the publish; #423 re-stamped; run 34527823078 green).
+  # The release PR CANNOT carry resolvable platform entries: the five `wicked-core-ts-<platform>`
+  # packages do not exist on npm until this workflow publishes them. Since core-ts 0.15.45 (#1550)
+  # the release PR writes each one as `"version": "<ver>"` with no `resolved`/`integrity`; `npm ci`
+  # (ci.yml's `core-ts TypeScript contract assertions` step) accepts that shape before and after
+  # the publish, so main stays green. The older version-less `{ "optional": true }` stub shape made
+  # every `npm ci` on main fail once the packages landed (0.7.17/0.7.18, #414/#423), and npm 11.20's
+  # `npm install --package-lock-only` deletes such stubs outright (#1252): never regenerate the lock
+  # in the release PR.
   #
-  # ci.yml is deliberately left on `npm ci`: that failure IS the lock-sync guarantee doing its job
-  # on a lockfile that is genuinely out of sync, so this job removes the cause instead of teaching
-  # CI to tolerate it. It waits for the registry to serve the main package and every platform
-  # package (npm processes a publish asynchronously — "a few minutes"; ~8 min observed on crew
-  # #514), regenerates the lockfile on `main`, and opens a lockfile-only PR. It never pushes to main.
+  # What the release PR cannot write is the pins. `npm install --package-lock-only` treats a
+  # versioned entry as satisfied and leaves it alone (#1551), so this job deletes the five entries
+  # first (`scripts/core-ts-platform-lock.py drop`), regenerates, and checks that every entry has
+  # the released version, its registry tarball and an integrity hash (`… check`) before it opens a
+  # PR. It waits for the registry to serve the main package and every platform package (npm
+  # processes a publish asynchronously — "a few minutes"; ~8 min observed on crew #514),
+  # regenerates the lockfile on `main`, and opens a lockfile-only PR. It never pushes to main.
   lockfile:
     name: re-stamp main's lockfile (opens a PR)
     needs: registry # publish, then npm serving all six packages
@@ -537,7 +538,11 @@ jobs:
             echo "changed=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # (#1551) Drop the five platform entries so npm resolves each one afresh: it leaves a
+          # versioned entry without `resolved`/`integrity` alone. Then check every pin landed.
+          python3 ../../scripts/core-ts-platform-lock.py drop package-lock.json
           npm install --package-lock-only --ignore-scripts --no-audit --no-fund --prefer-online
+          python3 ../../scripts/core-ts-platform-lock.py check package-lock.json "$VERSION"
           # Lockfile-only by construction — refuse to open a PR that carries anything else. Counted
           # rather than compared against a path, so the check does not depend on how `git status`
           # spells the path from this working directory (Copilot on #427).
@@ -582,12 +587,12 @@ jobs:
 
           Regenerated on main by napi-release.yml's `lockfile` job once the publish job
           had succeeded and the registry served all six packages. The release PR could
-          only write the five wicked-core-ts-<platform> lock entries as version-less
-          stubs (the packages did not exist on npm yet); this stamps their
-          version/resolved/integrity against the published artifacts so `npm ci` on
-          main resolves again. Lockfile-only, no version bump.
+          only write the five wicked-core-ts-<platform> lock entries with their version
+          and no resolved/integrity (the packages did not exist on npm yet); this pins
+          their resolved/integrity against the published artifacts, so installs from
+          main check the platform binaries' integrity. Lockfile-only, no version bump.
 
-          Refs #422
+          Refs #422 #1551
           MSG
           remote_sha="$(git ls-remote --heads origin "$BRANCH" | cut -f1)"
           if [ -n "$remote_sha" ]; then
@@ -599,11 +604,11 @@ jobs:
           sed "s/__VERSION__/${VERSION}/g; s#__RUN_URL__#${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}#g" <<'BODY' > "$RUNNER_TEMP/pr-body.md"
           Opened automatically by `napi-release.yml`'s `lockfile` job for tag `core-ts-v__VERSION__` (run: __RUN_URL__).
 
-          The release PR could only write the five `wicked-core-ts-<platform>` entries in `crates/wicked-core-ts/package-lock.json` as version-less stubs — the packages did not exist on npm until the tag published them — and `npm ci` on main fails once they do. This re-stamps their `version` / `resolved` / `integrity` against the published __VERSION__ artifacts. Lockfile-only; no version bump.
+          The release PR could only write the five `wicked-core-ts-<platform>` entries in `crates/wicked-core-ts/package-lock.json` with their version and no `resolved` / `integrity` — the packages did not exist on npm until the tag published them. This pins their `resolved` / `integrity` against the published __VERSION__ artifacts (the job dropped the five entries, regenerated, and checked every pin). Lockfile-only; no version bump.
 
-          Merge it as soon as CI is green to stop main going red on the next `npm ci`. A PR opened with the workflow's GITHUB_TOKEN does not start `pull_request` workflows by itself — close and reopen it (`gh pr close <n> && gh pr reopen <n>`) or push to the branch to run CI.
+          Merge it once CI is green: until then, installs from main skip the integrity check for the platform binaries. A PR opened with the workflow's GITHUB_TOKEN does not start `pull_request` workflows by itself — close and reopen it (`gh pr close <n> && gh pr reopen <n>`) or push to the branch to run CI.
 
-          Refs #422
+          Refs #422 #1551
 
           🤖 Generated with [Claude Code](https://claude.com/claude-code)
           BODY
