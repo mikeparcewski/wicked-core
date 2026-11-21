@@ -5860,29 +5860,36 @@ fn run_unit_and_judge_in<'scope, 'env>(
     // its own account and never reaches the gate this feeds. (power-speed-2) Taken before the QE
     // reviewer and the team's final pass, which run alongside the floor: neither may write the
     // tree, and the final comparison below still catches one that did.
-    let guard_first_look = pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
+    // (core#1217) The tree-read note only for a unit that may floor: a review unit that never
+    // runs checks says nothing about checks.
+    let may_floor = !member_reviewing
+        && (input.unit.repo_checks_floor || default_floor_applies || recheck_armed);
+    let first_look = || {
         if output.status == StepStatus::Ok && !member_reviewing {
             crate::worktree_guard::outcome_for_unit(&input.unit, input.workdir.as_deref())
         } else {
             None
         }
-    });
+    };
+    let guard_first_look = if may_floor {
+        pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, first_look)
+    } else {
+        first_look()
+    };
     // F-039 REPO CHECKS FLOOR: whether it runs, and on what ([`FloorPlan`]).
     let floor_plan = if member_reviewing {
         None
     } else {
-        pre_floor_noted(emit_delta, PRE_FLOOR_NOTE_AFTER, || {
-            floor_plan(
-                input,
-                &output,
-                floor_rerun,
-                guard_first_look.as_ref(),
-                current_tree.as_deref(),
-                default_floor_applies,
-                recheck_armed,
-                stop.clone(),
-            )
-        })
+        floor_plan(
+            input,
+            &output,
+            floor_rerun,
+            guard_first_look.as_ref(),
+            current_tree.as_deref(),
+            default_floor_applies,
+            recheck_armed,
+            stop.clone(),
+        )
     };
     // (power-speed-2) A floor that runs on a CLEAN CHECKOUT of a known tree starts now, on its own
     // thread, while the QE reviewer, the team's final pass and the judge do their work: the
