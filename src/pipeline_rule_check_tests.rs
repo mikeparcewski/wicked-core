@@ -386,7 +386,8 @@ fn fold_review_after_build(
         false,
         Vec::new(),
         None,
-        true,
+        // Not reduced: the run requires a distinct evaluator, as J6's did.
+        false,
         &crate::assurance::QeOverride::Auto,
     )
     .expect("plan");
