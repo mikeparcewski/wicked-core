@@ -2602,6 +2602,20 @@ impl Core {
         })
     }
 
+    /// Run editor conformance in the engine's review harness jail. Request JSON:
+    /// `{ "packRoot": string, "timeoutS"?: integer }`, with no unknown fields. `packRoot` must
+    /// be an absolute existing directory (canonicalized); `timeoutS` must be 1..=900 and defaults
+    /// to 900 seconds. Resolves to JSON `{ "record": ConformanceRecord, "report": <parsed raw
+    /// report or null> }`. Only invalid requests reject; host failures resolve to refused records,
+    /// including `engine_refused` for hidden secret directories or skills resolution failures and
+    /// `unjailed_host` when no OS jail is available. The pack is read-only to the harness; only a
+    /// private temp directory is writable. Crew's install gate calls this; it never runs the harness
+    /// unjailed.
+    #[napi(ts_return_type = "Promise<string>")]
+    pub fn run_editor_conformance(request_json: String) -> AsyncTask<CoreTask> {
+        task(move || wicked_core::run_editor_conformance(&request_json).map_err(err))
+    }
+
     /// Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
     /// score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
     /// `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED

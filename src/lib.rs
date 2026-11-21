@@ -552,6 +552,8 @@ pub fn check_run_tree(
     deliver_lift::check_run_tree(run_id, workdir, repo_root, base_commit)
 }
 
+pub use actor::run_editor_conformance;
+
 /// (core#1122) What the repo-checks floor holds on disk — the build cache at
 /// `<worker home>/repo-checks` (by repository, largest first, with its caps) and the floor log
 /// store — for crew's diagnostics and the Nerve Center's disk row. Read-only; walks the cache.
