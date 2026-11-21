@@ -7163,7 +7163,7 @@ mod guarded_read_step_tests {
         assert_eq!(super::work_author_providers(&units, 2), observed);
         let rel = super::evaluator_relation(&units, &review, Some(&observed)).unwrap();
         assert!(rel.on_builder_seat);
-        let denial = rel.denial(&review);
+        let denial = rel.denial(&review, None);
         assert_eq!(denial.source, super::DENIAL_SOURCE_SAME_SEAT_EVALUATOR);
         assert!(denial.reason.contains("observed calling `chatgpt.com:443`"));
         assert!(denial.reason.contains("`codex`"));
