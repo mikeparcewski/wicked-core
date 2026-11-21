@@ -1189,12 +1189,23 @@ pub(crate) fn apply_and_finish_unit(
             None
         };
 
-    let det_denial = pinned_validator_denial_with_env(
-        unit,
-        workdir.as_deref().map(std::path::Path::new),
-        db_path,
-        &validator_env,
-    );
+    // (core#1418) Run off the actor before the fold when it could be, and applied only when it ran
+    // on exactly the inputs this fold would hand it; otherwise run here, as always (fail-closed:
+    // a failure denies).
+    let det_denial = match evidence.pinned_validator.as_ref().filter(|r| {
+        unit.validator.as_ref() == Some(&r.validator)
+            && r.workdir == workdir
+            && r.db_path.as_deref() == db_path
+            && r.env == validator_env
+    }) {
+        Some(read) => read.denial.clone(),
+        None => pinned_validator_denial_with_env(
+            unit,
+            workdir.as_deref().map(std::path::Path::new),
+            db_path,
+            &validator_env,
+        ),
+    };
 
     // (F-7R2-006 / review RT-1 / F-7R3-001) A judge seat that REFUSED while this unit's judge
     // rotated — an authentication failure, a quota refusal, a binary that could not start — is
@@ -1391,7 +1402,16 @@ pub(crate) fn apply_and_finish_unit(
             unit.repo_checks = Some(report.clone());
             let verify_floor = unit.repo_checks_floor || crate::deliver_lift::is_deliver_unit(unit);
             if !verify_floor {
-                creator_paths = creator_changed_paths(unit, workdir.as_deref(), report);
+                // (core#1418) Diffed off the actor when the trees are the ones read there.
+                creator_paths = match evidence.creator_paths.as_ref().filter(|c| {
+                    unit.worktree_baseline
+                        .as_ref()
+                        .is_some_and(|b| b.tree == c.baseline_tree)
+                        && report.tree.as_deref() == Some(c.after_tree.as_str())
+                }) {
+                    Some(read) => read.paths.clone(),
+                    None => creator_changed_paths(unit, workdir.as_deref(), report),
+                };
             }
             let (changed, changed_truncated) = creator_paths.clone().unwrap_or_default();
             emit(CoreEvent::RepoChecksEvaluated {
@@ -2637,13 +2657,22 @@ fn creator_changed_paths(
     ) else {
         return None;
     };
+    creator_paths_between(wd, baseline, after, unit.ord)
+}
+
+/// [`creator_changed_paths`] on given trees (core#1418: also run off the actor, before the fold).
+pub(crate) fn creator_paths_between(
+    wd: &str,
+    baseline: &crate::worktree_guard::WorktreeSnapshot,
+    after: &str,
+    ord: u32,
+) -> Option<(Vec<crate::worktree_guard::ChangedPath>, bool)> {
     match crate::worktree_guard::changed_since(std::path::Path::new(wd), baseline, after) {
         Ok(changed) => Some(crate::worktree_guard::capped(changed)),
         Err(e) => {
             eprintln!(
-                "wicked-core: unit {}: the changed paths of its creator floor could not be \
-                 listed: {e}",
-                unit.ord
+                "wicked-core: unit {ord}: the changed paths of its creator floor could not be \
+                 listed: {e}"
             );
             None
         }
@@ -2672,7 +2701,7 @@ fn pinned_validator_denial(
 
 /// [`pinned_validator_denial`] with the variables the unit's validator is handed (WT-C2:
 /// [`crate::walkthrough::validator_env`]; empty for every non-walkthrough unit).
-fn pinned_validator_denial_with_env(
+pub(crate) fn pinned_validator_denial_with_env(
     unit: &crate::domain::WorkUnit,
     workdir: Option<&std::path::Path>,
     db_path: Option<&str>,
@@ -5381,6 +5410,110 @@ mod judge_bench_tests {
             "the receipt is persisted on the unit"
         );
         (outcome.approved, outcome.denial.map(|d| d.source), receipt)
+    }
+
+    /// core#1418: the fold applies a pinned-validator read made off the actor only when it ran on
+    /// the fold's own inputs (the same validator, worktree, code graph and variables), and then
+    /// does not run the validator itself. A read on other inputs (here another worktree) is
+    /// ignored and the fold runs the validator, whose failure denies (fail-closed).
+    #[test]
+    fn the_fold_applies_an_off_actor_validator_read_only_on_its_own_inputs() {
+        let dir = std::env::temp_dir().join(format!(
+            "wicked-pinned-read-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let wd = dir.to_string_lossy().into_owned();
+        let validator = crate::validator::DeterministicValidator {
+            criterion: "c".into(),
+            script: "exit 1".into(),
+            approved: true,
+        };
+        let fold = |sid: &str, read_workdir: &str| -> Vec<crate::domain::UnitDenial> {
+            let mut store = wicked_apps_core::open_store(Some(":memory:")).unwrap();
+            let mut sink = |_e: CoreEvent| {};
+            let Planned {
+                mut units,
+                workflow_id,
+                cli_keys,
+                ..
+            } = plan_and_distribute(
+                &mut store,
+                &[cli("a")],
+                "Do step one.",
+                EntityMode::Shared,
+                sid,
+                crate::domain::HumanConfirm::None,
+                false,
+                None,
+                Some(wd.clone()),
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                &mut sink,
+                None,
+                false,
+                false,
+                Vec::new(),
+                None,
+                true,
+                &crate::assurance::QeOverride::Auto,
+            )
+            .expect("plan");
+            units[0].validator = Some(validator.clone());
+            let evidence = crate::workflow::UnitEvidence {
+                judge_skipped: Some("no eligible judge seat distinct from creator 'a'".into()),
+                pinned_validator: Some(crate::workflow::PinnedValidatorRead {
+                    validator: validator.clone(),
+                    workdir: Some(read_workdir.to_string()),
+                    db_path: None,
+                    env: Vec::new(),
+                    denial: Some("read off the actor".into()),
+                }),
+                ..Default::default()
+            };
+            let output = crate::workflow::stub_output(&units[0]);
+            let outcome = apply_and_finish_unit(
+                &mut store,
+                &mut units[0],
+                &output,
+                &workflow_id,
+                EntityMode::Shared,
+                sid,
+                0,
+                false,
+                false,
+                &cli_keys,
+                None,
+                &evidence,
+                &mut |_e| {},
+                None,
+            )
+            .expect("apply");
+            outcome
+                .denial
+                .into_iter()
+                .chain(units[0].denials_behind.clone().unwrap_or_default())
+                .filter(|d| d.source == "pinned_validator")
+                .collect()
+        };
+        let read = fold("pinned-read-same", &wd);
+        assert_eq!(
+            read.iter().map(|d| d.reason.as_str()).collect::<Vec<_>>(),
+            vec!["read off the actor"],
+            "a read on the fold's own inputs is applied as it is: {read:?}"
+        );
+        let other = fold("pinned-read-other", "/elsewhere");
+        assert_eq!(other.len(), 1, "{other:?}");
+        assert!(
+            other[0].reason.starts_with("pinned validator failed"),
+            "a read on other inputs is ignored and the fold runs the validator: {other:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn fold_with_evidence(
