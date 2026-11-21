@@ -100,8 +100,11 @@ pub fn apply(verdict: Verdict, counter: &AtomicUsize, out: &mut dyn Write) -> bo
     match verdict {
         Verdict::Run => false,
         Verdict::Skip(notice) => {
+            // A skip nobody can see is not taken: the test fails instead.
+            if let Err(e) = writeln!(out, "{notice}").and_then(|()| out.flush()) {
+                panic!("{notice}, but the notice could not be written ({e}), so the test fails");
+            }
             counter.fetch_add(1, Ordering::SeqCst);
-            let _ = writeln!(out, "{notice}");
             true
         }
         Verdict::Fail(message) => panic!("{message}"),
@@ -223,6 +226,23 @@ mod tests {
             &AtomicUsize::new(0),
             &mut Vec::new(),
         );
+    }
+
+    struct Broken;
+    impl Write for Broken {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("broken pipe"))
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "the notice could not be written")]
+    fn a_skip_whose_notice_cannot_be_written_fails_the_test() {
+        let verdict = decide(Need::Pty, &denied(), false, "injected");
+        apply(verdict, &AtomicUsize::new(0), &mut Broken);
     }
 
     #[test]
