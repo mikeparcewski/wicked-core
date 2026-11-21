@@ -2191,6 +2191,27 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#1346) One run's session + its ordered units, or `None` for a run the store does not
+    /// hold: the per-run read behind a run page's poll, so a read about one run never folds every
+    /// run on the store ([`Core::sessions_detail`]).
+    ///
+    /// Answered off the actor from the read model (core#1390), in one read transaction, and through
+    /// the actor only when this store has none.
+    pub fn session_detail(&self, run_id: &str) -> anyhow::Result<Option<SessionView>> {
+        if let Some(view) = self.run_read_model.read(|s| actor::project_view(s, run_id)) {
+            return Ok(view);
+        }
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::Project {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// A unit's captured work output (the transcript), if any. A REJECTED unit answers with
     /// whatever PARTIAL output existed at rejection (usability review #1) — read the unit record's
     /// status/`denial` (or [`Core::unit_transcript`]) to distinguish partial from resolved; `None`

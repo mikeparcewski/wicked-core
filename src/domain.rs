@@ -2175,9 +2175,18 @@ pub fn session_units(store: &dyn GraphRead, session_id: &str) -> anyhow::Result<
         kinds: vec![NodeKind::Other(WORK_UNIT.to_string())],
         ..Default::default()
     };
+    // (core#1346) Another run's unit is skipped on its raw `session_id` before it is decoded: a
+    // per-run read decodes this run's units only. A node without the field is decoded and judged
+    // on the decoded id, as before.
     let mut units: Vec<WorkUnit> = store
         .find_symbols(&query)?
         .iter()
+        .filter(|n| {
+            n.metadata
+                .get("session_id")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| id == session_id)
+        })
         .filter_map(|n| WorkUnit::from_node(n).ok())
         .filter(|u| u.session_id == session_id)
         .collect();

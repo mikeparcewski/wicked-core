@@ -5897,6 +5897,22 @@ fn warm_arm_checkout(
     mounts: &[PlanMount],
     homes: &[PathBuf],
 ) -> (std::sync::Arc<seat::Seat>, Vec<String>) {
+    try_warm_arm(kube, checkout, tree, image, mounts, homes, true, &[]).unwrap()
+}
+
+/// [`warm_arm_checkout`] with the judge's view and write roots spelled, answering the arm.
+#[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
+fn try_warm_arm(
+    kube: &super::Kube,
+    checkout: Option<std::sync::Arc<seat::WarmCheckout>>,
+    tree: &Path,
+    image: &str,
+    mounts: &[PlanMount],
+    homes: &[PathBuf],
+    view: bool,
+    write_roots: &[PathBuf],
+) -> Result<(std::sync::Arc<seat::Seat>, Vec<String>), (FloorUnarmed, String)> {
     let call = crate::validator::one_shot_run_id("validator");
     let spec = seat::ArmSpec {
         run_id: &call,
@@ -5908,10 +5924,10 @@ fn warm_arm_checkout(
         sync_image: "sync",
         workdir: tree,
         tree,
-        view: true,
+        view,
         mounts,
         protected: &[],
-        write_roots: &[],
+        write_roots,
         seat_dirs: homes,
         scratch: None,
         seed_base: None,
@@ -5921,7 +5937,97 @@ fn warm_arm_checkout(
         role: "judge",
         deps: None,
     };
-    seat::arm_warm(kube, &spec, vec![], checkout, Some((image, "floor"))).unwrap()
+    seat::arm_warm(kube, &spec, vec![], checkout, Some((image, "floor")))
+}
+
+// W24: the wrapped runner arms every ungoverned judge with its own tree as its write root
+// (`worker_write_roots` = [cwd]); the warm guard refused that shape, and the "cold" fallback
+// re-passed the same checkout into the same refusal, so no warm judge could ever arm.
+#[cfg(unix)]
+#[test]
+fn warm_judge_the_warm_guard_refuses_still_arms_a_true_cold_seat_w24() {
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key, _runtime) = warm_fixture();
+    let tree = dir.join("tree");
+    // A write root outside the judge's view: never warm, so the fallback must be a cold arm.
+    let notes = dir.join("notes");
+    std::fs::create_dir(&notes).unwrap();
+    let checkout = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    let (cold, _) = try_warm_arm(
+        &kube,
+        Some(checkout.clone()),
+        &tree,
+        "image",
+        &[],
+        &[],
+        true,
+        std::slice::from_ref(&notes),
+    )
+    .unwrap_or_else(|(_, e)| panic!("the cold fallback after a warm refusal must arm: {e}"));
+    assert_ne!(
+        cold.ns,
+        super::run_namespace_name(&kube.owner, &key.parent),
+        "a cold arm places by its own call, never in the warm parent's namespace"
+    );
+    assert_ne!(cold.scope.as_deref(), Some(checkout.scope().as_str()));
+    seat::reap(&cold.id);
+    drop(cold);
+    drop(checkout);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_with_its_own_tree_as_write_root_reuses_the_pod_and_writes_nothing_back_w24() {
+    let _env = crate::test_env::ENV_LOCK
+        .write()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key, _runtime) = warm_fixture();
+    let tree = dir.join("tree");
+    let out = tree.join("out");
+    std::fs::create_dir(&out).unwrap();
+    let mounts = [PlanMount::Bind {
+        path: out.clone(),
+        rw: true,
+    }];
+    let arm = || {
+        let checkout = seat::checkout_warm(key.clone()).unwrap();
+        assert!(checkout.is_some(), "the slot is free between calls");
+        try_warm_arm(
+            &kube,
+            checkout,
+            &tree,
+            "image",
+            &mounts,
+            &[],
+            true,
+            std::slice::from_ref(&tree),
+        )
+        .unwrap_or_else(|(_, e)| panic!("a production-shaped warm judge must arm: {e}"))
+    };
+    let (a, _) = arm();
+    assert_eq!(
+        a.ns,
+        super::run_namespace_name(&kube.owner, &key.parent),
+        "the judge armed warm, in its parent's namespace"
+    );
+    assert!(
+        a.roots.iter().all(|r| !r.back),
+        "a warm judge's replica never comes back to the host: {:?}",
+        a.roots
+    );
+    let pod = a.pod.clone();
+    seat::settle(&a, Ending::Exited(0)).unwrap();
+    drop(a);
+    let (b, _) = arm();
+    assert_eq!(pod, b.pod, "the second call reuses the warm pod");
+    seat::reap(&b.id);
+    drop(b);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[cfg(unix)]
