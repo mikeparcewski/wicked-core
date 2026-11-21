@@ -14653,6 +14653,25 @@ mod tests {
         );
     }
 
+    /// core#1743: a container claude seat's temp is the container's own `/tmp`, outside the tree,
+    /// so the governed hook's READ roots (and only those: never the mount read roots, which would
+    /// mount a host path) carry it, or a Read of a task output is a boundary block. Red on main:
+    /// the temp was `<tree>/tmp`, inside the write root, and nothing wires it.
+    #[test]
+    fn core_1743_the_hook_read_roots_carry_the_container_claude_temp_and_only_there() {
+        let src = include_str!("execute_wrapped.rs");
+        let production = src.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            production.contains("read_roots.extend(seat_temp_read_root(&floor_env))"),
+            "the governed hook's WICKED_READ_ROOTS no longer carries the container claude temp"
+        );
+        assert_eq!(
+            production.matches("seat_temp_read_root(").count(),
+            2,
+            "defined once and used once: in the hook env, never the mount read roots"
+        );
+    }
+
     #[test]
     fn the_launcher_settles_the_graph_without_arming_a_graph_write_dir() {
         let src = include_str!("execute_wrapped.rs");

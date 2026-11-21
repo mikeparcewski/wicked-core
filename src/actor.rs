@@ -36455,6 +36455,94 @@ mod seat_failover_tests {
         );
     }
 
+    /// core#1743 (train-11 J6, run c38b8c59, attempts 9 and 10): a seat pod whose write-back was
+    /// refused lost its result, and the run ended `sessionFailed` on an autonomous run (the
+    /// fall-through `fail_run`), against #1518's "never fails the unit". The reason was elided too:
+    /// the long host path ate the 300-char head and `[… N chars elided …]` cut the reason itself.
+    /// Now a lost result pauses at the `failure` gate on EVERY human_confirm, before the triage
+    /// judge (an engine settlement failure is not the seat's to rule on), and the stepFailed and
+    /// the unit's denial carry the engine's whole reason. Red on main: `none` failed the run,
+    /// `all` on a first try went to the triage judge, and the detail was elided mid-reason.
+    #[test]
+    fn core_1743_a_refused_write_back_pauses_at_the_failure_gate_with_the_whole_reason() {
+        for (case, confirm) in [
+            ("none", HumanConfirm::None),
+            ("all-first-try", HumanConfirm::All),
+        ] {
+            let run_id = format!("lost-wb-{case}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed_session(
+                &mut store,
+                &run_id,
+                &["claude", "codex", "pi"],
+                SessionStatus::Executing,
+                0,
+            );
+            let mut session = crate::domain::get_session(&store, &run_id)
+                .unwrap()
+                .unwrap();
+            session.human_confirm = confirm;
+            put_node(&mut store, session.to_node()).unwrap();
+            seed_unit(
+                &mut store,
+                &run_id,
+                6,
+                "extract",
+                "claude",
+                PhaseRole::Creator,
+                &[],
+                UnitStatus::Distributed,
+            );
+            let long = "w".repeat(140);
+            let reason = format!(
+                "the write-back of /srv/seat-host/.wicked-crew/worktrees/{long} was refused: \
+                 `tmp/claude-1000/-srv-seat-host--wicked-crew-worktrees-{long}/0b1c/tasks/a1.output` \
+                 is a symlink that leaves its root"
+            );
+            let lost = crate::execute_wrapped::settle_failure_output(
+                "claude",
+                &format!("{}{reason}", crate::execute_wrapped::SETTLE_FAILED),
+                &"the seat's own report of its extraction page\n".repeat(200),
+            );
+            let (applied, session, units, events) =
+                fold_failed_capturing(&mut store, &run_id, &lost);
+            assert!(matches!(applied, StepApplied::Paused), "{case}");
+            assert_eq!(session.status, SessionStatus::AwaitingHuman, "{case}");
+            assert!(
+                !events
+                    .iter()
+                    .any(|e| matches!(e, CoreEvent::SessionFailed { .. })),
+                "{case}: never sessionFailed"
+            );
+            let kind = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::AwaitingHuman { gate_kind, .. } => Some(gate_kind.clone()),
+                    _ => None,
+                })
+                .expect("awaitingHuman");
+            assert_eq!(kind, "failure", "{case}");
+            let detail = events
+                .iter()
+                .find_map(|e| match e {
+                    CoreEvent::StepFailed { detail, .. } => Some(detail.clone()),
+                    _ => None,
+                })
+                .expect("stepFailed");
+            assert!(
+                detail.contains("is a symlink that leaves its root") && !detail.contains("elided"),
+                "{case}: the whole reason rides the event: {detail}"
+            );
+            let denial = units[0].denial_reason.clone().unwrap_or_default();
+            assert!(
+                denial.contains("is a symlink that leaves its root"),
+                "{case}: the gate's reason is whole: {denial}"
+            );
+            assert_eq!(units[0].assigned_cli.as_deref(), Some("claude"), "{case}");
+            assert!(units[0].worker_failed_clis.is_empty(), "{case}");
+        }
+    }
+
     /// (core#1010) The same unclassified worker crash twice benches the seat for the run (run
     /// cdf4462a: opencode exited 1 on "no compatible V2 health response" for scope, the scope
     /// retry and triage, and plan rev 2 still seated it everywhere). The signature ignores the

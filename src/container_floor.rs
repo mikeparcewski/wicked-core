@@ -5983,6 +5983,40 @@ esac
     /// 512 MB tmpfs HOME and never the host's seeded cache: the plan points `CARGO_HOME` and
     /// `CARGO_TARGET_DIR` into `<worker home>/seat-build/<cli>`, which is neither a seed root (under
     /// `<worker home>/cache`) nor a write-back root, and the mount plan and Landlock policy admit it.
+    /// core#1743 (train-11 J6, run c38b8c59): a full-posture claude seat's own temp is the
+    /// container's `/tmp` (an in-memory dir every container floor grants rwx, never a replica root,
+    /// so never written back), never `<tree>/tmp`. In the tree, an Agent-tool task's
+    /// `tmp/claude-<uid>/…/tasks/<id>.output` (a link to the subagent transcript outside the tree)
+    /// refused the pod's write-back and lost the unit's result. Red on main: `<cwd>/tmp`.
+    #[test]
+    fn core_1743_a_full_posture_claude_seats_temp_is_the_containers_own_tmp_never_the_tree() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        let base = tmp("claude-temp-1743");
+        let tree = base.join("wt");
+        let worker = base.join("worker");
+        std::fs::create_dir_all(&tree).unwrap();
+        let (plan, _) = cargo_seat(&worker, &tree, &[]);
+        let temp: Vec<&PathBuf> = plan
+            .env
+            .iter()
+            .filter(|(k, _)| *k == "CLAUDE_CODE_TMPDIR")
+            .map(|(_, v)| v)
+            .collect();
+        assert_eq!(temp.len(), 1, "set once: {:?}", plan.env);
+        assert_eq!(temp[0], &PathBuf::from("/tmp"), "{:?}", plan.env);
+        assert!(!temp[0].starts_with(&tree), "never under the tree: {:?}", temp[0]);
+        // No new mount and no new write root: the #1578 fence regressions came from a host scratch
+        // mounted under the worker home.
+        assert!(
+            !plan.inputs.write_roots.iter().any(|r| r == Path::new("/tmp")),
+            "{:?}",
+            plan.inputs.write_roots
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn a_rust_capable_seats_cargo_state_is_outside_the_seed_and_the_write_back() {
         let _env = crate::test_env::ENV_LOCK

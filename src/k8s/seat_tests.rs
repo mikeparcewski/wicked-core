@@ -2025,6 +2025,29 @@ fn k8s_a_failed_settlement_keeps_the_clis_output_as_the_result_lost_frame() {
     assert!(out.ends_with("rate limited: retry later"), "{out}");
 }
 
+/// core#1743: the engine's reason is the frame's ONE line, whatever it holds (a codec error
+/// carries `\n`), so every reader takes the whole first line as the reason and bounds only the
+/// seat's output after it. Red on main: the reason's second line fell into the seat's output.
+#[test]
+fn k8s_core_1743_a_multi_line_settlement_reason_stays_on_the_frame_line() {
+    let err = format!(
+        "{}the write-back could not read the replica: wicked-sync: refused\ncommand terminated \
+         with exit code 3",
+        crate::execute_wrapped::SETTLE_FAILED
+    );
+    let out = crate::execute_wrapped::settle_failure_output("claude", &err, "seat words");
+    let first = out.lines().next().unwrap();
+    assert!(
+        first.starts_with(crate::execute_wrapped::RESULT_LOST_PREFIX),
+        "{out}"
+    );
+    assert!(
+        first.ends_with("command terminated with exit code 3)"),
+        "the whole reason is the first line: {out}"
+    );
+    assert_eq!(out.lines().nth(1), Some("seat words"), "{out}");
+}
+
 // ── review r4 folds ──────────────────────────────────────────────────────────────────────────
 
 #[test]
