@@ -95,9 +95,9 @@ pub(crate) enum GraphAge {
     /// Indexed at any other commit: older, newer, or unrelated.
     Stale { indexed: String, base: String },
     /// Recorded at the base commit but not known to BE the base (estate's `repo_info.dirty`): indexed
-    /// from a working tree with uncommitted changes, by a checkout re-index (a live checkout is never
-    /// an immutable base), or by an index that did not finish (wicked-core#1230, `code_graph`'s
-    /// `mark_not_a_base`).
+    /// from a working tree with uncommitted changes, by a checkout re-index without a clean,
+    /// unchanged HEAD proof (wicked-core#1681), or by an index that did not finish (wicked-core#1230,
+    /// `code_graph`'s `mark_not_a_base`).
     Dirty { indexed: String, base: String },
     /// No graph, no recorded commit, or unreadable.
     Missing(String),

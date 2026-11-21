@@ -350,6 +350,7 @@ pub(crate) fn read_report(path: &std::path::Path) -> Result<Option<String>, Stri
 }
 
 /// Judge the report file the Tool wrote.
+#[cfg(test)]
 pub(crate) fn judge_file(path: &std::path::Path, attempt: u32) -> ConformanceRecord {
     match read_report(path) {
         Ok(raw) => judge_report(raw.as_deref(), attempt),

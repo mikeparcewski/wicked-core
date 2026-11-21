@@ -37,9 +37,15 @@ use crate::workflow::{
     GateCond, GateSpec, GateType, PhaseDef, PhaseExecutor, PhaseRole, StepOwner,
 };
 
-/// The garden QE security specialist `security_review` runs (DES-TEAMING-002 Q6, fixed in C1): the
-/// frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
+/// The default garden QE security specialist `security_review` runs (DES-TEAMING-002 Q6, fixed in
+/// C1): the frontmatter name of `skills/qe-security-test-engineer/SKILL.md` in wicked-garden.
 pub const SECURITY_REVIEW_SKILL: &str = "wicked-garden-qe-security-test-engineer";
+/// The skills a `security_review` step may run: the catalog's own and the platform specialist
+/// the app presets use.
+pub const SECURITY_REVIEW_SKILLS: &[&str] = &[
+    SECURITY_REVIEW_SKILL,
+    "wicked-garden-platform-security-engineer",
+];
 /// The skill domain-extraction's coverage judge runs (`domain_coverage`, X-MIG M6): the one skill
 /// under which a self-verifying evaluator's code run is report-writing, not code work
 /// ([`crate::plan`]'s `code_work_step`).
@@ -1188,10 +1194,10 @@ fn apps_preset(json: &str, name: &str) -> Vec<PlanStep> {
 /// `mcp-server` (M12, DES-W7-M12 on core#649): the def's nine phases as data
 /// (`src/presets/mcp-server.json`, pinned to its mapping by a test). scope, source-discovery →
 /// `understand`; design → `design`; build → `build`; test → `test` (the bold cell: role neutral →
-/// evaluator); security-review and observability-review → `review`, each keeping its specialist
-/// skill and its raised gate (`review` leaves the skill unset; the catalog's `security_review` fixes
-/// its own, so the MCP review is a `review` and a high band's floor adds the generic one beside
-/// it); install-plan and install → `run` with their Tool commands, install gated `consent_before`.
+/// evaluator); security-review → `security_review`, keeping the platform specialist, and
+/// observability-review → `review`, keeping its observability specialist. Both keep their raised
+/// gates and satisfy the high band's two review slots (wicked-core#1682); install-plan and install →
+/// `run` with their Tool commands, install gated `consent_before`.
 /// Phase ids are kept: crew keys delivery on `install-plan` / `install`.
 fn mcp_server_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
@@ -1207,9 +1213,10 @@ fn mcp_server_preset() -> Vec<PlanStep> {
 /// editor conformance cases on the host (DES-EDITOR-CONFORMANCE-HOST, e2e F18: no seat has a headless
 /// browser); test → `test`, which cites that record, judges the editor's behaviour and is
 /// the run's QE phase (`qe_acceptance` required, as for every app-change preset); security-review →
-/// `review` keeping the platform specialist; install-plan and install → `run` with their Tool
-/// commands, install gated `consent_before`. The ids `install-plan` / `install` are the ones a
-/// delivering run's deliver goes before ([`crate::plan_gate`]).
+/// `security_review` keeping the platform specialist (wicked-core#1682: the band may add a generic
+/// `review`); install-plan and install → `run` with their Tool commands, install gated
+/// `consent_before`. The ids `install-plan` / `install` are the ones a delivering run's deliver goes
+/// before ([`crate::plan_gate`]).
 fn editor_plugin_preset() -> Vec<PlanStep> {
     let plan: crate::plan::PlanSteps =
         serde_json::from_str(include_str!("presets/editor-plugin.json"))
@@ -1329,6 +1336,7 @@ fn domain_extraction_preset() -> Vec<PlanStep> {
         },
         PlanStep {
             skill_ref: Some(crate::domain_extraction::EXTRACTOR_SKILL.to_string()),
+            required_deliverables: Some(vec![RULES_REL.to_string()]),
             ..step("produce", "extract", Some(EXTRACT_PREPARE_STEP))
         },
         // The page's own review (a `critique`, so the floor adds no generic one that judges a page
@@ -1582,6 +1590,7 @@ fn entry(
     executes_code: bool,
 ) -> PhaseDef {
     PhaseDef {
+        write_set: Vec::new(),
         requires_capture_report: false,
         answer_only: false,
         id: id.to_string(),
@@ -1610,6 +1619,76 @@ fn entry(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_presets_keep_one_authored_security_review_at_the_top_band() {
+        use crate::plan::{floor_fill, AddedBy, FloorInput, PlanSteps};
+
+        for (name, security_id) in [
+            ("mcp-server", "security-review"),
+            ("editor-plugin", "security-review"),
+            ("scaffold", "security"),
+        ] {
+            let plan = PlanSteps {
+                steps: builtin_preset(name).unwrap(),
+                ..PlanSteps::default()
+            };
+            let filled = floor_fill(
+                catalog(),
+                &plan,
+                FloorInput {
+                    score: 100,
+                    destructive: false,
+                    human_confirm: &crate::domain::HumanConfirm::None,
+                    deliver: None,
+                    obligations: &[],
+                    ran: &[],
+                    requires_evaluator: true,
+                    requires_qe: true,
+                    power_absorbs: &[],
+                },
+            )
+            .unwrap_or_else(|e| panic!("{name} floor fills: {e}"));
+            let security: Vec<_> = filled
+                .steps
+                .steps
+                .iter()
+                .filter(|s| s.catalog == "security_review")
+                .collect();
+            assert_eq!(security.len(), 1, "{name}: exactly one security review");
+            assert_eq!(
+                security[0].id, security_id,
+                "{name}: keep the preset's step"
+            );
+            assert_eq!(security[0].added_by, Some(AddedBy::Plan), "{name}");
+            assert!(security[0].floor_reason.is_none(), "{name}");
+            assert_eq!(
+                security[0].skill_ref.as_deref(),
+                Some("wicked-garden-platform-security-engineer"),
+                "{name}"
+            );
+            let reviews = filled
+                .def
+                .phases
+                .iter()
+                .filter(|p| p.kind == StageKind::Review)
+                .count();
+            assert_eq!(
+                reviews, 2,
+                "{name}: security plus a generic or observability review"
+            );
+            assert_eq!(
+                filled
+                    .steps
+                    .steps
+                    .iter()
+                    .filter(|s| s.catalog == "review")
+                    .count(),
+                1,
+                "{name}: the generic review floor is also satisfied"
+            );
+        }
+    }
 
     /// The §8.3 table, cell by cell, as fixed values (not re-derived from the builder).
     #[test]
@@ -1914,6 +1993,159 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
                 assert!(text.contains(why), "{case}: {text}");
             }
         }
+    }
+
+    #[test]
+    fn domain_extract_declares_its_rules_deliverable() {
+        let def = composed("domain-extraction");
+        let extract = def.phases.iter().find(|p| p.id == "extract").unwrap();
+        assert_eq!(
+            extract.required_deliverables,
+            [crate::domain_extraction::RULES_REL]
+        );
+    }
+
+    /// #1320: fixing one old failure cannot pay for a new failure in the same file.
+    #[cfg(unix)]
+    #[test]
+    fn qe_verify_rejects_equal_count_failure_substitution() {
+        use wicked_apps_core::spawn::HardenedCommand;
+        // spawn-audit: hardened probe for the real node:test fixture's harness.
+        if !std::process::Command::new("node")
+            .hardened()
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("skipped: node is not on PATH");
+            return;
+        }
+        let setup = r#"set -e
+git init -q -b main src && cd src
+git config user.email t@example.invalid && git config user.name t && git config commit.gpgsign false
+printf '{"scripts":{"test":"node --test"}}\n' > package.json
+mkdir -p test tests
+cat > test/m.test.js <<'JS'
+const test=require('node:test');const assert=require('node:assert');
+test('add',()=>assert.equal(1+2,3));
+test('red-1',()=>assert.equal(1,2));
+test('red-2',()=>assert.equal(2,3));
+JS
+git add -A && git commit -qm base
+git rev-parse HEAD > ../base.txt
+cat > test/m.test.js <<'JS'
+const test=require('node:test');const assert=require('node:assert');
+test('add',()=>assert.equal(1+2,4));
+test('red-1',()=>assert.equal(1,1));
+test('red-2',()=>assert.equal(2,3));
+test('new passing test',()=>assert.equal(3,3));
+JS
+echo '# plan' > tests/PLAN-add.md
+"#;
+        let text = qe_verify_identity_fixture("substitution", setup, false);
+        assert!(text.contains("failed=1 not_executed=0"), "{text}");
+        assert!(text.contains("checks_failed=1 failed_on_base=0"), "{text}");
+        assert!(text.contains("head_failure_ids=\"add|red-2\""), "{text}");
+    }
+
+    /// #1320: vitest collection failures have identities too. Exercise both comparisons,
+    /// including a suite-only substitution, and fail closed when the runner prints no ids.
+    #[cfg(unix)]
+    #[test]
+    fn qe_verify_vitest_collection_failures_require_the_same_identities() {
+        for (case, head_id, suite_only, want_ok) in [
+            ("same", "tests/broken.test.ts", false, true),
+            ("new-collection", "tests/new.test.ts", false, false),
+            ("suite-new-collection", "tests/new.test.ts", true, false),
+            ("unreadable", "", false, false),
+        ] {
+            let setup = format!(
+                r#"set -e
+git init -q -b main src && cd src
+git config user.email t@example.invalid && git config user.name t && git config commit.gpgsign false
+printf '{{"devDependencies":{{"vitest":"*"}}}}\n' > package.json
+printf 'node_modules/\n' > .gitignore
+mkdir -p tests node_modules/.bin
+echo '// base' > tests/broken.test.ts
+git add -A && git commit -qm base
+git rev-parse HEAD > ../base.txt
+echo '// head' >> tests/broken.test.ts
+echo '# plan' > tests/PLAN-broken.md
+cat > node_modules/.bin/vitest <<'SH'
+#!/bin/bash
+if grep -q head tests/broken.test.ts; then
+  echo ' Tests  1 failed | 2 passed (3)'
+  id='{head_id}'
+  if [ '{suite_only}' = true ] && [ "$#" -gt 1 ]; then id=tests/broken.test.ts; fi
+else
+  echo ' Tests  1 failed | 1 passed (2)'
+  id=tests/broken.test.ts
+fi
+[ -z "$id" ] || echo " FAIL  $id [ $PWD/$id ]"
+exit 1
+SH
+chmod +x node_modules/.bin/vitest
+"#
+            );
+            let text = qe_verify_identity_fixture(case, &setup, want_ok);
+            assert!(
+                text.contains("base_failure_ids=\"tests/broken.test.ts\""),
+                "{text}"
+            );
+            if want_ok {
+                assert!(text.contains("checks_failed=0 failed_on_base=1"), "{text}");
+            } else if suite_only {
+                assert!(text.contains("checks_failed=1 failed_on_base=1"), "{text}");
+            } else {
+                assert!(text.contains("failed=1 not_executed=0"), "{text}");
+                assert!(text.contains("checks_failed=1 failed_on_base=0"), "{text}");
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    fn qe_verify_identity_fixture(case: &str, setup: &str, want_ok: bool) -> String {
+        use wicked_apps_core::spawn::HardenedCommand;
+        let root =
+            std::env::temp_dir().join(format!("wicked-qe-identity-{}-{case}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        // spawn-audit: hardened fixture build, entirely in a throwaway repository.
+        let made = std::process::Command::new("bash")
+            .hardened()
+            .args(["-c", setup])
+            .current_dir(&root)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{case}: fixture: {made:?}");
+        let base = std::fs::read_to_string(root.join("base.txt")).unwrap();
+        let def = composed("qe-author-tests");
+        let PhaseExecutor::Tool { cmd } = &def
+            .phases
+            .iter()
+            .find(|p| p.id == "verify")
+            .unwrap()
+            .executor
+        else {
+            panic!("verify is a Tool step");
+        };
+        // spawn-audit: hardened invocation of the shipped verify Tool script.
+        let out = std::process::Command::new("bash")
+            .hardened()
+            .args(["-c", cmd.last().unwrap()])
+            .current_dir(root.join("src"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("TMPDIR", &root)
+            .env("WICKED_RUN_BASE", base.trim())
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&out.stdout).to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(out.status.success(), want_ok, "{case}: {text}");
+        text
     }
 
     /// M6: the built-in `domain-extraction` composes to the def the shipped JSON describes (the C1
@@ -2556,6 +2788,33 @@ printf "test('clamp lo',()=>assert.equal(m.clamp(-1,0,5),0));\ntest('clamp hi',(
         assert!(!domain
             .iter()
             .any(|s| s.catalog == "deliver" || s.catalog == "build"));
+    }
+
+    /// Research and independent re-fetches share the governed web source (core#1362).
+    #[test]
+    fn learn_research_and_review_use_only_the_web_source() {
+        let steps = builtin_preset("learn").unwrap();
+        for id in ["research", "review"] {
+            let text = steps
+                .iter()
+                .find(|s| s.id == id)
+                .unwrap()
+                .instructions
+                .as_deref()
+                .unwrap();
+            assert!(text.contains("web source"), "{id}: {text}");
+            assert!(text.contains("scripts/mcp/shim.py"), "{id}: {text}");
+            assert!(!text.contains("curl"), "{id}: {text}");
+            assert!(!text.contains("own web tools"), "{id}: {text}");
+            if id == "research" {
+                assert!(text.contains("not listed"));
+                assert!(text.contains("none of its calls answers"));
+                assert!(text.contains("research: no web access"));
+                assert!(text.contains("not fetched and continue"));
+            } else {
+                assert!(text.contains("could not"));
+            }
+        }
     }
 
     /// (CS3) The sourced report's check keeps off every seat that gathered or synthesized it: both

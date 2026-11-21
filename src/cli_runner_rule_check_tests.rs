@@ -214,6 +214,7 @@ fn review_input(repo: &std::path::Path, base: &str, db: &str) -> StepInput {
     unit.assigned_cli = Some("codex".into());
     unit.run_base_commit = Some(base.to_string());
     StepInput {
+        base_commit: None,
         run_id: "s".into(),
         unit_ix: 1,
         attempt: 0,
@@ -784,6 +785,7 @@ fn the_deliver_step_checks_a_deferred_rule_against_the_published_text() {
     let out = repo.join("pr-text.md");
     let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
     let ctx = |deferred: Vec<String>| DeliveryRuleCtx {
+        run_id: "delivery-run".into(),
         db_path: db.clone(),
         project: None,
         repo: None,
@@ -852,6 +854,7 @@ fn a_deliver_check_that_cannot_run_names_each_deferred_rule_so_it_can_be_skipped
     let runner = Arc::new(Breaks(Mutex::new(Vec::new())));
     let ctx = |db_path: String, deferred: Vec<String>, skips: Vec<crate::rule_check::RuleSkip>| {
         DeliveryRuleCtx {
+            run_id: "delivery-unchecked-run".into(),
             db_path,
             project: None,
             repo: None,

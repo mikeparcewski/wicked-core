@@ -54,7 +54,14 @@ impl Place {
                 true,
             ),
         };
-        let create = || cluster::ensure_run(&kube, &run, &render::RunBudget::default(), "20Gi");
+        let create = || {
+            cluster::ensure_run(
+                &kube,
+                &run,
+                &render::RunBudget::default(),
+                &format!("{}Gi", render::REPLICA_CLAIM_GI),
+            )
+        };
         let ns = if owned {
             create()
         } else {
@@ -174,6 +181,11 @@ impl Place {
             .map_err(|(why, e)| format!("{}: {e}", why.as_str()))?;
         self.reap_earlier()?;
         let doc = render::floor_pod(spec)?;
+        let dependencies = crate::checks_container::dependency_mounts(
+            &self.kube,
+            &self.ns,
+            spec.claims.iter().map(|(name, _, _)| name.as_str()),
+        )?;
         if let Err(e) = self.kube.apply(&[doc]) {
             self.delete(&spec.name);
             return Err(format!("the {} pod was not admitted: {e}", spec.role));
@@ -184,6 +196,9 @@ impl Place {
             match self.kube.get_json(Some(&self.ns), "pod", &spec.name) {
                 Ok(Some(p)) => {
                     if cluster::running_pod(std::slice::from_ref(&p)).is_some() {
+                        if let Some(dependencies) = &dependencies {
+                            dependencies.mounted();
+                        }
                         return Ok(());
                     }
                     if let Some(why) = stuck(&p) {
@@ -269,8 +284,17 @@ impl Place {
 
     /// Ensure the claim `name` exists in this place (idempotent).
     pub(crate) fn claim(&self, name: &str, size: &str) -> Result<(), String> {
+        let _admission =
+            crate::checks_container::admit_dependency_claim(&self.kube, &self.ns, name)?;
         self.kube
             .apply(&[render::pvc(&self.ns, &self.kube.owner, name, size)])
+            .map_err(|e| {
+                if e.contains("exceeded quota") {
+                    format!("admission_pending: the run's claim quota refused pvc/{name}: {e}")
+                } else {
+                    e
+                }
+            })
     }
 }
 
@@ -409,5 +433,34 @@ pub(crate) fn rc_verdict(seen: Option<i32>, rc: Option<&str>) -> Option<String> 
             "floor infrastructure: the exec stream was lost before the check finished (kubectl \
              said {seen}, the check left no exit code) — not a failure of the change"
         )),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pr_c2_claim_tests {
+    use super::*;
+
+    #[test]
+    fn quota_exceeded_claim_apply_is_a_named_admission_refusal() {
+        let dir = std::env::temp_dir().join(format!("claim-quota-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let kubectl = dir.join("kubectl");
+        crate::test_env::install_stub(&kubectl,
+            "#!/bin/sh\ncat >/dev/null\necho 'exceeded quota: run-budget, requested: persistentvolumeclaims=1' >&2\nexit 1\n");
+        let place = Place {
+            kube: Kube {
+                kubectl,
+                kubeconfig: None,
+                context: "test".into(),
+                owner: "me".into(),
+            },
+            ns: "live-run".into(),
+            run: "run".into(),
+            owned: false,
+        };
+        let err = place.claim("target", "64Gi").unwrap_err();
+        assert!(err.starts_with("admission_pending:"), "{err}");
+        assert!(err.contains("run-budget"), "{err}");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

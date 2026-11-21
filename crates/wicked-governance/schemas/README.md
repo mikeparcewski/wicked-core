@@ -13,13 +13,13 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
 | `domain-model.schema.json` | DESCRIPTIVE domain model mined FROM code — garden STEERS on it | 1.1.0 |
 | `coverage.schema.json` | Front-half coverage report wire shape | 1.0.0 |
 | `vocabulary.schema.json` | Domain vocabulary spine | 1.0.0 |
-| `VERSION` | Semver of the whole **bundle** (currently `1.3.0`) | — |
+| `VERSION` | Semver of the whole **bundle** (currently `1.3.2`) | — |
 
 ## Version semantics (two versions, deliberately)
 
 - **Bundle version** (`VERSION` file): bumps when ANY file in the bundle changes
   (additive optional field = patch; new required field = minor; invariant change
-  = major). Currently `1.3.1` (1.0.0→1.1.0 added `conformance-rules.schema.json`
+  = major). Currently `1.3.2` (1.0.0→1.1.0 added `conformance-rules.schema.json`
   to the bundle — archive commit 75735b9; 1.2.0→1.2.1 is the additive, optional
   DC-S1 project-rule fields of conformance-rules 1.2.0; 1.2.1→1.2.2 is the additive
   `operator-words` rule source kind of conformance-rules 1.3.0, core#827; 1.2.2→1.2.3 is
@@ -31,7 +31,11 @@ enforces these contracts (`conformance.rs` write-boundary invariants, the
   engine relabels every graph it reads, so no persisted label is served in the old shape);
   1.3.0→1.3.1 adds domain-model 1.1.0's optional `requirement.business_domain` and
   `metadata.business_domains` (the repository's business domains, proposed from code evidence;
-  requirement keys unchanged).
+  requirement keys unchanged); 1.3.1→1.3.2 adds domain-model 1.1.0's optional boolean
+  `metadata.product_only`: the build left tests, data, manifests and documents out (an extracted
+  rule counts whatever its file). Set by the build, never by a read's coverage relabel; absent means
+  a build from before the field (no claim). A row carried from an earlier build because its unit
+  left the index is flagged `unindexed` on the read's rows and keeps that build's verdict (core#1236).
 - **Per-schema contract version** (the `$id` version segment and each schema's
   `metadata.schema_version` const): the version a *document* carries and a
   consumer validates against. Independent of the bundle semver — the schemas say

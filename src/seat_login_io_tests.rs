@@ -7,12 +7,36 @@ use super::*;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Failures at the BrokerIo boundary, replacing the old shell stub's failure files.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum Fail {
+    RemoveLogin,
+    RemoveBroker(String),
+    Probe,
+    Write(String),
+    Publish,
+    Cleanup,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GatewayState {
+    #[default]
+    Running,
+    Stopped,
+    Absent,
+    Unknown,
+}
+
 #[derive(Default)]
-struct MemIo {
+pub(crate) struct MemIo {
     broker: RefCell<Option<BTreeMap<String, Vec<u8>>>>,
     stores: RefCell<BTreeMap<String, BTreeMap<String, Vec<u8>>>>,
     pods: RefCell<BTreeSet<String>>,
-    log: RefCell<Vec<String>>,
+    pub(crate) log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fail: RefCell<BTreeSet<Fail>>,
+    pub(crate) gateway_state: RefCell<GatewayState>,
+    pub(crate) broker_missing: RefCell<bool>,
+    pub(crate) published: RefCell<Vec<u8>>,
     /// When set: the gateway dir whose mutation lock must be held at `open_login` and free at
     /// `prepare_login` (review B-4 #3).
     lock_dir: RefCell<Option<std::path::PathBuf>>,
@@ -22,19 +46,89 @@ struct MemIo {
 
 impl MemIo {
     fn note(&self, s: String) {
-        self.log.borrow_mut().push(s);
+        self.log.lock().unwrap().push(s);
     }
-    fn broker_file(&self, f: &str) -> Option<Vec<u8>> {
+    pub(crate) fn broker_file(&self, f: &str) -> Option<Vec<u8>> {
         self.broker.borrow().as_ref()?.get(f).cloned()
+    }
+    pub(crate) fn broker_text(&self, file: &str) -> Option<String> {
+        self.broker_file(file)
+            .map(|v| String::from_utf8(v).unwrap())
+    }
+    pub(crate) fn seed_broker(&self, file: &str, bytes: impl AsRef<[u8]>) {
+        self.broker
+            .borrow_mut()
+            .get_or_insert_with(BTreeMap::new)
+            .insert(file.into(), bytes.as_ref().to_vec());
+    }
+    pub(crate) fn seed_login(&self, dir: &Path, cli: &str, file: &str, bytes: impl AsRef<[u8]>) {
+        let session = read_session(dir, cli).unwrap().expect("an open session");
+        self.stores
+            .borrow_mut()
+            .entry(session)
+            .or_default()
+            .insert(file.into(), bytes.as_ref().to_vec());
+    }
+    pub(crate) fn remove_login_file(&self, dir: &Path, cli: &str, file: &str) {
+        let session = read_session(dir, cli).unwrap().expect("an open session");
+        self.stores
+            .borrow_mut()
+            .entry(session)
+            .or_default()
+            .remove(file);
+    }
+    pub(crate) fn fail(&self, failure: Fail) {
+        self.fail.borrow_mut().insert(failure);
+    }
+    pub(crate) fn recover(&self, failure: Fail) {
+        assert!(
+            self.fail.borrow_mut().remove(&failure),
+            "failure was injected"
+        );
+    }
+    pub(crate) fn calls(&self) -> String {
+        self.log.lock().unwrap().join("\n")
+    }
+    pub(crate) fn clear_calls(&self) {
+        self.log.lock().unwrap().clear();
+    }
+    fn check(&self, failure: Fail) -> Result<(), String> {
+        if self.fail.borrow().contains(&failure) {
+            Err(format!("injected {failure:?}"))
+        } else {
+            Ok(())
+        }
+    }
+    fn publish(&self, dir: &Path) -> Result<(), String> {
+        self.note("publish".into());
+        *self.published.borrow_mut() =
+            std::fs::read(dir.join("config/config.json")).map_err(|e| e.to_string())?;
+        self.check(Fail::Publish)
     }
 }
 
 impl BrokerIo for MemIo {
     fn broker_present(&self) -> Result<bool, String> {
-        Ok(self.broker.borrow().is_some())
+        self.note("broker present".into());
+        Ok(!*self.broker_missing.borrow() && self.broker.borrow().is_some())
     }
-    fn init_broker(&self, _dir: &Path) -> Result<(), String> {
-        self.broker.borrow_mut().get_or_insert_with(BTreeMap::new);
+    fn init_broker(&self, dir: &Path) -> Result<(), String> {
+        self.note("init broker".into());
+        *self.broker_missing.borrow_mut() = false;
+        let mut config = crate::seat_gateway::load_config(dir)?;
+        crate::seat_gateway::reconcile_routes(&mut config);
+        let mut broker = self.broker.borrow_mut();
+        let broker = broker.get_or_insert_with(BTreeMap::new);
+        for route in config.providers {
+            let file = route
+                .credential_file
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            broker.entry(file).or_default();
+        }
         Ok(())
     }
     fn read_broker(
@@ -42,6 +136,7 @@ impl BrokerIo for MemIo {
         paths: &[&str],
         presence: bool,
     ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        self.note("read broker".into());
         let b = self.broker.borrow();
         let b = b.as_ref().ok_or("no broker")?;
         Ok(paths
@@ -62,6 +157,8 @@ impl BrokerIo for MemIo {
             .collect())
     }
     fn write_broker(&self, _d: &Path, _c: &str, file: &str, body: &[u8]) -> Result<(), String> {
+        self.note(format!("write {file}"));
+        self.check(Fail::Write(file.into()))?;
         self.broker
             .borrow_mut()
             .get_or_insert_with(BTreeMap::new)
@@ -72,36 +169,65 @@ impl BrokerIo for MemIo {
         let mut b = self.broker.borrow_mut();
         let b = b.get_or_insert_with(BTreeMap::new);
         for f in files {
+            self.note(format!("empty {f}"));
             b.insert((*f).into(), Vec::new());
         }
         Ok(())
     }
     fn remove_broker(&self, _d: &Path, _c: &str, file: &str) -> Result<(), String> {
+        self.note(format!("remove broker {file}"));
+        self.check(Fail::RemoveBroker(file.into()))?;
         if let Some(b) = self.broker.borrow_mut().as_mut() {
             b.remove(file);
         }
         Ok(())
     }
-    fn cleanup(&self, _dir: &Path) -> Result<(), String> {
+    fn cleanup(&self, dir: &Path) -> Result<(), String> {
+        self.note("cleanup".into());
+        self.check(Fail::Cleanup)?;
+        for scope in [
+            "claude", "codex", "pi", "opencode", "copilot", "agy", "broker", "config",
+        ] {
+            crate::seat_refresh::remove_private_file(&crate::seat_gateway::unsettled_path(
+                dir, scope,
+            ))?;
+        }
         Ok(())
     }
     fn route_sign_in(
         &self,
-        _d: &Path,
+        dir: &Path,
         cli: &str,
-        _l: &crate::seat_gateway::RouteLiterals,
+        literals: &crate::seat_gateway::RouteLiterals,
     ) -> Result<(), String> {
         self.note(format!("route {cli}"));
-        Ok(())
+        crate::seat_gateway::route_sign_in_with(dir, cli, literals, || self.publish(dir))
     }
-    fn confirm_sign_out(&self, _d: &Path, cli: &str) -> Result<(), String> {
+    fn confirm_sign_out(&self, dir: &Path, cli: &str) -> Result<(), String> {
         self.note(format!("confirm {cli}"));
-        Ok(())
+        let serving = match *self.gateway_state.borrow() {
+            GatewayState::Running => Some(true),
+            GatewayState::Stopped | GatewayState::Absent => Some(false),
+            GatewayState::Unknown => None,
+        };
+        crate::seat_gateway::confirm_sign_out_with(
+            dir,
+            cli,
+            serving,
+            serving == Some(false),
+            || self.publish(dir),
+            |_, accepted| {
+                self.note(format!("probe {accepted}"));
+                self.check(Fail::Probe)
+            },
+        )
     }
     fn login_exists(&self, session: &str) -> Result<bool, String> {
+        self.note(format!("login exists {session}"));
         Ok(self.stores.borrow().contains_key(session) || self.pods.borrow().contains(session))
     }
     fn create_login(&self, session: &str) -> Result<(), String> {
+        self.note(format!("create login {session}"));
         self.stores
             .borrow_mut()
             .insert(session.into(), BTreeMap::new());
@@ -109,6 +235,12 @@ impl BrokerIo for MemIo {
     }
     fn init_login(&self, _d: &Path, cli: &str, session: &str) -> Result<(), String> {
         self.note(format!("init {cli} {session}"));
+        if cli == "copilot" {
+            self.stores.borrow_mut().get_mut(session).unwrap().insert(
+                "copilot/settings.json".into(),
+                COPILOT_SETTINGS.as_bytes().to_vec(),
+            );
+        }
         Ok(())
     }
     fn prepare_login(&self, cli: &str) -> Result<(), String> {
@@ -139,6 +271,7 @@ impl BrokerIo for MemIo {
             !self.pods.borrow().contains(session),
             "a store is read only after its login pod is gone"
         );
+        self.note(format!("read login {session}"));
         let s = self.stores.borrow();
         let s = s.get(session).ok_or("no store")?;
         Ok(paths
@@ -147,10 +280,16 @@ impl BrokerIo for MemIo {
             .collect())
     }
     fn stop_login(&self, session: &str) -> Result<(), String> {
+        self.note(format!("stop login {session}"));
         self.pods.borrow_mut().remove(session);
         Ok(())
     }
     fn remove_login(&self, session: &str) -> Result<(), String> {
+        self.note(format!("remove login {session}"));
+        // A missing store counts as removed even if the remove operation fails.
+        if self.login_exists(session)? {
+            self.check(Fail::RemoveLogin)?;
+        }
         if *self.fail_open_and_remove.borrow() {
             return Err("injected: the cluster is unreachable".into());
         }
@@ -161,9 +300,11 @@ impl BrokerIo for MemIo {
     fn send(
         &self,
         _d: &Path,
-        _c: &str,
+        cli: &str,
         _r: &crate::seat_refresh::Request,
     ) -> Result<Value, String> {
+        self.note(format!("send {cli}"));
+        self.check(Fail::Probe)?;
         Err("no account reads here".into())
     }
 }
@@ -186,7 +327,11 @@ fn sign_claude_in(io: &MemIo, dir: &Path) {
         argv,
         vec!["exec".to_string(), session.clone(), "claude".into()]
     );
-    assert!(io.log.borrow().contains(&format!("init claude {session}")));
+    assert!(io
+        .log
+        .lock()
+        .unwrap()
+        .contains(&format!("init claude {session}")));
     io.stores
         .borrow_mut()
         .get_mut(&session)
@@ -212,7 +357,7 @@ fn a_container_login_signs_in_and_out_over_any_transport() {
         io.broker_file("anthropic.token"),
         Some(token().into_bytes())
     );
-    assert!(io.log.borrow().contains(&"route claude".to_string()));
+    assert!(io.log.lock().unwrap().contains(&"route claude".to_string()));
     assert!(
         io.stores.borrow().is_empty(),
         "the credential-bearing store is gone"
@@ -231,7 +376,11 @@ fn a_container_login_signs_in_and_out_over_any_transport() {
     ));
     sign_out_and_route(&io, &dir, "claude").unwrap();
     assert_eq!(io.broker_file("anthropic.token"), Some(Vec::new()));
-    assert!(io.log.borrow().contains(&"confirm claude".to_string()));
+    assert!(io
+        .log
+        .lock()
+        .unwrap()
+        .contains(&"confirm claude".to_string()));
     assert_eq!(broker_status(&io, "claude"), BrokerStatus::SignedOut);
     assert!(seat_sign_in(&io, &dir, "claude")
         .unwrap_err()
@@ -255,7 +404,11 @@ fn a_seats_sign_in_read_finishes_an_interrupted_sign_out() {
     let err = seat_sign_in(&io, &dir, "claude").unwrap_err();
     assert!(err.contains("not signed in"), "{err}");
     assert_eq!(io.broker_file("anthropic.token"), Some(Vec::new()));
-    assert!(io.log.borrow().contains(&"confirm claude".to_string()));
+    assert!(io
+        .log
+        .lock()
+        .unwrap()
+        .contains(&"confirm claude".to_string()));
     assert!(!signout_path(&dir, "claude").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -289,7 +442,11 @@ fn a_login_starts_inside_its_sessions_transaction() {
     let (io, dir) = (MemIo::default(), temp_dir());
     *io.lock_dir.borrow_mut() = Some(dir.clone());
     prepare_login_argv(&io, &dir, "claude").unwrap();
-    assert!(io.log.borrow().contains(&"prepare claude".to_string()));
+    assert!(io
+        .log
+        .lock()
+        .unwrap()
+        .contains(&"prepare claude".to_string()));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -312,4 +469,24 @@ fn a_failed_login_whose_cleanup_fails_keeps_its_session_marker() {
         "the next sign-in cleared it"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// #1438: a failed journal removal must retain it for the state machine's next repair.
+#[test]
+fn a_failed_broker_remove_retains_the_file_until_retry() {
+    let io = MemIo::default();
+    let file = "claude.ingest.next";
+    io.seed_broker(file, b"journal");
+    io.fail(Fail::RemoveBroker(file.into()));
+    assert!(io
+        .remove_broker(Path::new("/unused"), "claude", file)
+        .is_err());
+    assert_eq!(io.broker_file(file), Some(b"journal".to_vec()));
+    io.recover(Fail::RemoveBroker(file.into()));
+    io.remove_broker(Path::new("/unused"), "claude", file)
+        .unwrap();
+    assert_eq!(io.broker_file(file), None);
+    // Already removed is harmless, too.
+    io.remove_broker(Path::new("/unused"), "claude", file)
+        .unwrap();
 }

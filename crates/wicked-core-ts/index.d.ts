@@ -563,6 +563,12 @@ export declare class Core {
    */
   registerRepo(name: string, rootPath: string): Promise<string>
   /**
+   * Unregister a repository; resolves to the JSON literal `true`, or `false` for an unknown id.
+   * Rejects with `repo_in_use: ` for live runs or graph leases, or `repo_in_project: ` for
+   * project memberships. Leaves the checkout folder, code graph database, and worktrees on disk.
+   */
+  unregisterRepo(repoId: string): Promise<string>
+  /**
    * (rejudge) Whether the run's open gate can RE-RUN ITS JUDGE now, as a JSON
    * `RejudgeReadiness` object: `{applies, available, ord, eligible, missing: [{seat, reason}],
    * reason}`. `applies` — the gate is a unit's `judge_unavailable` denial; `available` — the
@@ -889,6 +895,18 @@ export declare class Core {
    */
   static checkRunTree(runId: string, workdir: string, repoRoot: string, baseCommit: string): Promise<string>
   /**
+   * Run editor conformance in the engine's review harness jail. Request JSON:
+   * `{ "packRoot": string, "timeoutS"?: integer }`, with no unknown fields. `packRoot` must
+   * be an absolute existing directory (canonicalized); `timeoutS` must be 1..=900 and defaults
+   * to 900 seconds. Resolves to JSON `{ "record": ConformanceRecord, "report": <parsed raw
+   * report or null> }`. Only invalid requests reject; host failures resolve to refused records,
+   * including `engine_refused` for hidden secret directories or skills resolution failures and
+   * `unjailed_host` when no OS jail is available. The pack is read-only to the harness; only a
+   * private temp directory is writable. Crew's install gate calls this; it never runs the harness
+   * unjailed.
+   */
+  static runEditorConformance(requestJson: string): Promise<string>
+  /**
    * Governance rules eval — run an eval corpus through the REAL SELECT→DECIDE gate path and
    * score every sample (the engine seam behind crew's `POST /api/v1/testing/evals/run`).
    * `args_json` is `{ type?, corpus?, knowledgeDb?, memoryDb?, dbPath }` (camelCase keys are the PINNED
@@ -1160,10 +1178,12 @@ export declare class Core {
    * recomputed from the store's own counts against the configured minimum. Resolves to a JSON
    * string `{ "graph": <domain-model document | null>, "coverage": {...}, "build": { generation,
    * coverage } | null, "rows": { <domain>: { <REQ-NNN>: { real, uncounted: null | "structural" |
-   * "not_product" | "unindexed" } } } | null }`: `graph` is the last build (null until a build
-   * reached the minimum), `coverage` the store now, `build` the label that build persisted, `rows`
-   * the engine's verdict on each listed row that recorded its unit (same pass as `coverage`). An
-   * unknown `repo_ref` REJECTS.
+   * "not_product" | "unindexed" } } } | null, "satisfied_by": { <domain>: { <REQ-NNN>:
+   * [{ symbol, name, file, kind, confidence }] } } | null }`: `graph` is the last build (null until
+   * a build reached the minimum), `coverage` the store now, `build` the label that build persisted,
+   * `rows` the engine's verdict on each listed row that recorded its unit (same pass as `coverage`),
+   * and `satisfied_by` each listed requirement's live code links, sorted by symbol, with an empty
+   * list when no target remains and null until built. An unknown `repo_ref` REJECTS.
    */
   getRequirementsGraphForRepo(repoRef: string): Promise<string>
   /**
@@ -1409,7 +1429,10 @@ export declare class Subscription {
  * dry-run plan carries `choices` (`'consent:<id>'` per plan choice, then `'reject'`), `recommended`
  * (the default, program-owned choice), `choiceLabels` and `writeTargets` (both keyed by choice
  * token; each target `{path, what, cli?, operatorOwned}`, `reject` → `[]`), `writePlanOrd` and,
- * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`). With no plan it carries only
+ * when the plan names any, `writeTargetsSkipped` (`{cli, why}[]`) and `consentAsks`
+ * (`{editor, permission, why}[]`). Each is present only when the plan names any; `consentAsks`
+ * describes what each editor in the pack asks to do, for the person's information. The grants
+ * are given later in Plugins. With no plan it carries only
  * `writeTargetsMissing` (why nothing is listed). Answer with `action: 'consent:<id>'`, approve
  * (= the default) or reject.
  * core#762 / core#418 (additive, new events): `acpTurnSettled` {session, ord, attempt, cliKey,

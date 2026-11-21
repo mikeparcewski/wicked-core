@@ -84,6 +84,13 @@
       "worker_read": "none (seat pods reach no host path; the floor covers this directory like the gateway's, and a seat-writable tree over it is refused)"
     },
     {
+      "name": "k8s-replica-git",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/k8s/seat.rs GitBuild::build — <state home>/k8s-replica-git/<sha256 of (tree, branch, masks)>/, the replica .git builders of the k8s seats (core#1441, core#1678; registered by core#1699): a disposable 0700 cache the engine wipes and re-creates on its first use in each process and keeps at most 8 builders in, the least recently used evicted. Not the credential directory `k8s`: `cluster install` and `cluster uninstall` never touch it",
+      "worker_read": "none (each builder holds a copy of a host repository's .git objects; a seat receives them only through the copy-in stream, never through the state home)"
+    },
+    {
       "name": "learn-schedules.json",
       "kind": "file",
       "owner": "crew",

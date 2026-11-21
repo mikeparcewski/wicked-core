@@ -72,12 +72,15 @@ mod tests {
 
     fn make_unit(ord: u32, description: &str, invocation: &str) -> WorkUnit {
         WorkUnit {
+            pass_started_ms: None,
+            write_set: Vec::new(),
             requires_capture_report: false,
             answer_only: false,
             capture_report: None,
             base_skill_ref: None,
             id: format!("u-test-{ord}"),
             session_id: "sess-p2wl".to_string(),
+            parent_run_id: None,
             ord,
             description: description.to_string(),
             stage: StageKind::Build,
@@ -176,6 +179,7 @@ mod tests {
     fn make_input(run_id: &str, unit_ix: usize, unit: WorkUnit) -> StepInput {
         use wicked_core::EntityMode;
         StepInput {
+            base_commit: None,
             run_id: run_id.to_string(),
             unit_ix,
             attempt: 0,

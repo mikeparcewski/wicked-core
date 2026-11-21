@@ -68,6 +68,7 @@ struct Lead {
     answer: Option<(StepStatus, String)>,
     released: bool,
     prompts: Vec<String>,
+    parents: Vec<Option<String>>,
 }
 
 struct Runner {
@@ -96,6 +97,7 @@ impl StepRunner for Runner {
             let (lock, cv) = &*self.lead;
             let mut lead = lock.lock().unwrap();
             lead.prompts.push(input.unit.description.clone());
+            lead.parents.push(input.unit.parent_run_id.clone());
             while !lead.released {
                 let (g, _) = cv.wait_timeout(lead, Duration::from_millis(50)).unwrap();
                 lead = g;
@@ -435,6 +437,11 @@ fn a_send_back_replans_holds_a_new_rev_and_dispatches_nothing() {
     rig.until("the lead's turn", |r| {
         !r.lead.0.lock().unwrap().prompts.is_empty()
     });
+    // (core#1413) The lead's synthetic session belongs to the run being re-planned.
+    assert_eq!(
+        rig.lead.0.lock().unwrap().parents,
+        vec![Some(run.to_string())]
+    );
     assert!(gate_changed(rig.core().confirm_gate_expecting(
         run,
         approve(),

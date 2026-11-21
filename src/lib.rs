@@ -553,6 +553,8 @@ pub fn check_run_tree(
     deliver_lift::check_run_tree(run_id, workdir, repo_root, base_commit)
 }
 
+pub use actor::run_editor_conformance;
+
 /// (core#1122) What the repo-checks floor holds on disk — the build cache at
 /// `<worker home>/repo-checks` (by repository, largest first, with its caps) and the floor log
 /// store — for crew's diagnostics and the Nerve Center's disk row. Read-only; walks the cache.
@@ -1398,6 +1400,21 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::RegisterRepo { spec, reply })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// Unregister a repository, returning false if it is unknown. Refuses live runs, graph leases,
+    /// and project memberships. Leaves the checkout folder, code graph database, and worktrees on
+    /// disk.
+    pub fn unregister_repo(&self, repo_id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::UnregisterRepo {
+                repo_id: repo_id.to_string(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
