@@ -2953,9 +2953,9 @@ pub(crate) const BOUNDARY_WITHDRAWAL_HELD: &str =
     "held for the operator: a monitor may not withdraw a boundary finding; its withdrawal request \
      is recorded beside it and only the operator clears it (core#959)";
 
-/// DES-001 §4.7 step 5: one turn per member with ≥1 unaccepted finding, listing each with the
-/// worker's state; `finding.settled{held|withdrawn}` for every unaccepted finding — exactly one
-/// each — and silence (no line, a failed turn, no time left) is HOLD.
+/// DES-001 §4.7 step 5: one turn per member with ≥1 finding settling now, listing each with the
+/// worker's state; `finding.settled{held|withdrawn}` exactly once per finding. Silence (no line,
+/// a failed turn, no time left) is HOLD. Deferred findings wait for the hand-off review.
 fn hold_round(
     u: &mut UnitTeam,
     ledger: &TeamLedger,
@@ -2966,10 +2966,10 @@ fn hold_round(
     timed_out: &mut bool,
 ) {
     let key = u.key();
-    // The unaccepted findings this attempt raised, by the member that authored them.
+    // The findings this attempt must settle now, by the member that authored them.
     let mut by_member: BTreeMap<String, Vec<(u32, super::LedgerFinding)>> = BTreeMap::new();
     for f in &ledger.findings {
-        if !tev::is_unaccepted(f) || f.monitor_reply.is_some() {
+        if !tev::settles_now(f) || f.monitor_reply.is_some() {
             continue;
         }
         let Some(seq) = u.book.raise_of(&f.finding.finding_id) else {

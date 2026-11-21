@@ -200,6 +200,8 @@ pub struct Claimed {
     pub reviewing: Option<u32>,
     /// The step's criterion (the `HELP:` context).
     pub criterion: String,
+    /// core#1206: the dispatched unit authorizes DEFER for exactly this attempt.
+    pub advice_scoped: bool,
 }
 
 /// The seat instance a step runs under (`by` on R rows): the unit's assigned seat.
@@ -418,6 +420,9 @@ pub fn claim(runner: Option<&TeamRunner>, input: &StepInput) -> Result<Attempt, 
                 claimed_id: id,
                 reviewing,
                 criterion,
+                advice_scoped: input.unit.advice_scope.as_ref().is_some_and(|scope| {
+                    scope.attempt == attempt && scope.kind == crate::actor::FLOOR_AUTO_RETRY_SCOPE
+                }),
             })))
         }
         Ok(None) => "step.claimed superseded: the run or attempt moved past it".to_string(),
@@ -548,7 +553,11 @@ pub fn boundary(claimed: &Claimed) -> Boundary {
     let (block, sent, _rest) = if advice.is_empty() {
         (String::new(), Vec::new(), Vec::new())
     } else {
-        super::advice_block_within(advice, super::ADVICE_TEXT_CAP.saturating_sub(text.len()))
+        super::advice_block_within(
+            advice,
+            super::ADVICE_TEXT_CAP.saturating_sub(text.len()),
+            claimed.advice_scoped,
+        )
     };
     text.push_str(&block);
     let delivery_id = tev::delivery_id_boundary(&claimed.step_id, claimed.attempt);
@@ -998,6 +1007,10 @@ fn publish_turn_lines(claimed: &Claimed, output: &StepOutput) {
                             disposition: match resp.disposition {
                                 super::Disposition::Accepted => tev::AdviceDisposition::Accepted,
                                 super::Disposition::Declined => tev::AdviceDisposition::Declined,
+                                super::Disposition::Deferred if claimed.advice_scoped => {
+                                    tev::AdviceDisposition::Deferred
+                                }
+                                super::Disposition::Deferred => tev::AdviceDisposition::Declined,
                             },
                             reason: resp.reason.clone(),
                         }),
@@ -1279,7 +1292,12 @@ pub fn render_for_gate(snap: &UnitTeamSnapshot) -> Option<String> {
             }
         ));
         if let Some(r) = &f.worker_reason {
-            s.push_str(&format!("  worker: {}\n", cap_utf8(r, 512)));
+            let label = if f.status == super::FindingStatus::Deferred {
+                "deferred to the hand-off review"
+            } else {
+                "worker"
+            };
+            s.push_str(&format!("  {label}: {}\n", cap_utf8(r, 512)));
         }
         if let Some(r) = &f.monitor_reply {
             s.push_str(&format!(

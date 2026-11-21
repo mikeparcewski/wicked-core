@@ -472,9 +472,9 @@ Exact payloads (envelope fields omitted after the first):
  "outcome":"injected",             // "injected" | "turn_ended" | "refused" | "not_delivered", as S3's SteerOutcome spells them (src/team.rs:1704-1709); an "end:" row is always channel "none", outcome "not_delivered"
  "detail":null}
 
-// 13 — advice.answered (R): the worker thread, from the PA's `ADVICE <id>: ACCEPT|DECLINE — <reason>` lines (S3 parser, src/team.rs:1989)
+// 13 — advice.answered (R): the worker thread, from the PA's `ADVICE <id>: ACCEPT|DECLINE|DEFER — <reason>` lines (S3 parser, src/team.rs:1989)
 {"ord":3,"attempt":1,"by":"claude#1","re":"finding.raised#4","raise_seq":4,"answered_in":"build:1",   // the step:attempt whose output carried the line
- "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined" (src/team.rs:1676-1679)
+ "finding_id":"f-3fa9c2e1d0b4a7e6","disposition":"declined","reason":"campaign.rs:325 documents the exclusion"}   // "accepted" | "declined" | "deferred"
 
 // 14 / 15 — help.requested (R: the PA asks) and help.answered (S: a member answers)
 {"ord":3,"attempt":1,"by":"claude#1","help_id":"h-1a2b…",
@@ -784,7 +784,12 @@ The plan only **grows**. The engine publishes `plan.revised{plan_rev, reason, ad
   - **What it publishes:** one `advice.delivered{channel:"boundary", outcome:"injected"}` row **per finding** it rendered. A finding that did not fit the cap gets no row and is picked up at the following boundary.
   - **Why this covers every carrier:** it works for wrapped CLIs with null stdin (`src/execute_wrapped.rs:3468`), for PTY, and for every ACP adapter, because a step boundary is a prompt every carrier builds.
 - **Claude ACP, additionally mid-turn (S3's mechanism, unchanged).** `steer_at_boundary` (`src/acp_runner.rs:4903`) keeps its delivery point and its `_session/steering` request with `idleBehavior:"promptRequired"`. Its **source** becomes a poll of `finding.raised{severity:"high"}` for the attempt, after the attempt's `step.claimed` id and minus the attempt's delivered set. It publishes one `advice.delivered{channel:"acp_steering", outcome}` row per finding the steer carried, all sharing that steer's `steer_id`.
-- **Authority is unchanged (DES-001 §5.3).** The advice block says ADVISORY. The PA answers `ADVICE <id>: ACCEPT|DECLINE — <evidence>` and may decline; the gate decides.
+- **Authority is unchanged (DES-001 §5.3).** The advice block says ADVISORY. The PA answers `ADVICE <id>: ACCEPT|DECLINE|DEFER — <evidence>` and may decline; the gate decides. `DEFER` is offered only when `WorkUnit.advice_scope`
+  names this exact attempt with kind `floor_auto_retry`. The runner publishes it as `deferred`
+  on that attempt, otherwise as `declined`, retaining the reason and last-line-wins behavior.
+  Deferred findings stay unaccepted in the ledger and reach the hand-off review through the
+  existing creator snapshot. They skip this attempt's hold round, council and timeout HOLD
+  synthesis; operator holds and stream-gap pauses still apply (core#1206).
 
 ### 8.10 The council (operator step 8)
 

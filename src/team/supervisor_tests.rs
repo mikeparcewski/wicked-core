@@ -2109,6 +2109,7 @@ fn t6_e_a_help_line_is_asked_answered_and_rendered_at_the_next_boundary() {
         claimed_id,
         reviewing: None,
         criterion: "the handler cancels stale fetches".into(),
+        advice_scoped: false,
     };
     let out = crate::workflow::StepOutput {
         run_id: RUN.into(),
@@ -2517,6 +2518,7 @@ fn help_scaffold(
         claimed_id,
         reviewing: None,
         criterion: "the handler cancels stale fetches".into(),
+        advice_scoped: false,
     };
     let out = crate::workflow::StepOutput {
         run_id: RUN.into(),
@@ -3163,5 +3165,46 @@ fn team_plan_with_pool_810() {
         high.with_pool(&["pi".into()]).monitors,
         3,
         "a pool never watches less"
+    );
+}
+
+/// core#1206: a passing step with a delivered deferred HIGH skips HOLD/council and keeps it for review.
+#[test]
+fn deferred_high_skips_hold_and_council_and_is_rendered_for_review() {
+    let mut h = Harness::new("deferred-review");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, _| Ok(format!("{hit}\nDONE")));
+    h.start("claude#1", &["claude#1", "claude#2", "codex"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1);
+    h.delivered(3, 1, &raised[0], "injected");
+    h.answer(3, 1, &raised[0], "deferred", "unrelated to failing checks");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert!(h.host.prompts_matching("hold round").is_empty());
+    assert!(h.rows(tev::FINDING_SETTLED).is_empty());
+    assert!(h.rows(tev::COUNCIL_CALLED).is_empty());
+    assert!(h.rows(tev::COUNCIL_RULED).is_empty());
+    assert!(h.council.calls.lock().unwrap().is_empty());
+    let ledger = h.folded(3, 1);
+    assert_eq!(ledger.final_pass, super::super::FinalPass::Completed);
+    assert!(!ledger.team_pause);
+    assert_eq!(ledger.findings[0].status.as_str(), "deferred");
+    assert_eq!(
+        ledger.findings[0].worker_reason.as_deref(),
+        Some("unrelated to failing checks")
+    );
+    let mut snap =
+        super::super::UnitTeamSnapshot::stamped(super::super::Transport::Bus, None, None);
+    snap.ledger = Some(ledger);
+    let review = super::super::runner::render_for_gate(&snap).unwrap();
+    assert!(review.contains("[HIGH] src/lib.rs:3"), "{review}");
+    assert!(
+        review.contains("deferred to the hand-off review: unrelated to failing checks"),
+        "{review}"
     );
 }

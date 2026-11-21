@@ -2240,3 +2240,53 @@ fn a_ruling_records_the_drawn_seats_and_the_seed_on_the_dispute() {
     assert_eq!(d.seats, vec!["codex", "opencode", "pi"]);
     assert_eq!(d.seed, Some(77));
 }
+
+/// core#1206: deferred HIGHs survive wire/persisted-ledger round trips and timeout without HOLD.
+#[test]
+fn deferred_high_round_trips_without_pause_or_timeout_settlement() {
+    let mut payload = fixture(ADVICE_ANSWERED);
+    payload["disposition"] = json!("deferred");
+    let event = TeamEvent::from_payload(ADVICE_ANSWERED, &payload).unwrap();
+    assert_eq!(event.to_payload().unwrap(), payload);
+    let s = base_high(Some(("deferred", "unrelated to failing checks")), None);
+    let ledger = s.fold();
+    let f = &ledger.findings[0];
+    assert_eq!(f.status.as_str(), "deferred");
+    assert_eq!(
+        f.worker_reason.as_deref(),
+        Some("unrelated to failing checks")
+    );
+    assert!(is_unaccepted(f));
+    assert!(!ledger.team_pause);
+    let mut persisted = serde_json::to_value(&ledger).unwrap();
+    persisted["teamPause"] = json!(true);
+    let restored: TeamLedger = serde_json::from_value(persisted).unwrap();
+    assert!(!restored.team_pause, "pause is recomputed on load");
+    assert_eq!(restored, ledger);
+    let timeout = synthesize_timeout(restored);
+    assert_eq!(timeout.final_pass, FinalPass::TimedOut);
+    assert!(!timeout.team_pause);
+    assert!(timeout.findings[0].monitor_reply.is_none());
+    assert!(timeout.findings[0].dispute.is_none());
+}
+
+/// core#1206: DEFER cannot clear operator holds or stream-gap pauses.
+#[test]
+fn deferred_high_preserves_operator_hold_and_stream_gap_pause() {
+    let mut s = base_high(Some(("deferred", "review later")), Some("held"));
+    let mut ledger = s.fold();
+    ledger.findings[0]
+        .monitor_reply
+        .as_mut()
+        .unwrap()
+        .withdrawal_requested = Some("only the operator may withdraw".into());
+    ledger.refresh_pause();
+    assert!(ledger.team_pause);
+    let restored: TeamLedger =
+        serde_json::from_value(serde_json::to_value(&ledger).unwrap()).unwrap();
+    assert!(restored.team_pause);
+    s.rows
+        .retain(|r| !matches!(r.event.body, TeamBody::StepCompleted(_)));
+    assert_eq!(s.fold().final_pass, FinalPass::StreamGap);
+    assert!(s.fold().team_pause);
+}

@@ -3635,6 +3635,7 @@ mod tests {
             last_attempt: None,
             rework_of: None,
             rework_amendment: None,
+            advice_scope: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
             requested_rejudge: None,

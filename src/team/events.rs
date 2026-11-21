@@ -496,7 +496,11 @@ wire_enum! {
 }
 wire_enum! {
     /// `advice.answered.disposition`.
-    pub enum AdviceDisposition { Accepted = "accepted", Declined = "declined" }
+    pub enum AdviceDisposition {
+        Accepted = "accepted",
+        Declined = "declined",
+        Deferred = "deferred",
+    }
 }
 wire_enum! {
     /// `step.completed.status`: `StepStatus` as `status_to_str` spells it.
@@ -1553,11 +1557,16 @@ pub fn is_unaccepted(f: &LedgerFinding) -> bool {
     )
 }
 
-/// DES-001 §6.3: HIGH, not accepted, and held by its monitor. A missing hold-round reply counts
-/// as HOLD (a monitor's silence never clears a finding).
+/// core#1206: deferred advice stays unaccepted but waits for the hand-off review.
+pub fn settles_now(f: &LedgerFinding) -> bool {
+    is_unaccepted(f) && f.status != FindingStatus::Deferred
+}
+
+/// DES-001 §6.3: HIGH, settling now, and held by its monitor. A missing hold-round reply counts
+/// as HOLD (a monitor's silence never clears a finding). Deferred advice waits for review.
 pub fn is_unresolved_high(f: &LedgerFinding) -> bool {
     f.finding.severity == Severity::High
-        && is_unaccepted(f)
+        && settles_now(f)
         && f.monitor_reply
             .as_ref()
             .is_none_or(|r| r.kind == ReplyKind::Hold)
@@ -1912,14 +1921,14 @@ pub fn dispute_of(r: &CouncilRuled) -> Dispute {
     }
 }
 
-/// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every unaccepted HIGH
+/// DES-001 §4.7 budget expiry, fail-closed: `finalPass: "timed_out"`, and every HIGH settling now
 /// missing a hold-round reply or a council verdict gets `{kind:"hold", reason:"no reply (final
 /// pass timed out)"}` / `{verdict:"no_verdict", reason:"timeout"}`. Recorded results are kept;
-/// MEDIUM and accepted/withdrawn/superseded findings are untouched. `teamPause` is recomputed.
+/// MEDIUM and accepted/withdrawn/superseded/deferred findings are untouched. `teamPause` is recomputed.
 pub fn synthesize_timeout(mut ledger: TeamLedger) -> TeamLedger {
     ledger.final_pass = FinalPass::TimedOut;
     for f in &mut ledger.findings {
-        if f.finding.severity != Severity::High || !is_unaccepted(f) {
+        if f.finding.severity != Severity::High || !settles_now(f) {
             continue;
         }
         if f.monitor_reply.is_none() {
@@ -2045,6 +2054,7 @@ impl FindingAcc {
             _ => match self.answer.as_ref().map(|a| a.disposition) {
                 Some(AdviceDisposition::Accepted) => FindingStatus::Accepted,
                 Some(AdviceDisposition::Declined) => FindingStatus::Declined,
+                Some(AdviceDisposition::Deferred) => FindingStatus::Deferred,
                 None => FindingStatus::Unanswered,
             },
         };

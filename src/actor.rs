@@ -9275,9 +9275,10 @@ const FLOOR_AUTO_RETRY_NOTE: &str = "[automatic floor retry — round 1 of 1 (co
 const FLOOR_AUTO_RETRY_SCOPE_NOTE: &str = " This round is ONLY for these failing checks: make no \
      edit they do not require — no refactor, no follow-up, no other platform, and no reviewer's or \
      team member's advice unless the failing checks need it — because any edit makes the floor run \
-     again on a new tree. Other advice waits for the hand-off's review, which reads it with your \
-     answer. If you answer that no change is needed, leave the tree exactly as it is: the engine \
-     compares the tree, and an attempt that changed it is read as a change.";
+     again on a new tree. Answer unrelated advice `ADVICE <id>: DEFER — <why>`; it goes to the \
+     hand-off's review, which reads it with your answer. If you answer that no change is needed, \
+     leave the tree exactly as it is: the engine compares the tree, and an attempt that changed it \
+     is read as a change.";
 
 /// (j4-gates, core#1113; core#1142) The automatic round's note, from the floor's structured
 /// results ([`crate::repo_checks::RepoChecksReport::failure_split`]): it names the HEAD-ONLY
@@ -12777,6 +12778,13 @@ fn dispatch_unit_with(
         unit.observation_pending = true;
     }
     unit.observation_reset = false;
+    let advice_scope_changed = unit
+        .advice_scope
+        .as_ref()
+        .is_some_and(|scope| scope.attempt != session.attempt);
+    if advice_scope_changed {
+        unit.advice_scope = None;
+    }
     let attempt_changed = unit.last_attempt != Some(session.attempt);
     if attempt_changed {
         unit.last_attempt = Some(session.attempt);
@@ -12894,6 +12902,7 @@ fn dispatch_unit_with(
     if (notes_root.is_some() && unit.notes_root != notes_root)
         || qe_root_changed
         || attempt_changed
+        || advice_scope_changed
         || team_changed
     {
         if notes_root.is_some() {
@@ -21481,6 +21490,12 @@ fn rewind_to_creator_scoped(
         u.draft_render = None;
         // A rework runs the seat: a re-judge left armed (its attempt never folded) is void.
         u.requested_rejudge = None;
+        u.advice_scope = (ix == target_ix && scope == FLOOR_AUTO_RETRY_SCOPE).then(|| {
+            crate::domain::AdviceScope {
+                attempt: round,
+                kind: scope.to_string(),
+            }
+        });
         if ix == target_ix {
             u.status = crate::domain::UnitStatus::Distributed;
             u.rework_of = Some(review_ord);
@@ -24353,6 +24368,73 @@ mod substance_gate_tests {
             (escalated.0.as_str(), escalated.1.as_str()),
             ("floor_failed", "repo_checks")
         );
+    }
+
+    /// core#1206: the automatic scope binds its dispatched attempt; ordinary operator retries
+    /// and reworks clear it, and old unit records default to an absent scope.
+    #[test]
+    fn floor_retry_binds_advice_scope_and_operator_rework_clears_it() {
+        for (name, decision) in [
+            (
+                "retry",
+                crate::workflow::HumanDecision::Approve {
+                    amend: None,
+                    amend_scope: crate::workflow::AmendScope::Cursor,
+                },
+            ),
+            (
+                "rework",
+                crate::workflow::HumanDecision::RequestChanges {
+                    note: Some("ordinary operator rework".into()),
+                },
+            ),
+        ] {
+            let run_id = format!("floor-advice-scope-{name}-{}", std::process::id());
+            let mut store = open_store(Some(":memory:")).unwrap();
+            seed(&mut store, &run_id, PhaseRole::Creator);
+            let mut subs = crate::event_log::EventSink::default();
+            let (_, session, unit) =
+                fold_at(&mut store, &mut subs, &run_id, 0, creator_floor(1, false));
+            let mut wire = serde_json::to_value(&unit).unwrap();
+            assert_eq!(
+                wire["advice_scope"],
+                serde_json::json!({
+                    "attempt": session.attempt, "kind": "floor_auto_retry"
+                })
+            );
+            assert_eq!(unit.last_attempt, Some(session.attempt));
+            wire.as_object_mut().unwrap().remove("advice_scope");
+            let old: WorkUnit = serde_json::from_value(wire).unwrap();
+            assert!(old.advice_scope.is_none());
+            let (applied, _, _) =
+                fold_at(&mut store, &mut subs, &run_id, 1, creator_floor(1, false));
+            assert!(matches!(applied, StepApplied::Paused));
+            let (tx, _rx) = channel::<Command>();
+            let runner: Arc<dyn StepRunner> = Arc::new(NoopRunner);
+            let status = confirm_gate(
+                &mut store,
+                &mut subs,
+                &runner,
+                &tx,
+                &mut HashSet::new(),
+                &run_id,
+                decision,
+                &None,
+                &None,
+                uuid::Uuid::nil(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(status, SessionStatus::Executing);
+            let unit = crate::domain::session_units(&store, &run_id)
+                .unwrap()
+                .remove(0);
+            assert!(serde_json::to_value(&unit)
+                .unwrap()
+                .get("advice_scope")
+                .is_none());
+            assert_eq!(unit.last_attempt, Some(2));
+        }
     }
 
     /// (core#1142) A creator floor whose every failing test also fails on the run base takes NO
@@ -34111,7 +34193,7 @@ mod code_evidence_floor_tests {
                 "the note is not a declaration: {note}"
             );
             // (rig run ea73afc0) Every variant scopes the round to the failing checks: no other
-            // edit, team advice declined for the review, and a no-change answer leaves the tree.
+            // edit, team advice deferred to the review, and a no-change answer leaves the tree.
             assert!(note.ends_with(FLOOR_AUTO_RETRY_SCOPE_NOTE), "{note}");
             assert!(
                 note.contains("make no edit they do not require")
@@ -34119,8 +34201,7 @@ mod code_evidence_floor_tests {
                     && note.contains("read as a change"),
                 "{note}"
             );
-            // (xreview on #1204) No prescribed DECLINE: a declined finding opens the hold round
-            // (and a council for a held HIGH) at once; the engine has no "defer to review" answer.
+            // core#1206: unrelated advice uses DEFER; a DECLINE would settle it now.
             assert!(!note.contains("DECLINE"), "{note}");
             assert!(
                 crate::team::parse_advice_lines(note).is_empty(),

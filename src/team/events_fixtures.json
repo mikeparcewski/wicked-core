@@ -783,5 +783,21 @@
    "reason": "no distinct signed-in seat",
    "error": "only claude is signed in"
   }
+ },
+ {
+  "type": "wicked.team.advice.answered",
+  "payload": {
+   "run_id": "r1",
+   "ord": 3,
+   "attempt": 1,
+   "by": "claude#1",
+   "at": 1758700000012,
+   "re": "finding.raised#4",
+   "raise_seq": 4,
+   "answered_in": "build:1",
+   "finding_id": "f-7bf84000911d564c",
+   "disposition": "deferred",
+   "reason": "Unrelated to the failing checks; carry to the hand-off review."
+  }
  }
 ]

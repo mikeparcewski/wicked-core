@@ -338,3 +338,24 @@ fn a_repo_view_writes_the_checkpoint_tree_read_only() {
         let _ = std::fs::remove_dir_all(d);
     }
 }
+
+/// core#1206: DEFER uses the advice grammar, its keyword boundary and last-line-wins rule.
+#[test]
+fn defer_parses_with_keyword_boundary_last_line_and_reason_cap() {
+    let answers = parse_advice_lines(&format!(
+        "ADVICE {A}: ACCEPT — fixed\nADVICE {A}: DEFER — unrelated to failing checks\n\
+         ADVICE {A}: DEFERRED — not the keyword\nADVICE {B}: DEFER: review it"
+    ));
+    assert_eq!(answers.len(), 2);
+    assert_eq!(answers[A].disposition, Disposition::Deferred);
+    assert_eq!(answers[A].reason, "unrelated to failing checks");
+    assert_eq!(answers[B].reason, "review it");
+    assert!(parse_advice_lines(&format!("ADVICE {A}: DEFERRED — no")).is_empty());
+    let answers = parse_advice_lines(&format!("ADVICE {A}: DEFER - {}", "é".repeat(3000)));
+    assert_eq!(answers[A].reason, "é".repeat(REASON_CAP / 2));
+    let empty = parse_advice_lines(&format!("ADVICE {A}: DEFER"));
+    assert_eq!(empty[A].disposition, Disposition::Deferred);
+    assert_eq!(empty[A].reason, "");
+    let answers = parse_advice_lines(&format!("ADVICE {A}: DEFER\nADVICE {A}: ACCEPT — fixed"));
+    assert_eq!(answers[A].disposition, Disposition::Accepted);
+}

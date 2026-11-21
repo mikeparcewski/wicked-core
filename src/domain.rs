@@ -1121,6 +1121,13 @@ fn is_zero_u32(n: &u32) -> bool {
     *n == 0
 }
 
+/// core#1206: authorization to defer advice on one exact dispatched attempt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdviceScope {
+    pub attempt: u32,
+    pub kind: String,
+}
+
 /// A unit of distributed work, persisted as `Node(Other(WORK_UNIT))`. Plan creates it `Pending`;
 /// distribute records the assignment; execute records the outcome.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1551,6 +1558,9 @@ pub struct WorkUnit {
     /// re-reading the evaluator transcript. Absent until the unit is rewound; cleared on approval.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rework_amendment: Option<String>,
+    /// core#1206: only this attempt may defer unrelated advice to the hand-off review.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advice_scope: Option<AdviceScope>,
     /// (core#760) Every NOT-PASS verdict this (Evaluator) unit returned, oldest first — handed back
     /// to the unit on its next round. Never cleared by a rewind; skipped on the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2010,6 +2020,7 @@ impl WorkUnit {
             last_attempt: None,
             rework_of: None,
             rework_amendment: None,
+            advice_scope: None,
             review_rounds: Vec::new(),
             operator_rulings: Vec::new(),
             requested_rejudge: None,

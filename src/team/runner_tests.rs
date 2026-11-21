@@ -642,6 +642,7 @@ fn an_unreadable_stream_at_the_timeout_is_stream_gap() {
         claimed_id: 2,
         reviewing: None,
         criterion: String::new(),
+        advice_scoped: false,
     };
     let i = input("t5c3", 1, 0, Some(bus_stamp(1)));
     let snap = complete(&c, &ok_output(&i));
@@ -1490,6 +1491,7 @@ fn k3c_the_boundary_renders_a_non_answered_help_and_the_pas_own_plan_refusal_onc
         claimed_id: c2,
         reviewing: None,
         criterion: String::new(),
+        advice_scoped: false,
     };
     let text = boundary(&claimed).block.expect("a block").output;
     assert!(
@@ -1588,6 +1590,7 @@ fn k3c_an_answer_landing_after_the_claim_waits_for_the_next_boundary_and_renders
         claimed_id: c1,
         reviewing: None,
         criterion: String::new(),
+        advice_scoped: false,
     };
     assert!(
         boundary(&at_c1)
@@ -1706,6 +1709,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
         claimed_id: c2,
         reviewing: None,
         criterion: String::new(),
+        advice_scoped: false,
     };
     let text = boundary(&claimed).block.expect("a block").output;
     assert!(text.len() <= crate::team::ADVICE_TEXT_CAP, "{}", text.len());
@@ -1768,7 +1772,7 @@ fn k3c_answers_fit_by_priority_and_disclose_what_did_not() {
         target: Default::default(),
     };
     let (block, sent, rest) =
-        crate::team::advice_block_within(vec![crate::team::Advice { finding: f }], 100);
+        crate::team::advice_block_within(vec![crate::team::Advice { finding: f }], 100, false);
     assert!(block.is_empty() && sent.is_empty() && rest.len() == 1);
 }
 
@@ -1835,6 +1839,7 @@ fn k3c_an_unpresented_completion_cuts_no_window() {
         claimed_id: c2,
         reviewing: None,
         criterion: String::new(),
+        advice_scoped: false,
     };
     let text = boundary(&at_c2).block.expect("a block").output;
     assert!(
@@ -1927,4 +1932,57 @@ fn merge_snapshot_preserves_a_carried_record_and_its_pause() {
     assert_eq!(merged.carried_from, Some(1));
     assert_eq!(merged.ledger, reviewed.ledger);
     assert!(merged.ledger.unwrap().team_pause);
+}
+
+/// core#1206: only the exact floor-retry attempt may publish DEFER; the final answer wins.
+#[test]
+fn defer_is_published_before_completion_only_for_the_scoped_attempt() {
+    for (name, scope, expected) in [
+        (
+            "scoped",
+            json!({"attempt": 1, "kind": "floor_auto_retry"}),
+            "deferred",
+        ),
+        ("ordinary", serde_json::Value::Null, "declined"),
+        (
+            "stale",
+            json!({"attempt": 0, "kind": "floor_auto_retry"}),
+            "declined",
+        ),
+        (
+            "other",
+            json!({"attempt": 1, "kind": "request_changes"}),
+            "declined",
+        ),
+    ] {
+        let rig = rig(&format!("defer-{name}"));
+        let run = "defer-policy";
+        let floor = start(&rig, run);
+        let raised = finding(run, 1, 1, 1, "high", "src/a.rs", "claude#2");
+        let id = finding_id_of(&raised);
+        publish(&rig, &raised);
+        let mut i = input(run, 1, 1, Some(bus_stamp(floor)));
+        let mut unit = serde_json::to_value(&i.unit).unwrap();
+        unit["advice_scope"] = scope;
+        i.unit = serde_json::from_value(unit).unwrap();
+        let tr = runner(&rig);
+        let c = claimed(claim(Some(&tr), &i).unwrap());
+        let block = boundary(&c).block.expect("advice").output;
+        assert_eq!(
+            block.contains("ADVICE <id>: DEFER"),
+            expected == "deferred",
+            "{name}: {block}"
+        );
+        let mut out = ok_output(&i);
+        out.output =
+            format!("ADVICE {id}: ACCEPT — fixed\nADVICE {id}: DEFER — review unrelated advice");
+        let _ = complete(&c, &out);
+        let answered = rows_of(&rig, run, tev::ADVICE_ANSWERED);
+        assert_eq!(answered.len(), 1, "{name}: {answered:?}");
+        assert_eq!(answered[0].1["disposition"], expected, "{name}");
+        assert_eq!(answered[0].1["reason"], "review unrelated advice");
+        let completed = rows_of(&rig, run, tev::STEP_COMPLETED);
+        assert_eq!(completed.len(), 1);
+        assert!(answered[0].0 < completed[0].0);
+    }
 }
