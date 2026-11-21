@@ -20,6 +20,11 @@ pub(crate) enum Command {
     Sessions(Sender<anyhow::Result<Vec<String>>>),
     /// Every session + its ordered units — what the UI builds its project list from.
     Projects(Sender<anyhow::Result<Vec<crate::SessionView>>>),
+    /// (core#1346) One run's session + its ordered units; `None` for a run the store does not hold.
+    Project {
+        run_id: String,
+        reply: Sender<anyhow::Result<Option<crate::SessionView>>>,
+    },
     /// A unit's captured work output (transcript), if any — a REJECTED unit answers with its
     /// partial output (usability review #1); `None` only when no output was ever stored.
     WorkOutput(String, Sender<Option<String>>),
@@ -372,6 +377,20 @@ pub(crate) enum Command {
     /// Workers send this when they need to emit a structured event without holding a subscriber list
     /// reference. The actor fans the event out to all subscribers on receipt.
     EmitEvent(CoreEvent),
+    /// Internal (core#1409, core#1434): a cancel's worktree reap ended off the actor. A kept tree
+    /// (`reaped: false`) is said as `worktreeRetained`, and the cleanup record of that cancel
+    /// (`cancel_id`) is resolved.
+    WorktreeCleanupDone {
+        run_id: String,
+        cancel_id: u64,
+        reaped: bool,
+    },
+    /// (core#1434) Whether a cancel's worktree cleanup for this run is still going (its outcome not
+    /// said yet). Read on the actor, so a `false` comes after the outcome's event.
+    WorktreeCleanupPending {
+        run_id: String,
+        reply: Sender<anyhow::Result<bool>>,
+    },
     // ── PTY terminal sessions (DES-TERMINAL-001) ────────────────────────────────────────────────
     /// Open a PTY session running `cmd` (or the login shell if `None`) in `cwd`, sized `cols`x`rows`.
     /// The actor registers the session (id → status + `seq`) — single writer — and spawns the
@@ -694,6 +713,7 @@ impl Command {
             Command::Ping { .. } => "Ping",
             Command::Sessions { .. } => "Sessions",
             Command::Projects { .. } => "Projects",
+            Command::Project { .. } => "Project",
             Command::WorkOutput { .. } => "WorkOutput",
             Command::UnitTranscript { .. } => "UnitTranscript",
             Command::Subscribe { .. } => "Subscribe",
@@ -739,6 +759,8 @@ impl Command {
             Command::CloseAsk { .. } => "CloseAsk",
             Command::ResolveElicitation { .. } => "ResolveElicitation",
             Command::EmitEvent { .. } => "EmitEvent",
+            Command::WorktreeCleanupDone { .. } => "WorktreeCleanupDone",
+            Command::WorktreeCleanupPending { .. } => "WorktreeCleanupPending",
             Command::OpenTerminal { .. } => "OpenTerminal",
             Command::CloseTerminal { .. } => "CloseTerminal",
             Command::TerminalChunk { .. } => "TerminalChunk",

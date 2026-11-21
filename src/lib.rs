@@ -1430,6 +1430,22 @@ impl Core {
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
     }
 
+    /// (core#1434) Whether a cancel's worktree cleanup for `run_id` is still going: the reap runs
+    /// off the actor after the cancel replies, and a kept tree's `worktreeRetained` is said when it
+    /// ends. Asked through the actor, so a `false` answer comes after that event was emitted: a
+    /// caller that keeps reading events until this answers `false` sees the outcome.
+    pub fn worktree_cleanup_pending(&self, run_id: &str) -> anyhow::Result<bool> {
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::WorktreeCleanupPending {
+                run_id: run_id.to_string(),
+                reply,
+            })
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
     /// Open an operator question for a still-bound unit on a nonterminal run, through the actor.
     pub fn open_ask(&self, token: &str, request: AskRequest) -> Result<AskTicket, AskError> {
         let (reply, rx) = channel();
@@ -2186,6 +2202,27 @@ impl Core {
         let (reply, rx) = channel();
         self.tx
             .send(Command::Projects(reply))
+            .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
+        rx.recv()
+            .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
+    }
+
+    /// (core#1346) One run's session + its ordered units, or `None` for a run the store does not
+    /// hold: the per-run read behind a run page's poll, so a read about one run never folds every
+    /// run on the store ([`Core::sessions_detail`]).
+    ///
+    /// Answered off the actor from the read model (core#1390), in one read transaction, and through
+    /// the actor only when this store has none.
+    pub fn session_detail(&self, run_id: &str) -> anyhow::Result<Option<SessionView>> {
+        if let Some(view) = self.run_read_model.read(|s| actor::project_view(s, run_id)) {
+            return Ok(view);
+        }
+        let (reply, rx) = channel();
+        self.tx
+            .send(Command::Project {
+                run_id: run_id.to_string(),
+                reply,
+            })
             .map_err(|_| anyhow::anyhow!("core actor stopped"))?;
         rx.recv()
             .map_err(|_| anyhow::anyhow!("core actor dropped the reply"))?
