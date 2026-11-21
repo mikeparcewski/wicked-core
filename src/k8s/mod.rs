@@ -342,6 +342,12 @@ pub(crate) fn run_ended_since(run_id: &str, before: u64) -> bool {
         .is_some_and(|e| *e > before)
 }
 
+/// Read-only warm checkout fence, including an end recorded at epoch zero.
+pub(crate) fn admit_warm(run_id: &str, generation: u64) -> bool {
+    let ended = ENDED.lock().unwrap_or_else(|p| p.into_inner());
+    !ended.as_ref().is_some_and(|m| m.contains_key(run_id)) && lifecycle(run_id) == generation
+}
+
 /// The run's arm epoch now (0 = never armed by this process); never blocks.
 pub(crate) fn run_epoch(run_id: &str) -> u64 {
     life(run_id).1.load(std::sync::atomic::Ordering::SeqCst)
@@ -435,6 +441,9 @@ pub(crate) fn release_run(run_id: &str, epoch: u64) {
     // never fences the resumed run.
     let l = life(run_id);
     let g = l.0.lock().unwrap_or_else(|p| p.into_inner());
+    if !admit_warm(run_id, lifecycle(run_id)) {
+        seat::reap_warm_parent(run_id);
+    }
     if l.1.load(std::sync::atomic::Ordering::SeqCst) != epoch {
         return;
     }

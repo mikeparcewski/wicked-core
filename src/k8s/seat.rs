@@ -4,9 +4,14 @@
 //!
 //! **The runner contract holds.** The seat is still a child process of the engine (the kubectl
 //! client): stdio streams, the deadline and the cancel kill are the existing spawn path's. A
-//! pod outlives a killed client, so [`settle`] (and every guard's drop) deletes the Sandbox and
-//! waits until its pod is gone before anything of the unit's is read back: by then no seat
-//! process can be alive (A2, A12).
+//! pod outlives a killed client. A2/A12 require deletion and confirmed pod termination before
+//! replica write-back. In container mode, repo-less, ungoverned `validator-` calls with session
+//! `validator`, unit `validator-agent`, and a non-empty parent and assigned seat may reuse a pod
+//! keyed by (parent run id, exact judge seat). This includes rule-check and agent-gate judges;
+//! reprobes and all other sessions stay cold. A busy or reaping slot falls back to a cold call.
+//! Exclusive checkout, physical UID/owner/fingerprint/lifetime checks and a verified SIGKILL/
+//! quiescence barrier permit read-only (no-op) write-back and warm return. Any doubt or
+//! abandonment reaps; cold calls confirm termination before replica write-back.
 //!
 //! **What the pod sees** is the unit's mount plan, as replica copies at the same absolute paths
 //! (B6, B11): its tree (what git lists, plus a `.git` the engine builds fresh for every unit), its
@@ -484,6 +489,482 @@ pub(crate) fn exit_code(kubectl: i32, rc_file: Option<&str>) -> Option<i32> {
     (rc == kubectl).then_some(rc)
 }
 
+/// A physical judge belongs to exactly this parent and assigned seat (including `#instance`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct WarmKey {
+    pub(crate) parent: String,
+    seat: String,
+}
+
+impl WarmKey {
+    pub(crate) fn new(parent: &str, seat: &str) -> Self {
+        Self {
+            parent: parent.into(),
+            seat: seat.into(),
+        }
+    }
+
+    pub(crate) fn scope(&self) -> String {
+        use sha2::{Digest, Sha256};
+        // Length framing prevents ambiguous parent/seat concatenations.
+        let mut h = Sha256::new();
+        h.update((self.parent.len() as u64).to_le_bytes());
+        h.update(self.parent.as_bytes());
+        h.update(self.seat.as_bytes());
+        format!("warm-{:x}", h.finalize())
+    }
+}
+
+#[derive(Debug, Default)]
+struct WarmState {
+    busy: bool,
+    retired: bool,
+    reaping: bool,
+    pod: Option<PhysicalJudge>,
+    host_dirs: Vec<PathBuf>,
+    replica: Option<(Kube, String, String)>,
+}
+
+#[derive(Debug, Default)]
+struct WarmSlot {
+    state: Mutex<WarmState>,
+}
+
+type WarmCache = HashMap<WarmKey, Arc<WarmSlot>>;
+
+static WARM: Mutex<Option<WarmCache>> = Mutex::new(None);
+
+/// Held from before host configuration is prepared until after the gateway lease is released.
+/// The slot contains only physical state; no execution, gateway key, credential or conversation.
+#[derive(Debug)]
+pub(crate) struct WarmCheckout {
+    key: WarmKey,
+    slot: Arc<WarmSlot>,
+    epoch: u64,
+    generation: u64,
+    completed: std::sync::atomic::AtomicBool,
+}
+
+impl WarmCheckout {
+    pub(crate) fn live(&self) -> bool {
+        !super::run_ended_since(&self.key.parent, self.epoch)
+            && super::lifecycle(&self.key.parent) == self.generation
+            && super::admit_warm(&self.key.parent, self.generation)
+    }
+
+    /// Host directories are private engine output. Start each batch with fresh trusted seeds.
+    pub(crate) fn scope(&self) -> String {
+        self.key.scope()
+    }
+
+    pub(crate) fn fresh_dir(&self, path: &Path) -> Result<(), String> {
+        let mut state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.retired || !self.live() {
+            return Err("the judge's parent ended".into());
+        }
+        if !state.host_dirs.iter().any(|p| p == path) {
+            state.host_dirs.push(path.to_path_buf());
+        }
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                let pod = state.pod.take();
+                drop(state);
+                if let Some(pod) = pod {
+                    pod.reap();
+                }
+                Err(format!(
+                    "cannot reset judge directory {}: {e}",
+                    path.display()
+                ))
+            }
+        }
+    }
+}
+
+impl Drop for WarmCheckout {
+    fn drop(&mut self) {
+        let mut state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        let abandoned = if !self.completed.load(std::sync::atomic::Ordering::SeqCst) {
+            state.pod.take()
+        } else {
+            None
+        };
+        // Keep the key exclusive through an abandonment's deletion.
+        if let Some(pod) = abandoned {
+            drop(state);
+            pod.reap();
+            state = self.slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        }
+        state.busy = false;
+        if state.retired && !state.reaping && clean_warm_dirs(&mut state) {
+            forget_warm_slot(&self.key, &self.slot);
+        }
+    }
+}
+
+fn forget_warm_slot(key: &WarmKey, slot: &Arc<WarmSlot>) {
+    if let Some(cache) = WARM.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        if cache.get(key).is_some_and(|have| Arc::ptr_eq(have, slot)) {
+            cache.remove(key);
+        }
+    }
+}
+
+fn clean_warm_dirs(state: &mut WarmState) -> bool {
+    if let Some((kube, ns, _)) = &state.replica {
+        if let Err((_, e)) = clear_stale(kube, ns) {
+            eprintln!("wicked-core: warm judge scope cleanup deferred: {e}");
+            return false;
+        }
+    }
+    if let Some((kube, ns, scope)) = &state.replica {
+        if let Err(e) = drop_replica_scope(kube, ns, scope) {
+            eprintln!("wicked-core: warm judge cleanup deferred: {e}");
+            return false;
+        }
+        if let Ok(mut g) = SEEDED.lock() {
+            if let Some(set) = g.as_mut() {
+                let prefix = seeded_key(ns, &format!("{scope}/"));
+                set.retain(|k| !k.starts_with(&prefix));
+            }
+        }
+    }
+    state.replica = None;
+    for path in state.host_dirs.drain(..) {
+        let _ = std::fs::remove_dir_all(path);
+    }
+    true
+}
+
+/// Busy or reaping slots fall back to cold immediately; ended parents are refused.
+pub(crate) fn checkout_warm(key: WarmKey) -> Result<Option<Arc<WarmCheckout>>, String> {
+    let generation = super::lifecycle(&key.parent);
+    let epoch = super::run_epoch(&key.parent);
+    let slot = {
+        let mut cache = WARM.lock().unwrap_or_else(|p| p.into_inner());
+        if !super::admit_warm(&key.parent, generation) {
+            return Err("the judge's parent ended before checkout".into());
+        }
+        cache
+            .get_or_insert_with(HashMap::new)
+            .entry(key.clone())
+            .or_default()
+            .clone()
+    };
+    // Reset and retirement can hold the state lock during I/O. Never queue a judge behind them.
+    let mut state = match slot.state.try_lock() {
+        Ok(state) => state,
+        Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            return if super::admit_warm(&key.parent, generation) {
+                Ok(None)
+            } else {
+                Err("the judge's parent ended before checkout".into())
+            };
+        }
+    };
+    if state.retired || !super::admit_warm(&key.parent, generation) {
+        return Err("the judge's parent ended before checkout".into());
+    }
+    if state.busy || state.reaping {
+        return Ok(None);
+    }
+    state.busy = true;
+    drop(state);
+    Ok(Some(Arc::new(WarmCheckout {
+        key,
+        slot,
+        epoch,
+        generation,
+        completed: std::sync::atomic::AtomicBool::new(false),
+    })))
+}
+
+/// Only this immutable identity and mount contract may be carried across calls.
+#[derive(Debug)]
+struct PhysicalJudge {
+    kube: Kube,
+    ns: String,
+    sandbox: String,
+    unit: String,
+    uid: String,
+    owner_uid: String,
+    fingerprint: Value,
+    pod_spec: Value,
+    pod_labels: Value,
+    sandbox_spec: Value,
+    expires: Instant,
+    wall_expires: std::time::SystemTime,
+}
+
+impl PhysicalJudge {
+    fn delete(&self) -> Result<(), String> {
+        delete_seat_pod(&self.kube, &self.ns, Some(&self.sandbox), &self.sandbox)
+    }
+
+    fn reap(&self) {
+        if let Err(e) = self.delete() {
+            eprintln!("wicked-core: warm judge {} not reaped: {e}", self.sandbox);
+            UNREAPED.lock().unwrap_or_else(|p| p.into_inner()).push((
+                self.ns.clone(),
+                self.sandbox.clone(),
+                self.sandbox.clone(),
+            ));
+        }
+    }
+
+    fn verify(&self, timeout: Duration) -> Result<(), String> {
+        let needed = timeout + Duration::from_secs(60);
+        if self.expires.saturating_duration_since(Instant::now()) < needed
+            || self
+                .wall_expires
+                .duration_since(std::time::SystemTime::now())
+                .unwrap_or_default()
+                < needed
+        {
+            return Err("insufficient physical pod lifetime".into());
+        }
+        let pod = self
+            .kube
+            .get_json(Some(&self.ns), "pod", &self.sandbox)?
+            .ok_or("the cached judge pod disappeared")?;
+        let owner = pod
+            .pointer("/metadata/ownerReferences")
+            .and_then(Value::as_array)
+            .and_then(|owners| {
+                owners
+                    .iter()
+                    .find(|o| o["kind"] == "Sandbox" && o["name"] == self.sandbox)
+            })
+            .and_then(|o| o["uid"].as_str());
+        let sandbox = self
+            .kube
+            .get_json(Some(&self.ns), "sandboxes.agents.x-k8s.io", &self.sandbox)?
+            .ok_or("the cached judge Sandbox disappeared")?;
+        let sandbox_uid = sandbox.pointer("/metadata/uid").and_then(Value::as_str);
+        if sandbox_uid != Some(self.owner_uid.as_str())
+            || !super::is_owned_by(&sandbox, &self.kube.owner)
+            || pod.pointer("/metadata/uid").and_then(Value::as_str) != Some(self.uid.as_str())
+            || owner != Some(self.owner_uid.as_str())
+            || !super::is_owned_by(&pod, &self.kube.owner)
+            || pod_state(&pod, &self.sandbox, &self.unit) != PodState::Ready
+            || pod.get("spec") != Some(&self.pod_spec)
+            || pod.pointer("/metadata/labels") != Some(&self.pod_labels)
+            || sandbox.get("spec") != Some(&self.sandbox_spec)
+        {
+            return Err(
+                "the cached judge's UID, owner, readiness or pod specification changed".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn quiet(&self) -> Result<(), String> {
+        self.verify(Duration::ZERO)?;
+        warm_exec(self, WARM_QUIESCE, "wicked-warm-quiet")?;
+        self.verify(Duration::ZERO)
+    }
+}
+
+#[derive(Debug)]
+struct WarmExecution {
+    checkout: Arc<WarmCheckout>,
+    physical: PhysicalJudge,
+}
+
+/// SIGKILL spares PID 1 and this ash (kill is an ash builtin). Poll the entire PID namespace,
+/// including detached children. Only the trusted PID 1's busybox sleep may coexist with us.
+/// Missing proc evidence or a surviving process fails closed. The exact stdout is a receipt;
+/// an empty successful kubectl response is not proof.
+pub(crate) const WARM_QUIESCE: &str = r#"set -eu
+F=/floor/busybox
+[ -r /proc/1/stat ] && [ -r /proc/$$/stat ] || exit 1
+[ "$($F id -u)" = 1000 ] || exit 1
+kill -9 -1 2>/dev/null || :
+n=0
+while [ "$n" -lt 40 ]; do
+    quiet=1
+    for d in /proc/[0-9]*; do
+        p=${d##*/}
+        [ "$p" = 1 ] && continue
+        [ "$p" = "$$" ] && continue
+        [ -d "$d" ] || continue
+        if ! read -r pid comm state ppid rest < "$d/stat"; then
+            [ ! -d "$d" ] && continue
+            exit 1
+        fi
+        if [ "$ppid" = 1 ] && [ "$state" = S ] &&
+           [ "$($F readlink "$d/exe" 2>/dev/null)" = /floor/busybox ] &&
+           [ "$($F tr '\000' ' ' < "$d/cmdline")" = '/floor/busybox sleep 2 ' ]; then
+            continue
+        fi
+        quiet=0
+    done
+    if [ "$quiet" = 1 ]; then echo wicked-warm-quiet; exit 0; fi
+    n=$((n + 1)); $F sleep 0.05
+done
+exit 1"#;
+
+/// API-server defaults may add fields, but cannot replace a requested field or add containers,
+/// mounts or privileges inside an explicitly rendered list.
+fn pod_contract_matches(expected: &Value, actual: &Value) -> bool {
+    match (expected, actual) {
+        (Value::Object(want), Value::Object(have)) => want
+            .iter()
+            .all(|(k, v)| have.get(k).is_some_and(|h| pod_contract_matches(v, h))),
+        (Value::Array(want), Value::Array(have)) => {
+            want.len() == have.len()
+                && want
+                    .iter()
+                    .zip(have)
+                    .all(|(w, h)| pod_contract_matches(w, h))
+        }
+        _ => expected == actual,
+    }
+}
+
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+/// Clear disposable contents, preserving separately mounted roots (including beneath /tmp).
+/// Traverse only ancestors of a protected mount; rm never follows a seat-planted symlink.
+pub(crate) fn warm_reset_script(tree: &Path, mounts: &[PathBuf], homes: &[PathBuf]) -> String {
+    let protected = mounts
+        .iter()
+        .map(|p| shell_path(p))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut script = format!(
+        r#"set -eu
+F=/floor/busybox
+wipe() {{
+    dir=$1
+    [ -d "$dir" ] && [ ! -L "$dir" ] || return 1
+    for p in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+        [ -e "$p" ] || [ -L "$p" ] || continue
+        keep=0; descend=0
+        for m in {protected}; do
+            [ "$p" = "$m" ] && keep=1
+            case "$m" in "$p"/*) descend=1;; esac
+        done
+        [ "$keep" = 1 ] && continue
+        if [ "$descend" = 1 ]; then (wipe "$p") || return 1
+        else $F rm -rf -- "$p" || return 1
+            [ ! -e "$p" ] && [ ! -L "$p" ] || return 1
+        fi
+    done
+}}
+wipe /home/seat
+wipe /tmp
+wipe /wicked-unit
+wipe /wicked-canary
+"#
+    );
+    for home in homes {
+        script.push_str(&format!("wipe {}\n", shell_path(home)));
+    }
+    script.push_str(&format!(
+        "wipe {}\ncd /wicked-ro\nset -o pipefail\n$F tar -cf -",
+        shell_path(tree)
+    ));
+    for mount in mounts
+        .iter()
+        .filter(|p| p.as_path() != tree && p.starts_with(tree))
+    {
+        if let Ok(rel) = mount.strip_prefix(tree) {
+            script.push_str(&format!(
+                " --exclude={}",
+                shell_path(&Path::new(".").join(rel))
+            ));
+        }
+    }
+    script.push_str(&format!(
+        " . | $F tar -C {} -xf -\necho wicked-warm-reset",
+        shell_path(tree)
+    ));
+    script
+}
+
+fn warm_exec(pod: &PhysicalJudge, script: &str, receipt: &str) -> Result<(), String> {
+    let r = pod.kube.call(
+        Some(&pod.ns),
+        &[
+            "exec",
+            "-c",
+            "seat",
+            &pod.sandbox,
+            "--",
+            "/floor/busybox",
+            "sh",
+            "-c",
+            script,
+        ],
+        None,
+        CALL,
+    );
+    if r.ok() && String::from_utf8_lossy(&r.stdout).trim() == receipt {
+        Ok(())
+    } else {
+        Err(format!(
+            "judge process barrier/reset was not proved: {}",
+            r.err_text()
+        ))
+    }
+}
+
+/// Off the actor thread, before namespace release. Retiring slots never wait for an active
+/// execution: parent cancellation stops it, its guards reap it, and its checkout removes homes.
+pub(crate) fn reap_warm_parent(parent: &str) {
+    let slots: Vec<(WarmKey, Arc<WarmSlot>)> = WARM
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .as_ref()
+        .map(|cache| {
+            cache
+                .iter()
+                .filter(|(k, _)| k.parent == parent)
+                .map(|(k, slot)| (k.clone(), slot.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    for (key, slot) in slots {
+        let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.retired = true;
+        state.reaping = true;
+        let pod = state.pod.take();
+        drop(state);
+        let gone = pod.as_ref().is_none_or(|p| match p.delete() {
+            Ok(()) => true,
+            Err(e) => {
+                eprintln!("wicked-core: parent {parent}'s warm judge was not reaped: {e}");
+                p.reap();
+                false
+            }
+        });
+        let mut state = slot.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.reaping = !gone;
+        if gone && !state.busy && clean_warm_dirs(&mut state) {
+            forget_warm_slot(&key, &slot);
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn expire_warm_for_test(key: &WarmKey) {
+    let slot = WARM
+        .lock()
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .get(key)
+        .unwrap()
+        .clone();
+    slot.state.lock().unwrap().pod.as_mut().unwrap().expires = Instant::now();
+}
+
 /// What one live seat is (in [`SEATS`] from arming until it is settled or dropped).
 #[derive(Debug)]
 pub(crate) struct Seat {
@@ -516,6 +997,7 @@ pub(crate) struct Seat {
     /// The run's node_modules claim is mounted: every `node_modules` path of the tree is the
     /// engine's, never the seat's, and never comes back (B-3 review r2).
     pub(crate) deps: bool,
+    warm: Mutex<Option<WarmExecution>>,
 }
 
 /// Live seats by id.
@@ -553,8 +1035,8 @@ pub(crate) fn seat_id_of(args: &[String]) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The engine's one-shot session prefixes (a judge, a ballot, a triage call): they share the
-/// daemon's session namespace, each in its own replica scope, deleted when the session ends.
+/// The engine's cold one-shot session prefixes: they share the daemon's session namespace,
+/// each in its own replica scope. Warm validator judges instead use their parent's namespace.
 pub(crate) fn one_shot_scope(run_id: &str) -> Option<String> {
     ["council-", "validator-", "triage-", "member-", "send-back-"]
         .iter()
@@ -1088,6 +1570,17 @@ pub(crate) fn copy_in_stream(
     with_git: bool,
     seeded: &HashSet<String>,
 ) -> Result<CopyInStream, CopyInRefusal> {
+    copy_in_stream_fresh(scope, tree, roots, with_git, seeded, false)
+}
+
+pub(crate) fn copy_in_stream_fresh(
+    scope: Option<&str>,
+    tree: &Path,
+    roots: &[PlanRoot],
+    with_git: bool,
+    seeded: &HashSet<String>,
+    fresh_seeds: bool,
+) -> Result<CopyInStream, CopyInRefusal> {
     let mut stream: Vec<Root> = Vec::new();
     let mut plan_roots: Vec<(String, PlanRoot)> = Vec::new();
     let mut base = None;
@@ -1108,18 +1601,24 @@ pub(crate) fn copy_in_stream(
         }
         if r.mode == Mode::Seed {
             // Sent once per replica, outside the unit's budget: an oversized cache is left out.
-            let entries = if seeded.contains(&replica) {
+            let entries = if !fresh_seeds && seeded.contains(&replica) {
                 Vec::new()
             } else {
                 seed_entries(&r.host, &r.skip, &mut seed_used)
             };
+            // A warm reset emptied the mounted root without changing its inode. Home mode
+            // restores this bounded trusted seed in place; the one-time seed stamp is bypassed.
+            let mut copied = r.clone();
+            if fresh_seeds {
+                copied.mode = Mode::Home;
+            }
             stream.push(Root {
                 replica: replica.clone(),
-                mode: r.mode,
+                mode: copied.mode,
                 entries,
             });
             took.insert(replica.clone(), t_root.elapsed().as_millis());
-            plan_roots.push((replica, r.clone()));
+            plan_roots.push((replica, copied));
             continue;
         }
         // A plain root read before at the same host signature is not read again (k8s-final: the
@@ -1349,6 +1848,18 @@ pub(crate) fn copy_in(
     roots: &[PlanRoot],
     with_git: bool,
 ) -> Result<(Option<String>, Baseline, Tracked), (FloorUnarmed, String)> {
+    copy_in_fresh(kube, ns, scope, tree, roots, with_git, false)
+}
+
+fn copy_in_fresh(
+    kube: &Kube,
+    ns: &str,
+    scope: Option<&str>,
+    tree: &Path,
+    roots: &[PlanRoot],
+    with_git: bool,
+    fresh_seeds: bool,
+) -> Result<(Option<String>, Baseline, Tracked), (FloorUnarmed, String)> {
     let seeded: HashSet<String> = {
         let g = SEEDED.lock().unwrap_or_else(|p| p.into_inner());
         roots
@@ -1359,8 +1870,12 @@ pub(crate) fn copy_in(
             .collect()
     };
     // What could not be copied in is said as that (fix-k8s-chat), never `root_unresolvable`.
-    let (body, plan, base, baseline, tracked) =
-        copy_in_stream(scope, tree, roots, with_git, &seeded).map_err(|r| (r.why, r.detail))?;
+    let encoded = if fresh_seeds {
+        copy_in_stream_fresh(scope, tree, roots, with_git, &seeded, true)
+    } else {
+        copy_in_stream(scope, tree, roots, with_git, &seeded)
+    };
+    let (body, plan, base, baseline, tracked) = encoded.map_err(|r| (r.why, r.detail))?;
     if body.len() as u64 > STREAM_LIMIT + SEED_LIMIT {
         return Err((
             FloorUnarmed::CopyInRefused,
@@ -1950,14 +2465,82 @@ pub(crate) fn arm(
     s: &ArmSpec<'_>,
     landrun: Vec<String>,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
-    let (ns, scope, run) = place(kube, s.run_id);
-    if scope.is_some() {
+    arm_warm(kube, s, landrun, None, None)
+}
+
+/// `checkout` is explicit: only eligible wrapped validator judges may request reuse.
+pub(crate) fn arm_warm(
+    kube: &Kube,
+    s: &ArmSpec<'_>,
+    landrun: Vec<String>,
+    checkout: Option<Arc<WarmCheckout>>,
+    images: Option<(&str, &str)>,
+) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
+    let result = arm_physical(kube, s, landrun.clone(), checkout.clone(), images, true);
+    if result.is_err() && checkout.as_ref().is_some_and(|c| c.live()) {
+        if let Some(c) = &checkout {
+            let old = c
+                .slot
+                .state
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pod
+                .take();
+            if let Some(old) = old {
+                old.reap();
+            }
+        }
+        if let Err((_, e)) = &result {
+            eprintln!(
+                "wicked-core: warm judge preparation unproved; reaping and taking a cold arm: {e}"
+            );
+        }
+        return arm_physical(kube, s, landrun, checkout, images, false);
+    }
+    result
+}
+
+fn arm_physical(
+    kube: &Kube,
+    s: &ArmSpec<'_>,
+    landrun: Vec<String>,
+    checkout: Option<Arc<WarmCheckout>>,
+    images: Option<(&str, &str)>,
+    allow_cache: bool,
+) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
+    let (ns, scope, run) = match &checkout {
+        Some(c) if c.live() && s.view && s.write_roots.is_empty() && images.is_some() => (
+            super::run_namespace_name(&kube.owner, &c.key.parent),
+            Some(c.key.scope()),
+            c.key.parent.clone(),
+        ),
+        Some(_) => {
+            return Err((
+                FloorUnarmed::PodNotReady,
+                "the warm judge is not read-only or its parent ended".into(),
+            ))
+        }
+        None => place(kube, s.run_id),
+    };
+    let lifecycle_run = checkout
+        .as_ref()
+        .map_or(s.run_id, |c| c.key.parent.as_str());
+    let generation = checkout.as_ref().map_or(s.generation, |c| c.generation);
+
+    if scope.is_some() && checkout.is_none() {
         if let Ok(mut m) = SCOPES.lock() {
             m.get_or_insert_with(HashMap::new)
                 .insert(s.run_id.to_string(), kube.clone());
         }
     }
-    super::admit_arm(s.run_id, s.generation, || {
+    if let Some(c) = &checkout {
+        c.slot
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replica = Some((kube.clone(), ns.clone(), c.key.scope()));
+    }
+    super::admit_arm(lifecycle_run, generation, || {
         cluster::ensure_run(kube, &run, &RunBudget::default(), "20Gi")
     })
     .ok_or_else(|| {
@@ -1990,6 +2573,22 @@ pub(crate) fn arm(
     // plain, so it is selected below and removed at settle, never kept in the replica.
     let mut roots = roots;
     mark_homes(&mut roots, s.seat_dirs, s.scratch);
+    let mut reset_dirs: Vec<PathBuf> = s.seat_dirs.to_vec();
+    reset_dirs.extend(
+        pod_mounts
+            .iter()
+            .filter(|m| checkout.is_some() && m.rw && m.path != s.tree && m.path.is_dir())
+            .map(|m| m.path.clone()),
+    );
+    if s.deps.is_some() {
+        reset_dirs.extend(
+            render::NM_WRITABLE
+                .iter()
+                .map(|d| s.tree.join("node_modules").join(d)),
+        );
+    }
+    reset_dirs.sort();
+    reset_dirs.dedup();
     let scratch: Vec<PathBuf> = pod_mounts
         .iter()
         .filter(|m| m.rw)
@@ -2000,28 +2599,23 @@ pub(crate) fn arm(
         })
         .map(|m| m.path.clone())
         .collect();
-    // One arm at a time copies into a namespace's replica (review r7 #7): the stale-pod check and
-    // the copy-in see the same pods.
-    let arming = arm_lock(&ns);
-    let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
-    clear_stale(kube, &ns)?;
-    super::clock::mark("clear_stale");
-    let (base, baseline, tracked) = copy_in(kube, &ns, scope.as_deref(), s.tree, &roots, true)?;
-    drop(_arming);
-    // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
-    let branch = match &base {
-        Some(_) => head_branch(s.tree).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?,
-        None => None,
-    };
     let id = uuid::Uuid::new_v4().simple().to_string();
-    let sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
-    let unit_label = label_value(&format!("{}-{}", s.ord, &id[..10]));
-    let secs = s.deadline.as_secs() + 600;
+    let mut sandbox = format!("{}-{}-{}", s.role, s.ord, &id[..10]);
+    let mut unit_label = label_value(&format!("{}-{}", s.ord, &id[..10]));
+    let secs = if checkout.is_some() && allow_cache {
+        (6 * 3600).max(s.deadline.as_secs() + 600)
+    } else {
+        s.deadline.as_secs() + 600
+    };
+    // Shutdown timestamps round down to seconds; keep our estimate strictly earlier.
+    let lifetime = Duration::from_secs(secs.saturating_sub(2));
+    let mut expires = Instant::now() + lifetime;
+    let mut wall_expires = std::time::SystemTime::now() + lifetime;
     let spec = SeatPod {
         name: sandbox.clone(),
         namespace: ns.clone(),
         owner: kube.owner.clone(),
-        run_label: label_value(s.run_id),
+        run_label: label_value(lifecycle_run),
         unit_label: unit_label.clone(),
         boot: super::boot_id().into(),
         role: s.role.into(),
@@ -2043,7 +2637,137 @@ pub(crate) fn arm(
         view: s.view.then(|| s.tree.to_path_buf()),
         deps: s.deps.map(|c| (c.to_string(), s.tree.to_path_buf())),
     };
-    let doc = render::seat_sandbox(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    let mut doc = render::seat_sandbox(&spec).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
+    let mut expected_sandbox = doc["spec"].clone();
+    let expected_pod = expected_sandbox["podTemplate"]["spec"].clone();
+    let mut fingerprint = doc.clone();
+    fingerprint["metadata"]["name"] = Value::Null;
+    fingerprint["metadata"]["labels"][UNIT_LABEL] = Value::Null;
+    fingerprint["spec"]["podTemplate"]["metadata"]["labels"][UNIT_LABEL] = Value::Null;
+    fingerprint["spec"]["shutdownTime"] = Value::Null;
+    fingerprint["plan"] = Value::String(format!(
+        "{roots:?} {:?} {:?} {:?} {:?} {}",
+        s.protected, s.seat_dirs, s.scratch, s.seed_base, generation
+    ));
+    fingerprint["images"] = serde_json::json!(images);
+    fingerprint["launcher"] = serde_json::json!([s.cli, s.sync_image, format!("{landrun:?}")]);
+    // File subPaths pin inodes: the codec replaces files. Reuse only when their trusted
+    // contents are identical; changed files must be bound afresh by a cold arm.
+    let mut file_hashes = Vec::new();
+    for root in roots
+        .iter()
+        .filter(|r| checkout.is_some() && r.mode == Mode::Files)
+    {
+        for name in &root.files {
+            if sync::entry_size(&root.host, name) > STREAM_LIMIT {
+                return Err((
+                    FloorUnarmed::CopyInRefused,
+                    "a pinned file exceeds the stream limit".into(),
+                ));
+            }
+            let e = sync::read_host_entry(&root.host, name)
+                .map_err(|e| (FloorUnarmed::CopyInRefused, e))?
+                .ok_or_else(|| {
+                    (
+                        FloorUnarmed::CopyInRefused,
+                        "a pinned file disappeared".into(),
+                    )
+                })?;
+            file_hashes.push((root.host.join(name), sync::digest(&e)));
+        }
+    }
+    fingerprint["file_subpaths"] = Value::String(format!("{file_hashes:?}"));
+    struct Pending(Option<PhysicalJudge>);
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.take() {
+                p.reap();
+            }
+        }
+    }
+    let mut pending = Pending(checkout.as_ref().and_then(|c| {
+        c.slot
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .pod
+            .take()
+    }));
+    if let Some(p) = pending.0.as_ref() {
+        let checked = if p.kube != *kube || p.fingerprint != fingerprint {
+            Err("the judge mount plan or cluster fingerprint changed".into())
+        } else {
+            p.verify(s.deadline).and_then(|()| p.quiet())
+        };
+        if let Err(e) = checked {
+            eprintln!("wicked-core: warm judge discarded; cold arm: {e}");
+            let old = pending.0.take().expect("checked physical judge");
+            old.delete().map_err(|e| {
+                old.reap();
+                (FloorUnarmed::ClusterUnreachable, e)
+            })?;
+        }
+    }
+    let reused = pending.0.is_some();
+    if let Some(p) = pending.0.as_ref() {
+        sandbox.clone_from(&p.sandbox);
+        unit_label.clone_from(&p.unit);
+    }
+    let mut reset_mounts: Vec<PathBuf> = pod_mounts.iter().map(|m| m.path.clone()).collect();
+    if s.deps.is_some() {
+        reset_mounts.push(s.tree.join("node_modules"));
+    }
+    // One arm at a time copies into a namespace's replica (review r7 #7): the stale-pod check and
+    // the copy-in see the same pods.
+    let arming = arm_lock(&ns);
+    let _arming = arming.lock().unwrap_or_else(|p| p.into_inner());
+    clear_stale(kube, &ns)?;
+    if checkout.is_some() && !reused {
+        drop_replica_scope(kube, &ns, scope.as_deref().expect("warm scope"))
+            .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+    }
+    super::clock::mark("clear_stale");
+    if let Some(p) = pending.0.as_ref() {
+        // Reset before copy-in; rebuild the view again after fresh replica inputs arrive.
+        warm_exec(
+            p,
+            &warm_reset_script(s.tree, &reset_mounts, &reset_dirs),
+            "wicked-warm-reset",
+        )
+        .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+    }
+    let (base, baseline, tracked) = copy_in_fresh(
+        kube,
+        &ns,
+        scope.as_deref(),
+        s.tree,
+        &roots,
+        true,
+        checkout.is_some(),
+    )?;
+    if let Some(p) = pending.0.as_ref() {
+        warm_exec(
+            p,
+            &warm_reset_script(s.tree, &reset_mounts, &[]),
+            "wicked-warm-reset",
+        )
+        .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
+    }
+    drop(_arming);
+    // The branch the commits land on, as it was at copy-in (codex b2-seat #9).
+    let branch = match &base {
+        Some(_) => head_branch(s.tree).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?,
+        None => None,
+    };
+    if !reused {
+        // A new pod's clock starts after copy-in, just as on the cold path. Reuse never
+        // extends the physical generation's absolute lifetime.
+        expires = Instant::now() + lifetime;
+        wall_expires = std::time::SystemTime::now() + lifetime;
+        let shutdown = Value::String(super::rfc3339_after(Duration::from_secs(secs)));
+        doc["spec"]["shutdownTime"] = shutdown.clone();
+        expected_sandbox["shutdownTime"] = shutdown;
+    }
     let mounted: Vec<PathBuf> = pod_mounts.iter().map(|m| m.path.clone()).collect();
     let seat = register(Seat {
         id: id.clone(),
@@ -2065,6 +2789,7 @@ pub(crate) fn arm(
         unit_label: unit_label.clone(),
         settled: Mutex::new(false),
         deps: s.deps.is_some(),
+        warm: Mutex::new(None),
     });
     // Owned from here: every way out before the caller holds the seat reaps it (review r1: an
     // API error while waiting, or an apply whose reply was lost, leaked the Sandbox).
@@ -2077,7 +2802,9 @@ pub(crate) fn arm(
         }
     }
     let mut guard = Guard(Some(id.clone()));
-    kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
+    if !reused {
+        kube.apply(&[doc]).map_err(|e| (classify_apply(&e), e))?;
+    }
     // From here every failure reaps the Sandbox (the caller's guard holds the id).
     super::clock::mark("sandbox_apply");
     let start = Instant::now();
@@ -2112,7 +2839,10 @@ pub(crate) fn arm(
             note_states(&mut seen, p);
         }
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
-            Some(PodState::Ready) => break,
+            Some(PodState::Ready) => {
+                last = pod;
+                break;
+            }
             Some(PodState::Failed(why, msg)) => {
                 let msg = format!("{msg} ({})", diagnose(pod.as_ref(), &seen));
                 reap(&id);
@@ -2193,6 +2923,79 @@ pub(crate) fn arm(
     if s.deps.is_some() {
         super::clock::mark("deps_unpack");
     }
+    if let Some(c) = checkout.as_ref().filter(|_| allow_cache) {
+        if !c.live() {
+            return Err((
+                FloorUnarmed::PodNotReady,
+                "the judge's parent ended during arm".into(),
+            ));
+        }
+        let sandbox_object = kube
+            .get_json(Some(&ns), "sandboxes.agents.x-k8s.io", &sandbox)
+            .ok()
+            .flatten();
+        let physical = pending.0.take().or_else(|| {
+            let pod = last.as_ref()?;
+            let uid = pod.pointer("/metadata/uid")?.as_str()?.to_string();
+            let owner_uid = pod
+                .pointer("/metadata/ownerReferences")?
+                .as_array()?
+                .iter()
+                .find(|o| o["kind"] == "Sandbox" && o["name"] == sandbox)?["uid"]
+                .as_str()?
+                .to_string();
+            let owner = sandbox_object.as_ref()?;
+            if uid.is_empty()
+                || owner_uid.is_empty()
+                || !super::is_owned_by(pod, &kube.owner)
+                || !super::is_owned_by(owner, &kube.owner)
+                || owner.pointer("/metadata/uid").and_then(Value::as_str)
+                    != Some(owner_uid.as_str())
+                || !pod_contract_matches(&expected_pod, pod.get("spec")?)
+                || !pod_contract_matches(&expected_sandbox, owner.get("spec")?)
+                || !pod_contract_matches(
+                    &expected_sandbox["podTemplate"]["metadata"]["labels"],
+                    pod.pointer("/metadata/labels")?,
+                )
+            {
+                return None;
+            }
+            Some(PhysicalJudge {
+                kube: kube.clone(),
+                ns: ns.clone(),
+                sandbox: sandbox.clone(),
+                unit: unit_label.clone(),
+                uid,
+                owner_uid,
+                fingerprint,
+                pod_spec: pod.get("spec")?.clone(),
+                pod_labels: pod.pointer("/metadata/labels")?.clone(),
+                sandbox_spec: owner.get("spec")?.clone(),
+                expires,
+                wall_expires,
+            })
+        });
+        match physical {
+            Some(physical) => {
+                *seat.warm.lock().unwrap_or_else(|p| p.into_inner()) = Some(WarmExecution {
+                    checkout: c.clone(),
+                    physical,
+                })
+            }
+            None => {
+                return Err((
+                    FloorUnarmed::PolicyRefused,
+                    "the new judge's physical identity or rendered contract was not proved".into(),
+                ))
+            }
+        }
+    }
+    if checkout.is_some() && !super::admit_warm(lifecycle_run, generation) {
+        return Err((
+            FloorUnarmed::PodNotReady,
+            "the run ended during its seat arm".into(),
+        ));
+    }
     guard.0 = None;
     let mut wrapper = kube.head(Some(&ns));
     wrapper.extend(
@@ -2243,6 +3046,12 @@ pub(crate) fn finalize(cmd: &Command) -> Result<Option<(Command, Arc<Seat>)>, St
         return Ok(None);
     };
     let seat = lookup(&id).ok_or("the seat's pod is no longer armed")?;
+    if let Some(warm) = seat.warm.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
+        if !warm.checkout.live() {
+            return Err("the judge's parent ended before exec".into());
+        }
+        warm.physical.verify(Duration::ZERO)?;
+    }
     // Where landrun's own options end (`--` before the launcher's `--check`).
     let land = args
         .iter()
@@ -2467,7 +3276,8 @@ pub(crate) fn reap(id: &str) {
 
 /// The per-namespace arm lock ([`arm`], review r7 #7).
 fn arm_lock(ns: &str) -> Arc<Mutex<()>> {
-    static LOCKS: Mutex<Option<HashMap<String, Arc<Mutex<()>>>>> = Mutex::new(None);
+    type ArmLocks = HashMap<String, Arc<Mutex<()>>>;
+    static LOCKS: Mutex<Option<ArmLocks>> = Mutex::new(None);
     let mut g = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
     g.get_or_insert_with(HashMap::new)
         .entry(ns.to_string())
@@ -2592,8 +3402,9 @@ pub(crate) enum Ending {
     Cancelled,
 }
 
-/// Settle a seat after its client ended: read its exit code from the pod, delete the pod and
-/// wait it out, then write back every root that comes back. `Ok(code)` = the CLI's own exit code
+/// Settle a seat after its client ended: read its exit code, then establish the stop barrier
+/// (confirmed deletion, or verified quiescence for an exclusive warm read-only judge) before
+/// write-back. `Ok(code)` = the CLI's own exit code
 /// (or the client's for a timeout or cancel); `Err` = the unit has no result (a lost stream, a
 /// pod not confirmed gone, a write-back refused): could-not-run, never a pass.
 #[cfg(test)]
@@ -2648,6 +3459,46 @@ pub(crate) fn settle_unless(
         }
         Ending::TimedOut | Ending::Cancelled => Ok(-1),
     };
+    let warm = seat.warm.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(warm) = warm {
+        // A read-only judge's write-back is empty. Prove the stop barrier before returning
+        // its physical state; retain exclusive checkout in the runner through lease revocation.
+        let barrier = warm.physical.quiet();
+        let eligible = code.is_ok()
+            && matches!(ending, Ending::Exited(_))
+            && !cancelled()
+            && warm.checkout.live()
+            && write_back_roots(&seat.roots).is_empty();
+        let mut state = warm
+            .checkout
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if barrier.is_ok() && eligible && !state.retired {
+            warm.checkout
+                .completed
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            state.pod = Some(warm.physical);
+            *settled = true;
+            drop(state);
+            drop(settled);
+            unregister(&seat.id);
+            return code.map(|c| (c, Vec::new()));
+        }
+        drop(state);
+        let gone = delete_pod(seat);
+        if gone.is_err() {
+            unreaped(seat);
+        }
+        *settled = true;
+        drop(settled);
+        unregister(&seat.id);
+        gone?;
+        drop_scratch(seat);
+        barrier?;
+        return code.map(|c| (c, Vec::new()));
+    }
     let gone = delete_pod(seat);
     if gone.is_err() {
         unreaped(seat);
@@ -3511,8 +4362,14 @@ pub(crate) fn drop_scope(run_id: &str) {
         }
     }
 
+    if let Err(e) = drop_replica_scope(&kube, &ns, &scope) {
+        eprintln!("wicked-core: {e}");
+    }
+}
+
+fn drop_replica_scope(kube: &Kube, ns: &str, scope: &str) -> Result<(), String> {
     let r = kube.call(
-        Some(&ns),
+        Some(ns),
         &[
             "exec",
             "-c",
@@ -3528,11 +4385,12 @@ pub(crate) fn drop_scope(run_id: &str) {
         CALL,
     );
     if !r.ok() {
-        eprintln!(
-            "wicked-core: session scope {scope} not removed: {}",
+        return Err(format!(
+            "session scope {scope} not removed: {}",
             r.err_text()
-        );
+        ));
     }
+    Ok(())
 }
 
 /// Turn a plan's mounts (from the floor) into [`PlanMount`]s.
@@ -3575,5 +4433,6 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
         unit_label: "u".into(),
         settled: Mutex::new(false),
         deps: false,
+        warm: Mutex::new(None),
     })
 }

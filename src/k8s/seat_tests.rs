@@ -5285,3 +5285,620 @@ fn an_api_error_keeps_the_last_pod_diagnosis_and_wait_history() {
         "{msg}"
     );
 }
+
+// Exercise the real warm arm/copy-in/settle path against a stateful API stub.
+#[cfg(unix)]
+fn warm_fixture() -> (PathBuf, super::Kube, seat::WarmKey) {
+    let dir = tmp("warm-judge");
+    let kubectl = dir.join("kubectl");
+    crate::test_env::install_stub(
+        &kubectl,
+        r#"#!/usr/bin/env python3
+import json, pathlib, sys
+base = pathlib.Path(__file__).parent
+args = sys.argv[1:]
+ns = args[args.index('--namespace') + 1] if '--namespace' in args else ''
+a = next(i for i, v in enumerate(args) if v in ('apply', 'get', 'exec', 'delete'))
+args = args[a:]
+statefile = base / 'state.json'
+state = json.loads(statefile.read_text()) if statefile.exists() else {}
+with (base / 'calls').open('a') as f: f.write(json.dumps(args) + '\n')
+def save(): statefile.write_text(json.dumps(state))
+if args[0] == 'apply':
+    for d in json.load(sys.stdin)['items']:
+        if d['kind'] != 'Sandbox': continue
+        name = d['metadata']['name']
+        md = dict(d['spec']['podTemplate']['metadata'], name=name, uid=name+'-uid')
+        md['ownerReferences'] = [{'kind':'Sandbox', 'name':name, 'uid':name+'-owner'}]
+        d['metadata']['uid'] = name+'-owner'
+        state[name] = dict(metadata=md, spec=d['spec']['podTemplate']['spec'], _sandbox=d,
+            status={'phase':'Running', 'hostIP':'10.0.0.2',
+                    'conditions':[{'type':'Ready','status':'True'}],
+                    'containerStatuses':[{'name':'seat','ready':True}]})
+    save()
+elif args[0] == 'get':
+    if '-l' in args:
+        if 'wicked.dev/role=sync' in ' '.join(args):
+            sync = {
+                'metadata': {'name': 'sync', 'labels': {
+                    'wicked.dev/boot': (base/'boot').read_text()}},
+                'status': {'phase': 'Running', 'conditions': [
+                    {'type': 'Ready', 'status': 'True'}],
+                    'containerStatuses': [{'ready': True}]}}
+            print(json.dumps({'items': [sync]}))
+        else: print(json.dumps({'items':[]}))
+    elif args[2] in state:
+        obj = json.loads(json.dumps(state[args[2]]))
+        if args[1] == 'sandboxes.agents.x-k8s.io': obj = obj['_sandbox']
+        else: obj.pop('_sandbox', None)
+        print(json.dumps(obj))
+elif args[0] == 'delete':
+    state.pop(args[2], None); save()
+elif args[0] == 'exec':
+    if '-i' in args: sys.stdin.buffer.read()
+    if args[-1] == '/wicked-unit/rc': print('0')
+    elif 'nc_()' in args[-1]:
+        import re
+        nodes = re.findall(r'node(\d+)', args[-1])
+        print('api=closed net=closed gw=open ' + ' '.join('node%s=closed'%p for p in nodes))
+    elif 'wicked-warm-quiet' in args[-1]:
+        if (base/'fail-reset').exists(): sys.exit(1)
+        print('wicked-warm-quiet')
+    elif 'wicked-warm-reset' in args[-1]: print('wicked-warm-reset')
+"#,
+    );
+    std::fs::write(dir.join("boot"), super::boot_id()).unwrap();
+    std::fs::create_dir(dir.join("tree")).unwrap();
+    let key = seat::WarmKey::new(&format!("parent-{}", uuid::Uuid::new_v4()), "codex#2");
+    let kube = super::Kube {
+        kubectl,
+        kubeconfig: None,
+        context: "warm-test".into(),
+        owner: "owner".into(),
+    };
+    (dir, kube, key)
+}
+
+#[cfg(unix)]
+fn warm_arm(
+    kube: &super::Kube,
+    key: Option<&seat::WarmKey>,
+    tree: &Path,
+    image: &str,
+) -> (std::sync::Arc<seat::Seat>, Vec<String>) {
+    warm_arm_plan(kube, key, tree, image, &[], &[])
+}
+
+#[cfg(unix)]
+fn warm_arm_plan(
+    kube: &super::Kube,
+    key: Option<&seat::WarmKey>,
+    tree: &Path,
+    image: &str,
+    mounts: &[PlanMount],
+    homes: &[PathBuf],
+) -> (std::sync::Arc<seat::Seat>, Vec<String>) {
+    let checkout = key.and_then(|k| seat::checkout_warm(k.clone()).unwrap());
+    warm_arm_checkout(kube, checkout, tree, image, mounts, homes)
+}
+
+#[cfg(unix)]
+fn warm_arm_checkout(
+    kube: &super::Kube,
+    checkout: Option<std::sync::Arc<seat::WarmCheckout>>,
+    tree: &Path,
+    image: &str,
+    mounts: &[PlanMount],
+    homes: &[PathBuf],
+) -> (std::sync::Arc<seat::Seat>, Vec<String>) {
+    let call = crate::validator::one_shot_run_id("validator");
+    let spec = seat::ArmSpec {
+        run_id: &call,
+        generation: super::lifecycle(&call),
+        ord: 1,
+        cli: "codex",
+        image,
+        floor_image: "floor",
+        sync_image: "sync",
+        workdir: tree,
+        tree,
+        view: true,
+        mounts,
+        protected: &[],
+        write_roots: &[],
+        seat_dirs: homes,
+        scratch: None,
+        seed_base: None,
+        memory: "1Gi",
+        gateway_ip: None,
+        deadline: Duration::from_secs(30),
+        role: "judge",
+        deps: None,
+    };
+    seat::arm_warm(kube, &spec, vec![], checkout, Some((image, "floor"))).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_reuses_physical_pod_with_fresh_execution_and_gateway_identity() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let (a, argv_a) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    let id = a.id.clone();
+    let pod = a.pod.clone();
+    let unit_a = crate::container_floor::gateway_unit(&id, 1);
+    let key_a = crate::seat_gateway::UnitKey::new(&id, &unit_a, "codex");
+    seat::settle(&a, Ending::Exited(0)).unwrap();
+    drop(a);
+    let (b, argv_b) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    let unit_b = crate::container_floor::gateway_unit(&b.id, 1);
+    let key_b = crate::seat_gateway::UnitKey::new(&b.id, &unit_b, "codex");
+    assert_eq!(pod, b.pod);
+    assert_ne!(id, b.id);
+    assert_ne!(argv_a.last(), argv_b.last());
+    assert_ne!(unit_a, unit_b);
+    assert_ne!(key_a.key, key_b.key);
+    assert!(seat::lookup(&id).is_none());
+    seat::reap(&b.id);
+    drop(b);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_other_parent_other_seat_and_parentless_calls_are_isolated() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let (a, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    let pod = a.pod.clone();
+    seat::settle(&a, Ending::Exited(0)).unwrap();
+    drop(a);
+    for other in [
+        Some(seat::WarmKey::new(&key.parent, "codex#3")),
+        Some(seat::WarmKey::new("other-parent", "codex#2")),
+        None,
+        None,
+    ] {
+        let (b, _) = warm_arm(&kube, other.as_ref(), &dir.join("tree"), "image");
+        assert_ne!(pod, b.pod);
+        seat::reap(&b.id);
+        drop(b);
+        if let Some(k) = other {
+            seat::reap_warm_parent(&k.parent);
+        }
+    }
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_fingerprint_change_and_failed_reset_reap_before_rearm() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let (a, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    let pod_a = a.pod.clone();
+    seat::settle(&a, Ending::Exited(0)).unwrap();
+    drop(a);
+    let (b, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "changed-image");
+    assert_ne!(pod_a, b.pod);
+    let pod_b = b.pod.clone();
+    seat::settle(&b, Ending::Exited(0)).unwrap();
+    drop(b);
+    std::fs::write(dir.join("fail-reset"), "1").unwrap();
+    let (c, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "changed-image");
+    assert_ne!(pod_b, c.pod);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(state.get(&pod_a).is_none());
+    assert!(state.get(&pod_b).is_none());
+    seat::reap(&c.id);
+    drop(c);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_busy_checkout_runs_cold_and_leaves_the_cached_pod_for_reuse() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let held = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    let (first, _) = warm_arm_checkout(
+        &kube,
+        Some(held.clone()),
+        &dir.join("tree"),
+        "image",
+        &[],
+        &[],
+    );
+    let pod = first.pod.clone();
+    seat::settle(&first, Ending::Exited(0)).unwrap();
+    drop(first);
+    assert!(seat::checkout_warm(key.clone()).unwrap().is_none());
+    // The same-key call gets an ordinary run-id scope while the warm checkout is held.
+    std::fs::create_dir(dir.join("cold-tree")).unwrap();
+    let (cold, _) = warm_arm(&kube, Some(&key), &dir.join("cold-tree"), "image");
+    assert_ne!(pod, cold.pod);
+    assert_ne!(cold.scope.as_deref(), Some(held.scope().as_str()));
+    assert!(cold.scope.as_deref().unwrap().starts_with("s-"));
+    assert_ne!(cold.ns, super::run_namespace_name(&kube.owner, &key.parent));
+    seat::settle(&cold, Ending::Exited(0)).unwrap();
+    drop(cold);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(
+        state.get(&pod).is_some(),
+        "cold settle leaves the cached pod alone"
+    );
+    assert_eq!(state.as_object().unwrap().len(), 1);
+    drop(held);
+    let (next, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    assert_eq!(pod, next.pod);
+    seat::reap(&next.id);
+    drop(next);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn warm_judge_parent_end_refuses_checkout_even_while_busy() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let key = seat::WarmKey::new(&format!("parent-{}", uuid::Uuid::new_v4()), "pi#2");
+    let first = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    assert!(seat::checkout_warm(key.clone()).unwrap().is_none());
+    super::end_run(&key.parent);
+    assert!(seat::checkout_warm(key.clone()).is_err());
+    seat::reap_warm_parent(&key.parent);
+    drop(first);
+    assert!(seat::checkout_warm(key).is_err());
+}
+
+#[test]
+fn warm_reset_preserves_nested_mounts_and_rebuilds_disposable_view() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let mounts = vec![
+        PathBuf::from("/tmp/nested/repo"),
+        PathBuf::from("/tmp/nested/config"),
+    ];
+    let script = seat::warm_reset_script(Path::new("/tmp/nested/repo"), &mounts, &[]);
+    assert!(script.contains("/tmp/nested/repo"));
+    assert!(script.contains("/tmp/nested/config"));
+    assert!(script.contains("/wicked-ro"));
+    assert!(script.contains("/home/seat"));
+    assert!(script.contains("/wicked-unit"));
+    assert!(seat::WARM_QUIESCE.contains("kill -9 -1"));
+    assert!(seat::WARM_QUIESCE.contains("/proc/"));
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_changed_mounts_uid_owner_or_remaining_lifetime_rearm() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let tree = dir.join("tree");
+    let config = dir.join("config");
+    std::fs::create_dir(&config).unwrap();
+    let mounts = [PlanMount::Bind {
+        path: config.clone(),
+        rw: true,
+    }];
+    let (a, _) = warm_arm(&kube, Some(&key), &tree, "image");
+    let old = a.pod.clone();
+    seat::settle(&a, Ending::Exited(0)).unwrap();
+    drop(a);
+    let (b, _) = warm_arm_plan(
+        &kube,
+        Some(&key),
+        &tree,
+        "image",
+        &mounts,
+        std::slice::from_ref(&config),
+    );
+    assert_ne!(old, b.pod, "mount fingerprint changed");
+    let mut old = b.pod.clone();
+    seat::settle(&b, Ending::Exited(0)).unwrap();
+    drop(b);
+    for field in ["uid", "owner", "deadline"] {
+        if field == "deadline" {
+            seat::expire_warm_for_test(&key);
+        } else {
+            let file = dir.join("state.json");
+            let mut state: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            if field == "uid" {
+                state[&old]["metadata"]["uid"] = json!("replacement");
+            } else {
+                state[&old]["metadata"]["ownerReferences"][0]["uid"] = json!("replacement");
+            }
+            std::fs::write(file, serde_json::to_vec(&state).unwrap()).unwrap();
+        }
+        let (next, _) = warm_arm_plan(
+            &kube,
+            Some(&key),
+            &tree,
+            "image",
+            &mounts,
+            std::slice::from_ref(&config),
+        );
+        assert_ne!(old, next.pod, "{field} must force a cold arm");
+        old.clone_from(&next.pod);
+        seat::settle(&next, Ending::Exited(0)).unwrap();
+        drop(next);
+    }
+    super::end_run(&key.parent);
+    seat::reap_warm_parent(&key.parent);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(
+        state.as_object().unwrap().is_empty(),
+        "parent end reaps idle pods"
+    );
+    assert!(seat::checkout_warm(key).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn warm_judge_successive_checkouts_reset_homes_and_retirement_removes_them() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tmp("warm-homes");
+    let key = seat::WarmKey::new(&format!("parent-{}", uuid::Uuid::new_v4()), "pi#1");
+    let first = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    first.fresh_dir(&dir).unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("old-history"), "old").unwrap();
+    assert!(seat::checkout_warm(key.clone()).unwrap().is_none());
+    assert!(
+        dir.join("old-history").exists(),
+        "busy checkout never resets warm paths"
+    );
+    drop(first);
+    let second = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    second.fresh_dir(&dir).unwrap();
+    assert!(!dir.exists());
+    std::fs::create_dir_all(&dir).unwrap();
+    super::end_run(&key.parent);
+    seat::reap_warm_parent(&key.parent);
+    super::forget_ended(&key.parent);
+    assert!(
+        seat::checkout_warm(key.clone()).is_err(),
+        "old lifecycle still owns stable paths"
+    );
+    drop(second);
+    assert!(!dir.exists());
+    let resumed = seat::checkout_warm(key.clone()).unwrap().unwrap();
+    drop(resumed);
+    seat::reap_warm_parent(&key.parent);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_judge_failed_settle_barrier_reaps_and_never_caches_the_pod() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let (a, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    let pod = a.pod.clone();
+    std::fs::write(dir.join("fail-reset"), "1").unwrap();
+    assert!(seat::settle(&a, Ending::Exited(0)).is_err());
+    drop(a);
+    std::fs::remove_file(dir.join("fail-reset")).unwrap();
+    let (b, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    assert_ne!(pod, b.pod);
+    seat::reap(&b.id);
+    drop(b);
+    seat::reap_warm_parent(&key.parent);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_reset_script_removes_history_tmp_unit_and_view_sentinels_without_crossing_mounts() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tmp("warm-reset-script");
+    for d in [
+        "home",
+        "tmp/mounted/config",
+        "tmp/mounted/tree",
+        "unit",
+        "canary",
+        "source",
+    ] {
+        std::fs::create_dir_all(dir.join(d)).unwrap();
+    }
+    for d in [
+        "home",
+        "tmp",
+        "unit",
+        "canary",
+        "tmp/mounted/config",
+        "tmp/mounted/tree",
+    ] {
+        std::fs::write(dir.join(d).join("sentinel"), "old").unwrap();
+    }
+    std::fs::write(dir.join("source/fresh"), "fresh").unwrap();
+    let tree = dir.join("tmp/mounted/tree");
+    let config = dir.join("tmp/mounted/config");
+    let mounts = vec![tree.clone(), config.clone()];
+    // Run only the reset, in temporary directories. The process-kill barrier is never run
+    // in the host PID namespace. `host_tools` stands in for the floor's busybox dispatcher.
+    let mut script = seat::warm_reset_script(&tree, &mounts, std::slice::from_ref(&config));
+    for (from, to) in [
+        ("wipe /home/seat", "home"),
+        ("wipe /tmp", "tmp"),
+        ("wipe /wicked-unit", "unit"),
+        ("wipe /wicked-canary", "canary"),
+        ("cd /wicked-ro", "source"),
+    ] {
+        let cmd = from.split_whitespace().next().unwrap();
+        script = script.replace(from, &format!("{cmd} '{}'", dir.join(to).display()));
+    }
+    script = script.replace(
+        "F=/floor/busybox",
+        "host_tools() { command \"$@\"; }; F=host_tools",
+    );
+    let out = std::process::Command::new("bash")
+        .hardened()
+        .args(["-c", &script])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for d in [
+        "home",
+        "tmp",
+        "unit",
+        "canary",
+        "tmp/mounted/config",
+        "tmp/mounted/tree",
+    ] {
+        assert!(!dir.join(d).join("sentinel").exists(), "{d}");
+    }
+    assert_eq!(std::fs::read(tree.join("fresh")).unwrap(), b"fresh");
+    assert!(config.is_dir());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_quiescence_checks_detached_processes_and_refuses_a_survivor() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tmp("warm-proc-barrier");
+    for pid in ["1", "22", "23"] {
+        std::fs::create_dir_all(dir.join(pid)).unwrap();
+        let ppid = if pid == "23" { "22" } else { "1" };
+        std::fs::write(
+            dir.join(pid).join("stat"),
+            format!("{pid} (child) S {ppid} 0"),
+        )
+        .unwrap();
+    }
+    // A synthetic proc table and a shell function substitute the signal primitive. Never
+    // execute kill -1 in the host PID namespace. PID 22 is detached; PID 23 is its child.
+    let prefix = format!(
+        r#"
+mkdir -p '{p}'/$$; echo "$$ (helper) S 1 0" > '{p}'/$$/stat
+trap 'rm -rf "{p}/$$"' EXIT
+host_tools() {{ if [ "$1" = id ]; then echo 1000; else command "$@"; fi; }}
+kill() {{ [ -f '{p}/survive' ] || rm -rf '{p}/22' '{p}/23'; }}
+"#,
+        p = dir.display()
+    );
+    let script = seat::WARM_QUIESCE
+        .replace("/proc/", &format!("{}/", dir.display()))
+        .replace("F=/floor/busybox", "F=host_tools");
+    let run = || {
+        std::process::Command::new("bash")
+            .hardened()
+            .args(["-c", &format!("{prefix}{script}")])
+            .output()
+            .unwrap()
+    };
+    std::fs::write(dir.join("survive"), "1").unwrap();
+    assert!(
+        !run().status.success(),
+        "a surviving detached process must fail the barrier"
+    );
+    std::fs::remove_file(dir.join("survive")).unwrap();
+    let out = run();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!dir.join("22").exists() && !dir.join("23").exists());
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        "wicked-warm-quiet"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_seed_copy_bypasses_the_old_replica_stamp_and_restores_trusted_contents() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let dir = tmp("warm-seeds");
+    std::fs::write(dir.join("cache"), "trusted").unwrap();
+    let root = PlanRoot {
+        host: dir.clone(),
+        mode: Mode::Seed,
+        skip: vec![],
+        back: false,
+        files: vec![],
+        masks: vec![],
+        repo: false,
+    };
+    let rep = seat::replica_of(Some("warm-test"), &dir).unwrap();
+    let seeded = [rep].into_iter().collect();
+    let encode = || {
+        seat::copy_in_stream_fresh(
+            Some("warm-test"),
+            &dir,
+            std::slice::from_ref(&root),
+            false,
+            &seeded,
+            true,
+        )
+        .unwrap()
+        .0
+    };
+    for content in ["trusted", "updated"] {
+        std::fs::write(dir.join("cache"), content).unwrap();
+        let bytes = encode();
+        let roots = sync::decode(&mut bytes.as_slice(), sync::MAX_STREAM).unwrap();
+        assert_eq!(
+            roots[0].mode,
+            Mode::Home,
+            "restore into the already-mounted directory"
+        );
+        assert_eq!(roots[0].entries[0].data, content.as_bytes());
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn warm_parent_end_during_execution_cannot_return_a_pod_to_the_cache() {
+    let _env = crate::test_env::ENV_LOCK
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
+    let (dir, kube, key) = warm_fixture();
+    let (seat, _) = warm_arm(&kube, Some(&key), &dir.join("tree"), "image");
+    super::end_run(&key.parent);
+    seat::reap_warm_parent(&key.parent);
+    seat::settle(&seat, Ending::Exited(0)).unwrap();
+    drop(seat);
+    let state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(dir.join("state.json")).unwrap()).unwrap();
+    assert!(state.as_object().unwrap().is_empty());
+    assert!(seat::checkout_warm(key).is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}
