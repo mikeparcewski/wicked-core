@@ -2556,8 +2556,8 @@ fn t6_restart_between_the_fold_and_the_dispute_pause_reopens_the_dispute() {
         };
         launch_team(&e, "t6od");
         wait_status(&e, "t6od", SessionStatus::AwaitingHuman);
+        stop(e);
     }
-    std::thread::sleep(Duration::from_millis(300));
     // The state a crash between the fold's unit write and the pause leaves behind.
     edit_store(&db, "t6od", |s, _| {
         s.status = SessionStatus::Executing;
@@ -2995,8 +2995,8 @@ fn a_restart_between_the_ack_and_the_apply_applies_the_edit_exactly_once() {
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     assert_eq!(plan_revs(&e, "r9b"), (2, 2), "applied at boot");
     assert_eq!(unit_ids(&e, "r9b"), EDITED_UNITS);
@@ -3175,8 +3175,8 @@ fn a_noted_edit_applied_at_boot_lands_its_note_once_1139() {
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     assert_eq!(unit_ids(&e, "nb"), EDITED_UNITS, "applied at boot");
     assert_eq!(noted_units(&e, "nb", note), [("make".to_string(), 1)]);
@@ -3358,8 +3358,8 @@ fn a_held_plan_whose_row_is_already_answered_is_answered_through_the_plan_arm() 
         crate::interaction::now_millis(),
     )
     .unwrap();
+    // The test's own connection closes synchronously on drop; the engine's was waited for above.
     drop(store);
-    std::thread::sleep(Duration::from_millis(300));
     let e = engine_on(&db, fast(&rig));
     let _ = e.core.confirm_gate("r10a", approve(None));
     wait_for("plan.accepted", || {

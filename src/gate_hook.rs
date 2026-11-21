@@ -13309,19 +13309,25 @@ mod boundary_tests {
             );
             (SHELL_SCAN_SEEN.with(std::cell::Cell::get), command.len())
         };
-        let (deep, deep_len) = scanned(10_000);
         let (shallow, shallow_len) = scanned(100);
-        assert!(
-            deep >= deep_len && shallow >= shallow_len,
-            "every judgment scans its command at least once: {deep}/{deep_len}, {shallow}/{shallow_len}"
-        );
-        // Linear: a chain 100x deeper costs no more per byte than 4x the shallow one. Rescanning
-        // each `env -S` level (no global budget) costs ~depth/2 per byte: ~5000x here.
-        assert!(
-            deep * shallow_len <= 4 * shallow * deep_len,
-            "the scan grows with the chain's depth: {deep} bytes for {deep_len} vs {shallow} for \
-             {shallow_len}"
-        );
+        // 9 000 levels (63 004 bytes) fit the byte budget, so the recursive scan really walks
+        // the chain; 10 000 (70 004 bytes) exceed it from the first scan.
+        for count in [9_000, 10_000] {
+            let (deep, deep_len) = scanned(count);
+            assert!(
+                deep >= deep_len && shallow >= shallow_len,
+                "every judgment scans its command at least once: {deep}/{deep_len}, \
+                 {shallow}/{shallow_len}"
+            );
+            // Linear: a chain 90-100x deeper costs no more than 16x the shallow one per byte.
+            // Rescanning every `env -S` level (a budget that is not global, or no depth bound)
+            // costs ~depth/2 per byte: thousands of times more here.
+            assert!(
+                deep * shallow_len <= 16 * shallow * deep_len,
+                "the scan grows with the chain's depth ({count} levels): {deep} bytes for \
+                 {deep_len} vs {shallow} for {shallow_len}"
+            );
+        }
         shell_read_951_r2_assert_reads(
             &scratch,
             &outside,
