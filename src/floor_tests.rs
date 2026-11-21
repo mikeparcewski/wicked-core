@@ -6302,8 +6302,8 @@ fn core_1605_disk_filling_during_a_check_is_terminal_and_preserves_evidence() {
 }
 
 /// core#1731: admission read free space once, then a build could fill the host's disk. A running
-/// check is stopped when the volume falls under the stop line, as an environment refusal that
-/// names the free figure; the rest of the floor does not retry it.
+/// check (and what it started) is stopped when the volume falls under the stop line on a LATER
+/// reading, and the whole floor is an environment refusal that names the free figure.
 #[cfg(unix)]
 #[test]
 fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
@@ -6315,7 +6315,7 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
     impl Drop for Restore {
         fn drop(&mut self) {
             TEST_FREE_BYTES.with(|c| c.set(u64::MAX));
-            TEST_WATCH_FREE_BYTES.with(|c| c.set(u64::MAX));
+            TEST_WATCH_FREE.with(|f| *f.borrow_mut() = None);
             for (key, value) in &self.0 {
                 match value {
                     Some(v) => std::env::set_var(key, v),
@@ -6352,10 +6352,18 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
 
     let wt = scratch("disk-watch");
     std::fs::create_dir_all(wt.join("node_modules")).unwrap();
-    std::fs::write(wt.join(".gitignore"), "node_modules/\nattempts\n").unwrap();
+    std::fs::write(
+        wt.join(".gitignore"),
+        "node_modules/\nstarted\nwriter.log\n",
+    )
+    .unwrap();
+    // The check starts a writer in the background, then (a second later, after the watch's first
+    // reading) marks that it is running, and keeps going far past the floor's patience.
+    let script = "(while :; do echo x >> writer.log; sleep 0.2; done) & sleep 1; touch started; \
+                  sleep 60";
     std::fs::write(
         wt.join("package.json"),
-        serde_json::json!({"scripts": {"test": "echo run >> attempts; sleep 60"}}).to_string(),
+        serde_json::json!({"scripts": {"test": script}}).to_string(),
     )
     .unwrap();
     let base = git_repo_with_commit(&wt);
@@ -6364,10 +6372,20 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
         git_dir: Some(wt.join(".git")),
         ..FloorContext::default()
     };
-    // Admission sees plenty; once the check is spawned its build "fills" the volume to 1 GiB.
+    // Admission sees plenty; the watch sees plenty until the check is running, then its build has
+    // "filled" the volume to 1 GiB.
     TEST_FREE_BYTES.with(|c| c.set(40 << 30));
-    TEST_WATCH_FREE_BYTES.with(|c| c.set(40 << 30));
-    seam::before_spawn(|| TEST_WATCH_FREE_BYTES.with(|c| c.set(1 << 30)));
+    let (marker, readings) = (
+        wt.join("started"),
+        std::rc::Rc::new(std::cell::Cell::new(0u32)),
+    );
+    let counted = std::rc::Rc::clone(&readings);
+    TEST_WATCH_FREE.with(|f| {
+        *f.borrow_mut() = Some(Box::new(move || {
+            counted.set(counted.get() + 1);
+            Some(if marker.exists() { 1 << 30 } else { 40 << 30 })
+        }))
+    });
     let started = Instant::now();
     let report = run_floor(&wt, &ctx);
     let elapsed = started.elapsed();
@@ -6376,10 +6394,21 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
         .iter()
         .find(|c| c.name == "test")
         .expect("test ran");
+    assert!(wt.join("started").exists(), "the check ran: {check:?}");
+    assert!(
+        readings.get() >= 2,
+        "stopped on a later reading, not the first: {}",
+        readings.get()
+    );
     assert!(
         elapsed < Duration::from_secs(30),
         "the check was stopped, not left to run: {elapsed:?} {check:?}"
     );
+    // What the check started was stopped with it: the writer's log stops growing.
+    let size = || std::fs::metadata(wt.join("writer.log")).map_or(0, |m| m.len());
+    let at_return = size();
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(size(), at_return, "the background writer was stopped too");
     assert!(!check.timed_out, "{check:?}");
     assert_eq!(check.outcome(), "could_not_run", "{check:?}");
     assert!(check.environment_failure(), "{check:?}");
@@ -6398,9 +6427,13 @@ fn core_1731_a_check_that_fills_the_disk_is_stopped_at_the_stop_line() {
         "{check:?}"
     );
     assert!(check.base.is_none(), "{check:?}");
+    // The whole floor is that environment refusal, as a floor refused for disk at admission.
     assert!(!report.passed, "{report:?}");
+    assert_eq!(report.environment_refusal(), Some(cause), "{report:?}");
     assert!(
-        report.denial_reason().contains(cause),
+        report
+            .denial_reason()
+            .starts_with("repo checks floor could not run: environment: the disk was nearly full"),
         "{}",
         report.denial_reason()
     );

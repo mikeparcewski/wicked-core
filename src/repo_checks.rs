@@ -1174,10 +1174,21 @@ fn reusable_run(check: &RepoCheck, run: &CheckRun, logs: &Path) -> bool {
 /// with every log it names — its own streams, its decision's, its retries' and its base run's —
 /// still whole in `logs` (each blob's age restarts)?
 fn finished_whole(run: &CheckRun, logs: &Path) -> bool {
+    // (core#1731) A retry, base or inventory run the environment stopped (the disk) is no
+    // evidence either: the decision it fed is not reused.
+    fn environment_stopped(r: &CheckRun) -> bool {
+        r.environment_failure()
+            || r.reruns.iter().any(environment_stopped)
+            || r.base
+                .as_ref()
+                .and_then(|b| b.run.as_ref())
+                .is_some_and(environment_stopped)
+    }
     let finished = !run.did_not_finish()
         && run.spawn_error.is_none()
         && run.decision.is_some()
-        && outcome_of(run) != Some(OUTCOME_COULD_NOT_RUN);
+        && outcome_of(run) != Some(OUTCOME_COULD_NOT_RUN)
+        && !environment_stopped(run);
     let mut refs: Vec<&crate::floor_log::LogRef> = Vec::new();
     fn collect<'a>(r: &'a CheckRun, out: &mut Vec<&'a crate::floor_log::LogRef>) {
         out.extend(r.logs.iter());
@@ -3629,6 +3640,9 @@ pub(crate) struct CheckScratch {
     pub(crate) container: Option<std::sync::Arc<crate::checks_container::ChecksFloor>>,
     /// The launch this floor belongs to, independent of the runner carrying it.
     stop: Option<FloorStop>,
+    /// (core#1731) The first disk-watch stop of this floor ([`disk_watch`]): the whole floor is
+    /// then that environment refusal, whichever run (head, retry, base, inventory) it stopped.
+    disk_stop: std::sync::OnceLock<String>,
 }
 
 impl Drop for CheckScratch {
@@ -4128,6 +4142,7 @@ impl CheckScratch {
             log_cap: log_cap(),
             container: None,
             stop: None,
+            disk_stop: std::sync::OnceLock::new(),
         })
     }
 
@@ -5287,9 +5302,9 @@ fn disk_watch(check: &RepoCheck, free: Option<u64>, stop_gib: u64) -> Option<Str
     })
 }
 
-/// (core#1731) The free bytes the running-check watch reads: [`free_bytes`]. Test builds read
-/// `TEST_WATCH_FREE_BYTES` instead, apart from admission's reading, so a fixture that needs a
-/// check to run to its end at low admission-free space still does.
+/// (core#1731) The free bytes the running-check watch reads: [`free_bytes`]. Test builds ask
+/// `TEST_WATCH_FREE` instead (plenty when unset), apart from admission's reading, so a fixture
+/// can lower the watch's reading while its check runs.
 #[cfg(not(test))]
 fn watch_free_bytes(path: &Path) -> Option<u64> {
     free_bytes(path)
@@ -5297,15 +5312,17 @@ fn watch_free_bytes(path: &Path) -> Option<u64> {
 
 #[cfg(test)]
 fn watch_free_bytes(_path: &Path) -> Option<u64> {
-    let v = TEST_WATCH_FREE_BYTES.with(std::cell::Cell::get);
-    (v != u64::MAX - 1).then_some(v)
+    TEST_WATCH_FREE.with(|f| f.borrow_mut().as_mut().map_or(Some(u64::MAX), |f| f()))
 }
 
-// (core#1731) Test seam: the free space a running check's disk watch reads in test builds, per
-// test thread (plenty by default; `u64::MAX - 1` = unreadable).
+#[cfg(test)]
+pub(crate) type WatchProbe = Box<dyn FnMut() -> Option<u64>>;
+
+// (core#1731) Test seam: what a running check's disk watch reads in test builds, per test thread.
 #[cfg(test)]
 thread_local! {
-    pub(crate) static TEST_WATCH_FREE_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+    pub(crate) static TEST_WATCH_FREE: std::cell::RefCell<Option<WatchProbe>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// (core#1560) The GiB of headroom per in-flight floor: `WICKED_FLOOR_PEAK_GB`, else 20.
@@ -6023,7 +6040,7 @@ pub(crate) fn run_with_sandbox_ctx(
         None,
     );
     let Some((why, inputs)) = again else {
-        return first;
+        return disk_stopped(first, &scratch);
     };
     eprintln!(
         "wicked-core: repo checks floor — the reused checks were set aside: {why}; running every \
@@ -6048,6 +6065,20 @@ pub(crate) fn run_with_sandbox_ctx(
         )),
         ..r
     });
+    disk_stopped(report, &scratch)
+}
+
+/// (core#1731) A floor during which the disk watch stopped a run is that environment refusal (as
+/// one refused for disk at admission), never a failed or passed floor: its checks kept for display.
+fn disk_stopped(mut report: RepoChecksReport, scratch: &CheckScratch) -> RepoChecksReport {
+    if let Some(why) = scratch
+        .disk_stop
+        .get()
+        .filter(|_| report.sandbox_error.is_none())
+    {
+        report.sandbox_error = Some(why.clone());
+        report.passed = false;
+    }
     report
 }
 
@@ -6701,10 +6732,13 @@ fn run_detected(
             }
             s.fresh.push(check.name.clone());
         }
-        if let Some(j) = journal.as_mut() {
+        // (core#1731) A check decided while the disk watch stopped a run of this floor (its own,
+        // its retry's, its base's or an inventory's) is no evidence for a later floor.
+        let stopped_for_disk = scratch.disk_stop.get().is_some();
+        if let Some(j) = journal.as_mut().filter(|_| !stopped_for_disk) {
             j.record(check, &run, untouched);
         }
-        if ctx.stage == FloorStage::Creator {
+        if ctx.stage == FloorStage::Creator && !stopped_for_disk {
             ran_here.push(CreatorEntry {
                 dir: check.dir.clone(),
                 name: check.name.clone(),
@@ -11524,6 +11558,7 @@ pub(crate) fn run_one_with(
                 crate::validator::kill_child_tree(&mut child);
                 crate::validator::reap_bounded(&mut child);
                 eprintln!("wicked-core: repo checks floor — {why}");
+                let _ = scratch.disk_stop.set(why.clone());
                 result.spawn_error = Some(why);
                 stopped = true;
                 break None;
@@ -11593,10 +11628,11 @@ pub(crate) fn run_one_with(
         .or_else(|| [&out, &err].into_iter().find(|s| s.error.is_some()))
     {
         if let Some(e) = &stream.error {
-            result.spawn_error = Some(if stream.no_space {
-                format!("{}; {e}", disk_full_error(check, ""))
-            } else {
-                e.clone()
+            result.spawn_error = Some(match result.spawn_error.take().filter(|_| stopped) {
+                // (core#1731) A stopped check keeps its stop as the cause; the log error follows.
+                Some(cause) => format!("{cause}; {e}"),
+                None if stream.no_space => format!("{}; {e}", disk_full_error(check, "")),
+                None => e.clone(),
             });
         }
     }
