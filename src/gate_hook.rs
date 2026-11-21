@@ -1669,13 +1669,14 @@ fn shell_tokens_blanked(command: &str, original: &str) -> Vec<String> {
 /// Reads need argument boundaries even beside glued input redirects and sequence operators.
 /// Keep the write scan's token spelling intact while sharing its quote/escape lexer (core#951).
 fn shell_tokens_with_operators(command: &str, split_operators: bool) -> Vec<String> {
-    lex_shell_tokens(command, split_operators, &HeredocLines::default())
+    lex_shell_tokens(command, split_operators, &[])
 }
 
 /// The lexer behind [`shell_tokens`] and [`shell_tokens_with_operators`]. `heredoc` lists the
 /// lines (0-based, sorted) whose line break ends a data heredoc header or body line, where no
-/// command ends, and which have a quoted delimiter; shell bodies are commands (core#1470).
-fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &HeredocLines) -> Vec<String> {
+/// command ends; it is read only when `split_operators` is false. A shell's body is not listed:
+/// its line breaks separate its commands (core#1470).
+fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &[usize]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur = String::new();
     // (core#1465) Which line a line break ends: its index among all of them.
@@ -1687,16 +1688,17 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &HeredocLines
     let in_heredoc = |at: usize| {
         breaks
             .binary_search(&at)
-            .is_ok_and(|line| heredoc.data.binary_search(&line).is_ok())
+            .is_ok_and(|line| heredoc.binary_search(&line).is_ok())
     };
+    let line_of = |at: usize| breaks.partition_point(|b| *b < at);
     // A heredoc's body (or closing delimiter) line: the line before it ends inside the heredoc.
     // Its text is the program's data, read as before: no glued operator is split there.
-    let body_quoted = |at: usize| {
-        let line = breaks.partition_point(|b| *b < at);
-        line.checked_sub(1)
-            .filter(|line| heredoc.data.binary_search(line).is_ok())
-            .map(|line| heredoc.quoted.binary_search(&line).is_ok())
-    };
+    let in_body = |line: usize| line > 0 && heredoc.binary_search(&(line - 1)).is_ok();
+    // (core#1470) The closing delimiter line of a data body: the body is data, so a quote it left
+    // open ends with it, and the command after the delimiter is read as a command. Inside the body
+    // nothing changes (a quote there still keeps its text literal, as before).
+    let closes_body = |line: usize| in_body(line) && heredoc.binary_search(&line).is_err();
+    let mut line_now = 0usize;
     // A `${…}` operand, `$[…]` arithmetic, a backtick substitution or a `$'…'` string may hold a
     // line break or `||` that is not a separator of the outer command (`rm -- -${X:-a|| ../f}`
     // removes `../f`), and this lexer does not track those contexts: a command holding any of
@@ -1705,38 +1707,20 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &HeredocLines
     let mut chars = command.char_indices().map(|(at, c)| (c, at)).peekable();
     let mut in_single = false;
     let mut in_double = false;
-    let mut body_substitution = 0usize;
-    let mut body_backtick = false;
     let flush = |cur: &mut String, out: &mut Vec<String>| {
         if !cur.is_empty() {
             out.push(std::mem::take(cur));
         }
     };
     while let Some((ch, at)) = chars.next() {
-        // Data is not shell syntax: its quotes cannot open a string that hides
-        // the command after the delimiter. Only unquoted bodies expand substitutions (core#1470).
-        let quoted = body_quoted(at);
-        let data = quoted.is_some();
-        if !data {
-            body_substitution = 0;
-            body_backtick = false;
-        }
-        if data && !in_single && !in_double {
-            if quoted == Some(false) {
-                if ch == '`' {
-                    body_backtick = !body_backtick;
-                }
-                if ch == '(' && (body_substitution > 0 || cur.ends_with('$')) {
-                    body_substitution += 1;
-                } else if ch == ')' {
-                    body_substitution = body_substitution.saturating_sub(1);
-                }
-            }
-            if (quoted == Some(true) || (body_substitution == 0 && !body_backtick))
-                && matches!(ch, '\'' | '"')
-            {
-                cur.push(ch);
-                continue;
+        let line = if split_operators { 0 } else { line_of(at) };
+        let data = in_body(line);
+        if line != line_now {
+            line_now = line;
+            if closes_body(line) && (in_single || in_double) {
+                in_single = false;
+                in_double = false;
+                flush(&mut cur, &mut out);
             }
         }
         if in_single {
@@ -1852,32 +1836,15 @@ fn lex_shell_tokens(command: &str, split_operators: bool, heredoc: &HeredocLines
     out
 }
 
-#[derive(Default)]
-struct HeredocLines {
-    /// Line breaks before data body/delimiter lines, in sorted order.
-    data: Vec<usize>,
-    /// The subset whose following line belongs to a quoted-delimiter body.
-    quoted: Vec<usize>,
-}
-
-impl HeredocLines {
-    fn push(&mut self, line: usize, quoted: bool) {
-        self.data.push(line);
-        if quoted {
-            self.quoted.push(line);
-        }
-    }
-}
-
 /// (core#1465, core#1470) The lines (0-based, sorted) whose line break ends a data heredoc's header
 /// or body line. Only shell bodies keep command separators. The closing delimiter is not one (unless
 /// another data heredoc of the same header follows): the next command starts after it. Only a
 /// plain delimiter ([`plain_heredoc_word`]) is read; another spelling (`$'E'`, `E'O'F`) might close
 /// where this scan does not, so its line breaks stay separators.
-fn heredoc_lines(command: &str) -> HeredocLines {
+fn heredoc_lines(command: &str) -> Vec<usize> {
     let lines: Vec<&str> = command.split('\n').collect();
     let last = lines.len().saturating_sub(1);
-    let mut out = HeredocLines::default();
+    let mut out = Vec::new();
     let mut pending: std::collections::VecDeque<Heredoc> = std::collections::VecDeque::new();
     let mut quotes = HeredocQuotes::default();
     let mut i = 0usize;
@@ -1891,11 +1858,11 @@ fn heredoc_lines(command: &str) -> HeredocLines {
             };
             if probe == h.delim {
                 pending.pop_front();
-                if let Some(next) = pending.front().filter(|next| !next.shell) {
-                    out.push(i, next.quoted);
+                if pending.front().is_some_and(|next| !next.shell) {
+                    out.push(i);
                 }
             } else if !h.shell {
-                out.push(i, h.quoted);
+                out.push(i);
             }
             i += 1;
             continue;
@@ -1909,14 +1876,13 @@ fn heredoc_lines(command: &str) -> HeredocLines {
         let found = heredocs_in(&header, true, false, &mut quotes);
         if !found.is_empty() && found.iter().all(|h| plain_heredoc_word(&h.word)) {
             if !found[0].shell {
-                out.push(i, found[0].quoted);
+                out.push(i);
             }
             pending.extend(found);
         }
         i += 1;
     }
-    out.data.retain(|line| *line < last);
-    out.quoted.retain(|line| *line < last);
+    out.retain(|line| *line < last);
     out
 }
 
@@ -13864,7 +13830,10 @@ mod boundary_tests {
     #[cfg(unix)]
     #[test]
     fn a_leading_cd_keeps_other_cwds_when_the_operand_scan_exceeds_its_budget_1470() {
-        let base = std::env::temp_dir().join(format!("gate-cd-budget-{}", std::process::id()));
+        // The fixture path must not hold the word `cd`: leading_cd refuses any later word naming
+        // a directory move.
+        let base =
+            std::env::temp_dir().join(format!("gate-dominance-budget-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
         let wt = base.join("wt");
         let other = base.join("other");
@@ -13942,6 +13911,11 @@ mod boundary_tests {
             "ruby <<'EOF'\ncp a /outside/f\nEOF",
             "env python3 <<'EOF'\ncp a /outside/f\nEOF",
             "sh -c 'node' <<'EOF'\ncp a /outside/f\nEOF",
+            // A quote inside a data body still keeps its text literal, as on main: a body's
+            // quoted `>` or `tee` is no write (the sourced report's stdin packet, CS3).
+            "cat <<'P' | checker --packet -\n{\"t\":\"A > /outside/f, and tee /outside/g\"}\nP",
+            "python3 <<'EOF'\nprint(\"a > /outside/f\")\nEOF",
+            "wc -l <<E\nsay 'x > /outside/f'\nE",
         ] {
             let targets = bash_write_targets(cmd);
             assert!(targets.is_empty(), "{cmd:?}: {targets:?}");
