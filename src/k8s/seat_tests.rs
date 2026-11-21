@@ -5200,6 +5200,405 @@ fn a_failed_read_after_a_runtime_error_keeps_that_error() {
     );
 }
 
+// (core#1441) A kept builder fetches the next commit and repairs a broken object store.
+#[cfg(unix)]
+#[test]
+fn k8s_replica_git_builder_is_incremental_and_repairs_corruption() {
+    let host = tmp("incremental-host");
+    let home = tmp("incremental-home");
+    let replica = tmp("incremental-replica");
+    git_in(&host, &["init", "-q", "-b", "main"]);
+    let builders = std::sync::Mutex::new(seat::GitBuilders::default());
+    let build = |branch: &str| {
+        let sha = std::process::Command::new("git")
+            .hardened()
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&host)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha.stdout).unwrap().trim().to_string();
+        let entries = seat::GitBuild {
+            tree: &host,
+            sha: &sha,
+            branch: &Some(format!("refs/heads/{branch}")),
+            masks: &[],
+            budget: sync::MAX_STREAM,
+        }
+        .build(&builders, Some(&home))
+        .unwrap();
+        (sha, entries)
+    };
+    seat::FRESH_BUILDS.with(|n| n.set(0));
+    std::fs::write(host.join("a"), "one").unwrap();
+    git_in(&host, &["add", "a"]);
+    git_in(&host, &["commit", "-qm", "c1"]);
+    build("main");
+    std::fs::write(host.join("a"), "two").unwrap();
+    git_in(&host, &["commit", "-qam", "c2"]);
+    let (c2, entries) = build("main");
+    seat::FRESH_BUILDS.with(|n| assert_eq!(n.get(), 1));
+    let body = sync::encode(&[Root {
+        replica: "repo/.git".into(),
+        mode: Mode::Git,
+        entries,
+    }]);
+    let out = codec(
+        &replica,
+        &["unpack", &json!([["repo/.git", "git", []]]).to_string()],
+        &body,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let checkout = replica.join("repo");
+    git_in(&checkout, &["checkout", "-q", "--", "."]);
+    let output = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .hardened()
+            .args(args)
+            .current_dir(&checkout)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap()
+    };
+    assert_eq!(output(&["rev-parse", "HEAD"]).trim(), c2);
+    assert_eq!(output(&["symbolic-ref", "HEAD"]).trim(), "refs/heads/main");
+    assert_eq!(
+        output(&["log", "-2", "--format=%s"])
+            .lines()
+            .collect::<Vec<_>>(),
+        ["c2", "c1"]
+    );
+    assert!(output(&["status", "--porcelain"]).is_empty());
+    let kept = std::fs::read_dir(home.join("k8s-replica-git"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::remove_dir_all(kept.join(".git/objects")).unwrap();
+    let (repaired, entries) = build("main");
+    assert_eq!(repaired, c2);
+    let body = sync::encode(&[Root {
+        replica: "repo/.git".into(),
+        mode: Mode::Git,
+        entries,
+    }]);
+    let out = codec(
+        &replica,
+        &["unpack", &json!([["repo/.git", "git", []]]).to_string()],
+        &body,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(output(&["rev-parse", "HEAD"]).trim(), c2);
+    assert_eq!(output(&["log", "-2", "--format=%s"]).lines().count(), 2);
+    assert!(output(&["status", "--porcelain"]).is_empty());
+    seat::FRESH_BUILDS.with(|n| assert_eq!(n.get(), 2));
+    git_in(&host, &["checkout", "-qb", "other"]);
+    build("other");
+    seat::FRESH_BUILDS.with(|n| assert_eq!(n.get(), 3));
+    for p in [host, home, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+// (core#1441) Published generations use their identity; lookalikes still walk.
+#[cfg(unix)]
+#[test]
+fn k8s_skills_generation_signs_without_a_walk_and_reuses_its_read() {
+    let home = tmp("generation-signature");
+    let host = home.join("skills/snapshots/123");
+    std::fs::create_dir_all(host.join("skills/a")).unwrap();
+    std::fs::write(host.join("skills/a/SKILL.md"), "skill").unwrap();
+    let index = host.join("snapshot.json");
+    std::fs::write(&index, r#"{"gen":"123","contentHash":"sha256:abc"}"#).unwrap();
+    let r = PlanRoot {
+        host: host.clone(),
+        mode: Mode::Plain,
+        skip: vec![],
+        back: false,
+        files: vec![],
+        masks: vec![],
+        repo: false,
+    };
+    seat::SIG_WALKS.with(|n| n.set(0));
+    let before = seat::HOST_READS.with(|n| n.get());
+    let copy = || {
+        seat::copy_in_stream(
+            None,
+            &home,
+            std::slice::from_ref(&r),
+            false,
+            &Default::default(),
+        )
+        .unwrap()
+    };
+    let first = copy();
+    assert_eq!(copy().0, first.0);
+    seat::SIG_WALKS.with(|n| assert_eq!(n.get(), 0));
+    seat::HOST_READS.with(|n| assert_eq!(n.get(), before + 1));
+    std::fs::write(&index, r#"{"gen":"124","contentHash":"sha256:abc"}"#).unwrap();
+    copy();
+    seat::SIG_WALKS.with(|n| assert!(n.get() > 0));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[cfg(unix)]
+fn repo_stamp_fixture() -> (PathBuf, PathBuf, PlanRoot) {
+    let host = tmp("repo-stamp-host");
+    let replica = tmp("repo-stamp-replica");
+    git_in(&host, &["init", "-q"]);
+    std::fs::write(host.join("payload"), "stamp payload one").unwrap();
+    git_in(&host, &["add", "payload"]);
+    let r = PlanRoot {
+        host: host.clone(),
+        mode: Mode::Plain,
+        skip: vec![],
+        back: false,
+        files: vec![],
+        masks: vec![],
+        repo: true,
+    };
+    (host, replica, r)
+}
+
+#[cfg(unix)]
+fn stamped_copy(
+    replica: &Path,
+    r: &PlanRoot,
+    have: std::collections::HashMap<String, String>,
+) -> seat::CopyInStream {
+    let mut stamps = seat::RepoStamps::new(None, std::slice::from_ref(r)).unwrap();
+    stamps.have = have;
+    let result = seat::copy_in_stream_stamped(
+        None,
+        &r.host,
+        std::slice::from_ref(r),
+        false,
+        &Default::default(),
+        &stamps,
+    )
+    .unwrap();
+    let out = codec(replica, &["unpack", &result.1.to_string()], &result.0);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    result
+}
+
+#[cfg(unix)]
+fn read_repo_stamps(replica: &Path, rep: &str) -> std::collections::HashMap<String, String> {
+    let out = codec(replica, &["stamps", &json!([rep]).to_string()], &[]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_repo_stamp_keeps_an_unchanged_repo_without_reading_or_streaming_it() {
+    let (host, replica, r) = repo_stamp_fixture();
+    let rep = seat::replica_of(None, &host).unwrap();
+    let before = seat::HOST_READS.with(|n| n.get());
+    let first = stamped_copy(&replica, &r, Default::default());
+    let have = read_repo_stamps(&replica, &rep);
+    assert!(have.contains_key(&rep));
+    let n = seat::HOST_READS.with(|n| n.get());
+    let next = stamped_copy(&replica, &r, have);
+    assert_eq!(n, before + 1);
+    assert!(!sync::decode(&mut first.0.as_slice(), sync::MAX_STREAM)
+        .unwrap()
+        .is_empty());
+    assert!(!next
+        .0
+        .windows(b"stamp payload one".len())
+        .any(|w| w == b"stamp payload one"));
+    assert!(sync::decode(&mut next.0.as_slice(), sync::MAX_STREAM)
+        .unwrap()
+        .is_empty());
+    assert_eq!(next.1, json!([]));
+    seat::HOST_READS.with(|c| assert_eq!(c.get(), n));
+    assert_eq!(
+        std::fs::read_to_string(replica.join(&rep).join("payload")).unwrap(),
+        "stamp payload one"
+    );
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_repo_stamp_changes_when_a_host_file_is_edited() {
+    let (host, replica, r) = repo_stamp_fixture();
+    let rep = seat::replica_of(None, &host).unwrap();
+    stamped_copy(&replica, &r, Default::default());
+    let have = read_repo_stamps(&replica, &rep);
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::write(host.join("payload"), "edited payload").unwrap();
+    let next = stamped_copy(&replica, &r, have.clone());
+    assert!(!sync::decode(&mut next.0.as_slice(), sync::MAX_STREAM)
+        .unwrap()
+        .is_empty());
+    assert_ne!(read_repo_stamps(&replica, &rep), have);
+    assert_eq!(
+        std::fs::read_to_string(replica.join(&rep).join("payload")).unwrap(),
+        "edited payload"
+    );
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_plain_ancestor_stream_invalidates_the_repo_stamp() {
+    let (host, replica, r) = repo_stamp_fixture();
+    let rep = seat::replica_of(None, &host).unwrap();
+    stamped_copy(&replica, &r, Default::default());
+    let ancestor = rep.rsplit_once('/').unwrap().0;
+    let body = sync::encode(&[Root {
+        replica: ancestor.into(),
+        mode: Mode::Plain,
+        entries: vec![],
+    }]);
+    let out = codec(
+        &replica,
+        &["unpack", &json!([[ancestor, "plain", []]]).to_string()],
+        &body,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(read_repo_stamps(&replica, &rep).is_empty());
+    // The codec refuses a root in its own stamp store, whatever the host sends.
+    let forged = sync::encode(&[Root {
+        replica: ".wicked-stamps".into(),
+        mode: Mode::Plain,
+        entries: vec![],
+    }]);
+    let out = codec(
+        &replica,
+        &[
+            "unpack",
+            &json!([[".wicked-stamps", "plain", []]]).to_string(),
+        ],
+        &forged,
+    );
+    assert!(
+        !out.status.success(),
+        "a root in the stamp store was unpacked"
+    );
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_repo_stamp_from_another_secret_is_not_kept() {
+    let (host, replica, r) = repo_stamp_fixture();
+    let rep = seat::replica_of(None, &host).unwrap();
+    let (body, mut plan, _, _, _) = stamped_copy(&replica, &r, Default::default());
+    let foreign = seat::repo_key(&r, &rep, &[0x42; 32]).unwrap();
+    plan[0][4] = json!(foreign);
+    let out = codec(&replica, &["unpack", &plan.to_string()], &body);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let have = read_repo_stamps(&replica, &rep);
+    assert_eq!(have.get(&rep), Some(&foreign));
+    let next = stamped_copy(&replica, &r, have);
+    assert!(!sync::decode(&mut next.0.as_slice(), sync::MAX_STREAM)
+        .unwrap()
+        .is_empty());
+    assert_ne!(read_repo_stamps(&replica, &rep).get(&rep), Some(&foreign));
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn k8s_a_live_writable_seat_mount_prevents_a_repo_stamp_hit() {
+    let (host, replica, r) = repo_stamp_fixture();
+    let rep = seat::replica_of(None, &host).unwrap();
+    let kube = super::Kube {
+        kubectl: host.join("unused-kubectl"),
+        kubeconfig: None,
+        context: "t".into(),
+        owner: "o".into(),
+    };
+    for mount in [
+        host.clone(),
+        host.parent().unwrap().to_path_buf(),
+        host.join("subdir"),
+    ] {
+        stamped_copy(&replica, &r, Default::default());
+        let have = read_repo_stamps(&replica, &rep);
+        let id = format!("stamps-{}", uuid::Uuid::new_v4());
+        let live = seat::register_for_test(&kube, &id, &mount, "test");
+        let mut stamps = seat::RepoStamps::new(None, std::slice::from_ref(&r)).unwrap();
+        stamps.have = have;
+        stamps.block_writers("ns");
+        let next = seat::copy_in_stream_stamped(
+            None,
+            &host,
+            std::slice::from_ref(&r),
+            false,
+            &Default::default(),
+            &stamps,
+        )
+        .unwrap();
+        seat::forget_for_test(&id);
+        drop(live);
+        assert!(!sync::decode(&mut next.0.as_slice(), sync::MAX_STREAM)
+            .unwrap()
+            .is_empty());
+        let out = codec(&replica, &["unpack", &next.1.to_string()], &next.0);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            read_repo_stamps(&replica, &rep).is_empty(),
+            "a live writer left a trusted stamp"
+        );
+    }
+    for p in [host, replica] {
+        let _ = std::fs::remove_dir_all(p);
+    }
+}
+
+// (core#1463) The codec's stamp store can never be a seat-mounted replica root.
+#[test]
+fn k8s_replica_stamp_storage_cannot_be_a_seat_root() {
+    assert!(seat::replica_of(None, Path::new("/.wicked-stamps")).is_err());
+    assert!(seat::replica_of(None, Path::new("/.wicked-stamps/guessed-key")).is_err());
+    assert!(seat::replica_of(None, Path::new("/.wicked-stamps-other")).is_ok());
+}
+
 // (core#1541) Every failed arm contributes evidence, with the final attempt first.
 #[test]
 fn a_not_ready_arm_keeps_each_attempts_diagnosis() {

@@ -578,3 +578,99 @@ fn a_pre_build_units_phase_scope_is_read_on_the_worker() {
     drop(f.core);
     let _ = std::fs::remove_dir_all(&f.dir);
 }
+
+/// #1369: a Tool with no tree reads still waits for checkout indexing, as does an agent.
+#[test]
+fn checkout_indexing_defers_agent_and_tool_dispatch_probes() {
+    let f = fixture("checkout-index");
+    let run = format!("probe-checkout-{}", uuid::Uuid::new_v4().simple());
+    launch_with(&f, &run, crate::HumanConfirm::All);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while status(&f, &run) != Some(crate::SessionStatus::AwaitingHuman) && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(status(&f, &run), Some(crate::SessionStatus::AwaitingHuman));
+    let view = f
+        .core
+        .sessions_detail()
+        .unwrap()
+        .into_iter()
+        .find(|v| v.session.id == run)
+        .unwrap();
+    let db_path = f.dir.join("estate.db");
+    let _home = crate::code_graph::StateHomeScope::for_store(&db_path.to_string_lossy());
+    let store = wicked_apps_core::open_store_ro(Some(&db_path.to_string_lossy())).unwrap();
+    let repo = crate::repo::get_repo(&store, &f.repo_ref).unwrap().unwrap();
+    let graph = std::path::Path::new(&repo.code_graph_db);
+    for tool in [false, true] {
+        let mut unit = view.units[0].clone();
+        if tool {
+            unit.tool_cmd = Some(vec!["/bin/true".into()]);
+        }
+        let units = vec![unit.clone()];
+        let marker = crate::code_graph::test_hold_checkout_index(graph);
+        let job = super::super::dispatch_probe_job(&store, &view.session, &units, &unit, &None)
+            .expect("indexing requires a probe, including for a Tool with no other reads");
+        let (entered, release) = hold(&run);
+        let (tx, answers) = channel();
+        super::start(&tx, job);
+        entered
+            .recv_timeout(Duration::from_secs(60))
+            .expect("probe started");
+        release.send(()).unwrap();
+        let premature = answers.recv_timeout(Duration::from_millis(200)).ok();
+        // The actor remains responsive while its repository's graph is being indexed.
+        f.core.ping();
+        assert!(f.seat.ran.lock().unwrap().is_empty());
+        drop(marker);
+        assert!(
+            premature.is_none(),
+            "dispatch probe answered during checkout indexing"
+        );
+        assert!(matches!(
+            answers
+                .recv_timeout(Duration::from_secs(60))
+                .expect("dispatch released"),
+            crate::command::Command::DispatchProbed { .. }
+        ));
+        super::forget(&run);
+    }
+    let marker = crate::code_graph::test_hold_checkout_index(graph);
+    let (entered, release) = hold(&run);
+    f.core
+        .confirm_gate(
+            &run,
+            crate::HumanDecision::Approve {
+                amend: None,
+                amend_scope: crate::workflow::AmendScope::default(),
+            },
+        )
+        .expect("approve while indexing");
+    entered
+        .recv_timeout(Duration::from_secs(60))
+        .expect("gate continuation probes");
+    release.send(()).unwrap();
+    assert_eq!(status(&f, &run), Some(crate::SessionStatus::Executing));
+    assert!(crate::repo::active_runs_on_repo(&store, &f.repo_ref)
+        .unwrap()
+        .contains(&run));
+    assert!(
+        f.seat.ran.lock().unwrap().is_empty(),
+        "no unit dispatched during indexing"
+    );
+    f.core.ping();
+    drop(marker);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while f.seat.ran.lock().unwrap().is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        f.seat.ran.lock().unwrap().len(),
+        1,
+        "gate dispatch released"
+    );
+    drop(store);
+    drop(f.core);
+    let _ = std::fs::remove_dir_all(&f.dir);
+}

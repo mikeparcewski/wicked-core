@@ -236,6 +236,56 @@ pub fn resolve_open_for_session(
     Ok(n)
 }
 
+/// (core#1319) The key an answered triage row carries for the attempt its approve re-dispatched.
+pub const TRIAGE_REDISPATCH_KEY: &str = "redispatch_attempt";
+
+/// (core#1319) Record on the answered `triage` row at `ord` that its answer re-dispatched the unit
+/// at `attempt`. The fresh attempt keeps the escalated failure's record apart; this marker keeps
+/// that attempt a first try for the automatic remedies, which bound themselves by attempt.
+pub fn mark_triage_redispatch(
+    store: &mut dyn GraphStore,
+    session_id: &str,
+    ord: u32,
+    attempt: u32,
+) -> anyhow::Result<()> {
+    let answered = list_interactions(store, Some(session_id), Some(InteractionStatus::Answered))?;
+    let Some(mut row) = answered
+        .into_iter()
+        .find(|r| r.ord == Some(ord) && r.gate_kind.as_deref() == Some("triage"))
+    else {
+        return Ok(());
+    };
+    let mut answer = row
+        .answer
+        .as_deref()
+        .and_then(|a| serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(a).ok())
+        .unwrap_or_default();
+    answer.insert(TRIAGE_REDISPATCH_KEY.to_string(), attempt.into());
+    row.answer = Some(serde_json::Value::Object(answer).to_string());
+    put_node(store, row.to_node())
+}
+
+/// (core#1319) Whether `attempt` of the unit at `ord` is the re-dispatch an answer at its triage
+/// gate made ([`mark_triage_redispatch`]). An automatic retry bumps past it, so this holds for one
+/// attempt per answer.
+pub fn redispatched_by_triage(
+    store: &dyn GraphRead,
+    session_id: &str,
+    ord: u32,
+    attempt: u32,
+) -> bool {
+    attempt > 0
+        && list_interactions(store, Some(session_id), Some(InteractionStatus::Answered))
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.ord == Some(ord) && r.gate_kind.as_deref() == Some("triage"))
+            .filter_map(|r| r.answer.as_deref())
+            .filter_map(|a| serde_json::from_str::<serde_json::Value>(a).ok())
+            .any(|a| {
+                a.get(TRIAGE_REDISPATCH_KEY).and_then(|n| n.as_u64()) == Some(u64::from(attempt))
+            })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

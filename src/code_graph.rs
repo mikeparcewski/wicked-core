@@ -89,7 +89,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Condvar, LazyLock, Mutex};
 
 use wicked_apps_core::{open_store, GraphRead, HardenedCommand, NodeKind};
 use wicked_estate_core::{Direction, SymbolId};
@@ -1106,6 +1107,103 @@ fn budget_for(tree: &Path, fixed: IndexBound) -> crate::index_budget::IndexBudge
 /// once, and concurrent indexers never stack up on the host.
 static BASE_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Mapping consumers hold one graph at their base for the lifetime of the run.
+type GraphLeases = HashMap<PathBuf, BTreeMap<String, Option<String>>>;
+static GRAPH_LEASES: LazyLock<Mutex<GraphLeases>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn lease_graph(db: &Path, run_id: &str, base: Option<&str>) {
+    GRAPH_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(db.to_path_buf())
+        .or_default()
+        .insert(run_id.to_string(), base.map(str::to_string));
+}
+
+pub(crate) fn release_graph_lease(run_id: &str) {
+    GRAPH_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, runs| {
+            runs.remove(run_id);
+            !runs.is_empty()
+        });
+}
+
+/// Read only while holding BASE_INDEX_LOCK, before deciding whether to rewrite the graph.
+fn other_graph_leases(db: &Path, run_id: &str, base: &str) -> Vec<(String, Option<String>)> {
+    GRAPH_LEASES
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(db)
+        .map(|runs| {
+            runs.iter()
+                .filter(|(id, held_base)| {
+                    id.as_str() != run_id && held_base.as_deref() != Some(base)
+                })
+                .map(|(id, base)| (id.clone(), base.clone()))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+static CHECKOUT_INDEXING: LazyLock<Mutex<HashSet<PathBuf>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+static CHECKOUT_INDEX_DONE: Condvar = Condvar::new();
+
+pub(crate) fn checkout_index_in_flight(db: &Path) -> bool {
+    CHECKOUT_INDEXING
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(db)
+}
+
+pub(crate) fn wait_checkout_index(db: &Path) {
+    let mut indexing = CHECKOUT_INDEXING.lock().unwrap_or_else(|e| e.into_inner());
+    while indexing.contains(db) {
+        indexing = CHECKOUT_INDEX_DONE
+            .wait(indexing)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+struct CheckoutIndexGuard {
+    db: PathBuf,
+    started: bool,
+}
+
+impl CheckoutIndexGuard {
+    fn begin(db: &Path) -> Self {
+        CHECKOUT_INDEXING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(db.to_path_buf());
+        Self {
+            db: db.to_path_buf(),
+            started: false,
+        }
+    }
+}
+
+impl Drop for CheckoutIndexGuard {
+    fn drop(&mut self) {
+        // Publish not-a-base before waking dispatches, including on indexer failure or panic.
+        if self.started {
+            mark_not_a_base(&self.db, "a checkout re-index");
+        }
+        CHECKOUT_INDEXING
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.db);
+        CHECKOUT_INDEX_DONE.notify_all();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_hold_checkout_index(db: &Path) -> impl Drop {
+    CheckoutIndexGuard::begin(db)
+}
+
 /// What [`index_at_base`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BaseIndex {
@@ -1115,6 +1213,8 @@ pub(crate) enum BaseIndex {
     Current,
     /// The graph was stale and is now indexed at the base.
     Indexed,
+    /// Nothing written: other mappings hold the graph at a different or unknown base.
+    Held(Vec<(String, Option<String>)>),
 }
 
 /// D8: bring an indexed repo's code graph to the run's base before the run is scored. A launch
@@ -1133,10 +1233,23 @@ pub(crate) fn index_at_base(
     worktree: &Path,
     base_commit: &str,
     root: Option<&Path>,
+    run_id: &str,
+    mapping: bool,
 ) -> Result<BaseIndex, String> {
-    index_at_base_with(&indexer_bin(), repo, key, worktree, base_commit, root, None)
+    index_at_base_with(
+        &indexer_bin(),
+        repo,
+        key,
+        worktree,
+        base_commit,
+        root,
+        None,
+        run_id,
+        mapping,
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn index_at_base_with(
     bin: &str,
     repo: &Path,
@@ -1145,6 +1258,8 @@ fn index_at_base_with(
     base_commit: &str,
     root: Option<&Path>,
     bound: IndexBound,
+    run_id: &str,
+    mapping: bool,
 ) -> Result<BaseIndex, String> {
     let _one_at_a_time = BASE_INDEX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(db) = resolved_code_graph_db_at(key, root) {
@@ -1157,13 +1272,23 @@ fn index_at_base_with(
         .map(|s| crate::review_scale::graph_age(&s, base_commit))
         .is_ok_and(|age| age == crate::review_scale::GraphAge::Current);
     if current {
+        if mapping {
+            lease_graph(&db, run_id, Some(base_commit));
+        }
         return Ok(BaseIndex::Current);
+    }
+    let held = other_graph_leases(&db, run_id, base_commit);
+    if !held.is_empty() {
+        return Ok(BaseIndex::Held(held));
     }
     if let Err(e) = run_indexer(bin, worktree, &db, &budget_for(worktree, bound)) {
         mark_not_a_base(&db, "a launch's base index did not finish");
         return Err(e);
     }
     record_registered_root(&db, repo, worktree);
+    if mapping {
+        lease_graph(&db, run_id, Some(base_commit));
+    }
     Ok(BaseIndex::Indexed)
 }
 
@@ -1287,14 +1412,15 @@ fn index_checkout_with(
     let Some(db) = existing_code_graph_at(key, root) else {
         return Ok(CheckoutIndex::NoGraph);
     };
+    // Set before held_by reads the store. A dispatch seeing no marker precedes this insert:
+    // its run is already persisted Executing, so held_by sees it and answers Held.
+    let mut indexing = CheckoutIndexGuard::begin(&db);
     let held = held_by()?;
     if !held.is_empty() {
         return Ok(CheckoutIndex::Held(held));
     }
-    let ran = run_indexer(bin, repo, &db, &budget_for(repo, bound));
-    // Whether it finished or not, a checkout's graph is no run's base (see `mark_not_a_base`).
-    mark_not_a_base(&db, "a checkout re-index");
-    ran?;
+    indexing.started = true;
+    run_indexer(bin, repo, &db, &budget_for(repo, bound))?;
     Ok(CheckoutIndex::Indexed)
 }
 
@@ -1351,6 +1477,18 @@ pub(crate) fn base_index_refusal(
     base_commit: &str,
 ) -> Option<String> {
     match indexed {
+        Ok(BaseIndex::Held(held)) if graph_required => Some(format!(
+            "the repository's code graph is held by {}. This mapping needs base {}; \
+             launch again when it ends, or cancel it",
+            held.iter()
+                .map(|(run, base)| format!(
+                    "run `{run}` at base {}",
+                    base.as_deref().unwrap_or("unknown"),
+                ))
+                .collect::<Vec<_>>()
+                .join(", "),
+            base_commit,
+        )),
         Err(e) if graph_required => Some(format!(
             "the repository's code graph could not be re-indexed at this run's base {} ({e}). \
              Mapping it would read code the run does not have, so the run is not started. \
@@ -1535,6 +1673,322 @@ mod tests {
         crate::review_scale::graph_age(&s, base)
     }
 
+    #[cfg(unix)]
+    fn leased_d8_case(
+        tag: &str,
+        holder_base: Option<&str>,
+        release: bool,
+        launch_base: &str,
+    ) -> (
+        Result<BaseIndex, String>,
+        bool,
+        crate::review_scale::GraphAge,
+    ) {
+        let dir = scratch(tag);
+        let key = mint_repo_graph_key(tag);
+        let root = dir.join("graphs");
+        let db = repo_graph_db_at(&root, &key);
+        graph_at(&db, "base-one");
+        let fresh = dir.join("fresh.db");
+        graph_at(&fresh, launch_base);
+        let ran = dir.join("ran");
+        let bin = dir.join("indexer");
+        crate::test_env::install_stub(
+            &bin,
+            &format!(
+                "#!/bin/sh\ntouch '{}'\ncp '{}' \"$4\"\n",
+                ran.display(),
+                fresh.display()
+            ),
+        );
+        let holder = format!("{tag}-holder");
+        lease_graph(&db, &holder, holder_base);
+        // Establish that the lease holds before testing its compatible-base or release cases.
+        assert_eq!(
+            index_at_base_with(
+                "never-run",
+                &dir,
+                &key,
+                &dir,
+                "conflicting-base",
+                Some(&root),
+                Some(crate::test_env::PATIENT),
+                "other-launch",
+                false,
+            ),
+            Ok(BaseIndex::Held(vec![(
+                holder.clone(),
+                holder_base.map(str::to_string)
+            )]))
+        );
+        if release {
+            release_graph_lease(&holder);
+        }
+        let result = index_at_base_with(
+            &bin.to_string_lossy(),
+            &dir,
+            &key,
+            &dir,
+            launch_base,
+            Some(&root),
+            Some(crate::test_env::PATIENT),
+            "other-launch",
+            false,
+        );
+        let observed = age(&db, "base-one");
+        let did_run = ran.exists();
+        release_graph_lease(&holder);
+        let _ = std::fs::remove_dir_all(dir);
+        (result, did_run, observed)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d8_cannot_move_a_mapping_lease_to_another_base() {
+        let (result, ran, age) = leased_d8_case("lease-other", Some("base-one"), false, "base-two");
+        assert_eq!(
+            result,
+            Ok(BaseIndex::Held(vec![(
+                "lease-other-holder".into(),
+                Some("base-one".into()),
+            )]))
+        );
+        assert!(!ran, "a holder's graph must not be rewritten");
+        assert_eq!(age, crate::review_scale::GraphAge::Current);
+    }
+
+    #[test]
+    fn a_mapping_refusal_names_the_graph_holders_and_their_bases() {
+        let held = Ok(BaseIndex::Held(vec![
+            ("mapping-a".into(), Some("base-one".into())),
+            ("mapping-unknown".into(), None),
+        ]));
+        let why = base_index_refusal(true, &held, "base-two").expect("mapping refused");
+        for text in [
+            "mapping-a",
+            "base-one",
+            "mapping-unknown",
+            "unknown",
+            "cancel",
+            "launch again when it ends",
+        ] {
+            assert!(why.contains(text), "{why}");
+        }
+        assert_eq!(base_index_refusal(false, &held, "base-two"), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn d8_allows_a_holder_at_the_same_base() {
+        // The graph needs a rewrite even though the holder's base agrees.
+        let (result, ran, _) = leased_d8_case("lease-same", Some("base-two"), false, "base-two");
+        assert_eq!(result, Ok(BaseIndex::Indexed));
+        assert!(ran);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn releasing_a_graph_lease_allows_d8_to_reindex() {
+        let (result, ran, _) = leased_d8_case("lease-release", Some("base-one"), true, "base-two");
+        assert_eq!(result, Ok(BaseIndex::Indexed));
+        assert!(ran);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unknown_base_lease_holds_the_graph() {
+        let (result, ran, age) = leased_d8_case("lease-unknown", None, false, "base-two");
+        assert_eq!(
+            result,
+            Ok(BaseIndex::Held(vec![("lease-unknown-holder".into(), None)]))
+        );
+        assert!(!ran);
+        assert_eq!(age, crate::review_scale::GraphAge::Current);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_mapping_takes_its_base_lease_on_both_current_and_indexed_graphs() {
+        for current in [false, true] {
+            let dir = scratch(if current {
+                "lease-current"
+            } else {
+                "lease-indexed"
+            });
+            let key = mint_repo_graph_key("mapping");
+            let root = dir.join("graphs");
+            let db = repo_graph_db_at(&root, &key);
+            graph_at(&db, if current { "base-one" } else { "old" });
+            let fresh = dir.join("fresh.db");
+            graph_at(&fresh, "base-one");
+            let bin = dir.join("indexer");
+            crate::test_env::install_stub(
+                &bin,
+                &format!("#!/bin/sh\ncp '{}' \"$4\"\n", fresh.display()),
+            );
+            let run_id = format!("mapping-{current}");
+            lease_graph(&db, &run_id, None);
+            assert_eq!(
+                index_at_base_with(
+                    &bin.to_string_lossy(),
+                    &dir,
+                    &key,
+                    &dir,
+                    "base-one",
+                    Some(&root),
+                    Some(crate::test_env::PATIENT),
+                    &run_id,
+                    true,
+                ),
+                Ok(if current {
+                    BaseIndex::Current
+                } else {
+                    BaseIndex::Indexed
+                })
+            );
+            let held = index_at_base_with(
+                "never-run",
+                &dir,
+                &key,
+                &dir,
+                "base-two",
+                Some(&root),
+                Some(crate::test_env::PATIENT),
+                "other",
+                false,
+            );
+            release_graph_lease(&run_id);
+            assert_eq!(
+                held,
+                Ok(BaseIndex::Held(vec![(run_id, Some("base-one".into()))]))
+            );
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_index_marker_covers_the_holder_read_and_indexer_and_clears_on_error() {
+        use std::sync::mpsc::channel;
+        for fails in [false, true] {
+            let dir = scratch(if fails {
+                "checkout-marker-fail"
+            } else {
+                "checkout-marker-ok"
+            });
+            let key = mint_repo_graph_key("checkout-marker");
+            let root = dir.join("graphs");
+            let db = repo_graph_db_at(&root, &key);
+            graph_at(&db, "base");
+            let started = dir.join("started");
+            let release = dir.join("release");
+            let bin = dir.join("indexer");
+            crate::test_env::install_stub(
+                &bin,
+                &format!(
+                    "#!/bin/sh\ntouch '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit {}\n",
+                    started.display(),
+                    release.display(),
+                    if fails { 3 } else { 0 },
+                ),
+            );
+            let (entered_tx, entered) = channel();
+            let (go, go_rx) = channel();
+            let (r, d) = (root.clone(), dir.clone());
+            let worker = std::thread::spawn(move || {
+                index_checkout_with(
+                    &bin.to_string_lossy(),
+                    &d,
+                    &key,
+                    Some(&r),
+                    Some(crate::test_env::PATIENT),
+                    || {
+                        entered_tx.send(()).unwrap();
+                        go_rx.recv().unwrap();
+                        Ok(vec![])
+                    },
+                )
+            });
+            entered
+                .recv_timeout(crate::test_env::PATIENT)
+                .expect("holder read entered");
+            let during_holder_read = checkout_index_in_flight(&db);
+            go.send(()).unwrap();
+            let deadline = std::time::Instant::now() + crate::test_env::PATIENT;
+            while !started.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            let during_index = checkout_index_in_flight(&db);
+            let (done_tx, done) = channel();
+            let waiting_db = db.clone();
+            let waiter = std::thread::spawn(move || {
+                wait_checkout_index(&waiting_db);
+                done_tx.send(age(&waiting_db, "base")).unwrap();
+            });
+            let premature = done
+                .recv_timeout(std::time::Duration::from_millis(100))
+                .ok();
+            std::fs::write(&release, "").unwrap();
+            let result = worker.join().unwrap();
+            waiter.join().unwrap();
+            assert!(started.exists(), "the fake indexer ran");
+            assert!(
+                during_holder_read && during_index,
+                "marker covers both reads"
+            );
+            assert!(
+                premature.is_none(),
+                "waiter returned before the index settled"
+            );
+            assert!(matches!(
+                done.recv().unwrap(),
+                crate::review_scale::GraphAge::Dirty { .. }
+            ));
+            assert_eq!(result.is_err(), fails);
+            assert!(!checkout_index_in_flight(&db));
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkout_index_marker_clears_after_holder_errors_holds_and_panics() {
+        let dir = scratch("checkout-marker-unwind");
+        let key = mint_repo_graph_key("marker-unwind");
+        let root = dir.join("graphs");
+        let db = repo_graph_db_at(&root, &key);
+        graph_at(&db, "base");
+        for mode in 0..3 {
+            let result = std::panic::catch_unwind(|| {
+                index_checkout_with(
+                    "never-run",
+                    &dir,
+                    &key,
+                    Some(&root),
+                    Some(crate::test_env::PATIENT),
+                    || {
+                        assert!(checkout_index_in_flight(&db));
+                        match mode {
+                            0 => Err("holder read failed".into()),
+                            1 => Ok(vec!["holder".into()]),
+                            _ => panic!("holder read panicked"),
+                        }
+                    },
+                )
+            });
+            match mode {
+                0 => assert!(result.unwrap().is_err()),
+                1 => assert_eq!(
+                    result.unwrap(),
+                    Ok(CheckoutIndex::Held(vec!["holder".into()]))
+                ),
+                _ => assert!(result.is_err()),
+            }
+            assert!(!checkout_index_in_flight(&db));
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     /// D8 (rig run 1a22f803): the launch started from the fetched remote tip e9d64e7 while the
     /// repo graph stayed at onboarding's 3071a76, so a behavioural scope failed closed at 100 on
     /// every run. A stale graph is re-indexed from the run's worktree (the base tree) into the
@@ -1585,6 +2039,8 @@ mod tests {
                 BASE,
                 Some(&root),
                 Some(std::time::Duration::from_secs(timeout)),
+                "launch",
+                false,
             )
         };
 
@@ -1704,7 +2160,17 @@ mod tests {
         let (r, d, w) = (root.clone(), repo.clone(), wt.clone());
         let base_key = key.clone();
         let base = std::thread::spawn(move || {
-            index_at_base_with(&d8, &d, &base_key, &w, BASE, Some(&r), patient)
+            index_at_base_with(
+                &d8,
+                &d,
+                &base_key,
+                &w,
+                BASE,
+                Some(&r),
+                patient,
+                "launch",
+                false,
+            )
         });
         while !started.exists() {
             std::thread::sleep(std::time::Duration::from_millis(20));
@@ -1792,6 +2258,8 @@ mod tests {
             BASE,
             Some(&root),
             Some(crate::test_env::PATIENT),
+            "launch",
+            false,
         );
         assert!(out.unwrap_err().contains("failed"));
         assert!(
@@ -1850,6 +2318,8 @@ mod tests {
             BASE,
             Some(&root),
             Some(crate::test_env::PATIENT),
+            "launch",
+            false,
         );
         assert_eq!(out, Ok(BaseIndex::Indexed));
         assert!(ran.exists(), "D8 trusted a dirty-tree graph as the base");
@@ -2248,6 +2718,8 @@ mod tests {
                 "new-base",
                 Some(&root),
                 patient,
+                "launch",
+                false,
             );
             for result in [checkout.map(|_| ()), indexed.map(|_| ())] {
                 let err = result.unwrap_err();
