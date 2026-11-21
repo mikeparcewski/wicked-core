@@ -596,6 +596,7 @@ pub(super) fn raise_rigor(
                     rescore_seq: seq,
                     score,
                     destructive: false,
+                    repositories: 0,
                     fact: crate::plan_gate::queued_facts(&[fact])?
                         .pop()
                         .ok_or_else(|| anyhow::anyhow!("no path.scored fact"))?,
@@ -610,6 +611,53 @@ pub(super) fn raise_rigor(
     put_node(store, session.to_node())?;
     emit_change(subscribers, run_id, row);
     Ok(out)
+}
+
+/// (operator ruling 2026-11-18) A power run took a rigor-only rise into high risk without asking.
+/// The run's rigor history carries it as a row of its own, trigger `high_risk_accepted`, so the
+/// feed and Details name it; the phases the new score requires were added by the same revision.
+pub(super) fn record_auto_high_risk(
+    store: &mut dyn GraphStore,
+    subscribers: &mut crate::event_log::EventSink,
+    run_id: &str,
+    band: &str,
+    added: &[String],
+) -> anyhow::Result<()> {
+    let Some(mut session) = crate::domain::get_session(&*store, run_id)? else {
+        return Ok(());
+    };
+    let Some(power) = session.power.as_mut() else {
+        return Ok(());
+    };
+    let rigor = power.rigor.unwrap_or(Rigor::Light);
+    let planned = power.planned_score();
+    // The row is a notice, not a measurement: it carries the latest measured score forward, so the
+    // run's outcome (`history.last().actual`) still reads what was measured.
+    let actual = power.history.last().map_or(planned, |r| r.actual);
+    let added_text = if added.is_empty() {
+        "the plan already had every phase the new score requires".to_string()
+    } else {
+        format!("the plan added: {}", added.join(", "))
+    };
+    let row = crate::power::change(
+        "high_risk_accepted",
+        rigor,
+        rigor,
+        planned,
+        actual,
+        vec![format!(
+            "The change rose into high risk (band {band}) and the run continued without asking: \
+             a rigor-only rise (no destructive step, no override, no new obligation, no new \
+             repository); {added_text}."
+        )],
+        None,
+        "engine",
+        crate::interaction::now_millis(),
+    );
+    let row = power.push_change(row);
+    put_node(store, session.to_node())?;
+    emit_change(subscribers, run_id, row);
+    Ok(())
 }
 
 /// The operator's answer to a checkpoint pause (`POST /runs/:id/power/pause`).

@@ -662,3 +662,115 @@ fn handoff_unit(u: &crate::domain::WorkUnit) -> bool {
         Some("review" | "critique" | "security_review" | "test")
     )
 }
+
+/// (operator ruling 2026-11-18) A POWER run whose re-scored change rises from standard into the
+/// highest band at the hand-off takes the rise itself: no plan gate opens, `plan.revised` adds the
+/// new score's phases, and the run's rigor history carries a `high_risk_accepted` row that names
+/// it. (A standard run's same rise still pauses: `x1_e_the_diff_rescore_still_ratchets_...`.)
+#[cfg(not(windows))]
+#[test]
+fn a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it() {
+    if crate::validator::skip_in_container_floor(
+        "a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it",
+    ) {
+        return;
+    }
+    if crate::validator::skip_when_nested(
+        "a_power_run_takes_a_rigor_only_rise_into_the_highest_band_with_no_human_gate_and_names_it",
+    ) {
+        return;
+    }
+    let w = Worker::scripted(move |i, _| {
+        let phase = i.unit.id.rsplit(':').next().unwrap_or("").to_string();
+        match phase.as_str() {
+            "pa-scope" => turn(&pa_output("SCOPE {\"touch\":[\"README.md\"]}"), None),
+            // A real edit under `src/` (no graph: scored at the fail-closed 100); the settled
+            // diff the supervisor reports is the same path.
+            "fix" => {
+                let wd = i.workdir.as_ref().expect("a worktree");
+                std::fs::create_dir_all(wd.join("src")).unwrap();
+                std::fs::write(wd.join("src/lib.rs"), "pub fn f() {}\n").unwrap();
+                turn("edited the code\nHANDOFF: done", Some(&["src/lib.rs"]))
+            }
+            "validator-agent" => turn("PASS", None),
+            _ => hold(),
+        }
+    });
+    let mut e = power_engine("pw6", w.clone(), "ph");
+    let mut waited = 0;
+    while payloads(&e, "ph", tev::PLAN_REVISED).is_empty() {
+        std::thread::sleep(Duration::from_millis(250));
+        waited += 1;
+        if waited > 160 {
+            let v = view(&e, "ph");
+            let tp = v.session.team_plan.clone();
+            panic!(
+                "no plan.revised: status {:?} unit_ix {} units {:?} rescored {:?} rev {:?} accepted_rev {:?} \
+                 max {:?} pending {:?} calls {:?} power {:?} bus {:?}",
+                v.session.status,
+                v.session.unit_ix,
+                v.units.iter().map(|u| (u.id.clone(), format!("{:?}", u.status))).collect::<Vec<_>>(),
+                tp.as_ref().map(|t| t.rescored.clone()),
+                tp.as_ref().map(|t| t.rev),
+                tp.as_ref().map(|t| t.accepted_rev),
+                tp.as_ref().map(|t| t.max_score),
+                tp.as_ref().map(|t| t.pending.is_some()),
+                e.worker.calls(),
+                v.session.power.as_ref().map(|p| p.history.iter().map(|h| h.trigger.clone()).collect::<Vec<_>>()),
+                rows(&e, "ph").iter().map(|r| r.1.clone()).collect::<Vec<_>>(),
+            );
+        }
+    }
+    let revised = payloads(&e, "ph", tev::PLAN_REVISED);
+    assert_eq!(revised[0]["reason"], "floor_raised");
+    assert_eq!(revised[0]["to_band"], "70-100");
+    assert_eq!(revised[0]["high_risk"], true);
+    assert!(
+        !revised[0]["added"].as_array().unwrap().is_empty(),
+        "the new score's phases are added: {}",
+        revised[0]["added"]
+    );
+    wait_for(
+        "the high_risk_accepted row on the run's rigor history",
+        || {
+            view(&e, "ph")
+                .session
+                .power
+                .as_ref()
+                .is_some_and(|p| p.history.iter().any(|r| r.trigger == "high_risk_accepted"))
+        },
+    );
+    let v = view(&e, "ph");
+    let row = v
+        .session
+        .power
+        .as_ref()
+        .unwrap()
+        .history
+        .iter()
+        .find(|r| r.trigger == "high_risk_accepted")
+        .unwrap();
+    assert!(
+        row.reasons[0].contains("continued without asking") && row.reasons[0].contains("70-100"),
+        "{:?}",
+        row.reasons
+    );
+    let tp = v.session.team_plan.unwrap();
+    assert!(tp.accepted_high_risk, "the high-risk rev is accepted");
+    assert!(tp.pending.is_none(), "nothing is held for a person");
+    assert_eq!(tp.accepted_rev, tp.rev);
+    assert!(
+        e.awaiting("ph")
+            .iter()
+            .all(|(_, k)| k != crate::plan_gate::GATE_KIND),
+        "no plan_approval gate opened: {:?}",
+        e.awaiting("ph")
+    );
+    assert!(
+        !payloads(&e, "ph", tev::GATE_OPENED)
+            .iter()
+            .any(|p| p["kind"] == "plan_approval"),
+        "no plan_approval gate.opened on the bus"
+    );
+    release_all(&w);
+}

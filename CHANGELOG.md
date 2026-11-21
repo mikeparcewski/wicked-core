@@ -344,6 +344,14 @@ Two release tracks share this file, newest entry first regardless of track:
 
 ### Changed
 
+- **A power run takes a rigor-only rise into high risk itself (operator ruling 2026-11-18).** When a diff re-score or a
+  rigor raise lifts a POWER run's floor into high risk and the rise carries no destructive step, no newly fired
+  obligation, no repository beyond the run's own and no override, the revision is accepted at once: the plan adds the
+  phases the new score requires (QE, security and architecture minimums) and the run continues. The escalation is a named
+  `high_risk_accepted` row on the run's rigor history (`rigorRescored`), so the feed and Details show it. A standard run
+  still stops at the plan gate (`into_high_risk`), and any rise with a destructive step, a new obligation or a second
+  repository still waits for a person. Rev 16 of DES-TEAMING-002 (§8.6).
+
 - **Seat egress is open by default (core#1476).** With `WICKED_SEAT_EGRESS_HOSTS` unset (or `*`, alone or
   inside a list) the gateway's CONNECT listener serves one `egress-allowlist` route with no `hostnames`
   key, so a seat fetches crates, npm and PyPI packages with no operator setting (agentgateway v1.6.0

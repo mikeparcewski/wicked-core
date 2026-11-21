@@ -174,6 +174,7 @@ fn a_held_rescore_with_an_unholdable_rule_fails_the_boundary() {
         ord: 1,
         attempt: 0,
         rescore_seq: 1,
+        repositories: 1,
         score: 0,
         destructive: false,
         fact: crate::plan_gate::queued_facts(&[fact])
@@ -229,6 +230,7 @@ fn a_held_rescore_that_needs_a_security_review_on_a_non_code_run_fails_the_run()
             ord: 1,
             attempt: 0,
             rescore_seq: 1,
+            repositories: 1,
             score: 0,
             destructive: false,
             fact: crate::plan_gate::queued_facts(std::slice::from_ref(&fact))
@@ -342,6 +344,7 @@ fn a_restart_mid_unit_resumes_without_a_re_plan() {
             ord: 1,
             attempt: 0,
             rescore_seq: 1,
+            repositories: 1,
             // High risk (band 70-100): the raise a re-plan would apply.
             score: 90,
             destructive: false,

@@ -82,6 +82,7 @@ fn floor(score: u8) -> Change {
         ord: 2,
         attempt: 0,
         rescore_seq: 1,
+        repositories: 1,
         score,
         destructive: false,
         fact: crate::plan_gate::queued_facts(&[fact])
@@ -192,6 +193,108 @@ fn t4_b_into_high_risk_holds_in_auto_and_every_revision_holds_in_manual() {
     let r = revise("r", &s, floor(50), &["build".into()], &manual, Some(1), 0).unwrap();
     assert!(matches!(r.outcome, Outcome::Held { .. }));
     assert_eq!(r.state.pending.as_ref().unwrap().reason, "manual_mode");
+}
+
+/// (operator ruling 2026-11-18) A POWER run takes a rigor-only rise into high risk itself: the
+/// revision is accepted at once, flagged for the named event, and carries the floor's phases. The
+/// same rise on a standard run still holds (`t4_b_into_high_risk_holds_in_auto...`).
+#[test]
+fn a_power_run_accepts_a_rigor_only_rise_into_high_risk_and_a_standard_run_still_holds() {
+    let auto = HumanConfirm::None;
+    let steps = json!([{"catalog":"build"},{"catalog":"review"}]);
+    let mut power = accepted(steps.clone(), 25, &auto);
+    power.power = true;
+    let r = revise("r", &power, floor(80), &["build".into()], &auto, Some(1), 0).unwrap();
+    assert!(
+        matches!(r.outcome, Outcome::Accepted { .. }),
+        "no human gate"
+    );
+    assert!(r.auto_accepted_high_risk);
+    assert!(r.state.pending.is_none());
+    assert_eq!((r.state.rev, r.state.accepted_rev), (2, 2));
+    assert!(r.state.accepted_high_risk && !r.state.approved_high_risk);
+    let b = revised(&r);
+    assert_eq!(b.to_band, "70-100");
+    assert!(b.high_risk);
+    assert!(!b.added.is_empty(), "the new score's phases are added");
+    // A second rise on the accepted high-risk plan is still rigor-only: no gate.
+    let r2 = revise(
+        "r",
+        &r.state,
+        floor(100),
+        &["build".into()],
+        &auto,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(matches!(r2.outcome, Outcome::Accepted { .. }));
+    // Standard run: the matrix row is unchanged.
+    let standard = accepted(steps, 25, &auto);
+    let r = revise(
+        "r",
+        &standard,
+        floor(80),
+        &["build".into()],
+        &auto,
+        Some(1),
+        0,
+    )
+    .unwrap();
+    assert!(matches!(r.outcome, Outcome::Held { .. }));
+    assert!(!r.auto_accepted_high_risk);
+    assert_eq!(r.state.pending.as_ref().unwrap().reason, "into_high_risk");
+}
+
+/// (operator ruling 2026-11-18) A power run's rise is NOT rigor-only when it carries a destructive
+/// step, a newly fired obligation or a second repository: each still waits for a person. (An
+/// override cannot reach here: auto mode refuses a plan that carries one.)
+#[test]
+fn a_power_rise_with_a_destructive_step_a_new_obligation_or_a_new_repository_still_holds() {
+    let auto = HumanConfirm::None;
+    let base = || {
+        let mut s = accepted(json!([{"catalog":"build"},{"catalog":"review"}]), 25, &auto);
+        s.power = true;
+        s
+    };
+    let held = |mut rescore: DiffRescore, why: &str| {
+        rescore.score = 80;
+        let r = revise(
+            "r",
+            &base(),
+            Change::Floor(rescore),
+            &["build".into()],
+            &auto,
+            Some(1),
+            0,
+        )
+        .unwrap();
+        assert!(matches!(r.outcome, Outcome::Held { .. }), "{why}");
+        assert!(!r.auto_accepted_high_risk, "{why}");
+        assert_eq!(
+            r.state.pending.as_ref().unwrap().reason,
+            "into_high_risk",
+            "{why}"
+        );
+    };
+    let fresh = || {
+        let Change::Floor(r) = floor(80) else {
+            unreachable!()
+        };
+        r
+    };
+    let mut destructive = fresh();
+    destructive.destructive = true;
+    held(destructive, "destructive");
+    let mut obligation = fresh();
+    obligation.obligations = vec![crate::plan::HeldObligation {
+        rule: "TST-1002".into(),
+        token: "step:walkthrough".into(),
+    }];
+    held(obligation, "new obligation");
+    let mut repos = fresh();
+    repos.repositories = 2;
+    held(repos, "new repository");
 }
 
 /// (c) A floor phase whose catalog position precedes a done step lands at the cursor, `late`.
