@@ -4075,6 +4075,8 @@ esac
                     Some(&gateway),
                     &mut |_, _| {},
                     &mut |_| Ok(()),
+                    None,
+                    crate::workflow::unit_timeout_ceiling(),
                 ) else {
                     panic!("stub refuses submission");
                 };
