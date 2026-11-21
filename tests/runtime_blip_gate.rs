@@ -411,6 +411,77 @@ fn another_seat_network_error_names_its_cause_and_no_pool_remedy() {
     assert_eq!(seats, vec!["a".to_string()], "no failover");
 }
 
+/// (core#1667) `floor_refusal_text` plus the runner's diagnosis suffix.
+const PARTIAL_REFUSAL: &str = "(seat 'a' could not run this governed unit: its seat container did \
+not arm — partial_clone: the repository is a partial clone (cloned with --filter) and \
+objects of its recent history were never fetched, so the seat's copy of its \
+history cannot be made — the engine does not fetch them: in the repository run \
+`git config --unset remote.<name>.partialclonefilter` and \
+`git fetch --refetch <name>` (<name> is the remote marked promisor, usually \
+origin), or clone it again without --filter, then retry; the unit is refused rather than run \
+outside the floor (fail closed) — every seat copies the same repository, so fix it, then retry \
+— runtime error: promisor remote upstream lacks objects of recent history)";
+
+#[test]
+fn a_partial_clone_refusal_pauses_once_without_failing_over() {
+    let sid = "partial-clone-refusal";
+    let runner = Arc::new(RuntimeDown {
+        fail_first: 1,
+        calls: AtomicU32::new(0),
+        seats: Mutex::new(Vec::new()),
+        text: PARTIAL_REFUSAL,
+    });
+    let core = Core::spawn_with_engine(
+        ":memory:".to_string(),
+        Arc::new(NumericDispatcher),
+        runner.clone(),
+    );
+    let ev = core.subscribe();
+    core.launch_run(attended(sid, vec![cli("a"), cli("b")]))
+        .expect("launch");
+    let collected = drain(&ev, sid, true);
+    let gates: Vec<_> = collected
+        .iter()
+        .filter_map(|e| match e {
+            CoreEvent::AwaitingHuman {
+                session,
+                gate_kind,
+                prompt,
+                ..
+            } if session == sid => Some((gate_kind.as_str(), prompt.as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(gates.len(), 1, "{collected:?}");
+    let (kind, prompt) = gates[0];
+    assert_eq!(kind, "failure");
+    for text in [
+        "partial clone",
+        "promisor remote upstream",
+        "git config --unset remote.<name>.partialclonefilter",
+        "git fetch --refetch <name>",
+        "clone it again without --filter",
+        "Every seat copies the same repository",
+        "reassigning does not fix it",
+        "not seat 'a''s",
+    ] {
+        assert!(prompt.contains(text), "missing {text:?}: {prompt}");
+    }
+    assert!(
+        collected.iter().any(|e| matches!(e,
+            CoreEvent::StepFailed { failure_kind, .. }
+                if matches!(failure_kind, wicked_core::StepFailureKind::EnvironmentRefused))),
+        "{collected:?}"
+    );
+    assert!(
+        !collected
+            .iter()
+            .any(|e| matches!(e, CoreEvent::SeatBenched { .. })),
+        "{collected:?}"
+    );
+    assert_eq!(*runner.seats.lock().unwrap(), vec!["a".to_string()]);
+}
+
 // ── Test-harness hygiene (core#311) — not a test ─────────────────────────────────────────────
 /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
 /// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
