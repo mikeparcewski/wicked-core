@@ -77,12 +77,7 @@ fn recomputed_coverage_validates_against_the_kept_schema() {
     .unwrap();
     let bare = node(&mut s, "helper", NodeKind::Function, "auth/util.rs"); // UNACCOUNTED hole
     let _ = bare;
-    let pgm = node(
-        &mut s,
-        "PGM",
-        NodeKind::Other("cics_program".into()),
-        "mf/a.cbl",
-    );
+    let pgm = node(&mut s, "PGM", NodeKind::Other("step".into()), "mf/a.cbl");
     s.set_node_semantics(
         &pgm.symbol,
         None,
