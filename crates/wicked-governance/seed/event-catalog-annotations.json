@@ -162,7 +162,7 @@
   },
   "wicked.team.advice.answered": {
     "trigger": "R: the PA's `ADVICE` line at the end of its turn",
-    "payload": "`raise_seq`, `answered_in`, `finding_id`, `disposition`, `reason`; key: ord, attempt, `raise_seq`, `answered_in`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
+    "payload": "`raise_seq`, `answered_in`, `finding_id`, `disposition` (`accepted`, `declined`, or `deferred`; DEFER is authorized only on the exact `floor_auto_retry` attempt), `reason`; key: ord, attempt, `raise_seq`, `answered_in`; plus the envelope `run_id`, `ord`, `attempt`, `by`, `at`, `re`"
   },
   "wicked.team.help.requested": {
     "trigger": "R: the PA asks the team (`HELP:` line)",

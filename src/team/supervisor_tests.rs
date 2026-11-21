@@ -2109,6 +2109,7 @@ fn t6_e_a_help_line_is_asked_answered_and_rendered_at_the_next_boundary() {
         claimed_id,
         reviewing: None,
         criterion: "the handler cancels stale fetches".into(),
+        advice_scoped: false,
     };
     let out = crate::workflow::StepOutput {
         run_id: RUN.into(),
@@ -2517,6 +2518,7 @@ fn help_scaffold(
         claimed_id,
         reviewing: None,
         criterion: "the handler cancels stale fetches".into(),
+        advice_scoped: false,
     };
     let out = crate::workflow::StepOutput {
         run_id: RUN.into(),
@@ -3163,5 +3165,111 @@ fn team_plan_with_pool_810() {
         high.with_pool(&["pi".into()]).monitors,
         3,
         "a pool never watches less"
+    );
+}
+
+/// core#1206: a passing step with a delivered deferred HIGH skips HOLD/council and keeps it for review.
+#[test]
+fn deferred_high_skips_hold_and_council_and_is_rendered_for_review() {
+    let mut h = Harness::new("deferred-review");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, _| Ok(format!("{hit}\nDONE")));
+    h.start("claude#1", &["claude#1", "claude#2", "codex"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1);
+    h.delivered(3, 1, &raised[0], "injected");
+    h.answer(3, 1, &raised[0], "deferred", "unrelated to failing checks");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    assert!(h.host.prompts_matching("hold round").is_empty());
+    assert!(h.rows(tev::FINDING_SETTLED).is_empty());
+    assert!(h.rows(tev::COUNCIL_CALLED).is_empty());
+    assert!(h.rows(tev::COUNCIL_RULED).is_empty());
+    assert!(h.council.calls.lock().unwrap().is_empty());
+    let ledger = h.folded(3, 1);
+    assert_eq!(ledger.final_pass, super::super::FinalPass::Completed);
+    assert!(!ledger.team_pause);
+    assert_eq!(ledger.findings[0].status.as_str(), "deferred");
+    assert_eq!(
+        ledger.findings[0].worker_reason.as_deref(),
+        Some("unrelated to failing checks")
+    );
+    let mut snap = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+    snap.ledger = Some(ledger);
+    let review = super::super::runner::render_for_gate(&snap).unwrap();
+    assert!(review.contains("[HIGH] src/lib.rs:3"), "{review}");
+    assert!(
+        review.contains("deferred to the hand-off review: unrelated to failing checks"),
+        "{review}"
+    );
+}
+
+/// core#1206 (coord r2 W12): a deferred finding is a checklist item in the review brief, by its
+/// id, so the reviewer must rule on it; its claim stays out of the checklist (it is in the fenced
+/// [team findings] block only).
+#[test]
+fn a_deferred_finding_is_a_checklist_item_in_the_review_brief() {
+    use crate::workflow::PhaseRole;
+    let mut h = Harness::new("deferred-checklist");
+    let hit = finding_line("high", "src/lib.rs", 3, "    let x = 2;", "x is stale");
+    h.host.set_reply(move |_, _| Ok(format!("{hit}\nDONE")));
+    h.start("claude#1", &["claude#1", "claude#2", "codex"], "20-39");
+    h.claim(3, 1, "claude#1");
+    h.fx.write("src/lib.rs", "fn a() {}\nfn b() {\n    let x = 2;\n}\n");
+    h.checkpoint(3, 1, 1, "edit");
+    h.pump();
+    let raised = h.rows(tev::FINDING_RAISED);
+    assert_eq!(raised.len(), 1);
+    h.delivered(3, 1, &raised[0], "injected");
+    h.answer(3, 1, &raised[0], "deferred", "unrelated to failing checks");
+    h.complete(3, 1, "claude#1", "ok");
+    h.pump();
+    let ledger = h.folded(3, 1);
+    let id = ledger.findings[0].finding.finding_id.clone();
+    let mut snap = crate::domain::UnitTeamSnapshot::stamped(tev::Transport::Bus, None, None);
+    snap.ledger = Some(ledger);
+    let mut creator = crate::domain::WorkUnit::pending("r:2", "r", 2, "unit 2");
+    creator.role = PhaseRole::Creator;
+    creator.team = Some(snap);
+    let mut eval = crate::domain::WorkUnit::pending("r:3", "r", 3, "unit 3");
+    eval.role = PhaseRole::Evaluator;
+    let units = vec![creator, eval.clone()];
+    let brief = crate::review_context::evaluator_brief(
+        "Do it.\n## Done when\n- the gate opens\n",
+        &[],
+        &units,
+        &eval,
+        None,
+        None,
+    );
+    let c = &brief[0].2;
+    assert!(
+        c.contains(&format!(
+            "  2. rule on deferred team finding {id} [HIGH] at src/lib.rs:3 — its claim is in \
+             [team findings — unit 2]\n"
+        )),
+        "{c}"
+    );
+    assert!(
+        !c.contains("x is stale") && !c.contains("unrelated to failing checks"),
+        "{c}"
+    );
+    // No deferred finding, no item.
+    let plain = crate::review_context::evaluator_brief(
+        "Do it.\n## Done when\n- the gate opens\n",
+        &[],
+        &[eval.clone()],
+        &eval,
+        None,
+        None,
+    );
+    assert!(
+        !plain[0].2.contains("deferred team finding"),
+        "{}",
+        plain[0].2
     );
 }

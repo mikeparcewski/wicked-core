@@ -414,6 +414,7 @@ wire_enum! {
     pub enum FindingStatus {
         Accepted = "accepted",
         Declined = "declined",
+        Deferred = "deferred",
         Withdrawn = "withdrawn",
         Unanswered = "unanswered",
         Superseded = "superseded",
@@ -1255,6 +1256,7 @@ pub(crate) struct Advice {
 pub(crate) enum Disposition {
     Accepted,
     Declined,
+    Deferred,
 }
 
 /// One parsed `ADVICE` line.
@@ -1282,6 +1284,11 @@ ADVICE <id>: ACCEPT — <what you changed>\n  \
 ADVICE <id>: DECLINE — <your evidence>\n\
 The gate reviews each finding together with your answer.\n";
 
+const ADVICE_DEFER_FOOTER: &str =
+    "This round is scoped to failing checks. For unrelated advice, answer:\n  \
+ADVICE <id>: DEFER — <why>\n\
+It stays unaccepted and goes to the hand-off's review, without a hold round or council now.\n";
+
 fn advice_entry(f: &Finding) -> String {
     let mut s = format!(
         "- {} [{}] {}:{} — {}{}\n  Evidence (that line): `{}`\n",
@@ -1301,20 +1308,22 @@ fn advice_entry(f: &Finding) -> String {
     s
 }
 
-/// [`advice_block`] within `cap` bytes: the boundary renders the team's answers first (they have
+/// Advice within `cap` bytes: the boundary renders the team's answers first (they have
 /// no delivery row to make them retry) and gives the findings what is left — a finding that does
 /// not fit is `rest`, not `sent`, so its `advice.delivered` is never published for text that was
 /// cut (ASK-K3c, codex review of #740).
 pub(crate) fn advice_block_within(
     advice: Vec<Advice>,
     cap: usize,
+    scoped: bool,
 ) -> (String, Vec<Advice>, Vec<Advice>) {
     // With the WHOLE cap the first entry is always sent, truncated if it must be: a finding
     // larger than the cap would otherwise never deliver. With a reduced cap (the team's answers
     // took room) nothing is forced: a finding that does not fit is `rest`, and the next boundary
     // — its answers already shown — has the whole cap for it (codex review of #740 round 2).
     let whole = cap >= ADVICE_TEXT_CAP;
-    let budget = cap.saturating_sub(ADVICE_HEADER.len() + ADVICE_FOOTER.len());
+    let defer_footer = if scoped { ADVICE_DEFER_FOOTER } else { "" };
+    let budget = cap.saturating_sub(ADVICE_HEADER.len() + ADVICE_FOOTER.len() + defer_footer.len());
     let mut body = String::new();
     let mut sent = Vec::new();
     let mut rest = Vec::new();
@@ -1336,11 +1345,15 @@ pub(crate) fn advice_block_within(
     if sent.is_empty() {
         return (String::new(), sent, rest);
     }
-    (format!("{ADVICE_HEADER}{body}{ADVICE_FOOTER}"), sent, rest)
+    (
+        format!("{ADVICE_HEADER}{body}{ADVICE_FOOTER}{defer_footer}"),
+        sent,
+        rest,
+    )
 }
 
 /// Parse the worker's `ADVICE` lines (DES §5.3):
-/// `^\s*ADVICE (f-[0-9a-f]{16}): (ACCEPT|DECLINE)\b\s*[—:-]?\s*(.*)$`. The LAST line per id wins.
+/// `^\s*ADVICE (f-[0-9a-f]{16}): (ACCEPT|DECLINE|DEFER)\b\s*[—:-]?\s*(.*)$`. The LAST line per id wins.
 pub(crate) fn parse_advice_lines(output: &str) -> BTreeMap<String, AdviceResponse> {
     let mut out = BTreeMap::new();
     for line in output.lines() {
@@ -1362,9 +1375,12 @@ fn parse_advice_line(line: &str) -> Option<AdviceResponse> {
         return None;
     }
     let rest = rest[18..].strip_prefix(": ")?;
-    let (disposition, rest) = match rest.strip_prefix("ACCEPT") {
-        Some(r) => (Disposition::Accepted, r),
-        None => (Disposition::Declined, rest.strip_prefix("DECLINE")?),
+    let (disposition, rest) = if let Some(r) = rest.strip_prefix("ACCEPT") {
+        (Disposition::Accepted, r)
+    } else if let Some(r) = rest.strip_prefix("DECLINE") {
+        (Disposition::Declined, r)
+    } else {
+        (Disposition::Deferred, rest.strip_prefix("DEFER")?)
     };
     // `\b`: the keyword must not run on into a word character (`ACCEPTED` is not `ACCEPT`).
     if rest
