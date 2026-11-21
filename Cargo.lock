@@ -3561,6 +3561,7 @@ dependencies = [
  "anyhow",
  "base64 0.22.1",
  "ctor",
+ "flate2",
  "jsonschema",
  "libc",
  "memchr",

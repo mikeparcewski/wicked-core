@@ -1800,7 +1800,7 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) generation: u64,
     pub(crate) ord: u32,
     pub(crate) cli: &'a str,
-    /// The seat image (in the builder's store, which the cluster shares: D2).
+    /// The immutable per-id seat tag, already inspected and loaded into the node store.
     pub(crate) image: &'a str,
     pub(crate) floor_image: &'a str,
     pub(crate) sync_image: &'a str,
@@ -2342,6 +2342,9 @@ pub(crate) fn arm(
     s: &ArmSpec<'_>,
     landrun: Vec<String>,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
+    // A retry is another arm: a replaced node needs the images again before any pod apply.
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    super::images::ensure_for(kube, &rt, &[s.image, s.floor_image, s.sync_image])?;
     let (ns, scope, run) = place(kube, s.run_id);
     if scope.is_some() {
         if let Ok(mut m) = SCOPES.lock() {
@@ -2512,6 +2515,11 @@ pub(crate) fn arm(
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
+                let msg = if why == FloorUnarmed::ImageUnavailable {
+                    format!("{msg}; {}", super::images::start_fix(kube))
+                } else {
+                    msg
+                };
                 let msg = format!("{msg} ({})", diagnose(pod.as_ref(), &seen));
                 reap(&id);
                 return Err((why, msg));

@@ -31,6 +31,7 @@ pub(crate) mod clock;
 pub(crate) mod cluster;
 pub(crate) mod floor;
 pub(crate) mod gw;
+pub(crate) mod images;
 // The sign-in transport (B-4); seat sign-ins need a Unix host, as the seat runner does.
 #[cfg(unix)]
 pub(crate) mod login;

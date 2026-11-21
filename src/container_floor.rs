@@ -3,9 +3,8 @@
 //! Seats run as pods on a local Kubernetes cluster (Rancher Desktop or Docker Desktop
 //! Kubernetes), installed once with `wicked-core cluster install --admin-context <ctx>
 //! --home <state home>`. The container CLI (`docker`, `nerdctl`, or `podman`) never runs a
-//! seat: it builds images into the store shared with the cluster (pods use `imagePullPolicy:
-//! Never`) and inspects a seat image before an arm ([`inspect_seat_image`]: a short-lived helper
-//! that runs only the floor's own busybox over the image as data).
+//! seat: it builds images, loads them into the node store when needed (pods use
+//! `imagePullPolicy: Never`), and inspects seat image archives as data before an arm.
 //! With `nerdctl`, every command uses the kubelet's `k8s.io` containerd namespace.
 //!
 //! The mount plan comes from [`SeatFloor`]: writable roots, read views, pinned launch files,
@@ -841,14 +840,8 @@ pub(crate) struct ImageFacts {
     pub(crate) healthcheck: bool,
 }
 
-/// The facts of `image`, read by the engine's OWN code on its OWN root filesystem: the floor image
-/// runs `find -type l` over the seat image mounted as data (`--mount type=image`), so nothing of
-/// the seat image runs and none of its links is followed. Memoized per image id.
-pub(crate) fn inspect_seat_image(
-    rt: &Runtime,
-    floor: &str,
-    image: &str,
-) -> Result<ImageFacts, String> {
+/// Read an image export as data, without starting any container. Memoized per image id.
+pub(crate) fn inspect_seat_image(rt: &Runtime, image: &str) -> Result<ImageFacts, String> {
     static SEEN: Mutex<Option<std::collections::HashMap<String, ImageFacts>>> = Mutex::new(None);
     let mut c = rt.cmd();
     c.args([
@@ -871,7 +864,8 @@ pub(crate) fn inspect_seat_image(
     if let Some(f) = SEEN.lock().ok().and_then(|m| m.as_ref()?.get(id).cloned()) {
         return Ok(f);
     }
-    let config: serde_json::Value = serde_json::from_str(config).unwrap_or_default();
+    let config: serde_json::Value = serde_json::from_str(config)
+        .map_err(|e| format!("could not read seat image config: {e}"))?;
     let volumes: Vec<String> = config
         .get("Volumes")
         .and_then(|v| v.as_object())
@@ -884,52 +878,15 @@ pub(crate) fn inspect_seat_image(
         .and_then(|t| t.first())
         .and_then(|t| t.as_str())
         .is_some_and(|first| first != "NONE");
-    let mut c = rt.cmd();
-    c.args([
-        "run",
-        "--rm",
-        "--pull",
-        "never",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        // Read every directory of the image, whatever its modes (no write, no other privilege).
-        "--cap-add",
-        "DAC_READ_SEARCH",
-        "--security-opt",
-        "no-new-privileges",
-        "--user",
-        "0:0",
-        "--mount",
-        &format!("type=image,src={id},dst=/seat"),
-        "--entrypoint",
-        "/busybox",
-        floor,
-        "find",
-        "/seat",
-        "-xdev",
-        "-type",
-        "l",
-        "-print0",
-    ]);
-    let out = output_within(c, rt.bound(Duration::from_secs(120)))
-        .ok_or_else(|| format!("inspecting seat image {image} did not finish"))?;
-    if !out.status.success() {
-        return Err(format!(
-            "inspecting seat image {image} failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    let symlinks = out
-        .stdout
-        .split(|b| *b == 0)
-        .filter_map(|p| std::str::from_utf8(p).ok())
-        .filter_map(|p| p.strip_prefix("/seat"))
-        .filter(|p| p.starts_with('/'))
-        .map(PathBuf::from)
-        .collect();
+    let dir = crate::k8s::images::archive_dir()?;
+    let archive = dir.0.join("seat.tar");
+    save_seat_archive(
+        rt,
+        id,
+        &archive,
+        rt.bound(crate::k8s::images::IMAGE_TRANSFER_TIMEOUT),
+    )?;
+    let symlinks = crate::image_archive::archive_symlinks(&archive, id)?;
     let facts = ImageFacts {
         id: id.to_string(),
         symlinks,
@@ -941,6 +898,119 @@ pub(crate) fn inspect_seat_image(
             .insert(id.to_string(), facts.clone());
     }
     Ok(facts)
+}
+
+/// Stream stdout directly to disk: an image may be many GiB. The exporting child is bounded
+/// by a deadline and killed/reaped on failure; neither pipe is accumulated in memory.
+fn save_seat_archive(
+    rt: &Runtime,
+    id: &str,
+    archive: &Path,
+    limit: Duration,
+) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let err_path = archive.with_extension("stderr");
+    let out = std::fs::File::create(archive)
+        .map_err(|e| format!("cannot write seat image archive: {e}"))?;
+    let err = std::fs::File::create(&err_path)
+        .map_err(|e| format!("cannot write image export stderr: {e}"))?;
+    let mut cmd = rt.cmd();
+    cmd.args(["save", id])
+        .stdout(Stdio::from(out))
+        .stderr(Stdio::from(err));
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot save seat image {id}: {e}"))?;
+    let start = Instant::now();
+    let mut reaped = false;
+    let result = loop {
+        match child.try_wait() {
+            Ok(Some(s)) => {
+                reaped = true;
+                break if s.success() {
+                    Ok(())
+                } else {
+                    Err(format!("image save exited {s}"))
+                };
+            }
+            Ok(None) if start.elapsed() < limit => std::thread::sleep(Duration::from_millis(25)),
+            other => {
+                break Err(match other {
+                    Err(e) => format!("image save could not be waited for: {e}"),
+                    _ => "image save timed out".into(),
+                });
+            }
+        }
+    };
+    if !reaped {
+        // Not reaped yet (a reaped child's pid could be reused): end the export's process group,
+        // any descendant still writing the archive included, then reap it.
+        #[cfg(unix)]
+        // SAFETY: the export owns this process group (process_group(0) above) and is unreaped.
+        unsafe {
+            libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    result.map_err(|why| {
+        let mut last = String::new();
+        if let Ok(mut f) = std::fs::File::open(err_path) {
+            let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = f.seek(SeekFrom::Start(len.saturating_sub(4096)));
+            let mut bytes = Vec::new();
+            let _ = f.take(4096).read_to_end(&mut bytes);
+            last = String::from_utf8_lossy(&bytes).trim().to_string();
+        }
+        format!("could not read seat image {id}: {why}: {last}; rebuild the image and make `image save` work on the selected runtime")
+    })
+}
+
+/// A tag nobody builds to, bound to the inspected id, including registry ports and digest refs.
+pub(crate) fn pin_seat_image(rt: &Runtime, image: &str, id: &str) -> Result<String, String> {
+    let id = valid_image_id(id).ok_or("cannot pin seat image: invalid inspected id")?;
+    let hex = id.strip_prefix("sha256:").unwrap_or(&id);
+    let reference = if valid_image_id(image).is_some() {
+        "wicked-seat"
+    } else {
+        image.split('@').next().unwrap_or(image)
+    };
+    let slash = reference.rfind('/');
+    let repo = match reference.rfind(':') {
+        Some(colon) if slash.is_none_or(|slash| colon > slash) => &reference[..colon],
+        _ => reference,
+    };
+    let pinned = format!("{repo}:id-{hex}");
+    let mut cmd = rt.cmd();
+    cmd.args(["tag", &id, &pinned]);
+    let result = crate::k8s::run_bounded(cmd, None, rt.bound(PROBE_TIMEOUT));
+    if !result.ok() {
+        return Err(format!(
+            "cannot pin inspected seat image: {}; make `tag {id} {pinned}` work",
+            result.err_text()
+        ));
+    }
+    Ok(pinned)
+}
+
+/// Injectable WSL facts keep platform detection testable without a Windows host.
+fn is_wsl(interop_exists: bool, proc_version: &str) -> bool {
+    interop_exists || proc_version.to_ascii_lowercase().contains("microsoft")
+}
+
+fn check_wsl_checkout(wsl: bool, path: &Path) -> Result<(), (FloorUnarmed, String)> {
+    let text = path.to_string_lossy();
+    let drive = text.strip_prefix("/mnt/").and_then(|s| s.split('/').next());
+    if wsl && drive.is_some_and(|d| d.len() == 1 && d.as_bytes()[0].is_ascii_alphabetic()) {
+        return Err((FloorUnarmed::ContainerUnsupportedHost, format!(
+            "the checkout {} is on the Windows filesystem; clone it inside the WSL2 distro (for example under ~/src) and run there", path.display())));
+    }
+    Ok(())
 }
 
 /// Refuse a seat image that could move a mount: a declared volume (the runtime mounts it from the
@@ -2311,6 +2381,16 @@ pub(crate) fn arm_noting(
     on_built: &mut dyn FnMut(&str, Duration),
     before_copy: &mut dyn FnMut(&MountView) -> Result<(), String>,
 ) -> Result<ArmedContainer, (FloorUnarmed, String)> {
+    let wsl = is_wsl(
+        Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists(),
+        &std::fs::read_to_string("/proc/version").unwrap_or_default(),
+    );
+    for path in std::iter::once(&inp.cwd).chain(inp.write_roots.iter()) {
+        check_wsl_checkout(wsl, path)?;
+        if let Some(real) = crate::worker_sandbox::canon_lenient(path) {
+            check_wsl_checkout(wsl, &real)?;
+        }
+    }
     let cli = argv
         .first()
         .map(|b| wicked_apps_core::spawn::SeatCli::from_binary(b))
@@ -2396,8 +2476,7 @@ pub(crate) fn arm_noting(
     // launch file by subPath, bound to the inode the copy-in made, so a file rewritten after the
     // arm (claude's narrowed `--settings`) never reached the seat.
     before_copy(&view).map_err(|e| (FloorUnarmed::RootUnresolvable, e))?;
-    // The image builder (D2: it builds the seat, floor and sync images into the store the
-    // cluster shares; it never runs a seat).
+    // The image builder (D2); images are loaded into the node store before any pod uses them.
     let rt = runtime().map_err(|w| (w, String::new()))?;
     let (image, built_in) =
         ensure_seat_image_noting(&rt, cli).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
@@ -2405,12 +2484,6 @@ pub(crate) fn arm_noting(
         on_built(&image, waited);
     }
     let floor_image = ensure_floor_image(&rt).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
-    let floor_id = image_id(&rt, &floor_image).ok_or_else(|| {
-        (
-            FloorUnarmed::NoSeatImage,
-            format!("floor image {floor_image} vanished"),
-        )
-    })?;
     let sync_image = crate::checks_container::image_tag();
     if !image_present(&rt, &sync_image) {
         build_image(&rt, crate::checks_container::DOCKERFILE, &sync_image, &[])
@@ -2435,8 +2508,6 @@ pub(crate) fn arm_noting(
     })?;
     let kube = crate::k8s::kube_for(&home)?;
     crate::k8s::cluster::probe_cached(&kube)?;
-    crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image)?;
-    crate::k8s::clock::mark("cluster_probe");
     // The seat image cannot move a mount (a link where one lands, a declared volume).
     let dests: Vec<PathBuf> = mounts
         .iter()
@@ -2445,10 +2516,15 @@ pub(crate) fn arm_noting(
             inp.cwd.canonicalize().unwrap_or_else(|_| inp.cwd.clone()),
         ))
         .collect();
-    inspect_seat_image(&rt, &floor_id, &image)
-        .and_then(|f| check_seat_image(&f, &dests))
-        .map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let facts = inspect_seat_image(&rt, &image).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    check_seat_image(&facts, &dests).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
+    let image =
+        pin_seat_image(&rt, &image, &facts.id).map_err(|e| (FloorUnarmed::NoSeatImage, e))?;
     crate::k8s::clock::mark("image_inspect");
+    // The pids probe loads the floor image itself; seat::arm loads the seat, floor and sync
+    // images before any of its pods (one load point per pod-creating path).
+    crate::k8s::cluster::ensure_pids_limited(&kube, &floor_image)?;
+    crate::k8s::clock::mark("cluster_probe");
     let online = gateway_dir.is_some() && !offline_seats();
     gateway_route_defined(cli, online).map_err(|e| (FloorUnarmed::GatewayUnavailable, e))?;
     let (env, files, lease, seat_args, copilot_account, gateway_ip) =
@@ -3366,8 +3442,7 @@ fn list_images(rt: &Runtime) -> Result<std::collections::HashMap<String, String>
         .collect())
 }
 
-/// Native Windows is refused (the floor mounts host paths at the same path, which a Linux
-/// container cannot do with Windows paths): no runtime is ever resolved there.
+/// Native Windows runs no pod seats: the daemon and checkouts must live inside WSL2.
 #[cfg(all(test, windows))]
 mod windows_tests {
     #[test]
@@ -3376,6 +3451,27 @@ mod windows_tests {
             super::runtime(),
             Err(crate::worker_sandbox::FloorUnarmed::ContainerUnsupportedHost)
         ));
+    }
+}
+
+#[cfg(test)]
+mod platform_tests {
+    use super::*;
+
+    #[test]
+    fn wsl_windows_checkouts_are_refused_only_on_wsl() {
+        assert!(is_wsl(true, "Linux"));
+        assert!(is_wsl(false, "Linux version Microsoft WSL2"));
+        assert!(!is_wsl(false, "Linux version 6.8"));
+        for path in ["/mnt/c/repo", "/mnt/Z/repo", "/mnt/c"] {
+            let e = check_wsl_checkout(true, Path::new(path)).unwrap_err();
+            assert_eq!(e.0, FloorUnarmed::ContainerUnsupportedHost);
+            assert!(e.1.contains(path) && e.1.contains("clone it inside the WSL2 distro"));
+            assert!(check_wsl_checkout(false, Path::new(path)).is_ok());
+        }
+        for path in ["/home/op/src/repo", "/mnt/cache/repo", "/mnt/cc/repo"] {
+            assert!(check_wsl_checkout(true, Path::new(path)).is_ok());
+        }
     }
 }
 
@@ -3389,6 +3485,392 @@ mod agy_tests;
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::image_archive::tests::image_tar;
+
+    #[cfg(unix)]
+    fn archived_seat(
+        layers: Vec<Vec<u8>>,
+        oci: bool,
+        mismatch: bool,
+    ) -> (RemoveOnDrop, Runtime, String, PathBuf) {
+        let dir = tmp(&format!("archive-seat-{}", uuid::Uuid::new_v4().simple()));
+        let id = format!(
+            "sha256:{}",
+            uuid::Uuid::new_v4().simple().to_string().repeat(2)
+        );
+        let hex = if mismatch {
+            "0".repeat(64)
+        } else {
+            id[7..].to_string()
+        };
+        let config = if oci {
+            format!("blobs/sha256/{hex}")
+        } else {
+            format!("{hex}.json")
+        };
+        let names: Vec<String> = (0..layers.len())
+            .map(|i| {
+                if oci {
+                    format!("blobs/sha256/layer{i}")
+                } else {
+                    format!("layer{i}/layer.tar")
+                }
+            })
+            .collect();
+        let manifest =
+            serde_json::to_vec(&serde_json::json!([{"Config": config, "Layers": names}])).unwrap();
+        let mut entries = vec![
+            ("manifest.json", b'0', manifest.as_slice(), ""),
+            (config.as_str(), b'0', b"{}".as_slice(), ""),
+        ];
+        for (name, layer) in names.iter().zip(&layers) {
+            entries.push((name.as_str(), b'0', layer.as_slice(), ""));
+        }
+        let archive = dir.join("image.tar");
+        std::fs::write(&archive, image_tar(&entries)).unwrap();
+        let log = dir.join("calls");
+        let cli = dir.join("docker");
+        crate::test_env::install_stub(&cli, &format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\ncase \"$1\" in\nimage) echo '{} {{\"Volumes\":{{\"/data\":{{}}}},\"Healthcheck\":{{\"Test\":[\"CMD\",\"bad\"]}}}}';;\nsave) cat '{}';;\nrun) exit 99;;\ntag) exit 0;;\n*) exit 98;;\nesac\n",
+            log.display(), id, archive.display()));
+        (RemoveOnDrop(dir), Runtime::answering(cli), id, log)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seat_archive_inspection_reads_legacy_and_gzip_oci_without_running() {
+        use std::io::Write;
+        for oci in [false, true] {
+            let mut layer = image_tar(&[("floor", b'2', b"", "elsewhere")]);
+            if oci {
+                let mut gz =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                gz.write_all(&layer).unwrap();
+                layer = gz.finish().unwrap();
+            }
+            let (_dir, rt, id, log) = archived_seat(vec![layer], oci, false);
+            let f = inspect_seat_image(&rt, "seat:build").unwrap();
+            assert_eq!(f.id, id);
+            assert!(f.symlinks.contains(Path::new("/floor")));
+            assert_eq!(f.volumes, vec!["/data"]);
+            assert!(f.healthcheck);
+            let calls = std::fs::read_to_string(log).unwrap();
+            assert!(calls.contains(&format!("save {id}")), "{calls}");
+            assert!(!calls.lines().any(|l| l.starts_with("run ")), "{calls}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seat_archive_folds_whiteouts_opaque_directories_and_link_replacements() {
+        let base = image_tar(&[
+            ("gone", b'2', b"", "elsewhere"),
+            ("opaque/old", b'2', b"", "elsewhere"),
+            ("replace", b'2', b"", "elsewhere"),
+            ("removed/old", b'2', b"", "elsewhere"),
+            ("keep/old", b'2', b"", "elsewhere"),
+        ]);
+        // The new child deliberately precedes the opaque marker: opacity removes EARLIER layers.
+        let top = image_tar(&[
+            ("opaque/new", b'2', b"", "elsewhere"),
+            (".wh.gone", b'0', b"", ""),
+            ("opaque/.wh..wh..opq", b'0', b"", ""),
+            ("replace", b'5', b"", ""),
+            (".wh.removed", b'0', b"", ""),
+            ("keep", b'5', b"", ""),
+        ]);
+        let (_dir, rt, _id, _log) = archived_seat(vec![base, top], false, false);
+        assert_eq!(
+            inspect_seat_image(&rt, "seat:build").unwrap().symlinks,
+            [PathBuf::from("/opaque/new"), PathBuf::from("/keep/old")]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seat_archive_refuses_a_different_config_digest_and_unsupported_compression() {
+        let (_dir, rt, _, _) = archived_seat(vec![image_tar(&[])], false, true);
+        assert!(inspect_seat_image(&rt, "seat:build")
+            .unwrap_err()
+            .contains("config digest"));
+        let (_dir, rt, _, _) = archived_seat(vec![vec![0x28, 0xb5, 0x2f, 0xfd]], true, false);
+        assert!(inspect_seat_image(&rt, "seat:build")
+            .unwrap_err()
+            .contains("seat image layer compression not supported"));
+    }
+
+    #[test]
+    fn a_failed_or_unreadable_seat_export_produces_no_facts() {
+        let (_dir, rt, _, _) = archived_seat(vec![image_tar(&[])], false, false);
+        let archive = rt.cli.parent().unwrap().join("image.tar");
+        std::fs::write(&archive, b"unreadable image archive").unwrap();
+        let error = inspect_seat_image(&rt, "seat:build").unwrap_err();
+        assert!(
+            error.contains("seat image archive") && error.contains("rebuild/export"),
+            "{error}"
+        );
+        std::fs::remove_file(&archive).unwrap();
+        let error = inspect_seat_image(&rt, "seat:build").unwrap_err();
+        assert!(
+            error.contains("save") && error.contains("selected runtime"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_stalled_seat_export_is_killed_at_its_deadline() {
+        let dir = RemoveOnDrop(tmp(&format!(
+            "stalled-export-{}",
+            uuid::Uuid::new_v4().simple()
+        )));
+        let cli = dir.0.join("docker");
+        crate::test_env::install_stub(&cli, "#!/bin/sh\nexec sleep 300\n");
+        let rt = Runtime {
+            cli,
+            answer_bound: None,
+        };
+        let error = save_seat_archive(
+            &rt,
+            "seat:test",
+            &dir.0.join("image.tar"),
+            Duration::from_millis(100),
+        )
+        .unwrap_err();
+        assert!(error.contains("timed out"), "{error}");
+    }
+
+    #[test]
+    fn per_id_tags_preserve_repositories_ports_and_digest_references() {
+        let (_dir, rt, id, log) = archived_seat(vec![image_tar(&[])], false, false);
+        for (reference, repo) in [
+            (
+                "registry:5000/team/seat:build".to_string(),
+                "registry:5000/team/seat",
+            ),
+            ("team/seat".into(), "team/seat"),
+            (format!("team/seat@{id}"), "team/seat"),
+            (id.clone(), "wicked-seat"),
+        ] {
+            let pinned = pin_seat_image(&rt, &reference, &id).unwrap();
+            assert_eq!(pinned, format!("{repo}:id-{}", &id[7..]));
+            assert!(std::fs::read_to_string(&log)
+                .unwrap()
+                .contains(&format!("tag {id} {pinned}")));
+        }
+    }
+
+    #[test]
+    fn arms_load_kind_once_pin_the_pod_image_and_refuse_unknown_or_failed_stores() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Env(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                for (key, value) in self.0.drain(..) {
+                    match value {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+            }
+        }
+        let keys = [
+            RUNTIME_ENV,
+            NETWORK_ENV,
+            "WICKED_SEAT_IMAGE_CLAUDE",
+            crate::k8s::KUBECTL_ENV,
+            crate::k8s::CONTEXT_ENV,
+            crate::k8s::KUBECONFIG_ENV,
+        ];
+        let _restore = Env(keys.into_iter().map(|k| (k, std::env::var_os(k))).collect());
+        for scenario in ["kind", "shared", "unknown", "failed-load"] {
+            let dir = RemoveOnDrop(tmp(&format!(
+                "image-arm-{scenario}-{}",
+                uuid::Uuid::new_v4().simple()
+            )));
+            let tree = dir.0.join("tree");
+            let state = dir.0.join("state");
+            let gateway = state.join("gateway");
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::create_dir_all(&gateway).unwrap();
+            let log = dir.0.join("calls");
+            let applies = dir.0.join("applies");
+            let seat_id = format!(
+                "sha256:{}",
+                uuid::Uuid::new_v4().simple().to_string().repeat(2)
+            );
+            let config = format!("{}.json", &seat_id[7..]);
+            let manifest =
+                serde_json::to_vec(&serde_json::json!([{"Config": config, "Layers": []}])).unwrap();
+            let archive = dir.0.join("archive.tar");
+            std::fs::write(
+                &archive,
+                image_tar(&[
+                    ("manifest.json", b'0', &manifest, ""),
+                    (&config, b'0', b"{}", ""),
+                ]),
+            )
+            .unwrap();
+            let cli = dir.0.join("docker");
+            let script = r#"#!/bin/sh
+printf 'docker %s\n' "$*" >> '@LOG@'
+last=; for a in "$@"; do last=$a; done
+case "$1" in
+version) echo 27;;
+image)
+  case "$*" in
+    *'json .Config'*) echo '@SEAT@ {}';;
+    *) case "$last" in wicked-floor:*) echo 'sha256:@FLOOR@';; wicked-checks-floor:*) echo 'sha256:@CHECKS@';; *) echo '@SEAT@';; esac;;
+  esac;;
+tag) exit 0;;
+save) if [ "$2" = -o ]; then cp '@ARCHIVE@' "$3"; else cat '@ARCHIVE@'; fi;;
+run) exit 99;;
+*) exit 98;;
+esac
+"#.replace("@LOG@", &log.display().to_string()).replace("@SEAT@", &seat_id)
+                .replace("@FLOOR@", &"b".repeat(64)).replace("@CHECKS@", &"c".repeat(64))
+                .replace("@ARCHIVE@", &archive.display().to_string());
+            crate::test_env::install_stub(&cli, &script);
+            crate::test_env::install_stub(
+                &dir.0.join("kind"),
+                &format!(
+                    "#!/bin/sh\necho \"kind $*\" >> '{}'\n{}\n",
+                    log.display(),
+                    if scenario == "failed-load" {
+                        "echo load-broke >&2; exit 3"
+                    } else {
+                        "exit 0"
+                    }
+                ),
+            );
+            let owner = crate::k8s::owner_id(&state);
+            let kubectl = dir.0.join("kubectl");
+            let nodes = serde_json::json!({"items":[{"metadata":{"name":"n","uid":dir.0.display().to_string()},
+                "spec":{"providerID": if scenario == "kind" || scenario == "failed-load" { "kind://docker/c/n" } else { "" }},
+                "status":{"nodeInfo":{"containerRuntimeVersion":if scenario == "shared" { "docker://27.0.0" } else { "containerd://1.7" }}}}]});
+            let script = r#"#!/bin/sh
+case "$*" in
+*'version -o json'*) echo '{}';;
+*'get nodes -o json'*) echo '@NODES@';;
+*'get deployment agent-sandbox-controller '*) echo '@CONTROLLER@';;
+*'get crd '*) echo '{}';;
+*'apply '*) body=$(cat); printf '%s\n' "$body" >> '@APPLIES@'; case "$body" in *'"kind":"Sandbox"'*) echo test-stop >&2; exit 1;; esac;;
+*'get pod pids-probe-'*) echo '{"metadata":{"labels":{"wicked.dev/owner":"@OWNER@"}},"status":{"phase":"Succeeded"}}';;
+*'logs pids-probe-'*) printf "net=closed\nnet=closed\nnet=closed\n4094\nsh: can't fork\n";;
+*'get pods -l '*wicked.dev/role=sync*) echo '{"items":[{"metadata":{"name":"sync","labels":{"wicked.dev/boot":"@BOOT@"}},"status":{"phase":"Running","conditions":[{"type":"Ready","status":"True"}],"containerStatuses":[{"ready":true}]}}]}';;
+*'get pods '*) echo '{"items":[]}';;
+*'exec '*) cat >/dev/null;;
+*'delete '*|*'get pod '*|*'get sandboxes.agents.x-k8s.io '*) exit 0;;
+*) echo "unhandled: $*" >&2; exit 98;;
+esac
+"#.replace("@NODES@", &nodes.to_string()).replace("@OWNER@", &owner)
+                .replace("@APPLIES@", &applies.display().to_string()).replace("@BOOT@", crate::k8s::boot_id())
+                .replace("@CONTROLLER@", &serde_json::json!({"spec":{"template":{"spec":{"containers":[{"image":crate::k8s::AGENT_SANDBOX_IMAGE}]}}},
+                    "status":{"updatedReplicas":1,"availableReplicas":1}}).to_string());
+            crate::test_env::install_stub(&kubectl, &script);
+            std::env::set_var(RUNTIME_ENV, &cli);
+            std::env::set_var(NETWORK_ENV, "none");
+            std::env::set_var("WICKED_SEAT_IMAGE_CLAUDE", "seat:test");
+            std::env::set_var(crate::k8s::KUBECTL_ENV, &kubectl);
+            std::env::set_var(crate::k8s::CONTEXT_ENV, dir.0.display().to_string());
+            std::env::set_var(crate::k8s::KUBECONFIG_ENV, dir.0.join("config"));
+            *RUNTIME_OK.lock().unwrap() =
+                Some((Some(cli.display().to_string()), Runtime::answering(cli)));
+            let inp = crate::worker_sandbox::FloorInputs {
+                cwd: tree.clone(),
+                write_roots: vec![tree],
+                read_only: false,
+                seat_dirs: vec![],
+                scratch: None,
+                unmask: vec![],
+                pinned: vec![],
+                net: vec![],
+                home: None,
+                trusted_git_dir: None,
+            };
+            for _ in 0..2 {
+                let (why, detail) = arm_noting(
+                    &inp,
+                    &["claude".into()],
+                    &format!("run-{scenario}"),
+                    1,
+                    &[],
+                    None,
+                    None,
+                    Some(&gateway),
+                    &mut |_, _| {},
+                    &mut |_| Ok(()),
+                )
+                .err()
+                .expect("stub refuses submission");
+                if scenario == "unknown" || scenario == "failed-load" {
+                    assert_eq!(why, FloorUnarmed::ImageUnavailable, "{scenario}: {detail}");
+                    assert!(
+                        detail.contains(if scenario == "unknown" {
+                            "select nerdctl"
+                        } else {
+                            "kind load image-archive"
+                        }),
+                        "{detail}"
+                    );
+                } else {
+                    assert_eq!(why, FloorUnarmed::PolicyRefused, "{scenario}: {detail}");
+                    assert!(detail.contains("test-stop"), "{scenario}: {detail}");
+                }
+            }
+            let calls = std::fs::read_to_string(&log).unwrap();
+            let pinned = format!("seat:id-{}", &seat_id[7..]);
+            match scenario {
+                "kind" | "shared" => {
+                    let docs: Vec<serde_json::Value> = std::fs::read_to_string(&applies)
+                        .unwrap()
+                        .lines()
+                        .map(|l| serde_json::from_str(l).unwrap())
+                        .collect();
+                    let sandboxes: Vec<_> = docs
+                        .iter()
+                        .flat_map(|v| v["items"].as_array().unwrap())
+                        .filter(|v| v["kind"] == "Sandbox")
+                        .collect();
+                    assert_eq!(sandboxes.len(), 2);
+                    for pod in sandboxes {
+                        assert_eq!(
+                            pod["spec"]["podTemplate"]["spec"]["containers"][0]["image"],
+                            pinned
+                        );
+                    }
+                    let saves: Vec<_> = calls
+                        .lines()
+                        .filter(|l| l.starts_with("docker save -o "))
+                        .collect();
+                    if scenario == "kind" {
+                        assert_eq!(saves.len(), 3, "{calls}");
+                        assert_eq!(
+                            saves.iter().filter(|l| l.ends_with(&pinned)).count(),
+                            1,
+                            "{calls}"
+                        );
+                        assert_eq!(
+                            calls.matches("kind load image-archive ").count(),
+                            3,
+                            "{calls}"
+                        );
+                        assert!(calls.contains("--name c"));
+                    } else {
+                        assert!(saves.is_empty() && !calls.contains("kind load"), "{calls}");
+                    }
+                }
+                _ => assert!(!applies.exists(), "a refused store must apply no pod"),
+            }
+            assert!(
+                !calls.lines().any(|l| l.starts_with("docker run ")),
+                "{calls}"
+            );
+        }
+    }
 
     #[test]
     fn launch_unit_has_a_full_uuid_nonce_1546() {
@@ -4682,7 +5164,7 @@ mod tests {
     /// LIVE (`WICKED_CONTAINER_LIVE=1`; kept by B-6 review: the Kubernetes arm still inspects the
     /// seat image through the image builder): codex ln-r1's hostile image (`/floor` -> a dir it then
     /// declares as a volume, with its own `launch`) is refused by the engine's inspection, which
-    /// runs only the floor's own busybox over the image as data; the engine's seat image passes.
+    /// reads an exported archive as data; the engine's seat image passes.
     #[cfg(unix)]
     #[test]
     fn live_a_hostile_seat_image_is_refused_before_it_runs() {
@@ -4694,10 +5176,9 @@ mod tests {
             return;
         }
         let rt = runtime().expect("a container runtime answers");
-        let floor = ensure_floor_image(&rt).expect("the floor image");
         let good = ensure_seat_image(&rt, "claude").expect("the claude seat image");
         let dests = vec![PathBuf::from("/Users/op/wt")];
-        let f = inspect_seat_image(&rt, &floor, &good).expect("inspected");
+        let f = inspect_seat_image(&rt, &good).expect("inspected");
         assert!(
             f.symlinks.contains(Path::new("/bin")),
             "the base's own links are seen"
@@ -4711,7 +5192,7 @@ mod tests {
         let df = "FROM busybox:1.37-musl\nRUN mkdir -p /opt/evil && ln -s /opt/evil /floor && printf '#!/bin/sh\\necho BYPASSED\\n' > /opt/evil/launch && chmod 0755 /opt/evil/launch\nVOLUME [\"/opt/evil\"]\n";
         let tag = "wicked-test-hostile-seat:1";
         build_image(&rt, df, tag, &[]).expect("hostile image built");
-        let f = inspect_seat_image(&rt, &floor, tag).expect("inspected");
+        let f = inspect_seat_image(&rt, tag).expect("inspected");
         assert!(f.symlinks.contains(Path::new("/floor")), "{f:?}");
         let e = check_seat_image(&f, &dests).unwrap_err();
         assert!(e.contains("volume") || e.contains("symbolic link"), "{e}");
@@ -4719,7 +5200,7 @@ mod tests {
         let df = "FROM busybox:1.37-musl\nHEALTHCHECK --interval=100ms CMD [\"/bin/sh\", \"-c\", \"printf BYPASSED > /wicked-canary/healthcheck-bypass\"]\n";
         let hc_tag = "wicked-test-healthcheck-seat:1";
         build_image(&rt, df, hc_tag, &[]).expect("healthcheck image built");
-        let f = inspect_seat_image(&rt, &floor, hc_tag).expect("inspected");
+        let f = inspect_seat_image(&rt, hc_tag).expect("inspected");
         assert!(f.healthcheck, "{f:?}");
         let e = check_seat_image(&f, &dests).unwrap_err();
         assert!(e.contains("HEALTHCHECK"), "{e}");

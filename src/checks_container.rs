@@ -16,8 +16,8 @@
 //! with a read-only root and a memory cap. OOM kills are infrastructure failures, never
 //! failures of the change. Cache keys, tree serialization, and floor reports live here.
 //!
-//! The container CLI only builds the checks image into the cluster's shared image store
-//! (`imagePullPolicy: Never`). Install the local Rancher Desktop or Docker Desktop Kubernetes
+//! The container CLI builds the checks image; the engine loads it into the node's image store
+//! before use (`imagePullPolicy: Never`). Install the local Rancher Desktop or Docker Desktop Kubernetes
 //! cluster once with `wicked-core cluster install --admin-context <ctx> --home <state home>`.
 //!
 //! [`RUNNER_ENV`] selects `auto|container|sandbox`: auto tries pods on macOS, with the host
