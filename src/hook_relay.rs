@@ -1628,12 +1628,6 @@ exit 2
 
     #[test]
     fn the_container_hook_command_is_byte_identical_1621() {
-        if crate::test_sandbox::skip(
-            crate::test_sandbox::Need::Loopback,
-            "the_container_hook_command_is_byte_identical_1621",
-        ) {
-            return;
-        }
         assert_eq!(hook_command("ab12").unwrap(), format!(
             "out=$(/floor/busybox wget -q -Y off -T {} --header 'Content-Type: application/json' \
              --post-file - -O - http://agw:8711/hook/ab12) || {{ echo 'the gate hook could not reach the engine relay; the call is denied (fail closed)' >&2; exit 2; }}; \

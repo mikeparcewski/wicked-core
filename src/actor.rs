@@ -41440,6 +41440,12 @@ mod walkthrough_record_tests {
     #[cfg(unix)]
     #[test]
     fn the_recorder_runs_jailed_loopback_only_with_exactly_the_declared_env() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Loopback,
+            "the_recorder_runs_jailed_loopback_only_with_exactly_the_declared_env",
+        ) {
+            return;
+        }
         let dir = scratch("jailed");
         let proof = dir.join("evidence").join("wr");
         let worktree = dir.join("wt");

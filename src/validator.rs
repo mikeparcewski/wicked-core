@@ -7163,6 +7163,12 @@ mod worker_sandbox_tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal() {
+        if crate::test_sandbox::skip(
+            crate::test_sandbox::Need::Pty,
+            "a_jailed_check_cannot_mint_a_pty_extension_for_an_outside_terminal",
+        ) {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("wicked-floor-ptymint-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let dir = dir.canonicalize().unwrap();
