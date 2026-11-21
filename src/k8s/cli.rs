@@ -166,14 +166,26 @@ fn status(home: &Path) -> (Value, i32) {
                 pods.extend(kube.list_owned(Some(n), "pods", &[])?);
             }
         }
-        Ok(status_doc(
+        // The node's image store, reported (never fatal: the status reads without a builder).
+        let node = crate::container_floor::runtime()
+            .map_err(|w| w.describe().to_string())
+            .and_then(|rt| cluster::single_node(&kube, &rt).map_err(|(_, e)| e));
+        let mut doc = status_doc(
             &kube.context,
             cluster::controller_ready(&kube),
             dep.as_ref(),
             &gw_pods,
             &runs,
             &pods,
-        ))
+        );
+        match node {
+            Ok(node) => {
+                doc["imageStore"] = json!(node.store.label());
+                doc["node"] = json!(node.name);
+            }
+            Err(e) => doc["imageStore"] = json!(format!("unknown: {e}")),
+        }
+        Ok(doc)
     };
     match read() {
         Ok(v) => (v, 0),

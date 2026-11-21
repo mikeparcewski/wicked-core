@@ -31,6 +31,7 @@ pub(crate) mod clock;
 pub(crate) mod cluster;
 pub(crate) mod floor;
 pub(crate) mod gw;
+pub(crate) mod images;
 // The sign-in transport (B-4); seat sign-ins need a Unix host, as the seat runner does.
 #[cfg(unix)]
 pub(crate) mod login;
@@ -285,6 +286,14 @@ pub(crate) fn forget_engine_home_for_test() {
     if let Ok(mut g) = ENGINE_HOME.lock() {
         *g = None;
     }
+}
+
+/// Swap only the explicitly noted home, preserving the absence of one in test guards.
+/// Callers hold ENV_LOCK for the lifetime of the override.
+#[cfg(test)]
+pub(crate) fn swap_engine_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
+    let mut current = ENGINE_HOME.lock().unwrap_or_else(|p| p.into_inner());
+    std::mem::replace(&mut *current, home)
 }
 
 /// The daemon's operational home as noted by its actor, else the worker home base (a floor run

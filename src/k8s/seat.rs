@@ -854,6 +854,8 @@ fn ensure_sync(
     if running(kube).map_err(|e| (FloorUnarmed::ClusterUnreachable, e))? {
         return Ok(());
     }
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    super::images::ensure_for(kube, &rt, &[image, floor])?;
     let existing = kube
         .get_json(Some(ns), "pod", "sync")
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e))?;
@@ -1818,7 +1820,7 @@ pub(crate) struct ArmSpec<'a> {
     pub(crate) generation: u64,
     pub(crate) ord: u32,
     pub(crate) cli: &'a str,
-    /// The seat image (in the builder's store, which the cluster shares: D2).
+    /// The immutable per-id seat tag, already inspected and loaded into the node store.
     pub(crate) image: &'a str,
     pub(crate) floor_image: &'a str,
     pub(crate) sync_image: &'a str,
@@ -2360,6 +2362,9 @@ pub(crate) fn arm(
     s: &ArmSpec<'_>,
     landrun: Vec<String>,
 ) -> Result<(Arc<Seat>, Vec<String>), (FloorUnarmed, String)> {
+    // A retry is another arm: a replaced node needs the images again before any pod apply.
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    super::images::ensure_for(kube, &rt, &[s.image, s.floor_image, s.sync_image])?;
     let (ns, scope, run) = place(kube, s.run_id);
     if scope.is_some() {
         let arming = arm_lock(&ns);
@@ -2570,6 +2575,11 @@ pub(crate) fn arm(
         match pod.as_ref().map(|p| pod_state(p, &sandbox, &unit_label)) {
             Some(PodState::Ready) => break,
             Some(PodState::Failed(why, msg)) => {
+                let msg = if why == FloorUnarmed::ImageUnavailable {
+                    format!("{msg}; {}", super::images::start_fix(kube))
+                } else {
+                    msg
+                };
                 let msg = format!("{msg} ({})", diagnose(pod.as_ref(), &seen));
                 reap(&id);
                 return Err((why, msg));
@@ -4134,6 +4144,99 @@ pub(crate) fn register_for_test(kube: &Kube, id: &str, tree: &Path, cli: &str) -
 #[cfg(all(test, unix))]
 pub(crate) fn forget_for_test(id: &str) {
     unregister(id);
+}
+
+#[cfg(all(test, unix))]
+mod image_loading_tests {
+    use super::*;
+
+    #[test]
+    fn missing_sync_pod_loads_kind_images_before_apply() {
+        let _env = crate::test_env::ENV_LOCK
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::container_floor::RUNTIME_ENV, value),
+                    None => std::env::remove_var(crate::container_floor::RUNTIME_ENV),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os(crate::container_floor::RUNTIME_ENV));
+        let dir = crate::container_floor::RemoveOnDrop(
+            std::env::temp_dir().join(format!("sync-images-{}", uuid::Uuid::new_v4().simple())),
+        );
+        std::fs::create_dir_all(&dir.0).unwrap();
+        let log = dir.0.join("calls");
+        let applied = dir.0.join("applied");
+        let cli = dir.0.join("docker");
+        let script = r#"#!/bin/sh
+printf 'docker %s\n' "$*" >> '@LOG@'
+case "$1" in
+version) echo 27;;
+image) case "$*" in *sync:test) echo 'sha256:@SYNC@';; *) echo 'sha256:@FLOOR@';; esac;;
+save) : > "$3";;
+*) exit 98;;
+esac
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@SYNC@", &"d".repeat(64))
+        .replace("@FLOOR@", &"e".repeat(64));
+        crate::test_env::install_stub(&cli, &script);
+        crate::test_env::install_stub(
+            &dir.0.join("kind"),
+            &format!("#!/bin/sh\necho \"kind $*\" >> '{}'\n", log.display()),
+        );
+        let kubectl = dir.0.join("kubectl");
+        let nodes = serde_json::json!({"items": [{
+            "metadata": {"name": "n", "uid": dir.0.display().to_string()},
+            "spec": {"providerID": "kind://docker/c/n"},
+            "status": {"nodeInfo": {"containerRuntimeVersion": "containerd://1.7"}}
+        }]});
+        let pods = serde_json::json!({"items": [{
+            "metadata": {"name": "sync", "labels": {
+                "wicked.dev/owner": "wtest", "wicked.dev/boot": crate::k8s::boot_id()
+            }},
+            "status": {"phase": "Running", "conditions": [{
+                "type": "Ready", "status": "True"
+            }], "containerStatuses": [{"ready": true}]}
+        }]});
+        let script = r#"#!/bin/sh
+printf 'kubectl %s\n' "$*" >> '@LOG@'
+case "$*" in
+*'get nodes -o json'*) echo '@NODES@';;
+*'get pods '*) if [ -f '@APPLIED@' ]; then echo '@PODS@'; else echo '{"items":[]}'; fi;;
+*'get pod sync '*) exit 0;;
+*'apply '*) cat >/dev/null; touch '@APPLIED@';;
+*) exit 98;;
+esac
+"#
+        .replace("@LOG@", &log.display().to_string())
+        .replace("@APPLIED@", &applied.display().to_string())
+        .replace("@NODES@", &nodes.to_string())
+        .replace("@PODS@", &pods.to_string());
+        crate::test_env::install_stub(&kubectl, &script);
+        std::env::set_var(crate::container_floor::RUNTIME_ENV, cli);
+        let kube = crate::k8s::Kube {
+            kubectl,
+            kubeconfig: None,
+            context: dir.0.display().to_string(),
+            owner: "wtest".into(),
+        };
+        ensure_sync(&kube, "sync-images", "run", "sync:test", "floor:test").unwrap();
+        let calls = std::fs::read_to_string(&log).unwrap();
+        let apply = calls.find("apply ").unwrap();
+        let loads: Vec<_> = calls.match_indices("kind load image-archive ").collect();
+        assert_eq!(loads.len(), 2, "{calls}");
+        assert!(loads.iter().all(|(at, _)| *at < apply), "{calls}");
+        for image in ["sync:test", "floor:test"] {
+            assert!(calls
+                .lines()
+                .any(|l| l.starts_with("docker save ") && l.ends_with(image)));
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

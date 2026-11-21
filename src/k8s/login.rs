@@ -367,6 +367,8 @@ impl BrokerIo for K8sIo {
         let rt = crate::container_floor::runtime()
             .map_err(|why| format!("an image builder is required: {}", why.describe()))?;
         let image = crate::container_floor::ensure_seat_image(&rt, cli)?;
+        let id = crate::container_floor::image_id(&rt, &image).ok_or("the login image vanished")?;
+        let image = crate::container_floor::pin_seat_image(&rt, &image, &id)?;
         // No vendor CLI starts on a cluster that has not proved it holds pods (review B-4 #4):
         // the same pids-limit and NetworkPolicy-enforcement probe a seat arm runs.
         let floor = crate::container_floor::ensure_floor_image(&rt)?;
@@ -384,6 +386,8 @@ impl BrokerIo for K8sIo {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
             .ok_or("the login was not prepared")?;
+        let rt = crate::container_floor::runtime().map_err(|w| w.describe().to_string())?;
+        super::images::ensure_for(&gw.kube, &rt, &[&image]).map_err(described)?;
         let doc = render::login_pod(&login_pod_spec(gw, cli, session, &image));
         if let Err(e) = gw.kube.apply(&[doc]) {
             let _ = self.stop_login(session);
@@ -398,7 +402,10 @@ impl BrokerIo for K8sIo {
                     }
                     if let Some(why) = super::floor::stuck(&p) {
                         let _ = self.stop_login(session);
-                        return Err(format!("the login pod cannot start: {why}"));
+                        return Err(format!(
+                            "the login pod cannot start: {why}; {}",
+                            super::images::start_fix(&gw.kube)
+                        ));
                     }
                 }
                 Ok(None) => {}

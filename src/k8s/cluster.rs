@@ -15,6 +15,8 @@ use super::{
 };
 use crate::worker_sandbox::FloorUnarmed;
 
+pub(crate) use super::images::ImageStore;
+
 /// The pinned agent-sandbox release manifest, vendored byte for byte.
 pub(crate) const AGENT_SANDBOX_MANIFEST: &str =
     include_str!("../../containers/k8s/agent-sandbox-v1.0.10.yaml");
@@ -984,7 +986,17 @@ static PIDS_VERDICT: std::sync::Mutex<Option<(String, std::time::Instant, u32)>>
 
 /// The one node this runner certifies: v1 runs on a single-node local cluster, and a verdict
 /// for one node never approves another (review r1 P2).
-pub(crate) fn single_node(kube: &Kube) -> Result<(String, String), (FloorUnarmed, String)> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NodeInfo {
+    pub(crate) name: String,
+    pub(crate) uid: String,
+    pub(crate) store: ImageStore,
+}
+
+pub(crate) fn single_node(
+    kube: &Kube,
+    rt: &crate::container_floor::Runtime,
+) -> Result<NodeInfo, (FloorUnarmed, String)> {
     let r = kube.call(
         None,
         &["get", "nodes", "-o", "json"],
@@ -996,32 +1008,34 @@ pub(crate) fn single_node(kube: &Kube) -> Result<(String, String), (FloorUnarmed
     }
     let v: Value = serde_json::from_slice(&r.stdout)
         .map_err(|e| (FloorUnarmed::ClusterUnreachable, e.to_string()))?;
-    // (name, uid): the uid is the node's incarnation, so a reset cluster whose node keeps its
-    // name is probed again (review r2 P2).
-    let names: Vec<(String, String)> = v
-        .get("items")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|n| {
-                    Some((
-                        n.pointer("/metadata/name")?.as_str()?.to_string(),
-                        n.pointer("/metadata/uid")?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    match names.as_slice() {
-        [one] => Ok(one.clone()),
-        _ => Err((
+    let nodes = v.get("items").and_then(Value::as_array).ok_or_else(|| {
+        (
+            FloorUnarmed::ClusterUnreachable,
+            "node listing has no items array".to_string(),
+        )
+    })?;
+    let [node] = nodes.as_slice() else {
+        return Err((
             FloorUnarmed::PolicyRefused,
             format!(
                 "the runner certifies a single-node local cluster; this one has {} nodes",
-                names.len()
+                nodes.len()
             ),
-        )),
-    }
+        ));
+    };
+    let field = |p: &str| {
+        node.pointer(p)
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| (FloorUnarmed::ClusterUnreachable, format!("node lacks {p}")))
+    };
+    Ok(NodeInfo {
+        name: field("/metadata/name")?,
+        // A reset cluster may keep its name; its node incarnation must be loaded/probed anew.
+        uid: field("/metadata/uid")?,
+        store: ImageStore::classify(node, rt.cli.file_name().is_some_and(|n| n == "nerdctl"))?,
+    })
 }
 
 /// Whether this cluster's pods are held to a pids limit and its NetworkPolicy is enforced
@@ -1038,8 +1052,10 @@ pub(crate) fn ensure_pids_limited(
             "the pids probe lock is poisoned".to_string(),
         )
     })?;
-    let (node, node_uid) = single_node(kube)?;
-    let key = format!("{}|{node}|{node_uid}", kube.head(None).join(" "));
+    let rt = crate::container_floor::runtime().map_err(|w| (w, w.describe().to_string()))?;
+    let node = single_node(kube, &rt)?;
+    super::images::ensure_loaded(kube, &rt, &node, &[floor_image])?;
+    let key = format!("{}|{}|{}", kube.head(None).join(" "), node.name, node.uid);
     if let Some((k, at, n)) = cache.as_ref() {
         if *k == key && at.elapsed() < PIDS_PROBE_EVERY {
             return Ok(*n);
@@ -1059,7 +1075,7 @@ pub(crate) fn ensure_pids_limited(
         &kube.owner,
         &name,
         floor_image,
-        &node,
+        &node.name,
     )])
     .map_err(infra)?;
     let start = std::time::Instant::now();

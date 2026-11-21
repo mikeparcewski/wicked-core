@@ -91,6 +91,20 @@
       "worker_read": "none (each builder holds a copy of a host repository's .git objects; a seat receives them only through the copy-in stream, never through the state home)"
     },
     {
+      "name": "seat-image-facts",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/container_floor.rs seat_facts_path — <state home>/seat-image-facts/<version>/<image id hex>.json, the k8s seat images' inspected facts (links, volumes, healthcheck) keyed by immutable image id (core#1102, core#1440): a cache the engine re-derives from the image when a file is missing, invalid or of another version",
+      "worker_read": "none (the engine reads these facts before an arm; a seat never needs them)"
+    },
+    {
+      "name": "image-archives",
+      "kind": "dir",
+      "owner": "engine",
+      "source": "wicked-core src/k8s/images.rs archive_dir — <state home>/image-archives/<unique dir>/image.tar, the transient image exports the engine loads into a kind or k3s node (core#1398): each removed when its load ends, stale ones swept once per process",
+      "worker_read": "none (each archive is a whole engine or seat image; a seat receives an image only through the node's store)"
+    },
+    {
       "name": "learn-schedules.json",
       "kind": "file",
       "owner": "crew",

@@ -176,6 +176,9 @@ impl Place {
     /// Create `spec`'s pod and wait until it runs. A pod that does not start is deleted, and
     /// the reason names what held it (an image, a policy, the quota).
     pub(crate) fn start(&self, spec: &FloorPod) -> Result<(), String> {
+        let rt = crate::container_floor::runtime().map_err(|w| w.describe().to_string())?;
+        super::images::ensure_for(&self.kube, &rt, &[&spec.image, &spec.floor_image])
+            .map_err(|(why, e)| format!("{}: {e}", why.as_str()))?;
         self.reap_earlier()?;
         let doc = render::floor_pod(spec)?;
         let dependencies = crate::checks_container::dependency_mounts(
@@ -200,7 +203,12 @@ impl Place {
                     }
                     if let Some(why) = stuck(&p) {
                         self.delete(&spec.name);
-                        return Err(format!("the {} pod cannot start: {why}", spec.role));
+                        let fix = if why.contains("Image") {
+                            format!("; {}", super::images::start_fix(&self.kube))
+                        } else {
+                            String::new()
+                        };
+                        return Err(format!("the {} pod cannot start: {why}{fix}", spec.role));
                     }
                     last = p
                         .pointer("/status/phase")
