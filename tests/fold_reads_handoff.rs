@@ -184,16 +184,18 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
     let db = dir.join("estate.db").to_str().unwrap().to_string();
 
     // The validator says it started, then waits in the worktree until the test lets it go, and
-    // says it ended. Relative paths: it runs with the run's worktree as its working directory.
+    // says it ended. Relative paths: it runs with the run's worktree as its working directory. No
+    // `>` or `$(`: the validator denylist refuses them (`validator::looks_dangerous`). The engine's
+    // validator timeout bounds the wait.
     let pin = {
         let mut store = wicked_apps_core::open_store(Some(&db)).unwrap();
         let pin = store_validator(
             &mut store,
             &DeterministicValidator {
                 criterion: "the work is checked".into(),
-                script: ": > started; i=0; while [ ! -f go ] && [ $i -lt 1200 ]; do sleep 0.05; \
-                         i=$((i+1)); done; : > ended; exit 0"
-                    .into(),
+                script:
+                    "touch started; while [ ! -f go ]; do sleep 0.05; done; touch ended; exit 0"
+                        .into(),
                 approved: true,
             },
         )
