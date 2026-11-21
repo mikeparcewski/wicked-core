@@ -4920,8 +4920,11 @@ impl WrappedCliStepRunner {
                 // `assemble_read_roots`. A mis-shaped `code_graph_db` — an in-tree
                 // `<repo>/.codegraph/estate.db` from a pre-core#406 record included — is NOT
                 // widened (the helper's shape check), reported here so the operator sees why.
-                let read_roots: Vec<std::ffi::OsString> = g
-                    .read_roots(self.operational_home.as_deref())
+                let mut read_roots: Vec<PathBuf> = g.read_roots(self.operational_home.as_deref());
+                // (core#1743) A container claude seat's own temp (its task outputs) is outside
+                // the tree: readable through the hook, never mounted (it is the container's own).
+                read_roots.extend(seat_temp_read_root(&floor_env));
+                let read_roots: Vec<std::ffi::OsString> = read_roots
                     .into_iter()
                     .map(PathBuf::into_os_string)
                     .collect();
@@ -5538,6 +5541,19 @@ pub(crate) fn redirect_scratch_into_boundary(cmd: &mut Command, cwd: &Path) {
         cmd.env("TMP", &unit_tmp);
         cmd.env("TEMP", &unit_tmp);
     }
+}
+
+/// (core#1743) The governed hook's read root for a container claude seat's own temp: the
+/// `CLAUDE_CODE_TMPDIR` the floor plan set when it is the container-local dir
+/// ([`crate::worker_sandbox::SEAT_LOCAL_TMP`]), which no mount backs. A fenced unit's temp (its
+/// mounted scratch) and every host-floor seat get none.
+pub(crate) fn seat_temp_read_root(floor_env: &[(&'static str, PathBuf)]) -> Option<PathBuf> {
+    floor_env
+        .iter()
+        .rev()
+        .find(|(k, _)| *k == "CLAUDE_CODE_TMPDIR")
+        .map(|(_, v)| v.clone())
+        .filter(|v| v == Path::new(crate::worker_sandbox::SEAT_LOCAL_TMP))
 }
 
 /// Rule-check and agent-gate judges share a trust domain, keyed by parent and exact seat.
@@ -7846,6 +7862,14 @@ const CANCELLED: &str = "__wicked_cancelled__";
 pub(crate) fn settle_failure_output(cli: &str, err: &str, out: &str) -> String {
     let rest = err.strip_prefix(SETTLE_FAILED).unwrap_or(err);
     let (why, stderr) = rest.split_once(SETTLE_SEP).unwrap_or((rest, ""));
+    // (core#1743) The reason is the frame's ONE line (a codec error carries line breaks), so a
+    // reader takes the whole first line as the engine's reason and bounds only the seat's output.
+    let why = why
+        .split(['\n', '\r'])
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut text = format!("{RESULT_LOST_PREFIX}{cli}`: {why})");
     if !out.trim().is_empty() {
         text.push('\n');
@@ -7874,6 +7898,14 @@ pub(crate) const RESULT_LOST_PREFIX: &str = "(the engine lost the result of `";
 pub(crate) fn failed_after_the_seat_ran(output: &str) -> bool {
     output.starts_with(RESULT_LOST_PREFIX)
         || output.starts_with(crate::seat_secret_guard::SEAT_CREDENTIAL_MARKER)
+}
+
+/// (core#1743) The engine's whole reason for a result it lost in settlement: the frame's one line
+/// ([`settle_failure_output`]), never cut; `None` for any other output.
+pub(crate) fn result_lost_reason(output: &str) -> Option<&str> {
+    output
+        .starts_with(RESULT_LOST_PREFIX)
+        .then(|| output.lines().next().unwrap_or(output))
 }
 
 /// The `err` prefix of a seat pod whose settlement failed (its rc could not be confirmed, or its
@@ -8187,6 +8219,9 @@ pub(crate) fn run_bounded(
             // unit's evidence (review r3): a lost rc read or a refused write-back must not erase
             // minutes of output, usage and tool records.
             Err(e) => {
+                // (core#1743) The whole reason in the daemon log: the step's own report bounds the
+                // seat's output, and this is where an operator greps for why a result was lost.
+                eprintln!("wicked-core: the engine lost a seat's result in settlement: {e}");
                 // The reason, then the CLI's own stderr (review r4: it may say why it failed).
                 return Ok((
                     -1,
@@ -14670,6 +14705,34 @@ mod tests {
             2,
             "defined once and used once: in the hook env, never the mount read roots"
         );
+    }
+
+    /// core#1743: only the container-local claude temp becomes a hook read root; a fenced unit's
+    /// mounted scratch temp, a seat with no claude temp and a host path never do. The lost-result
+    /// reason is the frame's whole first line, and only a lost result has one.
+    #[test]
+    fn core_1743_the_seat_temp_read_root_and_the_lost_result_reason() {
+        let local = PathBuf::from(crate::worker_sandbox::SEAT_LOCAL_TMP);
+        assert_eq!(
+            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", local.clone())]),
+            Some(local.clone())
+        );
+        assert_eq!(
+            seat_temp_read_root(&[("CLAUDE_CODE_TMPDIR", PathBuf::from("/w/scratch/tmp"))]),
+            None
+        );
+        assert_eq!(seat_temp_read_root(&[("TMPDIR", local)]), None);
+        assert_eq!(seat_temp_read_root(&[]), None);
+        let out = settle_failure_output(
+            "claude",
+            &format!("{SETTLE_FAILED}the write-back was refused:\n`a` leaves its root"),
+            "seat words\nmore",
+        );
+        assert_eq!(
+            result_lost_reason(&out),
+            Some("(the engine lost the result of `claude`: the write-back was refused: `a` leaves its root)")
+        );
+        assert_eq!(result_lost_reason("(cli `claude` exited 1) x"), None);
     }
 
     #[test]

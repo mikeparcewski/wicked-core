@@ -7851,6 +7851,68 @@ fn apply_step_result(
         // self-heal and the triage judge), so a check that fails again parks at triage again.
         let first_try = output.attempt == 0
             || crate::interaction::redispatched_by_triage(&*store, &run_id, ord, output.attempt);
+        // (core#1743, train-11 J6 run c38b8c59) The ENGINE lost the result of a seat that ran (its
+        // pod's write-back was refused, or its exit code could not be confirmed): no verdict on
+        // the work and no seat failure, so neither the triage judge nor the failover ladder rules
+        // on it, and it never ends the run (#1518). It pauses at the `failure` gate on EVERY
+        // human_confirm, as a denial does (core#464): approve re-dispatches at a fresh attempt,
+        // reject stops. "Keep the captured output" is not offered: the tree changes never landed.
+        // The engine's reason rides whole (path-redacted); only the seat's own words are bounded.
+        if let Some(lost) = crate::execute_wrapped::result_lost_reason(&output.output)
+            .filter(|_| unit.tool_cmd.is_none())
+        {
+            let reason = wicked_apps_core::emit::redact_paths(lost);
+            let cli = unit
+                .assigned_cli
+                .clone()
+                .unwrap_or_else(|| "claude".to_string());
+            let seat_words = output.output[lost.len()..].trim();
+            let why = format!(
+                "Unit {ord} ({cli}) ran on attempt {}, but its result did not come back: {reason}",
+                output.attempt + 1
+            );
+            unit.status = crate::domain::UnitStatus::Rejected;
+            unit.denial_reason = Some(if seat_words.is_empty() {
+                why.clone()
+            } else {
+                format!(
+                    "{why}\nThe seat's own output: {}",
+                    wicked_apps_core::emit::redact_paths(&failure_detail_excerpt(seat_words))
+                )
+            });
+            unit.denial = Some(crate::domain::UnitDenial::new(
+                "worker_failure",
+                why.clone(),
+            ));
+            put_node(store, unit.to_node())?;
+            persist_rejected_transcript(store, &session, unit, &output.output);
+            eprintln!("wicked-core: run {run_id} unit {ord}: {why}");
+            emit(
+                subscribers,
+                CoreEvent::StepFailed {
+                    session: run_id.clone(),
+                    ord,
+                    attempt: output.attempt,
+                    detail: format!("{why} — pausing for operator decision"),
+                    failure_kind: crate::event::StepFailureKind::WorkerError,
+                },
+            );
+            let prompt = format!(
+                "{why}. Nothing it changed was applied to the run's tree. Approve to run the unit \
+                 again (optionally amend), or reject to stop the run."
+            );
+            pause_for_human(
+                store,
+                subscribers,
+                self_tx,
+                &mut session,
+                ord,
+                Some(ord),
+                "failure",
+                prompt,
+            )?;
+            return Ok(StepApplied::Paused);
+        }
         // (core#556) A refusal or unrecognised failure keeps its HUMAN decision point on EVERY
         // attempt. The attempt counter bounds only the AUTOMATIC remedies — the trust-grant
         // self-heal and the triage judge run on attempt 0 alone — never the gate: run `db708484`
