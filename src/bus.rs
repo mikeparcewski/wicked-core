@@ -328,12 +328,22 @@ impl BusDb {
     /// that opened but could not be initialized is leaked rather than closed, because closing it
     /// would be exactly the open-and-close this handle exists to prevent. Opens run on the calling
     /// thread: callers keep them off the actor thread (`actor::run` opens only from bus threads).
+    ///
+    /// (core#887) Opens of one path take turns on that path's own lock; the process-wide registry
+    /// is locked only to look up and to record. An open of a locked bus file can sit in SQLite's
+    /// busy handler for [`BUSY_TIMEOUT_MS`], and under one registry lock every other bus file in
+    /// the process waited behind it (a second engine's launch bridge missed its arming deadline).
     pub fn shared(path: &str) -> Result<Self> {
         let key = shared_key(path);
-        let mut registry = shared_registry()
+        let opening = shared_open_lock(&key);
+        let _opening = opening
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(entry) = registry.get(&key) {
+        if let Some(entry) = shared_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+        {
             // A bus file deleted and recreated under the same path is a DIFFERENT database: reuse
             // the handle only while the path still names the file it opened (same identity). On a
             // mismatch the old connection stays open (never closed) and a fresh one is registered.
@@ -352,6 +362,9 @@ impl BusDb {
         let db = Self::with_connection(conn, path, limits);
         let opener = std::thread::current().name().unwrap_or("").to_string();
         let identity = file_identity(&key);
+        let mut registry = shared_registry()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let opens = match registry.get(&key) {
             Some(replaced) => {
                 // Never close the replaced connection either: leak one strong reference to it.
@@ -478,6 +491,20 @@ static SHARED_OPENS_TOTAL: AtomicUsize = AtomicUsize::new(0);
 fn shared_registry() -> &'static Mutex<HashMap<PathBuf, SharedEntry>> {
     static REGISTRY: OnceLock<Mutex<HashMap<PathBuf, SharedEntry>>> = OnceLock::new();
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The lock that serializes opens of ONE bus file (core#887): held across `Connection::open` and
+/// the PRAGMAs, so a path still gets exactly one connection, while other paths open freely. One
+/// entry per bus path this process ever opened, never removed (a handful per process).
+fn shared_open_lock(key: &Path) -> Arc<Mutex<()>> {
+    static OPENING: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    OPENING
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.to_path_buf())
+        .or_default()
+        .clone()
 }
 
 /// The registry key: the path with its PARENT canonicalized (the file itself may not exist yet), so
@@ -1695,6 +1722,42 @@ mod tests {
     }
 
     /// T0 connection rule: one handle per bus file per process; clones and repeat calls share it.
+    /// (core#887) An open of a locked bus file waits in SQLite's busy handler (up to
+    /// `BUSY_TIMEOUT_MS`); it must not hold every OTHER bus file in the process hostage. On Windows
+    /// CI a second engine's launch bridge missed its 2 s arming deadline behind an earlier test's
+    /// open of a locked bus, because the registry lock was held across the open.
+    #[test]
+    fn a_stuck_open_of_one_bus_file_does_not_block_another_887() {
+        let locked = tmp_bus("887-locked");
+        let free = tmp_bus("887-free");
+        // Rollback journal + EXCLUSIVE: even the opener's first read waits on the busy handler.
+        let holder = Connection::open(&locked).unwrap();
+        holder
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE; CREATE TABLE hold(x); BEGIN EXCLUSIVE; \
+                 INSERT INTO hold VALUES (1);",
+            )
+            .unwrap();
+        let stuck = {
+            let locked = locked.clone();
+            std::thread::spawn(move || BusDb::shared(&locked).map(|_| ()))
+        };
+        // A head start into the busy handler. Too short only lets the old code pass too; the
+        // fixed code passes either way.
+        std::thread::sleep(Duration::from_millis(300));
+        let opened = BusDb::shared(&free);
+        let still_stuck = !stuck.is_finished();
+        holder.execute_batch("COMMIT;").unwrap();
+        drop(holder);
+        let _ = stuck.join();
+        assert!(opened.is_ok(), "the free bus opened: {:?}", opened.err());
+        assert!(
+            still_stuck,
+            "the open of {free} waited until the stuck open of {locked} gave up"
+        );
+        assert_eq!(shared_bus_stats(&free).map(|s| s.0), Some(1));
+    }
+
     #[test]
     fn shared_opens_once_per_file_and_clones_share_the_connection() {
         let path = tmp_bus("shared-once");
