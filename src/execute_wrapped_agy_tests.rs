@@ -431,7 +431,10 @@ fn the_agy_adapter_and_the_runner_hold_bounded_text() {
     );
     assert!(held.len() > AGY_HELD_TEXT - 4, "it keeps what fits");
     assert!(held.ends_with(AGY_TRUNCATED), "a cut answer says so");
-    // An oversized `result.response`, through the adapter and the runner's own cap: cut, said so.
+    // An oversized `result.response`, held by the adapter and then pushed under the runner's
+    // retained cap: cut, said so. (core#1290) In production a line this long never reaches the
+    // adapter: the runner's line cap drops it first, with a note. This checks the adapter's own
+    // bound, which still holds an answer streamed in many shorter lines.
     let mut b = AgyStreamJson::default();
     let result = serde_json::json!({"event":"result","result":{"conversation_id":CONVERSATION,
         "status":"SUCCESS","response":"x".repeat(9 * 1024 * 1024),"num_turns":1}})

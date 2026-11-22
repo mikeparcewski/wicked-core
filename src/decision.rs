@@ -77,7 +77,7 @@ pub(crate) struct BallotReaper(Arc<std::sync::Mutex<Vec<std::thread::JoinHandle<
 pub(crate) const REAP_BOUND: std::time::Duration = std::time::Duration::from_secs(150);
 
 impl BallotReaper {
-    fn hold(&self, ballot: std::thread::JoinHandle<()>) {
+    pub(crate) fn hold(&self, ballot: std::thread::JoinHandle<()>) {
         self.0
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1953,6 +1953,8 @@ mod tests {
         runs: AtomicUsize,
         cancels: AtomicUsize,
         parents: std::sync::Mutex<Vec<Option<String>>>,
+        /// The stdout cap each run saw on its own thread (core#1290).
+        caps: std::sync::Mutex<Vec<Option<usize>>>,
     }
 
     impl crate::workflow::StepRunner for SlowSeat {
@@ -1962,6 +1964,10 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(i.unit.parent_run_id.clone());
+            self.caps
+                .lock()
+                .unwrap()
+                .push(crate::execute_wrapped::current_stdout_cap());
             std::thread::sleep(self.delay);
             crate::workflow::StepOutput {
                 run_id: i.run_id.clone(),
@@ -1986,6 +1992,7 @@ mod tests {
             runs: AtomicUsize::new(0),
             cancels: AtomicUsize::new(0),
             parents: Default::default(),
+            caps: Default::default(),
         })
     }
 
@@ -2072,6 +2079,26 @@ mod tests {
         );
         assert_eq!(reaper.reap(Duration::from_millis(200)), 1, "bounded");
         assert_eq!(reaper.reap(Duration::from_secs(10)), 0);
+    }
+
+    /// (core#1290, coord review of #1774) A carried ballot runs its seat under the stdout cap the
+    /// council handed it, on the ballot's own thread, so the runner stops keeping text at that cap.
+    #[test]
+    fn a_carried_ballot_runs_its_seat_under_its_stdout_cap() {
+        use wicked_council::types::BallotCarrier;
+        let runner = slow(0);
+        SeatBallots::new(runner.clone(), None)
+            .run_ballot(
+                &seat("pi"),
+                "t-cap",
+                "ballot",
+                std::time::Duration::from_secs(5),
+                None,
+                4096,
+            )
+            .expect("the seat answered");
+        assert_eq!(*runner.caps.lock().unwrap(), vec![Some(4096)]);
+        assert_eq!(crate::execute_wrapped::current_stdout_cap(), None);
     }
 
     /// (core#1290) A ballot that answers in time leaves nothing to reap.

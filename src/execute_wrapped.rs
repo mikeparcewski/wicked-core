@@ -8088,6 +8088,12 @@ thread_local! {
     static STDOUT_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
+/// The stdout cap [`with_stdout_cap`] set on this thread, if any (tests read what a runner saw).
+#[cfg(test)]
+pub(crate) fn current_stdout_cap() -> Option<usize> {
+    STDOUT_CAP.with(|c| c.get())
+}
+
 /// (core#1290) Run `f` with every [`run_bounded`] on THIS thread keeping at most `cap` bytes of
 /// stdout text (never more than the runner's own cap): a carried council ballot runs its seat
 /// with its own output cap, so the runner's retained text stops growing at it rather than being
