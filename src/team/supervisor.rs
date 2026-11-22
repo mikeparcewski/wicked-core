@@ -132,8 +132,16 @@ pub trait Council: Send + Sync {
 
 /// The production council: the engine's single council entry point (`Core::convene_decision`,
 /// ballots off-actor), reached over the actor's command channel with a bounded wait.
+///
+/// (core#1289) Parties are excluded by key AND by identity ([`team_council_seats`]), and the
+/// council is admitted through the host's one council slot (`cli_runner::HostCouncilLock`, the
+/// same file the rule councils lock): the slot is taken HERE, on the supervisor's thread (never
+/// the actor's), within the convene budget, and moved into the command. The council thread
+/// drops it after its last ballot.
 pub struct ActorCouncil {
     pub tx: Sender<crate::command::Command>,
+    /// The host council slot's lock file (`HostCouncilLock::host_path` in production).
+    pub lock_path: PathBuf,
 }
 
 impl Council for ActorCouncil {
@@ -143,25 +151,52 @@ impl Council for ActorCouncil {
         excluded: &[String],
         budget: Duration,
     ) -> CouncilOutcome {
-        let clis: Vec<wicked_council::AgenticCli> = crate::registry_roster()
-            .into_iter()
-            .filter(|c| !super::runner::is_excluded(&c.key, excluded))
-            .collect();
+        self.convene_from(crate::registry_roster(), req, excluded, budget)
+    }
+}
+
+impl ActorCouncil {
+    /// [`Council::convene`] over `roster` (the registry's roster in production).
+    pub(crate) fn convene_from(
+        &self,
+        roster: Vec<wicked_council::AgenticCli>,
+        req: DecisionRequest,
+        excluded: &[String],
+        budget: Duration,
+    ) -> CouncilOutcome {
+        let clis = team_council_seats(roster, excluded);
         if clis.is_empty() {
             return CouncilOutcome::NoSeats(format!(
-                "no council seat is left after excluding the parties [{}]",
+                "no council seat is left after excluding the parties [{}] by key and by identity",
                 excluded.join(", ")
             ));
         }
+        let deadline = Instant::now() + budget;
+        let lock =
+            match crate::cli_runner::HostCouncilLock::acquire_until(&self.lock_path, deadline) {
+                Ok(lock) => lock,
+                // Another council held the host slot for the whole budget.
+                Err(crate::cli_runner::SlotRefused::Busy) => return CouncilOutcome::TimedOut,
+                Err(crate::cli_runner::SlotRefused::Unavailable(why)) => {
+                    return CouncilOutcome::Failed(format!(
+                        "the host council slot is unavailable: {why}"
+                    ))
+                }
+            };
         let (reply, rx) = channel();
         if self
             .tx
-            .send(crate::command::Command::ConveneDecision { req, clis, reply })
+            .send(crate::command::Command::ConveneDecision {
+                req,
+                clis,
+                lock,
+                reply,
+            })
             .is_err()
         {
             return CouncilOutcome::Failed("the engine stopped".into());
         }
-        match rx.recv_timeout(budget) {
+        match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             Ok(Ok(v)) => CouncilOutcome::Ruled(v),
             Ok(Err(e)) => CouncilOutcome::Failed(format!("{e:#}")),
             Err(RecvTimeoutError::Timeout) => CouncilOutcome::TimedOut,
@@ -170,6 +205,32 @@ impl Council for ActorCouncil {
             }
         }
     }
+}
+
+/// (core#1289) The seats a team council may draw from `roster`, each party in `excluded`
+/// excluded by key AND by identity, as a rule council excludes them
+/// (`cli_runner::rule_council_seats`): a seat sits only when neither its key nor its cli key is a
+/// party, none of the identities it may execute is one a party may execute (an alias: a second
+/// key that runs a party's binary), and its launch can be verified (its invocation runs its own
+/// declared binary or carrier, one the engine ships; a launcher script cannot be shown distinct).
+pub(crate) fn team_council_seats(
+    roster: Vec<wicked_council::AgenticCli>,
+    excluded: &[String],
+) -> Vec<wicked_council::AgenticCli> {
+    let party_ids = crate::cli_runner::excluded_identities(excluded, &roster);
+    roster
+        .into_iter()
+        .filter(|c| {
+            !super::runner::is_excluded(&c.key, excluded)
+                && crate::cli_runner::launches_its_own_binary(
+                    c,
+                    &crate::cli_runner::invocation_identity(&c.headless_invocation),
+                )
+                && crate::cli_runner::record_identities(c)
+                    .iter()
+                    .all(|i| !party_ids.contains(i))
+        })
+        .collect()
 }
 
 /// The live teamed runs (P1's replay set, `Core::live_team_runs`).

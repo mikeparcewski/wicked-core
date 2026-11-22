@@ -991,7 +991,7 @@ fn rule_judge_seats(
 
 /// (DES-RULE-CHECK-001 rev 2, A.3) Every identity the `exclude_seats` keys may execute: each one's
 /// registry record (by key, then by its cli key), and the key itself.
-fn excluded_identities(
+pub(crate) fn excluded_identities(
     exclude_seats: &[String],
     registry: &[crate::AgenticCli],
 ) -> std::collections::BTreeSet<String> {
@@ -1015,7 +1015,7 @@ fn excluded_identities(
 /// the CLIs the engine ships ([`shipped_identities`]). A launcher script, a shell or `env`, or a
 /// record that merely declares its own wrapper as its binary is not seen through (codex r1), so it
 /// cannot be shown distinct from anyone.
-fn launches_its_own_binary(c: &crate::AgenticCli, launched: &str) -> bool {
+pub(crate) fn launches_its_own_binary(c: &crate::AgenticCli, launched: &str) -> bool {
     if launched.is_empty() || !shipped_identities().contains(launched) {
         return false;
     }
@@ -1149,9 +1149,20 @@ pub(crate) enum SlotRefused {
 }
 
 impl HostCouncilLock {
-    /// The host lock's path.
+    /// (core#1289) How long a council with no budget of its own (`Core::convene_decision`) waits
+    /// for the host slot before it is refused.
+    pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(15 * 60);
+
+    /// The host lock's path: every council on the host (rule and team councils, and
+    /// `Core::convene_decision`) is admitted through it (core#1289). Under `cargo test` it is this
+    /// test process's own file, so a test never waits on a live daemon's council.
     pub(crate) fn host_path() -> std::path::PathBuf {
-        if cfg!(windows) {
+        if cfg!(test) {
+            std::env::temp_dir().join(format!(
+                "wicked-council-slot-test-{}.lock",
+                std::process::id()
+            ))
+        } else if cfg!(windows) {
             std::env::var_os("ProgramData")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from(r"C:\ProgramData"))
