@@ -2104,13 +2104,13 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
         {
             continue;
         }
-        let owner = std::fs::read_to_string(admin.join(DAEMON_MARKER)).unwrap_or_default();
+        let owner = read_small_regular(&admin.join(DAEMON_MARKER)).unwrap_or_default();
         if owner.trim() != daemon {
             continue;
         }
-        let back = std::fs::read_to_string(admin.join("gitdir")).unwrap_or_default();
+        let back = read_small_regular(&admin.join("gitdir")).unwrap_or_default();
         let back = Path::new(back.trim()).to_path_buf();
-        let pointer = std::fs::read_to_string(&dot_git)
+        let pointer = read_small_regular(&dot_git)
             .ok()
             .and_then(|t| {
                 t.lines()
@@ -2145,6 +2145,32 @@ pub fn repair_moved_worktrees(repo_id: &str, repo_root: &str, daemon: Option<&st
         );
     }
     repaired
+}
+
+/// A small link or marker file a seat may have replaced, read at boot: opened without following a
+/// final link (Windows: as a reparse point) and without blocking (a FIFO there never parks the
+/// boot), accepted only as a regular file on the opened handle, read to at most 8 KiB.
+fn read_small_regular(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000);
+    }
+    let file = opts.open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    let mut text = String::new();
+    file.take(8192).read_to_string(&mut text)?;
+    Ok(text)
 }
 
 /// Replace `path` with a regular file holding `text`: written whole to a new file beside it, then
@@ -4868,6 +4894,38 @@ mod tests {
         );
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "do not touch\n");
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&old);
+    }
+
+    /// core#1662 (review): a seat that leaves a FIFO in place of its admin dir's daemon marker or
+    /// back-pointer cannot park the boot: the repair reads return and the tree is skipped.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_place_of_a_marker_or_link_never_blocks_the_boot_repair() {
+        let old = git_repo("move-fifo");
+        let p = old.to_str().unwrap().to_string();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        create_worktree(&p, "run-a").unwrap();
+        create_worktree(&p, "run-b").unwrap();
+        let admin = |n: &str| old.join(".git").join("worktrees").join(n);
+        for f in [
+            admin("run-a").join(DAEMON_MARKER),
+            admin("run-b").join("gitdir"),
+        ] {
+            std::fs::remove_file(&f).unwrap();
+            let c = std::ffi::CString::new(f.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a valid NUL-terminated path; mkfifo reads it and nothing else.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0, "mkfifo");
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(repair_moved_worktrees("r", &p, Some("daemon-me")))
+                .unwrap();
+        });
+        let repaired = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("the repair returned instead of blocking on a FIFO");
+        assert_eq!(repaired, 0);
         let _ = std::fs::remove_dir_all(&old);
     }
 
