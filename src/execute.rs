@@ -428,14 +428,16 @@ fn work_output_node(
     }
     scrub_notes_fields(m, &["output", "denial_reason", "denial"]);
     crate::tool_activity::redact_fields(m, &["output", "denial_reason", "denial"]);
+    scrub_notes_fields(m, &["output", "denial_reason", "denial"]);
     node
 }
 
 /// (core#1380) No host temp path in a persisted unit record: a read-only unit's notes root is an
 /// absolute path under the host temp dir, and a seat that links a note it wrote there would carry
 /// that path into the run record. Every string under the named fields goes through
-/// [`crate::worktree_guard::scrub_notes_paths`]; run before the secret redaction, so a redaction
-/// can never split a path the scrub must still match.
+/// [`crate::worktree_guard::scrub_notes_paths`]. Run on both sides of the secret redaction: before
+/// it, so a cut can never split a path the scrub must match; after it, because the redaction joins
+/// a shell line continuation (`/tm\<newline>p/...`) into a path the scrub had not seen.
 fn scrub_notes_fields(map: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
     fn scrub(value: &mut serde_json::Value) {
         match value {
@@ -531,6 +533,7 @@ pub(crate) fn record_attempt_output(
     }
     scrub_notes_fields(m, &["output"]);
     crate::tool_activity::redact_fields(m, &["output"]);
+    scrub_notes_fields(m, &["output"]);
     put_node(store, node)
 }
 
@@ -563,50 +566,60 @@ mod tests {
     }
 
     /// (core#1380) A read-only unit's output links a note it wrote under its notes root, an
-    /// absolute path under the host temp dir. Neither the attempt record nor the resolution record
-    /// (output, denial reason, denial) keeps the host temp dir; the reference keeps its tail.
+    /// absolute path under the host temp dir, as the engine names it and as it resolves. Neither
+    /// the attempt record nor the resolution record (output, denial reason, denial) keeps the host
+    /// temp dir, the reference keeps its tail, and a secret beside it is still cut. A path split by
+    /// a shell line continuation, which the redaction joins, is scrubbed too.
     #[test]
     fn persisted_output_names_no_host_temp_dir_for_a_notes_link_1380() {
         let mut store = open_store(Some(":memory:")).unwrap();
         let unit = WorkUnit::pending("s:u9", "s", 9, "verify it");
         let tmp = std::env::temp_dir();
-        let root = crate::worktree_guard::notes_root("run-1380", 9);
-        let mut prefixes = vec![tmp
-            .to_string_lossy()
-            .trim_end_matches(['/', '\\'])
-            .to_string()];
-        let mut links = vec![root.join("command-record.md")];
+        let run_dir = crate::gate_hook::run_dir_name("run-1380");
+        let mut temps = vec![tmp.clone()];
         if let Ok(resolved) = std::fs::canonicalize(&tmp) {
-            let plain = resolved
-                .to_string_lossy()
-                .trim_start_matches(r"\\?\")
-                .to_string();
-            links.push(
-                std::path::PathBuf::from(&plain)
-                    .join("wicked-core-notes")
-                    .join(crate::gate_hook::run_dir_name("run-1380"))
-                    .join("unit-9")
-                    .join("command-record.md"),
-            );
-            prefixes.push(plain);
+            temps.push(resolved);
         }
-        let tail = std::path::Path::new("wicked-core-notes")
-            .join(crate::gate_hook::run_dir_name("run-1380"))
-            .join("unit-9")
-            .join("command-record.md")
-            .to_string_lossy()
-            .into_owned();
-        for (attempt, link) in links.iter().enumerate() {
-            let output = format!("Checks pass.\n\n[Command record]({})\n", link.display());
-            let expected = format!("Checks pass.\n\n[Command record]({tail})\n");
-            record_attempt_output(&mut store, &unit, attempt as u32, "ok", &output).unwrap();
+        let token = format!(concat!("gh", "p_", "{}"), "Fake7".repeat(4));
+        let tail = format!("wicked-core-notes/{run_dir}/unit-9/command-record.md");
+        let mut cases = Vec::new();
+        for t in &temps {
+            let link = t
+                .join("wicked-core-notes")
+                .join(&run_dir)
+                .join("unit-9")
+                .join("command-record.md")
+                .display()
+                .to_string();
+            cases.push((
+                format!("Checks pass with {token}.\n\n[Command record]({link})\n"),
+                format!("Checks pass with ***.\n\n[Command record]({tail})\n"),
+            ));
+            // The shell continuation the redaction joins, inside the temp dir's spelling.
+            let cut = link.char_indices().nth(3).map(|(i, _)| i).unwrap();
+            cases.push((
+                format!("cat {}\\\n{}", &link[..cut], &link[cut..]),
+                format!("cat {tail}"),
+            ));
+        }
+        let host: Vec<String> = temps
+            .iter()
+            .map(|t| {
+                t.to_string_lossy()
+                    .trim_end_matches(['/', '\\'])
+                    .to_string()
+            })
+            .collect();
+        for (attempt, (output, expected)) in cases.iter().enumerate() {
+            let attempt = attempt as u32;
+            record_attempt_output(&mut store, &unit, attempt, "ok", output).unwrap();
             let node = store
-                .get_node(&attempt_output_symbol(&unit.id, attempt as u32))
+                .get_node(&attempt_output_symbol(&unit.id, attempt))
                 .unwrap()
                 .unwrap();
-            assert_eq!(node.metadata["output"].as_str().unwrap(), expected);
-            let denial = UnitDenial::new("worker_failure", &output);
-            record_rejected_output(&mut store, &unit, "s", &output, &denial, 0).unwrap();
+            let mut stored = vec![node.metadata["output"].as_str().unwrap().to_string()];
+            let denial = UnitDenial::new("worker_failure", output.as_str());
+            record_rejected_output(&mut store, &unit, "s", output, &denial, 0).unwrap();
             let node = store
                 .get_node(&synthetic_symbol(WORK_OUTPUT, &unit.id))
                 .unwrap()
@@ -616,21 +629,20 @@ mod tests {
                 &node.metadata["denial_reason"],
                 &node.metadata["denial"]["reason"],
             ] {
-                let stored = value.as_str().unwrap();
-                assert_eq!(stored, expected);
-                for prefix in &prefixes {
-                    assert!(
-                        !stored.contains(prefix.as_str()),
-                        "{stored:?} keeps the host temp dir {prefix:?}"
-                    );
+                stored.push(value.as_str().unwrap().to_string());
+            }
+            for got in &stored {
+                assert_eq!(got, expected, "from {output:?}");
+                for h in &host {
+                    assert!(!got.contains(h.as_str()), "{got:?} keeps {h:?}");
                 }
             }
         }
         // Text naming no notes path is stored byte for byte.
         let plain = "  Ran /tmp/build.sh and read wicked-core-notes.md.\n";
-        record_attempt_output(&mut store, &unit, 7, "ok", plain).unwrap();
+        record_attempt_output(&mut store, &unit, 99, "ok", plain).unwrap();
         let node = store
-            .get_node(&attempt_output_symbol(&unit.id, 7))
+            .get_node(&attempt_output_symbol(&unit.id, 99))
             .unwrap()
             .unwrap();
         assert_eq!(node.metadata["output"].as_str().unwrap(), plain);

@@ -238,36 +238,163 @@ pub(crate) fn notes_root(run_id: &str, ord: u32) -> PathBuf {
 /// The directory under the host temp dir that holds every run's notes roots ([`notes_root`]).
 const NOTES_DIR: &str = "wicked-core-notes";
 
-/// (core#1380) `text` with every host spelling of the notes base (`<temp>/wicked-core-notes`, as
-/// the engine names it and as it resolves, e.g. macOS `/var/...` and `/private/var/...`) rewritten
-/// to the relative `wicked-core-notes`. A read-only unit is told its notes root as an absolute host
-/// path, and a seat that writes a note there links it in its output (`[Command record](<temp>/
-/// wicked-core-notes/<run>/unit-9/command-record.md)`); the run record keeps the reference
-/// (`wicked-core-notes/<run>/unit-9/command-record.md`) without the host's temp dir. Applied where
-/// a unit's output is persisted (`execute.rs`). Text naming no notes path comes back borrowed.
+/// (core#1380) `text` with every host path into the notes base (`<temp>/wicked-core-notes`)
+/// rewritten to the relative `wicked-core-notes/...`. A read-only unit is told its notes root as
+/// an absolute host path, and a seat that writes a note there links it in its output
+/// (`[Command record](<temp>/wicked-core-notes/<run>/unit-9/command-record.md)`); the run record
+/// keeps the reference (`wicked-core-notes/<run>/unit-9/command-record.md`) without the host's temp
+/// dir. Applied where a unit's output is persisted (`execute.rs`). Text naming no notes path comes
+/// back borrowed.
+///
+/// A match is a whole path: the temp dir in any spelling the host has for it ([`NotesScrub`]),
+/// starting at a path boundary (or after `file://`), then one or more separators and the
+/// `wicked-core-notes` component itself. `/var/tmp/wicked-core-notes/...`, `<tree>/tmp/
+/// wicked-core-notes/...` and `<temp>/wicked-core-notes.md` are other paths and stay as written.
 pub(crate) fn scrub_notes_paths(text: &str) -> std::borrow::Cow<'_, str> {
-    let tmp = std::env::temp_dir();
-    let mut bases = vec![tmp.join(NOTES_DIR).to_string_lossy().into_owned()];
-    if let Ok(resolved) = std::fs::canonicalize(&tmp) {
-        bases.push(
-            plain_path(resolved)
-                .join(NOTES_DIR)
-                .to_string_lossy()
-                .into_owned(),
-        );
+    static HOST: std::sync::OnceLock<NotesScrub> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let tmp = std::env::temp_dir();
+        let mut temps = vec![tmp.to_string_lossy().into_owned()];
+        if let Ok(resolved) = std::fs::canonicalize(&tmp) {
+            temps.push(resolved.to_string_lossy().into_owned());
+            temps.push(plain_path(resolved).to_string_lossy().into_owned());
+        }
+        NotesScrub::new(
+            &temps,
+            cfg!(windows),
+            cfg!(any(windows, target_os = "macos")),
+        )
+    })
+    .scrub(text)
+}
+
+/// (core#1380) The spellings of the host temp dir a notes path may start with, and how to match
+/// them. Built from the temp dir as named and as resolved, plus the spellings the same directory
+/// has on this kind of host: macOS's `/var` and `/tmp` with and without `/private`; on Windows,
+/// `/` separators and the verbatim `\\?\` and `\\?\UNC\` forms. Matched ASCII-case-insensitively
+/// where the filesystem is (macOS, Windows).
+pub(crate) struct NotesScrub {
+    /// Longest first, so a spelling that contains another (`/private/var/...` holds `/var/...`)
+    /// is tried before it.
+    temps: Vec<String>,
+    windows: bool,
+    fold_case: bool,
+}
+
+impl NotesScrub {
+    pub(crate) fn new(temps: &[String], windows: bool, fold_case: bool) -> Self {
+        let mut all: Vec<String> = Vec::new();
+        for t in temps {
+            let t = t.trim_end_matches(['/', '\\']);
+            if t.is_empty() {
+                continue;
+            }
+            let mut spellings = vec![t.to_string()];
+            for (with, without) in [("/private/var", "/var"), ("/private/tmp", "/tmp")] {
+                let under = |p: &str, root: &str| p == root || p.starts_with(&format!("{root}/"));
+                if under(t, with) {
+                    spellings.push(t.replacen(with, without, 1));
+                } else if under(t, without) {
+                    spellings.push(t.replacen(without, with, 1));
+                }
+            }
+            if windows {
+                for sp in spellings.clone() {
+                    let plain = if let Some(rest) = sp.strip_prefix(r"\\?\UNC\") {
+                        format!(r"\\{rest}")
+                    } else if let Some(rest) = sp.strip_prefix(r"\\?\") {
+                        rest.to_string()
+                    } else {
+                        sp
+                    };
+                    let verbatim = match plain.strip_prefix(r"\\") {
+                        Some(rest) => format!(r"\\?\UNC\{rest}"),
+                        None => format!(r"\\?\{plain}"),
+                    };
+                    for v in [plain, verbatim] {
+                        spellings.push(v.replace('/', "\\"));
+                        spellings.push(v.replace('\\', "/"));
+                        spellings.push(v);
+                    }
+                }
+            }
+            all.extend(spellings);
+        }
+        all.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        all.dedup();
+        NotesScrub {
+            temps: all,
+            windows,
+            fold_case,
+        }
     }
-    // Longest first: one spelling can contain another (`/private/var/...` holds `/var/...`), and
-    // the shorter one must never cut into the longer.
-    bases.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    bases.dedup();
-    if !bases.iter().any(|b| text.contains(b.as_str())) {
-        return std::borrow::Cow::Borrowed(text);
+
+    pub(crate) fn scrub<'a>(&self, text: &'a str) -> std::borrow::Cow<'a, str> {
+        // A byte that continues a path name: a match must not start or end inside one.
+        let name_byte = |c: u8| c.is_ascii_alphanumeric() || b"._-~%+@".contains(&c) || c >= 0x80;
+        let sep = |c: u8| c == b'/' || c == b'\\';
+        // The tail of a matched path runs to the next space or closing delimiter.
+        let tail_byte = |c: u8| !c.is_ascii_whitespace() && !b")]>\"'`,;|".contains(&c);
+        let b = text.as_bytes();
+        let mut out = String::new();
+        let mut last = 0;
+        let mut from = 0;
+        while let Some(off) = text[from..].find(NOTES_DIR) {
+            let at = from + off;
+            let end = at + NOTES_DIR.len();
+            from = end;
+            if b.get(end).is_some_and(|&c| name_byte(c)) {
+                continue;
+            }
+            let mut k = at;
+            while k > last && sep(b[k - 1]) {
+                k -= 1;
+            }
+            if k == at {
+                continue;
+            }
+            let found = self.temps.iter().find_map(|t| {
+                let s = k.checked_sub(t.len()).filter(|&s| s >= last)?;
+                let seen = &b[s..k];
+                let same = if self.fold_case {
+                    seen.eq_ignore_ascii_case(t.as_bytes())
+                } else {
+                    seen == t.as_bytes()
+                };
+                same.then_some(s)
+            });
+            let Some(mut s) = found else {
+                continue;
+            };
+            const FILE_URL: &[u8] = b"file://";
+            if s >= last + FILE_URL.len() && b[s - FILE_URL.len()..s].eq_ignore_ascii_case(FILE_URL)
+            {
+                s -= FILE_URL.len();
+            }
+            if s > 0 && (name_byte(b[s - 1]) || sep(b[s - 1])) {
+                continue;
+            }
+            let mut t = end;
+            while t < b.len() && tail_byte(b[t]) {
+                t += 1;
+            }
+            out.push_str(&text[last..s]);
+            out.push_str(NOTES_DIR);
+            let tail = &text[end..t];
+            if self.windows {
+                out.push_str(&tail.replace('\\', "/"));
+            } else {
+                out.push_str(tail);
+            }
+            last = t;
+            from = t;
+        }
+        if last == 0 {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        out.push_str(&text[last..]);
+        std::borrow::Cow::Owned(out)
     }
-    let mut out = text.to_string();
-    for base in &bases {
-        out = out.replace(base.as_str(), NOTES_DIR);
-    }
-    std::borrow::Cow::Owned(out)
 }
 
 fn now_ms() -> u64 {
@@ -2054,5 +2181,103 @@ pub(crate) mod tests {
             outcome_for_unit(&unit, Some(&dir)),
             Some(WorktreeGuardOutcome::Unverifiable(_))
         ));
+    }
+
+    /// (core#1380) The notes-path scrub on fixed host spellings, the same on every OS: a link into
+    /// the notes base loses the host temp dir in each spelling the host has for it, and every other
+    /// path (a sibling of the base, a `tmp/wicked-core-notes` under another directory, an already
+    /// relative reference) stays byte for byte.
+    #[test]
+    fn the_notes_scrub_rewrites_whole_temp_paths_only_1380() {
+        let check = |scrub: &NotesScrub, input: &str, want: &str| {
+            assert_eq!(scrub.scrub(input), want, "scrubbing {input:?}");
+        };
+        let linux = NotesScrub::new(&["/tmp".into()], false, false);
+        for (input, want) in [
+            (
+                "[Command record](/tmp/wicked-core-notes/run-1/unit-9/command-record.md)",
+                "[Command record](wicked-core-notes/run-1/unit-9/command-record.md)",
+            ),
+            (
+                "see file:///tmp/wicked-core-notes/run-1/unit-9/a.md now",
+                "see wicked-core-notes/run-1/unit-9/a.md now",
+            ),
+            (
+                "cat /tmp//wicked-core-notes/r/unit-9/a.md",
+                "cat wicked-core-notes/r/unit-9/a.md",
+            ),
+            (
+                "a=/tmp/wicked-core-notes/r/u/a.md, b=`/tmp/wicked-core-notes/r/u/b.md`",
+                "a=wicked-core-notes/r/u/a.md, b=`wicked-core-notes/r/u/b.md`",
+            ),
+            (
+                "notes go in /tmp/wicked-core-notes now",
+                "notes go in wicked-core-notes now",
+            ),
+        ] {
+            check(&linux, input, want);
+        }
+        for kept in [
+            "/var/tmp/wicked-core-notes/r/a.md",
+            "/srv/tmp/wicked-core-notes/r/a.md",
+            "repo/tmp/wicked-core-notes/r/a.md",
+            "/tmp/wicked-core-notes.md and /tmp/wicked-core-notes-backup/a.md",
+            "wicked-core-notes/r/unit-9/a.md",
+            "/TMP/wicked-core-notes/r/a.md",
+            "Ran /tmp/build.sh.",
+        ] {
+            check(&linux, kept, kept);
+        }
+
+        // macOS: named with a trailing slash, resolved under /private; both in one text, and the
+        // /tmp spelling of a /private/tmp temp dir.
+        let mac = NotesScrub::new(
+            &[
+                "/var/folders/k3/x_y/T/".into(),
+                "/private/var/folders/k3/x_y/T".into(),
+            ],
+            false,
+            true,
+        );
+        check(
+            &mac,
+            "a /private/var/folders/k3/x_y/T/wicked-core-notes/r/u/a.md b \
+             /var/folders/k3/x_y/T//wicked-core-notes/r/u/b.md c",
+            "a wicked-core-notes/r/u/a.md b wicked-core-notes/r/u/b.md c",
+        );
+        let mac_tmp = NotesScrub::new(&["/private/tmp".into()], false, true);
+        check(
+            &mac_tmp,
+            "(/tmp/wicked-core-notes/r/u/a.md) (/private/tmp/wicked-core-notes/r/u/b.md)",
+            "(wicked-core-notes/r/u/a.md) (wicked-core-notes/r/u/b.md)",
+        );
+
+        // Windows: either separator, any ASCII case, the verbatim form, a space in the user name,
+        // and a UNC temp dir; the kept tail uses `/`.
+        let win = NotesScrub::new(
+            &[r"C:\Users\John Smith\AppData\Local\Temp\".into()],
+            true,
+            true,
+        );
+        for input in [
+            r"[r](C:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\run-1\unit-9\a.md)",
+            "[r](C:/Users/John Smith/AppData/Local/Temp/wicked-core-notes/run-1/unit-9/a.md)",
+            r"[r](c:\users\john smith\appdata\local\temp\wicked-core-notes\run-1\unit-9\a.md)",
+            r"[r](\\?\C:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\run-1\unit-9\a.md)",
+        ] {
+            check(&win, input, "[r](wicked-core-notes/run-1/unit-9/a.md)");
+        }
+        check(
+            &win,
+            r"D:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\a.md",
+            r"D:\Users\John Smith\AppData\Local\Temp\wicked-core-notes\a.md",
+        );
+        let unc = NotesScrub::new(&[r"\\?\UNC\srv\share\Temp".into()], true, true);
+        for input in [
+            r"\\srv\share\Temp\wicked-core-notes\r\a.md",
+            r"\\?\UNC\srv\share\Temp\wicked-core-notes\r\a.md",
+        ] {
+            check(&unc, input, "wicked-core-notes/r/a.md");
+        }
     }
 }
