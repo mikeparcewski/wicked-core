@@ -93,6 +93,51 @@ jobs:
           # A probe fixture that would skip here (no tool, no sandbox) fails instead.
           echo "WICKED_REQUIRE_PROBE_TOOLS=1" >> "$GITHUB_ENV"
 
+      # core#1762: the real-browser draft-render jail test
+      # (`actor::draft_render_live::a_real_browser_prints_in_the_read_allowlisted_jail_without_a_venv`)
+      # needs a headless shell; without one it skipped, and CI reported it as passed. This provisions
+      # Playwright's `chrome-headless-shell` at the version crew provisions its renderer with (cached
+      # on that version, so a hit costs one restore and no npx), and sets
+      # `WICKED_REQUIRE_HEADLESS_SHELL` so the test fails here rather than skip.
+      - name: Restore the headless shell (draft-render jail test)
+        if: runner.os != 'Windows'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ${{ runner.temp }}/ms-playwright
+          key: chrome-headless-shell-${{ runner.os }}-${{ runner.arch }}-playwright-1.64.0
+
+      - name: Provision the headless shell (draft-render jail test)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          PLAYWRIGHT_VERSION: 1.64.0
+          PLAYWRIGHT_BROWSERS_PATH: ${{ runner.temp }}/ms-playwright
+        run: |
+          set -euo pipefail
+          find_shell() {
+            find "$PLAYWRIGHT_BROWSERS_PATH" -type f \
+              -path '*/chrome-headless-shell-*/chrome-headless-shell' 2>/dev/null | head -n 1
+          }
+          shell="$(find_shell || true)"
+          if [ -z "$shell" ]; then
+            npx --yes "playwright@$PLAYWRIGHT_VERSION" install --only-shell chromium
+            shell="$(find_shell || true)"
+          fi
+          test -n "$shell" && test -x "$shell"
+          # The runner usually has every library the shell links; only when it cannot start are the
+          # system packages installed (three tries: the runner's apt mirrors fail at times).
+          if ! "$shell" --version; then
+            test "$RUNNER_OS" = Linux
+            for i in 1 2 3; do
+              npx --yes "playwright@$PLAYWRIGHT_VERSION" install-deps chromium && break
+              test "$i" != 3
+              sleep 30
+            done
+            "$shell" --version
+          fi
+          echo "WICKED_TEST_HEADLESS_SHELL=$shell" >> "$GITHUB_ENV"
+          echo "WICKED_REQUIRE_HEADLESS_SHELL=1" >> "$GITHUB_ENV"
+
       - name: Release script tests (scripts/changelog-section.py core#1552, scripts/npm-publish-resumable.py core#1556)
         if: runner.os == 'Linux'
         run: python3 -m unittest discover -s scripts -p 'test_*.py' -v
