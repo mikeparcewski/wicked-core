@@ -5,16 +5,19 @@
 //! itself, as the `draft_render` Tool, and the review is handed the record.
 //!
 //! A repo-less plan `draft → measure-pages → review` (crew's launch shape: the draft is the launch's
-//! declared deliverable in a declared write root) dispatches the catalog's fixed command (a stub
-//! `wicked-garden` FIRST on `PATH`, which answers by the mode written in the draft itself) in the
-//! render jail:
+//! declared deliverable in a declared write root) runs garden's counter in the render jail. The garden
+//! is the root of the `wicked-garden` FIRST on `PATH`; it has NO `.venv` (core#1336: the counter runs
+//! with the PATH's `python3`, never through the launcher, whose stub here fails), and its
+//! `scripts/draft/page_count.py` is a stub that answers by the mode written in the draft itself:
 //!
 //! - a verified print completes the run with a `measured` record (the count, the sha256 of the draft's
 //!   bytes) and the review's context carries `[draft render record — unit N]` and the rule never to
 //!   render in the seat. Without the fix there is no such step and no record: this fails;
 //! - a print that could not happen (the counter's own estimate, a report that is not its own) is
 //!   `not_measured`, and the run still completes: the step never holds it;
-//! - a send-back to the draft re-runs the render on the new bytes (a new sha256, the next attempt).
+//! - a send-back to the draft re-runs the render on the new bytes (a new sha256, the next attempt);
+//! - (core#1335) a counter that tries to read a file beside the draft, the garden and the renderer
+//!   is refused by the jail's read allowlist.
 //!
 //! POSIX only: the stub is a shell script (the suite's idiom).
 
@@ -37,42 +40,80 @@ fn fixture_root() -> PathBuf {
     std::env::temp_dir().join(format!("wicked-core-dr-{}", std::process::id()))
 }
 
-/// Pre-main (single-threaded): the hermetic emit spool, a stub `wicked-garden` first on `PATH`, a
-/// fixture renderer file named by `WICKED_CHROME`, and an empty claude config dir (no garden ladder).
+/// The file a `MODE:PEEK` counter tries to read: beside the draft's dir, the garden and the renderer.
+fn peek_file() -> PathBuf {
+    fixture_root().join("peek.txt")
+}
+
+/// The stub renderer's `--version` line.
+const RENDERER_VERSION: &str = "Stub Renderer 1.2.3";
+
+/// The stub counter's text (its sha256 is the record's `counter_sha256`).
+fn counter_text() -> String {
+    format!(
+        r#"import json, re, sys
+f = sys.argv[-1]
+t = open(f).read()
+print("ARGV " + " ".join(sys.argv[1:]), file=sys.stderr)
+def report(n, source="chrome-render", verified=True, notes=(), est=1):
+    print(json.dumps({{"check": "pages", "pages": n, "source": source, "verified": verified,
+        "notes": list(notes), "estimate": {{"estimate": est}}}}))
+if "MODE:PEEK" in t:
+    try:
+        open({peek:?}).read()
+        report(9)
+    except OSError:
+        report(1)
+    sys.exit(0)
+if "MODE:MEASURED" in t:
+    report(int(re.search(r"PAGES:(\d+)", t).group(1)))
+    sys.exit(0)
+if "MODE:UNVERIFIED" in t:
+    report(2, "html-estimate", False, ["chrome exited 1 without writing a PDF: no display"], 2)
+    sys.exit(3)
+print("not a report")
+"#,
+        peek = peek_file().to_string_lossy()
+    )
+}
+
+/// Pre-main (single-threaded): the hermetic emit spool, a stub garden (a failing launcher first on
+/// `PATH`, the stub counter, no `.venv`), a stub renderer named by `WICKED_CHROME` that only answers
+/// `--version`, the file a peeking counter must not read, and an empty claude config dir (no garden
+/// ladder).
 ///
 /// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only touches the filesystem and
 /// process env vars via the std API.
 #[ctor::ctor(unsafe)]
 fn arm() {
+    use std::os::unix::fs::PermissionsExt;
     wicked_apps_core::emit::hermetic_test_spool();
     let root = fixture_root();
     let _ = std::fs::remove_dir_all(&root);
-    let bin = root.join("bin");
-    std::fs::create_dir_all(&bin).expect("fixture bin dir");
-    let stub = bin.join("wicked-garden");
-    // The last argument is the draft; its text names the mode. Every line to stderr is the Tool's
-    // output; the report goes to stdout (the engine sends it to its report file).
-    let script = "#!/bin/sh\n\
-         echo \"ARGV $*\" >&2\n\
-         env | sed 's/^/ENV /' >&2\n\
-         for a in \"$@\"; do f=\"$a\"; done\n\
-         if grep -q MODE:MEASURED \"$f\"; then n=$(grep -o 'PAGES:[0-9]*' \"$f\" | cut -d: -f2); \
-           printf '{\"check\":\"pages\",\"pages\":%s,\"source\":\"chrome-render\",\"verified\":true,\"notes\":[],\"estimate\":{\"estimate\":1}}' \"$n\"; exit 0; fi\n\
-         if grep -q MODE:UNVERIFIED \"$f\"; then \
-           printf '%s' '{\"check\":\"pages\",\"pages\":2,\"source\":\"html-estimate\",\"verified\":false,\"notes\":[\"chrome exited 1 without writing a PDF: no display\"],\"estimate\":{\"estimate\":2}}'; exit 3; fi\n\
-         echo 'not a report'\n\
-         exit 0\n";
-    std::fs::write(&stub, script).expect("write the stub");
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-    let chrome = root.join("headless-shell");
-    std::fs::write(&chrome, "#!/bin/sh\nexit 0\n").expect("fixture renderer");
+    let scripts = root.join("garden/scripts");
+    std::fs::create_dir_all(scripts.join("draft")).expect("fixture garden");
+    let launcher = scripts.join("wicked-garden");
+    // core#1336: the engine runs the counter itself; the launcher must never run.
+    std::fs::write(
+        &launcher,
+        "#!/bin/sh\necho 'the garden launcher ran' >&2\nexit 1\n",
+    )
+    .expect("write the launcher");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(scripts.join("draft/page_count.py"), counter_text()).expect("write the counter");
+    let chrome_dir = root.join("chrome");
+    std::fs::create_dir_all(&chrome_dir).expect("fixture renderer dir");
+    let chrome = chrome_dir.join("headless-shell");
+    std::fs::write(&chrome, format!("#!/bin/sh\necho '{RENDERER_VERSION}'\n"))
+        .expect("fixture renderer");
+    std::fs::set_permissions(&chrome, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::write(peek_file(), "beside everything the render may read").expect("peek file");
     let config = root.join("claude-config");
     std::fs::create_dir_all(&config).expect("fixture claude config dir");
     std::env::remove_var("WICKED_SKILLS_SNAPSHOT");
     std::env::set_var("CLAUDE_CONFIG_DIR", &config);
     std::env::set_var(wicked_core::draft_render::CHROME_ENV, &chrome);
-    let mut paths = vec![bin];
+    let mut paths = vec![scripts];
     paths.extend(std::env::split_paths(
         &std::env::var_os("PATH").unwrap_or_default(),
     ));
@@ -423,7 +464,26 @@ fn a_measured_draft_completes_and_the_review_cites_the_engines_count() {
     assert_eq!(rec.file.as_deref(), Some(r.draft.to_str().unwrap()));
     assert!(rec.producer.is_some(), "{rec:?}");
     assert!(rec.jail.is_some() && rec.renderer.is_some() && rec.counter.is_some());
-    // The fixed command on the draft itself, with only the declared variables.
+    // core#1337: the measured count names the counter's bytes and the renderer's own version.
+    assert_eq!(
+        rec.counter_sha256.as_deref(),
+        Some(
+            format!(
+                "{:x}",
+                <sha2::Sha256 as sha2::Digest>::digest(counter_text().as_bytes())
+            )
+            .as_str()
+        ),
+        "{rec:?}"
+    );
+    assert_eq!(rec.renderer_version.as_deref(), Some(RENDERER_VERSION));
+    // core#1336: the counter ran from the PATH launcher's garden root, which has no `.venv`.
+    assert_eq!(
+        rec.counter.as_deref().map(PathBuf::from),
+        fixture_root().join("garden").canonicalize().ok(),
+        "{rec:?}"
+    );
+    // The counter on the draft itself, with only the declared variables.
     let out = r
         .core
         .work_output(&format!("{}:measure-pages", r.sid))
@@ -478,6 +538,26 @@ fn an_unmeasured_draft_is_recorded_honestly_and_the_run_completes() {
             assert!(t.contains("lower bound, not a count"), "{t}");
         }
     }
+}
+
+/// (core#1335) The render jail reads an allowlist: a counter that tries to read a file beside the
+/// draft's dir, the garden and the renderer is refused (the stub then reports 1 page; 9 if it could
+/// read it). Without the allowlist every host file outside the secret dirs was readable.
+#[test]
+fn the_counter_cannot_read_a_file_beside_its_inputs() {
+    let r = run("peek", &["<p>MODE:PEEK</p>"]);
+    if unjailed(&r, true) {
+        return;
+    }
+    assert!(completed(&r.events), "{:?}", types(&r.events));
+    let rec = record(&r);
+    assert!(rec.measured(), "{rec:?}");
+    assert_eq!(
+        rec.pages,
+        Some(1),
+        "the counter read {} from inside the render jail: {rec:?}",
+        peek_file().display()
+    );
 }
 
 /// A send-back to the draft resets the render: it runs again on the new bytes, with its own attempt,

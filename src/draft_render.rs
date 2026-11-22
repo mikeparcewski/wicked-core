@@ -13,11 +13,20 @@
 //!   too), and the engine reads it again after the print: the record's sha256 is of bytes that were
 //!   the same before and after, else nothing is measured (`draft_changed`).
 //! - **The counter** is garden's `page_count.py --render --json` ([`RENDER_CMD`]), the module
-//!   crew's floor counts with, run from the admitted skills generation in [`crate::validator::render_jail`]
-//!   (no network at all, writes only to the temp dir). Its stdout goes to a report file the engine
-//!   reads ([`judge_report`]).
+//!   crew's floor counts with. (core#1336) The engine runs that file itself, never through the garden
+//!   launcher: `<python> -I -B <root>/`[`COUNTER_SCRIPT`]` --render --json <draft>`, from the admitted
+//!   skills generation (else the root of the `wicked-garden` on `PATH`), with the root's `.venv`
+//!   interpreter, else `python3`/`python` on `PATH` ([`interpreter`]). The counter is stdlib only, so a
+//!   root without a `.venv` needs no `uv`, no cache and no network. It runs in
+//!   [`crate::validator::render_jail`]: no network at all, writes only to the temp dir, and (core#1335)
+//!   reads only the system's own directories, the draft, the garden root, the interpreter and the
+//!   renderer ([`render_read_roots`]). Its stdout goes to a report file the engine reads
+//!   ([`judge_report`]).
 //! - **The renderer** is the daemon's [`CHROME_ENV`] only (crew provisions a headless shell and exports
 //!   it). Unset: nothing is spawned and the record says `no_renderer`.
+//! - **The identity** (core#1337) of a measured count: the sha256 of the `page_count.py` bytes the
+//!   engine ran (`counter_sha256`) and the renderer's own `--version` line, asked in the same jail
+//!   (`renderer_version`), so a consumer that reuses a count can tell two builds at one path apart.
 //!
 //! ## How it counts
 //!
@@ -41,6 +50,10 @@ pub const RENDER_CMD: [&str; 5] = [
     "--render",
     "--json",
 ];
+/// (core#1336) The counter's path below a garden root, and the arguments before the draft: the
+/// script and flags of [`RENDER_CMD`], which the engine runs with a resolved interpreter.
+pub const COUNTER_SCRIPT: &str = "scripts/draft/page_count.py";
+pub const COUNTER_ARGS: [&str; 2] = ["--render", "--json"];
 /// The daemon variable naming the browser the counter prints with (crew exports its managed one).
 pub const CHROME_ENV: &str = "WICKED_CHROME";
 /// What a `measured` count means, for a consumer that reuses it: the counter, the renderer's print
@@ -66,7 +79,7 @@ const REPORT_MAX: u64 = 1024 * 1024;
 pub struct DraftRenderRecord {
     /// [`OUTCOME_MEASURED`] or [`OUTCOME_NOT_MEASURED`].
     pub outcome: String,
-    /// Why it was not measured: `no_renderer`, `no_draft`, `no_garden`, `unjailed_host`,
+    /// Why it was not measured: `no_renderer`, `no_draft`, `no_garden`, `no_python`, `unjailed_host`,
     /// `render_failed`, `bad_report`, `draft_changed`, `deadline_exceeded`, `engine_refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cause: Option<String>,
@@ -95,9 +108,17 @@ pub struct DraftRenderRecord {
     /// [`PROFILE`] (when measured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<String>,
-    /// Where the counter ran from: the skills generation's root, or `PATH` (when measured).
+    /// The garden root the counter ran from: the skills generation's, or the one the `wicked-garden`
+    /// on `PATH` belongs to (when measured).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub counter: Option<String>,
+    /// (core#1337) Lowercase hex sha256 of the `page_count.py` bytes the engine ran (when measured).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counter_sha256: Option<String>,
+    /// (core#1337) The renderer's own `--version` line, asked in the render jail (when measured and it
+    /// printed one).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renderer_version: Option<String>,
     /// The jail's launcher (`sandbox-exec`, `bwrap`), when the counter ran.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub jail: Option<String>,
@@ -119,6 +140,8 @@ impl DraftRenderRecord {
             renderer: None,
             profile: None,
             counter: None,
+            counter_sha256: None,
+            renderer_version: None,
             jail: None,
             attempt,
         }
@@ -337,6 +360,90 @@ fn renderer_from(v: Option<std::ffi::OsString>) -> Result<std::path::PathBuf, (S
                 ),
             )
         })
+}
+
+/// (core#1336) The garden root a `wicked-garden` launcher found on `PATH` belongs to: the launcher
+/// lives in `<root>/scripts`, so the root is its real path's grandparent, when the counter is there.
+pub(crate) fn root_of_launcher(launcher: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = launcher
+        .canonicalize()
+        .ok()?
+        .parent()?
+        .parent()?
+        .to_path_buf();
+    root.join(COUNTER_SCRIPT).is_file().then_some(root)
+}
+
+/// (core#1336) The interpreter the counter runs with: the root's `.venv` one (crew's synced venv),
+/// else `python3`, then `python`, from `find` (the daemon's `PATH`). With the canonical `.venv` dir
+/// when that is where it came from (the jail must read it; a snapshot's `.venv` may be a link).
+pub(crate) fn interpreter(
+    root: &std::path::Path,
+    find: &dyn Fn(&str) -> Option<std::path::PathBuf>,
+) -> Option<(std::path::PathBuf, Option<std::path::PathBuf>)> {
+    let venv = root.join(".venv");
+    for name in ["python3", "python"] {
+        let p = venv.join("bin").join(name);
+        if p.is_file() {
+            return Some((p, venv.canonicalize().ok()));
+        }
+    }
+    ["python3", "python"]
+        .iter()
+        .find_map(|n| find(n))
+        .map(|p| (p, None))
+}
+
+/// (core#1335) What the render jail may read beside the system's own directories and its write
+/// roots: the draft file, the garden root, the `.venv` its interpreter came from, the interpreter's
+/// install prefix (its real path's grandparent: `<prefix>/bin/python3`) and the renderer's install
+/// (its outermost `*.app` bundle, else its directory). The jail itself drops `/` and any root that
+/// holds the home directory ([`crate::validator::render_jail`]).
+pub(crate) fn render_read_roots(
+    draft: &std::path::Path,
+    garden: &std::path::Path,
+    python: &std::path::Path,
+    venv: Option<&std::path::Path>,
+    renderer: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let real = |p: &std::path::Path| p.canonicalize().ok();
+    let mut out: Vec<std::path::PathBuf> = vec![draft.to_path_buf(), garden.to_path_buf()];
+    out.extend(venv.map(std::path::Path::to_path_buf));
+    out.extend(
+        real(python)
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf),
+    );
+    out.extend(real(renderer).map(|r| {
+        r.ancestors()
+            .filter(|a| a.extension().is_some_and(|e| e == "app"))
+            .last()
+            .or_else(|| r.parent())
+            .unwrap_or(&r)
+            .to_path_buf()
+    }));
+    out
+}
+
+/// (core#1337) The renderer's `--version` line from the file the jailed shell wrote it to: the first
+/// non-empty line, trimmed, at most 200 characters; `None` when there is none.
+pub(crate) fn read_version(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(4096)
+        .read_to_end(&mut buf)
+        .ok()?;
+    let text = String::from_utf8_lossy(&buf);
+    let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+    Some(line.chars().take(200).collect())
 }
 
 /// Read the report file the counter's stdout went to (no link followed, at most [`REPORT_MAX`]).
@@ -664,6 +771,138 @@ mod tests {
             renderer_from(Some(exe.clone().into_os_string())).unwrap(),
             exe
         );
+    }
+
+    /// (core#1336) The engine runs the same counter and flags the catalog's fixed command names.
+    #[test]
+    fn the_counter_is_the_fixed_commands_script_and_flags() {
+        assert_eq!(RENDER_CMD[..2], ["wicked-garden", "run"]);
+        assert_eq!(RENDER_CMD[2], COUNTER_SCRIPT);
+        assert_eq!(RENDER_CMD[3..], COUNTER_ARGS);
+    }
+
+    /// (core#1336) A root without a `.venv` runs the counter with `python3` (then `python`) from
+    /// `PATH`; a `.venv` interpreter wins and names its venv; none at all is `None`.
+    #[cfg(unix)]
+    #[test]
+    fn the_interpreter_is_the_venvs_else_python3_on_path() {
+        let d = std::env::temp_dir().join(format!("wc-dr-py-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("root")).unwrap();
+        let root = d.join("root");
+        let on_path = |n: &str| (n == "python3").then(|| std::path::PathBuf::from("/x/python3"));
+        assert_eq!(
+            interpreter(&root, &on_path),
+            Some((std::path::PathBuf::from("/x/python3"), None))
+        );
+        let only_python = |n: &str| (n == "python").then(|| std::path::PathBuf::from("/x/python"));
+        assert_eq!(
+            interpreter(&root, &only_python).map(|(p, _)| p),
+            Some(std::path::PathBuf::from("/x/python"))
+        );
+        assert_eq!(interpreter(&root, &|_| None), None);
+        std::fs::create_dir_all(root.join(".venv/bin")).unwrap();
+        std::fs::write(root.join(".venv/bin/python"), "").unwrap();
+        let (p, venv) = interpreter(&root, &on_path).unwrap();
+        assert_eq!(p, root.join(".venv/bin/python"));
+        assert_eq!(venv, root.join(".venv").canonicalize().ok());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// (core#1336) A `wicked-garden` on `PATH` belongs to the root two levels up from its real path,
+    /// and only when the counter is there.
+    #[cfg(unix)]
+    #[test]
+    fn a_launcher_on_path_names_its_root_only_when_the_counter_is_there() {
+        let d = std::env::temp_dir().join(format!("wc-dr-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let root = d.join("garden");
+        std::fs::create_dir_all(root.join("scripts/draft")).unwrap();
+        std::fs::write(root.join("scripts/wicked-garden"), "").unwrap();
+        assert_eq!(root_of_launcher(&root.join("scripts/wicked-garden")), None);
+        std::fs::write(root.join(COUNTER_SCRIPT), "").unwrap();
+        std::fs::create_dir_all(d.join("bin")).unwrap();
+        std::os::unix::fs::symlink(
+            root.join("scripts/wicked-garden"),
+            d.join("bin/wicked-garden"),
+        )
+        .unwrap();
+        assert_eq!(
+            root_of_launcher(&d.join("bin/wicked-garden")),
+            root.canonicalize().ok()
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// (core#1335) The renderer's install is its outermost `.app` bundle, else its directory; the
+    /// interpreter's is its real path's grandparent.
+    #[cfg(unix)]
+    #[test]
+    fn the_read_roots_name_the_installs_not_the_binaries() {
+        let d = std::env::temp_dir().join(format!("wc-dr-reads-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let app = d.join("Chrome.app/Contents/MacOS");
+        let shell = d.join("shell");
+        let py = d.join("py/bin");
+        for x in [&app, &shell, &py] {
+            std::fs::create_dir_all(x).unwrap();
+        }
+        for f in [
+            app.join("Chrome"),
+            shell.join("headless"),
+            py.join("python3.13"),
+        ] {
+            std::fs::write(f, "").unwrap();
+        }
+        std::os::unix::fs::symlink(py.join("python3.13"), d.join("python3")).unwrap();
+        let real = |p: std::path::PathBuf| p.canonicalize().unwrap();
+        let draft = d.join("doc.html");
+        let garden = d.join("garden");
+        let r = render_read_roots(
+            &draft,
+            &garden,
+            &d.join("python3"),
+            None,
+            &app.join("Chrome"),
+        );
+        assert_eq!(
+            r,
+            vec![
+                draft.clone(),
+                garden.clone(),
+                real(d.join("py")),
+                real(d.join("Chrome.app"))
+            ]
+        );
+        let venv = d.join("venv");
+        let r = render_read_roots(
+            &draft,
+            &garden,
+            &d.join("python3"),
+            Some(&venv),
+            &shell.join("headless"),
+        );
+        assert_eq!(r[2], venv);
+        assert_eq!(r[4], real(shell));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn the_version_is_the_first_line_bounded() {
+        let d = std::env::temp_dir().join(format!("wc-dr-ver-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("v.txt");
+        assert_eq!(read_version(&f), None);
+        std::fs::write(&f, "\n  Google Chrome for Testing 156.0.8078.4  \nmore\n").unwrap();
+        assert_eq!(
+            read_version(&f).as_deref(),
+            Some("Google Chrome for Testing 156.0.8078.4")
+        );
+        std::fs::write(&f, "x".repeat(500)).unwrap();
+        assert_eq!(read_version(&f).map(|v| v.len()), Some(200));
+        std::fs::write(&f, "\n\n").unwrap();
+        assert_eq!(read_version(&f), None);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
