@@ -1435,10 +1435,17 @@ pub enum CoreEvent {
     /// shape power-mode-ui renders). `state` is `started` | `finished`; `kind` is `read` | `search`
     /// | `run` | `test` | `edit` | `write` | `skill` | `task` | `other`; `target` is a
     /// repo-relative path or a redacted command (<= 160 chars). See [`crate::tool_activity`].
+    ///
+    /// `cli` is the seat key of the launch whose stream it came from (`claude`, `codex`, `pi`,
+    /// `opencode#2`, …), the same key [`CoreEvent::SkillUsed`] carries for that launch (core#1786:
+    /// a QE step's executor and its reviewer seat share one `ord`, so the seat files a row, not the
+    /// ord). Wire: always a non-empty string, never `null`; a frame from a core before this field
+    /// has no `cli` key at all, which a reader takes as "seat unknown" (file by `ord`, as before).
     ToolActivity {
         session: String,
         ord: u32,
         attempt: u32,
+        cli: String,
         at: i64,
         id: String,
         state: String,
@@ -2453,6 +2460,7 @@ impl CoreEvent {
                 session,
                 ord,
                 attempt,
+                cli,
                 at,
                 id,
                 state,
@@ -2466,6 +2474,7 @@ impl CoreEvent {
                 "session": session,
                 "ord": ord,
                 "attempt": attempt,
+                "cli": cli,
                 "at": at,
                 "id": id,
                 "state": state,

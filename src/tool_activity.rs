@@ -6,7 +6,8 @@
 //! stream (claude `stream-json`: a `tool_use` block when a call starts, the `tool_result` that
 //! answers it when it finishes) into one `toolActivity` frame per state change, sent to the run's
 //! actor as it happens. The frame shape is the one power-mode-ui renders:
-//! `{session, ord, attempt, at, id, state, kind, tool, target, ok, durationMs}`.
+//! `{session, ord, attempt, cli, at, id, state, kind, tool, target, ok, durationMs}` (`cli`, the
+//! launch's seat key, since core#1786).
 //!
 //! A target is a repo-relative path or a redacted command, at most 160 characters. Nothing here
 //! decides anything: a frame that cannot be sent is dropped.
@@ -167,7 +168,8 @@ pub struct ToolActivitySink {
     tx: Emit,
     open: HashMap<String, Open>,
     window: (Instant, usize),
-    /// The seat (`codex`, `pi`, …), named on a heartbeat.
+    /// The seat key (`codex`, `pi`, `opencode#2`, …): every frame's `cli`, and the tool a
+    /// heartbeat names.
     seat: String,
     /// When this attempt last sent any frame (epoch ms), shared with its [`Heartbeat`].
     last_frame: Arc<AtomicU64>,
@@ -178,29 +180,33 @@ pub struct ToolActivitySink {
 }
 
 impl ToolActivitySink {
-    /// The sink for a dispatched unit, `None` when its actor is not reachable from here.
-    pub fn for_input(input: &crate::workflow::StepInput, root: &Path) -> Option<Self> {
+    /// The sink for a dispatched unit's launch by seat `cli` (the launch's seat key, the one its
+    /// `skillUsed` frames carry), `None` when its actor is not reachable from here.
+    pub fn for_input(input: &crate::workflow::StepInput, cli: &str, root: &Path) -> Option<Self> {
         let tx: Sender<Command> = crate::power::actor_tx(input.process_gen)?;
         let tx = std::sync::Mutex::new(tx);
-        let seat = input
-            .unit
-            .assigned_cli
-            .clone()
-            .unwrap_or_else(|| "seat".to_string());
-        Some(
-            Self::new(
-                &input.run_id,
-                input.unit.ord,
-                input.attempt,
-                root,
-                Box::new(move |ev| {
-                    if let Ok(t) = tx.lock() {
-                        let _ = t.send(Command::EmitEvent(ev));
-                    }
-                }),
-            )
-            .seat(&seat),
-        )
+        Some(Self::for_launch(
+            input,
+            cli,
+            root,
+            Box::new(move |ev| {
+                if let Ok(t) = tx.lock() {
+                    let _ = t.send(Command::EmitEvent(ev));
+                }
+            }),
+        ))
+    }
+
+    /// The sink for one launch of `input` by seat `cli`, its frames handed to `tx`. Every frame
+    /// names the seat (core#1786): two seats of one step (a QE executor and its reviewer) share
+    /// the unit's `ord`, so only `cli` tells their rows apart.
+    pub(crate) fn for_launch(
+        input: &crate::workflow::StepInput,
+        cli: &str,
+        root: &Path,
+        tx: Box<dyn Fn(CoreEvent) + Send + Sync>,
+    ) -> Self {
+        Self::new(&input.run_id, input.unit.ord, input.attempt, root, tx).seat(cli)
     }
 
     pub fn new(
@@ -225,7 +231,7 @@ impl ToolActivitySink {
         }
     }
 
-    /// The seat a heartbeat names.
+    /// The seat key every frame carries as `cli` (and a heartbeat names as its tool).
     pub fn seat(mut self, seat: &str) -> Self {
         self.seat = seat.to_string();
         self
@@ -396,6 +402,7 @@ impl ToolActivitySink {
             session: self.run_id.clone(),
             ord: self.ord,
             attempt: self.attempt,
+            cli: self.seat.clone(),
             at: crate::interaction::now_millis(),
             id: id.to_string(),
             state: state.to_string(),
@@ -445,6 +452,7 @@ impl Heartbeat {
             session: self.run_id.clone(),
             ord: self.ord,
             attempt: self.attempt,
+            cli: self.seat.clone(),
             at: now as i64,
             id: format!("working-{}", self.attempt),
             state: "working".to_string(),
@@ -1574,6 +1582,8 @@ mod tests {
             assert_eq!(f["state"], "working");
             assert_eq!(f["kind"], "working");
             assert_eq!(f["tool"], "copilot");
+            // (core#1786) A heartbeat names its seat as `cli` too.
+            assert_eq!(f["cli"], "copilot");
             assert_eq!(f["id"], "working-0");
             assert_eq!(f["target"], "last output 12 s ago");
             assert_eq!(f["durationMs"], 12_000);

@@ -3286,6 +3286,17 @@ impl OneShotScratch {
     }
 }
 
+/// The seat key a wrapped launch of `input` runs as: the unit's assigned seat, else `claude`. Its
+/// `skillUsed` and `toolActivity` frames carry it as `cli` (core#1786).
+pub(crate) fn launch_cli_key(input: &StepInput) -> String {
+    input
+        .unit
+        .assigned_cli
+        .as_deref()
+        .unwrap_or("claude")
+        .to_string()
+}
+
 /// (core#992, W24) The call-id cleanup of an engine-internal call, a warm judge's too: a warm arm
 /// that falls back to a cold seat places it by this call's id, and only this guard drops that
 /// replica scope. A warm call's stable dirs stay its checkout's (its seat home is never noted).
@@ -3325,12 +3336,7 @@ impl WrappedCliStepRunner {
             }
         }
         let one_shot_scratch = one_shot_scratch_for(input);
-        let cli_key = input
-            .unit
-            .assigned_cli
-            .as_deref()
-            .unwrap_or("claude")
-            .to_string();
+        let cli_key = launch_cli_key(input);
         // Prefer the unit's own invocation template (an ad-hoc launch CLI not in the registry); else
         // resolve the key via the council registry — `launch_invocation`, the resolution seat
         // selection also reads (#402 review pass 2).
@@ -4046,7 +4052,8 @@ impl WrappedCliStepRunner {
         } else {
             // Every seat's live activity from its own stream (claude, codex, pi); a stream with no
             // tool events gets the heartbeat only (coordinator 2026-10-30, rig run 1d372696).
-            let activity = || crate::tool_activity::ToolActivitySink::for_input(input, &cwd);
+            let activity =
+                || crate::tool_activity::ToolActivitySink::for_input(input, &cli_key, &cwd);
             // Skill usage (`skillUsed`): read off the same stream, inside the roots THIS launch
             // was handed (codex's populated home as the seat's env names it), sent on the
             // runner's own channel.

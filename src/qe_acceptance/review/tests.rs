@@ -2131,3 +2131,54 @@ fn ledger_reasons_are_redacted_and_capped_before_they_reach_the_builder() {
     assert_eq!(detail.chars().count(), 2000);
     assert!(detail.ends_with('…'));
 }
+
+/// (core#1786, studio#935 item 5) A QE step's executor (codex) and its reviewer seat (pi) run as
+/// two launches of ONE unit: same `ord`, same attempt. Each launch's tool frames, built the way
+/// the wrapped runner builds them (its seat key, `launch_cli_key`), carry that seat as `cli`, so a
+/// viewer files pi's rows under pi and not under codex.
+#[test]
+fn two_seats_of_one_step_send_tool_frames_with_their_own_cli() {
+    let ledger = Path::new("/l/.wicked-qe");
+    let executor = input_for(qe_unit("codex", ledger));
+    let reviewer = reviewer_input(&executor, &seat("pi", BASIS_DISTINCT), "/d", "n-1786");
+    assert_eq!(executor.unit.ord, reviewer.unit.ord, "one step");
+    assert_eq!(executor.attempt, reviewer.attempt);
+    let frames: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    for (input, call) in [(&executor, "exec-1"), (&reviewer, "rev-1")] {
+        let sent = Arc::clone(&frames);
+        let mut sink = crate::tool_activity::ToolActivitySink::for_launch(
+            input,
+            &crate::execute_wrapped::launch_cli_key(input),
+            Path::new("/w/repo"),
+            Box::new(move |ev| sent.lock().unwrap().push(ev.to_json())),
+        );
+        sink.started(
+            call,
+            "Read",
+            &serde_json::json!({"file_path": "/w/repo/src/lib.rs"}),
+        );
+        sink.finished(call, true);
+    }
+    let frames = frames.lock().unwrap();
+    let rows: Vec<(&str, &str, u64)> = frames
+        .iter()
+        .map(|f| {
+            assert_eq!(f["type"], "toolActivity", "{f}");
+            (
+                f["id"].as_str().unwrap(),
+                f["cli"].as_str().unwrap_or("(none)"),
+                f["ord"].as_u64().unwrap(),
+            )
+        })
+        .collect();
+    let ord = u64::from(executor.unit.ord);
+    assert_eq!(
+        rows,
+        vec![
+            ("exec-1", "codex", ord),
+            ("exec-1", "codex", ord),
+            ("rev-1", "pi", ord),
+            ("rev-1", "pi", ord),
+        ]
+    );
+}
