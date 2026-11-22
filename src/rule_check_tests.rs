@@ -5354,8 +5354,9 @@ fn a_quote_across_a_nul_counts_as_the_seat_read_it() {
 /// neither. Rule by rule: `NAMES-NOTHING`'s UNKNOWN on the server's part names no file; `QUIET`
 /// gets no line on a part that shows the test alone; `OWN-ONLY`'s UNKNOWN names only the file its
 /// part shows; `ELSEWHERE-ONLY`'s names only the file outside it, and a view of the test alone
-/// keeps it; `SCOPED-NA` is N/A when asked on the named files. Every prompt is recorded with its
-/// seat.
+/// keeps it; `SCOPED-NA` is N/A when asked on the named files. On the named files a KEPT names each
+/// file listed as not shown (core#1791), except `SKIPS-LIST`'s, which is silent on them. Every
+/// prompt is recorded with its seat.
 struct SpanJudge {
     seen: Mutex<Vec<(String, String)>>,
     extra: &'static str,
@@ -5389,8 +5390,18 @@ impl RuleJudge for SpanJudge {
         for id in asked_ids(prompt) {
             let line = match (id.as_str(), server, test) {
                 ("SCOPED-NA", _, _) if scoped => "N/A — these files are not about it".to_string(),
-                (_, true, true) => {
-                    format!("KEPT — test/server.test.ts covers the handler {s} adds")
+                (id, true, true) => {
+                    // (core#1791) The scoped judge rules out each file listed as not shown.
+                    let ruled_out: String = match prompt.split("NOTSHOWN-").nth(1) {
+                        Some(list) if id != "SKIPS-LIST" => list
+                            .lines()
+                            .skip(1)
+                            .take_while(|l| !l.starts_with("NOTSHOWN-"))
+                            .map(|f| format!("; {f} is data the rule does not bear on"))
+                            .collect(),
+                        _ => String::new(),
+                    };
+                    format!("KEPT — test/server.test.ts covers the handler {s} adds{ruled_out}")
                 }
                 ("QUIET", false, true) => continue,
                 ("NAMES-NOTHING", true, false) => {
@@ -5609,6 +5620,46 @@ fn core_1278_a_rule_whose_pages_were_not_all_shown_still_holds() {
         row.reason.contains("only KEPT or BROKEN counts"),
         "{}",
         row.reason
+    );
+}
+
+/// (core#1791) On the named files, a KEPT that does not name a file listed as changed and not
+/// shown is not counted: whether the rule bears on that file is the judge's call, and silence (a
+/// missed list, or text planted in the change) is no answer, so the rule holds for a person. The
+/// same judge naming the listed file keeps it (the test above).
+#[test]
+fn core_1791_a_scoped_kept_silent_on_a_not_shown_file_is_not_counted() {
+    let c = span_change(4000);
+    let judge = SpanJudge::new("");
+    let r = span_check(
+        &[rule("SKIPS-LIST", "every handler has a test")],
+        &c,
+        &judge,
+    );
+    let row = row(&r, "SKIPS-LIST");
+    assert_eq!(row.status, RuleStatus::Unchecked, "{row:?}");
+    assert!(
+        row.reason.contains("each changed file listed as not shown"),
+        "{}",
+        row.reason
+    );
+    let seen = judge.seen.lock().unwrap();
+    let scoped: Vec<&String> = seen
+        .iter()
+        .map(|(_, p)| p)
+        .filter(|p| p.starts_with(SCOPE_NOTE))
+        .collect();
+    assert_eq!(scoped.len(), 1, "asked once on the named files");
+    let list = scoped[0]
+        .split("NOTSHOWN-")
+        .nth(1)
+        .expect("the not-shown list");
+    assert!(list.contains("fixtures/data.json\n"), "{list}");
+    // The judge is told a KEPT names each listed file.
+    assert!(
+        scoped[0].contains("A KEPT names EACH of them"),
+        "{:.400}",
+        scoped[0]
     );
 }
 
