@@ -1202,22 +1202,17 @@ fn worktree_admin_dir(wt: &Path) -> Option<PathBuf> {
         .then_some(admin)
 }
 
-/// (core#1436) The common git dir of the registered checkout at `repo` (which no seat writes): its
-/// `.git` dir; for a checkout whose `.git` is a file (a `--separate-git-dir` repository, or a linked
-/// checkout registered as a repository), the dir that file names, then that dir's `commondir` when
-/// it has one.
+/// (core#1436) The common git dir of the registered checkout at `repo` (which no seat writes), as
+/// git's own discovery finds it from there: a checkout's `.git` dir, the dir a `.git` file names (a
+/// `--separate-git-dir` repository, a linked checkout) and its `commondir`, the enclosing checkout
+/// of a registered subdirectory.
 fn repo_common_dir(repo: &Path) -> Option<PathBuf> {
-    let dot = repo.join(".git");
-    let meta = std::fs::metadata(&dot).ok()?;
-    if meta.is_dir() {
-        return Some(dot);
-    }
-    let link = std::fs::read_to_string(&dot).ok()?;
-    let gitdir = resolve_link(repo, link.trim().strip_prefix("gitdir:")?.trim());
-    match std::fs::read_to_string(gitdir.join("commondir")) {
-        Ok(common) => Some(resolve_link(&gitdir, common.trim())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(gitdir),
-        Err(_) => None,
+    match git(
+        repo.to_str()?,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) {
+        Ok((true, out, _)) if !out.is_empty() => Some(PathBuf::from(out)),
+        _ => None,
     }
 }
 
@@ -1247,11 +1242,12 @@ fn read_link_file(path: &Path) -> std::io::Result<String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    #[cfg(not(unix))]
+    // FILE_FLAG_OPEN_REPARSE_POINT: a link (or junction) is opened as itself, and fails the
+    // regular-file check below on the handle, with no window between a check and the open.
+    #[cfg(windows)]
     {
-        if std::fs::symlink_metadata(path)?.file_type().is_symlink() {
-            return Err(std::io::Error::other("a link, not a regular file"));
-        }
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x0020_0000);
     }
     let file = opts.open(path)?;
     if !file.metadata()?.is_file() {
@@ -1264,9 +1260,16 @@ fn read_link_file(path: &Path) -> std::io::Result<String> {
 
 /// The RAW run id a live worktree was minted (or adopted) for — `None` when unmarked: a tree from
 /// a pre-marker engine, or one a downstream pre-provisioned (crew#390/#391).
+///
+/// (review on #1760) A marker that exists and cannot be read as a regular file (a link a seat
+/// planted, a FIFO) is [`UNREADABLE_OWNER`]: no run's, so never adopted or re-stamped.
 fn worktree_owner(wt: &Path) -> Option<String> {
     let marker = worktree_admin_dir(wt)?.join("wicked-run-id");
-    let owner = read_link_file(&marker).ok()?;
+    let owner = match read_link_file(&marker) {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(_) => return Some(UNREADABLE_OWNER.to_string()),
+    };
     let owner = owner.trim();
     if owner.is_empty() {
         return None;
@@ -1280,7 +1283,23 @@ fn stamp_worktree_owner(wt: &Path, run_id: &str) {
     if let Some(dir) = worktree_admin_dir(wt) {
         // A failed stamp leaves the tree UNMARKED, which silently downgrades the ownership
         // guard (a later colliding id would read it as adoptable) — say so, loudly.
-        if let Err(e) = std::fs::write(dir.join("wicked-run-id"), run_id) {
+        // (review on #1760) Written to a fresh private file and renamed into place, so a link a
+        // seat planted at the marker is replaced, never written through.
+        let tmp = dir.join(format!(
+            "wicked-run-id.{}.{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let written = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .and_then(|mut f| std::io::Write::write_all(&mut f, run_id.as_bytes()))
+            .and_then(|()| std::fs::rename(&tmp, dir.join("wicked-run-id")));
+        if written.is_err() {
+            let _ = std::fs::remove_file(&tmp);
+        }
+        if let Err(e) = written {
             eprintln!(
                 "wicked-core: could not stamp worktree owner for run {run_id} at {} ({e}) — \
                  the tree stays unmarked and a name-colliding run could adopt it (core#337)",
@@ -1509,6 +1528,7 @@ fn may_touch_worktree(wt: &Path, run_id: &str) -> bool {
     }
     match worktree_owner(wt) {
         None => true,
+        Some(owner) if owner == UNREADABLE_OWNER => false,
         Some(owner) => owner == run_id || sanitize_worktree_id(&owner) == run_id,
     }
 }
@@ -4834,6 +4854,58 @@ mod tests {
         let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
         assert!(!daemon_may_touch(&theirs));
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// core#1436 (review r2 on #1760): a repository registered at a SUBDIRECTORY of its checkout
+    /// keeps its trees' owner markers: the common git dir is the one git finds from there.
+    #[test]
+    fn a_subdirectory_registration_keeps_its_trees_owner_markers() {
+        let root = git_repo("subdir-registration");
+        let sub = root.join("packages").join("pkg");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("lib.txt"), "pkg\n").unwrap();
+        let p = root.to_str().unwrap();
+        assert!(git(p, &["add", "-A"]).unwrap().0);
+        assert!(git(p, &["commit", "-qm", "pkg"]).unwrap().0);
+        let theirs = {
+            let _other = DaemonOwnerScope::bind(Some("daemon-other".into()));
+            create_worktree(sub.to_str().unwrap(), "run-sub").unwrap()
+        };
+        assert!(theirs.starts_with(&sub));
+        assert_eq!(worktree_owner(&theirs).as_deref(), Some("run-sub"));
+        assert_eq!(worktree_daemon(&theirs).as_deref(), Some("daemon-other"));
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        assert!(!daemon_may_touch(&theirs));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// core#1436 (review r2 on #1760): a seat that replaces its run marker with a link to a file
+    /// outside its reach gets neither an adoption nor a write through the link: the reuse refuses,
+    /// the destructive guard refuses, and the link's target is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_run_marker_is_never_adopted_or_written_through() {
+        let root = git_repo("linked-run-marker");
+        let p = root.to_str().unwrap();
+        let _me = DaemonOwnerScope::bind(Some("daemon-me".into()));
+        let wt = create_worktree(p, "run-linked").unwrap();
+        let target = root.join("outside.txt");
+        std::fs::write(&target, "keep\n").unwrap();
+        let marker = worktree_admin_dir(&wt).unwrap().join("wicked-run-id");
+        std::fs::remove_file(&marker).unwrap();
+        std::os::unix::fs::symlink(&target, &marker).unwrap();
+        assert_eq!(worktree_owner(&wt).as_deref(), Some(UNREADABLE_OWNER));
+        assert!(create_worktree(p, "run-linked").is_err(), "no adoption");
+        assert!(!may_touch_worktree(&wt, "run-linked"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "keep\n");
+        stamp_worktree_owner(&wt, "run-linked");
+        assert_eq!(
+            std::fs::read_to_string(&target).unwrap(),
+            "keep\n",
+            "a stamp replaces the link, never writes through it"
+        );
+        assert_eq!(worktree_owner(&wt).as_deref(), Some("run-linked"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// core#1436 (review on #1760): a seat that replaces its admin dir's back-pointer or its
