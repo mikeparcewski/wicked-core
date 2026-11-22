@@ -114,7 +114,8 @@
             "end": "^test result: FAILED",
             "use": "last-before-end"
           }
-        ]
+        ],
+        "count": "^running (?P<n>\\d+) tests?$"
       },
       "list": {
         "run": [

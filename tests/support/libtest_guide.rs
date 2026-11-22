@@ -1,7 +1,8 @@
 /// A build-guide check (DES-BUILD-GUIDE, contract v1) for a libtest-style runner — `cargo test` and
 /// the stand-ins that mimic it: the binaries' `Running` lines (stderr, merged) qualify ids; a
 /// failure is a name in the final `failures:` list; one test runs alone with `<name> --exact`, and
-/// deselects with `--skip=<name> --exact`. Verified (every probe `pass`) on `verified` when it is
+/// deselects with `--skip=<name> --exact`; `running N tests` lines count what a run executed.
+/// Verified (every probe `pass`) on `verified` when it is
 /// not empty. Test fixture data, shared by the lib's and the integration tests: the floor knows
 /// none of it.
 #[allow(dead_code)]
@@ -21,7 +22,8 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
         "results": {"kind": "text", "how": {"merge": true}},
         "parser": {"section": section, "blocks": [{
             "start": "^failures:$", "item": r"^    (?P<id>\S+)$",
-            "end": "^test result: FAILED", "use": "last-before-end"}]},
+            "end": "^test result: FAILED", "use": "last-before-end"}],
+            "count": r"^running (?P<n>\d+) tests?$"},
         "list": {"run": tail(&["--list"]), "item": r"^(?P<id>\S+): test$",
                  "section": section, "merge": true},
         "alone": {"run": tail(&["{id}", "--exact"])},
@@ -31,8 +33,9 @@ pub fn libtest_guide(argv: &[String], verified: &str) -> serde_json::Value {
     if !verified.is_empty() {
         g["verified"] = serde_json::json!({
             "baseSha": verified, "runnerVersion": "", "at": "",
-            "results": {"list": "pass", "run": "pass", "ids": "pass", "alone": "pass",
-                        "deselect": "pass", "mutation": "pass", "multi": "pass"}});
+            "results": {"list": "pass", "run": "pass", "complete": "pass", "ids": "pass",
+                        "alone": "pass", "deselect": "pass", "mutation": "pass",
+                        "multi": "pass"}});
     }
     g
 }

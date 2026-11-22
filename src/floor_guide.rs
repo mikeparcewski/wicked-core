@@ -17,9 +17,10 @@ use serde::{Deserialize, Serialize};
 /// Where a repository keeps its guide.
 pub const GUIDE_PATH: &str = ".wicked/build-guide.json";
 /// The probes every check needs, all `pass`, before its exclusion is relied on (plus `affected`
-/// when the check has that piece).
-pub const REQUIRED_PROBES: [&str; 7] = [
-    "list", "run", "ids", "alone", "deselect", "mutation", "multi",
+/// when the check has that piece). (core#1101) `complete`: the clean run executes exactly the
+/// tests the list names, so an incomplete list cannot make a shared name look unique.
+pub const REQUIRED_PROBES: [&str; 8] = [
+    "list", "run", "complete", "ids", "alone", "deselect", "mutation", "multi",
 ];
 
 /// A repository's build/test guide (contract v1).
@@ -132,6 +133,11 @@ pub struct Parser {
     pub failed: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blocks: Vec<Block>,
+    /// (core#1101) Lines that say how many tests ran, with a named group `n` (a number): summed
+    /// over a run's results — in the `section`s the list names — they are what the run executed,
+    /// which the `complete` probe holds to the list's count.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -327,8 +333,8 @@ fn cwd_ok(cwd: &str) -> bool {
 /// naming its `failedExit` (never 0), a `name` of 1-64 `[A-Za-z0-9._-]` (never `.` or `..`),
 /// `results.how.env` names that pass [`env_name_ok`], a
 /// `cwd` inside the repo, and a `deselect` whose
-/// `{ids:re|}` is once-only and never beside `{q}`. Anything else does not parse (detection
-/// decides).
+/// `{ids:re|}` is once-only and never beside `{q}`, and whose per-id tokens hold `{q}` and an
+/// id together or neither (core#1101). Anything else does not parse (detection decides).
 pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
     let guide: BuildGuide =
         serde_json::from_str(raw).map_err(|e| format!("does not parse: {e}"))?;
@@ -369,6 +375,14 @@ pub(crate) fn parse(raw: &str) -> Result<BuildGuide, String> {
             Some("`{ids:re|}` among the per-id tokens of `deselect.append` (it is once-only)")
         } else if has(tokens, "{ids:re|}") && has(tokens, "{q}") {
             Some("`{ids:re|}` and `{q}` in one `deselect.append` (the pattern cannot bind ids to qualifiers)")
+        } else if has(tokens, "{q}")
+            && tokens[first..last]
+                .iter()
+                .any(|t| t.contains("{q}") != (t.contains("{id}") || t.contains("{id:re}")))
+        {
+            // (core#1101) A qualifier deselects only bound to its id: `--skip={q}` beside
+            // `--name={id}` would deselect the whole qualifier, or the id in every one.
+            Some("`{q}` and `{id}` in different `deselect.append` tokens (a qualifier is bound to its id only inside one token)")
         } else {
             None
         };
@@ -510,6 +524,7 @@ pub(crate) struct Compiled {
     section: Option<Regex>,
     failed: Vec<Regex>,
     blocks: Vec<(Regex, Regex, Regex, bool)>,
+    count: Option<Regex>,
     list_item: Regex,
     list_section: Option<Regex>,
 }
@@ -527,7 +542,7 @@ impl GuideCheck {
     /// Compile every regex the check's pieces name; `Err` names the first that is missing or bad.
     pub(crate) fn compile(&self) -> Result<Compiled, String> {
         let list = self.list.as_ref().ok_or("no `list` piece")?;
-        let (section, failed, blocks) = match self.results.kind.as_str() {
+        let (section, failed, blocks, count) = match self.results.kind.as_str() {
             "text" => {
                 let p = self
                     .parser
@@ -549,9 +564,15 @@ impl GuideCheck {
                     p.section.as_deref().map(re).transpose()?,
                     p.failed.iter().map(|f| re(f)).collect::<Result<_, _>>()?,
                     blocks,
+                    match p.count.as_deref().map(re).transpose()? {
+                        Some(c) if !c.capture_names().any(|n| n == Some("n")) => {
+                            return Err("`parser.count` has no named group `n`".into())
+                        }
+                        c => c,
+                    },
                 )
             }
-            "junit" => (None, Vec::new(), Vec::new()),
+            "junit" => (None, Vec::new(), Vec::new(), None),
             k @ ("json-lines" | "tap") => {
                 return Err(format!("`results.kind` `{k}` is reserved (not read in v1)"))
             }
@@ -561,6 +582,7 @@ impl GuideCheck {
             section,
             failed,
             blocks,
+            count,
             list_item: re(&list.item)?,
             list_section: list.section.as_deref().map(re).transpose()?,
         })
@@ -872,6 +894,41 @@ impl Compiled {
     pub(crate) fn keyed(&self) -> bool {
         self.list_section.is_some()
     }
+
+    /// (core#1101) How many tests a run's text results say it EXECUTED: every `count` line's `n`,
+    /// summed. With a keyed list, only in a `section` whose qualifier the list names: a section
+    /// the list never names (`Doc-tests`, whose tests no list prints) is not the list's to
+    /// compare. `None` without a `count` piece; `Err` for an `n` that is not a number.
+    pub(crate) fn executed(&self, text: &str, listed: &[TestId]) -> Option<Result<usize, String>> {
+        let count = self.count.as_ref()?;
+        let keyed = self.keyed();
+        let named: std::collections::HashSet<&str> = listed.iter().map(|t| t.q.as_str()).collect();
+        let mut q = String::new();
+        let mut total = 0usize;
+        for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+            if let Some(s) = self.section.as_ref().and_then(|r| r.captures(l)) {
+                q = s
+                    .name("q")
+                    .map(|m| m.as_str().to_string())
+                    .unwrap_or_default();
+            }
+            let Some(n) = count.captures(l).and_then(|c| c.name("n")) else {
+                continue;
+            };
+            if keyed && !named.contains(q.as_str()) {
+                continue;
+            }
+            match n.as_str().parse::<usize>() {
+                Ok(n) => total = total.saturating_add(n),
+                Err(_) => {
+                    return Some(Err(format!(
+                        "`parser.count` matched `{l}`, whose `n` is not a number"
+                    )))
+                }
+            }
+        }
+        Some(Ok(total))
+    }
 }
 
 /// Unique, first-seen order; without a keyed list, the qualifier is dropped.
@@ -1115,6 +1172,15 @@ mod tests {
                 "deselect",
                 serde_json::json!({"append": ["--suite={q}", "--p=^(?!(?:{ids:re|})$)"]}),
             ),
+            // (core#1101) `{q}` and `{id}` in different tokens.
+            (
+                "deselect",
+                serde_json::json!({"append": ["--suite={q}", "--skip={id}"]}),
+            ),
+            (
+                "deselect",
+                serde_json::json!({"append": ["--skip={id}", "--", "{q}"]}),
+            ),
         ] {
             let mut bad = serde_json::to_value(check("text")).unwrap();
             bad[k] = v.clone();
@@ -1122,11 +1188,50 @@ mod tests {
         }
         let mut ok = serde_json::to_value(check("text")).unwrap();
         ok["cwd"] = "crates/x".into();
+        assert!(guide(ok.clone()).is_ok());
+        // (core#1101) One token binds the qualifier to its id.
+        ok["deselect"] = serde_json::json!({"append": ["--", "--skip={q}::{id}", "--exact"]});
         assert!(guide(ok).is_ok());
         assert_eq!(
             fill(&s(&["--{id}@{q}"]), &t("Q", "a{q}b")),
             s(&["--a{q}b@Q"])
         );
+    }
+
+    /// (core#1101) `parser.count` sums the tests a run executed, in the sections the list names
+    /// (a section the list never names, such as doctests, is skipped); an unkeyed list counts
+    /// every line; no `count`, no answer; an `n` that is not a number is an error.
+    #[test]
+    fn the_count_sums_the_sections_the_list_names() {
+        let text =
+            "== bin1\nrunning 2 tests\n== docs\nrunning 3 tests\n== bin2\nrunning 1 test\r\n";
+        let listed = [t("bin1", "a"), t("bin1", "b"), t("bin2", "c")];
+        let mut c = check("text");
+        assert_eq!(c.compile().unwrap().executed(text, &listed), None);
+        c.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\d+) tests?$".into());
+        assert_eq!(c.compile().unwrap().executed(text, &listed), Some(Ok(3)));
+        let mut unkeyed = c.clone();
+        unkeyed.list.as_mut().unwrap().section = None;
+        assert_eq!(
+            unkeyed.compile().unwrap().executed(text, &listed),
+            Some(Ok(6))
+        );
+        c.parser.as_mut().unwrap().count = Some(r"^running (?P<n>\S+) tests?$".into());
+        assert!(matches!(
+            c.compile()
+                .unwrap()
+                .executed("== bin1\nrunning many tests\n", &listed),
+            Some(Err(_))
+        ));
+        // Written back as the author wrote it.
+        let wrote = serde_json::to_value(&c).unwrap();
+        assert!(wrote["parser"]["count"].is_string(), "{wrote}");
+        // A `count` with no group `n` counts nothing: refused, never a silent zero.
+        c.parser.as_mut().unwrap().count = Some(r"^running \d+ tests?$".into());
+        assert!(c
+            .compile()
+            .err()
+            .is_some_and(|e| e.contains("no named group `n`")));
     }
 
     /// (confirmation round on d32b2b2, codex P1) A check name keys files the engine writes: only

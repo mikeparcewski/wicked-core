@@ -13,13 +13,18 @@
 //! * `run` — the clean run is GREEN (exit 0, no parsed failure): every later probe needs a green
 //!   base, so a mutation's failure is the run's only one and a deselected run that exits 0 does so
 //!   because of the deselect;
+//! * `complete` (core#1101) — the clean run executed exactly as many tests as the list names
+//!   (junit: every testcase with an id, run or skipped; text: `parser.count`, in the sections the
+//!   list names), so an incomplete list cannot make a shared name look unique;
 //! * `mutation` — with `probes.mutation` written, the run fails with a `failedExit` naming EXACTLY
 //!   the expected test, and the run deselecting it is green;
-//! * `multi` — with `probes.mutation2` written too, the run names exactly both; deselecting both
-//!   is green, and the list deselecting both lists exactly the rest;
+//! * `multi` — with `probes.mutation2` written too, the run names exactly both; deselecting the
+//!   first alone still fails naming exactly the second (core#1101); deselecting both is green, and
+//!   the list deselecting both lists exactly the rest;
 //! * `ids` — every id the results report is in the list;
 //! * `alone` — the mutated test alone fails naming exactly it (with junit, exactly one testcase
-//!   ran), and a passing test under its qualifier alone is green (with junit, exactly it ran);
+//!   ran), and a passing test under its qualifier, whose id is unique across every qualifier
+//!   (core#1101), alone is green (with junit, exactly it ran);
 //! * `deselect` — the list deselecting that passing test lists exactly the rest;
 //! * `affected` (when the check has the piece) — with the mutation file as `{files}`, its run's
 //!   failures include the mutated test;
@@ -42,8 +47,8 @@ use std::path::Path;
 
 use crate::floor_guide::{passed, BuildGuide, GuideCheck, Mutation, TestId};
 use crate::repo_checks::{
-    inventory, remove_base_export, results_exec, results_of, run_held, run_one_with,
-    runner_version, BaseTree, CheckScratch, RepoCheck, Tree,
+    inventory, parse_results, remove_base_export, results_exec, results_text, run_held,
+    run_one_with, runner_version, BaseTree, CheckScratch, RepoCheck, Toc, Tree,
 };
 
 /// A results run's parse: every testcase (junit) and the failures.
@@ -331,6 +336,12 @@ impl Probe<'_> {
     /// A results run of `argv` (with `how`) in `c`: its exit code, every testcase (junit), its
     /// failures.
     fn results(&self, c: &BaseTree, argv: &[String]) -> (Option<i32>, Parsed) {
+        let (exit, text) = self.results_text(c, argv);
+        (exit, text.and_then(|t| parse_results(self.g, &t)))
+    }
+
+    /// A results run of `argv` (with `how`) in `c`: its exit code and its results text.
+    fn results_text(&self, c: &BaseTree, argv: &[String]) -> (Option<i32>, Result<String, String>) {
         let rc = RepoCheck {
             argv: self.g.for_results(argv),
             ..self.rc.clone()
@@ -349,8 +360,50 @@ impl Probe<'_> {
         if r.timed_out || r.spawn_error.is_some() {
             return (None, Err(format!("did not finish ({})", r.summary())));
         }
-        let parsed = results_of(&c.held, &self.rc, self.g, &mut r, self.scratch, since);
-        (r.exit_code, parsed)
+        let text = self
+            .g
+            .compile()
+            .and_then(|_| results_text(&c.held, &self.rc, self.g, &mut r, self.scratch, since));
+        (r.exit_code, text)
+    }
+
+    /// (core#1101) `complete`: the clean run executed exactly as many tests as the list names —
+    /// with junit, every testcase with an id (run or skipped); with text, the `parser.count` lines
+    /// in the sections the list names ([`crate::floor_guide::Compiled::executed`]). An incomplete
+    /// list (a `--lib` list beside a full run) could otherwise make a name shared with an unlisted
+    /// test look unique.
+    fn complete(&self, listed: &Toc, text: &Result<String, String>, parsed: &Parsed) -> String {
+        if let Some(why) = &listed.incomplete {
+            return format!("fail: the list: {why}");
+        }
+        let executed = if self.g.results.kind == "junit" {
+            match parsed {
+                Ok((all, _)) => all.len(),
+                Err(e) => return format!("fail: the clean run's results: {e}"),
+            }
+        } else {
+            let text = match text {
+                Ok(t) => t,
+                Err(e) => return format!("fail: the clean run's results: {e}"),
+            };
+            let counted = match self.g.compile() {
+                Ok(c) => c.executed(text, &listed.ids),
+                Err(e) => return format!("fail: {e}"),
+            };
+            match counted {
+                None => {
+                    return "fail: no `parser.count` to count the tests the run executed".into()
+                }
+                Some(Err(e)) => return format!("fail: {e}"),
+                Some(Ok(n)) => n,
+            }
+        };
+        verdict(executed == listed.ids.len(), || {
+            format!(
+                "the clean run executed {executed} test(s); the list names {}",
+                listed.ids.len()
+            )
+        })
     }
 
     /// A results run that exits 0 and names no failure.
@@ -451,8 +504,13 @@ impl Probe<'_> {
         );
         // A green base: the mutations' failures are then the run's only failures, and a deselected
         // run that exits 0 does so because of the deselect.
-        let (exit, clean) = self.results(&clean_copy, &g.run);
+        let (exit, clean_text) = self.results_text(&clean_copy, &g.run);
         drop(clean_copy);
+        let clean: Parsed = clean_text.clone().and_then(|t| parse_results(g, &t));
+        out.insert(
+            "complete".into(),
+            self.complete(&clean_list, &clean_text, &clean),
+        );
         let green = exit == Some(0) && clean.as_ref().is_ok_and(|(_, f)| f.is_empty());
         out.insert(
             "run".into(),
@@ -559,16 +617,26 @@ impl Probe<'_> {
             }
             _ => Vec::new(),
         };
+        // (core#1101) Deselecting the first ALONE still fails, naming exactly the second: a
+        // deselect that drops more than the one id it names cannot pass by deselecting both.
+        let first_alone = || {
+            let second: Vec<TestId> = pair.iter().filter(|x| **x != t).cloned().collect();
+            let (exit, r) =
+                self.results(&both_copy, &g.deselected(&g.run, std::slice::from_ref(&t)));
+            self.failed_exit(exit) && r.is_ok_and(|(_, f)| f == second)
+        };
         out.insert(
             "multi".into(),
             verdict(
                 !pair.is_empty()
+                    && first_alone()
                     && self.green(&both_copy, &g.deselected(&g.run, &pair))
                     && self.deselects_exactly(&both_copy, &listed.ids, &pair),
                 || {
                     format!(
-                        "with both mutations: {:?} (exit {bexit:?}); both must be named, and \
-                         deselecting both must run green and list exactly the rest",
+                        "with both mutations: {:?} (exit {bexit:?}); both must be named, \
+                         deselecting the first alone must still fail naming exactly the second, \
+                         and deselecting both must run green and list exactly the rest",
                         both.as_ref().map(|(_, f)| f.clone()).unwrap_or_default()
                     )
                 },
@@ -614,10 +682,17 @@ impl Probe<'_> {
             }) && (g.results.kind != "junit" || all == std::slice::from_ref(want))
         };
         let (aexit, alone_t) = self.results(&both_copy, &g.alone_argv(&t));
+        // (core#1101) A passing test whose id is unique across EVERY qualifier: running or
+        // deselecting a shared name proves nothing about one test.
         let passing = listed
             .ids
             .iter()
-            .find(|x| x.q == t.q && **x != t && !is(x, m2))
+            .find(|x| {
+                x.q == t.q
+                    && **x != t
+                    && !is(x, m2)
+                    && listed.ids.iter().filter(|y| y.id == x.id).count() == 1
+            })
             .cloned();
         out.insert(
             "alone".into(),
@@ -630,7 +705,8 @@ impl Probe<'_> {
                 }
                 (_, Err(e)) => format!("fail: `{}` alone: {e}", t.id),
                 (None, _) => format!(
-                    "fail: no passing test beside `{}` under its qualifier",
+                    "fail: no passing test beside `{}` under its qualifier whose id is unique \
+                     across every qualifier",
                     t.id
                 ),
                 (Some(p), _) => {
@@ -655,7 +731,8 @@ impl Probe<'_> {
             "deselect".into(),
             match &passing {
                 None => format!(
-                    "fail: no passing test beside `{}` under its qualifier",
+                    "fail: no passing test beside `{}` under its qualifier whose id is unique \
+                     across every qualifier",
                     t.id
                 ),
                 Some(p) => verdict(
