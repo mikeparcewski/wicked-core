@@ -278,3 +278,11 @@ fn a_result_whose_run_was_relaunched_while_its_validator_ran_never_folds() {
     let _ = std::fs::remove_dir_all(&repo);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Pre-main, so no test thread can spool an emission before the override is set (core#311).
+/// SAFETY (`ctor(unsafe)`): runs before `main` on one thread and only sets one process env var
+/// via the std API — no allocator setup, no threads, no panics across the FFI boundary.
+#[ctor::ctor(unsafe)]
+fn arm_hermetic_emit_spool() {
+    wicked_apps_core::emit::hermetic_test_spool();
+}
