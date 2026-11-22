@@ -426,8 +426,34 @@ fn work_output_node(
             m.insert("denial".into(), v);
         }
     }
+    scrub_notes_fields(m, &["output", "denial_reason", "denial"]);
     crate::tool_activity::redact_fields(m, &["output", "denial_reason", "denial"]);
     node
+}
+
+/// (core#1380) No host temp path in a persisted unit record: a read-only unit's notes root is an
+/// absolute path under the host temp dir, and a seat that links a note it wrote there would carry
+/// that path into the run record. Every string under the named fields goes through
+/// [`crate::worktree_guard::scrub_notes_paths`]; run before the secret redaction, so a redaction
+/// can never split a path the scrub must still match.
+fn scrub_notes_fields(map: &mut serde_json::Map<String, serde_json::Value>, keys: &[&str]) {
+    fn scrub(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::String(s) => {
+                if let std::borrow::Cow::Owned(t) = crate::worktree_guard::scrub_notes_paths(s) {
+                    *s = t;
+                }
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(scrub),
+            serde_json::Value::Object(fields) => fields.values_mut().for_each(scrub),
+            _ => {}
+        }
+    }
+    for key in keys {
+        if let Some(value) = map.get_mut(*key) {
+            scrub(value);
+        }
+    }
 }
 
 /// Persist the REJECTED transcript record for a unit that never reached the governance gate — the
@@ -503,6 +529,7 @@ pub(crate) fn record_attempt_output(
     if !output.trim().is_empty() {
         m.insert("output".into(), s(output));
     }
+    scrub_notes_fields(m, &["output"]);
     crate::tool_activity::redact_fields(m, &["output"]);
     put_node(store, node)
 }
@@ -533,6 +560,80 @@ mod tests {
             assert_eq!(stored.as_bytes(), expected.as_bytes());
             assert!(!stored.contains(&token));
         }
+    }
+
+    /// (core#1380) A read-only unit's output links a note it wrote under its notes root, an
+    /// absolute path under the host temp dir. Neither the attempt record nor the resolution record
+    /// (output, denial reason, denial) keeps the host temp dir; the reference keeps its tail.
+    #[test]
+    fn persisted_output_names_no_host_temp_dir_for_a_notes_link_1380() {
+        let mut store = open_store(Some(":memory:")).unwrap();
+        let unit = WorkUnit::pending("s:u9", "s", 9, "verify it");
+        let tmp = std::env::temp_dir();
+        let root = crate::worktree_guard::notes_root("run-1380", 9);
+        let mut prefixes = vec![tmp
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string()];
+        let mut links = vec![root.join("command-record.md")];
+        if let Ok(resolved) = std::fs::canonicalize(&tmp) {
+            let plain = resolved
+                .to_string_lossy()
+                .trim_start_matches(r"\\?\")
+                .to_string();
+            links.push(
+                std::path::PathBuf::from(&plain)
+                    .join("wicked-core-notes")
+                    .join(crate::gate_hook::run_dir_name("run-1380"))
+                    .join("unit-9")
+                    .join("command-record.md"),
+            );
+            prefixes.push(plain);
+        }
+        let tail = std::path::Path::new("wicked-core-notes")
+            .join(crate::gate_hook::run_dir_name("run-1380"))
+            .join("unit-9")
+            .join("command-record.md")
+            .to_string_lossy()
+            .into_owned();
+        for (attempt, link) in links.iter().enumerate() {
+            let output = format!("Checks pass.\n\n[Command record]({})\n", link.display());
+            let expected = format!("Checks pass.\n\n[Command record]({tail})\n");
+            record_attempt_output(&mut store, &unit, attempt as u32, "ok", &output).unwrap();
+            let node = store
+                .get_node(&attempt_output_symbol(&unit.id, attempt as u32))
+                .unwrap()
+                .unwrap();
+            assert_eq!(node.metadata["output"].as_str().unwrap(), expected);
+            let denial = UnitDenial::new("worker_failure", &output);
+            record_rejected_output(&mut store, &unit, "s", &output, &denial, 0).unwrap();
+            let node = store
+                .get_node(&synthetic_symbol(WORK_OUTPUT, &unit.id))
+                .unwrap()
+                .unwrap();
+            for value in [
+                &node.metadata["output"],
+                &node.metadata["denial_reason"],
+                &node.metadata["denial"]["reason"],
+            ] {
+                let stored = value.as_str().unwrap();
+                assert_eq!(stored, expected);
+                for prefix in &prefixes {
+                    assert!(
+                        !stored.contains(prefix.as_str()),
+                        "{stored:?} keeps the host temp dir {prefix:?}"
+                    );
+                }
+            }
+        }
+        // Text naming no notes path is stored byte for byte.
+        let plain = "  Ran /tmp/build.sh and read wicked-core-notes.md.\n";
+        record_attempt_output(&mut store, &unit, 7, "ok", plain).unwrap();
+        let node = store
+            .get_node(&attempt_output_symbol(&unit.id, 7))
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.metadata["output"].as_str().unwrap(), plain);
     }
 
     #[test]

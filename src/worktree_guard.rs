@@ -230,9 +230,44 @@ pub const ENGINE_SCRATCH_DIR: &str = "tmp";
 /// `evidence/<issue>/reproduce.md` in the tree (the run-loss shape core#464 closes).
 pub(crate) fn notes_root(run_id: &str, ord: u32) -> PathBuf {
     std::env::temp_dir()
-        .join("wicked-core-notes")
+        .join(NOTES_DIR)
         .join(crate::gate_hook::run_dir_name(run_id))
         .join(format!("unit-{ord}"))
+}
+
+/// The directory under the host temp dir that holds every run's notes roots ([`notes_root`]).
+const NOTES_DIR: &str = "wicked-core-notes";
+
+/// (core#1380) `text` with every host spelling of the notes base (`<temp>/wicked-core-notes`, as
+/// the engine names it and as it resolves, e.g. macOS `/var/...` and `/private/var/...`) rewritten
+/// to the relative `wicked-core-notes`. A read-only unit is told its notes root as an absolute host
+/// path, and a seat that writes a note there links it in its output (`[Command record](<temp>/
+/// wicked-core-notes/<run>/unit-9/command-record.md)`); the run record keeps the reference
+/// (`wicked-core-notes/<run>/unit-9/command-record.md`) without the host's temp dir. Applied where
+/// a unit's output is persisted (`execute.rs`). Text naming no notes path comes back borrowed.
+pub(crate) fn scrub_notes_paths(text: &str) -> std::borrow::Cow<'_, str> {
+    let tmp = std::env::temp_dir();
+    let mut bases = vec![tmp.join(NOTES_DIR).to_string_lossy().into_owned()];
+    if let Ok(resolved) = std::fs::canonicalize(&tmp) {
+        bases.push(
+            plain_path(resolved)
+                .join(NOTES_DIR)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    // Longest first: one spelling can contain another (`/private/var/...` holds `/var/...`), and
+    // the shorter one must never cut into the longer.
+    bases.sort_by_key(|b| std::cmp::Reverse(b.len()));
+    bases.dedup();
+    if !bases.iter().any(|b| text.contains(b.as_str())) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = text.to_string();
+    for base in &bases {
+        out = out.replace(base.as_str(), NOTES_DIR);
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 fn now_ms() -> u64 {
